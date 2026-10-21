@@ -19,6 +19,7 @@
 
 import { defined } from "@/util/object"
 import type { JobInfo, JobRegistry, JobWaitResult, StartJobInput } from "./job-registry"
+import type { BackgroundJobClientHandle } from "./layer"
 import { messageOf, portFromMessagePort } from "./port"
 
 /**
@@ -68,9 +69,9 @@ export interface JobPort {
 }
 
 /**
- * Adapt a real `MessagePort` (the worker's dedicated control link) to `JobPort`.
- * Mirrors `cancel.ts`'s `cancelPortFromMessagePort`, so the hub can serve the
- * registry over a transferred port and the worker can drive the client.
+ * Adapt a real `MessagePort` (the worker's dedicated control link) to `JobPort`,
+ * so the hub can serve the registry over a transferred port and the worker can
+ * drive the client.
  */
 export function jobPortFromMessagePort(port: MessagePort): JobPort {
   const channel = portFromMessagePort<JobFrame>(port)
@@ -300,6 +301,39 @@ export function createJobClient(port: JobPort, options: CreateJobClientOptions =
       pending.clear()
       childHandlers.clear()
     },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Step 21 — thin adapter to the reduced session-worker seam.
+// ---------------------------------------------------------------------------
+
+/**
+ * The worker-side background-job client over a raw control `MessagePort`.
+ *
+ * Production transfers the hub's job port to the worker (`onJobPort` →
+ * `hub.attachJobPort`), so the worker holds a `MessagePort`, not a `JobPort`.
+ * This adapter bridges the two and narrows the wide {@link JobClient} surface to
+ * the exact `BackgroundJobClientHandle` seam the reduced layer consumes
+ * (`layer.ts:83-86`). The existing `createJobClient` API is untouched; `dispose`
+ * is exposed so the worker can release the port.
+ */
+export interface BackgroundJobClient extends BackgroundJobClientHandle {
+  /** Refined for callers that need the settle detail; still assignable to the seam. */
+  wait(id: string, timeoutMs?: number): Promise<JobWaitResult>
+  dispose(): void
+}
+
+/** Adapt a raw job `MessagePort` into the `BackgroundJobClientHandle` seam. */
+export function createBackgroundJobClient(
+  port: MessagePort,
+  options: CreateJobClientOptions = {},
+): BackgroundJobClient {
+  const client = createJobClient(jobPortFromMessagePort(port), options)
+  return {
+    wait: (id, timeoutMs) => client.wait(id, timeoutMs),
+    cancel: (id) => client.cancel(id),
+    dispose: () => client.dispose(),
   }
 }
 

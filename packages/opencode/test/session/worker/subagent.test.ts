@@ -12,10 +12,11 @@ import { describe, expect, test } from "bun:test"
 import {
   createDispatcher,
   SessionCancelledError,
+  WorkerCrashedError,
   type CancellationConfig,
 } from "@/session/worker/dispatch"
 import { createExecutorWorker, createExecutorWorkerPool } from "@/session/worker/execute"
-import { createJobRegistry } from "@/session/worker/job-registry"
+import { createJobRegistry, type JobInfo, type JobRegistry } from "@/session/worker/job-registry"
 import {
   assertSubagentAdmitted,
   dispatchSubagent,
@@ -226,5 +227,159 @@ describe("9.6 the real registry wires the parent-cancel cascade", () => {
     expect(await childA).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
     expect(await childB).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
     expect(order).toEqual(["ses_child_a", "ses_child_b", "ses_parent"])
+  })
+})
+
+// ---- 33 end-to-end: a depth-1 child routes its settled result to the parent ---
+
+/** One settled child routed to the parent worker, as the hub router would push it. */
+interface Routed {
+  readonly parentID: string
+  readonly id: string
+  readonly status: JobInfo["status"]
+  readonly output: string | undefined
+}
+
+/**
+ * A registry wired to capture every routed child result, with a depth-0 parent
+ * already running — the minimum hub state a child's result routes against.
+ */
+function routingRegistry(): { registry: JobRegistry; routed: Routed[] } {
+  const routed: Routed[] = []
+  const registry = createJobRegistry({
+    routeResult: (parentID, info) => routed.push({ parentID, id: info.id, status: info.status, output: info.output }),
+  })
+  registry.start({ id: "ses_parent", type: "task", depth: 0 })
+  return { registry, routed }
+}
+
+/**
+ * The child worker's job client, faked: it records the dispatch and then settles
+ * the child's hub-registry job exactly as the worker would over its job port.
+ */
+function headroomWorker(registry: JobRegistry, output: string): { scheduler: SubagentScheduler; dispatched: Recorded[] } {
+  const dispatched: Recorded[] = []
+  const scheduler: SubagentScheduler = {
+    dispatch: async (request) => {
+      dispatched.push({ sessionID: request.sessionID, depth: request.depth })
+      registry.complete(request.sessionID, output)
+    },
+  }
+  return { scheduler, dispatched }
+}
+
+describe("33 subagent path end-to-end: a depth-1 child routes its settled result to the parent", () => {
+  test("a depth-1 child runs on a headroom worker and its completed result routes to the parent", async () => {
+    const { registry, routed } = routingRegistry()
+    const { scheduler, dispatched } = headroomWorker(registry, "child-output")
+
+    const info = await dispatchSubagent(
+      { registry, scheduler, depthLimit: 1, headroomFull: () => false },
+      { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task", title: "work" },
+    )
+
+    expect(dispatched).toEqual([{ sessionID: "ses_child", depth: 1 }])
+    expect(info).toMatchObject({
+      id: "ses_child",
+      status: "completed",
+      output: "child-output",
+      depth: 1,
+      parentID: "ses_parent",
+    })
+    expect(routed).toEqual([{ parentID: "ses_parent", id: "ses_child", status: "completed", output: "child-output" }])
+    expect(registry.childrenOf("ses_parent")).toEqual(["ses_child"])
+  })
+
+  test("a cancelled child settles as cancelled and routes the cancellation to the parent", async () => {
+    const { registry, routed } = routingRegistry()
+    const scheduler: SubagentScheduler = {
+      dispatch: () => Promise.reject(new SessionCancelledError({ message: "cancelled", sessionID: sid("ses_child") })),
+    }
+
+    const settled = await capture(
+      dispatchSubagent(
+        { registry, scheduler, depthLimit: 1, headroomFull: () => false },
+        { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
+      ),
+    )
+
+    expect(settled).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
+    expect(registry.get("ses_child")?.status).toBe("cancelled")
+    expect(routed).toEqual([{ parentID: "ses_parent", id: "ses_child", status: "cancelled", output: undefined }])
+  })
+
+  test("a crashed child settles as an error (not a cancellation) and routes the error", async () => {
+    const { registry, routed } = routingRegistry()
+    const scheduler: SubagentScheduler = {
+      dispatch: () => Promise.reject(new WorkerCrashedError({ message: "worker 7 crashed", workerID: 7 })),
+    }
+
+    const settled = await capture(
+      dispatchSubagent(
+        { registry, scheduler, depthLimit: 1, headroomFull: () => false },
+        { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
+      ),
+    )
+
+    expect(settled.ok).toBe(false)
+    expect(registry.get("ses_child")?.status).toBe("error")
+    expect(routed).toEqual([{ parentID: "ses_parent", id: "ses_child", status: "error", output: undefined }])
+  })
+
+  test("an over-deep child is rejected before it is registered or routed", async () => {
+    const { registry, routed } = routingRegistry()
+    const { scheduler, dispatched } = headroomWorker(registry, "unreachable")
+
+    const settled = await capture(
+      dispatchSubagent(
+        { registry, scheduler, depthLimit: 0, headroomFull: () => false },
+        { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
+      ),
+    )
+
+    expect(settled).toEqual({ ok: false, error: expect.any(SubagentDepthError) })
+    expect(dispatched).toHaveLength(0)
+    expect(registry.get("ses_child")).toBeUndefined()
+    expect(routed).toHaveLength(0)
+  })
+})
+
+describe("33 real dispatcher: a depth-1 child consumes headroom and routing fires on settle", () => {
+  test("the child runs on a spawned headroom worker and its result routes to the parent", async () => {
+    const pool = createFakeWorkerPool(2)
+    const routed: Array<{ parentID: string; id: string; status: JobInfo["status"] }> = []
+    const registry = createJobRegistry({
+      routeResult: (parentID, info) => routed.push({ parentID, id: info.id, status: info.status }),
+    })
+    registry.start({ id: "ses_parent", type: "task", depth: 0 })
+    const dispatcher = createDispatcher({ pool })
+
+    try {
+      const settled = dispatchSubagent(
+        {
+          registry,
+          scheduler: dispatcher,
+          depthLimit: 1,
+          headroomFull: () => dispatcher.headroomSlotCount >= dispatcher.headroomCapacity,
+        },
+        { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
+      )
+      await flush()
+
+      // The depth-1 child took a spawned headroom slot, not a foreground worker.
+      expect(dispatcher.headroomSlotCount).toBe(1)
+      expect(pool.spawned).toHaveLength(1)
+      expect(pool.spawned[0].runs).toEqual([{ sessionID: sid("ses_child"), depth: 1 }])
+
+      // The child worker settles its job over the job port, then its run ends.
+      registry.complete("ses_child", "child-output")
+      pool.spawned[0].finish(sid("ses_child"))
+
+      const info = await settled
+      expect(info).toMatchObject({ id: "ses_child", status: "completed", output: "child-output", depth: 1 })
+      expect(routed).toEqual([{ parentID: "ses_parent", id: "ses_child", status: "completed" }])
+    } finally {
+      await dispatcher.terminateAll()
+    }
   })
 })

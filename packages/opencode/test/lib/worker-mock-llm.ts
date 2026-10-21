@@ -172,7 +172,15 @@ async function readChatStream(response: Response, id: string): Promise<MockLlmCh
   return result
 }
 
-async function consumeChat(bootstrap: MockLlmBootstrap, request: MockLlmChatRequest): Promise<MockLlmChatResult> {
+/**
+ * Fetch one chat completion from `bootstrap.baseUrl` and parse the SSE reply into
+ * a `MockLlmChatResult`. Exported for tests that drive the exact worker-side
+ * parser against a mock provider, so producer and consumer cannot drift.
+ */
+export async function consumeChat(
+  bootstrap: MockLlmBootstrap,
+  request: MockLlmChatRequest,
+): Promise<MockLlmChatResult> {
   const response = await fetch(`${bootstrap.baseUrl}/chat/completions`, {
     method: "POST",
     headers: {

@@ -1,73 +1,66 @@
-// Phase 8.2 — length-prefixed versioned egress frames (plan task 8.2).
+// W2 — framed worker event channel codec (spec Q6/Q7/Q21).
 //
-// Frame wire format: `[u32 big-endian length][UTF-8 JSON body]`. The body is a
-// versioned envelope (`v: 1`); an unknown version fails loud. The codec must be
-// byte-exact: decoding then re-encoding yields identical bytes, and a frame may
-// be split across / joined with other frames in one buffer.
+// The egress channel keeps its `[u32 big-endian length][UTF-8 JSON body]` framing,
+// but the body is now a shared `WorkerFrameEnvelope` (events port): the EventV2
+// event crosses VERBATIM as `{ id, type, properties }` — there is no `data`
+// translation. An unknown envelope version or a malformed body fails loud.
 
 import { describe, expect, test } from "bun:test"
+import { MalformedFrameError, decodeFrame, decodeFrames, encodeFrame, type EgressFrame } from "@/session/egress/frame"
 import {
-  MalformedFrameError,
+  ProtocolError,
   UnsupportedFrameVersionError,
-  decodeFrame,
-  decodeFrames,
-  encodeFrame,
-  type EgressEvent,
-  type EgressFrame,
-} from "@/session/egress/frame"
+  ackFrame,
+  endFrame,
+  eventFrame,
+  resyncFrame,
+} from "@/session/worker/frame"
 
-const event: EgressEvent = {
-  id: "evt_1",
-  type: "message.part.updated",
-  data: { text: "héllo 🌍" },
+const event = { id: "evt_1", type: "message.part.delta", properties: { sessionID: "s1", delta: "héllo 🌍" } }
+
+function asEventFrame(frame: EgressFrame): Extract<EgressFrame, { readonly kind: "event" }> {
+  if (frame.kind !== "event") throw new Error(`expected an event frame, got ${frame.kind}`)
+  return frame
 }
 
-const durableEvent: EgressEvent = {
-  id: "evt_2",
-  type: "message.updated",
-  data: { role: "assistant" },
-  durable: { aggregateID: "ses_1", seq: 7 },
-}
-
-describe("egress frame codec", () => {
-  test("round-trips a deltas frame with UTF-8 content", () => {
-    const frame: EgressFrame = { kind: "deltas", v: 1, events: [event] }
-    expect(decodeFrame(encodeFrame(frame))).toEqual(frame)
+describe("egress frame codec (events envelope)", () => {
+  test("round-trips an event frame with the verbatim {id,type,properties}", () => {
+    const frame = eventFrame({ event })
+    const decoded = decodeFrame(encodeFrame(frame))
+    expect(decoded).toEqual(frame)
+    expect(asEventFrame(decoded).payload.event).toEqual(event)
   })
 
-  test("round-trips a durable frame carrying writer-stamped meta", () => {
-    const frame: EgressFrame = {
-      kind: "durable",
-      v: 1,
-      meta: { generation: 3, ordinal: 42 },
-      event: durableEvent,
+  test("preserves properties verbatim and never introduces a `data` field", () => {
+    const decoded = asEventFrame(decodeFrame(encodeFrame(eventFrame({ event })))).payload.event
+    expect(decoded.properties).toEqual({ sessionID: "s1", delta: "héllo 🌍" })
+    expect("properties" in decoded).toBe(true)
+    expect("data" in decoded).toBe(false)
+  })
+
+  test("round-trips the end, resync, and ack control frames", () => {
+    for (const frame of [endFrame(), resyncFrame({ pattern: "message.*" }), ackFrame({ count: 3 })]) {
+      expect(decodeFrame(encodeFrame(frame))).toEqual(frame)
     }
-    expect(decodeFrame(encodeFrame(frame))).toEqual(frame)
-  })
-
-  test("round-trips an end frame", () => {
-    const frame: EgressFrame = { kind: "end", v: 1 }
-    expect(decodeFrame(encodeFrame(frame))).toEqual(frame)
   })
 
   test("is byte-exact: decode then re-encode yields identical bytes", () => {
-    const frame: EgressFrame = { kind: "deltas", v: 1, events: [event, durableEvent] }
+    const frame = eventFrame({ event, generation: 2, ordinal: 7 })
     const bytes = encodeFrame(frame)
     expect(encodeFrame(decodeFrame(bytes))).toEqual(bytes)
   })
 
   test("prefixes the body with a big-endian u32 byte length", () => {
-    const frame: EgressFrame = { kind: "end", v: 1 }
+    const frame = endFrame()
     const bytes = encodeFrame(frame)
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
     expect(view.getUint32(0, false)).toBe(bytes.byteLength - 4)
-    const body = new TextDecoder().decode(bytes.subarray(4))
-    expect(JSON.parse(body)).toEqual(frame)
+    expect(JSON.parse(new TextDecoder().decode(bytes.subarray(4)))).toEqual(frame)
   })
 
   test("decodes concatenated frames in order", () => {
-    const first: EgressFrame = { kind: "deltas", v: 1, events: [event] }
-    const second: EgressFrame = { kind: "durable", v: 1, meta: { generation: 1, ordinal: 1 }, event: durableEvent }
+    const first = eventFrame({ event })
+    const second = endFrame()
     const joined = new Uint8Array([...encodeFrame(first), ...encodeFrame(second)])
     const { frames, rest } = decodeFrames(joined)
     expect(frames).toEqual([first, second])
@@ -75,7 +68,7 @@ describe("egress frame codec", () => {
   })
 
   test("retains a partial trailing frame as rest and resumes when completed", () => {
-    const frame: EgressFrame = { kind: "deltas", v: 1, events: [event] }
+    const frame = eventFrame({ event })
     const bytes = encodeFrame(frame)
     const partial = bytes.subarray(0, bytes.byteLength - 3)
     const first = decodeFrames(partial)
@@ -87,79 +80,55 @@ describe("egress frame codec", () => {
   })
 
   test("a header-only buffer is rest, not a frame", () => {
-    const frame: EgressFrame = { kind: "end", v: 1 }
-    const bytes = encodeFrame(frame)
+    const bytes = encodeFrame(endFrame())
     expect(decodeFrames(bytes.subarray(0, 4))).toEqual({ frames: [], rest: bytes.subarray(0, 4) })
   })
 
-  test("fails loud on an unsupported version", () => {
-    const body = new TextEncoder().encode(JSON.stringify({ kind: "end", v: 2 }))
-    const bytes = new Uint8Array(4 + body.byteLength)
-    new DataView(bytes.buffer).setUint32(0, body.byteLength, false)
-    bytes.set(body, 4)
-    expect(() => decodeFrame(bytes)).toThrow(UnsupportedFrameVersionError)
-  })
-
-  test("decodeFrame rejects a buffer carrying more than one frame", () => {
-    const joined = new Uint8Array([...encodeFrame({ kind: "end", v: 1 }), ...encodeFrame({ kind: "end", v: 1 })])
-    expect(() => decodeFrame(joined)).toThrow(MalformedFrameError)
-  })
-
-  test("decodeFrame rejects a truncated frame", () => {
-    const bytes = encodeFrame({ kind: "end", v: 1 })
-    expect(() => decodeFrame(bytes.subarray(0, bytes.byteLength - 1))).toThrow(MalformedFrameError)
-  })
-
   test("the returned rest is a copy, not a view of the input buffer", () => {
-    const frame: EgressFrame = { kind: "deltas", v: 1, events: [event] }
-    const bytes = encodeFrame(frame)
+    const bytes = encodeFrame(eventFrame({ event }))
     const partial = bytes.slice(0, bytes.byteLength - 3)
     const { rest } = decodeFrames(partial)
     partial.fill(0)
     expect(rest).toEqual(bytes.subarray(0, bytes.byteLength - 3))
   })
 
-  test("rejects a body that is not valid JSON as MalformedFrameError", () => {
-    const body = new TextEncoder().encode("{not json")
-    const bytes = new Uint8Array(4 + body.byteLength)
-    new DataView(bytes.buffer).setUint32(0, body.byteLength, false)
-    bytes.set(body, 4)
-    expect(() => decodeFrame(bytes)).toThrow(MalformedFrameError)
+  test("fails loud on an unsupported envelope version", () => {
+    expect(() => decodeFrame(rawFrame({ v: 2, port: "events", kind: "end" }))).toThrow(UnsupportedFrameVersionError)
   })
 
-  test("rejects a durable frame with a non-integer ordinal or missing generation", () => {
-    expect(() =>
-      decodeFrame(rawFrame({ kind: "durable", v: 1, meta: { generation: 1, ordinal: "nope" }, event })),
-    ).toThrow(MalformedFrameError)
-    expect(() =>
-      decodeFrame(rawFrame({ kind: "durable", v: 1, meta: { ordinal: 1 }, event })),
-    ).toThrow(MalformedFrameError)
+  test("fails loud on a frame from another port", () => {
+    expect(() => decodeFrame(rawFrame({ v: 1, port: "writer", kind: "end" }))).toThrow(ProtocolError)
   })
 
-  test("rejects structurally invalid events at the parse boundary", () => {
-    expect(() => decodeFrame(rawFrame({ kind: "deltas", v: 1, events: [42] }))).toThrow(MalformedFrameError)
+  test("fails loud on an event missing properties (no `data` fallback)", () => {
     expect(() =>
-      decodeFrame(rawFrame({ kind: "deltas", v: 1, events: [{ type: "x", data: {} }] })),
-    ).toThrow(MalformedFrameError)
-    expect(() =>
-      decodeFrame(rawFrame({ kind: "durable", v: 1, meta: { generation: 1, ordinal: 1 }, event: "nope" })),
-    ).toThrow(MalformedFrameError)
-    expect(() =>
-      decodeFrame(
-        rawFrame({
-          kind: "deltas",
-          v: 1,
-          events: [{ id: "e", type: "t", data: {}, durable: { aggregateID: 1, seq: 1 } }],
-        }),
-      ),
-    ).toThrow(MalformedFrameError)
+      decodeFrame(rawFrame({ v: 1, port: "events", kind: "event", payload: { event: { id: "e", type: "t" } } })),
+    ).toThrow(ProtocolError)
+  })
+
+  test("fails loud on a body that is not valid JSON", () => {
+    expect(() => decodeFrame(rawBody("{not json"))).toThrow(MalformedFrameError)
+  })
+
+  test("decodeFrame rejects a buffer carrying more than one frame", () => {
+    const joined = new Uint8Array([...encodeFrame(endFrame()), ...encodeFrame(endFrame())])
+    expect(() => decodeFrame(joined)).toThrow(MalformedFrameError)
+  })
+
+  test("decodeFrame rejects a truncated frame", () => {
+    const bytes = encodeFrame(endFrame())
+    expect(() => decodeFrame(bytes.subarray(0, bytes.byteLength - 1))).toThrow(MalformedFrameError)
   })
 })
 
-function rawFrame(body: unknown): Uint8Array {
-  const encoded = new TextEncoder().encode(JSON.stringify(body))
-  const bytes = new Uint8Array(4 + encoded.byteLength)
-  new DataView(bytes.buffer).setUint32(0, encoded.byteLength, false)
-  bytes.set(encoded, 4)
+function rawBody(text: string): Uint8Array {
+  const body = new TextEncoder().encode(text)
+  const bytes = new Uint8Array(4 + body.byteLength)
+  new DataView(bytes.buffer).setUint32(0, body.byteLength, false)
+  bytes.set(body, 4)
   return bytes
+}
+
+function rawFrame(body: unknown): Uint8Array {
+  return rawBody(JSON.stringify(body))
 }

@@ -84,7 +84,13 @@ describe("session action routes", () => {
         const res = yield* requestInDirectory(`/session/${session.id}/abort`, test.directory, { method: "POST" })
 
         expect(res.status).toBe(200)
-        expect(yield* res.json).toBe(true)
+        expect(yield* res.json).toEqual({
+          sessionID: session.id,
+          mode: "completed",
+          winner: "completion",
+          acknowledged: false,
+          durationMs: 0,
+        })
       }),
     { git: true },
   )

@@ -1,13 +1,15 @@
-// Phase 8.1 — worker-side egress sender (plan task 8.1).
+// W2 — worker-side egress sender over the events envelope (spec Q7/Q16).
 //
-// The worker owns a NEW dedicated `MessagePort` to the hub. Every frame the
+// The worker owns a dedicated `MessagePort` to the hub. Every batch the
 // coalescer emits is encoded once (v1 UTF-8 JSON, length-prefixed) and posted as
-// bytes; the buffer is transferred so the send is zero-copy. Durable frames are
-// stamped with the writer ordinal here via the `meta` argument (or an internal
-// monotonic fallback until Phase 7 lands).
+// a single byte buffer; the buffer is transferred so the send is zero-copy.
+// Durable frames are stamped with the writer ordinal here via the `meta`
+// argument (or an internal monotonic fallback until Phase 7 lands).
+
+import { type EventsFrame, type EventV2Event } from "@/session/worker/frame"
 
 import { createCoalescer, type Coalescer, type CoalescerScheduler } from "./coalesce"
-import { encodeFrame, type DurableMeta, type EgressEvent } from "./frame"
+import { encodeFrames, type DurableMeta } from "./frame"
 import { createMonotonicOrdinalSource } from "./ordinal"
 
 export interface EgressSenderOptions {
@@ -20,9 +22,9 @@ export interface EgressSenderOptions {
 }
 
 export interface EgressSender {
-  pushDelta(event: EgressEvent): void
+  pushDelta(event: EventV2Event): void
   /** Push a durable boundary event; `meta` defaults to the fallback ordinal. */
-  pushDurable(event: EgressEvent, meta?: DurableMeta): void
+  pushDurable(event: EventV2Event, meta?: DurableMeta): void
   /** Flush buffered deltas and emit the end frame. */
   end(): void
   readonly buffered: number
@@ -36,8 +38,8 @@ export function createEgressSender(options: EgressSenderOptions): EgressSender {
     windowMs: options.windowMs,
     maxBatch: options.maxBatch,
     scheduler: options.scheduler,
-    onFrame: (frame) => {
-      const bytes = encodeFrame(frame)
+    onBatch: (frames: readonly EventsFrame[]) => {
+      const bytes = encodeFrames(frames)
       options.port.postMessage(bytes, [bytes.buffer])
     },
   })

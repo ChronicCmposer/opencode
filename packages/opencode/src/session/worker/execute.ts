@@ -9,13 +9,15 @@
 //
 // Transport is the worker's default channel; frames are JSON. Work crosses the
 // isolate as a `kind` string (never a closure): `SessionWorkFactory` resolves a
-// kind to a session work Effect. Phase 5 ships a `"noop"` placeholder; Phase 6
-// registers the reduced-`AppLayer` pipeline.
+// kind to a session work Effect. The default kind is `"session"`; the worker
+// registry (`session-worker.ts`) resolves it to the reduced-`AppLayer` pipeline
+// and aliases the legacy `"noop"`.
 
 import { Cause, Effect, Exit, Schema, Scope } from "effect"
 import type { Latch } from "effect"
 import { Runner } from "@/effect/runner"
 import type { SessionID } from "@/session/schema"
+import type { CancelFrame, CancelPort } from "./cancel"
 
 /** JSON-safe result of one session run (the full message crosses via egress). */
 export interface SessionExecutionResult {
@@ -26,8 +28,19 @@ export interface SessionExecutionResult {
 export type SessionWork = (sessionID: SessionID) => Effect.Effect<SessionExecutionResult>
 export type SessionWorkFactory = (kind: string) => SessionWork
 
-/** Production placeholder work kind (Phase 6 replaces the factory). */
-export const DEFAULT_WORK_KIND = "noop"
+/**
+ * Production work kind. The worker registry (`session-worker.ts`
+ * `productionWorkRegistry`) resolves `"session"` to the real reduced-layer
+ * session work and aliases the legacy `"noop"` to it, so the hub and worker
+ * agree.
+ *
+ * Typed as `string` (not the `"session"` literal) because the worker registry
+ * currently builds its alias table as `{ session, [DEFAULT_WORK_KIND]: session }`;
+ * a literal type would make the computed key statically collide with the
+ * shorthand (TS1117). Consolidation: `session-worker.ts` (not owned here) should
+ * alias the literal `"noop"` instead, after which this can be narrowed.
+ */
+export const DEFAULT_WORK_KIND: string = "session"
 
 /** Raised when a worker is asked for a work kind it has no factory for. */
 export class UnknownWorkKindError extends Schema.TaggedErrorClass<UnknownWorkKindError>()("UnknownWorkKindError", {
@@ -301,6 +314,42 @@ export interface ExecutorWorker extends ExecutorSessionWorker {
   cancel(sessionID: SessionID): Promise<void>
   assertNotBusy(sessionID: SessionID): Promise<boolean>
   resultFor(sessionID: SessionID): SessionExecutionResult | undefined
+  /**
+   * Cooperative cancel control port (plan 11.2). `dispatch.ts`'s
+   * `CancellationConfig.portFor` returns this so a cancel notifies the worker and
+   * observes its ack within the grace window. Optional so minimal test fakes
+   * remain valid; `createExecutorWorker` always provides it.
+   */
+  readonly cancelPort?: CancelPort
+}
+
+export interface ExecutorCancelPortOptions {
+  readonly cancel: (sessionID: SessionID) => Promise<void>
+}
+
+/**
+ * Adapt an executor worker's request/reply `cancel` into the Phase-11
+ * `CancelPort` shape: a `cancel` frame drives `cancel`, and its settlement is
+ * echoed back as a `cancel-ack` (accepted on success, rejected otherwise).
+ */
+export function createExecutorCancelPort(options: ExecutorCancelPortOptions): CancelPort {
+  const handlers = new Set<(frame: CancelFrame) => void>()
+  const emit = (frame: CancelFrame): void => {
+    for (const handler of [...handlers]) handler(frame)
+  }
+  return {
+    notify(frame) {
+      if (frame.type !== "cancel") return
+      options.cancel(frame.sessionID as SessionID).then(
+        () => emit({ type: "cancel-ack", sessionID: frame.sessionID, accepted: true }),
+        () => emit({ type: "cancel-ack", sessionID: frame.sessionID, accepted: false }),
+      )
+    },
+    onMessage(handler) {
+      handlers.add(handler)
+      return () => handlers.delete(handler)
+    },
+  }
 }
 
 export interface ExecutorWorkerOptions {
@@ -345,6 +394,8 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     return message.type === "busy" ? message.busy : false
   }
 
+  const cancelPort = createExecutorCancelPort({ cancel })
+
   return {
     id: options.id,
     get alive() {
@@ -352,6 +403,7 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     },
     execute,
     cancel,
+    cancelPort,
     assertNotBusy,
     resultFor: (sessionID) => results.get(sessionID),
     terminate: async () => {

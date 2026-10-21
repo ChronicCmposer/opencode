@@ -12,9 +12,10 @@
 // is surfaced to its stream as a terminal typed error instead of silently
 // dropping a committed boundary.
 
+import { endFrame } from "@/session/worker/frame"
+
 import type { ControlLink } from "./control"
 import { createControlLink } from "./control"
-import type { EgressFrame } from "./frame"
 import { createFanout, type Fanout } from "./fanout"
 import { createEgressReceiver, type EgressReceiver } from "./receiver"
 
@@ -47,7 +48,7 @@ export interface EgressHub {
   close(): void
 }
 
-const END_FRAME: EgressFrame = { kind: "end", v: 1 }
+const END_FRAME = endFrame()
 
 function createNotifier() {
   let waiters: (() => void)[] = []

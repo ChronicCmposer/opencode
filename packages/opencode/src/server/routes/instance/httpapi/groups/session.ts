@@ -75,6 +75,17 @@ export const PermissionResponsePayload = Schema.Struct({
   response: PermissionV1.Reply,
 })
 
+// Cancellation outcome reported by `POST /session/:sessionID/abort`. Fields are
+// optional so an idle session with no active run (no outcome to report) still
+// serializes a 200 body rather than failing the declared success schema.
+export const AbortOutcome = Schema.Struct({
+  sessionID: Schema.optional(SessionID),
+  mode: Schema.optional(Schema.Literals(["cooperative", "terminated", "completed"])),
+  winner: Schema.optional(Schema.Literals(["cancel", "completion"])),
+  acknowledged: Schema.optional(Schema.Boolean),
+  durationMs: Schema.optional(Schema.Number),
+})
+
 export const SessionPaths = {
   list: root,
   status: `${root}/status`,
@@ -253,7 +264,7 @@ export const SessionApi = HttpApi.make("session")
         HttpApiEndpoint.post("abort", SessionPaths.abort, {
           params: { sessionID: SessionID },
           query: WorkspaceRoutingQuery,
-          success: described(Schema.Boolean, "Aborted session"),
+          success: described(AbortOutcome, "Aborted session"),
           error: HttpApiError.BadRequest,
         }).annotateMerge(
           OpenApi.annotations({

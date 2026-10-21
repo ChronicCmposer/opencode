@@ -16,8 +16,9 @@ import {
 import { createEgressHub } from "@/session/egress/hub"
 import { decodeFrame, encodeFrame, type EgressFrame } from "@/session/egress/frame"
 import { createEgressReceiver } from "@/session/egress/receiver"
+import { endFrame } from "@/session/worker/frame"
 import { createWorkerHarness } from "../../lib/worker-harness"
-import { delta, durableFrame } from "../../lib/egress-fixtures"
+import { deltasFrame, durableFrame } from "../../lib/egress-fixtures"
 
 const WORKER_ENTRY = new URL("../../fixture/egress-worker.ts", import.meta.url)
 
@@ -76,7 +77,7 @@ describe("egress across a worker isolate", () => {
     const subscriber = hub.fanout.subscribe("sse")
     worker.post({ type: "delta", id: "w1" })
     await pollUntil(() => hub.frames === 1)
-    expect(subscriber.drain()).toEqual([{ kind: "deltas", v: 1, events: [delta("w1")] }])
+    expect(subscriber.drain()).toEqual([deltasFrame("w1")])
   })
 
   test("durable frames cross in commit order", async () => {
@@ -88,7 +89,7 @@ describe("egress across a worker isolate", () => {
     await pollUntil(() => hub.frames === 2)
     const frames = subscriber.drain()
     expect(
-      frames.map((frame) => (frame.kind === "durable" ? [frame.meta.ordinal, frame.event.id] : [-1, ""])),
+      frames.map((frame) => (frame.kind === "event" ? [frame.payload.ordinal ?? -1, frame.payload.event.id] : [-1, ""])),
     ).toEqual([
       [1, "d1"],
       [2, "d2"],
@@ -119,7 +120,7 @@ describe("egress across a worker isolate", () => {
     await pollUntil(() => hub.frames === 2)
     hub.close()
 
-    expect(subscriber.drain()).toEqual([durableFrame("kept", 1), { kind: "end", v: 1 }])
+    expect(subscriber.drain()).toEqual([durableFrame("kept", 1), endFrame()])
   })
 
   test("a worker `end` command terminates the stream", async () => {
@@ -132,7 +133,7 @@ describe("egress across a worker isolate", () => {
     await pollUntil(() => hub.fanout.subscribers.length === 1)
     worker.post({ type: "end" })
     await consumer
-    expect(frames).toEqual([{ kind: "end", v: 1 }])
+    expect(frames).toEqual([endFrame()])
   })
 })
 
@@ -140,7 +141,7 @@ describe("egress receiver framing boundaries", () => {
   test("accepts an ArrayBuffer chunk", async () => {
     const channel = new MessageChannel()
     const receiver = createEgressReceiver({ port: channel.port2, onFrame: () => {} })
-    const bytes = encodeFrame({ kind: "end", v: 1 })
+    const bytes = encodeFrame(endFrame())
     channel.port1.postMessage(bytes.buffer)
     await pollUntil(() => receiver.ended)
     expect(receiver.lastError).toBeUndefined()
@@ -152,14 +153,14 @@ describe("egress receiver framing boundaries", () => {
     const channel = new MessageChannel()
     const frames: EgressFrame[] = []
     const receiver = createEgressReceiver({ port: channel.port2, onFrame: (frame) => frames.push(frame) })
-    const framed = encodeFrame({ kind: "deltas", v: 1, events: [delta("v1")] })
+    const framed = encodeFrame(deltasFrame("v1"))
     const padded = new Uint8Array(framed.byteLength + 8)
     padded.set(framed, 4)
     const view = padded.subarray(4, 4 + framed.byteLength)
     channel.port1.postMessage(view)
     await pollUntil(() => frames.length === 1)
     expect(receiver.lastError).toBeUndefined()
-    expect(frames[0]).toEqual({ kind: "deltas", v: 1, events: [delta("v1")] })
+    expect(frames[0]).toEqual(deltasFrame("v1"))
     receiver.close()
     channel.port1.close()
   })

@@ -602,27 +602,32 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     // Detach the slot so the terminate-induced rejection is not misread as a crash.
     admitted.slot = undefined
     const outcome = await controllerFor(config, slot, port).cancel(sessionID, { complete: admitted.promise })
+    // Q11 — completion wins. The dispatcher claims the cancel gate before the
+    // controller runs, so a run that settles on its own during the grace window
+    // is reported by the controller as `cooperative`. The worker's `cancel-ack`
+    // is the discriminator: a settle with no ack means the run completed
+    // naturally, so reclassify the outcome to `completed`/`completion`. The ack
+    // already reflects the worker's real reply and is preserved verbatim.
+    const resolved: CancelOutcome =
+      outcome.mode === "cooperative" && !outcome.acknowledged
+        ? { ...outcome, mode: "completed", winner: "completion" }
+        : outcome
 
-    if (outcome.mode === "terminated") {
+    if (resolved.mode === "terminated") {
       // The controller already terminated the isolate and reaped its PGIDs;
       // terminate again is idempotent, only release the reservation + slot.
       await terminateSlot(sessionID, admitted, slot, { reap: false })
       pump()
       nextWaiter(sessionID)
     } else {
-      // Cooperative: the run settled at a checkpoint; reuse the live worker (11.4).
+      // Cooperative or completed: the run settled at a checkpoint; reuse the live
+      // worker (11.4).
       slot.busy = null
       maybeReap(slot)
       pump()
     }
-    // The dispatcher claimed cancel first, so a terminal event is never "completed".
-    config.onCancelled?.({
-      sessionID,
-      mode: outcome.mode === "terminated" ? "terminated" : "cooperative",
-      workerID: slot.worker.id,
-      resumeFromDb: true,
-    })
-    return outcome
+    config.onCancelled?.({ sessionID, mode: resolved.mode, workerID: slot.worker.id, resumeFromDb: true })
+    return resolved
   }
 
   const terminateAll = async (): Promise<void> => {

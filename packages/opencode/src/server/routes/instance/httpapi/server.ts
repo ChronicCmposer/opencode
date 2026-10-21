@@ -35,6 +35,8 @@ import { SessionProcessor } from "@/session/processor"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
+import { SessionWorkerNodes } from "@/session/worker/nodes"
+import { SessionHubModule } from "@/session/worker/hub"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
@@ -238,6 +240,9 @@ const app = LayerNode.group([
   RuntimeFlags.node,
   EventV2Bridge.node,
   SessionRunState.node,
+  // Flag-gated session-worker hub: `[]` when the rollout flag is off, so the
+  // flag-off graph is byte-identical (no hub node, no worker spawn).
+  ...SessionWorkerNodes.sessionWorkerNodes({ hubNode: SessionHubModule.productionSessionHubNode() }),
   SessionProcessor.node,
   SessionCompaction.node,
   SessionRevert.node,

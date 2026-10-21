@@ -11,9 +11,23 @@
 //     `ready` frame, so survivors can detect a stale writer.
 
 import { mergeEnv } from "@/session/broker/env"
+import { messageOf, portFromMessagePort } from "@/session/worker/port"
+import {
+  writerErrorTag,
+  type WorkerWriterEvent,
+  type WorkerWriterFrame,
+  type WorkerWriterReply,
+} from "@/session/worker/writer-client"
 import { defined } from "@/util/object"
 import type { StorageReadResult } from "./core"
-import { parseWriterResponse, type QueryMethod, type WriterEvent, type WriterRequest, type WriterResponse } from "./protocol"
+import {
+  ProtocolError,
+  parseWriterResponse,
+  type QueryMethod,
+  type WriterEvent,
+  type WriterRequest,
+  type WriterResponse,
+} from "./protocol"
 
 export interface PublishResult {
   readonly seq: number | null
@@ -421,6 +435,86 @@ export class WriterClient {
 
 export function createWriterClient(options: WriterClientOptions = {}): WriterClient {
   return new WriterClient(options)
+}
+
+// ---------------------------------------------------------------------------
+// Step 17 — hub side of the worker writer port.
+// ---------------------------------------------------------------------------
+
+/**
+ * The slice of the hub-owned writer a worker port server needs. `WriterClient`
+ * satisfies it structurally: a worker `publish` is a durable publish, so it
+ * returns `{ seq, committed }`.
+ */
+export interface HubWriter {
+  readonly query: (method: QueryMethod, sql: string, params: readonly unknown[]) => Promise<unknown>
+  readonly publish: (
+    event: WriterEvent,
+    options: { readonly durable: boolean },
+  ) => Promise<{ readonly seq: number | null; readonly committed: boolean }>
+}
+
+const QUERY_METHODS: ReadonlySet<string> = new Set<QueryMethod>(["all", "values", "run", "exec"])
+
+/** Parse a wire method string into the trusted `QueryMethod`; fail loud otherwise. */
+function toQueryMethod(method: string): QueryMethod {
+  if (!QUERY_METHODS.has(method)) {
+    throw new ProtocolError(`unknown query method "${method}"; expected all, values, run or exec`)
+  }
+  return method as QueryMethod
+}
+
+/** Parse a wire event into a trusted `WriterEvent`; `data` must be a record. */
+function toWriterEvent(event: WorkerWriterEvent): WriterEvent {
+  const data = event.data
+  if (typeof data !== "object" || data === null || Array.isArray(data)) {
+    throw new ProtocolError(`event.data must be an object (got ${JSON.stringify(data)})`)
+  }
+  return { id: event.id, type: event.type, aggregateID: event.aggregateID, data: data as Record<string, unknown> }
+}
+
+/**
+ * Hub side: serve worker writer requests on `port` against `hubWriter`. Returns a
+ * disposer. A reply to a closed port is swallowed (the worker is gone); a rejected
+ * request becomes a typed error reply, never an unhandled rejection.
+ */
+export function serveWriterPort(hubWriter: HubWriter, port: MessagePort): () => void {
+  const channel = portFromMessagePort<WorkerWriterFrame>(port)
+  return channel.onMessage((frame) => {
+    if (frame.kind !== "request") return
+    const id = frame.id
+    const reply = (payload: WorkerWriterReply): void => {
+      try {
+        channel.post(payload)
+      } catch {
+        // Drop the reply: the port is gone.
+      }
+    }
+    const replyError = (error: unknown): void =>
+      reply({ kind: "reply", id, ok: "error", tag: writerErrorTag(error), message: messageOf(error) })
+    try {
+      switch (frame.op) {
+        case "query":
+          hubWriter.query(toQueryMethod(frame.method), frame.sql, frame.params ?? []).then(
+            (value) => reply({ kind: "reply", id, ok: "query", value: value ?? null }),
+            replyError,
+          )
+          return
+        case "publish":
+          hubWriter.publish(toWriterEvent(frame.event), { durable: true }).then(
+            (result) => reply({ kind: "reply", id, ok: "publish", result }),
+            replyError,
+          )
+          return
+        default: {
+          const unknown: never = frame
+          replyError(new Error(`unknown writer request: ${JSON.stringify(unknown)}`))
+        }
+      }
+    } catch (error) {
+      replyError(error)
+    }
+  })
 }
 
 export * as WriterClientModule from "./client"

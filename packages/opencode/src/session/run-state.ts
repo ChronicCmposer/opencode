@@ -11,10 +11,11 @@ import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
 import { SessionHubService, type SessionHub } from "./worker/hub"
 import { SessionBusyError, type SessionExecutionResult } from "./worker/execute"
+import type { CancelOutcome } from "./worker/cancel"
 
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
-  readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  readonly cancel: (sessionID: SessionID) => Effect.Effect<CancelOutcome | undefined>
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -81,17 +82,16 @@ export const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
       const hub = yield* hubIfEnabled
-      if (hub !== undefined) {
-        yield* Effect.promise(() => hub.cancel(sessionID))
-        return
-      }
+      if (hub !== undefined) return yield* Effect.promise(() => hub.cancel(sessionID))
       yield* cancelBackgroundJobs(background, sessionID)
       const runners = yield* InstanceState.get(state)
       if (!runners.busy(sessionID)) {
         yield* status.set(sessionID, { type: "idle" })
-        return
+        return completedOutcome(sessionID)
       }
+      const started = Date.now()
       yield* runners.cancel(sessionID)
+      return cooperativeOutcome(sessionID, Date.now() - started)
     })
 
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
@@ -179,6 +179,24 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
 
 function busyError(sessionID: SessionID) {
   return new Session.BusyError({ sessionID })
+}
+
+/**
+ * The flag-off idle outcome: no run was in flight, so the run had already
+ * settled and completion wins. There is no worker protocol to acknowledge, so
+ * `acknowledged` is `false`: only a real worker `cancel-ack` may set it true.
+ */
+function completedOutcome(sessionID: SessionID): CancelOutcome {
+  return { sessionID, mode: "completed", winner: "completion", acknowledged: false, durationMs: 0 }
+}
+
+/**
+ * The flag-off busy outcome: the in-process runner unwound at its next
+ * checkpoint. There is no worker ack in the flag-off path, so `acknowledged`
+ * is `false`.
+ */
+function cooperativeOutcome(sessionID: SessionID, durationMs: number): CancelOutcome {
+  return { sessionID, mode: "cooperative", winner: "cancel", acknowledged: false, durationMs }
 }
 
 /** Parse a worker's JSON result into the trusted `WithParts` at the hub boundary. */

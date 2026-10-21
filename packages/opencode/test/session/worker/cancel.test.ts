@@ -1,7 +1,7 @@
-// Phase 11 — terminate-based cancel & cooperative checkpoints (plan tasks 11.1–11.9).
+// Phase 11 — terminate-based cancel (plan tasks 11.1–11.9).
 //
-// Covers the cancel module (tokens, checkpoints, control-port frames, grace
-// controller) plus the additive dispatch wiring (cooperative vs terminate,
+// Covers the cancel module (control-port frames, grace controller, first-writer-
+// wins outcome gate) plus the additive dispatch wiring (cooperative vs terminate,
 // PGID reap on terminate, cascade, idempotency, crash taxonomy). The real
 // process evidence for `terminate()` interrupting a tight sync loop comes from
 // the 3.10 spike; the case here is a regression guard over a real Bun isolate.
@@ -11,17 +11,10 @@ import path from "node:path"
 import type { SessionID } from "@/session/schema"
 import {
   CANCEL_GRACE_ENV,
-  CheckpointCancelledError,
   DEFAULT_CANCEL_GRACE_MS,
-  cancelPortFromMessagePort,
   createCancelController,
-  createCancelToken,
-  createCheckpoints,
   createOutcomeGate,
   resolveCancelGraceMs,
-  runModelStep,
-  runToolCall,
-  serveCancel,
   type CancelFrame,
   type CancelPort,
   type CancelScheduler,
@@ -41,7 +34,6 @@ import { createWorkerHarness } from "../../lib/worker-harness"
 import { capture, flush, sid } from "../../lib/async"
 import { createListenerPair } from "../../lib/port-pair"
 import { createRecordingScheduler } from "../../lib/scheduler"
-import { pollUntil } from "../../lib/poll"
 
 /** An in-process pair of cancel ports; `hub.notify` reaches the worker side. */
 function createPortPair(): { hub: CancelPort; worker: CancelPort } {
@@ -51,165 +43,6 @@ function createPortPair(): { hub: CancelPort; worker: CancelPort } {
     worker: { notify: (frame) => pair.worker.post(frame), onMessage: (handler) => pair.worker.onMessage(handler) },
   }
 }
-
-describe("11.2 checkpoints before/after each model step and tool call", () => {
-  test("records the boundary and throws CheckpointCancelledError after cancel", () => {
-    const token = createCancelToken()
-    const checkpoints = createCheckpoints(token)
-
-    checkpoints.at("model:turn:before")
-    expect(checkpoints.boundaries).toEqual(["model:turn:before"])
-
-    token.cancel("ui:stop")
-    expect(() => checkpoints.at("model:turn:after")).toThrow(CheckpointCancelledError)
-  })
-
-  test("runModelStep and runToolCall checkpoint before AND after the body", async () => {
-    const token = createCancelToken()
-    const checkpoints = createCheckpoints(token)
-
-    const model = await runModelStep(checkpoints, "turn", () => 21 * 2)
-    expect(model).toBe(42)
-    expect(checkpoints.boundaries).toEqual(["model:turn:before", "model:turn:after"])
-
-    const tool = await runToolCall(checkpoints, "read", async () => "ok")
-    expect(tool).toBe("ok")
-    expect(checkpoints.boundaries).toEqual([
-      "model:turn:before",
-      "model:turn:after",
-      "tool:read:before",
-      "tool:read:after",
-    ])
-  })
-
-  test("records the :after boundary even when the step or tool call throws", async () => {
-    const token = createCancelToken()
-
-    const model = createCheckpoints(token)
-    await expect(
-      runModelStep(model, "turn", () => {
-        throw new Error("model boom")
-      }),
-    ).rejects.toThrow("model boom")
-    expect(model.boundaries).toEqual(["model:turn:before", "model:turn:after"])
-
-    const tool = createCheckpoints(token)
-    await expect(
-      runToolCall(tool, "read", () => {
-        throw new Error("tool boom")
-      }),
-    ).rejects.toThrow("tool boom")
-    expect(tool.boundaries).toEqual(["tool:read:before", "tool:read:after"])
-  })
-
-  test("a cancel during a step aborts at the following checkpoint", async () => {
-    const token = createCancelToken()
-    const checkpoints = createCheckpoints(token)
-
-    await expect(
-      runModelStep(checkpoints, "turn", () => {
-        token.cancel()
-        return "unused"
-      }),
-    ).rejects.toBeInstanceOf(CheckpointCancelledError)
-    expect(checkpoints.boundaries).toEqual(["model:turn:before", "model:turn:after"])
-  })
-})
-
-describe("11.2/11.4 worker side: cancel+ack on the control port, clean up then ack", () => {
-  test("serveCancel cancels the token, kills children, closes the scope, then acks", async () => {
-    const pair = createPortPair()
-    const token = createCancelToken()
-    const events: string[] = []
-    const server = serveCancel(pair.worker, token, sid("ses_1"), {
-      killChildren: () => {
-        events.push("kill-children")
-      },
-      closeScope: () => {
-        events.push("close-scope")
-      },
-    })
-    const acks: CancelFrame[] = []
-    pair.hub.onMessage((frame) => acks.push(frame))
-
-    pair.hub.notify({ type: "cancel", sessionID: "ses_1", reason: "ui:stop" })
-    await flush()
-
-    expect(token.cancelled).toBe(true)
-    expect(token.reason).toBe("ui:stop")
-    expect(events).toEqual(["kill-children", "close-scope"])
-    expect(server.handled).toBe(1)
-    expect(acks).toEqual([{ type: "cancel-ack", sessionID: "ses_1", accepted: true }])
-
-    server.dispose()
-  })
-
-  test("rejects a cancel frame for a session this worker does not own", async () => {
-    const pair = createPortPair()
-    const token = createCancelToken()
-    let killed = 0
-    const server = serveCancel(pair.worker, token, sid("ses_owned"), {
-      killChildren: () => {
-        killed++
-      },
-    })
-    const acks: CancelFrame[] = []
-    pair.hub.onMessage((frame) => acks.push(frame))
-
-    pair.hub.notify({ type: "cancel", sessionID: "ses_other" })
-    await flush()
-
-    expect(token.cancelled).toBe(false)
-    expect(killed).toBe(0)
-    expect(server.handled).toBe(0)
-    expect(acks).toEqual([{ type: "cancel-ack", sessionID: "ses_other", accepted: false }])
-
-    server.dispose()
-  })
-
-  test("a throwing cleanup still acks (accepted: false) and leaves the queue usable", async () => {
-    const pair = createPortPair()
-    const token = createCancelToken()
-    const server = serveCancel(pair.worker, token, sid("ses_1"), {
-      killChildren: () => {
-        throw new Error("kill boom")
-      },
-      closeScope: () => {
-        throw new Error("scope should not run")
-      },
-    })
-    const acks: CancelFrame[] = []
-    pair.hub.onMessage((frame) => acks.push(frame))
-
-    pair.hub.notify({ type: "cancel", sessionID: "ses_1" })
-    await flush()
-
-    expect(token.cancelled).toBe(true)
-    expect(server.handled).toBe(1)
-    expect(acks).toEqual([{ type: "cancel-ack", sessionID: "ses_1", accepted: false }])
-
-    // The queue must remain fulfilled: a repeat cancel is still acknowledged.
-    pair.hub.notify({ type: "cancel", sessionID: "ses_1" })
-    await flush()
-    expect(acks).toHaveLength(2)
-    expect(acks[1]).toEqual({ type: "cancel-ack", sessionID: "ses_1", accepted: true })
-
-    server.dispose()
-  })
-
-  test("cancelPortFromMessagePort round-trips frames over a real MessageChannel", async () => {
-    const channel = new MessageChannel()
-    const hubPort = cancelPortFromMessagePort(channel.port1)
-    const workerPort = cancelPortFromMessagePort(channel.port2)
-
-    const received: CancelFrame[] = []
-    workerPort.onMessage((frame) => received.push(frame))
-    hubPort.notify({ type: "cancel", sessionID: "ses_x" })
-
-    await pollUntil(() => received.length > 0, { message: "cancel frame never arrived over the MessageChannel" })
-    expect(received).toEqual([{ type: "cancel", sessionID: "ses_x" }])
-  })
-})
 
 describe("11.3 grace: cooperative checkpoint then terminate after the grace window", () => {
   test("defaults to 500 ms and honors OPENCODE_SESSION_CANCEL_GRACE_MS", () => {
@@ -506,7 +339,7 @@ describe("11.4 graceful cancel reuses the worker; terminate path replaces it", (
     await flush()
 
     const outcome = await dispatcher.cancelWithGrace(sid("ses_1"))
-    expect(outcome).toMatchObject({ mode: "cooperative", winner: "cancel" })
+    expect(outcome).toMatchObject({ mode: "cooperative", winner: "cancel", acknowledged: true })
     expect(await run).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
 
     // 11.4: the worker was NOT terminated and is reused for the next session.
@@ -590,5 +423,88 @@ describe("11.8 parent cancel cascades to subagents, children first", () => {
     expect(await childA).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
     expect(await childB).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
     expect(order).toEqual(["ses_child_a", "ses_child_b", "ses_parent"])
+  })
+})
+
+/**
+ * A `SessionWorker` that owns a cancel port but never acknowledges the cancel:
+ * the run simply completes on its own. This is the completion-wins side of the
+ * cancel-vs-completion race (Q11) once the cancel is already in flight.
+ */
+class CompletingWorker implements SessionWorker {
+  alive = true
+  readonly runs: SessionRun[] = []
+  readonly hub: CancelPort
+  private readonly worker: CancelPort
+  private readonly pending = new Map<SessionID, PendingRun>()
+
+  constructor(readonly id: number) {
+    const pair = createPortPair()
+    this.hub = pair.hub
+    this.worker = pair.worker
+    this.worker.onMessage((frame) => {
+      if (frame.type !== "cancel") return
+      // Deliberately no `cancel-ack`: the run finishes naturally instead.
+      queueMicrotask(() => this.pending.get(frame.sessionID as SessionID)?.resolve())
+    })
+  }
+
+  execute(run: SessionRun): Promise<void> {
+    this.runs.push(run)
+    return new Promise<void>((resolve, reject) => {
+      this.pending.set(run.sessionID, { resolve, reject })
+    })
+  }
+
+  async terminate(): Promise<void> {
+    this.alive = false
+    const pending = [...this.pending.values()]
+    this.pending.clear()
+    for (const run of pending) run.reject(new SessionCancelledError({ message: "terminated", sessionID: "" }))
+  }
+}
+
+class CompletingPool implements WorkerPool {
+  readonly workers: CompletingWorker[]
+  readonly spawned: CompletingWorker[] = []
+
+  constructor(k: number) {
+    this.workers = Array.from({ length: k }, (_, index) => new CompletingWorker(index + 1))
+  }
+
+  spawn(): SessionWorker {
+    const worker = new CompletingWorker(100 + this.spawned.length)
+    this.spawned.push(worker)
+    return worker
+  }
+
+  async terminateAll(): Promise<void> {}
+}
+
+describe("11.9 completion wins the cancel race (Q11)", () => {
+  test("a run that completes during the grace returns completed, unacknowledged", async () => {
+    const pool = new CompletingPool(1)
+    const cancelled: string[] = []
+    const dispatcher = createDispatcher({
+      pool,
+      cancellation: {
+        portFor: (worker) => (worker as CompletingWorker).hub,
+        graceMs: 500,
+        schedule: createRecordingScheduler<CancelScheduler>().schedule,
+        reap: () => {},
+        onCancelled: (event) => cancelled.push(`${event.sessionID}:${event.mode}`),
+      },
+    })
+
+    const run = capture(dispatcher.dispatch({ sessionID: sid("ses_1") }))
+    await flush()
+
+    const outcome = await dispatcher.cancelWithGrace(sid("ses_1"))
+    expect(outcome).toMatchObject({ mode: "completed", winner: "completion", acknowledged: false })
+    expect(await run).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
+    // The run completed on its own: the worker was neither terminated nor replaced.
+    expect(pool.workers[0].alive).toBe(true)
+    expect(pool.spawned).toHaveLength(0)
+    expect(cancelled).toEqual(["ses_1:completed"])
   })
 })

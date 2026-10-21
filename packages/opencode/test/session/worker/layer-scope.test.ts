@@ -2,7 +2,8 @@
 
 import { describe, expect, test } from "bun:test"
 import { Effect, Fiber } from "effect"
-import { createDirectoryState, createSessionScopeHost } from "@/session/worker/session-scope"
+import { WorkerCache } from "@/session/worker/cache"
+import { createDirectoryCache, createDirectoryState, createSessionScopeHost } from "@/session/worker/session-scope"
 
 describe("session scope host", () => {
   test("closes the child scope and runs finalizers when the session ends", async () => {
@@ -107,6 +108,58 @@ describe("session scope host", () => {
     expect(host.open).toBe(0)
     expect(host.closed).toBe(1)
   })
+
+  test("concurrent sessions in one worker each get their own scope and all finalizers run", async () => {
+    const finalized: string[] = []
+    const host = createSessionScopeHost()
+
+    const session = (id: string) =>
+      Effect.gen(function* () {
+        yield* Effect.addFinalizer(() => Effect.sync(() => finalized.push(id)))
+        yield* Effect.yieldNow
+        return id
+      })
+
+    const results = await Promise.all([
+      Effect.runPromise(host.run("a", session("a"))),
+      Effect.runPromise(host.run("b", session("b"))),
+      Effect.runPromise(host.run("c", session("c"))),
+    ])
+
+    expect(results).toEqual(["a", "b", "c"])
+    expect(finalized.sort()).toEqual(["a", "b", "c"])
+    expect(host.open).toBe(0)
+    expect(host.closed).toBe(3)
+  })
+
+  test("a finished session scope does not leak into the next concurrent run", async () => {
+    const open: string[] = []
+    const host = createSessionScopeHost()
+
+    const hold = (id: string) =>
+      Effect.gen(function* () {
+        yield* Effect.addFinalizer(() => Effect.sync(() => open.splice(open.indexOf(id), 1)))
+        open.push(id)
+        yield* Effect.never
+      })
+
+    const a = Effect.runFork(host.run("a", hold("a")))
+    await Effect.runPromise(Effect.yieldNow)
+    expect(host.open).toBe(1)
+
+    const b = Effect.runFork(host.run("b", hold("b")))
+    await Effect.runPromise(Effect.yieldNow)
+    expect(host.open).toBe(2)
+
+    await Effect.runPromise(Fiber.interrupt(a))
+    expect(host.open).toBe(1)
+    expect(open).toEqual(["b"])
+
+    await Effect.runPromise(Fiber.interrupt(b))
+    expect(host.open).toBe(0)
+    expect(open).toEqual([])
+    expect(host.closed).toBe(2)
+  })
 })
 
 describe("directory state", () => {
@@ -204,5 +257,114 @@ describe("directory state", () => {
 
     release?.()
     expect(await pending).toBe("/a")
+  })
+})
+
+describe("directory state under concurrency (step 30)", () => {
+  test("concurrent use of the same directory builds exactly once", async () => {
+    let builds = 0
+    const state = createDirectoryState<number>({
+      build: async () => {
+        builds += 1
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        return builds
+      },
+    })
+
+    const results = await Promise.all([
+      state.use("/a", (value) => value),
+      state.use("/a", (value) => value),
+      state.use("/a", (value) => value),
+    ])
+
+    expect(builds).toBe(1)
+    expect(results).toEqual([1, 1, 1])
+  })
+
+  test("concurrent switches keep exactly one live state (no leak)", async () => {
+    const live = new Set<string>()
+    const state = createDirectoryState<string>({
+      build: (directory) => {
+        live.add(directory)
+        return directory
+      },
+      dispose: (directory) => void live.delete(directory),
+    })
+
+    await Promise.all([state.use("/a", (value) => value), state.use("/b", (value) => value), state.use("/c", (value) => value)])
+
+    expect(live.size).toBe(1)
+    expect(state.current).toBe("/c")
+    await state.dispose()
+    expect(live.size).toBe(0)
+  })
+
+  test("disposing while a build is in flight does not resurrect the state", async () => {
+    let enterBuild: (() => void) | undefined
+    const buildEntered = new Promise<void>((resolve) => {
+      enterBuild = resolve
+    })
+    let releaseBuild: (() => void) | undefined
+    const buildGate = new Promise<void>((resolve) => {
+      releaseBuild = resolve
+    })
+    const disposed: string[] = []
+    const state = createDirectoryState<{ directory: string }>({
+      build: async (directory) => {
+        enterBuild?.()
+        await buildGate
+        return { directory }
+      },
+      dispose: (value) => void disposed.push(value.directory),
+    })
+
+    const pending = state.use("/a", (value) => value.directory)
+    await buildEntered
+    const disposing = state.dispose()
+    releaseBuild?.()
+
+    expect(await pending).toBe("/a")
+    await disposing
+    expect(state.current).toBeUndefined()
+    expect(disposed).toEqual(["/a"])
+  })
+})
+
+describe("directory cache integration (step 30)", () => {
+  test("a per-directory cache is built once and isolated across directories", async () => {
+    const state = createDirectoryCache()
+
+    const value = await state.use("/a", (cache) => {
+      cache.defineImmutable("agent/plan", "plan-a")
+      return cache.get("agent/plan")
+    })
+    expect(value).toBe("plan-a")
+
+    // Same directory: no rebuild, same cache instance.
+    const again = await state.use("/a", (cache) => cache.get("agent/plan"))
+    expect(again).toBe("plan-a")
+
+    // Switching directories disposes the old cache and builds a fresh one.
+    const other = await state.use("/b", (cache) => cache.get("agent/plan"))
+    expect(other).toBeUndefined()
+
+    await state.dispose()
+    expect(state.current).toBeUndefined()
+  })
+
+  test("a disposed directory cache is cleared, not retained", async () => {
+    let disposedCache: WorkerCache | undefined
+    const state = createDirectoryState<WorkerCache>({
+      build: () => new WorkerCache(),
+      dispose: (cache) => {
+        disposedCache = cache
+        cache.clear()
+      },
+    })
+
+    await state.use("/a", (cache) => cache.defineImmutable("k", "v"))
+    await state.use("/b", () => undefined)
+
+    expect(disposedCache?.size).toBe(0)
   })
 })

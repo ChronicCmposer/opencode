@@ -22,6 +22,7 @@ import {
   type SessionExecutionResult,
   type SessionWorkFactory,
 } from "@/session/worker/execute"
+import type { CancelFrame } from "@/session/worker/cancel"
 
 const sid = (value: string) => value as SessionID
 
@@ -277,8 +278,8 @@ describe("5.1 executor protocol", () => {
       })
     }))
 
-  test("DEFAULT_WORK_KIND is the production placeholder kind", () => {
-    expect(DEFAULT_WORK_KIND).toBe("noop")
+  test("DEFAULT_WORK_KIND is the production session work kind", () => {
+    expect(DEFAULT_WORK_KIND).toBe("session")
   })
 })
 
@@ -339,5 +340,70 @@ describe("5.7 executor robustness", () => {
     const third = pool.spawn("headroom")
     expect(third.id).toBe(5)
     await pool.terminateAll()
+  })
+})
+
+describe("13 executor cancel port", () => {
+  /** A transport whose `waitFor` replies to the most recent request. */
+  const replyingTransport = (
+    reply: (request: unknown) => unknown,
+  ): { readonly transport: ExecutorTransport; readonly posted: { readonly type: string }[] } => {
+    const posted: { readonly type: string }[] = []
+    let alive = true
+    return {
+      posted,
+      transport: {
+        post: (message) => posted.push(message as { readonly type: string }),
+        waitFor: async (match) => {
+          const outbound = reply(posted[posted.length - 1] ?? {}) as never
+          if (match(outbound)) return outbound
+          throw new Error("no matching reply")
+        },
+        get alive() {
+          return alive
+        },
+        async terminate() {
+          alive = false
+          return 0
+        },
+      },
+    }
+  }
+
+  test("a cancel frame drives the worker cancel and acks acceptance", async () => {
+    const { transport, posted } = replyingTransport((request) => ({
+      type: "cancelled",
+      id: (request as { readonly id?: number }).id,
+    }))
+    const worker = createExecutorWorker({ id: 1, transport })
+    const acks: CancelFrame[] = []
+    worker.cancelPort?.onMessage((frame) => acks.push(frame))
+
+    worker.cancelPort?.notify({ type: "cancel", sessionID: "ses_1" })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(posted.some((message) => message.type === "cancel")).toBe(true)
+    expect(acks).toEqual([{ type: "cancel-ack", sessionID: "ses_1", accepted: true }])
+  })
+
+  test("a failed cancel acks with accepted: false", async () => {
+    const transport: ExecutorTransport = {
+      post: () => {},
+      waitFor: async () => {
+        throw new Error("cancel transport failed")
+      },
+      alive: true,
+      async terminate() {
+        return 0
+      },
+    }
+    const worker = createExecutorWorker({ id: 1, transport })
+    const acks: CancelFrame[] = []
+    worker.cancelPort?.onMessage((frame) => acks.push(frame))
+
+    worker.cancelPort?.notify({ type: "cancel", sessionID: "ses_1" })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(acks).toEqual([{ type: "cancel-ack", sessionID: "ses_1", accepted: false }])
   })
 })

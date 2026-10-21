@@ -38,11 +38,11 @@ control.onMessage((frame) => {
 const handleCommand = (message: Command): void => {
   switch (message.type) {
     case "delta":
-      sender.pushDelta({ id: message.id ?? "", type: "message.part.updated", data: { id: message.id } })
+      sender.pushDelta({ id: message.id ?? "", type: "message.part.updated", properties: { id: message.id } })
       return
     case "durable":
       sender.pushDurable(
-        { id: message.id ?? "", type: "message.updated", data: { id: message.id } },
+        { id: message.id ?? "", type: "message.updated", properties: { id: message.id } },
         { generation: 1, ordinal: message.ordinal ?? 0 },
       )
       return
@@ -50,7 +50,7 @@ const handleCommand = (message: Command): void => {
       const count = message.count ?? 0
       control.notify({ type: "flood.start" })
       for (let index = 0; index < count; index++) {
-        sender.pushDelta({ id: `f${index}`, type: "message.part.updated", data: { index } })
+        sender.pushDelta({ id: `f${index}`, type: "message.part.updated", properties: { index } })
       }
       control.notify({ type: "flood.done", count })
       return

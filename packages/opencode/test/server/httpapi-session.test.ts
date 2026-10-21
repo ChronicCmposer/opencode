@@ -299,7 +299,13 @@ describe("session HttpApi", () => {
           method: "POST",
         })
         expect(abort.status).toBe(200)
-        expect(yield* responseJson(abort)).toBe(true)
+        expect(yield* responseJson(abort)).toEqual({
+          sessionID: missingSession,
+          mode: "completed",
+          winner: "completion",
+          acknowledged: false,
+          durationMs: 0,
+        })
 
         const session = yield* createSession({ title: "missing message" })
         const missingMessage = MessageID.ascending()
@@ -562,6 +568,21 @@ describe("session HttpApi", () => {
   )
 
   it.instance(
+    "keeps v2 interrupt as 204 No Content",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory }
+        const session = yield* createSession({ title: "v2 interrupt" })
+
+        const interrupt = yield* request(`/api/session/${session.id}/interrupt`, { method: "POST", headers })
+        expect(interrupt.status).toBe(204)
+        expect(yield* interrupt.text).toBe("")
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
     "durably records one v2 prompt for exact message-ID retries",
     () =>
       Effect.gen(function* () {
@@ -776,11 +797,17 @@ describe("session HttpApi", () => {
         expect(forkedWhitespace.id).not.toBe(created.id)
 
         expect(
-          yield* requestJson<boolean>(pathFor(SessionPaths.abort, { sessionID: created.id }), {
+          yield* requestJson<Record<string, unknown>>(pathFor(SessionPaths.abort, { sessionID: created.id }), {
             method: "POST",
             headers,
           }),
-        ).toBe(true)
+        ).toEqual({
+          sessionID: created.id,
+          mode: "completed",
+          winner: "completion",
+          acknowledged: false,
+          durationMs: 0,
+        })
 
         expect(
           yield* requestJson<boolean>(pathFor(SessionPaths.remove, { sessionID: created.id }), {

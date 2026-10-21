@@ -133,3 +133,81 @@ describe("WorkerCache", () => {
     expect(cache.get("c")).toBe(3)
   })
 })
+
+describe("WorkerCache concurrency (step 30)", () => {
+  test("concurrent read-through callers for one key load exactly once", async () => {
+    const cache = new WorkerCache()
+    let loads = 0
+    const loader = async () => {
+      loads += 1
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      return { id: loads }
+    }
+
+    const results = await Promise.all([
+      cache.readThrough("message:1", loader),
+      cache.readThrough("message:1", loader),
+      cache.readThrough("message:1", loader),
+    ])
+
+    expect(loads).toBe(1)
+    expect(results).toEqual([{ id: 1 }, { id: 1 }, { id: 1 }])
+  })
+
+  test("a failed read-through is not cached, so the next call retries", async () => {
+    const cache = new WorkerCache()
+    let attempts = 0
+    const loader = async () => {
+      attempts += 1
+      if (attempts === 1) throw new Error("transient")
+      return "ok"
+    }
+
+    await expect(cache.readThrough("k", loader)).rejects.toThrow("transient")
+    expect(await cache.readThrough("k", loader)).toBe("ok")
+    expect(attempts).toBe(2)
+  })
+
+  test("invalidate during an in-flight read-through prevents the stale store", async () => {
+    const cache = new WorkerCache()
+    let release: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let loads = 0
+    const loader = async () => {
+      loads += 1
+      await gate
+      return `v${loads}`
+    }
+
+    const pending = cache.readThrough("k", loader)
+    await Promise.resolve() // let the loader start
+    cache.invalidate("k")
+    release?.()
+
+    expect(await pending).toBe("v1")
+    expect(cache.has("k")).toBe(false)
+  })
+
+  test("clear drops in-flight reads so they cannot repopulate the cache", async () => {
+    const cache = new WorkerCache()
+    let release: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const loader = async () => {
+      await gate
+      return "late"
+    }
+
+    const pending = cache.readThrough("k", loader)
+    await Promise.resolve()
+    cache.clear()
+    release?.()
+
+    expect(await pending).toBe("late")
+    expect(cache.has("k")).toBe(false)
+    expect(cache.size).toBe(0)
+  })
+})

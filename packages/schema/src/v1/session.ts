@@ -656,11 +656,28 @@ export const Error = define({
   },
 })
 
+/**
+ * Terminal outcome of a cancel request, published once the hub has resolved the
+ * cancel-vs-completion race. Non-durable: the caller already receives the outcome
+ * synchronously from the abort handler, so this is a transient notification (the
+ * same shape as `session.error`/`session.diff`).
+ */
+export const Cancelled = define({
+  type: "session.cancelled",
+  schema: {
+    sessionID: SessionID,
+    mode: Schema.Literals(["cooperative", "terminated", "completed"]),
+    durationMs: Schema.Finite,
+    acknowledged: Schema.Boolean,
+  },
+})
+
 export const Event = {
   ...events,
   PartDelta,
   Diff,
   Error,
+  Cancelled,
   Definitions: inventory(
     events.Created,
     events.Updated,
@@ -672,5 +689,6 @@ export const Event = {
     PartDelta,
     Diff,
     Error,
+    Cancelled,
   ),
 }

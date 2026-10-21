@@ -46,6 +46,7 @@ const DEFAULT_CAPACITY = 1000
  */
 export class WorkerCache {
   private readonly entries = new Map<string, CacheEntry>()
+  private readonly inflight = new Map<string, Promise<unknown>>()
   private readonly now: () => number
   private readonly defaultTtlMs: number
   private readonly capacity: number
@@ -104,24 +105,51 @@ export class WorkerCache {
   /**
    * Read-through: return the cached value, or load it from the writer, cache it,
    * and return it. A stored `undefined` is a hit, so the loader runs once per
-   * key. Concurrent callers may each load; the cache is write-through, not a
-   * single-flight coordinator (the writer serializes anyway).
+   * key. Concurrent callers for the same key share one in-flight load
+   * (single-flight), so a burst of sessions never duplicates a writer RPC.
+   *
+   * A load only stores when it is still the live load: an intervening
+   * `invalidate`/`invalidateReadThrough`/`clear` cancels the store (the caller
+   * still receives its value) rather than repopulating a deliberately dropped
+   * entry.
    */
   async readThrough<T>(key: string, loader: () => Promise<T>): Promise<T> {
-    if (this.has(key)) return this.get(key) as T
-    const value = await loader()
-    this.store(key, { value, class: "read-through", storedAt: this.now(), epoch: this.currentEpoch })
-    return value
+    const cached = this.validEntry(key)
+    if (cached !== undefined) {
+      this.touch(key, cached)
+      return cached.value as T
+    }
+
+    const existing = this.inflight.get(key)
+    if (existing !== undefined) return existing as Promise<T>
+
+    const inflight = loader().then(
+      (value) => {
+        if (this.inflight.get(key) === inflight) {
+          this.inflight.delete(key)
+          this.store(key, { value, class: "read-through", storedAt: this.now(), epoch: this.currentEpoch })
+        }
+        return value
+      },
+      (error) => {
+        if (this.inflight.get(key) === inflight) this.inflight.delete(key)
+        throw error
+      },
+    )
+    this.inflight.set(key, inflight)
+    return inflight
   }
 
-  /** Drop one entry (own write or received durable event). */
+  /** Drop one entry and any in-flight load (own write or received durable event). */
   invalidate(key: string): void {
     this.entries.delete(key)
+    this.inflight.delete(key)
   }
 
-  /** Drop every read-through entry (a durable event touched unknown aggregates). */
+  /** Drop every read-through entry and in-flight load (a durable event touched unknown aggregates). */
   invalidateReadThrough(): void {
     for (const [key, entry] of this.entries) if (entry.class === "read-through") this.entries.delete(key)
+    this.inflight.clear()
   }
 
   /**
@@ -138,6 +166,7 @@ export class WorkerCache {
 
   clear(): void {
     this.entries.clear()
+    this.inflight.clear()
   }
 
   private isValid(entry: CacheEntry): boolean {

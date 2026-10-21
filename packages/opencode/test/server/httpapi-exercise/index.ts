@@ -1402,7 +1402,10 @@ const scenarios: Scenario[] = [
     .seeded((ctx) => ctx.session({ title: "Abort session" }))
     .at((ctx) => ({ path: route("/session/{sessionID}/abort", { sessionID: ctx.state.id }), headers: ctx.headers() }))
     .json(200, (body) => {
-      check(body === true, "abort should return true")
+      object(body)
+      check(body.mode === "completed", "idle abort should report the completed outcome")
+      check(body.winner === "completion", "idle abort should be won by completion")
+      check(body.acknowledged === false, "idle abort should not be acknowledged without a worker")
     }),
   http.protected
     .post("/session/{sessionID}/abort", "session.abort.missing")
@@ -1411,7 +1414,9 @@ const scenarios: Scenario[] = [
       headers: ctx.headers(),
     }))
     .json(200, (body) => {
-      check(body === true, "missing session abort should remain a no-op success")
+      object(body)
+      check(body.mode === "completed", "missing session abort should report the completed outcome")
+      check(body.acknowledged === false, "missing session abort should not be acknowledged")
     }),
   http.protected
     .post("/session/{sessionID}/init", "session.init")

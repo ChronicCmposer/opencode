@@ -26,6 +26,7 @@ const capture = () => {
         })
         return event
       }),
+    publishLive: () => Effect.void,
     subscribe: () => Stream.empty,
     all: () => Stream.empty,
     durable: () => Stream.empty,

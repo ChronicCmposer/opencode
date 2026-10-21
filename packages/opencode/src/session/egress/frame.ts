@@ -1,61 +1,68 @@
-// Phase 8.2 — length-prefixed versioned egress frames (plan task 8.2).
+// W2 — length-prefixed framing for the generic worker→hub event channel.
 //
-// The worker→hub egress channel is a byte stream of frames:
+// The channel keeps its byte framing, but the body is now a shared
+// `WorkerFrameEnvelope` (events port) instead of the old `EgressEvent`:
 //
 //     [u32 big-endian body length][UTF-8 JSON body]
 //
-// `v1` encodes the body once as UTF-8 JSON (room for a binary v2 later). The
-// codec is deliberately total on the *framing* layer: `decodeFrames` returns the
-// complete frames plus any partial trailing bytes as `rest`, so a caller can
-// reassemble frames that arrive split across `MessagePort` deliveries. Anything
-// that is well-framed but structurally invalid (unknown version / kind) fails
-// loud, so illegal states never enter internal logic.
+// Envelope validation is delegated to `session/worker/frame.ts` (the single
+// shared envelope, spec Q8/Q21/Q22/Q24), so the events `event` variant carries
+// the EventV2 event VERBATIM as `{ id, type, properties }` — there is no `data`
+// translation. The codec is total on the *framing* layer: `decodeFrames` returns
+// the complete frames plus any partial trailing bytes as `rest`, so a caller can
+// reassemble frames split across `MessagePort` deliveries. Anything well-framed
+// but structurally invalid (bad JSON, unknown version/port/kind) fails loud, so
+// illegal states never enter internal logic.
 
-export const FRAME_VERSION = 1
+import {
+  ProtocolError,
+  UnsupportedFrameVersionError,
+  WORKER_FRAME_VERSION,
+  encodeWorkerFrame,
+  parseEventsFrame,
+  type EventsAckPayload,
+  type EventsEventPayload,
+  type EventsFrame,
+  type EventsResyncPayload,
+  type EventV2Event,
+  type WorkerFrameEnvelope,
+} from "@/session/worker/frame"
+
+import type { WriterOrdinal } from "./ordinal"
+
+export { ProtocolError, UnsupportedFrameVersionError }
+export type {
+  EventsAckPayload,
+  EventsEventPayload,
+  EventsFrame,
+  EventsResyncPayload,
+  EventV2Event,
+  WorkerFrameEnvelope,
+}
+
+/** The only frame version understood by this build (shared envelope version). */
+export const FRAME_VERSION = WORKER_FRAME_VERSION
+
+/** Writer-stamped durable metadata; identical in shape to `WriterOrdinal`. */
+export type DurableMeta = WriterOrdinal
+
+/**
+ * @deprecated The channel now carries EventV2 events. Use {@link EventV2Event}.
+ * Retained only so opaque carriers (`control.ts`, `mesh.ts`) keep compiling.
+ */
+export type EgressEvent = EventV2Event
+
+/**
+ * @deprecated The channel now carries events frames. Use {@link EventsFrame}.
+ * Retained only as a stable name for existing imports.
+ */
+export type EgressFrame = EventsFrame
 
 const HEADER_BYTES = 4
 const textEncoder = new TextEncoder()
 const textDecoder = new TextDecoder()
 
-/** Writer-stamped global ordinal carried on durable frames (plan task 8.5). */
-export interface DurableMeta {
-  readonly generation: number
-  readonly ordinal: number
-}
-
-/** The minimal event envelope the egress channel transports. */
-export interface EgressEvent {
-  readonly id: string
-  readonly type: string
-  readonly data: unknown
-  /** Present only for durable events; the per-aggregate sequence from the writer. */
-  readonly durable?: { readonly aggregateID: string; readonly seq: number }
-}
-
-/**
- * A frame on the wire.
- *
- * - `deltas` — one or more coalesced non-durable events; carries no ordinal.
- * - `durable` — a single durable boundary event plus its writer-stamped meta.
- * - `end` — end-of-stream marker.
- */
-export type EgressFrame =
-  | { readonly kind: "deltas"; readonly v: typeof FRAME_VERSION; readonly events: readonly EgressEvent[] }
-  | {
-      readonly kind: "durable"
-      readonly v: typeof FRAME_VERSION
-      readonly meta: DurableMeta
-      readonly event: EgressEvent
-    }
-  | { readonly kind: "end"; readonly v: typeof FRAME_VERSION }
-
-export class UnsupportedFrameVersionError extends Error {
-  constructor(readonly version: unknown) {
-    super(`unsupported egress frame version: ${String(version)} (expected ${FRAME_VERSION})`)
-    this.name = "UnsupportedFrameVersionError"
-  }
-}
-
+/** Raised when the byte framing is wrong (truncated, multi-frame, or bad JSON). */
 export class MalformedFrameError extends Error {
   constructor(message: string) {
     super(`malformed egress frame: ${message}`)
@@ -64,16 +71,31 @@ export class MalformedFrameError extends Error {
 }
 
 /** Encode one frame as `[u32 length][UTF-8 JSON]`. */
-export function encodeFrame(frame: EgressFrame): Uint8Array {
-  const body = textEncoder.encode(JSON.stringify(frame))
+export function encodeFrame(frame: WorkerFrameEnvelope): Uint8Array {
+  const body = textEncoder.encode(encodeWorkerFrame(frame))
   const bytes = new Uint8Array(HEADER_BYTES + body.byteLength)
   new DataView(bytes.buffer).setUint32(0, body.byteLength, false)
   bytes.set(body, HEADER_BYTES)
   return bytes
 }
 
+/**
+ * Encode a batch of frames into ONE buffer, each length-prefixed in order, so a
+ * coalesced delta batch is posted as a single zero-copy message.
+ */
+export function encodeFrames(frames: readonly WorkerFrameEnvelope[]): Uint8Array {
+  const encoded = frames.map(encodeFrame)
+  const bytes = new Uint8Array(encoded.reduce((total, frame) => total + frame.byteLength, 0))
+  let offset = 0
+  for (const frame of encoded) {
+    bytes.set(frame, offset)
+    offset += frame.byteLength
+  }
+  return bytes
+}
+
 /** Decode a complete single frame; fails loud on a partial, multi-frame, or unsupported frame. */
-export function decodeFrame(bytes: Uint8Array): EgressFrame {
+export function decodeFrame(bytes: Uint8Array): EventsFrame {
   if (bytes.byteLength < HEADER_BYTES) {
     throw new MalformedFrameError(`truncated frame header: ${bytes.byteLength} of ${HEADER_BYTES} byte(s)`)
   }
@@ -85,18 +107,18 @@ export function decodeFrame(bytes: Uint8Array): EgressFrame {
   if (bytes.byteLength > total) {
     throw new MalformedFrameError(`expected exactly 1 frame, got ${bytes.byteLength - total} trailing byte(s)`)
   }
-  return parseFrame(bytes.subarray(HEADER_BYTES, total))
+  return parseBody(bytes.subarray(HEADER_BYTES, total))
 }
 
 export interface DecodedFrames {
-  readonly frames: readonly EgressFrame[]
+  readonly frames: readonly EventsFrame[]
   /** Bytes of an incomplete trailing frame, to prepend to the next chunk. */
   readonly rest: Uint8Array
 }
 
 /** A decoded frame plus the exact wire bytes it came from (for zero-copy fan-out). */
 export interface FrameChunk {
-  readonly frame: EgressFrame
+  readonly frame: EventsFrame
   readonly bytes: Uint8Array
 }
 
@@ -113,7 +135,10 @@ export function decodeFrameChunks(bytes: Uint8Array): DecodedFrameChunks {
     const length = new DataView(bytes.buffer, bytes.byteOffset + offset, HEADER_BYTES).getUint32(0, false)
     if (offset + HEADER_BYTES + length > bytes.byteLength) break
     const view = bytes.subarray(offset, offset + HEADER_BYTES + length)
-    frames.push({ frame: parseFrame(bytes.subarray(offset + HEADER_BYTES, offset + HEADER_BYTES + length)), bytes: view })
+    frames.push({
+      frame: parseBody(bytes.subarray(offset + HEADER_BYTES, offset + HEADER_BYTES + length)),
+      bytes: view,
+    })
     offset += HEADER_BYTES + length
   }
   // `rest` must not alias the caller's buffer: a later mutation or reuse of the
@@ -127,30 +152,9 @@ export function decodeFrames(bytes: Uint8Array): DecodedFrames {
   return { frames: frames.map((chunk) => chunk.frame), rest }
 }
 
-function parseFrame(body: Uint8Array): EgressFrame {
-  const parsed = parseJson(body)
-  const frame = asRecord(parsed, "body is not an object")
-  if (frame.v !== FRAME_VERSION) throw new UnsupportedFrameVersionError(frame.v)
-  const kind = frame.kind
-  if (kind === "end") return { kind: "end", v: FRAME_VERSION }
-  if (kind === "deltas") {
-    const events = frame.events
-    if (!Array.isArray(events)) throw new MalformedFrameError("deltas.events is not an array")
-    return { kind: "deltas", v: FRAME_VERSION, events: events.map(parseEvent) }
-  }
-  if (kind === "durable") {
-    const meta = asRecord(frame.meta, "durable.meta is not an object")
-    return {
-      kind: "durable",
-      v: FRAME_VERSION,
-      meta: {
-        generation: asInteger(meta.generation, "durable.meta.generation is not an integer"),
-        ordinal: asInteger(meta.ordinal, "durable.meta.ordinal is not an integer"),
-      },
-      event: parseEvent(frame.event),
-    }
-  }
-  throw new MalformedFrameError(`unknown kind: ${String(kind)}`)
+/** Parse the framed body as an events-port frame; malformed bodies fail loud. */
+function parseBody(body: Uint8Array): EventsFrame {
+  return parseEventsFrame(parseJson(body))
 }
 
 /** Parse the JSON body, translating the syntax error into the codec's own error type. */
@@ -160,41 +164,6 @@ function parseJson(body: Uint8Array): unknown {
   } catch (error) {
     throw new MalformedFrameError(`invalid JSON body: ${error instanceof Error ? error.message : String(error)}`)
   }
-}
-
-/** Parse one event at the frame boundary so internal logic never sees a partial event. */
-function parseEvent(value: unknown): EgressEvent {
-  const record = asRecord(value, "event is not an object")
-  const { id, type, data, durable } = record
-  if (typeof id !== "string") throw new MalformedFrameError("event.id is not a string")
-  if (typeof type !== "string") throw new MalformedFrameError("event.type is not a string")
-  if (data === undefined) throw new MalformedFrameError("event.data is missing")
-  if (durable === undefined) return { id, type, data }
-  const stamp = asRecord(durable, "event.durable is not an object")
-  return {
-    id,
-    type,
-    data,
-    durable: {
-      aggregateID: asString(stamp.aggregateID, "event.durable.aggregateID is not a string"),
-      seq: asInteger(stamp.seq, "event.durable.seq is not an integer"),
-    },
-  }
-}
-
-function asRecord(value: unknown, message: string): Record<string, unknown> {
-  if (typeof value !== "object" || value === null) throw new MalformedFrameError(message)
-  return value as Record<string, unknown>
-}
-
-function asInteger(value: unknown, message: string): number {
-  if (typeof value !== "number" || !Number.isInteger(value)) throw new MalformedFrameError(message)
-  return value
-}
-
-function asString(value: unknown, message: string): string {
-  if (typeof value !== "string") throw new MalformedFrameError(message)
-  return value
 }
 
 export * as EgressFrameCodec from "./frame"

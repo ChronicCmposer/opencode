@@ -8,8 +8,10 @@
 
 import { describe, expect, test } from "bun:test"
 import {
+  createBackgroundJobClient,
   createJobClient,
   createResultRouter,
+  jobPortFromMessagePort,
   serveJobRegistry,
   type JobClient,
   type JobFrame,
@@ -192,5 +194,51 @@ describe("9.4 child result routed to the parent worker by parentID", () => {
     expect(siblingGot).toEqual([])
 
     disposes.forEach((dispose) => dispose())
+  })
+})
+
+describe("21 the port adapter exposes BackgroundJobClientHandle", () => {
+  test("createBackgroundJobClient structurally satisfies BackgroundJobClientHandle", () => {
+    const channel = new MessageChannel()
+    const client = createBackgroundJobClient(channel.port2)
+    // Compile-time proof only: `wait`/`cancel` are the handle's whole surface.
+    const handle: BackgroundJobClientHandle = client
+    expect(typeof handle.wait).toBe("function")
+    expect(typeof handle.cancel).toBe("function")
+    client.dispose()
+  })
+
+  test("wait resolves over a real MessagePort once the job completes", async () => {
+    const channel = new MessageChannel()
+    const registry = createJobRegistry()
+    const disposeServer = serveJobRegistry(registry, jobPortFromMessagePort(channel.port1))
+    const handle = createBackgroundJobClient(channel.port2)
+
+    registry.start({ id: "ses_job", type: "task" })
+    const waiting = handle.wait("ses_job")
+    registry.complete("ses_job", "adapter output")
+
+    const result = await waiting
+    expect(result.timedOut).toBe(false)
+    expect(result.info?.output).toBe("adapter output")
+
+    handle.dispose()
+    disposeServer()
+  })
+
+  test("cancel settles a concurrent wait as cancelled", async () => {
+    const channel = new MessageChannel()
+    const registry = createJobRegistry()
+    const disposeServer = serveJobRegistry(registry, jobPortFromMessagePort(channel.port1))
+    const handle = createBackgroundJobClient(channel.port2)
+
+    registry.start({ id: "ses_job", type: "task" })
+    const waiting = handle.wait("ses_job")
+    await handle.cancel("ses_job")
+
+    expect((await waiting).info?.status).toBe("cancelled")
+
+    handle.dispose()
+    disposeServer()
   })
 })

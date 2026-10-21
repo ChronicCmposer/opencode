@@ -129,6 +129,13 @@ export interface Interface {
     data: Data<D>,
     options?: PublishOptions,
   ) => Effect.Effect<Payload<D>>
+  /**
+   * Publish an already-formed payload live-only: notify subscribers without a
+   * `Definition` lookup and without the durable commit path. Used to replay
+   * worker-originated events on the hub, where the durable write already happened
+   * in the worker isolate and must never be repeated.
+   */
+  readonly publishLive: (event: Payload) => Effect.Effect<void>
   readonly subscribe: <D extends Definition>(definition: D) => Stream.Stream<Payload<D>>
   readonly all: () => Stream.Stream<Payload>
   readonly durable: (input: { readonly aggregateID: string; readonly after?: number }) => Stream.Stream<Payload>
@@ -621,6 +628,7 @@ export const layerWith = (options?: LayerOptions) =>
 
       return Service.of({
         publish,
+        publishLive: (event) => notify(event, false),
         subscribe,
         all: streamAll,
         durable,

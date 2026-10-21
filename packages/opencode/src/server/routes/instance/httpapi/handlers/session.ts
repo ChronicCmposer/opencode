@@ -23,6 +23,7 @@ import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder, HttpApiError, HttpApiSchema } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import {
+  AbortOutcome,
   CommandPayload,
   DiffQuery,
   ForkPayload,
@@ -44,6 +45,20 @@ const tryParseJson = (text: string) =>
     try: () => JSON.parse(text) as unknown,
     catch: () => new HttpApiError.BadRequest({}),
   })
+
+// `SessionPrompt.cancel` reports `undefined` when the session has no active run
+// to cancel (already idle). The abort endpoint still owes the caller an outcome
+// body, so report the terminal "completed" outcome for that case.
+const idleAbortOutcome = (sessionID: SessionID): typeof AbortOutcome.Type => ({
+  sessionID,
+  mode: "completed",
+  winner: "completion",
+  acknowledged: false,
+  durationMs: 0,
+})
+
+const resolveAbortOutcome = (sessionID: SessionID, outcome: unknown): typeof AbortOutcome.Type =>
+  (outcome as typeof AbortOutcome.Type | undefined) ?? idleAbortOutcome(sessionID)
 
 export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", (handlers) =>
   Effect.gen(function* () {
@@ -230,8 +245,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     })
 
     const abort = Effect.fn("SessionHttpApi.abort")(function* (ctx: { params: { sessionID: SessionID } }) {
-      yield* promptSvc.cancel(ctx.params.sessionID)
-      return true
+      return resolveAbortOutcome(ctx.params.sessionID, yield* promptSvc.cancel(ctx.params.sessionID))
     })
 
     const init = Effect.fn("SessionHttpApi.init")(function* (ctx: {
