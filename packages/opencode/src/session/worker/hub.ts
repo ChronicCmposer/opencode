@@ -1015,6 +1015,10 @@ function lazyOpenWriter(writer: WriterClient, filename: string): HubWriter {
   return {
     query: (method, sql, params) => ensureOpen().then(() => writer.query(method, sql, params)),
     publish: (event, options) => ensureOpen().then(() => writer.publish(event, options)),
+    begin: () => ensureOpen().then(() => writer.begin()),
+    txQuery: (handle, method, sql, params) => ensureOpen().then(() => writer.txQuery(handle, method, sql, params)),
+    commit: (handle) => ensureOpen().then(() => writer.commit(handle)),
+    rollback: (handle) => ensureOpen().then(() => writer.rollback(handle)),
   }
 }
 

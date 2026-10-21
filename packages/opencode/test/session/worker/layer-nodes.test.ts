@@ -63,7 +63,6 @@ describe("session node table", () => {
     expect(labels).toEqual(
       expect.arrayContaining([
         "Database",
-        "SessionProjector",
         "LSP",
         "MCP",
         "McpAuth",
@@ -84,6 +83,15 @@ describe("session node table", () => {
         "LocationServiceMap",
       ]),
     )
+  })
+
+  test("SessionProjector is a worker-local allowlist node, not excluded", () => {
+    // The projector materializes session/message/part rows from durable events.
+    // It must run IN the worker (over the writer-backed Database), not be
+    // replaced by an empty boundary, so it is allowlisted worker-local.
+    expect(lookupNode("session-projector")?.boundary).toBe("worker-local")
+    expect(SESSION_EXCLUDED.map((item) => item.key)).not.toContain("session-projector")
+    expect(REQUIRED_SESSION_NODE_KEYS).toContain("session-projector")
   })
 
   test("the 9 residual hub/writer/broker/infra nodes are classified excluded", () => {

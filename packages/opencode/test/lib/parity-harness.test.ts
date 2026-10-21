@@ -46,23 +46,35 @@ import {
   buildHubProxyHandlers,
   createHubEventSink,
   serveEventsPort,
+  type HubEventSink,
   type HubProxyAuthorities,
   type HubProxyRunner,
 } from "@/session/worker/hub"
 import { createSessionWork } from "@/session/worker/session-worker"
+import { Session } from "@/session/session"
+import { SessionPrompt } from "@/session/prompt"
+import { SessionSummary } from "@/session/summary"
 import {
+  compareDurable,
   compareSequences,
   compareToGolden,
+  createE2EContext,
   goldenFromParity,
   readGolden,
   recordGolden,
   runParitySession,
+  type DurableRow,
+  type E2EContextOptions,
   type ParityResult,
   type ParityRunContext,
   type ParityRunner,
   type SessionScript,
 } from "./parity-harness"
-import { createEventSink, type EventSink } from "./event-sink"
+import { createBunSqliteConnection } from "@/session/writer/connection"
+import { createWriterCore } from "@/session/writer/core"
+import { serveWriterPort, type HubWriter } from "@/session/writer/client"
+import { createWorkerWriterClient } from "@/session/worker/writer-client"
+import { createEventSink, type EventSink, type SinkEvent } from "./event-sink"
 import { startMockProvider, type MockProviderHandle } from "./mock-provider"
 import { pollUntil } from "./poll"
 import { workerSnapshot } from "./snapshot"
@@ -230,6 +242,8 @@ interface HubBridge {
   readonly egressPort: MessagePort
   readonly hubProxyPort: MessagePort
   readonly sink: EventSink
+  /** The hub-side events-port sink; `ended` signals the worker flushed its stream. */
+  readonly hubSink: HubEventSink
   dispose(): Promise<void>
 }
 
@@ -249,7 +263,8 @@ async function createHubBridge(context: ParityRunContext): Promise<HubBridge> {
   const events = runtime.runSync(EventV2.Service)
   const publisher: LiveEventPublisher = createLiveEventPublisher(events)
   const egressChannel = new MessageChannel()
-  const disposeEvents = serveEventsPort(egressChannel.port2, createHubEventSink({ publisher }))
+  const hubSink = createHubEventSink({ publisher })
+  const disposeEvents = serveEventsPort(egressChannel.port2, hubSink)
 
   // The hub-proxy authorities run under the dispatched instance's context, exactly
   // as `productionSessionHubLayer` provides it (`hub.ts` `HubProxyRunner`).
@@ -272,6 +287,7 @@ async function createHubBridge(context: ParityRunContext): Promise<HubBridge> {
     hubProxyPort: hubProxyChannel.port1,
     // The sink only needs the `EventV2.Service` surface; the runtime carries more.
     sink: context.capture(runtime as unknown as ManagedRuntime.ManagedRuntime<EventV2.Service, never>),
+    hubSink,
     async dispose() {
       disposeEvents()
       disposeProxy()
@@ -466,3 +482,355 @@ describe("real worker session against the mock provider", () => {
 function event(id: string, type: string, properties: unknown) {
   return { id, type, properties }
 }
+
+// ---------------------------------------------------------------------------
+// Real `SessionPrompt.loop` flag-ON ≡ flag-OFF (o1-w4 audit gap 1).
+//
+// The synthetic `runBridgeSide` above publishes deltas directly; this section
+// runs the ACTUAL `SessionPrompt.loop` over the writer-backed Database with the
+// in-graph `SessionProjector`, once in-process (flag-OFF, captured from the
+// graph's own `EventV2`) and once with the worker event bridge forwarding every
+// session-scoped event to a hub (`event-sink` observes the hub surface).
+//
+// Why the loop runs directly here (not via `createSessionWork`): the harness must
+// observe the SAME `EventV2` instance the graph publishes on, and
+// `createSessionWork` builds its own layer scope internally. Calling
+// `SessionPrompt.loop` on a runtime built from `createE2EContext().layer` is the
+// identical loop the worker's work function invokes, over the identical graph.
+// ---------------------------------------------------------------------------
+
+/** The deterministic mock-provider reply both real-loop sides run against. */
+const loopScript: SessionScript = {
+  name: "real-loop",
+  prompt: "hi",
+  provider: { chunks: ["hel", "lo"] },
+}
+
+/**
+ * The worker bridge's own projection: only events whose payload carries a
+ * `sessionID` cross the isolate (`isSessionScopedEvent`). The flag-OFF graph also
+ * publishes hub-local telemetry (`plugin.added`, `catalog.updated`, …) that never
+ * crosses, so both sides are compared on this projection.
+ */
+function sessionScoped(events: ReadonlyArray<SinkEvent>): ReadonlyArray<SinkEvent> {
+  return events.filter((entry) => {
+    const properties = entry.properties
+    if (properties === null || typeof properties !== "object") return false
+    return typeof (properties as { readonly sessionID?: unknown }).sessionID === "string"
+  })
+}
+
+/** Count event types into a multiset, for exactly-once comparison. */
+function typeCounts(types: ReadonlyArray<string>): Record<string, number> {
+  const counts: Record<string, number> = {}
+  for (const type of types) counts[type] = (counts[type] ?? 0) + 1
+  return counts
+}
+
+/**
+ * Event types the hub owns (hub-proxied): the worker never forwards them over the
+ * events port, the hub authority publishes them on the hub surface instead.
+ */
+const HUB_OWNED_TYPES: ReadonlySet<string> = new Set(["session.status", "session.idle"])
+
+/**
+ * Split a captured sequence by the channel it crossed. The worker event bridge
+ * (events port) and the hub-proxy control port are independent transports, so the
+ * two subsets are each internally ordered but their interleaving is not
+ * deterministic. Within a channel, order is preserved and must match exactly.
+ */
+function channels(events: ReadonlyArray<SinkEvent>): {
+  readonly bridged: ReadonlyArray<SinkEvent>
+  readonly hubOwned: ReadonlyArray<SinkEvent>
+} {
+  return {
+    bridged: events.filter((entry) => !HUB_OWNED_TYPES.has(entry.type)),
+    hubOwned: events.filter((entry) => HUB_OWNED_TYPES.has(entry.type)),
+  }
+}
+
+/**
+ * Run one flag state of the real loop:
+ *
+ *  * flag-OFF captures the worker graph's own `EventV2`;
+ *  * flag-ON routes worker events over `createWorkerEgressClient` → `serveEventsPort`
+ *    → `createHubEventSink` (live-only republish), and routes `session.status`
+ *    through the hub authority, so the sink observes the full hub sequence.
+ */
+function loopRunner(directory: string): ParityRunner {
+  return async (context) => {
+    const config = modelConfig(context.provider)
+    const bridge = context.flag ? await createHubBridge(context) : undefined
+    const egress = bridge === undefined ? undefined : createWorkerEgressClient(bridge.egressPort, { windowMs: 0 })
+    const hubProxyClient = bridge === undefined ? undefined : createHubProxyClient(bridge.hubProxyPort)
+    const hubProxies: E2EContextOptions["hubProxies"] =
+      hubProxyClient === undefined
+        ? "in-process"
+        : { sessionStatus: hubProxyClient, permission: hubProxyClient, question: hubProxyClient }
+
+    const ctx = createE2EContext({
+      snapshot: workerSnapshot({ directory }),
+      modelConfig: config,
+      ...(egress === undefined ? {} : { egress }),
+      hubProxies,
+      // `SessionPrompt` forks `SessionSummary.summarize` into the service scope
+      // after the turn ends, so it can publish a `session.updated` AFTER the loop
+      // resolves (and, on the worker, after `egress.end()`), which makes the
+      // routed sequence nondeterministic. Neutralize that background work on BOTH
+      // sides: the loop's own event route — what this parity test proves — is
+      // otherwise unchanged.
+      replacements: [[SessionSummary.node, Layer.mock(SessionSummary.Service, { summarize: () => Effect.void })]],
+    })
+    const runtime = ManagedRuntime.make(ctx.layer)
+
+    try {
+      // Warm the runtime so the sink subscribes to the graph's live `EventV2`.
+      await runtime.runPromise(Effect.void)
+      const sink =
+        bridge === undefined
+          ? context.capture(runtime as unknown as ManagedRuntime.ManagedRuntime<EventV2.Service, never>)
+          : bridge.sink
+
+      // Seed the scripted session + one user text part under the harness-shared
+      // ids, so both sides run the SAME logical session.
+      await runtime.runPromise(
+        Effect.gen(function* () {
+          const events = yield* EventV2Bridge.Service
+          const sessions = yield* Session.Service
+          const now = Date.now()
+          const info = SessionV1.SessionInfo.make({
+            id: context.sessionID,
+            slug: "parity",
+            version: "0.0.0",
+            // `projectID` is branded; the graph's instance is the synthetic "e2e"
+            // project (see `createE2EContext`).
+            projectID: "e2e" as never,
+            directory,
+            title: "parity",
+            agent: "build",
+            permission: [{ permission: "*", pattern: "*", action: "allow" }] as never,
+            cost: 0,
+            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            time: { created: now, updated: now },
+          })
+          yield* events.publish(SessionV1.Event.Created, { sessionID: context.sessionID, info })
+          yield* sessions.updateMessage({
+            id: context.messageID,
+            role: "user",
+            sessionID: context.sessionID,
+            agent: "build",
+            model: { providerID: config.providerID, modelID: config.modelID },
+            time: { created: now },
+          } as never)
+          yield* sessions.updatePart({
+            id: context.partID,
+            messageID: context.messageID,
+            sessionID: context.sessionID,
+            type: "text",
+            text: context.script.prompt,
+          } as never)
+        }).pipe(Effect.provideService(InstanceRef, ctx.instance)),
+      )
+
+      // The real worker session loop, on the same runtime the sink observes.
+      await runtime.runPromise(
+        Effect.gen(function* () {
+          const prompt = yield* SessionPrompt.Service
+          yield* prompt.loop(new SessionPrompt.LoopInput({ sessionID: context.sessionID }))
+        }).pipe(Effect.provideService(InstanceRef, ctx.instance)),
+      )
+
+      if (bridge !== undefined && egress !== undefined) {
+        // Flush buffered deltas and signal end-of-stream, then wait on the HUB's
+        // confirmation (not a fixed sleep) that the last frame was dispatched.
+        egress.end()
+        await pollUntil(() => bridge.hubSink.ended, {
+          timeoutMs: 10_000,
+          message: `flag-ON hub never received the end frame (saw ${sink.types().length} events)`,
+        })
+      }
+    } finally {
+      egress?.dispose()
+      await runtime.dispose()
+      await ctx.dispose()
+      if (bridge !== undefined) await bridge.dispose()
+    }
+  }
+}
+
+describe("real SessionPrompt.loop flag-ON ≡ flag-OFF (o1-w4 gap 1)", () => {
+  it("the hub event sequence equals the in-process graph sequence, per delivery channel", async () => {
+    await using tmp = await tmpdir()
+    const result = await runParitySession({
+      script: loopScript,
+      run: loopRunner(tmp.path),
+      timeoutMs: 60_000,
+    })
+
+    expect(result.off.error).toBeUndefined()
+    expect(result.on.error).toBeUndefined()
+
+    // Both sides on the bridge's projection: session-scoped events only.
+    const off = channels(sessionScoped(result.off.events))
+    const on = channels(sessionScoped(result.on.events))
+    expect(off.bridged.length + off.hubOwned.length).toBeGreaterThan(0)
+
+    // The worker events port preserves order exactly...
+    const bridged = compareSequences(off.bridged, on.bridged, { key: (e) => e.type })
+    expect(bridged.mismatches).toEqual([])
+    expect(bridged.missingInOn).toEqual([])
+    expect(bridged.missingInOff).toEqual([])
+    expect(bridged.equal).toBe(true)
+
+    // ...and so does the hub-proxy control port (`session.status`/`session.idle`).
+    const hubOwned = compareSequences(off.hubOwned, on.hubOwned, { key: (e) => e.type })
+    expect(hubOwned.mismatches).toEqual([])
+    expect(hubOwned.equal).toBe(true)
+
+    // The two transports are independent, so their INTERLEAVING is not
+    // deterministic (e.g. `session.status` and `session.diff` can swap). The full
+    // sequence is therefore compared as a multiset, not positionally.
+    const offTypes = sessionScoped(result.off.events).map((entry) => entry.type)
+    expect(typeCounts(result.on.types)).toEqual(typeCounts(offTypes))
+  }, 60_000)
+
+  it("delivers every durable event to the hub exactly once (no writer+republish duplicate)", async () => {
+    await using tmp = await tmpdir()
+    const result = await runParitySession({
+      script: loopScript,
+      run: loopRunner(tmp.path),
+      timeoutMs: 60_000,
+    })
+
+    expect(result.off.error).toBeUndefined()
+    expect(result.on.error).toBeUndefined()
+
+    // The hub only ever saw session-scoped events: the bridge's projection is
+    // exact — no worker-local telemetry (`plugin.added`, …) leaked onto the hub.
+    expect(sessionScoped(result.on.events)).toHaveLength(result.on.events.length)
+
+    // No event id is delivered twice: a durable event that both committed in the
+    // worker AND was republished would surface with the same id twice.
+    const ids = result.on.events.map((entry) => entry.id)
+    expect(new Set(ids).size).toBe(ids.length)
+
+    // The loop created exactly one session; the bridge forwarded it once and the
+    // hub never re-committed/duplicated it.
+    expect(result.on.types.filter((type) => type === "session.created")).toHaveLength(1)
+
+    // Exactly-once at the hub mirrors the flag-OFF session-scoped multiset
+    // one-for-one (so no event is missing AND none is doubled).
+    const offTypes = sessionScoped(result.off.events).map((entry) => entry.type)
+    expect(typeCounts(result.on.types)).toEqual(typeCounts(offTypes))
+  }, 60_000)
+})
+
+// ---------------------------------------------------------------------------
+// Durable-row capture + flag-ON ≡ flag-OFF (the committed-state twin of the
+// event-sequence assertion above).
+// ---------------------------------------------------------------------------
+
+describe("durable-row parity", () => {
+  const rows: ReadonlyArray<DurableRow> = [
+    { table: "message", row: { id: "m1", role: "user", text: "hi" } },
+    { table: "message", row: { id: "m2", role: "assistant", text: "hello" } },
+    { table: "event", row: { id: "e1", type: "message.updated" } },
+  ]
+
+  const durableRunner =
+    (transform: (context: ParityRunContext) => ReadonlyArray<DurableRow>): ParityRunner =>
+    (context) => {
+      for (const entry of transform(context)) context.durable.add(entry.table, [entry.row])
+    }
+
+  it("captures durable rows per side and compares equal for identical writes", async () => {
+    const result = await runParitySession({ script, run: durableRunner(() => rows) })
+
+    expect(result.off.durable).toHaveLength(rows.length)
+    expect(result.on.durable).toHaveLength(rows.length)
+    const comparison = compareDurable(result.off, result.on)
+    expect(comparison.equal).toBe(true)
+    expect(comparison.missingInOn).toEqual([])
+    expect(comparison.missingInOff).toEqual([])
+  })
+
+  it("reports a duplicate durable write as a divergence (exactly-once)", async () => {
+    const result = await runParitySession({
+      script,
+      run: durableRunner((context) => (context.flag ? [...rows, rows[0]!] : rows)),
+    })
+
+    const comparison = compareDurable(result.off, result.on)
+    expect(comparison.equal).toBe(false)
+    expect(comparison.onCount).toBe(rows.length + 1)
+    expect(comparison.missingInOff.map((entry) => entry.table)).toEqual(["message"])
+  })
+
+  it("normalizes volatile columns before comparing", () => {
+    const off: ReadonlyArray<DurableRow> = [{ table: "message", row: { id: "m1", time: 1, text: "hi" } }]
+    const on: ReadonlyArray<DurableRow> = [{ table: "message", row: { id: "m2", time: 99, text: "hi" } }]
+    const comparison = compareDurable(off, on, {
+      normalize: ({ table, row }) => ({ table, text: row.text }),
+    })
+    expect(comparison.equal).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Head-of-line / backpressure: a read queued behind an in-flight durable write
+// (a pinned writer transaction) neither deadlocks nor exceeds a bounded
+// latency once the transaction commits.
+// ---------------------------------------------------------------------------
+
+describe("writer head-of-line and backpressure", () => {
+  it("a read queued behind a pinned transaction resolves after commit within a bound", async () => {
+    const connection = createBunSqliteConnection({ filename: ":memory:" })
+    connection.exec(
+      [
+        "CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, owner_id TEXT)",
+        "CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL)",
+      ].join(";\n"),
+    )
+    const core = createWriterCore({ connection, sleep: async () => {} })
+    const hub: HubWriter = {
+      query: (method, sql, params) => core.query(method, sql, params),
+      publish: (writerEvent, options) => core.publish({ event: writerEvent, durable: options.durable }),
+      begin: () => core.beginTransaction(),
+      txQuery: (handle, method, sql, params) => core.txQuery(handle, method, sql, params),
+      commit: (handle) => core.commitTransaction(handle),
+      rollback: (handle) => core.rollbackTransaction(handle),
+    }
+    const channel = new MessageChannel()
+    const dispose = serveWriterPort(hub, channel.port1)
+    const writer = createWorkerWriterClient(channel.port2)
+    try {
+      // Pin a transaction: every non-control job queues behind it.
+      const handle = await writer.begin()
+      const startedAt = performance.now()
+      let readSettled = false
+      const read = writer.query("all", "SELECT COUNT(*) AS n FROM event").then((value) => {
+        readSettled = true
+        return value
+      })
+
+      // The read must NOT resolve while the transaction is pinned (HOL).
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      expect(readSettled).toBe(false)
+
+      // Commit: the queued read drains promptly and never deadlocks.
+      await writer.commit(handle)
+      const value = await Promise.race([
+        read,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("queued read deadlocked")), 2_000)),
+      ])
+      expect(readSettled).toBe(true)
+      expect(Array.isArray(value)).toBe(true)
+      expect(performance.now() - startedAt).toBeLessThan(2_000)
+    } finally {
+      writer.dispose()
+      dispose()
+      channel.port1.close()
+      channel.port2.close()
+    }
+  })
+})

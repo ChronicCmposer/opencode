@@ -444,7 +444,8 @@ export function createWriterClient(options: WriterClientOptions = {}): WriterCli
 /**
  * The slice of the hub-owned writer a worker port server needs. `WriterClient`
  * satisfies it structurally: a worker `publish` is a durable publish, so it
- * returns `{ seq, committed }`.
+ * returns `{ seq, committed }`, and the four transaction primitives relay the
+ * reserved-handle protocol verbatim.
  */
 export interface HubWriter {
   readonly query: (method: QueryMethod, sql: string, params: readonly unknown[]) => Promise<unknown>
@@ -452,6 +453,10 @@ export interface HubWriter {
     event: WriterEvent,
     options: { readonly durable: boolean },
   ) => Promise<{ readonly seq: number | null; readonly committed: boolean }>
+  readonly begin: () => Promise<string>
+  readonly txQuery: (handle: string, method: QueryMethod, sql: string, params: readonly unknown[]) => Promise<unknown>
+  readonly commit: (handle: string) => Promise<void>
+  readonly rollback: (handle: string) => Promise<void>
 }
 
 const QUERY_METHODS: ReadonlySet<string> = new Set<QueryMethod>(["all", "values", "run", "exec"])
@@ -503,6 +508,30 @@ export function serveWriterPort(hubWriter: HubWriter, port: MessagePort): () => 
         case "publish":
           hubWriter.publish(toWriterEvent(frame.event), { durable: true }).then(
             (result) => reply({ kind: "reply", id, ok: "publish", result }),
+            replyError,
+          )
+          return
+        case "tx.begin":
+          hubWriter.begin().then(
+            (handle) => reply({ kind: "reply", id, ok: "tx.begin", handle }),
+            replyError,
+          )
+          return
+        case "tx.query":
+          hubWriter.txQuery(frame.handle, toQueryMethod(frame.method), frame.sql, frame.params ?? []).then(
+            (value) => reply({ kind: "reply", id, ok: "tx.query", value: value ?? null }),
+            replyError,
+          )
+          return
+        case "tx.commit":
+          hubWriter.commit(frame.handle).then(
+            () => reply({ kind: "reply", id, ok: "tx.commit" }),
+            replyError,
+          )
+          return
+        case "tx.rollback":
+          hubWriter.rollback(frame.handle).then(
+            () => reply({ kind: "reply", id, ok: "tx.rollback" }),
             replyError,
           )
           return

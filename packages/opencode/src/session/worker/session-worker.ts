@@ -20,7 +20,7 @@ import { SessionPrompt } from "@/session/prompt"
 import { InstanceRef } from "@/effect/instance-ref"
 import type { InstanceContext } from "@/project/instance-context"
 import { Provider } from "@/provider/provider"
-import { createWorkerWriterClient } from "./writer-client"
+import { createWorkerWriterClient, type WorkerWriterClient } from "./writer-client"
 import { createWorkerEgressClient } from "./egress-client"
 import { createWorkerBrokerClient } from "./broker-client"
 import { createBackgroundJobClient, createJobClient, jobPortFromMessagePort, type JobClient } from "./job-client"
@@ -136,9 +136,13 @@ function requirePort(port: MessagePort | undefined, field: string): MessagePort 
   return port
 }
 
-/** The four client handles the reduced session layer installs. */
+/**
+ * The four client handles the reduced session layer installs. The writer is the
+ * full `WorkerWriterClient`, so the production worker can build a real
+ * writer-backed `Database` (statements AND `begin`/`txQuery`/`commit`/`rollback`).
+ */
 export interface WorkerClients {
-  readonly writer: WriterClientHandle
+  readonly writer: WorkerWriterClient
   readonly egress: EventEgressClientHandle
   readonly broker: BrokerClientHandle
   readonly backgroundJob: BackgroundJobClientHandle
@@ -320,8 +324,21 @@ export function productionWorkRegistry(session: SessionWork): SessionWorkFactory
  * fallback reports a non-committed publish and emits nothing.
  */
 function directClients(backgroundJob: BackgroundJobClientHandle): WorkerClients {
+  // Degraded boot: there is no writer authority, so every write/transaction
+  // primitive fails loud instead of silently returning `undefined`.
+  const unavailable = (method: string) => async (): Promise<never> => {
+    throw new Error(`session worker has no writer authority for "${method}" (degraded boot)`)
+  }
   return {
-    writer: { query: async () => [], publish: async () => ({ seq: null, committed: false }) },
+    writer: {
+      query: async () => [],
+      publish: async () => ({ seq: null, committed: false }),
+      begin: unavailable("begin"),
+      txQuery: unavailable("txQuery"),
+      commit: unavailable("commit"),
+      rollback: unavailable("rollback"),
+      dispose: () => {},
+    },
     egress: { emit: () => {} },
     broker: { call: async () => null },
     backgroundJob,

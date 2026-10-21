@@ -132,3 +132,96 @@ describe("worker writer client (step 16)", () => {
     expect(await pending).toBeInstanceOf(Error)
   })
 })
+
+describe("worker writer client: transaction relay (step 16)", () => {
+  /** Reply to the four tx ops with deterministic, frame-shaped echoes. */
+  function respondToTransactions(port: MessagePort, seen: WorkerWriterFrame[]): void {
+    respondWith(port, (frame) => {
+      seen.push(frame)
+      if (frame.kind !== "request") return undefined
+      switch (frame.op) {
+        case "tx.begin":
+          return { kind: "reply", id: frame.id, ok: "tx.begin", handle: "tx-1" }
+        case "tx.query":
+          return { kind: "reply", id: frame.id, ok: "tx.query", value: [{ n: 1 }] }
+        case "tx.commit":
+          return { kind: "reply", id: frame.id, ok: "tx.commit" }
+        case "tx.rollback":
+          return { kind: "reply", id: frame.id, ok: "tx.rollback" }
+        default:
+          return undefined
+      }
+    })
+  }
+
+  test("round-trips begin → txQuery → commit with exact frame shapes", async () => {
+    const channel = new MessageChannel()
+    const seen: WorkerWriterFrame[] = []
+    respondToTransactions(channel.port1, seen)
+    const client = createWorkerWriterClient(channel.port2)
+
+    const handle = await client.begin()
+    const value = await client.txQuery(handle, "run", "insert into t values (?)", [7])
+    await client.commit(handle)
+
+    expect(handle).toBe("tx-1")
+    expect(value).toEqual([{ n: 1 }])
+    expect(seen).toEqual([
+      { kind: "request", id: 1, op: "tx.begin" },
+      { kind: "request", id: 2, op: "tx.query", handle: "tx-1", method: "run", sql: "insert into t values (?)", params: [7] },
+      { kind: "request", id: 3, op: "tx.commit", handle: "tx-1" },
+    ])
+    client.dispose()
+  })
+
+  test("round-trips rollback", async () => {
+    const channel = new MessageChannel()
+    const seen: WorkerWriterFrame[] = []
+    respondToTransactions(channel.port1, seen)
+    const client = createWorkerWriterClient(channel.port2)
+
+    const handle = await client.begin()
+    await client.rollback(handle)
+
+    expect(seen).toEqual([
+      { kind: "request", id: 1, op: "tx.begin" },
+      { kind: "request", id: 2, op: "tx.rollback", handle: "tx-1" },
+    ])
+    client.dispose()
+  })
+
+  test("surfaces a typed error from a failed txQuery", async () => {
+    const channel = new MessageChannel()
+    respondWith(channel.port1, (frame) =>
+      frame.kind === "request"
+        ? { kind: "reply", id: frame.id, ok: "error", tag: "TRANSACTION", message: "no transaction pinned" }
+        : undefined,
+    )
+    const client = createWorkerWriterClient(channel.port2)
+
+    const error = await client.txQuery("tx-9", "run", "insert into t values (1)").then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+
+    expect(error).toBeInstanceOf(WorkerWriterError)
+    expect((error as WorkerWriterError).tag).toBe("TRANSACTION")
+    expect((error as WorkerWriterError).message).toBe("no transaction pinned")
+    client.dispose()
+  })
+
+  test("rejects tx calls after dispose", async () => {
+    const channel = new MessageChannel()
+    respondToTransactions(channel.port1, [])
+    const client = createWorkerWriterClient(channel.port2)
+    client.dispose()
+
+    const error = await client.begin().then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+
+    expect(error).toBeInstanceOf(WorkerWriterError)
+    expect((error as WorkerWriterError).tag).toBe("DISPOSED")
+  })
+})

@@ -8,10 +8,17 @@
 //   * the hub-proxy control wire satisfies `SessionStatus` over a port.
 
 import { describe, expect, test } from "bun:test"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import { Effect, Layer } from "effect"
-import { SessionID } from "@/session/schema"
+import { MessageID, PartID, SessionID } from "@/session/schema"
+import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
+import { SessionProcessor } from "@/session/processor"
+import { LLM } from "@/session/llm"
 import { SessionStatus } from "@/session/status"
+import { InstanceRef } from "@/effect/instance-ref"
 import {
   ModelClient,
   PIPELINE_SESSION_NODES,
@@ -25,6 +32,7 @@ import {
   type WorkerModelConfig,
 } from "@/session/worker/layer"
 import { createSessionWork } from "@/session/worker/session-worker"
+import { collectNodeNames } from "@/session/worker/node-table"
 import {
   buildHubProxyHandlers,
   type HubProxyAuthorities,
@@ -34,6 +42,7 @@ import { Permission } from "@/permission"
 import { Question } from "@/question"
 import { startMockProvider, type MockProviderHandle } from "../../lib/mock-provider"
 import { workerSnapshot } from "../../lib/snapshot"
+import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
 
 const sid = (value: string) => SessionID.make(value)
 
@@ -70,20 +79,42 @@ describe("full worker graph boot", () => {
     expect(true).toBe(true)
   })
 
-  test("the default graph reaches the real SessionPrompt loop", async () => {
+  test("the default graph reaches the real SessionPrompt/SessionProcessor/LLM path", async () => {
     const built = buildSessionWorkerLayer({
       snapshot: workerSnapshot(),
       env: { values: {} },
       clients: stubClients(),
       modelClient: stubModel(),
     })
-    const provided = await Effect.runPromise(
+    const services = await Effect.runPromise(
       Effect.gen(function* () {
-        return yield* Effect.serviceOption(SessionPrompt.Service)
+        return {
+          prompt: yield* Effect.serviceOption(SessionPrompt.Service),
+          processor: yield* Effect.serviceOption(SessionProcessor.Service),
+          llm: yield* Effect.serviceOption(LLM.Service),
+        }
       }).pipe(Effect.provide(built.layer)),
     )
-    // The production `createSessionWork` swap relies on this being present.
-    expect(provided._tag).toBe("Some")
+    // The production `createSessionWork` swap relies on the whole prompt path
+    // being present, not just the entry service.
+    expect(services.prompt._tag).toBe("Some")
+    expect(services.processor._tag).toBe("Some")
+    expect(services.llm._tag).toBe("Some")
+  })
+
+  test("the default production graph materializes its own durable rows (SessionProjector in-worker)", () => {
+    // Production must not rely on a test-added projector: the default graph
+    // carries `SessionProjector` and the boundary layer must not blank it out.
+    const names = collectNodeNames(RUNNABLE_SESSION_NODES)
+    expect(names.has("session-projector")).toBe(true)
+    const built = buildSessionWorkerLayer({
+      snapshot: workerSnapshot(),
+      env: { values: {} },
+      clients: stubClients(),
+      modelClient: stubModel(),
+    })
+    const replaced = new Set(built.replacements.map(([node]) => node.name))
+    expect(replaced.has("session-projector")).toBe(false)
   })
 
   test("the bootable graph is the full runnable graph, not the pipeline subset", () => {
@@ -265,4 +296,78 @@ describe("hub-proxy control wire (production node wiring)", () => {
       "question.reject:req_q",
     ])
   })
+})
+
+// ---------------------------------------------------------------------------
+// The full graph runs the REAL prompt path (not the reduced `SessionPipeline`):
+// a mock session completes end-to-end over the writer-backed `Database`.
+// ---------------------------------------------------------------------------
+
+describe("full-graph prompt path against the mock provider", () => {
+  const modelConfig = (provider: MockProviderHandle) => ({
+    providerID: "mock",
+    modelID: provider.model,
+    apiId: provider.model,
+    npm: "@ai-sdk/openai-compatible",
+    baseUrl: provider.baseUrl,
+    apiKey: provider.apiKey,
+    headers: {},
+  })
+
+  const seed = (ctx: E2EContext, modelID: string, prompt: string) =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "full-graph",
+        agent: "build",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const user = (yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: session.id,
+        agent: "build",
+        model: { providerID: "mock", modelID },
+        time: { created: Date.now() },
+      } as never)) as { id: MessageID }
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: user.id,
+        sessionID: session.id,
+        type: "text",
+        text: prompt,
+      } as never)
+      return session.id
+    }).pipe(Effect.provide(ctx.layer), Effect.provideService(InstanceRef, ctx.instance))
+
+  test("runs SessionPrompt.loop and completes a mock session", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-layer-e2e-"))
+    await using provider = startMockProvider({ chunks: ["wor", "ld"] })
+    const ctx = createE2EContext({
+      snapshot: workerSnapshot({ directory }),
+      modelConfig: modelConfig(provider),
+    })
+    try {
+      const sessionID = await Effect.runPromise(seed(ctx, provider.model, "hi"))
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          const prompt = yield* SessionPrompt.Service
+          return yield* prompt.loop({ sessionID })
+        }).pipe(Effect.provide(ctx.layer), Effect.provideService(InstanceRef, ctx.instance)),
+      )
+      const value = result as { parts: ReadonlyArray<{ type: string; text?: string }> }
+      const text = value.parts
+        .filter((part) => part.type === "text")
+        .map((part) => part.text ?? "")
+        .join("")
+      expect(text).toBe("world")
+      expect(provider.requests.length).toBeGreaterThanOrEqual(1)
+      // The durable rows prove the writer-backed Database actually ran.
+      expect(ctx.rows("message")).toHaveLength(2)
+      expect(ctx.rows("part").length).toBeGreaterThanOrEqual(2)
+    } finally {
+      await ctx.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  }, 60_000)
 })

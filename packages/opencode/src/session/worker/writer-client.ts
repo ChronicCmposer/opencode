@@ -32,6 +32,21 @@ export type WorkerWriterRequest =
       readonly params?: readonly unknown[]
     }
   | { readonly kind: "request"; readonly id: number; readonly op: "publish"; readonly event: WorkerWriterEvent }
+  // Reserved-handle transaction family: the worker pins a transaction, runs
+  // statements against its opaque handle, then commits or rolls back. The handle
+  // is minted by the hub-owned writer and echoed verbatim.
+  | { readonly kind: "request"; readonly id: number; readonly op: "tx.begin" }
+  | {
+      readonly kind: "request"
+      readonly id: number
+      readonly op: "tx.query"
+      readonly handle: string
+      readonly method: string
+      readonly sql: string
+      readonly params?: readonly unknown[]
+    }
+  | { readonly kind: "request"; readonly id: number; readonly op: "tx.commit"; readonly handle: string }
+  | { readonly kind: "request"; readonly id: number; readonly op: "tx.rollback"; readonly handle: string }
 
 export interface WorkerWriterPublishResult {
   readonly seq: number | null
@@ -41,6 +56,10 @@ export interface WorkerWriterPublishResult {
 export type WorkerWriterReply =
   | { readonly kind: "reply"; readonly id: number; readonly ok: "query"; readonly value: unknown }
   | { readonly kind: "reply"; readonly id: number; readonly ok: "publish"; readonly result: WorkerWriterPublishResult }
+  | { readonly kind: "reply"; readonly id: number; readonly ok: "tx.begin"; readonly handle: string }
+  | { readonly kind: "reply"; readonly id: number; readonly ok: "tx.query"; readonly value: unknown }
+  | { readonly kind: "reply"; readonly id: number; readonly ok: "tx.commit" }
+  | { readonly kind: "reply"; readonly id: number; readonly ok: "tx.rollback" }
   | { readonly kind: "reply"; readonly id: number; readonly ok: "error"; readonly tag: string; readonly message: string }
 
 export type WorkerWriterFrame = WorkerWriterRequest | WorkerWriterReply
@@ -55,8 +74,26 @@ export class WorkerWriterError extends Error {
   }
 }
 
-/** The worker-side handle: the `WriterClientHandle` seam plus lifecycle control. */
+/**
+ * The worker-side handle: the `WriterClientHandle` seam plus lifecycle control.
+ *
+ * The transaction primitives are declared here (not only on `WriterClientHandle`)
+ * so this module owns the full worker-visible shape: the hub `WriterClient` and
+ * the worker relay agree on a `Promise`-based, opaque-string-handle API. The
+ * `WriterTxId` semantics (begin → txQuery* → commit | rollback, typed failure)
+ * are preserved; only the identifier representation (`string` handle, matching
+ * the hub) and the async style (`Promise`) differ from the plan's illustrative
+ * `Effect`/`number` sketch.
+ */
 export interface WorkerWriterClient extends WriterClientHandle {
+  /** Pin a transaction and return its opaque handle (e.g. `"tx-1"`). */
+  begin(): Promise<string>
+  /** Run a statement against the pinned transaction; rejects on a typed failure. */
+  txQuery(handle: string, method: string, sql: string, params?: readonly unknown[]): Promise<unknown>
+  /** Commit the pinned transaction; the handle is spent. */
+  commit(handle: string): Promise<void>
+  /** Roll back the pinned transaction, discarding its writes. */
+  rollback(handle: string): Promise<void>
   dispose(): void
 }
 
@@ -76,6 +113,22 @@ interface PendingRequest {
 }
 
 const DISPOSED_MESSAGE = "worker writer client disposed"
+
+/**
+ * Narrow a reply to the expected success shape, converting an error reply (or a
+ * mismatched success) into a typed `WorkerWriterError`. The port is the trust
+ * boundary: once narrowed, the caller reads fields without re-checking.
+ */
+function expectReply<K extends WorkerWriterReply["ok"]>(
+  reply: WorkerWriterReply,
+  expected: K,
+): Extract<WorkerWriterReply, { readonly ok: K }> {
+  if (reply.ok === "error") throw new WorkerWriterError(reply.tag, reply.message)
+  if (reply.ok !== expected) {
+    throw new WorkerWriterError("PROTOCOL", `expected a "${expected}" reply, received "${reply.ok}"`)
+  }
+  return reply as Extract<WorkerWriterReply, { readonly ok: K }>
+}
 
 /** Worker side: a thin `WriterClientHandle` over `port`. */
 export function createWorkerWriterClient(
@@ -131,20 +184,37 @@ export function createWorkerWriterClient(
         sql,
         ...defined({ params }),
       }))
-      if (reply.ok === "error") throw new WorkerWriterError(reply.tag, reply.message)
-      if (reply.ok !== "query") {
-        throw new WorkerWriterError("PROTOCOL", `expected a query reply, received "${reply.ok}"`)
-      }
-      return reply.value
+      return expectReply(reply, "query").value
     },
 
     async publish(event) {
       const reply = await request((id) => ({ kind: "request", id, op: "publish", event }))
-      if (reply.ok === "error") throw new WorkerWriterError(reply.tag, reply.message)
-      if (reply.ok !== "publish") {
-        throw new WorkerWriterError("PROTOCOL", `expected a publish reply, received "${reply.ok}"`)
-      }
-      return reply.result
+      return expectReply(reply, "publish").result
+    },
+
+    async begin() {
+      return expectReply(await request((id) => ({ kind: "request", id, op: "tx.begin" })), "tx.begin").handle
+    },
+
+    async txQuery(handle, method, sql, params) {
+      const reply = await request((id) => ({
+        kind: "request",
+        id,
+        op: "tx.query",
+        handle,
+        method,
+        sql,
+        ...defined({ params }),
+      }))
+      return expectReply(reply, "tx.query").value
+    },
+
+    async commit(handle) {
+      expectReply(await request((id) => ({ kind: "request", id, op: "tx.commit", handle })), "tx.commit")
+    },
+
+    async rollback(handle) {
+      expectReply(await request((id) => ({ kind: "request", id, op: "tx.rollback", handle })), "tx.rollback")
     },
 
     dispose() {

@@ -27,7 +27,8 @@
 //   The reader maps the four required scenarios onto these kinds:
 //     worker crash              -> `crashWorker@<worker point>`
 //     forced `SQLITE_BUSY`      -> `failCommitAt@writer:commit`
-//     mid-commit crash          -> `crashWorker@writer:commit`
+//     mid-commit crash          -> `crashWorker@writer:commit` (durable publish)
+//                                  `crashWorker@writer:tx-commit` (reserved-handle tx)
 //     requester death mid-write -> `abortTxAfter@writer:tx`
 //
 //   A malformed or unknown directive is a test-configuration bug and fails

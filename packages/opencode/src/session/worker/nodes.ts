@@ -33,13 +33,14 @@
 // `SessionRunState.node`.
 
 import type { AnyNode } from "@opencode-ai/core/effect/layer-node"
+import { experimentalSessionWorkersFromEnv } from "@/effect/runtime-flags"
 
 export interface SessionWorkerNodesOptions<N extends AnyNode = AnyNode> {
   /** The hub node to contribute when session workers are enabled. */
   readonly hubNode: N
   /**
-   * Explicit gate. Defaults to `sessionWorkersEnabled(env)`, which mirrors
-   * `RuntimeFlags.experimentalSessionWorkers`.
+   * Explicit gate. Defaults to `sessionWorkersEnabled(env)`, which delegates to
+   * the canonical `RuntimeFlags.experimentalSessionWorkersFromEnv`.
    */
   readonly enabled?: boolean
   /** Environment source for the default gate. Defaults to `process.env`. */
@@ -47,14 +48,15 @@ export interface SessionWorkerNodesOptions<N extends AnyNode = AnyNode> {
 }
 
 /**
- * Whether the session-worker rollout flag is on for `env`, mirroring
- * `enabledByExperimental` (runtime-flags.ts:12-16): the dedicated
- * `OPENCODE_EXPERIMENTAL_SESSION_WORKERS` var wins when present, otherwise the
- * `OPENCODE_EXPERIMENTAL` umbrella applies.
+ * Whether the session-worker rollout flag is on for `env`. Delegates to the
+ * canonical pure predicate `experimentalSessionWorkersFromEnv` (runtime-flags.ts)
+ * so the graph decision and `RuntimeFlags.experimentalSessionWorkers` cannot
+ * drift: the dedicated `OPENCODE_EXPERIMENTAL_SESSION_WORKERS` var wins when it
+ * parses as a boolean, otherwise the `OPENCODE_EXPERIMENTAL` umbrella applies,
+ * otherwise `false`.
  */
 export function sessionWorkersEnabled(env: Record<string, string | undefined> = process.env): boolean {
-  const dedicated = env.OPENCODE_EXPERIMENTAL_SESSION_WORKERS
-  return dedicated !== undefined ? dedicated === "true" : env.OPENCODE_EXPERIMENTAL === "true"
+  return experimentalSessionWorkersFromEnv(env)
 }
 
 /**

@@ -87,6 +87,22 @@ const EXECUTOR_FIXTURE = new URL("../../fixture/session-execute-worker.ts", impo
 /** The production worker entry (reduced layer as the work factory). */
 const SESSION_WORKER = new URL("../../../src/session/worker/session-worker.ts", import.meta.url)
 
+/** Transaction methods for writer stubs whose tests never exercise them; fail loud if reached. */
+const unusedHubWriterTx: Pick<HubWriter, "begin" | "txQuery" | "commit" | "rollback"> = {
+  begin: async () => {
+    throw new Error("begin was not expected in this test")
+  },
+  txQuery: async () => {
+    throw new Error("txQuery was not expected in this test")
+  },
+  commit: async () => {
+    throw new Error("commit was not expected in this test")
+  },
+  rollback: async () => {
+    throw new Error("rollback was not expected in this test")
+  },
+}
+
 describe("12.1 the hub executes zero sessions", () => {
   it.live("work runs in the reduced-layer worker, never on the hub", () =>
     Effect.gen(function* () {
@@ -476,6 +492,18 @@ describe("35a worker port serving", () => {
   const hubWriter: HubWriter = {
     query: async () => [{ n: 1 }],
     publish: async () => ({ seq: 7, committed: true }),
+    begin: async () => {
+      throw new Error("begin was not expected in this test")
+    },
+    txQuery: async () => {
+      throw new Error("txQuery was not expected in this test")
+    },
+    commit: async () => {
+      throw new Error("commit was not expected in this test")
+    },
+    rollback: async () => {
+      throw new Error("rollback was not expected in this test")
+    },
   }
 
   test("serves a worker's writer port against the hub writer", async () => {
@@ -717,6 +745,7 @@ describe("36 production port backends", () => {
           return [{ n: 1 }]
         },
         publish: async () => ({ seq: 7, committed: true }),
+        ...unusedHubWriterTx,
       },
       broker: fakeBroker(),
       egress: (_workerID, port) => {
@@ -826,7 +855,11 @@ describe("36 production port backends", () => {
                 // real writer/broker isolate; the hub-proxy handlers still come
                 // from the layer's real service deps.
                 backends: {
-                  writer: { query: async () => [], publish: async () => ({ seq: null, committed: false }) },
+                  writer: {
+          query: async () => [],
+          publish: async () => ({ seq: null, committed: false }),
+          ...unusedHubWriterTx,
+        },
                   broker: fakeBroker(),
                   databasePath: ":memory:",
                 },
@@ -887,7 +920,11 @@ describe("36 production port backends", () => {
     let torndown = 0
     const broker = fakeBroker()
     const backends = buildProductionPortBackends({
-      writer: { query: async () => [], publish: async () => ({ seq: null, committed: false }) },
+      writer: {
+          query: async () => [],
+          publish: async () => ({ seq: null, committed: false }),
+          ...unusedHubWriterTx,
+        },
       broker: { ...broker, teardown: async () => void (torndown += 1) },
     })
 
@@ -1082,7 +1119,11 @@ describe("Q22 hub event sink", () => {
   test("buildProductionPortBackends serves the events port with a live sink", async () => {
     const { publisher, published } = recordingPublisher()
     const backends = buildProductionPortBackends({
-      writer: { query: async () => [], publish: async () => ({ seq: null, committed: false }) },
+      writer: {
+          query: async () => [],
+          publish: async () => ({ seq: null, committed: false }),
+          ...unusedHubWriterTx,
+        },
       broker: fakeBroker(),
       events: publisher,
     })

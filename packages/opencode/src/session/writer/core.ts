@@ -552,6 +552,11 @@ export class WriterCore {
     return this.enqueue(() => {
       this.assertPinned(handle)
       this.clearIdleTimer()
+      // A mid-commit crash (only armed in a real isolate) fires before COMMIT, so
+      // the open transaction is never committed; the isolate dying rolls it back
+      // and nothing partial survives — the reserved-handle analogue of the
+      // publish path's mid-commit crash.
+      Faults.crashWorker("writer:tx-commit")
       this.connection.run("COMMIT", [])
       this.pinned = undefined
       this.cache.clear()

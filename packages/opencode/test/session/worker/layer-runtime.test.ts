@@ -1,12 +1,15 @@
 // Wave 2 — reduced session layer runtime tests (TDD plan steps 23–26).
 //
-//   * 23 writer-proxy Database
+//   * 23 writer-backed Drizzle Database
 //   * 24 hub-proxy authorities (SessionStatus / Permission / Question)
 //   * 25 reduced in-worker Provider (real call against the mock provider)
 //   * 26 LLM.stream-backed ModelClient
 
+import { Database as BunDatabase } from "bun:sqlite"
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer, Stream } from "effect"
+import { eq, sql } from "drizzle-orm"
+import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core"
 import { Database } from "@opencode-ai/core/database/database"
 import { streamText } from "ai"
 import type { LLMEvent } from "@opencode-ai/llm"
@@ -28,8 +31,8 @@ import {
   sessionStatusProxyLayer,
   writerDatabaseLayer,
   type HubProxyClients,
-  type WorkerDatabaseHandle,
   type WorkerModelConfig,
+  type WriterClientHandle,
 } from "@/session/worker/layer"
 import { Provider } from "@/provider/provider"
 import { LLM } from "@/session/llm"
@@ -39,57 +42,97 @@ import { workerSnapshot } from "../../lib/snapshot"
 const sid = (value: string) => SessionID.make(value)
 
 // ---------------------------------------------------------------------------
-// Step 23 — writer-proxy Database.
+// Step 23 — writer-backed Drizzle Database.
+//
+// `writerDatabaseLayer(writer)` yields a real Drizzle `Database` whose
+// `select` / `insert` / `update` / `delete` return Effects. The writer handle
+// here is backed by a real in-memory SQLite connection so the round-trip runs
+// against genuine storage rather than a mock.
 // ---------------------------------------------------------------------------
 
+const widget = sqliteTable("widget", {
+  id: integer("id").primaryKey(),
+  name: text("name").notNull(),
+})
+
+/**
+ * A writer handle backed by an in-memory SQLite connection. The stateless
+ * `query` path serves ordinary statements; `begin` / `txQuery` / `commit` /
+ * `rollback` mirror the production writer so the reserved-connection path is
+ * real too.
+ */
+function writerOverSqlite(native: BunDatabase): WriterClientHandle {
+  let nextTxId = 1
+  const run = (method: string, statement: string, params: readonly unknown[] = []) => {
+    const query = native.query(statement)
+    return method === "values" ? query.values(...(params as never[])) : query.all(...(params as never[]))
+  }
+  return {
+    query: async (method, statement, params) => run(method, statement, params),
+    publish: async () => ({ seq: null, committed: false }),
+    begin: async () => {
+      native.run("BEGIN IMMEDIATE")
+      return `tx-${nextTxId++}`
+    },
+    txQuery: async (_handle, method, statement, params) => run(method, statement, params),
+    commit: async () => {
+      native.run("COMMIT")
+    },
+    rollback: async () => {
+      native.run("ROLLBACK")
+    },
+  }
+}
+
 describe("writerDatabaseLayer (step 23)", () => {
-  test("routes reads and writes through the writer client", async () => {
-    const calls: Array<{ method: string; sql: string; params?: readonly unknown[] }> = []
-    const writer = {
-      query: async (method: string, sql: string, params?: readonly unknown[]) => {
-        calls.push({ method, sql, params })
-        return [{ ok: 1 }]
-      },
-      publish: async () => ({ seq: 1, committed: true }),
+  test("yields a real Drizzle Database that round-trips CRUD through the writer", async () => {
+    const native = new BunDatabase(":memory:")
+    try {
+      const rows = await Effect.runPromise(
+        Effect.gen(function* () {
+          const database = yield* Database.Service
+          const db = database.db
+          yield* db.run(sql`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`)
+          yield* db
+            .insert(widget)
+            .values([
+              { id: 1, name: "alpha" },
+              { id: 2, name: "beta" },
+            ])
+            .run()
+          yield* db.update(widget).set({ name: "ALPHA" }).where(eq(widget.id, 1)).run()
+          yield* db.delete(widget).where(eq(widget.id, 2)).run()
+          return yield* db.select().from(widget).all()
+        }).pipe(Effect.provide(writerDatabaseLayer(writerOverSqlite(native)))),
+      )
+
+      expect(rows).toEqual([{ id: 1, name: "ALPHA" }])
+    } finally {
+      native.close()
     }
-
-    const result = await Effect.runPromise(
-      Effect.gen(function* () {
-        const database = yield* Database.Service
-        const db = database.db as unknown as WorkerDatabaseHandle
-        return {
-          run: yield* Effect.promise(() => db.run("UPDATE t SET x = 1", [1])),
-          all: yield* Effect.promise(() => db.all("SELECT * FROM t", [2])),
-          get: yield* Effect.promise(() => db.get("SELECT * FROM t WHERE id = ?", [3])),
-        }
-      }).pipe(Effect.provide(writerDatabaseLayer(writer))),
-    )
-
-    expect(calls).toEqual([
-      { method: "run", sql: "UPDATE t SET x = 1", params: [1] },
-      { method: "all", sql: "SELECT * FROM t", params: [2] },
-      { method: "values", sql: "SELECT * FROM t WHERE id = ?", params: [3] },
-    ])
-    expect(result.all).toEqual([{ ok: 1 }])
   })
 
   test("boundaryReplacements installs the writer proxy, not the throwing stub", async () => {
-    const writer = {
-      query: async () => [{ routed: true }],
-      publish: async () => ({ seq: 1, committed: true }),
-    }
-    const entry = boundaryReplacements(workerSnapshot(), writer).find(([node]) => node.name === Database.node.name)
-    expect(entry).toBeDefined()
+    const native = new BunDatabase(":memory:")
+    try {
+      const entry = boundaryReplacements(workerSnapshot(), writerOverSqlite(native)).find(
+        ([node]) => node.name === Database.node.name,
+      )
+      expect(entry).toBeDefined()
 
-    const rows = await Effect.runPromise(
-      Effect.gen(function* () {
-        const database = yield* Database.Service
-        return yield* Effect.promise(() =>
-          (database.db as unknown as WorkerDatabaseHandle).all("SELECT 1"),
-        )
-      }).pipe(Effect.provide(entry![1] as Layer.Layer<Database.Service>)),
-    )
-    expect(rows).toEqual([{ routed: true }])
+      const rows = await Effect.runPromise(
+        Effect.gen(function* () {
+          const database = yield* Database.Service
+          yield* database.db.run(sql`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`)
+          yield* database.db.insert(widget).values({ id: 7, name: "seven" }).run()
+          return yield* database.db.select().from(widget).all()
+        }).pipe(Effect.provide(entry![1] as Layer.Layer<Database.Service>)),
+      )
+
+      expect(rows).toEqual([{ id: 7, name: "seven" }])
+    } finally {
+      native.close()
+    }
   })
 })
 
