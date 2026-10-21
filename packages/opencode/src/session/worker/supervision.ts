@@ -22,12 +22,24 @@ export interface Supervision {
   recordCrash(workerID: number): CrashDecision
   recordHealthy(workerID: number): void
   isDegraded(workerID: number): boolean
+  /** Drop all state for a slot that no longer exists, so degraded entries do not leak. */
+  forget(workerID: number): void
 }
 
-/** Backoff for the Nth consecutive crash: `1s · 2^(N−1)`, capped at 30 s. */
+/**
+ * Backoff for the Nth consecutive crash: `1s · 2^(N−1)`, capped at 30 s.
+ * The exponent is capped so a long-lived degraded slot can never overflow to
+ * `Infinity`; a non-finite or sub-one count maps to no backoff.
+ */
 export function crashBackoffMs(attempts: number): number {
-  if (attempts < 1) return 0
-  return Math.min(CRASH_BACKOFF_MAX_MS, CRASH_BACKOFF_INITIAL_MS * 2 ** (attempts - 1))
+  if (!Number.isFinite(attempts) || attempts < 1) return 0
+  return Math.min(CRASH_BACKOFF_MAX_MS, CRASH_BACKOFF_INITIAL_MS * 2 ** Math.min(attempts - 1, 30))
+}
+
+function assertWorkerID(workerID: number): void {
+  if (!Number.isInteger(workerID) || workerID < 0) {
+    throw new Error(`invalid workerID: ${workerID} (expected a non-negative integer)`)
+  }
 }
 
 export function createSupervision(): Supervision {
@@ -42,6 +54,7 @@ export function createSupervision(): Supervision {
       return count
     },
     recordCrash(workerID) {
+      assertWorkerID(workerID)
       const attempts = (attemptsByWorker.get(workerID) ?? 0) + 1
       attemptsByWorker.set(workerID, attempts)
       return {
@@ -52,10 +65,16 @@ export function createSupervision(): Supervision {
       }
     },
     recordHealthy(workerID) {
+      assertWorkerID(workerID)
       attemptsByWorker.delete(workerID)
     },
     isDegraded(workerID) {
+      assertWorkerID(workerID)
       return (attemptsByWorker.get(workerID) ?? 0) >= CRASH_ATTEMPTS_BEFORE_DEGRADED
+    },
+    forget(workerID) {
+      assertWorkerID(workerID)
+      attemptsByWorker.delete(workerID)
     },
   }
 }

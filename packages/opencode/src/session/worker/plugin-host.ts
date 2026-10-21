@@ -52,29 +52,46 @@ export interface WorkerPluginHost {
   toolAfter(input: unknown, output: ToolAfterOutput): Promise<ToolAfterOutput>
 }
 
-async function runHook<TInput, TOutput>(
+/** Raised when two plugins share a name (fail loud). */
+export class DuplicatePluginError extends Error {
+  constructor(name: string) {
+    super(`duplicate plugin: ${name}`)
+    this.name = "DuplicatePluginError"
+  }
+}
+
+/**
+ * Run one hook across every plugin. The caller selects the hook, so the
+ * function's input/output types are pinned by the selector with no cast.
+ */
+async function runHook<TOutput>(
   plugins: readonly WorkerPlugin[],
-  hook: keyof WorkerPluginHooks,
-  input: TInput,
+  select: (hooks: WorkerPluginHooks) => ((input: unknown, output: TOutput) => void | Promise<void>) | undefined,
+  input: unknown,
   output: TOutput,
 ): Promise<TOutput> {
   for (const plugin of plugins) {
-    const fn = plugin.hooks[hook]
+    const fn = select(plugin.hooks)
     if (fn === undefined) continue
-    await (fn as (input: TInput, output: TOutput) => void | Promise<void>)(input, output)
+    await fn(input, output)
   }
   return output
 }
 
 export function createWorkerPluginHost(plugins: readonly WorkerPlugin[]): WorkerPluginHost {
+  const names = plugins.map((plugin) => plugin.name)
+  const seen = new Set<string>()
+  for (const name of names) {
+    if (seen.has(name)) throw new DuplicatePluginError(name)
+    seen.add(name)
+  }
+
   return {
-    get names() {
-      return plugins.map((plugin) => plugin.name)
-    },
-    chatParams: (input, output) => runHook(plugins, "chat.params", input, output),
-    chatHeaders: (input, output) => runHook(plugins, "chat.headers", input, output),
-    toolBefore: (input, output) => runHook(plugins, "tool.execute.before", input, output),
-    toolAfter: (input, output) => runHook(plugins, "tool.execute.after", input, output),
+    names,
+    chatParams: (input, output) => runHook(plugins, (hooks) => hooks["chat.params"], input, output),
+    chatHeaders: (input, output) => runHook(plugins, (hooks) => hooks["chat.headers"], input, output),
+    toolBefore: (input, output) => runHook(plugins, (hooks) => hooks["tool.execute.before"], input, output),
+    toolAfter: (input, output) => runHook(plugins, (hooks) => hooks["tool.execute.after"], input, output),
   }
 }
 

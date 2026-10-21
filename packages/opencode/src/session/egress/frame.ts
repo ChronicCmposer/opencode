@@ -72,12 +72,20 @@ export function encodeFrame(frame: EgressFrame): Uint8Array {
   return bytes
 }
 
-/** Decode a complete single frame; fails loud on a partial or unsupported frame. */
+/** Decode a complete single frame; fails loud on a partial, multi-frame, or unsupported frame. */
 export function decodeFrame(bytes: Uint8Array): EgressFrame {
-  const { frames, rest } = decodeFrames(bytes)
-  if (rest.byteLength !== 0) throw new MalformedFrameError(`truncated frame: ${rest.byteLength} trailing byte(s)`)
-  if (frames.length !== 1) throw new MalformedFrameError(`expected exactly 1 frame, got ${frames.length}`)
-  return frames[0]
+  if (bytes.byteLength < HEADER_BYTES) {
+    throw new MalformedFrameError(`truncated frame header: ${bytes.byteLength} of ${HEADER_BYTES} byte(s)`)
+  }
+  const length = new DataView(bytes.buffer, bytes.byteOffset, HEADER_BYTES).getUint32(0, false)
+  const total = HEADER_BYTES + length
+  if (bytes.byteLength < total) {
+    throw new MalformedFrameError(`truncated frame body: ${bytes.byteLength - HEADER_BYTES} of ${length} byte(s)`)
+  }
+  if (bytes.byteLength > total) {
+    throw new MalformedFrameError(`expected exactly 1 frame, got ${bytes.byteLength - total} trailing byte(s)`)
+  }
+  return parseFrame(bytes.subarray(HEADER_BYTES, total))
 }
 
 export interface DecodedFrames {
@@ -108,7 +116,9 @@ export function decodeFrameChunks(bytes: Uint8Array): DecodedFrameChunks {
     frames.push({ frame: parseFrame(bytes.subarray(offset + HEADER_BYTES, offset + HEADER_BYTES + length)), bytes: view })
     offset += HEADER_BYTES + length
   }
-  return { frames, rest: bytes.subarray(offset) }
+  // `rest` must not alias the caller's buffer: a later mutation or reuse of the
+  // chunk would silently corrupt the bytes we hand to the next decode.
+  return { frames, rest: bytes.slice(offset) }
 }
 
 /** Decode every complete frame in `bytes`; a partial trailing frame is returned as `rest`. */
@@ -118,7 +128,7 @@ export function decodeFrames(bytes: Uint8Array): DecodedFrames {
 }
 
 function parseFrame(body: Uint8Array): EgressFrame {
-  const parsed: unknown = JSON.parse(textDecoder.decode(body))
+  const parsed = parseJson(body)
   const frame = asRecord(parsed, "body is not an object")
   if (frame.v !== FRAME_VERSION) throw new UnsupportedFrameVersionError(frame.v)
   const kind = frame.kind
@@ -126,23 +136,65 @@ function parseFrame(body: Uint8Array): EgressFrame {
   if (kind === "deltas") {
     const events = frame.events
     if (!Array.isArray(events)) throw new MalformedFrameError("deltas.events is not an array")
-    return { kind: "deltas", v: FRAME_VERSION, events: events as readonly EgressEvent[] }
+    return { kind: "deltas", v: FRAME_VERSION, events: events.map(parseEvent) }
   }
   if (kind === "durable") {
     const meta = asRecord(frame.meta, "durable.meta is not an object")
     return {
       kind: "durable",
       v: FRAME_VERSION,
-      meta: { generation: Number(meta.generation), ordinal: Number(meta.ordinal) },
-      event: frame.event as EgressEvent,
+      meta: {
+        generation: asInteger(meta.generation, "durable.meta.generation is not an integer"),
+        ordinal: asInteger(meta.ordinal, "durable.meta.ordinal is not an integer"),
+      },
+      event: parseEvent(frame.event),
     }
   }
   throw new MalformedFrameError(`unknown kind: ${String(kind)}`)
 }
 
+/** Parse the JSON body, translating the syntax error into the codec's own error type. */
+function parseJson(body: Uint8Array): unknown {
+  try {
+    return JSON.parse(textDecoder.decode(body))
+  } catch (error) {
+    throw new MalformedFrameError(`invalid JSON body: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+/** Parse one event at the frame boundary so internal logic never sees a partial event. */
+function parseEvent(value: unknown): EgressEvent {
+  const record = asRecord(value, "event is not an object")
+  const { id, type, data, durable } = record
+  if (typeof id !== "string") throw new MalformedFrameError("event.id is not a string")
+  if (typeof type !== "string") throw new MalformedFrameError("event.type is not a string")
+  if (data === undefined) throw new MalformedFrameError("event.data is missing")
+  if (durable === undefined) return { id, type, data }
+  const stamp = asRecord(durable, "event.durable is not an object")
+  return {
+    id,
+    type,
+    data,
+    durable: {
+      aggregateID: asString(stamp.aggregateID, "event.durable.aggregateID is not a string"),
+      seq: asInteger(stamp.seq, "event.durable.seq is not an integer"),
+    },
+  }
+}
+
 function asRecord(value: unknown, message: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null) throw new MalformedFrameError(message)
   return value as Record<string, unknown>
+}
+
+function asInteger(value: unknown, message: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value)) throw new MalformedFrameError(message)
+  return value
+}
+
+function asString(value: unknown, message: string): string {
+  if (typeof value !== "string") throw new MalformedFrameError(message)
+  return value
 }
 
 export * as EgressFrameCodec from "./frame"

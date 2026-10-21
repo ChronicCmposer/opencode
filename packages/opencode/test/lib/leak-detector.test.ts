@@ -9,7 +9,7 @@ import { describe, expect, test } from "bun:test"
 import { MessageChannel } from "node:worker_threads"
 import path from "node:path"
 import { createLeakDetector } from "./leak-detector"
-import { killProcessGroup, posixSupport, spawnDetached, waitForDeath } from "./process-tree"
+import { killProcessGroup, posixSupport, processGroupId, spawnDetached, waitForDeath } from "./process-tree"
 import { createWorkerHarness, type WorkerMessage } from "./worker-harness"
 
 const workerEntry = path.join(import.meta.dir, "../fixture/harness-worker.ts")
@@ -122,5 +122,12 @@ describe("leak detector", () => {
   test.skipIf(support.supported)("child PGID detection is skipped on non-POSIX platforms", () => {
     // Documents the reason the POSIX cases are skipped rather than silently absent.
     expect(support.reason).toMatch(/POSIX/)
+  })
+
+  test.skipIf(!support.supported)("default POSIX probe delegates to process-tree isGroupAlive", () => {
+    const pgid = processGroupId(process.pid)!
+    const detector = createLeakDetector()
+    detector.trackProcessGroup(pgid)
+    expect(detector.detect().processGroups).toEqual([pgid])
   })
 })

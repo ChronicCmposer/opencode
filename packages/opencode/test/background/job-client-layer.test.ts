@@ -9,45 +9,21 @@
 // pairs (no isolates).
 
 import { describe, expect, test } from "bun:test"
-import { Effect } from "effect"
+import { Deferred, Effect } from "effect"
 import { BackgroundJob } from "@/background/job"
 import {
   createJobClient,
   serveJobRegistry,
+  type JobClient,
   type JobFrame,
-  type JobPort,
 } from "@/session/worker/job-client"
 import { createJobRegistry } from "@/session/worker/job-registry"
-
-/** An in-process hub↔worker port pair; `hub.post` reaches the worker client. */
-function createPortPair(): { hub: JobPort; worker: JobPort } {
-  const hubListeners = new Set<(frame: JobFrame) => void>()
-  const workerListeners = new Set<(frame: JobFrame) => void>()
-  const deliver = (listeners: Set<(frame: JobFrame) => void>, frame: JobFrame): void => {
-    for (const listener of listeners) listener(frame)
-  }
-  return {
-    hub: {
-      post: (frame) => deliver(workerListeners, frame),
-      onMessage: (handler) => {
-        hubListeners.add(handler)
-        return () => hubListeners.delete(handler)
-      },
-    },
-    worker: {
-      post: (frame) => deliver(hubListeners, frame),
-      onMessage: (handler) => {
-        workerListeners.add(handler)
-        return () => workerListeners.delete(handler)
-      },
-    },
-  }
-}
+import { createListenerPair } from "../lib/port-pair"
 
 describe("BackgroundJob.clientLayer routes through the hub registry", () => {
   test("runs the work locally and reports completion to the registry", async () => {
     const registry = createJobRegistry()
-    const pair = createPortPair()
+    const pair = createListenerPair<JobFrame>()
     serveJobRegistry(registry, pair.hub)
     const client = createJobClient(pair.worker)
 
@@ -68,8 +44,8 @@ describe("BackgroundJob.clientLayer routes through the hub registry", () => {
 
   test("a wait on one worker resolves when another worker completes the job", async () => {
     const registry = createJobRegistry()
-    const a = createPortPair()
-    const b = createPortPair()
+    const a = createListenerPair<JobFrame>()
+    const b = createListenerPair<JobFrame>()
     serveJobRegistry(registry, a.hub)
     serveJobRegistry(registry, b.hub)
     const clientA = createJobClient(a.worker)
@@ -94,7 +70,7 @@ describe("BackgroundJob.clientLayer routes through the hub registry", () => {
 
   test("a failed run is reported as an error job", async () => {
     const registry = createJobRegistry()
-    const pair = createPortPair()
+    const pair = createListenerPair<JobFrame>()
     serveJobRegistry(registry, pair.hub)
     const client = createJobClient(pair.worker)
 
@@ -109,5 +85,86 @@ describe("BackgroundJob.clientLayer routes through the hub registry", () => {
     expect(result.info?.status).toBe("error")
     expect(result.info?.error).toBe("boom")
     client.dispose()
+  })
+
+  test("concurrent starts of the same id run the work exactly once", async () => {
+    const registry = createJobRegistry()
+    const pair = createListenerPair<JobFrame>()
+    serveJobRegistry(registry, pair.hub)
+    const client = createJobClient(pair.worker)
+    let runs = 0
+
+    const [a, b] = await Effect.runPromise(
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const run = Effect.sync(() => {
+          runs += 1
+          return "done"
+        })
+        const started = yield* Effect.all(
+          [jobs.start({ id: "job_once", type: "test", run }), jobs.start({ id: "job_once", type: "test", run })],
+          { concurrency: "unbounded" },
+        )
+        yield* jobs.wait({ id: "job_once" })
+        return started
+      }).pipe(Effect.provide(BackgroundJob.clientLayer(client))),
+    )
+
+    expect(runs).toBe(1)
+    expect(a.id).toBe("job_once")
+    expect(b.id).toBe("job_once")
+    client.dispose()
+  })
+
+  test("onPromote runs locally when the job is promoted", async () => {
+    const registry = createJobRegistry()
+    const pair = createListenerPair<JobFrame>()
+    serveJobRegistry(registry, pair.hub)
+    const client = createJobClient(pair.worker)
+
+    const promoted = await Effect.runPromise(
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const signal = yield* Deferred.make<void>()
+        const info = yield* jobs.start({
+          id: "job_promote",
+          type: "test",
+          onPromote: Deferred.succeed(signal, undefined).pipe(Effect.asVoid),
+          run: Effect.never,
+        })
+        const after = yield* jobs.promote(info.id)
+        // The callback cannot cross the job port; the layer must run it locally.
+        yield* Deferred.await(signal).pipe(Effect.timeout("1 second"))
+        return after
+      }).pipe(Effect.provide(BackgroundJob.clientLayer(client))),
+    )
+
+    expect(promoted?.metadata?.background).toBe(true)
+    client.dispose()
+  })
+
+  test("a failed completion report terminates the job instead of stranding it", async () => {
+    const registry = createJobRegistry()
+    const pair = createListenerPair<JobFrame>()
+    serveJobRegistry(registry, pair.hub)
+    const base = createJobClient(pair.worker)
+    const client: JobClient = {
+      ...base,
+      complete: async () => {
+        throw new Error("report failed")
+      },
+    }
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const info = yield* jobs.start({ id: "job_report_fail", type: "test", run: Effect.succeed("done") })
+        return yield* jobs.wait({ id: info.id, timeout: 2000 })
+      }).pipe(Effect.provide(BackgroundJob.clientLayer(client))),
+    )
+
+    expect(result.timedOut).toBe(false)
+    expect(result.info?.status).toBe("cancelled")
+    base.dispose()
   })
 })

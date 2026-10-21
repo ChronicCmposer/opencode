@@ -74,7 +74,12 @@ const handleRun = (id: number, value: number): void => {
       }),
       Effect.runPromise,
     )
-    .then((message) => scope.postMessage(message))
+    .then(
+      (message) => scope.postMessage(message),
+      // A defect (not a typed failure) escapes `Effect.match`; still answer with
+      // a structured error frame instead of rejecting silently.
+      (reason) => scope.postMessage(toError(id, reason)),
+    )
 }
 
 const handleFail = (id: number, message: string): void => {
@@ -86,7 +91,10 @@ const handleFail = (id: number, message: string): void => {
       }),
       Effect.runPromise,
     )
-    .then((out) => scope.postMessage(out))
+    .then(
+      (out) => scope.postMessage(out),
+      (reason) => scope.postMessage(toError(id, reason)),
+    )
 }
 
 scope.onmessage = (event) => {

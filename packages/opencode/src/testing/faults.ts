@@ -52,9 +52,12 @@ export const FAULTS_ENV = "OPENCODE_TEST_FAULTS"
 /** Exit code used by the default `crashWorker` action (worker crash = exit/`onerror`). */
 export const WORKER_CRASH_EXIT_CODE = 70
 
-export type FaultKind = "crashWorker" | "failCommitAt" | "abortTxAfter"
+/** The three fault kinds, declared once; `FaultKind` is derived from this list. */
+export const FAULT_KINDS = ["crashWorker", "failCommitAt", "abortTxAfter"] as const
 
-export const FAULT_KINDS = ["crashWorker", "failCommitAt", "abortTxAfter"] as const satisfies ReadonlyArray<FaultKind>
+export type FaultKind = (typeof FAULT_KINDS)[number]
+
+const FAULT_KIND_SET: ReadonlySet<string> = new Set(FAULT_KINDS)
 
 export interface FaultDirective {
   readonly kind: FaultKind
@@ -87,10 +90,6 @@ const DISABLED_PLAN: FaultPlan = Object.freeze({
   has: () => false,
 })
 
-function isFaultKind(value: string): value is FaultKind {
-  return (FAULT_KINDS as ReadonlyArray<string>).includes(value)
-}
-
 /**
  * Parse a raw `OPENCODE_TEST_FAULTS` value into a trusted plan.
  * Pure: the same string always yields the same plan.
@@ -111,14 +110,14 @@ export function parseFaultPlan(raw: string | undefined): FaultPlan {
         directive: token,
       })
     }
-    const kind = token.slice(0, separator)
-    if (!isFaultKind(kind)) {
+    const kind = token.slice(0, separator).trim()
+    if (!FAULT_KIND_SET.has(kind)) {
       throw new FaultSpecError({
         message: `unknown ${FAULTS_ENV} kind "${kind}": expected one of ${FAULT_KINDS.join(", ")}`,
         directive: token,
       })
     }
-    directives.push({ kind, point: token.slice(separator + 1) })
+    directives.push({ kind: kind as FaultKind, point: token.slice(separator + 1).trim() })
   }
 
   if (directives.length === 0) return DISABLED_PLAN
@@ -130,22 +129,41 @@ export function parseFaultPlan(raw: string | undefined): FaultPlan {
   })
 }
 
-let cachedRaw: string | undefined
-let cachedPlan: FaultPlan | undefined
+/**
+ * A single-entry memo keyed by the raw gate value. Parsing happens before the
+ * cache is touched, so a malformed spec throws without poisoning later reads.
+ */
+function createPlanCache() {
+  let cachedRaw: string | undefined
+  let cachedPlan: FaultPlan | undefined
+  return {
+    read(raw: string | undefined): FaultPlan {
+      if (cachedPlan !== undefined && cachedRaw === raw) return cachedPlan
+      const plan = parseFaultPlan(raw)
+      cachedRaw = raw
+      cachedPlan = plan
+      return plan
+    },
+    reset(): void {
+      cachedRaw = undefined
+      cachedPlan = undefined
+    },
+  }
+}
+
+const planCache = createPlanCache()
+
+/** Clear the memoized plan (test seam for the env-gate cache). */
+export function resetFaultsCache(): void {
+  planCache.reset()
+}
 
 /**
  * The active plan, read from the environment at call time (cached per value so
  * tests may change the gate between cases without a stale plan lingering).
  */
 export function activeFaults(): FaultPlan {
-  const raw = process.env[FAULTS_ENV]
-  if (cachedPlan !== undefined && cachedRaw === raw) return cachedPlan
-  // Parse before touching the cache so a malformed spec leaves it consistent
-  // (throwing must not poison subsequent reads).
-  const plan = parseFaultPlan(raw)
-  cachedRaw = raw
-  cachedPlan = plan
-  return plan
+  return planCache.read(process.env[FAULTS_ENV])
 }
 
 export interface CrashOptions {

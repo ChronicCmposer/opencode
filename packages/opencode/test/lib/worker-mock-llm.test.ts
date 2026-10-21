@@ -67,6 +67,7 @@ describe("worker mock llm", () => {
 
       expect(result.type).toBe("chat-result")
       if (result.type !== "chat-result") return
+      expect(result.id).toBe("c1")
       expect(result.text).toBe("hello from the worker")
       expect(result.usage).toEqual({ input: 11, output: 5 })
 
@@ -89,6 +90,7 @@ describe("worker mock llm", () => {
 
       expect(result.type).toBe("chat-result")
       if (result.type !== "chat-result") return
+      expect(result.id).toBe("c2")
       expect(result.toolCalls).toEqual([{ id: "call_1", name: "lookup", arguments: '{"query":"x"}' }])
     }),
   )
@@ -106,6 +108,7 @@ describe("worker mock llm", () => {
 
       expect(result.type).toBe("chat-error")
       if (result.type !== "chat-error") return
+      expect(result.id).toBe("c3")
       expect(result.message).toContain("500")
     }),
   )

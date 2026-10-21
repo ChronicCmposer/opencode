@@ -82,31 +82,33 @@ export class WorkerCache {
    * - immutable: always valid.
    * - stale-tolerant: valid while within TTL and the snapshot epoch matches.
    * - read-through: valid until explicitly invalidated.
+   *
+   * The value is `unknown` because one cache holds entries of unrelated shapes;
+   * the caller narrows the value it asked for. A `get` hit promotes the entry.
    */
-  get<T = unknown>(key: string): T | undefined {
-    const entry = this.entries.get(key)
+  get(key: string): unknown {
+    const entry = this.validEntry(key)
     if (entry === undefined) return undefined
-    if (!this.isValid(entry)) {
-      this.entries.delete(key)
-      return undefined
-    }
     this.touch(key, entry)
-    return entry.value as T
+    return entry.value
   }
 
+  /** Whether a valid entry exists. A `has` hit promotes the entry (LRU). */
   has(key: string): boolean {
-    const entry = this.entries.get(key)
-    return entry !== undefined && this.isValid(entry)
+    const entry = this.validEntry(key)
+    if (entry === undefined) return false
+    this.touch(key, entry)
+    return true
   }
 
   /**
    * Read-through: return the cached value, or load it from the writer, cache it,
-   * and return it. Concurrent callers may each load; the cache is write-through,
-   * not a single-flight coordinator (the writer serializes anyway).
+   * and return it. A stored `undefined` is a hit, so the loader runs once per
+   * key. Concurrent callers may each load; the cache is write-through, not a
+   * single-flight coordinator (the writer serializes anyway).
    */
   async readThrough<T>(key: string, loader: () => Promise<T>): Promise<T> {
-    const cached = this.get<T>(key)
-    if (cached !== undefined) return cached
+    if (this.has(key)) return this.get(key) as T
     const value = await loader()
     this.store(key, { value, class: "read-through", storedAt: this.now(), epoch: this.currentEpoch })
     return value
@@ -142,6 +144,17 @@ export class WorkerCache {
     if (entry.class === "immutable") return true
     if (entry.class === "read-through") return true
     return entry.epoch === this.currentEpoch && this.now() - entry.storedAt <= (entry.ttlMs ?? this.defaultTtlMs)
+  }
+
+  /** Return a valid entry, evicting it when expired. */
+  private validEntry(key: string): CacheEntry | undefined {
+    const entry = this.entries.get(key)
+    if (entry === undefined) return undefined
+    if (!this.isValid(entry)) {
+      this.entries.delete(key)
+      return undefined
+    }
+    return entry
   }
 
   private store(key: string, entry: CacheEntry): void {

@@ -10,6 +10,8 @@
 
 import os from "node:os"
 import type { BootstrapInbound, BootstrapOutbound } from "./bootstrap"
+import { mergeEnv } from "@/session/broker/env"
+import { parsePositiveInt } from "@/util/parse"
 
 export const WORKER_COUNT_ENV = "OPENCODE_SESSION_WORKER_COUNT"
 
@@ -38,30 +40,19 @@ export function resolveWorkerCount(options: WorkerCountOptions = {}): number {
 
 /** A single worker below 4 cores, otherwise `cores − 2`. */
 export function deriveWorkerCount(cores: number): number {
-  assertPositiveInteger(cores, "availableParallelism")
+  parsePositiveInt(cores, "availableParallelism")
   if (cores < CORES_REQUIRED_FOR_MULTIPLE_WORKERS) return 1
   return Math.max(1, cores - RESERVED_CORES)
 }
 
 function parseWorkerCountOverride(raw: string | undefined): number | undefined {
   if (raw === undefined || raw.trim() === "") return undefined
-  const parsed = Number(raw)
-  if (!Number.isInteger(parsed) || parsed < 1) {
-    throw new Error(`invalid ${WORKER_COUNT_ENV}: ${raw} (expected a positive integer)`)
-  }
-  return parsed
+  return parsePositiveInt(raw, WORKER_COUNT_ENV)
 }
 
 function readParallelism(availableParallelism?: () => number): number {
   const detected = (availableParallelism ?? os.availableParallelism.bind(os))()
-  assertPositiveInteger(detected, "availableParallelism")
-  return detected
-}
-
-function assertPositiveInteger(value: number, label: string): void {
-  if (!Number.isInteger(value) || value < 1) {
-    throw new Error(`invalid ${label}: ${value} (expected a positive integer)`)
-  }
+  return parsePositiveInt(detected, "availableParallelism")
 }
 
 export interface PoolWorker extends AsyncDisposable {
@@ -99,18 +90,6 @@ export interface WorkerPoolOptions {
 
 const DEFAULT_ENTRY = new URL("./bootstrap.ts", import.meta.url)
 
-function mergeEnv(overlay?: Env): Record<string, string> {
-  const env: Record<string, string> = {}
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined) env[key] = value
-  }
-  for (const [key, value] of Object.entries(overlay ?? {})) {
-    if (value === undefined) delete env[key]
-    else env[key] = value
-  }
-  return env
-}
-
 interface PendingRun {
   readonly resolve: (value: number) => void
   readonly reject: (error: Error) => void
@@ -123,6 +102,16 @@ function createPoolWorker(id: number, entry: string | URL, env: Record<string, s
   let threadId = 0
   let alive = true
   let nextRunId = 1
+  let exitCode: number | undefined
+
+  const rememberExitCode = (result: unknown): void => {
+    if (typeof result === "number") exitCode = result
+  }
+
+  /** Terminate the isolate, capturing whatever exit code the runtime returns. */
+  const terminateWorker = async (): Promise<void> => {
+    rememberExitCode(await worker.terminate())
+  }
 
   let settleReady!: () => void
   let failReady!: (error: Error) => void
@@ -153,6 +142,9 @@ function createPoolWorker(id: number, entry: string | URL, env: Record<string, s
     clearTimeout(readyTimer)
     failReady(error)
     failAll(error)
+    // A worker that errored must not linger: stop the isolate and remember its
+    // exit code so a later `terminate()` reports the real one.
+    void terminateWorker().catch(() => undefined)
   }
 
   worker.onmessage = (event: MessageEvent) => {
@@ -200,13 +192,16 @@ function createPoolWorker(id: number, entry: string | URL, env: Record<string, s
   }
 
   const terminate = async (code = 0): Promise<number> => {
-    if (!alive) return code
+    if (!alive) return exitCode ?? code
     alive = false
     clearTimeout(readyTimer)
     failReady(new Error(`worker ${id} terminated`))
     failAll(new Error(`worker ${id} terminated`))
-    const result = await worker.terminate()
-    return typeof result === "number" ? result : code
+    await terminateWorker()
+    // Fall back to the requested code when the runtime reports no exit code, so
+    // the code is stable (and idempotent) for every later terminate call.
+    if (exitCode === undefined) exitCode = code
+    return exitCode
   }
 
   return {
@@ -246,10 +241,7 @@ export function spawnPoolWorker(options: SpawnWorkerOptions = {}): PoolWorker {
 }
 
 export function createWorkerPool(options: WorkerPoolOptions = {}): WorkerPool {
-  const size = options.size ?? resolveWorkerCount(options)
-  if (!Number.isInteger(size) || size < 1) {
-    throw new Error(`invalid worker pool size: ${size} (expected a positive integer)`)
-  }
+  const size = parsePositiveInt(options.size ?? resolveWorkerCount(options), "worker pool size")
   const entry = options.entry ?? DEFAULT_ENTRY
   const env = mergeEnv(options.env)
   const timeoutMs = options.timeoutMs ?? DEFAULT_READY_TIMEOUT_MS

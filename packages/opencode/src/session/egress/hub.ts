@@ -6,10 +6,15 @@
 // closes the egress + control ports (plan decision line 83). Durable frames are
 // delivered as they arrive (immediate flush worker-side), so termination never
 // reorders or loses a committed boundary.
+//
+// Termination is tracked with a `terminated` flag rather than re-decoding each
+// drained chunk to look for the `end` marker, and a durable-saturated subscriber
+// is surfaced to its stream as a terminal typed error instead of silently
+// dropping a committed boundary.
 
 import type { ControlLink } from "./control"
 import { createControlLink } from "./control"
-import { decodeFrame, type EgressFrame } from "./frame"
+import type { EgressFrame } from "./frame"
 import { createFanout, type Fanout } from "./fanout"
 import { createEgressReceiver, type EgressReceiver } from "./receiver"
 
@@ -19,6 +24,14 @@ export interface EgressHubOptions {
   readonly controlPort?: MessagePort
   /** Per-client backpressure bound; defaults to 256. */
   readonly bound?: number
+}
+
+/** Raised on a subscriber stream whose durable queue overflowed — a lost commit. */
+export class EgressStreamOverflowError extends Error {
+  constructor(readonly subscriberId: string) {
+    super(`egress subscriber "${subscriberId}" overflowed: durable queue is full`)
+    this.name = "EgressStreamOverflowError"
+  }
 }
 
 export interface EgressHub {
@@ -51,30 +64,31 @@ function createNotifier() {
   }
 }
 
-function isEndFrame(bytes: Uint8Array): boolean {
-  try {
-    return decodeFrame(bytes).kind === "end"
-  } catch {
-    return false
-  }
-}
-
 export function createEgressHub(options: EgressHubOptions): EgressHub {
   const fanout = createFanout({ bound: options.bound })
   const notifier = createNotifier()
   let frames = 0
   let closed = false
+  // Set once the terminal `end` marker is queued; the stream returns without
+  // re-decoding drained chunks to discover it.
+  let terminated = false
+
+  // Declared before `finish` so the closure never observes an uninitialized
+  // binding; both are assigned synchronously below, before any callback fires.
+  let receiver: EgressReceiver
+  let control: ControlLink | undefined
 
   const finish = (): void => {
     if (closed) return
     closed = true
     fanout.finalize(END_FRAME)
+    terminated = true
     receiver.close()
     control?.dispose()
     notifier.notify()
   }
 
-  const receiver = createEgressReceiver({
+  receiver = createEgressReceiver({
     port: options.egressPort,
     onFrame: (frame, bytes) => {
       frames++
@@ -84,7 +98,7 @@ export function createEgressHub(options: EgressHubOptions): EgressHub {
     onEnd: finish,
   })
 
-  const control = options.controlPort ? createControlLink(options.controlPort) : undefined
+  control = options.controlPort ? createControlLink(options.controlPort) : undefined
 
   return {
     fanout,
@@ -100,16 +114,17 @@ export function createEgressHub(options: EgressHubOptions): EgressHub {
       const subscriber = fanout.subscribe(subscriberId)
       try {
         while (true) {
+          // A durable-saturated overflow means a committed boundary was lost:
+          // fail loud rather than emit a silently truncated stream.
+          if (subscriber.overflowed) throw new EgressStreamOverflowError(subscriberId)
           const chunks = subscriber.drainBytes()
           if (chunks.length === 0) {
-            if (closed) return
+            if (terminated) return
             await notifier.wait()
             continue
           }
-          for (const chunk of chunks) {
-            yield chunk
-            if (isEndFrame(chunk)) return
-          }
+          for (const chunk of chunks) yield chunk
+          if (terminated) return
         }
       } finally {
         fanout.unsubscribe(subscriberId)

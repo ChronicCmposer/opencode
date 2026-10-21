@@ -16,7 +16,7 @@ describe("WorkerCache", () => {
 
     time.advance(10_000)
     cache.invalidateEpoch(5)
-    expect(cache.get<{ name: string }>("agent/plan")).toEqual({ name: "plan" })
+    expect(cache.get("agent/plan")).toEqual({ name: "plan" })
   })
 
   test("stale-tolerant entries are served within TTL and expire after it", () => {
@@ -25,7 +25,7 @@ describe("WorkerCache", () => {
     cache.defineStale("config", { model: "a" })
 
     time.advance(50)
-    expect(cache.get<{ model: string }>("config")).toEqual({ model: "a" })
+    expect(cache.get("config")).toEqual({ model: "a" })
 
     time.advance(60)
     expect(cache.get("config")).toBeUndefined()
@@ -37,7 +37,7 @@ describe("WorkerCache", () => {
     const cache = new WorkerCache({ now: time.now, ttlMs: 10_000, epoch: 1 })
     cache.defineStale("auth", { token: "old" })
 
-    expect(cache.get<{ token: string }>("auth")).toEqual({ token: "old" })
+    expect(cache.get("auth")).toEqual({ token: "old" })
     cache.invalidateEpoch(2)
     expect(cache.get("auth")).toBeUndefined()
   })
@@ -50,7 +50,7 @@ describe("WorkerCache", () => {
 
     time.advance(50)
     expect(cache.get("short")).toBeUndefined()
-    expect(cache.get<number>("long")).toBe(2)
+    expect(cache.get("long")).toBe(2)
   })
 
   test("read-through loads once then serves the cache", async () => {
@@ -64,6 +64,20 @@ describe("WorkerCache", () => {
     expect(await cache.readThrough("message:1", loader)).toEqual({ id: "message-1" })
     expect(await cache.readThrough("message:1", loader)).toEqual({ id: "message-1" })
     expect(loads).toBe(1)
+  })
+
+  test("read-through treats a cached undefined value as a hit", async () => {
+    const cache = new WorkerCache()
+    let loads = 0
+    const loader = async () => {
+      loads += 1
+      return undefined
+    }
+
+    expect(await cache.readThrough("missing:1", loader)).toBeUndefined()
+    expect(await cache.readThrough("missing:1", loader)).toBeUndefined()
+    expect(loads).toBe(1)
+    expect(cache.has("missing:1")).toBe(true)
   })
 
   test("read-through is invalidated by an own write but not by an epoch bump", async () => {
@@ -89,8 +103,8 @@ describe("WorkerCache", () => {
 
     cache.invalidateReadThrough()
     expect(cache.get("session:1")).toBeUndefined()
-    expect(cache.get<string>("model")).toBe("m")
-    expect(cache.get<string>("config")).toBe("c")
+    expect(cache.get("model")).toBe("m")
+    expect(cache.get("config")).toBe("c")
   })
 
   test("evicts least-recently-used entries at capacity", () => {
@@ -101,8 +115,21 @@ describe("WorkerCache", () => {
     cache.defineImmutable("c", 3)
 
     expect(cache.size).toBe(2)
-    expect(cache.get<number>("b")).toBeUndefined()
-    expect(cache.get<number>("a")).toBe(1)
-    expect(cache.get<number>("c")).toBe(3)
+    expect(cache.get("b")).toBeUndefined()
+    expect(cache.get("a")).toBe(1)
+    expect(cache.get("c")).toBe(3)
+  })
+
+  test("has promotes the entry so it survives the next eviction", () => {
+    const cache = new WorkerCache({ capacity: 2 })
+    cache.defineImmutable("a", 1)
+    cache.defineImmutable("b", 2)
+    cache.has("a") // promote a so b is now least-recent
+    cache.defineImmutable("c", 3)
+
+    expect(cache.size).toBe(2)
+    expect(cache.has("b")).toBe(false)
+    expect(cache.get("a")).toBe(1)
+    expect(cache.get("c")).toBe(3)
   })
 })

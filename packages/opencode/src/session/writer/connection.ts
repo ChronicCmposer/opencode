@@ -16,8 +16,18 @@ export interface WriteOutcome {
 /** Positional (`?`) or named (`$name`) bindings; the Effect SQL path uses positional. */
 export type QueryParams = ReadonlyArray<unknown> | Record<string, unknown>
 
+/**
+ * Flatten a binding list into the native driver's variadic form. `QueryParams` is
+ * intentionally broad (the Effect SQL path passes positional `unknown[]`), so this
+ * is the single point where the values are handed to `bun:sqlite`.
+ */
 function spread(params: QueryParams): unknown[] {
   return Array.isArray(params) ? [...params] : [params]
+}
+
+/** Native variadic bindings; the driver validates each value at execution time. */
+function nativeBindings(params: QueryParams): never[] {
+  return spread(params) as never[]
 }
 
 export interface WriterConnection {
@@ -63,12 +73,11 @@ export function createBunSqliteConnection(options: BunSqliteConnectionOptions): 
   for (const pragma of options.pragmas ?? []) native.exec(pragma)
 
   return {
-    all: (sql, params = []) =>
-      native.query(sql).all(...(spread(params) as never[])) as ReadonlyArray<Record<string, unknown>>,
+    all: (sql, params = []) => native.query(sql).all(...nativeBindings(params)) as ReadonlyArray<Record<string, unknown>>,
     values: (sql, params = []) =>
-      native.query(sql).values(...(spread(params) as never[])) as ReadonlyArray<ReadonlyArray<unknown>>,
+      native.query(sql).values(...nativeBindings(params)) as ReadonlyArray<ReadonlyArray<unknown>>,
     run: (sql, params = []) => {
-      const result = native.query(sql).run(...(spread(params) as never[]))
+      const result = native.query(sql).run(...nativeBindings(params))
       return { changes: Number(result.changes), lastInsertRowid: Number(result.lastInsertRowid) }
     },
     exec: (sql) => native.exec(sql),

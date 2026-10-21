@@ -6,12 +6,26 @@
 // a pure FIFO data structure; scheduling lives in `dispatch.ts`.
 
 import { Schema } from "effect"
+import { parsePositiveInt } from "@/util/parse"
 
 /** Approved admission-queue bound (plan decision line 61). */
 export const ADMISSION_QUEUE_CAPACITY = 1024
 
 /** Approved foreground child-queue bound (plan decision line 71). */
 export const CHILD_QUEUE_CAPACITY = 64
+
+/**
+ * Bound on the different-kind waiters parked behind one session key. A session
+ * that is already admitted as a foreground run, then dispatched as a child (or
+ * vice-versa), waits for the first to settle; that wait list is bounded so a
+ * misbehaving caller cannot grow it without limit.
+ */
+export const WAITER_QUEUE_CAPACITY = 64
+
+/** Fail loud unless `value` is a positive integer; returns `value` for reuse. */
+export function assertPositiveInteger(value: number, label: string): number {
+  return parsePositiveInt(value, label)
+}
 
 /** Raised when a bounded queue is at capacity and cannot admit another item. */
 export class SessionQueueFullError extends Schema.TaggedErrorClass<SessionQueueFullError>()("SessionQueueFullError", {
@@ -36,9 +50,7 @@ export interface BoundedQueue<T> {
 }
 
 export function createBoundedQueue<T>(name: string, capacity: number): BoundedQueue<T> {
-  if (!Number.isInteger(capacity) || capacity < 1) {
-    throw new Error(`invalid queue capacity: ${capacity} (expected a positive integer)`)
-  }
+  parsePositiveInt(capacity, "queue capacity")
 
   const entries: T[] = []
 

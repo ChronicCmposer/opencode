@@ -10,40 +10,66 @@
 
 import { Effect, Exit, Scope } from "effect"
 
+/** Raised when a second scope is requested for a session that is still open. */
+export class ConcurrentSessionScopeError extends Error {
+  constructor(readonly sessionID: string) {
+    super(`session scope already open for ${sessionID}`)
+    this.name = "ConcurrentSessionScopeError"
+  }
+}
+
 export interface SessionScopeHost {
   /** Sessions currently open. */
   readonly open: number
   /** Sessions whose scope has been closed (finalizers run). */
   readonly closed: number
-  /** Run `effect` under a fresh child scope, closing it (and its finalizers) on exit. */
-  run<A, E>(sessionID: string, effect: Effect.Effect<A, E, Scope.Scope>): Effect.Effect<A, E, never>
+  /**
+   * Run `effect` under a fresh child scope, closing it (and its finalizers) on
+   * exit. Re-entrant use of the same `sessionID` fails with
+   * `ConcurrentSessionScopeError` so `open`/`closed` can never drift.
+   */
+  run<A, E>(
+    sessionID: string,
+    effect: Effect.Effect<A, E, Scope.Scope>,
+  ): Effect.Effect<A, E | ConcurrentSessionScopeError, never>
   /** Close every open session scope (worker shutdown). */
   closeAll(): Effect.Effect<void>
 }
 
 export function createSessionScopeHost(): SessionScopeHost {
   const scopes = new Map<string, Scope.Closeable>()
+  const active = new Set<string>()
   let open = 0
   let closed = 0
 
-  const run = <A, E>(sessionID: string, effect: Effect.Effect<A, E, Scope.Scope>): Effect.Effect<A, E, never> =>
-    Effect.gen(function* () {
-      const scope = yield* Scope.make()
-      scopes.set(sessionID, scope)
-      open += 1
+  const run = <A, E>(
+    sessionID: string,
+    effect: Effect.Effect<A, E, Scope.Scope>,
+  ): Effect.Effect<A, E | ConcurrentSessionScopeError, never> =>
+    // `Effect.suspend` reserves the session synchronously, before `Scope.make`
+    // can yield, so two concurrent runs of the same session can never both win.
+    Effect.suspend((): Effect.Effect<A, E | ConcurrentSessionScopeError, never> => {
+      if (active.has(sessionID)) return Effect.fail(new ConcurrentSessionScopeError(sessionID))
+      active.add(sessionID)
 
-      const close = Effect.suspend((): Effect.Effect<void> => {
-        if (scopes.get(sessionID) !== scope) return Effect.void
-        scopes.delete(sessionID)
-        open -= 1
-        closed += 1
-        return Scope.close(scope, Exit.void)
-      })
+      return Effect.gen(function* () {
+        const scope = yield* Scope.make()
+        scopes.set(sessionID, scope)
+        open += 1
 
-      return yield* effect.pipe(
-        Effect.provideService(Scope.Scope, scope),
-        Effect.onExit(() => close),
-      )
+        const close = Effect.suspend((): Effect.Effect<void> => {
+          if (!scopes.has(sessionID)) return Effect.void
+          scopes.delete(sessionID)
+          open -= 1
+          closed += 1
+          return Scope.close(scope, Exit.void)
+        })
+
+        return yield* effect.pipe(
+          Effect.provideService(Scope.Scope, scope),
+          Effect.onExit(() => close),
+        )
+      }).pipe(Effect.onExit(() => Effect.sync(() => active.delete(sessionID))))
     })
 
   const closeAll = (): Effect.Effect<void> =>
@@ -82,35 +108,59 @@ export interface DirectoryStateOptions<A> {
 }
 
 /**
+ * A directory's state is either still building or ready. Presence is carried by
+ * the entry itself, never by the value, so a legitimately `undefined` value is
+ * still tracked and disposed.
+ */
+type DirectoryEntry<A> =
+  | { readonly directory: string; readonly ready: false }
+  | { readonly directory: string; readonly ready: true; readonly value: A }
+
+/**
  * Directory-keyed state holder. Switching directories disposes the old value
  * before building the new one, so a reused worker never leaks state across
- * instance directories.
+ * instance directories. `use` calls are serialized through a queue and the new
+ * directory is published before the async `build`, so a concurrent reader never
+ * observes the previous directory mid-switch.
  */
 export function createDirectoryState<A>(options: DirectoryStateOptions<A>): DirectoryState<A> {
-  let currentDirectory: string | undefined
-  let currentValue: A | undefined
+  let current: DirectoryEntry<A> | undefined
+  let queue: Promise<unknown> = Promise.resolve()
 
   const dispose = async (): Promise<void> => {
-    if (currentDirectory === undefined || currentValue === undefined) return
-    const directory = currentDirectory
-    const value = currentValue
-    currentDirectory = undefined
-    currentValue = undefined
-    await options.dispose?.(value, directory)
+    if (current === undefined) return
+    const entry = current
+    current = undefined
+    if (entry.ready) await options.dispose?.(entry.value, entry.directory)
   }
 
-  const use = async <B>(directory: string, select: (value: A) => B | Promise<B>): Promise<B> => {
-    if (directory !== currentDirectory) {
+  const use = <B>(directory: string, select: (value: A) => B | Promise<B>): Promise<B> => {
+    const result = queue.then(async () => {
+      if (current !== undefined && current.directory === directory && current.ready) {
+        return select(current.value)
+      }
       await dispose()
-      currentValue = await options.build(directory)
-      currentDirectory = directory
-    }
-    return select(currentValue as A)
+      current = { directory, ready: false }
+      let value: A
+      try {
+        value = await options.build(directory)
+      } catch (error) {
+        current = undefined
+        throw error
+      }
+      current = { directory, ready: true, value }
+      return select(value)
+    })
+    queue = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    return result
   }
 
   return {
     get current() {
-      return currentDirectory
+      return current?.directory
     },
     use,
     dispose,

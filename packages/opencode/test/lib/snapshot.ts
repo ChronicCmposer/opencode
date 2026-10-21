@@ -12,6 +12,8 @@
 // `normalizeForSnapshot` for the common "snapshot subprocess output" path.
 import fs from "node:fs"
 import os from "node:os"
+import type { RuntimeFlags } from "@/effect/runtime-flags"
+import type { WorkerSnapshot } from "@/session/worker/layer"
 
 const TMP = os.tmpdir()
 const REAL_TMP = fs.realpathSync(TMP)
@@ -70,4 +72,25 @@ export function normalizeForSnapshot(
     out = out.replace(pattern, replacement)
   }
   return out
+}
+
+/**
+ * Base `WorkerSnapshot` for session-worker tests.
+ *
+ * Every worker/layer test needs the same minimal, dependency-free snapshot; the
+ * only per-file variation is identity (`directory`, `config`, `auth`). Callers
+ * pass those as `overrides`, so a new snapshot field is declared once here
+ * instead of in four hand-rolled factories.
+ */
+export function workerSnapshot(overrides: Partial<WorkerSnapshot> = {}): WorkerSnapshot {
+  return {
+    epoch: 1,
+    directory: "/tmp/opencode-worker",
+    config: {},
+    auth: {},
+    modelsDev: {},
+    flags: {} as RuntimeFlags.Info,
+    workerCount: 2,
+    ...overrides,
+  }
 }

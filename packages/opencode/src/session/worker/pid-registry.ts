@@ -28,9 +28,36 @@ export interface ReapSupport {
 const WINDOWS_REASON =
   "process-group/PGID reaping is POSIX-only; Windows is tracked separately (ProcessReaper TODO)"
 
+/** POSIX platforms whose `kill(-pgid)` semantics are verified. */
+const SUPPORTED_PLATFORMS: ReadonlyArray<NodeJS.Platform> = [
+  "linux",
+  "darwin",
+  "freebsd",
+  "openbsd",
+  "netbsd",
+  "aix",
+  "sunos",
+]
+
+/** Explicit, platform-specific reasons for every platform outside the allow-list. */
+const PLATFORM_REASONS: Readonly<Partial<Record<NodeJS.Platform, string>>> = {
+  win32: WINDOWS_REASON,
+  cygwin: "Cygwin process-group semantics differ from POSIX; reaping is disabled",
+  android: "Android process-group reaping is unverified; reaping is disabled",
+  haiku: "Haiku process-group reaping is unverified; reaping is disabled",
+}
+
+/**
+ * Report whether PGID reaping is verified on `platform`. Only the explicit
+ * POSIX allow-list is supported; anything else is disabled with a specific
+ * reason, so an unverified platform fails safe instead of group-killing.
+ */
 export function reapSupport(platform: NodeJS.Platform = process.platform): ReapSupport {
-  if (platform === "win32") return { supported: false, reason: WINDOWS_REASON }
-  return { supported: true, reason: "" }
+  if (SUPPORTED_PLATFORMS.includes(platform)) return { supported: true, reason: "" }
+  return {
+    supported: false,
+    reason: PLATFORM_REASONS[platform] ?? `process-group/PGID reaping is unverified on ${platform}`,
+  }
 }
 
 /** The POSIX reaper: `kill(-pgid, signal)`, treating a vanished group as success. */
@@ -66,16 +93,23 @@ export interface RegisterChildInput {
 
 export interface PidRegistry {
   readonly size: number
-  /** Mirror a child's PGID. Idempotent per PGID (re-registration updates the generation). */
+  /**
+   * Mirror a child's PGID. Re-registering the same PGID for the same owner only
+   * advances its generation; re-registering it for a different owner throws.
+   */
   register(child: RegisterChildInput): RegisteredChild
   unregister(pgid: number): boolean
   has(pgid: number): boolean
   get(pgid: number): RegisteredChild | undefined
   forWorker(workerID: number): ReadonlyArray<RegisteredChild>
   entries(): ReadonlyArray<RegisteredChild>
-  /** Group-kill every PGID owned by `workerID`, then unregister them. */
+  /**
+   * Group-kill every PGID owned by `workerID`, then unregister them. Every target
+   * is attempted and forgotten even if a kill throws; failures are rethrown as an
+   * `AggregateError` afterwards.
+   */
   reap(workerID: number, signal?: NodeJS.Signals): ReadonlyArray<number>
-  /** Group-kill every mirrored PGID, then clear. */
+  /** Group-kill every mirrored PGID, then clear. Failures aggregate like `reap`. */
   reapAll(signal?: NodeJS.Signals): ReadonlyArray<number>
   clear(): void
 }
@@ -90,10 +124,24 @@ export function createPidRegistry(options: PidRegistryOptions = {}): PidRegistry
 
   const killAll = (targets: ReadonlyArray<RegisteredChild>, signal: NodeJS.Signals | undefined): ReadonlyArray<number> => {
     const reaped: number[] = []
+    const failures: unknown[] = []
     for (const child of targets) {
-      reaper.killGroup(child.pgid, signal)
+      // Forget the target before killing: an attempted PGID is always removed,
+      // so a later terminate cannot double-reap a stale mirror even if the kill
+      // throws. Every remaining target is still attempted.
       children.delete(child.pgid)
-      reaped.push(child.pgid)
+      try {
+        reaper.killGroup(child.pgid, signal)
+        reaped.push(child.pgid)
+      } catch (error) {
+        failures.push(error)
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        `failed to reap ${failures.length} of ${targets.length} process group(s)`,
+      )
     }
     return reaped
   }
@@ -106,10 +154,18 @@ export function createPidRegistry(options: PidRegistryOptions = {}): PidRegistry
       assertPositiveInteger(input.pid, "pid")
       const pgid = input.pgid ?? input.pid
       assertPositiveInteger(pgid, "pgid")
-      if (!Number.isInteger(input.workerID) || input.workerID < 0) {
-        throw new Error(`invalid workerID: ${input.workerID} (expected a non-negative integer)`)
+      assertWorkerID(input.workerID)
+      assertLabel(input.label)
+      const existing = children.get(pgid)
+      if (existing !== undefined) {
+        // A live PGID must never be silently reassigned to a different owner;
+        // that would let a terminate kill the wrong worker's children.
+        assertSameOwner(existing, input)
+        // Same owner: a re-registration (e.g. a respawn) only advances generation.
+        const updated: RegisteredChild = { ...existing, generation: input.generation ?? 0 }
+        children.set(pgid, updated)
+        return updated
       }
-      if (input.label.trim() === "") throw new Error("child label must not be empty")
       const child: RegisteredChild = {
         pid: input.pid,
         pgid,
@@ -149,21 +205,56 @@ export interface SpawnRegisteredMeta {
  * the PGID is present in the registry the instant the caller can observe it.
  * `spawn` is the synchronous `Bun.spawn(...)` (it exposes `pid` immediately);
  * the returned child is the registered mirror.
+ *
+ * `meta` is validated before `spawn` runs, so a bad registration never leaks a
+ * process. If mirroring still fails (e.g. a PGID already owned by another
+ * worker) the freshly spawned group is killed rather than left unregistered.
  */
 export function spawnRegistered(
   spawn: () => SpawnLike,
   registry: PidRegistry,
   meta: SpawnRegisteredMeta,
+  reaper: ProcessReaper = posixReaper(),
 ): RegisteredChild {
+  assertWorkerID(meta.workerID)
+  assertLabel(meta.label)
   const spawned = spawn()
   if (spawned.pid === undefined) throw new Error(`spawn returned no pid (label ${meta.label})`)
-  return registry.register({
-    pid: spawned.pid,
-    pgid: spawned.pgid ?? spawned.pid,
-    workerID: meta.workerID,
-    label: meta.label,
-    generation: meta.generation,
-  })
+  const pgid = spawned.pgid ?? spawned.pid
+  try {
+    return registry.register({
+      pid: spawned.pid,
+      pgid,
+      workerID: meta.workerID,
+      label: meta.label,
+      generation: meta.generation,
+    })
+  } catch (error) {
+    try {
+      reaper.killGroup(pgid, "SIGKILL")
+    } catch {
+      // Best effort: the registration failure is the actionable error.
+    }
+    throw error
+  }
+}
+
+function assertWorkerID(workerID: number): void {
+  if (!Number.isInteger(workerID) || workerID < 0) {
+    throw new Error(`invalid workerID: ${workerID} (expected a non-negative integer)`)
+  }
+}
+
+function assertLabel(label: string): void {
+  if (label.trim() === "") throw new Error("child label must not be empty")
+}
+
+function assertSameOwner(existing: RegisteredChild, input: RegisterChildInput): void {
+  if (existing.workerID === input.workerID && existing.label === input.label) return
+  throw new Error(
+    `pgid ${existing.pgid} is owned by worker ${existing.workerID} (${existing.label}); ` +
+      `refusing to reassign it to worker ${input.workerID} (${input.label})`,
+  )
 }
 
 function assertPositiveInteger(value: number, label: string): void {

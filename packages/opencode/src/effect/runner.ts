@@ -246,7 +246,14 @@ export function createRunnerTable<K extends string, A, E = never>(
 ): RunnerTable<K, A, E> {
   const runners = new Map<K, Runner<A, E>>()
 
-  const runnerFor = (key: K, onInterrupt?: Effect.Effect<A, E>): Runner<A, E> => {
+  // `firstOnInterruptWins`: a `Runner` captures its `onInterrupt` at creation and
+  // cannot be rewritten. A later caller that joins the SAME key's runner gets the
+  // first caller's interrupt handler — intentionally, because joining an in-flight
+  // run must not change how that run reacts to cancellation. (A `startShell` on a
+  // busy key never reaches this point: it fails with `Busy` before the handler
+  // matters.) So the parameter is named for the contract, not for what it does on
+  // the reuse path.
+  const runnerFor = (key: K, firstOnInterrupt?: Effect.Effect<A, E>): Runner<A, E> => {
     const existing = runners.get(key)
     if (existing) return existing
     const next = make<A, E>(options.scope, {
@@ -255,7 +262,7 @@ export function createRunnerTable<K extends string, A, E = never>(
         return options.onIdle?.(key) ?? Effect.void
       }),
       onBusy: options.onBusy?.(key) ?? Effect.void,
-      ...(onInterrupt ? { onInterrupt } : {}),
+      ...(firstOnInterrupt ? { onInterrupt: firstOnInterrupt } : {}),
     })
     runners.set(key, next)
     return next

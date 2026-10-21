@@ -25,6 +25,15 @@ function spyWriter() {
         const id = key.join("/")
         return store.has(id) ? { found: true, content: store.get(id) } : { found: false }
       }),
+    update: <T>(key: ReadonlyArray<string>, fn: (draft: T) => void) =>
+      Effect.sync(() => {
+        const id = key.join("/")
+        if (!store.has(id)) return { found: false as const }
+        calls.push(`update:${id}`)
+        const content = store.get(id) as T
+        fn(content)
+        return { found: true as const, content }
+      }),
     write: (key, content) =>
       Effect.sync(() => {
         calls.push(`write:${key.join("/")}`)
@@ -74,7 +83,8 @@ describe("Storage routes through the writer port (7.13)", () => {
       expect(yield* svc.list(["session"])).toEqual([["session", "s1"]])
 
       yield* svc.remove(["session", "s1"])
-      expect(spy.calls).toEqual(["write:session/s1", "write:session/s1", "remove:session/s1"])
+      // `update` is a single atomic port call, not a read-then-write pair.
+      expect(spy.calls).toEqual(["write:session/s1", "update:session/s1", "remove:session/s1"])
     }),
   )
 

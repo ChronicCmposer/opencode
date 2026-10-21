@@ -10,11 +10,13 @@
 //     dispatches to the pool and the in-hub work effect never runs.
 //
 // The pool here is a spy so "untouched" is an observable fact, not an assumption.
+// This file is the canonical home of the delegation matrix (finding #186); the
+// `startShell`/`cancel` delegation wiring that is unique to the hub lives in
+// `worker/hub-wiring.test.ts`.
 
 import { describe, expect } from "bun:test"
 import { ConfigProvider, Effect, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
-import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { BackgroundJob } from "@/background/job"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import type { SessionID } from "@/session/schema"
@@ -30,22 +32,8 @@ import type {
 } from "@/session/worker/execute"
 import { withTmpdirInstance } from "../../fixture/fixture"
 import { it } from "../../lib/effect"
-
-const sid = (value: string) => value as SessionID
-
-/** A minimal valid `SessionV1.WithParts` (the worker result payload). */
-const withParts = (sessionID: SessionID): SessionV1.WithParts =>
-  ({
-    info: {
-      id: "msg_phase14",
-      sessionID,
-      role: "user",
-      time: { created: 0 },
-      agent: "build",
-      model: { providerID: "test", modelID: "test" },
-    },
-    parts: [],
-  }) as unknown as SessionV1.WithParts
+import { sid } from "../../lib/async"
+import { withParts } from "../../lib/session-parts"
 
 /** A pool that records every dispatch so "the pool ran" is directly observable. */
 class SpyPool implements ExecutorWorkerPool {
@@ -135,59 +123,69 @@ describe("14.1 RuntimeFlags.experimentalSessionWorkers defaults OFF", () => {
   )
 })
 
+/**
+ * The canonical flag-on/flag-off delegation matrix. One row is one observable
+ * outcome of `ensureRunning` when a hub (and its pool) is present:
+ *   * `workRan` — did the in-hub work effect execute?
+ *   * `dispatched` — which sessions the pool was asked to run.
+ *   * `registrySize` — the hub's key→worker map after the call.
+ * An absent `flags` row proves the flag-off default with no flag service at all.
+ */
+interface DelegationCase {
+  readonly name: string
+  readonly sessionID: SessionID
+  readonly flags?: Partial<RuntimeFlags.Info>
+  readonly workRan: boolean
+  readonly dispatched: SessionID[]
+  readonly registrySize: number
+}
+
+const delegationMatrix: readonly DelegationCase[] = [
+  {
+    name: "flag OFF: the pool is never dispatched; the in-hub runner runs the work",
+    sessionID: sid("ses_off"),
+    workRan: true,
+    dispatched: [],
+    registrySize: 0,
+  },
+  {
+    name: "flag ON: the pool is dispatched; the in-hub work effect never runs",
+    sessionID: sid("ses_on"),
+    flags: { experimentalSessionWorkers: true },
+    workRan: false,
+    dispatched: [sid("ses_on")],
+    registrySize: 0,
+  },
+]
+
 describe("14.1 the pool is gated by the flag (a present hub is ignored when OFF)", () => {
-  it.live("flag OFF: the pool is never dispatched; the in-hub runner runs the work", () => {
-    const pool = new SpyPool(1, withParts(sid("ses_off")))
-    const hub = createSessionHub({ pool })
-    return withTmpdirInstance()(
-      Effect.gen(function* () {
+  for (const testCase of delegationMatrix) {
+    it.live(testCase.name, () => {
+      const pool = new SpyPool(1, withParts(testCase.sessionID))
+      const hub = createSessionHub({ pool })
+      const run = Effect.gen(function* () {
         const state = yield* SessionRunState.Service
         let workRan = false
         const result = yield* state.ensureRunning(
-          sid("ses_off"),
-          Effect.succeed(withParts(sid("ses_off"))),
+          testCase.sessionID,
+          Effect.succeed(withParts(testCase.sessionID)),
           Effect.sync(() => {
             workRan = true
-            return withParts(sid("ses_off"))
+            return withParts(testCase.sessionID)
           }),
         )
 
-        expect(result).toEqual(withParts(sid("ses_off")))
-        expect(workRan).toBe(true)
-        expect(pool.dispatched).toEqual([])
-        expect(hub.dispatcher.registry.size).toBe(0)
-      }).pipe(
-        Effect.provide(runStateLayer),
-        Effect.provideService(SessionHubService, hub),
-        // RuntimeFlags absent ⇒ the flag is OFF ⇒ the in-hub runner is used.
-      ),
-    )
-  })
+        expect(result).toEqual(withParts(testCase.sessionID))
+        expect(workRan).toBe(testCase.workRan)
+        expect(pool.dispatched).toEqual(testCase.dispatched)
+        expect(hub.dispatcher.registry.size).toBe(testCase.registrySize)
+      }).pipe(Effect.provide(runStateLayer), Effect.provideService(SessionHubService, hub))
 
-  it.live("flag ON: the pool is dispatched; the in-hub work effect never runs", () => {
-    const pool = new SpyPool(1, withParts(sid("ses_on")))
-    const hub = createSessionHub({ pool })
-    return withTmpdirInstance()(
-      Effect.gen(function* () {
-        const state = yield* SessionRunState.Service
-        let workRan = false
-        const result = yield* state.ensureRunning(
-          sid("ses_on"),
-          Effect.succeed(withParts(sid("ses_on"))),
-          Effect.sync(() => {
-            workRan = true
-            return withParts(sid("ses_on"))
-          }),
-        )
-
-        expect(result).toEqual(withParts(sid("ses_on")))
-        expect(workRan).toBe(false)
-        expect(pool.dispatched).toEqual([sid("ses_on")])
-      }).pipe(
-        Effect.provide(runStateLayer),
-        Effect.provideService(SessionHubService, hub),
-        Effect.provide(RuntimeFlags.layer({ experimentalSessionWorkers: true })),
-      ),
-    )
-  })
+      // `flags` absent leaves RuntimeFlags unprovided ⇒ the flag defaults OFF ⇒
+      // the in-hub runner is used; otherwise the explicit flag-on layer is added.
+      return withTmpdirInstance()(
+        testCase.flags === undefined ? run : run.pipe(Effect.provide(RuntimeFlags.layer(testCase.flags))),
+      )
+    })
+  }
 })

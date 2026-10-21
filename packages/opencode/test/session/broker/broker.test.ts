@@ -20,6 +20,7 @@ import {
 } from "@/session/broker/broker"
 import type { ServerSpec } from "@/session/broker/protocol"
 import { createLeakDetector } from "../../lib/leak-detector"
+import { pollUntil } from "../../lib/poll"
 import {
   expectedDescendantCount,
   isAlive,
@@ -71,7 +72,6 @@ interface JournalEvent {
 }
 
 function readJournal(path: string): JournalEvent[] {
-  if (!existsSync(path)) return []
   return readFileSync(path, "utf8")
     .split("\n")
     .filter(Boolean)
@@ -254,11 +254,19 @@ describe("cancel propagation by request-id (10.7)", () => {
   test("abandons an in-flight call and keeps the broker usable", async () => {
     const broker = track(createBroker())
     const directory = makeTmp()
-    await broker.acquire({ directory, servers: [mcpSpec({ env: { BROKER_CHILD_DELAY_MS: "500" } })] })
+    const journal = join(makeTmp(), "cancel-journal.jsonl")
+    await broker.acquire({
+      directory,
+      servers: [mcpSpec({ env: { BROKER_CHILD_DELAY_MS: "500", BROKER_CHILD_JOURNAL: journal } })],
+    })
 
     const started = Date.now()
     const call = broker.call({ directory, server: "fake", method: "work", requestId: "slow-call" })
-    await new Promise((resolve) => setTimeout(resolve, 50))
+    // Wait for the child to journal that the call actually started, instead of
+    // guessing with a fixed sleep, then cancel it while it is in flight.
+    await pollUntil(() => existsSync(journal) && readJournal(journal).length > 0, {
+      message: "broker call never reached the child",
+    })
     await broker.cancel("slow-call")
 
     const error = await call.catch((reason: unknown) => reason)
@@ -283,6 +291,57 @@ describe("MCP notification fan-out (10.2)", () => {
     await broker.call({ directory, server: "fake", method: "notify" })
     await waitFor(() => (seen.length > 0 ? true : undefined), { message: "notification was not fanned out" })
     expect(seen[0]).toMatchObject({ directory, server: "fake", method: "notifications/message" })
+  })
+})
+
+describe("refactor guards: crash-before-ready, handshake, acquire", () => {
+  test("does not deadlock a request when the worker never becomes ready", async () => {
+    const broker = track(
+      createBroker({ entry: new URL("./never-ready-worker.ts", import.meta.url), timeoutMs: 150 }),
+    )
+    const started = Date.now()
+    const error = await broker.acquire({ directory: "/work/a", servers: [mcpSpec()] }).catch((reason: unknown) => reason)
+    expect(error).toBeInstanceOf(BrokerRequestError)
+    expect((error as BrokerRequestError).code).toBe("timeout")
+    expect(Date.now() - started).toBeLessThan(2000)
+  })
+
+  test("two concurrent acquisitions of one directory spawn exactly one child", async () => {
+    const broker = track(createBroker())
+    const directory = makeTmp()
+    const servers = [mcpSpec()]
+    const [first, second] = await Promise.all([
+      broker.acquire({ directory, servers }),
+      broker.acquire({ directory, servers }),
+    ])
+    expect(second.instanceId).toBe(first.instanceId)
+    expect(broker.children).toHaveLength(1)
+  })
+
+  test("reports a failed initialize handshake as handshake-failed", async () => {
+    const broker = track(createBroker())
+    const spec = mcpSpec({ env: { BROKER_CHILD_FAIL_INIT: "1" } })
+    const error = await broker.acquire({ directory: makeTmp(), servers: [spec] }).catch((reason: unknown) => reason)
+    expect(error).toBeInstanceOf(BrokerRequestError)
+    expect((error as BrokerRequestError).code).toBe("handshake-failed")
+    expect(broker.children).toHaveLength(0)
+  })
+
+  test("resets the observable handshake per generation", async () => {
+    const broker = track(createBroker({ env: { [FAULTS_ENV]: "crashWorker@broker:call" } }))
+    const events: SupervisionEvent[] = []
+    broker.onSupervision((event) => events.push(event))
+    await broker.ready
+    expect(broker.handshake).toEqual(["ready", "attach", "attached"])
+
+    const directory = makeTmp()
+    await broker.acquire({ directory, servers: [mcpSpec()] })
+    await broker.call({ directory, server: "fake", method: "work" }).catch(() => undefined)
+    await waitFor(() => events.find((event) => event.type === "respawned"), { message: "broker did not respawn" })
+
+    // The respawned generation's handshake replaces, rather than appends to, the
+    // previous one.
+    expect(broker.handshake).toEqual(["ready", "attach", "attached"])
   })
 })
 
@@ -362,7 +421,11 @@ describe("teardown + crash supervision (10.5, 10.8, 10.9)", () => {
     const acquired = await broker.acquire({ directory, servers: [mcpSpec()] })
     const root = acquired.servers[0]!
 
-    const detector = createLeakDetector({ workers: () => [broker.workerHandle] })
+    // The leak detector's `WorkerLike` keys on `id`; the broker exposes its
+    // generation under that name.
+    const detector = createLeakDetector({
+      workers: () => [{ id: broker.workerHandle.generation, alive: broker.workerHandle.alive }],
+    })
     const trackedPort = detector.trackPort(broker.portHandle, "broker-rpc")
     if (posix.supported) detector.trackProcessGroup(root.pgid)
 

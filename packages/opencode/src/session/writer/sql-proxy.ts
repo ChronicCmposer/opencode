@@ -7,13 +7,22 @@
 
 import type { WriterClient } from "./client"
 import type { QueryMethod } from "./protocol"
-import type { WriteOutcome } from "./connection"
+import type { WriteOutcome, WriterConnection } from "./connection"
 
-export interface RemoteConnection {
-  all(sql: string, params?: ReadonlyArray<unknown>): Promise<ReadonlyArray<Record<string, unknown>>>
-  values(sql: string, params?: ReadonlyArray<unknown>): Promise<ReadonlyArray<ReadonlyArray<unknown>>>
-  run(sql: string, params?: ReadonlyArray<unknown>): Promise<WriteOutcome>
-  exec(sql: string): Promise<void>
+/** The (async-wrapped) return type of a synchronous connection method. */
+type RemoteReturn<K extends keyof WriterConnection> = ReturnType<WriterConnection[K]>
+
+/**
+ * The async mirror of `WriterConnection` — every execution method returns a
+ * `Promise`, and the synchronous-only `close` (the writer owns the connection)
+ * is dropped. Return types are derived from the source so the two cannot drift;
+ * params stay positional because the wire frame only carries an array.
+ */
+export type RemoteConnection = {
+  readonly all: (sql: string, params?: ReadonlyArray<unknown>) => Promise<RemoteReturn<"all">>
+  readonly values: (sql: string, params?: ReadonlyArray<unknown>) => Promise<RemoteReturn<"values">>
+  readonly run: (sql: string, params?: ReadonlyArray<unknown>) => Promise<RemoteReturn<"run">>
+  readonly exec: (sql: string) => Promise<RemoteReturn<"exec">>
 }
 
 export function createRemoteConnection(client: WriterClient): RemoteConnection {

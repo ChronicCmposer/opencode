@@ -13,7 +13,7 @@
 
 import { Schema } from "effect"
 import type { SessionID } from "@/session/schema"
-import type { JobRegistry } from "./job-registry"
+import type { JobInfo, JobRegistry } from "./job-registry"
 
 /** Raised when a subagent would exceed the resolved `subagent_depth` limit. */
 export class SubagentDepthError extends Schema.TaggedErrorClass<SubagentDepthError>()("SubagentDepthError", {
@@ -38,6 +38,22 @@ export interface SubagentAdmission {
 
 /** Fail loud on an inadmissible child; a valid admission returns normally. */
 export function assertSubagentAdmitted(admission: SubagentAdmission): void {
+  // Boundary parse: a subagent is depth ≥ 1 and the limit is a non-negative
+  // integer. Validate before any comparison so a malformed value fails loud.
+  if (!Number.isInteger(admission.depth) || admission.depth < 1) {
+    throw new SubagentDepthError({
+      message: `subagent depth ${admission.depth} must be an integer ≥ 1`,
+      depth: admission.depth,
+      limit: admission.limit,
+    })
+  }
+  if (!Number.isInteger(admission.limit) || admission.limit < 0) {
+    throw new SubagentDepthError({
+      message: `subagent depth limit ${admission.limit} must be a non-negative integer`,
+      depth: admission.depth,
+      limit: admission.limit,
+    })
+  }
   if (admission.depth > admission.limit) {
     throw new SubagentDepthError({
       message: `subagent depth ${admission.depth} exceeds the limit ${admission.limit}`,
@@ -60,7 +76,7 @@ export interface SubagentDispatchOptions {
   readonly scheduler: SubagentScheduler
   /** Resolved `subagent_depth`; the child's depth must not exceed it. */
   readonly depthLimit: number
-  /** Whether the headroom pool is full (e.g. `dispatcher.headroomCount >= dispatcher.headroomCapacity`). */
+  /** Whether the headroom pool is full (e.g. `dispatcher.headroomSlotCount >= dispatcher.headroomCapacity`). */
   readonly headroomFull: () => boolean
 }
 
@@ -76,14 +92,14 @@ export interface SubagentDispatchRequest {
 }
 
 /**
- * Admit, register and dispatch one subagent child. Resolves when the child's
- * run settles (i.e. `scheduler.dispatch` resolves); a dispatch failure marks the
- * job failed and rethrows.
+ * Admit, register and dispatch one subagent child. Resolves with the child's
+ * settled registry info once `scheduler.dispatch` resolves; a dispatch failure
+ * marks the job failed and rethrows.
  */
 export async function dispatchSubagent(
   options: SubagentDispatchOptions,
   request: SubagentDispatchRequest,
-): Promise<void> {
+): Promise<JobInfo | undefined> {
   const parent = options.registry.get(request.parentID)
   const depth = request.depth ?? (parent?.depth ?? 0) + 1
   assertSubagentAdmitted({ depth, limit: options.depthLimit, headroomFull: options.headroomFull() })
@@ -104,6 +120,7 @@ export async function dispatchSubagent(
     options.registry.fail(request.childID, error)
     throw error
   }
+  return options.registry.get(request.childID)
 }
 
 export * as Subagent from "./subagent"

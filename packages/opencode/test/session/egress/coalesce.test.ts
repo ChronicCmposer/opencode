@@ -6,8 +6,9 @@
 // and timer are injected so the window is deterministic.
 
 import { describe, expect, test } from "bun:test"
-import { createCoalescer, type CoalescerScheduler } from "@/session/egress/coalesce"
-import type { EgressEvent, EgressFrame } from "@/session/egress/frame"
+import { CoalescerEndedError, createCoalescer, type CoalescerScheduler } from "@/session/egress/coalesce"
+import type { EgressFrame } from "@/session/egress/frame"
+import { delta } from "../../lib/egress-fixtures"
 
 interface FakeScheduler {
   readonly scheduler: CoalescerScheduler
@@ -21,7 +22,6 @@ function createFakeScheduler(): FakeScheduler {
   const timers = new Map<number, { readonly at: number; readonly run: () => void }>()
   return {
     scheduler: {
-      now: () => now,
       schedule: (run, delayMs) => {
         const id = nextId++
         timers.set(id, { at: now + delayMs, run })
@@ -44,8 +44,6 @@ function createFakeScheduler(): FakeScheduler {
     },
   }
 }
-
-const delta = (id: string): EgressEvent => ({ id, type: "message.part.updated", data: { id } })
 
 function setup(options: { windowMs?: number; maxBatch?: number } = {}) {
   const frames: EgressFrame[] = []
@@ -158,5 +156,31 @@ describe("delta coalescer", () => {
     expect(fake.pending).toBe(1)
     fake.advance(16)
     expect(frames).toHaveLength(2)
+  })
+
+  test("end cancels the pending idle timer", () => {
+    const { fake, coalescer } = setup()
+    coalescer.pushDelta(delta("a"))
+    expect(fake.pending).toBe(1)
+    coalescer.end()
+    expect(fake.pending).toBe(0)
+  })
+
+  test("flush after end is a no-op", () => {
+    const { frames, coalescer } = setup()
+    coalescer.pushDelta(delta("a"))
+    coalescer.end()
+    const emitted = frames.length
+    coalescer.flush()
+    expect(frames.length).toBe(emitted)
+  })
+
+  test("pushing after end throws CoalescerEndedError", () => {
+    const { coalescer } = setup()
+    coalescer.end()
+    expect(() => coalescer.pushDelta(delta("a"))).toThrow(CoalescerEndedError)
+    expect(() =>
+      coalescer.pushDurable({ id: "d", type: "t", data: {} }, { generation: 1, ordinal: 1 }),
+    ).toThrow(CoalescerEndedError)
   })
 })

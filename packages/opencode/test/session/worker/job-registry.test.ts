@@ -11,29 +11,7 @@ import {
   type JobInfo,
   type JobScheduler,
 } from "@/session/worker/job-registry"
-
-interface TestTimer {
-  readonly delayMs: number
-  readonly run: () => void
-  cancelled: boolean
-}
-
-/** A scheduler that records timers so timeout semantics are deterministic. */
-function createTestScheduler() {
-  const timers: TestTimer[] = []
-  const schedule: JobScheduler = (delayMs, run) => {
-    const timer: TestTimer = { delayMs, run, cancelled: false }
-    timers.push(timer)
-    return () => {
-      timer.cancelled = true
-    }
-  }
-  return {
-    schedule,
-    timers,
-    pending: () => timers.filter((timer) => !timer.cancelled),
-  }
-}
+import { createRecordingScheduler } from "../../lib/scheduler"
 
 describe("9.2 registry lifecycle", () => {
   test("start registers a running job with parent linkage and cross-worker metadata", () => {
@@ -95,7 +73,7 @@ describe("9.2 registry lifecycle", () => {
   })
 
   test("wait times out against the injected scheduler", async () => {
-    const scheduler = createTestScheduler()
+    const scheduler = createRecordingScheduler<JobScheduler>()
     const registry = createJobRegistry({ schedule: scheduler.schedule })
     registry.start({ id: "ses_job", type: "task" })
 
@@ -118,7 +96,7 @@ describe("9.2 registry lifecycle", () => {
   })
 
   test("complete cancels a pending timeout", async () => {
-    const scheduler = createTestScheduler()
+    const scheduler = createRecordingScheduler<JobScheduler>()
     const registry = createJobRegistry({ schedule: scheduler.schedule })
     registry.start({ id: "ses_job", type: "task" })
     const pending = registry.wait({ id: "ses_job", timeout: 100 })
@@ -208,5 +186,60 @@ describe("9.4/9.6 parent→children index", () => {
 
     expect(registry.childrenOf("ses_parent")).toEqual(["ses_a", "ses_b"])
     expect(registry.childrenOf("ses_other")).toEqual([])
+  })
+})
+
+describe("index hygiene on id reuse (9.4/9.6)", () => {
+  test("reusing a settled id clears its stale parent link", () => {
+    const registry = createJobRegistry()
+    registry.start({ id: "ses_child", type: "task", parentID: "ses_parent_a" })
+    registry.complete("ses_child", "done")
+    registry.start({ id: "ses_child", type: "task", parentID: "ses_parent_b" })
+
+    expect(registry.parentOf("ses_child")).toBe("ses_parent_b")
+    expect(registry.childrenOf("ses_parent_a")).toEqual([])
+    expect(registry.childrenOf("ses_parent_b")).toEqual(["ses_child"])
+  })
+
+  test("reusing a settled id without a parent drops the prior edge", () => {
+    const registry = createJobRegistry()
+    registry.start({ id: "ses_child", type: "task", parentID: "ses_parent" })
+    registry.complete("ses_child", "done")
+    registry.start({ id: "ses_child", type: "task" })
+
+    expect(registry.parentOf("ses_child")).toBeUndefined()
+    expect(registry.childrenOf("ses_parent")).toEqual([])
+  })
+})
+
+describe("bounded retention (9.2)", () => {
+  test("a settled job is evicted after the retention window and its indexes pruned", () => {
+    const scheduler = createRecordingScheduler<JobScheduler>()
+    const registry = createJobRegistry({ schedule: scheduler.schedule, retentionMs: 1_000 })
+    registry.start({ id: "ses_child", type: "task", parentID: "ses_parent" })
+    registry.complete("ses_child", "done")
+
+    expect(registry.get("ses_child")?.status).toBe("completed")
+    const eviction = scheduler.timers.find((timer) => timer.delayMs === 1_000)
+    expect(eviction).toBeDefined()
+    eviction!.run()
+
+    expect(registry.get("ses_child")).toBeUndefined()
+    expect(registry.parentOf("ses_child")).toBeUndefined()
+    expect(registry.childrenOf("ses_parent")).toEqual([])
+    expect(registry.size).toBe(0)
+  })
+
+  test("the retention cap evicts the oldest settled jobs first", () => {
+    let clock = 0
+    const registry = createJobRegistry({ maxJobs: 2, retentionMs: Infinity, now: () => (clock += 10) })
+    for (const id of ["a", "b", "c"]) {
+      registry.start({ id, type: "task" })
+      registry.complete(id, "done")
+    }
+
+    expect(registry.size).toBe(2)
+    expect(registry.get("a")).toBeUndefined()
+    expect(registry.get("c")?.status).toBe("completed")
   })
 })

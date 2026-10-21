@@ -7,10 +7,10 @@
 
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
-import { RuntimeFlags } from "@/effect/runtime-flags"
 import { testEffect } from "../../lib/effect"
 import { TestLLMServer } from "../../lib/llm-server"
 import { createWorkerHarness } from "../../lib/worker-harness"
+import { workerSnapshot } from "../../lib/snapshot"
 import type { WorkerSnapshot } from "@/session/worker/layer"
 
 const it = testEffect(TestLLMServer.layer)
@@ -27,17 +27,6 @@ type WorkerOut =
   | { type: "result"; id: number; value: PipelineResult }
   | { type: "snapshot-result"; id: number; value: { epoch: number; directory: string; env: Record<string, string> } }
   | { type: "error"; id: number; message: string }
-
-const snapshot = (overrides: Partial<WorkerSnapshot> = {}): WorkerSnapshot => ({
-  epoch: 1,
-  directory: "/tmp/worker-a",
-  config: {},
-  auth: {},
-  modelsDev: {},
-  flags: {} as RuntimeFlags.Info,
-  workerCount: 2,
-  ...overrides,
-})
 
 const initMessage = (llmUrl: string, snapshotValue: WorkerSnapshot) => ({
   type: "init" as const,
@@ -56,7 +45,7 @@ describe("reduced session layer in a worker (6.1)", () => {
         const harness = createWorkerHarness()
         try {
           const worker = harness.spawn<WorkerOut, unknown>(LAYER_WORKER)
-          worker.post(initMessage(llm.url, snapshot()))
+          worker.post(initMessage(llm.url, workerSnapshot()))
           yield* Effect.promise(() => worker.waitFor("ready"))
 
           worker.post({
@@ -94,7 +83,7 @@ describe("per-worker snapshot isolation (6.2)", () => {
           const harness = createWorkerHarness()
           try {
             const worker = harness.spawn<WorkerOut, unknown>(LAYER_WORKER)
-            worker.post(initMessage(llm.url, snapshot({ directory, epoch })))
+            worker.post(initMessage(llm.url, workerSnapshot({ directory, epoch })))
             yield* Effect.promise(() => worker.waitFor("ready"))
             worker.post({ type: "snapshot", id: 1 })
             const message = yield* Effect.promise(() =>
@@ -121,7 +110,7 @@ describe("per-worker snapshot isolation (6.2)", () => {
 
 describe("worker fixture contract", () => {
   test("the snapshot payload is structured-cloneable", () => {
-    const value = snapshot()
+    const value = workerSnapshot()
     expect(structuredClone(value)).toEqual(value)
   })
 })

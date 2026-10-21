@@ -87,10 +87,8 @@ export interface LoopGapProbe {
   stop(): LoopGapSample
 }
 
-/** POSIX platforms are everything except Windows. */
-export function isPosix(platform: string = process.platform): boolean {
-  return platform !== "win32"
-}
+/** POSIX platforms are everything except Windows (single source: `process-tree`). */
+export { isPosix } from "./process-tree"
 
 /** OS thread id of the calling thread, or `undefined` when `/proc` is unavailable. */
 export function currentThreadId(): number | undefined {
@@ -191,7 +189,9 @@ export function createLoopGapProbe(options: LoopGapProbeOptions = {}): LoopGapPr
   const sample = (): LoopGapSample =>
     Object.freeze({
       threadId,
-      windowMs: (finalSample?.windowMs ?? clock()) - startedAt,
+      // `finalSample.windowMs` is already relative to `startedAt`, so it must be
+      // returned as-is; only the live branch subtracts `startedAt`.
+      windowMs: finalSample?.windowMs ?? clock() - startedAt,
       intervalMs,
       ticks,
       maxGapMs: maxGap,

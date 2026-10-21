@@ -6,11 +6,20 @@
 // rewrite the result before it is published. The hub owns nothing on this path
 // except the plugin *definitions* it shipped in the worker bootstrap.
 
-import type { ToolAfterOutput, WorkerPluginHost } from "./plugin-host"
+import type { ToolAfterOutput, ToolBeforeOutput, WorkerPluginHost } from "./plugin-host"
 
 export interface WorkerToolContext {
   readonly sessionID: string
   readonly callID: string
+}
+
+/**
+ * The single hook input shape shared by `tool.execute.before` and
+ * `tool.execute.after`. `args` is the live (possibly rewritten) argument bag.
+ */
+export interface WorkerToolHookInput extends WorkerToolContext {
+  readonly tool: string
+  args: unknown
 }
 
 export interface WorkerToolResult {
@@ -65,9 +74,15 @@ export function createWorkerToolHost(options: WorkerToolHostOptions = {}): Worke
     const tool = tools.get(name)
     if (tool === undefined) throw new UnknownToolError(name)
 
-    const input = { tool: name, sessionID: context.sessionID, callID: context.callID }
-    const before = { args }
+    const input: WorkerToolHookInput = {
+      tool: name,
+      sessionID: context.sessionID,
+      callID: context.callID,
+      args,
+    }
+    const before: ToolBeforeOutput = { args }
     if (plugins !== undefined) await plugins.toolBefore(input, before)
+    input.args = before.args
 
     const result = await tool.execute(before.args, context)
 
@@ -76,7 +91,7 @@ export function createWorkerToolHost(options: WorkerToolHostOptions = {}): Worke
       output: result.output,
       metadata: result.metadata,
     }
-    if (plugins !== undefined) await plugins.toolAfter({ ...input, args: before.args }, after)
+    if (plugins !== undefined) await plugins.toolAfter(input, after)
 
     return { title: after.title, output: after.output, metadata: after.metadata }
   }

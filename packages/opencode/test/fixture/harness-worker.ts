@@ -3,6 +3,7 @@
 //   in : { type: "echo", data }        -> out: { type: "echo", data }
 //   in : { type: "error", message }    -> out: { type: "error", message }
 //   in : { type: "spin", ms }          -> out: { type: "spun" }   (busy-waits, no await)
+//   in : { type: "throw", message }    -> worker throws uncaught (fires Worker.onerror)
 //   in : { type: "close" }             -> worker closes itself
 //   anything else                      -> out: { type: "unknown" }
 // On startup: { type: "ready", pid, threadId }
@@ -42,6 +43,8 @@ scope.onmessage = (event) => {
       scope.postMessage({ type: "spun" })
       return
     }
+    case "throw":
+      throw new Error(input.message ?? "worker threw")
     case "close":
       scope.close()
       return

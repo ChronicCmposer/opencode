@@ -93,6 +93,19 @@ describe("golden capture", () => {
     expect(() => golden.durable({ aggregate_id: "s1", seq: 0, type: "", data: {} })).toThrow(/type/)
     expect(() => golden.durable({ aggregate_id: "s1", seq: 0, type: "t", data: undefined })).toThrow(/data/)
   })
+
+  test("validates rows written directly onto a shared capture timeline", () => {
+    const capture = createCapture()
+    const golden = createGoldenCapture({ capture })
+    capture.dbWrite("durable", { aggregate_id: "s1", seq: 0, type: "t", data: {} })
+
+    expect(golden.rows).toHaveLength(1)
+    expect(golden.sequence()).toEqual([{ aggregate_id: "s1", seq: 0, type: "t" }])
+
+    capture.dbWrite("durable", { aggregate_id: "s1", seq: -1, type: "t", data: {} })
+    expect(() => golden.rows).toThrow(/seq/)
+    expect(() => golden.snapshot()).toThrow(/seq/)
+  })
 })
 
 describe("golden equivalence", () => {

@@ -3,7 +3,7 @@ import { BackgroundJob as CoreBackgroundJob } from "@opencode-ai/core/background
 import { Identifier } from "@opencode-ai/core/id/id"
 import { InstanceState } from "@/effect/instance-state"
 import type { JobClient } from "@/session/worker/job-client"
-import { Effect, Layer, Scope } from "effect"
+import { Cause, Effect, Layer, Scope } from "effect"
 
 export {
   Service,
@@ -51,12 +51,33 @@ export function clientLayer(client: JobClient): Layer.Layer<CoreBackgroundJob.Se
     Effect.gen(function* () {
       const scope = yield* Scope.Scope
 
-      const run = (id: string, work: Effect.Effect<string, unknown>): Effect.Effect<void> =>
+      // The hub registry joins a running id, but it cannot tell this worker
+      // whether it created the job or joined it. A local ownership set closes
+      // that gap: `start` runs the work at most once per id per worker.
+      const running = new Set<string>()
+      // `onPromote` is an Effect closure and cannot cross the job port, so keep
+      // it worker-local and run it when this worker promotes the job.
+      const onPromoteCallbacks = new Map<string, Effect.Effect<void>>()
+
+      /** A failed report must not strand the job: log it, then terminate the entry. */
+      const terminate = (id: string, cause: Cause.Cause<unknown>): Effect.Effect<void> =>
+        Effect.logError("BackgroundJob.clientLayer: failed to report job result", { id, cause }).pipe(
+          Effect.andThen(report(() => client.cancel(id)).pipe(Effect.catchCause(() => Effect.void))),
+        )
+
+      const run = (id: string, work: Effect.Effect<string, unknown>, ownsGuard: boolean): Effect.Effect<void> =>
         work.pipe(
-          Effect.matchEffect({
+          Effect.matchCauseEffect({
             onSuccess: (output) => report(() => client.complete(id, output)),
-            onFailure: (error) => report(() => client.fail(id, error)),
+            onFailure: (cause) => report(() => client.fail(id, Cause.squash(cause))),
           }),
+          Effect.catchCause((cause) => terminate(id, cause)),
+          Effect.ensuring(
+            Effect.sync(() => {
+              onPromoteCallbacks.delete(id)
+              if (ownsGuard) running.delete(id)
+            }),
+          ),
           Effect.forkIn(scope, { startImmediately: true }),
           Effect.asVoid,
         )
@@ -77,14 +98,18 @@ export function clientLayer(client: JobClient): Layer.Layer<CoreBackgroundJob.Se
                 ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
               }),
             )
-            yield* run(id, input.run)
+            if (input.onPromote !== undefined) onPromoteCallbacks.set(id, input.onPromote)
+            if (!running.has(id)) {
+              running.add(id)
+              yield* run(id, input.run, true)
+            }
             return info
           }),
         extend: (input) =>
           Effect.gen(function* () {
             const reserved = yield* Effect.promise(() => client.extend(input.id))
             if (!reserved) return false
-            yield* run(input.id, input.run)
+            yield* run(input.id, input.run, false)
             return true
           }),
         wait: (input) =>
@@ -95,7 +120,16 @@ export function clientLayer(client: JobClient): Layer.Layer<CoreBackgroundJob.Se
             })),
           ),
         waitForPromotion: (id) => Effect.promise(() => client.waitForPromotion(id)),
-        promote: (id) => Effect.promise(() => client.promote(id)),
+        promote: (id) =>
+          Effect.gen(function* () {
+            const info = yield* Effect.promise(() => client.promote(id))
+            const onPromote = onPromoteCallbacks.get(id)
+            if (info?.metadata?.background === true && onPromote !== undefined) {
+              onPromoteCallbacks.delete(id)
+              yield* onPromote.pipe(Effect.ignore)
+            }
+            return info
+          }),
         cancel: (id) => Effect.promise(() => client.cancel(id).then(() => client.get(id))),
       })
     }),

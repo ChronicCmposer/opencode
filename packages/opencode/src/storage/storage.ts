@@ -5,6 +5,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Effect, Exit, Layer, Option, RcMap, Schema, Context, TxReentrantLock } from "effect"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { Git } from "@/git"
+import { isEnoent } from "@/session/writer/protocol"
 
 type Migration = (dir: string, fs: FSUtil.Interface, git: Git.Interface) => Effect.Effect<void, FSUtil.Error>
 
@@ -69,6 +70,15 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/St
  */
 export interface WriterPort {
   readonly read: (key: ReadonlyArray<string>) => Effect.Effect<{ readonly found: boolean; readonly content?: unknown }>
+  /**
+   * Atomic read-modify-write owned by the writer's serialized queue, so two
+   * concurrent `Storage.update` calls can never lose a write. `found: false` when
+   * the entry is absent.
+   */
+  readonly update: <T>(
+    key: ReadonlyArray<string>,
+    fn: (draft: T) => void,
+  ) => Effect.Effect<{ readonly found: boolean; readonly content?: T }>
   readonly write: (key: ReadonlyArray<string>, content: unknown) => Effect.Effect<void>
   readonly remove: (key: ReadonlyArray<string>) => Effect.Effect<void>
   readonly list: (prefix: ReadonlyArray<string>) => Effect.Effect<ReadonlyArray<ReadonlyArray<string>>>
@@ -81,12 +91,18 @@ function file(dir: string, key: string[]) {
 }
 
 function missing(err: unknown) {
+  // Shared Node-ENOENT detector; the Effect adapter adds its own tagged NotFound.
+  if (isEnoent(err)) return true
   if (!err || typeof err !== "object") return false
-  if ("code" in err && err.code === "ENOENT") return true
   if ("reason" in err && err.reason && typeof err.reason === "object" && "_tag" in err.reason) {
     return err.reason._tag === "NotFound"
   }
   return false
+}
+
+/** The writer port yields parsed-but-untyped content; `read`/`update` are generic. */
+function narrow<T>(value: unknown): T {
+  return value as T
 }
 
 function parseMigration(text: string) {
@@ -295,7 +311,7 @@ const layer = Layer.effect(
         if (Option.isSome(writer)) {
           const result = yield* writer.value.read(key)
           if (!result.found) return yield* fail(file((yield* state).dir, key))
-          return result.content as T
+          return narrow<T>(result.content)
         }
         const value = yield* withResolved(key, (target, rw) =>
           TxReentrantLock.withReadLock(rw, wrap(target, fs.readJson(target))),
@@ -306,25 +322,22 @@ const layer = Layer.effect(
     const update: Interface["update"] = <T>(key: string[], fn: (draft: T) => void) =>
       Effect.gen(function* () {
         if (Option.isSome(writer)) {
-          const result = yield* writer.value.read(key)
+          const result = yield* writer.value.update<T>(key, fn)
           if (!result.found) return yield* fail(file((yield* state).dir, key))
-          const content = result.content as T
-          fn(content)
-          yield* writer.value.write(key, content)
-          return content
+          return narrow<T>(result.content)
         }
         const value = yield* withResolved(key, (target, rw) =>
           TxReentrantLock.withWriteLock(
             rw,
             Effect.gen(function* () {
               const content = yield* wrap(target, fs.readJson(target))
-              fn(content as T)
+              fn(narrow<T>(content))
               yield* writeJson(target, content)
               return content
             }),
           ),
         )
-        return value as T
+        return narrow<T>(value)
       })
 
     const write: Interface["write"] = (key: string[], content: unknown) =>

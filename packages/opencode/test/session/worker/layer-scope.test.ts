@@ -1,7 +1,7 @@
 // Phase 6.7 — per-session child scope + directory state disposal tests.
 
 import { describe, expect, test } from "bun:test"
-import { Effect } from "effect"
+import { Effect, Fiber } from "effect"
 import { createDirectoryState, createSessionScopeHost } from "@/session/worker/session-scope"
 
 describe("session scope host", () => {
@@ -91,6 +91,22 @@ describe("session scope host", () => {
     expect(host.open).toBe(0)
     fiber.interruptUnsafe(0)
   })
+
+  test("a concurrent second run for the same session is rejected, not silently leaked", async () => {
+    const host = createSessionScopeHost()
+    const fiber = Effect.runFork(host.run("s1", Effect.never))
+
+    await Effect.runPromise(Effect.yieldNow)
+    expect(host.open).toBe(1)
+
+    await expect(Effect.runPromise(host.run("s1", Effect.void))).rejects.toThrow(/already open for s1/)
+    expect(host.open).toBe(1)
+    expect(host.closed).toBe(0)
+
+    await Effect.runPromise(Fiber.interrupt(fiber))
+    expect(host.open).toBe(0)
+    expect(host.closed).toBe(1)
+  })
 })
 
 describe("directory state", () => {
@@ -126,5 +142,67 @@ describe("directory state", () => {
     await state.use("/a", () => undefined)
     await state.use("/a", () => undefined)
     expect(builds).toBe(1)
+  })
+
+  test("a built undefined value is still present and disposed", async () => {
+    const disposed: string[] = []
+    const state = createDirectoryState<undefined>({
+      build: () => undefined,
+      dispose: (_value, directory) => void disposed.push(directory),
+    })
+
+    await state.use("/a", () => undefined)
+    expect(state.current).toBe("/a")
+
+    await state.use("/b", () => undefined)
+    expect(disposed).toEqual(["/a"])
+
+    await state.dispose()
+    expect(disposed).toEqual(["/a", "/b"])
+    expect(state.current).toBeUndefined()
+  })
+
+  test("concurrent switches are serialized so builds never interleave", async () => {
+    const events: string[] = []
+    const state = createDirectoryState<{ directory: string }>({
+      build: async (directory) => {
+        events.push(`build:start:${directory}`)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        events.push(`build:end:${directory}`)
+        return { directory }
+      },
+      dispose: (value) => void events.push(`dispose:${value.directory}`),
+    })
+
+    const [a, b] = await Promise.all([state.use("/a", (value) => value.directory), state.use("/b", (value) => value.directory)])
+
+    expect(a).toBe("/a")
+    expect(b).toBe("/b")
+    expect(events).toEqual(["build:start:/a", "build:end:/a", "dispose:/a", "build:start:/b", "build:end:/b"])
+  })
+
+  test("current reflects the new directory before the build resolves", async () => {
+    let enterBuild: (() => void) | undefined
+    const buildEntered = new Promise<void>((resolve) => {
+      enterBuild = resolve
+    })
+    let release: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const state = createDirectoryState<{ directory: string }>({
+      build: async (directory) => {
+        enterBuild?.()
+        await gate
+        return { directory }
+      },
+    })
+
+    const pending = state.use("/a", (value) => value.directory)
+    await buildEntered
+    expect(state.current).toBe("/a")
+
+    release?.()
+    expect(await pending).toBe("/a")
   })
 })

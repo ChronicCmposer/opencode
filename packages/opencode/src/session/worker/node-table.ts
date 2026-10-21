@@ -88,12 +88,22 @@ export const SESSION_EXCLUDED: readonly NodeEntry[] = [
   entry("ModelsDev", "@opencode/ModelsDev", ["hub"], "excluded", "hub-only catalog refresh"),
 ]
 
+/**
+ * Client service keys. This is the single source of truth: `layer.ts` keys its
+ * client service classes from these constants, so the table and the layer can
+ * never drift apart.
+ */
+export const WRITER_CLIENT_KEY = "@opencode/session-worker/WriterClient"
+export const EVENT_EGRESS_CLIENT_KEY = "@opencode/session-worker/EventEgressClient"
+export const BROKER_CLIENT_KEY = "@opencode/session-worker/BrokerClient"
+export const BACKGROUND_JOB_CLIENT_KEY = "@opencode/session-worker/BackgroundJobClient"
+
 /** Client nodes the session layer MUST contain (task 6.5: writer RPC client present). */
 export const SESSION_CLIENT_KEYS: readonly string[] = [
-  "@opencode/session-worker/WriterClient",
-  "@opencode/session-worker/EventEgressClient",
-  "@opencode/session-worker/BrokerClient",
-  "@opencode/session-worker/BackgroundJobClient",
+  WRITER_CLIENT_KEY,
+  EVENT_EGRESS_CLIENT_KEY,
+  BROKER_CLIENT_KEY,
+  BACKGROUND_JOB_CLIENT_KEY,
 ]
 
 const ALL_ENTRIES: readonly NodeEntry[] = [...SESSION_ALLOWLIST, ...SESSION_EXCLUDED]
@@ -101,49 +111,64 @@ const ALL_ENTRIES: readonly NodeEntry[] = [...SESSION_ALLOWLIST, ...SESSION_EXCL
 const EXCLUDED_KEYS: ReadonlySet<string> = new Set(SESSION_EXCLUDED.map((item) => item.key))
 const CLIENT_KEY_SET: ReadonlySet<string> = new Set(SESSION_CLIENT_KEYS)
 
+/** Key and label both resolve to the same entry. */
+const LOOKUP: ReadonlyMap<string, NodeEntry> = new Map(
+  ALL_ENTRIES.flatMap((item) => [
+    [item.key, item],
+    [item.label, item],
+  ]),
+)
+
+/** The table governs application nodes; Effect runtime infrastructure is out of scope. */
+const isApplicationNode = (name: string): boolean => name.startsWith("@opencode/")
+
 /** Look up a table entry by node name or label. */
 export function lookupNode(name: string): NodeEntry | undefined {
-  return ALL_ENTRIES.find((item) => item.key === name || item.label === name)
+  return LOOKUP.get(name)
+}
+
+type AnyNode = LayerNode.AnyNode
+
+/**
+ * Single traversal shared by `collectNodeNames` and `findNode`. Results are
+ * memoized per node, so a node reachable by several paths is visited once.
+ */
+function walkNodes<Result>(root: AnyNode, visit: (node: AnyNode, recur: (node: AnyNode) => Result) => Result): Result {
+  // Boxed so a legitimately `undefined` result is still a cache hit.
+  const cache = new Map<AnyNode, { readonly value: Result }>()
+  const recur = (node: AnyNode): Result => {
+    const cached = cache.get(node)
+    if (cached !== undefined) return cached.value
+    const value = visit(node, recur)
+    cache.set(node, { value })
+    return value
+  }
+  return recur(root)
 }
 
 /** Walk a node graph and collect every reachable node name (groups excluded). */
-export function collectNodeNames(root: LayerNode.Node<unknown, unknown, any>): ReadonlySet<string> {
+export function collectNodeNames(root: AnyNode): ReadonlySet<string> {
   const names = new Set<string>()
-  const seen = new Set<LayerNode.Node<unknown, unknown, any>>()
-  const visit = (node: LayerNode.Node<unknown, unknown, any>): void => {
-    if (seen.has(node)) return
-    seen.add(node)
+  walkNodes(root, (node, recur) => {
     if (node.kind !== "group") names.add(node.name)
-    for (const dependency of node.dependencies) visit(dependency)
-  }
-  visit(root)
+    for (const dependency of node.dependencies) recur(dependency)
+  })
   return names
 }
 
 /** Find a node by name in a graph (depth-first, first match). */
-export function findNode(
-  root: LayerNode.Node<unknown, unknown, any>,
-  name: string,
-): LayerNode.Node<unknown, unknown, any> | undefined {
-  const seen = new Set<LayerNode.Node<unknown, unknown, any>>()
-  const search = (node: LayerNode.Node<unknown, unknown, any>): LayerNode.Node<unknown, unknown, any> | undefined => {
+export function findNode(root: AnyNode, name: string): AnyNode | undefined {
+  return walkNodes<AnyNode | undefined>(root, (node, recur) => {
     if (node.name === name && node.kind !== "group") return node
-    if (seen.has(node)) return undefined
-    seen.add(node)
     for (const dependency of node.dependencies) {
-      const found = search(dependency)
+      const found = recur(dependency)
       if (found !== undefined) return found
     }
     return undefined
-  }
-  return search(root)
+  })
 }
 
 type AnyReplacement = LayerNode.Replacements[number][1]
-
-function isNode(input: AnyReplacement): input is LayerNode.Node<unknown, unknown, any> {
-  return "kind" in input && "dependencies" in input
-}
 
 function replacementMap(replacements: LayerNode.Replacements): ReadonlyMap<string, AnyReplacement> {
   const map = new Map<string, AnyReplacement>()
@@ -156,7 +181,7 @@ export interface SessionLayerReport {
   readonly excluded: readonly string[]
   /** Required client nodes absent from the effective graph (must be empty). */
   readonly missingClients: readonly string[]
-  /** Reachable nodes that are neither allowlisted nor excluded (informational). */
+  /** Reachable application nodes that are neither allowlisted nor excluded (must be empty). */
   readonly unknown: readonly string[]
   readonly ok: boolean
 }
@@ -194,12 +219,14 @@ export function validateSessionLayer(
 
     const replacement = map.get(node.name)
     if (replacement !== undefined) {
-      if (isNode(replacement)) for (const dependency of replacement.dependencies) visit(dependency)
+      if (LayerNode.isNode(replacement)) for (const dependency of replacement.dependencies) visit(dependency)
       return
     }
 
     if (EXCLUDED_KEYS.has(node.name)) excluded.push(node.name)
-    if (lookupNode(node.name) === undefined) unknown.add(node.name)
+    // Fail closed: a reachable application node the table does not classify is
+    // a violation, so a new dependency cannot slip in unclassified.
+    if (lookupNode(node.name) === undefined && isApplicationNode(node.name)) unknown.add(node.name)
 
     for (const dependency of node.dependencies) visit(dependency)
   }
@@ -210,7 +237,7 @@ export function validateSessionLayer(
     excluded: [...excluded].sort(),
     missingClients,
     unknown: [...unknown].sort(),
-    ok: excluded.length === 0 && missingClients.length === 0,
+    ok: excluded.length === 0 && missingClients.length === 0 && unknown.size === 0,
   }
 }
 
@@ -221,6 +248,7 @@ export class SessionLayerViolationError extends Error {
     const parts: string[] = []
     if (report.excluded.length > 0) parts.push(`excluded nodes present: ${report.excluded.join(", ")}`)
     if (report.missingClients.length > 0) parts.push(`missing client nodes: ${report.missingClients.join(", ")}`)
+    if (report.unknown.length > 0) parts.push(`unclassified nodes present: ${report.unknown.join(", ")}`)
     super(`session layer violates the node table (${parts.join("; ")})`)
     this.name = "SessionLayerViolationError"
     this.report = report

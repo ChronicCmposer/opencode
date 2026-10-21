@@ -9,6 +9,7 @@
 // `reportedRssBytes` is an observed in-worker sample, `rssBytes` is the hub reading.
 
 import path from "node:path"
+import { bootMany, summarizeBootLevel } from "./worker-boot"
 import { createWorkerHarness } from "./worker-harness"
 
 const DEFAULT_TIMEOUT_MS = 10000
@@ -76,26 +77,6 @@ export function readRssBytes(): number {
   return rss
 }
 
-function median(values: ReadonlyArray<number>): number {
-  if (values.length === 0) return 0
-  const sorted = values.slice().sort((left, right) => left - right)
-  const middle = Math.floor(sorted.length / 2)
-  if (sorted.length % 2 === 1) return sorted[middle]!
-  return (sorted[middle - 1]! + sorted[middle]!) / 2
-}
-
-function levelReport(workers: number, samples: ReadonlyArray<BootSample>, rssBytes: number): BootLevelReport {
-  const bootMs = samples.map((sample) => sample.bootMs)
-  return {
-    workers,
-    samples,
-    bootMs,
-    medianBootMs: median(bootMs),
-    maxBootMs: bootMs.length === 0 ? 0 : Math.max(...bootMs),
-    rssBytes,
-  }
-}
-
 export async function measureBootMemory(options: MeasureBootMemoryOptions = {}): Promise<BootMemoryReport> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const harness = createWorkerHarness({ cores: options.cores, timeoutMs })
@@ -118,16 +99,10 @@ export async function measureBootMemory(options: MeasureBootMemoryOptions = {}):
     return { workerId: worker.id, bootMs: performance.now() - started, reportedRssBytes: ready.rssBytes }
   }
 
-  const bootMany = async (count: number): Promise<BootSample[]> => {
-    const samples: BootSample[] = []
-    for (let index = 0; index < count; index++) samples.push(await bootWorker())
-    return samples
-  }
-
   try {
-    const atKSamples = await bootMany(k)
+    const atKSamples = await bootMany(k, bootWorker)
     const atKRssBytes = readRssBytes()
-    const extraSamples = await bootMany(extra)
+    const extraSamples = await bootMany(extra, bootWorker)
     const atKPlusExtraRssBytes = readRssBytes()
 
     const allSamples = [...atKSamples, ...extraSamples]
@@ -136,8 +111,8 @@ export async function measureBootMemory(options: MeasureBootMemoryOptions = {}):
       k,
       extra,
       baselineRssBytes,
-      atK: levelReport(atKSamples.length, atKSamples, atKRssBytes),
-      atKPlusExtra: levelReport(allSamples.length, allSamples, atKPlusExtraRssBytes),
+      atK: summarizeBootLevel(atKSamples.length, atKSamples, atKRssBytes),
+      atKPlusExtra: summarizeBootLevel(allSamples.length, allSamples, atKPlusExtraRssBytes),
       totalBootMs: allSamples.reduce((sum, sample) => sum + sample.bootMs, 0),
     }
   } finally {

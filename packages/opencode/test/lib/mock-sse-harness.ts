@@ -40,6 +40,7 @@ import {
 } from "./loop-gap"
 import { createMetrics, type Metrics, type MetricsSnapshot } from "./metrics"
 import { deriveWorkerCount, readRssBytes } from "./boot-memory"
+import { bootMany, summarizeBootLevel } from "./worker-boot"
 import { createWorkerHarness, type HarnessWorker, type WorkerHarness } from "./worker-harness"
 
 // --- Shared constants -------------------------------------------------------
@@ -262,6 +263,8 @@ export interface ParallelSessionOptions {
   readonly baseUrl: string
   readonly burnIterations?: number
   readonly model?: string
+  /** API key handed to the worker; defaults to the worker-side test key. */
+  readonly apiKey?: string
   /** Injected core count for deterministic pool sizing. */
   readonly cores?: number
   readonly timeoutMs?: number
@@ -292,23 +295,41 @@ export interface ParallelSessionReport {
 type WorkerOutbound = SessionExecutorOutbound | { readonly type: "ports"; readonly egress: MessagePort }
 type WorkerInbound = SessionExecutorInbound
 
+/** A spawned worker plus the single promise that resolves its bootstrap handshake. */
 interface SpawnedWorker {
   readonly worker: ExecutorWorker
-  readonly ready: Promise<number>
-  readonly ports: Promise<MessagePort | undefined>
+  /** Resolves once the worker reported `ready` AND transferred its egress port. */
+  readonly spawn: Promise<{ readonly threadId: number; readonly egress: MessagePort | undefined }>
 }
 
-const EXECUTOR_FRAME_TYPES: ReadonlySet<string> = new Set([
+/**
+ * The executor outbound frame types, derived from `SessionExecutorOutbound` so
+ * the runtime set cannot drift from the type union. `satisfies` rejects any
+ * member that is not a valid outbound type at compile time.
+ */
+const EXECUTOR_FRAME_TYPES = [
   "ready",
   "pong",
   "busy",
   "cancelled",
   "done",
   "error",
-])
+] as const satisfies ReadonlyArray<SessionExecutorOutbound["type"]>
+
+const EXECUTOR_FRAME_TYPE_SET: ReadonlySet<string> = new Set(EXECUTOR_FRAME_TYPES)
 
 function isExecutorOutbound(message: WorkerOutbound): message is SessionExecutorOutbound {
-  return EXECUTOR_FRAME_TYPES.has(message.type)
+  return EXECUTOR_FRAME_TYPE_SET.has(message.type)
+}
+
+/**
+ * Sessions completed per second for a run. A non-positive wall time yields `0`
+ * instead of `Infinity`/`NaN`, so an instantaneous run still records a finite
+ * throughput rather than poisoning the metrics snapshot.
+ */
+export function throughputPerSec(sessions: number, wallMs: number): number {
+  if (!(wallMs > 0)) return 0
+  return sessions / (wallMs / 1000)
 }
 
 function requirePositiveInteger(value: number, label: string): number {
@@ -318,11 +339,18 @@ function requirePositiveInteger(value: number, label: string): number {
   return value
 }
 
-function mockSseEnv(baseUrl: string, burnIterations: number, model?: string): Record<string, string> {
+/** Build the worker environment overlay handed to a spawned session worker. */
+export function mockSseEnv(
+  baseUrl: string,
+  burnIterations: number,
+  model?: string,
+  apiKey?: string,
+): Record<string, string> {
   return {
     [MOCK_SSE_URL_ENV]: baseUrl,
     [MOCK_SSE_BURN_ENV]: String(burnIterations),
     ...(model === undefined ? {} : { [MOCK_SSE_MODEL_ENV]: model }),
+    ...(apiKey === undefined ? {} : { [MOCK_SSE_API_KEY_ENV]: apiKey }),
   }
 }
 
@@ -349,16 +377,16 @@ function spawnSessionWorker(
   timeoutMs: number,
 ): SpawnedWorker {
   const handle = harness.spawn<WorkerOutbound, WorkerInbound>(entry, { env })
-  const ready = handle
-    .waitFor((message) => message.type === "ready", { timeoutMs })
-    .then((message) => (message.type === "ready" ? message.threadId : 0))
-  const ports = handle
-    .waitFor((message) => message.type === "ports", { timeoutMs })
-    .then((message) => (message.type === "ports" ? message.egress : undefined))
+  const spawn = Promise.all([
+    handle.waitFor((message) => message.type === "ready", { timeoutMs }),
+    handle.waitFor((message) => message.type === "ports", { timeoutMs }),
+  ]).then(([ready, ports]) => ({
+    threadId: ready.type === "ready" ? ready.threadId : 0,
+    egress: ports.type === "ports" ? ports.egress : undefined,
+  }))
   return {
     worker: createExecutorWorker({ id, transport: executorTransport(handle), workKind: MOCK_SSE_WORK_KIND, timeoutMs }),
-    ready,
-    ports,
+    spawn,
   }
 }
 
@@ -373,7 +401,7 @@ function recordRun(metrics: Metrics, run: { sessions: number; poolSize: number; 
   metrics.gauge("parallel.sessions", run.sessions)
   metrics.gauge("parallel.pool_size", run.poolSize)
   metrics.gauge("parallel.wall_ms", run.wallMs)
-  metrics.gauge("parallel.throughput_per_sec", run.sessions / (run.wallMs / 1000))
+  metrics.gauge("parallel.throughput_per_sec", throughputPerSec(run.sessions, run.wallMs))
   metrics.gauge("parallel.busy_threads", run.busyThreads)
 }
 
@@ -388,7 +416,7 @@ export async function runParallelSessions(options: ParallelSessionOptions): Prom
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const burnIterations = options.burnIterations ?? DEFAULT_BURN_ITERATIONS
   const entry = options.entry ?? MOCK_SSE_WORKER_ENTRY
-  const env = mockSseEnv(options.baseUrl, burnIterations, options.model)
+  const env = mockSseEnv(options.baseUrl, burnIterations, options.model, options.apiKey)
 
   const metrics = createMetrics()
   const harness = createWorkerHarness({ cores: options.cores, timeoutMs })
@@ -408,8 +436,9 @@ export async function runParallelSessions(options: ParallelSessionOptions): Prom
 
   let report: Omit<ParallelSessionReport, "leak"> | undefined
   try {
-    const threadIds = await Promise.all(spawned.map((worker) => worker.ready))
-    const ports = await Promise.all(spawned.map((worker) => worker.ports))
+    const bootstraps = await Promise.all(spawned.map((worker) => worker.spawn))
+    const threadIds = bootstraps.map((bootstrap) => bootstrap.threadId)
+    const ports = bootstraps.map((bootstrap) => bootstrap.egress)
     for (const [index, port] of ports.entries()) {
       if (port !== undefined) leakDetector.trackPort(port, `worker-${index + 1}-egress`)
     }
@@ -432,7 +461,7 @@ export async function runParallelSessions(options: ParallelSessionOptions): Prom
       sessions,
       poolSize,
       wallMs,
-      throughputPerSec: sessions / (wallMs / 1000),
+      throughputPerSec: throughputPerSec(sessions, wallMs),
       busyThreads,
       threadCpu,
       hubLoopGap,
@@ -482,26 +511,6 @@ export interface MeasureSessionBootOptions {
   readonly timeoutMs?: number
 }
 
-function median(values: ReadonlyArray<number>): number {
-  if (values.length === 0) return 0
-  const sorted = values.slice().sort((left, right) => left - right)
-  const middle = Math.floor(sorted.length / 2)
-  if (sorted.length % 2 === 1) return sorted[middle]!
-  return (sorted[middle - 1]! + sorted[middle]!) / 2
-}
-
-function bootLevel(workers: number, samples: ReadonlyArray<SessionBootSample>, rssBytes: number): SessionBootLevel {
-  const bootMs = samples.map((sample) => sample.bootMs)
-  return {
-    workers,
-    samples,
-    bootMs,
-    medianBootMs: median(bootMs),
-    maxBootMs: bootMs.length === 0 ? 0 : Math.max(...bootMs),
-    rssBytes,
-  }
-}
-
 /**
  * Boot the REAL session-worker entry K times, then `extra` more, recording each
  * worker's boot ms and the process RSS at each level. Bun workers are threads in
@@ -538,16 +547,10 @@ export async function measureSessionWorkerBoot(options: MeasureSessionBootOption
     throw new Error(`session worker did not report ready after ${BOOT_ATTEMPTS} attempts: ${reason}`)
   }
 
-  const bootMany = async (count: number): Promise<SessionBootSample[]> => {
-    const samples: SessionBootSample[] = []
-    for (let index = 0; index < count; index++) samples.push(await bootOne())
-    return samples
-  }
-
   try {
-    const atKSamples = await bootMany(k)
+    const atKSamples = await bootMany(k, bootOne)
     const atKRssBytes = readRssBytes()
-    const extraSamples = await bootMany(extra)
+    const extraSamples = await bootMany(extra, bootOne)
     const atKPlusExtraRssBytes = readRssBytes()
     const allSamples = [...atKSamples, ...extraSamples]
 
@@ -556,8 +559,8 @@ export async function measureSessionWorkerBoot(options: MeasureSessionBootOption
       k,
       extra,
       baselineRssBytes,
-      atK: bootLevel(atKSamples.length, atKSamples, atKRssBytes),
-      atKPlusExtra: bootLevel(allSamples.length, allSamples, atKPlusExtraRssBytes),
+      atK: summarizeBootLevel(atKSamples.length, atKSamples, atKRssBytes),
+      atKPlusExtra: summarizeBootLevel(allSamples.length, allSamples, atKPlusExtraRssBytes),
     }
   } finally {
     await harness.dispose()

@@ -8,7 +8,7 @@
 // one. A monotonic fallback source is provided for tests until Phase 7 lands.
 
 import { describe, expect, test } from "bun:test"
-import { compareOrdinals, createMonotonicOrdinalSource } from "@/session/egress/ordinal"
+import { EgressOrdinal, compareOrdinals, createMonotonicOrdinalSource } from "@/session/egress/ordinal"
 
 describe("writer ordinal", () => {
   test("orders by generation, then ordinal", () => {
@@ -32,5 +32,15 @@ describe("writer ordinal", () => {
     const second = createMonotonicOrdinalSource({ generation: 2 })
     const last = { generation: 1, ordinal: 2 }
     expect(compareOrdinals(second.next(), last)).toBeGreaterThan(0)
+  })
+
+  test("rejects a non-integer generation or start seed", () => {
+    expect(() => createMonotonicOrdinalSource({ generation: 1.5 })).toThrow(/generation/)
+    expect(() => createMonotonicOrdinalSource({ generation: Number.NaN })).toThrow(/generation/)
+    expect(() => createMonotonicOrdinalSource({ start: Number.NaN })).toThrow(/start/)
+  })
+
+  test("exposes the module under the EgressOrdinal namespace", () => {
+    expect(EgressOrdinal.compareOrdinals).toBe(compareOrdinals)
   })
 })

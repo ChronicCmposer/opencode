@@ -36,6 +36,16 @@ describe("11.5 mirrored PGID registry", () => {
     expect(registry.get(100)?.generation).toBe(2)
   })
 
+  test("refuses to reassign a live PGID to a different owner (fail loud)", () => {
+    const registry = createPidRegistry()
+    registry.register({ pid: 100, pgid: 100, workerID: 1, label: "lsp" })
+
+    expect(() => registry.register({ pid: 100, pgid: 100, workerID: 2, label: "lsp" })).toThrow(/owned by worker 1/)
+    expect(() => registry.register({ pid: 100, pgid: 100, workerID: 1, label: "mcp" })).toThrow(/owned by worker 1/)
+    expect(registry.size).toBe(1)
+    expect(registry.get(100)).toMatchObject({ workerID: 1, label: "lsp" })
+  })
+
   test("rejects an invalid PGID or negative worker id (fail loud)", () => {
     const registry = createPidRegistry()
     expect(() => registry.register({ pid: 0, pgid: 0, workerID: 1, label: "x" })).toThrow()
@@ -59,6 +69,32 @@ describe("11.5 mirrored PGID registry", () => {
     expect(spawnCalls).toBe(1)
     expect(child).toMatchObject({ pid: 4242, pgid: 4242, workerID: 9, label: "mcp" })
     expect(registry.has(4242)).toBe(true)
+  })
+
+  test("validates meta before spawning so a bad registration never leaks a process", () => {
+    const registry = createPidRegistry()
+    let spawnCalls = 0
+    const spawn = () => {
+      spawnCalls++
+      return { pid: 500 }
+    }
+
+    expect(() => spawnRegistered(spawn, registry, { workerID: -1, label: "lsp" })).toThrow()
+    expect(() => spawnRegistered(spawn, registry, { workerID: 1, label: "   " })).toThrow()
+    expect(spawnCalls).toBe(0)
+  })
+
+  test("kills the spawned group when mirroring fails, so it is never leaked", () => {
+    const { reaper, calls } = recordingReaper()
+    const registry = createPidRegistry()
+    registry.register({ pid: 700, pgid: 700, workerID: 1, label: "lsp" })
+
+    // The new spawn's PGID collides with a different owner; register throws.
+    expect(() => spawnRegistered(() => ({ pid: 700 }), registry, { workerID: 2, label: "mcp" }, reaper)).toThrow(
+      /owned by worker 1/,
+    )
+    expect(calls).toEqual([{ pgid: 700, signal: "SIGKILL" }])
+    expect(registry.get(700)).toMatchObject({ workerID: 1, label: "lsp" })
   })
 
   test("reap(workerID) group-kills only that worker's PGIDs and unregisters them", () => {
@@ -92,10 +128,41 @@ describe("11.5 mirrored PGID registry", () => {
     expect(registry.size).toBe(0)
   })
 
+  test("continues past a throwing kill, forgets every attempted PGID, and aggregates", () => {
+    const calls: number[] = []
+    const reaper: ProcessReaper = {
+      killGroup: (pgid) => {
+        calls.push(pgid)
+        if (pgid === 20) throw new Error("kill failed")
+      },
+    }
+    const registry = createPidRegistry({ reaper })
+    registry.register({ pid: 10, pgid: 10, workerID: 1, label: "lsp" })
+    registry.register({ pid: 20, pgid: 20, workerID: 1, label: "mcp" })
+    registry.register({ pid: 30, pgid: 30, workerID: 1, label: "dap" })
+
+    expect(() => registry.reap(1, "SIGKILL")).toThrow(AggregateError)
+    // Every target was attempted and forgotten, including the one that failed.
+    expect(calls).toEqual([10, 20, 30])
+    expect(registry.size).toBe(0)
+    expect(registry.has(20)).toBe(false)
+  })
+
   test("reports POSIX-only support with a documented reason on win32", () => {
     expect(reapSupport("win32").supported).toBe(false)
     expect(reapSupport("win32").reason).not.toBe("")
     expect(reapSupport("linux").supported).toBe(true)
+  })
+
+  test("supports only the explicit POSIX allow-list and explains every other platform", () => {
+    for (const platform of ["linux", "darwin", "freebsd", "openbsd", "netbsd", "aix", "sunos"] as const) {
+      expect(reapSupport(platform)).toEqual({ supported: true, reason: "" })
+    }
+    for (const platform of ["win32", "cygwin", "android", "haiku"] as const) {
+      const support = reapSupport(platform)
+      expect(support.supported).toBe(false)
+      expect(support.reason).not.toBe("")
+    }
   })
 })
 

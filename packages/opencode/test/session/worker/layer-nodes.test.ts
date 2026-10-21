@@ -62,6 +62,15 @@ describe("session node table", () => {
     expect(lookupNode("does-not-exist")).toBeUndefined()
   })
 
+  test("the client keys are the exported single-source constants", () => {
+    expect(SESSION_CLIENT_KEYS).toEqual([
+      WorkerNodeTable.WRITER_CLIENT_KEY,
+      WorkerNodeTable.EVENT_EGRESS_CLIENT_KEY,
+      WorkerNodeTable.BROKER_CLIENT_KEY,
+      WorkerNodeTable.BACKGROUND_JOB_CLIENT_KEY,
+    ])
+  })
+
   test("collectNodeNames walks the whole dependency graph", () => {
     const names = collectNodeNames(Session.node)
     expect(names.has("@opencode/Session")).toBe(true)
@@ -82,11 +91,12 @@ describe("validateSessionLayer", () => {
   })
 
   test("passes when excluded nodes are replaced and clients are present", () => {
-    const report = validateSessionLayer(LayerNode.group([Session.node, clientGroup()]), [
+    const report = validateSessionLayer(LayerNode.group([Database.node, clientGroup()]), [
       [Database.node, Layer.succeed(Database.Service, { db: {} as never })],
     ])
     expect(report.excluded).toEqual([])
     expect(report.missingClients).toEqual([])
+    expect(report.unknown).toEqual([])
     expect(report.ok).toBe(true)
   })
 
@@ -109,6 +119,20 @@ describe("validateSessionLayer", () => {
     expect(report.excluded).toContain("@opencode/MCP")
     expect(report.ok).toBe(false)
   })
+
+  test("unknown application nodes are violations (fail closed)", () => {
+    const orphan = clientNode("@opencode/Unclassified")
+    const report = validateSessionLayer(LayerNode.group([clientGroup(), orphan]))
+    expect(report.unknown).toContain("@opencode/Unclassified")
+    expect(report.ok).toBe(false)
+  })
+
+  test("non-application infrastructure nodes are outside the table", () => {
+    const infra = clientNode("effect/HttpClient")
+    const report = validateSessionLayer(LayerNode.group([clientGroup(), infra]))
+    expect(report.unknown).toEqual([])
+    expect(report.ok).toBe(true)
+  })
 })
 
 describe("assertSessionLayer", () => {
@@ -126,9 +150,19 @@ describe("assertSessionLayer", () => {
 
   test("is silent for a compliant layer", () => {
     expect(() =>
-      assertSessionLayer(LayerNode.group([Session.node, clientGroup()]), [
+      assertSessionLayer(LayerNode.group([Database.node, clientGroup()]), [
         [Database.node, Layer.succeed(Database.Service, { db: {} as never })],
       ]),
     ).not.toThrow()
+  })
+
+  test("names the unknown application nodes in the violation", () => {
+    try {
+      assertSessionLayer(LayerNode.group([clientGroup(), clientNode("@opencode/Unclassified")]))
+      throw new Error("expected assertSessionLayer to throw")
+    } catch (error) {
+      expect(error).toBeInstanceOf(WorkerNodeTable.SessionLayerViolationError)
+      expect((error as Error).message).toContain("@opencode/Unclassified")
+    }
   })
 })

@@ -15,7 +15,7 @@
 // `detect()` is pure: same registered resources + same probe results means the
 // same report, with no hidden mutation.
 
-import { posixSupport } from "./process-tree"
+import { isGroupAlive as defaultGroupProbe, posixSupport } from "./process-tree"
 
 export type LeakKind = "worker" | "port" | "process-group"
 
@@ -72,15 +72,6 @@ export interface LeakDetector {
   readonly ports: ReadonlyArray<TrackedPort>
   readonly processGroups: ReadonlyArray<number>
   detect(): LeakReport
-}
-
-function defaultGroupProbe(pgid: number): boolean {
-  try {
-    process.kill(-pgid, 0)
-    return true
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH"
-  }
 }
 
 export function createLeakDetector(options: LeakDetectorOptions = {}): LeakDetector {

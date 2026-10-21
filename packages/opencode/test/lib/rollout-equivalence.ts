@@ -17,7 +17,7 @@
 import { Effect, Exit, Scope } from "effect"
 import type { SessionID } from "@/session/schema"
 import { createSessionRunMachine, type SessionExecutionResult } from "@/session/worker/execute"
-import { createGoldenCapture, type GoldenCapture } from "./golden"
+import { createGoldenCapture, type GoldenCapture, type GoldenRow } from "./golden"
 import { DEFAULT_BURN_ITERATIONS, burnCpu, consumeMockSse, runParallelSessions } from "./mock-sse-harness"
 
 /** The default per-run owner fencing every durable row in a rollout capture. */
@@ -29,14 +29,8 @@ export interface SessionChatResult {
   readonly chunks: number
 }
 
-/** A full durable row as the golden helper compares it. */
-export interface SessionDurableRow {
-  readonly aggregate_id: string
-  readonly seq: number
-  readonly type: string
-  readonly data: unknown
-  readonly owner_id: string
-}
+/** A full durable row as the golden helper compares it (the canonical shape). */
+export type SessionDurableRow = GoldenRow
 
 // --- Boundary parsing (Parse, Don't Validate) -------------------------------
 

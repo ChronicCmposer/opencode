@@ -29,7 +29,13 @@ const scope = globalThis as unknown as WorkerScope
 
 function readGeneration(): number {
   const value = (workerData as { generation?: unknown } | undefined)?.generation
-  return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : 1
+  // Absent generation is a direct (non-client) spawn; a present-but-invalid one is
+  // a client bug, so fail loud rather than silently falling back to generation 1.
+  if (value === undefined) return 1
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new Error(`invalid writer generation ${JSON.stringify(value)}; expected an integer >= 1`)
+  }
+  return value
 }
 
 const generation = readGeneration()
@@ -44,11 +50,21 @@ function requireCore(): WriterCore {
 
 async function openConnection(filename: string): Promise<void> {
   if (connection !== undefined) throw new Error("writer connection is already open")
-  connection = createBunSqliteConnection({
+  // Build the whole graph before publishing any of it, so a failure partway leaves
+  // the isolate unopened (and the native handle closed) rather than half-open.
+  const nextConnection = createBunSqliteConnection({
     filename,
     pragmas: ["PRAGMA journal_mode = WAL", `PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`],
   })
-  core = createWriterCore({ connection })
+  let nextCore: WriterCore
+  try {
+    nextCore = createWriterCore({ connection: nextConnection })
+  } catch (error) {
+    nextConnection.close()
+    throw error
+  }
+  connection = nextConnection
+  core = nextCore
 }
 
 async function handle(request: WriterRequest): Promise<unknown> {
@@ -117,6 +133,11 @@ async function handle(request: WriterRequest): Promise<unknown> {
         ...(request.ownerID === undefined ? {} : { ownerID: request.ownerID }),
         ...(request.strictOwner === undefined ? {} : { strictOwner: request.strictOwner }),
       })
+    default: {
+      // Exhaustiveness guard: a new frame must be handled here or this fails to compile.
+      const _exhaustive: never = request
+      throw new Error(`unhandled writer request: ${JSON.stringify(_exhaustive)}`)
+    }
   }
 }
 

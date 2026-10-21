@@ -7,12 +7,15 @@
 // an in-memory fake, plus a real-Bun smoke test (task 4.9).
 
 import { describe, expect, test } from "bun:test"
+import { Effect } from "effect"
 import type { SessionID } from "@/session/schema"
 import {
+  adaptPoolWorker,
   createBunWorkerPool,
   createDispatcher,
   deriveHeadroom,
   SessionCancelledError,
+  SessionCrashedError,
   WorkerCrashedError,
   type Scheduler,
   type SessionRun,
@@ -20,6 +23,7 @@ import {
   type WorkerKind,
   type WorkerPool,
 } from "@/session/worker/dispatch"
+import type { PoolWorker } from "@/session/worker/pool"
 import { SessionQueueFullError } from "@/session/worker/queue"
 import { createWorkerHarness, type HarnessWorker, type WorkerHarness } from "../../lib/worker-harness"
 import { faultWorkerEntry, withFaults } from "../../lib/faults"
@@ -133,7 +137,7 @@ describe("4.3 one active session per worker", () => {
 
     expect(pool.workers[0].runs.map((run) => run.sessionID)).toEqual([sid("ses_1")])
     expect(pool.workers[1].runs.map((run) => run.sessionID)).toEqual([sid("ses_2")])
-    expect(dispatcher.activeCount).toBe(2)
+    expect(dispatcher.busySlotCount).toBe(2)
     expect(dispatcher.queuedCount).toBe(1)
 
     pool.workers[0].finish(sid("ses_1"))
@@ -144,7 +148,7 @@ describe("4.3 one active session per worker", () => {
     pool.workers[0].finish(sid("ses_3"))
     pool.workers[1].finish(sid("ses_2"))
     await Promise.all([second, third])
-    expect(dispatcher.activeCount).toBe(0)
+    expect(dispatcher.busySlotCount).toBe(0)
   })
 })
 
@@ -183,7 +187,7 @@ describe("4.5 bounded admission queue", () => {
     const third = dispatcher.dispatch({ sessionID: sid("ses_3") })
 
     expect(dispatcher.queuedCount).toBe(2)
-    await expect(dispatcher.dispatch({ sessionID: sid("ses_4") })).rejects.toBeInstanceOf(SessionQueueFullError)
+    await expect(dispatcher.dispatch({ sessionID: sid("ses_4") })).rejects.toThrow(SessionQueueFullError)
 
     pool.workers[0].finish(sid("ses_1"))
     await first
@@ -215,12 +219,12 @@ describe("4.6 on-demand headroom (depth-1 children only)", () => {
 
     // K=1 is busy: the sibling queues and no headroom worker is spawned.
     expect(dispatcher.queuedCount).toBe(1)
-    expect(dispatcher.headroomCount).toBe(0)
+    expect(dispatcher.headroomSlotCount).toBe(0)
     expect(pool.spawned).toHaveLength(0)
 
     const child = dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 })
     await flush()
-    expect(dispatcher.headroomCount).toBe(1)
+    expect(dispatcher.headroomSlotCount).toBe(1)
     expect(pool.spawned).toHaveLength(1)
     expect(pool.spawned[0].runs.map((run) => run.sessionID)).toEqual([sid("ses_child")])
 
@@ -255,7 +259,7 @@ describe("4.6 on-demand headroom (depth-1 children only)", () => {
     await flush()
 
     // headroom = 2 for K=1: two children run, the third queues.
-    expect(dispatcher.headroomCount).toBe(2)
+    expect(dispatcher.headroomSlotCount).toBe(2)
     expect(pool.spawned).toHaveLength(2)
     expect(dispatcher.queuedCount).toBe(1)
 
@@ -282,7 +286,7 @@ describe("4.6 on-demand headroom (depth-1 children only)", () => {
     const childB = dispatcher.dispatch({ sessionID: sid("ses_child_b"), depth: 1 })
 
     expect(dispatcher.queuedCount).toBe(2)
-    await expect(dispatcher.dispatch({ sessionID: sid("ses_child_c"), depth: 1 })).rejects.toBeInstanceOf(
+    await expect(dispatcher.dispatch({ sessionID: sid("ses_child_c"), depth: 1 })).rejects.toThrow(
       SessionQueueFullError,
     )
 
@@ -300,7 +304,7 @@ describe("4.6 on-demand headroom (depth-1 children only)", () => {
     await flush()
 
     const headroom = pool.spawned[0]
-    expect(dispatcher.headroomCount).toBe(1)
+    expect(dispatcher.headroomSlotCount).toBe(1)
 
     headroom.finish(sid("ses_child"))
     await child
@@ -311,7 +315,7 @@ describe("4.6 on-demand headroom (depth-1 children only)", () => {
     reap?.run()
     await flush()
 
-    expect(dispatcher.headroomCount).toBe(0)
+    expect(dispatcher.headroomSlotCount).toBe(0)
     expect(headroom.alive).toBe(false)
 
     pool.workers[0].finish(sid("ses_parent"))
@@ -352,7 +356,7 @@ describe("4.7 worker crash → at-most-once reject + respawn", () => {
     expect(pool.spawned[0].runs.map((run) => run.sessionID)).toEqual([sid("ses_2")])
     pool.spawned[0].finish(sid("ses_2"))
     await healthy
-    expect(dispatcher.activeCount).toBe(0)
+    expect(dispatcher.busySlotCount).toBe(0)
   })
 
   test("a crash-loop degrades the slot (K−1) instead of respawning forever", async () => {
@@ -377,7 +381,7 @@ describe("4.7 worker crash → at-most-once reject + respawn", () => {
     expect(degraded).toHaveLength(1)
     expect(dispatcher.degradedCount).toBe(1)
     // capacity is reduced: no free foreground slot remains
-    expect(dispatcher.headroomCount).toBe(0)
+    expect(dispatcher.headroomSlotCount).toBe(0)
     await dispatcher.terminateAll()
   })
 
@@ -552,6 +556,108 @@ describe("4.8 key→worker map lifecycle", () => {
   })
 })
 
+describe("4.10 crash error identity", () => {
+  test("WorkerCrashedError carries its own _tag and is still a SessionCrashedError", () => {
+    const crash = new WorkerCrashedError({ message: "worker 1 crashed", workerID: 1 })
+    expect(crash._tag).toBe("WorkerCrashedError")
+    expect(crash).toBeInstanceOf(WorkerCrashedError)
+    expect(crash).toBeInstanceOf(SessionCrashedError)
+  })
+
+  test("Effect.catchTag matches the WorkerCrashedError tag", async () => {
+    const caught = await Effect.runPromise(
+      Effect.fail(new WorkerCrashedError({ message: "boom", workerID: 1 })).pipe(
+        Effect.catchTag("WorkerCrashedError", () => Effect.succeed("worker")),
+        Effect.orElseSucceed(() => "missed"),
+      ),
+    )
+    expect(caught).toBe("worker")
+  })
+})
+
+describe("4.11 dispatch validation and waiters", () => {
+  test("an invalid depth rejects the returned promise instead of throwing", async () => {
+    const pool = new FakePool(1)
+    const dispatcher = createDispatcher({ pool })
+    let outcome: Promise<void> | undefined
+    expect(() => {
+      outcome = dispatcher.dispatch({ sessionID: sid("ses_bad"), depth: -1 })
+    }).not.toThrow()
+    await expect(outcome!).rejects.toThrow(/invalid dispatch depth/)
+  })
+
+  test("a shifted waiter that cannot enqueue fails the whole waiter list", async () => {
+    const pool = new FakePool(1)
+    const dispatcher = createDispatcher({ pool, headroom: 0, childCapacity: 1 })
+    const parent = dispatcher.dispatch({ sessionID: sid("ses_parent") })
+    const queuedChild = dispatcher.dispatch({ sessionID: sid("ses_queued"), depth: 1 })
+    const waiterA = capture(dispatcher.dispatch({ sessionID: sid("ses_parent"), depth: 1 }))
+    const waiterB = capture(dispatcher.dispatch({ sessionID: sid("ses_parent"), depth: 1 }))
+    await flush()
+    expect(dispatcher.queuedCount).toBe(1)
+
+    pool.workers[0].finish(sid("ses_parent"))
+    await parent
+    await flush()
+
+    expect(await waiterA).toBeInstanceOf(SessionQueueFullError)
+    expect(await waiterB).toBeInstanceOf(SessionQueueFullError)
+    await dispatcher.terminateAll()
+    await Promise.allSettled([queuedChild])
+  })
+
+  test("different-kind waiters for one key are bounded", async () => {
+    const pool = new FakePool(1)
+    const dispatcher = createDispatcher({ pool, waiterCapacity: 2 })
+    const root = capture(dispatcher.dispatch({ sessionID: sid("ses_1") }))
+    const one = capture(dispatcher.dispatch({ sessionID: sid("ses_1"), depth: 1 }))
+    const two = capture(dispatcher.dispatch({ sessionID: sid("ses_1"), depth: 2 }))
+    await expect(dispatcher.dispatch({ sessionID: sid("ses_1"), depth: 3 })).rejects.toThrow(
+      SessionQueueFullError,
+    )
+    await dispatcher.terminateAll()
+    await Promise.allSettled([root, one, two])
+  })
+})
+
+describe("4.12 production pool adapter", () => {
+  test("adaptPoolWorker forwards run.sessionID/depth to the driver", async () => {
+    const forwarded: SessionRun[] = []
+    const worker: PoolWorker = {
+      id: 42,
+      threadId: 0,
+      alive: true,
+      ready: async () => {},
+      run: async () => {
+        throw new Error("the bootstrap placeholder must not run for a forwarded run")
+      },
+      terminate: async () => 0,
+      [Symbol.asyncDispose]: () => Promise.resolve(),
+    }
+    const adapted = adaptPoolWorker(worker, async (_worker, run) => {
+      forwarded.push(run)
+    })
+
+    await adapted.execute({ sessionID: sid("ses_real"), depth: 2 })
+    expect(forwarded).toEqual([{ sessionID: sid("ses_real"), depth: 2 }])
+  })
+
+  test("createBunWorkerPool forwards the run through its driver", async () => {
+    const forwarded: SessionRun[] = []
+    await using pool = createBunWorkerPool({
+      k: 1,
+      drive: async (worker, run) => {
+        await worker.ready()
+        forwarded.push(run)
+      },
+    })
+    await using dispatcher = createDispatcher({ pool })
+
+    await dispatcher.dispatch({ sessionID: sid("ses_drive"), depth: 0 })
+    expect(forwarded.map((run) => run.sessionID)).toEqual([sid("ses_drive")])
+  })
+})
+
 describe("4.9 WorkerPool interface", () => {
   test("dispatches a session through real Bun workers behind the interface", async () => {
     await using pool = createBunWorkerPool({ k: 1 })
@@ -559,7 +665,7 @@ describe("4.9 WorkerPool interface", () => {
 
     await dispatcher.dispatch({ sessionID: sid("ses_real") })
 
-    expect(dispatcher.activeCount).toBe(0)
+    expect(dispatcher.busySlotCount).toBe(0)
     expect(dispatcher.registry.size).toBe(0)
   })
 })

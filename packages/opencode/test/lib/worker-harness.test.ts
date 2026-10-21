@@ -65,6 +65,30 @@ describe("worker harness", () => {
     expect(second.alive).toBe(false)
   })
 
+  test("surfaces the worker's real error message to a pending waitFor", async () => {
+    await using harness = createWorkerHarness({ cores: 1, timeoutMs: 2000 })
+    const worker = harness.spawn<WorkerMessage>(workerEntry)
+    await worker.received((message) => message.type === "ready")
+
+    const pending = worker.waitFor("never")
+    worker.post({ type: "throw", message: "kaboom-42" })
+
+    await expect(pending).rejects.toThrow(/kaboom-42/)
+    expect(worker.alive).toBe(false)
+  })
+
+  test("a naturally closing worker resolves exited without terminate", async () => {
+    await using harness = createWorkerHarness({ cores: 1, timeoutMs: 2000 })
+    const worker = harness.spawn<WorkerMessage>(workerEntry)
+    await worker.received((message) => message.type === "ready")
+
+    worker.post({ type: "close" })
+    const code = await worker.exited
+
+    expect(typeof code).toBe("number")
+    expect(worker.alive).toBe(false)
+  })
+
   test("surfaces a worker-side failure as an observable message", async () => {
     await using harness = createWorkerHarness({ cores: 1 })
     const worker = harness.spawn<WorkerMessage>(workerEntry)

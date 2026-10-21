@@ -12,7 +12,7 @@
 // The contract intentionally depends on nothing from the pool/writer/egress
 // modules: it is a leaf service the hub can own directly.
 
-import { DEFAULT_MCP_TIMEOUT_MS } from "./protocol"
+import { DEFAULT_MCP_TIMEOUT_MS, parseAcquireResult, parseOAuthResult, parsePingResult } from "./protocol"
 import type {
   AcquireResult,
   BrokerErrorCode,
@@ -22,9 +22,10 @@ import type {
   PingResult,
   ServerSpec,
 } from "./protocol"
+import { mergeEnv } from "./env"
 
 export interface WorkerLike {
-  readonly id: number
+  readonly generation: number
   readonly alive: boolean
 }
 
@@ -119,10 +120,8 @@ const defaultReaper: ProcessReaper = {
   reap(pgid: number): void {
     try {
       process.kill(-pgid, "SIGTERM")
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
-        /* best-effort reaping */
-      }
+    } catch {
+      /* best-effort: the group is already gone (ESRCH) or not ours to kill */
     }
   },
 }
@@ -140,18 +139,6 @@ interface PendingRequest {
   readonly resolve: (value: unknown) => void
   readonly reject: (error: Error) => void
   readonly timer: ReturnType<typeof setTimeout>
-}
-
-function mergeEnv(overlay?: Record<string, string | undefined>): Record<string, string> {
-  const env: Record<string, string> = {}
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined) env[key] = value
-  }
-  for (const [key, value] of Object.entries(overlay ?? {})) {
-    if (value === undefined) delete env[key]
-    else env[key] = value
-  }
-  return env
 }
 
 function keyOf(directory: string, server: string): string {
@@ -180,8 +167,25 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
   let worker: BrokerWorkerHandle | undefined
   let port: MessagePort | undefined
   let readySettled = false
+
   let resolveTransport: (() => void) | undefined
-  let transportReady: Promise<void>
+  let rejectTransport: ((error: Error) => void) | undefined
+
+  /**
+   * A fresh per-generation transport deferred. A crash before any request is
+   * waiting must not surface as an unhandled rejection, so the eager catch is
+   * attached here; `request` installs its own handlers on top.
+   */
+  function newTransportReady(): Promise<void> {
+    const promise = new Promise<void>((resolve, reject) => {
+      resolveTransport = resolve
+      rejectTransport = reject
+    })
+    promise.catch(() => {})
+    return promise
+  }
+
+  let transportReady = newTransportReady()
 
   let settleReady!: () => void
   const ready = new Promise<void>((resolve) => {
@@ -189,7 +193,7 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
   })
 
   const workerHandle: WorkerLike = {
-    get id() {
+    get generation() {
       return generation
     },
     get alive() {
@@ -240,21 +244,36 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
   }
 
   function request(frame: BrokerRequest): Promise<unknown> {
-    return transportReady.then(
-      () =>
-        new Promise<unknown>((resolve, reject) => {
-          if (!alive || !port) {
-            reject(new BrokerRequestError("crashed", "broker is not available"))
-            return
-          }
-          const timer = setTimeout(() => {
-            pending.delete(frame.requestId)
-            reject(new BrokerRequestError("timeout", `request ${frame.requestId} timed out after ${requestTimeoutMs}ms`))
-          }, requestTimeoutMs)
-          pending.set(frame.requestId, { resolve, reject, timer })
-          port.postMessage(frame)
-        }),
-    )
+    return new Promise<unknown>((resolve, reject) => {
+      let settled = false
+      // Declared before `finish` (no TDZ) and definitely assigned before any
+      // settle path can run, since all paths are asynchronous.
+      let timer!: ReturnType<typeof setTimeout>
+      const finish = (action: () => void) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        action()
+      }
+      // Arm the timeout around the whole request, including the wait for the
+      // transport: a worker that crashes (or never becomes ready) before the
+      // port is live must not hang the caller forever.
+      timer = setTimeout(() => {
+        pending.delete(frame.requestId)
+        finish(() =>
+          reject(new BrokerRequestError("timeout", `request ${frame.requestId} timed out after ${requestTimeoutMs}ms`)),
+        )
+      }, requestTimeoutMs)
+      const send = () => {
+        if (!alive || !port) {
+          finish(() => reject(new BrokerRequestError("crashed", "broker is not available")))
+          return
+        }
+        pending.set(frame.requestId, { resolve, reject, timer })
+        port.postMessage(frame)
+      }
+      transportReady.then(send, (error) => finish(() => reject(error)))
+    })
   }
 
   function rejectPending(error: Error): void {
@@ -273,17 +292,20 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
     threadId = 0
     port?.close()
     port = undefined
+    // Settle the outgoing transport before reassigning it, so any request caught
+    // waiting for the port fails fast instead of dangling on the old promise.
+    rejectTransport?.(new BrokerRequestError("crashed", `broker worker exited before ready (generation ${generation})`))
     emitSupervision({ type: "crashed", generation, orphans: orphans.length })
     for (const child of orphans) reaper.reap(child.pgid)
     generation += 1
-    transportReady = new Promise<void>((resolve) => {
-      resolveTransport = resolve
-    })
+    transportReady = newTransportReady()
     startWorker()
   }
 
   function startWorker(): void {
     const myId = ++currentWorkerId
+    // Each generation gets its own handshake trace; reset before it re-runs.
+    handshake.length = 0
     const handle = new Worker(entry, { env }) as unknown as BrokerWorkerHandle
     worker = handle
 
@@ -306,6 +328,7 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
         alive = true
         resolveTransport?.()
         resolveTransport = undefined
+        rejectTransport = undefined
         if (generation > 1) emitSupervision({ type: "respawned", generation })
         if (!readySettled) {
           readySettled = true
@@ -322,13 +345,14 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
     handle.addEventListener("error", onGone)
   }
 
-  transportReady = new Promise<void>((resolve) => {
-    resolveTransport = resolve
-  })
   startWorker()
 
+  async function requestAs<T>(frame: BrokerRequest, parse: (value: unknown) => T): Promise<T> {
+    return parse(await request(frame))
+  }
+
   const acquire = (input: AcquireInput): Promise<AcquireResult> =>
-    request({ kind: "acquire", requestId: nextId(), directory: input.directory, servers: input.servers }) as Promise<AcquireResult>
+    requestAs({ kind: "acquire", requestId: nextId(), directory: input.directory, servers: input.servers }, parseAcquireResult)
 
   const call = (input: CallInput): Promise<unknown> =>
     request({
@@ -345,12 +369,12 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
     request({ kind: "cancel", requestId: nextId(), targetId }).then(() => undefined)
 
   const oauth = (directory: string): Promise<OAuthResult> =>
-    request({ kind: "oauth", requestId: nextId(), directory }) as Promise<OAuthResult>
+    requestAs({ kind: "oauth", requestId: nextId(), directory }, parseOAuthResult)
 
   const release = (directory: string): Promise<void> =>
     request({ kind: "release", requestId: nextId(), directory }).then(() => undefined)
 
-  const ping = (): Promise<PingResult> => request({ kind: "ping", requestId: nextId() }) as Promise<PingResult>
+  const ping = (): Promise<PingResult> => requestAs({ kind: "ping", requestId: nextId() }, parsePingResult)
 
   async function teardown(): Promise<void> {
     if (disposed) return

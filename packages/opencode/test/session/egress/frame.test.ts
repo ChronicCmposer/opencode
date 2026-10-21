@@ -7,6 +7,7 @@
 
 import { describe, expect, test } from "bun:test"
 import {
+  MalformedFrameError,
   UnsupportedFrameVersionError,
   decodeFrame,
   decodeFrames,
@@ -98,4 +99,67 @@ describe("egress frame codec", () => {
     bytes.set(body, 4)
     expect(() => decodeFrame(bytes)).toThrow(UnsupportedFrameVersionError)
   })
+
+  test("decodeFrame rejects a buffer carrying more than one frame", () => {
+    const joined = new Uint8Array([...encodeFrame({ kind: "end", v: 1 }), ...encodeFrame({ kind: "end", v: 1 })])
+    expect(() => decodeFrame(joined)).toThrow(MalformedFrameError)
+  })
+
+  test("decodeFrame rejects a truncated frame", () => {
+    const bytes = encodeFrame({ kind: "end", v: 1 })
+    expect(() => decodeFrame(bytes.subarray(0, bytes.byteLength - 1))).toThrow(MalformedFrameError)
+  })
+
+  test("the returned rest is a copy, not a view of the input buffer", () => {
+    const frame: EgressFrame = { kind: "deltas", v: 1, events: [event] }
+    const bytes = encodeFrame(frame)
+    const partial = bytes.slice(0, bytes.byteLength - 3)
+    const { rest } = decodeFrames(partial)
+    partial.fill(0)
+    expect(rest).toEqual(bytes.subarray(0, bytes.byteLength - 3))
+  })
+
+  test("rejects a body that is not valid JSON as MalformedFrameError", () => {
+    const body = new TextEncoder().encode("{not json")
+    const bytes = new Uint8Array(4 + body.byteLength)
+    new DataView(bytes.buffer).setUint32(0, body.byteLength, false)
+    bytes.set(body, 4)
+    expect(() => decodeFrame(bytes)).toThrow(MalformedFrameError)
+  })
+
+  test("rejects a durable frame with a non-integer ordinal or missing generation", () => {
+    expect(() =>
+      decodeFrame(rawFrame({ kind: "durable", v: 1, meta: { generation: 1, ordinal: "nope" }, event })),
+    ).toThrow(MalformedFrameError)
+    expect(() =>
+      decodeFrame(rawFrame({ kind: "durable", v: 1, meta: { ordinal: 1 }, event })),
+    ).toThrow(MalformedFrameError)
+  })
+
+  test("rejects structurally invalid events at the parse boundary", () => {
+    expect(() => decodeFrame(rawFrame({ kind: "deltas", v: 1, events: [42] }))).toThrow(MalformedFrameError)
+    expect(() =>
+      decodeFrame(rawFrame({ kind: "deltas", v: 1, events: [{ type: "x", data: {} }] })),
+    ).toThrow(MalformedFrameError)
+    expect(() =>
+      decodeFrame(rawFrame({ kind: "durable", v: 1, meta: { generation: 1, ordinal: 1 }, event: "nope" })),
+    ).toThrow(MalformedFrameError)
+    expect(() =>
+      decodeFrame(
+        rawFrame({
+          kind: "deltas",
+          v: 1,
+          events: [{ id: "e", type: "t", data: {}, durable: { aggregateID: 1, seq: 1 } }],
+        }),
+      ),
+    ).toThrow(MalformedFrameError)
+  })
 })
+
+function rawFrame(body: unknown): Uint8Array {
+  const encoded = new TextEncoder().encode(JSON.stringify(body))
+  const bytes = new Uint8Array(4 + encoded.byteLength)
+  new DataView(bytes.buffer).setUint32(0, encoded.byteLength, false)
+  bytes.set(encoded, 4)
+  return bytes
+}
