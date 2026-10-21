@@ -60,6 +60,22 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Storage") {}
 
+/**
+ * The single-writer boundary for `Storage` (plan task 7.13). When present, every
+ * mutation and read proxies through it, so file-KV never bypasses the writer
+ * (the worker's storage operations serialize on the writer's one queue). Absent
+ * (the default, flag off), the service reads and writes the filesystem directly,
+ * byte-identical to before.
+ */
+export interface WriterPort {
+  readonly read: (key: ReadonlyArray<string>) => Effect.Effect<{ readonly found: boolean; readonly content?: unknown }>
+  readonly write: (key: ReadonlyArray<string>, content: unknown) => Effect.Effect<void>
+  readonly remove: (key: ReadonlyArray<string>) => Effect.Effect<void>
+  readonly list: (prefix: ReadonlyArray<string>) => Effect.Effect<ReadonlyArray<ReadonlyArray<string>>>
+}
+
+export class WriterService extends Context.Service<WriterService, WriterPort>()("@opencode/StorageWriter") {}
+
 function file(dir: string, key: string[]) {
   return path.join(dir, ...key) + ".json"
 }
@@ -215,6 +231,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
     const git = yield* Git.Service
+    const writer = yield* Effect.serviceOption(WriterService)
     const locks = yield* RcMap.make({
       lookup: () => TxReentrantLock.make(),
       idleTimeToLive: 0,
@@ -264,6 +281,10 @@ const layer = Layer.effect(
       )
 
     const remove: Interface["remove"] = Effect.fn("Storage.remove")(function* (key: string[]) {
+      if (Option.isSome(writer)) {
+        yield* writer.value.remove(key)
+        return
+      }
       yield* withResolved(key, (target, rw) =>
         TxReentrantLock.withWriteLock(rw, fs.remove(target).pipe(Effect.catchIf(missing, () => Effect.void))),
       )
@@ -271,6 +292,11 @@ const layer = Layer.effect(
 
     const read: Interface["read"] = <T>(key: string[]) =>
       Effect.gen(function* () {
+        if (Option.isSome(writer)) {
+          const result = yield* writer.value.read(key)
+          if (!result.found) return yield* fail(file((yield* state).dir, key))
+          return result.content as T
+        }
         const value = yield* withResolved(key, (target, rw) =>
           TxReentrantLock.withReadLock(rw, wrap(target, fs.readJson(target))),
         )
@@ -279,6 +305,14 @@ const layer = Layer.effect(
 
     const update: Interface["update"] = <T>(key: string[], fn: (draft: T) => void) =>
       Effect.gen(function* () {
+        if (Option.isSome(writer)) {
+          const result = yield* writer.value.read(key)
+          if (!result.found) return yield* fail(file((yield* state).dir, key))
+          const content = result.content as T
+          fn(content)
+          yield* writer.value.write(key, content)
+          return content
+        }
         const value = yield* withResolved(key, (target, rw) =>
           TxReentrantLock.withWriteLock(
             rw,
@@ -295,10 +329,18 @@ const layer = Layer.effect(
 
     const write: Interface["write"] = (key: string[], content: unknown) =>
       Effect.gen(function* () {
+        if (Option.isSome(writer)) {
+          yield* writer.value.write(key, content)
+          return
+        }
         yield* withResolved(key, (target, rw) => TxReentrantLock.withWriteLock(rw, writeJson(target, content)))
       })
 
     const list: Interface["list"] = Effect.fn("Storage.list")(function* (prefix: string[]) {
+      if (Option.isSome(writer)) {
+        const keys = yield* writer.value.list(prefix)
+        return keys.map((key) => [...key])
+      }
       const dir = (yield* state).dir
       const cwd = path.join(dir, ...prefix)
       const result = yield* fs

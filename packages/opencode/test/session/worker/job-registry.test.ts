@@ -1,0 +1,212 @@
+// Phase 9.2/9.4/9.6 — hub-hosted cross-worker job registry (plan tasks 9.2, 9.4, 9.6).
+//
+// The hub is the single authority for background jobs. These tests exercise the
+// in-memory registry directly: lifecycle (start/extend/complete/fail/cancel),
+// cross-worker metadata (parentID/workerID/depth), the parent→children index,
+// the terminal-result routing seam, and promotion/wait semantics. No threads.
+
+import { describe, expect, test } from "bun:test"
+import {
+  createJobRegistry,
+  type JobInfo,
+  type JobScheduler,
+} from "@/session/worker/job-registry"
+
+interface TestTimer {
+  readonly delayMs: number
+  readonly run: () => void
+  cancelled: boolean
+}
+
+/** A scheduler that records timers so timeout semantics are deterministic. */
+function createTestScheduler() {
+  const timers: TestTimer[] = []
+  const schedule: JobScheduler = (delayMs, run) => {
+    const timer: TestTimer = { delayMs, run, cancelled: false }
+    timers.push(timer)
+    return () => {
+      timer.cancelled = true
+    }
+  }
+  return {
+    schedule,
+    timers,
+    pending: () => timers.filter((timer) => !timer.cancelled),
+  }
+}
+
+describe("9.2 registry lifecycle", () => {
+  test("start registers a running job with parent linkage and cross-worker metadata", () => {
+    const registry = createJobRegistry()
+    const info = registry.start({
+      id: "ses_child",
+      type: "task",
+      title: "do work",
+      parentID: "ses_parent",
+      workerID: 3,
+      depth: 1,
+    })
+
+    expect(info.status).toBe("running")
+    expect(info.parentID).toBe("ses_parent")
+    expect(info.workerID).toBe(3)
+    expect(info.depth).toBe(1)
+    expect(info.started_at).toBeGreaterThan(0)
+    expect(registry.get("ses_child")).toEqual(info)
+    expect(registry.size).toBe(1)
+    expect(registry.childrenOf("ses_parent")).toEqual(["ses_child"])
+    expect(registry.parentOf("ses_child")).toBe("ses_parent")
+  })
+
+  test("start is idempotent for a running id (joins the existing job)", () => {
+    const registry = createJobRegistry()
+    const first = registry.start({ id: "ses_job", type: "task" })
+    const second = registry.start({ id: "ses_job", type: "other" })
+    expect(second).toEqual(first)
+    expect(registry.size).toBe(1)
+  })
+
+  test("wait resolves on completion; list is ordered by started_at", async () => {
+    let clock = 0
+    const registry = createJobRegistry({ now: () => (clock += 10) })
+    registry.start({ id: "ses_a", type: "task" })
+    const waiting = registry.wait({ id: "ses_a" })
+
+    const completed = registry.complete("ses_a", "hello")
+    expect(completed?.status).toBe("completed")
+    expect(completed?.completed_at).toBeGreaterThan(0)
+
+    const result = await waiting
+    expect(result.timedOut).toBe(false)
+    expect(result.info?.output).toBe("hello")
+
+    registry.start({ id: "ses_b", type: "task" })
+    expect(registry.list().map((job) => job.id)).toEqual(["ses_a", "ses_b"])
+  })
+
+  test("fail marks error with the message and resolves waiters", async () => {
+    const registry = createJobRegistry()
+    registry.start({ id: "ses_job", type: "task" })
+    const waiting = registry.wait({ id: "ses_job" })
+
+    registry.fail("ses_job", new Error("boom"))
+    const result = await waiting
+    expect(result.info).toMatchObject({ status: "error", error: "boom" })
+  })
+
+  test("wait times out against the injected scheduler", async () => {
+    const scheduler = createTestScheduler()
+    const registry = createJobRegistry({ schedule: scheduler.schedule })
+    registry.start({ id: "ses_job", type: "task" })
+
+    const unknown = await registry.wait({ id: "ses_missing" })
+    expect(unknown).toEqual({ timedOut: false })
+
+    let settled: { timedOut: boolean; info?: JobInfo } | undefined
+    const pending = registry.wait({ id: "ses_job", timeout: 25 }).then((value) => {
+      settled = value
+      return value
+    })
+
+    expect(settled).toBeUndefined()
+    expect(scheduler.pending()[0]?.delayMs).toBe(25)
+    scheduler.pending()[0]?.run()
+
+    const result = await pending
+    expect(result.timedOut).toBe(true)
+    expect(result.info?.status).toBe("running")
+  })
+
+  test("complete cancels a pending timeout", async () => {
+    const scheduler = createTestScheduler()
+    const registry = createJobRegistry({ schedule: scheduler.schedule })
+    registry.start({ id: "ses_job", type: "task" })
+    const pending = registry.wait({ id: "ses_job", timeout: 100 })
+    registry.complete("ses_job", "done")
+    expect((await pending).info?.output).toBe("done")
+    expect(scheduler.timers[0]?.cancelled).toBe(true)
+  })
+
+  test("cancel resolves waiters as cancelled and is idempotent", async () => {
+    const registry = createJobRegistry()
+    registry.start({ id: "ses_job", type: "task" })
+    const waiting = registry.wait({ id: "ses_job" })
+
+    registry.cancel("ses_job")
+    expect((await waiting).info?.status).toBe("cancelled")
+    expect(registry.cancel("ses_job")?.status).toBe("cancelled")
+  })
+
+  test("extend joins a running job; complete only settles at pending zero", () => {
+    const registry = createJobRegistry()
+    registry.start({ id: "ses_job", type: "task" })
+    expect(registry.extend("ses_job")).toBe(true)
+
+    registry.complete("ses_job", "first", 0)
+    expect(registry.get("ses_job")?.status).toBe("running")
+
+    registry.complete("ses_job", "second", 1)
+    expect(registry.get("ses_job")?.status).toBe("completed")
+    expect(registry.get("ses_job")?.output).toBe("second")
+
+    expect(registry.extend("ses_missing")).toBe(false)
+  })
+
+  test("promote flips metadata.background and wakes waitForPromotion", async () => {
+    const registry = createJobRegistry()
+    registry.start({ id: "ses_job", type: "task" })
+    const promoted = registry.waitForPromotion("ses_job")
+
+    const info = registry.promote("ses_job")
+    expect(info?.metadata?.background).toBe(true)
+    expect((await promoted).metadata?.background).toBe(true)
+  })
+
+  test("waitForPromotion resolves immediately when already background", async () => {
+    const registry = createJobRegistry()
+    registry.start({ id: "ses_job", type: "task", metadata: { background: true } })
+    expect((await registry.waitForPromotion("ses_job")).metadata?.background).toBe(true)
+  })
+})
+
+describe("9.4 terminal result routing by parentID", () => {
+  test("a settled child with a parentID is routed to that parent", () => {
+    const routed: Array<{ parentID: string; info: JobInfo }> = []
+    const registry = createJobRegistry({ routeResult: (parentID, info) => routed.push({ parentID, info }) })
+
+    registry.start({ id: "ses_child", type: "task", parentID: "ses_parent" })
+    registry.complete("ses_child", "done")
+
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.parentID).toBe("ses_parent")
+    expect(routed[0]?.info).toMatchObject({ id: "ses_child", status: "completed", output: "done" })
+  })
+
+  test("a root job (no parentID) is never routed", () => {
+    const routed: JobInfo[] = []
+    const registry = createJobRegistry({ routeResult: (_parentID, info) => routed.push(info) })
+    registry.start({ id: "ses_root", type: "task" })
+    registry.complete("ses_root", "done")
+    expect(routed).toHaveLength(0)
+  })
+
+  test("an error result is routed too", () => {
+    const routed: Array<{ parentID: string; status: string }> = []
+    const registry = createJobRegistry({ routeResult: (parentID, info) => routed.push({ parentID, status: info.status }) })
+    registry.start({ id: "ses_child", type: "task", parentID: "ses_parent" })
+    registry.fail("ses_child", "nope")
+    expect(routed).toEqual([{ parentID: "ses_parent", status: "error" }])
+  })
+})
+
+describe("9.4/9.6 parent→children index", () => {
+  test("linkChild is idempotent and childrenOf is stable-ordered", () => {
+    const registry = createJobRegistry()
+    registry.linkChild("ses_parent", "ses_a")
+    registry.linkChild("ses_parent", "ses_b")
+    registry.linkChild("ses_parent", "ses_a")
+
+    expect(registry.childrenOf("ses_parent")).toEqual(["ses_a", "ses_b"])
+    expect(registry.childrenOf("ses_other")).toEqual([])
+  })
+})
