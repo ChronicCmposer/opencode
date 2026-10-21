@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test"
+import { Schema } from "effect"
 import { LegacyEvent } from "../src/legacy-event"
 import { PermissionV1 } from "../src/permission-v1"
 import { QuestionV1 } from "../src/question-v1"
 import { Project } from "../src/project"
+import type { SessionID } from "../src/session-id"
 import { SessionV1 } from "../src/session-v1"
 
 describe("legacy public event schemas", () => {
@@ -18,11 +20,30 @@ describe("legacy public event schemas", () => {
       "message.part.delta",
       "session.diff",
       "session.error",
+      "session.cancelled",
     ])
     const durable = SessionV1.Event.Definitions.filter((event) => event.durable !== undefined)
     expect(durable).toHaveLength(7)
     expect(durable.every((event) => event.durable?.aggregate === "sessionID")).toBe(true)
     expect(durable.every((event) => event.durable?.version === 1)).toBe(true)
+  })
+
+  test("owns the transient session.cancelled outcome payload", () => {
+    const decoded = Schema.decodeUnknownSync(SessionV1.Event.Cancelled.data)({
+      sessionID: "ses_1" as SessionID,
+      mode: "cooperative",
+      durationMs: 12,
+      acknowledged: true,
+    })
+    expect(decoded).toEqual({
+      sessionID: "ses_1" as SessionID,
+      mode: "cooperative",
+      durationMs: 12,
+      acknowledged: true,
+    })
+    expect(SessionV1.Event.Cancelled.durable).toBeUndefined()
+    const invalid = { sessionID: "ses_1", mode: "queued", durationMs: 0, acknowledged: false }
+    expect(() => Schema.decodeUnknownSync(SessionV1.Event.Cancelled.data)(invalid as never)).toThrow()
   })
 
   test("owns the legacy transient public definitions", () => {

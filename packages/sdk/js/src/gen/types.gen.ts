@@ -2398,7 +2398,13 @@ export type SessionAbortResponses = {
   /**
    * Aborted session
    */
-  200: boolean
+  200: {
+    sessionID?: string
+    mode?: "cooperative" | "terminated" | "completed"
+    winner?: "cancel" | "completion"
+    acknowledged?: boolean
+    durationMs?: number
+  }
 }
 
 export type SessionAbortResponse = SessionAbortResponses[keyof SessionAbortResponses]

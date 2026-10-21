@@ -92,9 +92,24 @@ export interface SubagentDispatchRequest {
 }
 
 /**
+ * A dispatch rejection is a cancellation (not a failure) when it carries the
+ * exact `SessionCancelledError` tag. `WorkerCrashedError` re-parents its
+ * prototype to `SessionCancelledError`, so an `instanceof` test would misread a
+ * crash as a cancel; the tag check keeps the two distinct.
+ */
+function isSessionCancellation(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { readonly _tag?: unknown })._tag === "SessionCancelledError"
+  )
+}
+
+/**
  * Admit, register and dispatch one subagent child. Resolves with the child's
  * settled registry info once `scheduler.dispatch` resolves; a dispatch failure
- * marks the job failed and rethrows.
+ * settles the job and rethrows — `cancelled` for a cancellation, `error`
+ * otherwise — so the parent's routed result matches the child's terminal state.
  */
 export async function dispatchSubagent(
   options: SubagentDispatchOptions,
@@ -117,7 +132,8 @@ export async function dispatchSubagent(
   try {
     await options.scheduler.dispatch({ sessionID: request.childID, depth })
   } catch (error) {
-    options.registry.fail(request.childID, error)
+    if (isSessionCancellation(error)) options.registry.cancel(request.childID)
+    else options.registry.fail(request.childID, error)
     throw error
   }
   return options.registry.get(request.childID)

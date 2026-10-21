@@ -1,28 +1,49 @@
-// Phase 8.1 + 8.5 — hub-side egress receiver (plan tasks 8.1, 8.5).
+// W2 — hub-side egress receiver over the events envelope (spec Q6/Q16/Q21).
 //
 // The hub end of a worker's dedicated egress port. Incoming `Uint8Array` chunks
 // are reassembled with the length-prefixed codec (a frame may be split across
-// deliveries and a delivery may carry several frames). Complete frames are handed
-// to `onFrame` in arrival order — which is commit order for a single worker — and
-// durable ordinals are checked for generation-scoped monotonicity, so an
-// out-of-order or stale-generation durable frame fails loud instead of silently
-// corrupting commit order.
+// deliveries and a delivery may carry several frames). Event frames are handed to
+// `onFrame` in arrival order — which is commit order for a single worker — and
+// durable `(generation, ordinal)` pairs are checked for generation-scoped
+// monotonicity, so an out-of-order or stale-generation durable frame fails loud
+// instead of silently corrupting commit order. The `end`/`resync`/`ack` control
+// frames are surfaced distinctly rather than swallowed.
+//
+// Backpressure (spec Q16): when the downstream consumer reports pressure, a
+// non-durable delta is DROPPED and a resync is surfaced, so a slow hub never
+// blocks the worker. Durable events are never dropped.
 
-import { decodeFrameChunks, type EgressFrame } from "./frame"
+import { type EventsAckPayload, type EventsFrame, type EventsResyncPayload, decodeFrameChunks } from "./frame"
 import { compareOrdinals, type WriterOrdinal } from "./ordinal"
+
+type EventFrame = Extract<EventsFrame, { readonly kind: "event" }>
 
 export interface EgressReceiverOptions {
   readonly port: MessagePort
-  /** Called with each complete frame and the exact wire bytes it arrived as. */
-  readonly onFrame: (frame: EgressFrame, bytes: Uint8Array) => void
+  /** Called with each delivered event frame and the exact wire bytes it arrived as. */
+  readonly onFrame: (frame: EventsFrame, bytes: Uint8Array) => void
+  /** Called once when the worker's `end` frame arrives. */
   readonly onEnd?: () => void
+  /** Called for a received `resync` frame, or `undefined` for an overflow resync. */
+  readonly onResync?: (payload: EventsResyncPayload | undefined) => void
+  /** Called for a received `ack` frame. */
+  readonly onAck?: (payload: EventsAckPayload | undefined) => void
   /** Called once on the first framing/ordering error; the receiver then stops. */
   readonly onError?: (error: Error) => void
+  /**
+   * Backpressure signal: when it returns `true`, non-durable deltas are dropped
+   * (and a resync surfaced) instead of delivered. Durable events always deliver.
+   */
+  readonly pressure?: () => boolean
 }
 
 export interface EgressReceiver {
-  /** Number of non-end frames delivered. */
+  /** Number of event frames delivered to `onFrame`. */
   readonly received: number
+  /** Number of non-durable deltas dropped under backpressure. */
+  readonly dropped: number
+  /** Number of resyncs surfaced (received `resync` frames + overflow resyncs). */
+  readonly resyncs: number
   readonly ended: boolean
   /** Bytes buffered awaiting a complete frame. */
   readonly pendingBytes: number
@@ -50,10 +71,19 @@ function concat(left: Uint8Array, right: Uint8Array): Uint8Array {
   return joined
 }
 
+/** A durable event carries BOTH a generation and an ordinal; a delta carries neither. */
+function durableOrdinal(frame: EventFrame): WriterOrdinal | undefined {
+  const { generation, ordinal } = frame.payload
+  if (generation === undefined || ordinal === undefined) return undefined
+  return { generation, ordinal }
+}
+
 export function createEgressReceiver(options: EgressReceiverOptions): EgressReceiver {
   const { port } = options
   let rest: Uint8Array = EMPTY
   let received = 0
+  let dropped = 0
+  let resyncs = 0
   let ended = false
   let lastError: Error | undefined
   let last: WriterOrdinal | undefined
@@ -65,22 +95,46 @@ export function createEgressReceiver(options: EgressReceiverOptions): EgressRece
     port.close()
   }
 
-  const handleFrame = (frame: EgressFrame, bytes: Uint8Array): void => {
-    if (frame.kind === "end") {
-      ended = true
-      options.onEnd?.()
-      return
-    }
-    if (frame.kind === "durable") {
-      if (last && compareOrdinals(frame.meta, last) <= 0) {
+  const handleEvent = (frame: EventFrame, bytes: Uint8Array): void => {
+    const meta = durableOrdinal(frame)
+    if (meta) {
+      if (last && compareOrdinals(meta, last) <= 0) {
         throw new Error(
-          `out-of-order durable egress: got ${frame.meta.generation}/${frame.meta.ordinal}, last ${last.generation}/${last.ordinal}`,
+          `out-of-order durable egress: got ${meta.generation}/${meta.ordinal}, last ${last.generation}/${last.ordinal}`,
         )
       }
-      last = frame.meta
+      last = meta
+      received++
+      options.onFrame(frame, bytes)
+      return
+    }
+    if (options.pressure?.() === true) {
+      dropped++
+      resyncs++
+      options.onResync?.(undefined)
+      return
     }
     received++
     options.onFrame(frame, bytes)
+  }
+
+  const handleFrame = (frame: EventsFrame, bytes: Uint8Array): void => {
+    switch (frame.kind) {
+      case "event":
+        handleEvent(frame, bytes)
+        return
+      case "end":
+        ended = true
+        options.onEnd?.()
+        return
+      case "resync":
+        resyncs++
+        options.onResync?.(frame.payload)
+        return
+      case "ack":
+        options.onAck?.(frame.payload)
+        return
+    }
   }
 
   port.onmessage = (event: MessageEvent) => {
@@ -101,6 +155,12 @@ export function createEgressReceiver(options: EgressReceiverOptions): EgressRece
   return {
     get received() {
       return received
+    },
+    get dropped() {
+      return dropped
+    },
+    get resyncs() {
+      return resyncs
     },
     get ended() {
       return ended

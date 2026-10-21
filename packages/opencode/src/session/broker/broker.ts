@@ -12,17 +12,28 @@
 // The contract intentionally depends on nothing from the pool/writer/egress
 // modules: it is a leaf service the hub can own directly.
 
-import { DEFAULT_MCP_TIMEOUT_MS, parseAcquireResult, parseOAuthResult, parsePingResult } from "./protocol"
+import {
+  BrokerFailure,
+  BrokerProtocolError,
+  DEFAULT_MCP_TIMEOUT_MS,
+  parseAcquireResult,
+  parseBrokerRequest,
+  parseOAuthResult,
+  parsePingResult,
+} from "./protocol"
 import type {
   AcquireResult,
+  BrokerError,
   BrokerErrorCode,
   BrokerFrame,
   BrokerRequest,
   OAuthResult,
   PingResult,
+  ResponseFrame,
   ServerSpec,
 } from "./protocol"
 import { mergeEnv } from "./env"
+import { portFromMessagePort } from "../worker/port"
 
 export interface WorkerLike {
   readonly generation: number
@@ -443,6 +454,108 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
     onSupervision,
     [Symbol.asyncDispose]: teardown,
   }
+}
+
+// ---------------------------------------------------------------------------
+// Worker-facing proxy (plan step 19).
+//
+// A session worker must not spawn MCP/LSP children, so the hub exposes its
+// broker over a transferred `MessagePort` with `serveBrokerPort`. The worker
+// pairs it with `createWorkerBrokerClient` (`../worker/broker-client`). Requests
+// are parsed at this boundary with `parseBrokerRequest`; replies are the
+// protocol's `ResponseFrame`s, carrying either a trusted value or a coded error.
+// ---------------------------------------------------------------------------
+
+/** The broker surface `serveBrokerPort` drives; `BrokerClient` satisfies it. */
+export interface BrokerBackend {
+  acquire(input: AcquireInput): Promise<AcquireResult>
+  call(input: CallInput): Promise<unknown>
+  cancel(targetId: string): Promise<void>
+  oauth(directory: string): Promise<OAuthResult>
+  release(directory: string): Promise<void>
+  ping(): Promise<PingResult>
+  teardown(): Promise<void>
+}
+
+/** Map any backend/parse failure onto the wire error taxonomy. */
+function brokerErrorFrom(reason: unknown): BrokerError {
+  if (reason instanceof BrokerFailure) return { code: reason.code, message: reason.message }
+  if (reason instanceof BrokerProtocolError) return { code: "invalid-request", message: reason.message }
+  if (reason instanceof BrokerRequestError) return { code: reason.code, message: reason.message }
+  if (reason instanceof Error) return { code: "protocol", message: reason.message }
+  return { code: "protocol", message: String(reason) }
+}
+
+/** Dispatch one parsed request to the hub broker; results are re-parsed so the
+ * wire value is always the trusted protocol shape. */
+function executeBrokerRequest(broker: BrokerBackend, request: BrokerRequest): unknown {
+  switch (request.kind) {
+    case "acquire":
+      return broker.acquire({ directory: request.directory, servers: request.servers }).then(parseAcquireResult)
+    case "call":
+      return broker.call({
+        directory: request.directory,
+        server: request.server,
+        method: request.method,
+        ...(request.params === undefined ? {} : { params: request.params }),
+        ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
+      })
+    case "cancel":
+      return broker.cancel(request.targetId)
+    case "release":
+      return broker.release(request.directory)
+    case "oauth":
+      return broker.oauth(request.directory).then(parseOAuthResult)
+    case "ping":
+      return broker.ping().then(parsePingResult)
+    case "teardown":
+      return broker.teardown()
+    default: {
+      const exhausted: never = request
+      void exhausted
+      return Promise.reject(new BrokerFailure("invalid-request", "unknown broker request kind"))
+    }
+  }
+}
+
+/**
+ * Serve worker broker calls on `port`. Returns a disposer that detaches the
+ * listener. A malformed frame is answered with an `invalid-request` error
+ * correlated by its `requestId` (or `"unknown"`); a rejected handler becomes a
+ * coded error frame. Replies are guarded: a port that closed between request
+ * and reply drops the frame instead of crashing the hub.
+ */
+export function serveBrokerPort(broker: BrokerBackend, port: MessagePort): () => void {
+  const channel = portFromMessagePort<unknown>(port)
+
+  const reply = (frame: ResponseFrame): void => {
+    try {
+      channel.post(frame)
+    } catch {
+      // The port is gone (worker terminated); drop the reply rather than crash.
+    }
+  }
+
+  return channel.onMessage((frame) => {
+    let request: BrokerRequest
+    try {
+      request = parseBrokerRequest(frame)
+    } catch (error) {
+      const requestId = (frame as { requestId?: unknown } | null)?.requestId
+      reply({
+        kind: "response",
+        requestId: typeof requestId === "string" ? requestId : "unknown",
+        ok: false,
+        error: brokerErrorFrom(error),
+      })
+      return
+    }
+
+    void Promise.resolve(executeBrokerRequest(broker, request)).then(
+      (value) => reply({ kind: "response", requestId: request.requestId, ok: true, value: value ?? null }),
+      (reason) => reply({ kind: "response", requestId: request.requestId, ok: false, error: brokerErrorFrom(reason) }),
+    )
+  })
 }
 
 export * as Broker from "./broker"

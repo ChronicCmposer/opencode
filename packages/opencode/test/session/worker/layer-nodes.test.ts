@@ -9,7 +9,9 @@ import { Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { Session } from "@/session/session"
+import { SessionPrompt } from "@/session/prompt"
 import {
+  REQUIRED_SESSION_NODE_KEYS,
   SESSION_CLIENT_KEYS,
   SESSION_EXCLUDED,
   assertSessionLayer,
@@ -19,6 +21,25 @@ import {
   validateSessionLayer,
   WorkerNodeTable,
 } from "@/session/worker/node-table"
+import { boundaryReplacements } from "@/session/worker/layer"
+import { workerSnapshot } from "../../lib/snapshot"
+
+/**
+ * The 9 residual hub/writer/broker/infra-owned nodes the reduced worker must
+ * never own. They are reachable from the real `SessionPrompt` graph, so they
+ * must be classified `excluded` (and replaced) rather than left `unknown`.
+ */
+const RESIDUAL_EXCLUDED_KEYS = [
+  "@opencode/Storage",
+  "@opencode/Git",
+  "@opencode/BackgroundJob",
+  "@opencode/Global",
+  "@opencode/AppProcess",
+  "@opencode/RipgrepBinary",
+  "@opencode/v2/Ripgrep",
+  "@opencode/McpBrowser",
+  "@opencode/example/LocationServiceMap",
+] as const
 
 const clientNode = (name: string) =>
   LayerNode.make({ name, layer: Layer.empty as Layer.Layer<never>, deps: [] as const })
@@ -52,8 +73,24 @@ describe("session node table", () => {
         "Installation",
         "Npm",
         "ModelsDev",
+        "Storage",
+        "Git",
+        "BackgroundJob",
+        "Global",
+        "AppProcess",
+        "RipgrepBinary",
+        "v2/Ripgrep",
+        "McpBrowser",
+        "LocationServiceMap",
       ]),
     )
+  })
+
+  test("the 9 residual hub/writer/broker/infra nodes are classified excluded", () => {
+    for (const key of RESIDUAL_EXCLUDED_KEYS) {
+      const entry = lookupNode(key)
+      expect(entry?.boundary).toBe("excluded")
+    }
   })
 
   test("lookupNode resolves by key and by label", () => {
@@ -164,5 +201,46 @@ describe("assertSessionLayer", () => {
       expect(error).toBeInstanceOf(WorkerNodeTable.SessionLayerViolationError)
       expect((error as Error).message).toContain("@opencode/Unclassified")
     }
+  })
+})
+
+describe("required session node set (step 29)", () => {
+  test("every required session node is classified (never unknown)", () => {
+    for (const key of REQUIRED_SESSION_NODE_KEYS) expect(lookupNode(key)).toBeDefined()
+  })
+
+  test("a graph using the required nodes validates", () => {
+    const required = REQUIRED_SESSION_NODE_KEYS.map((key) => clientNode(key))
+    const report = validateSessionLayer(LayerNode.group([...required, clientGroup()]))
+    expect(report.excluded).toEqual([])
+    expect(report.missingClients).toEqual([])
+    expect(report.unknown).toEqual([])
+    expect(report.ok).toBe(true)
+  })
+
+  test("the real session pipeline no longer reports any required node as unknown", () => {
+    const report = validateSessionLayer(LayerNode.group([SessionPrompt.node, clientGroup()]))
+    for (const key of REQUIRED_SESSION_NODE_KEYS) expect(report.unknown).not.toContain(key)
+  })
+
+  test("hub/writer/broker-owned reachable nodes are excluded, never unknown", () => {
+    const report = validateSessionLayer(LayerNode.group([SessionPrompt.node, clientGroup()]))
+    // The residual nodes are classified `excluded`: a worker that reaches them
+    // without a replacement is a violation, reported as `excluded` (not unknown).
+    expect(report.excluded).toContain("@opencode/Storage")
+    expect(report.excluded).toContain("@opencode/Global")
+    for (const key of RESIDUAL_EXCLUDED_KEYS) expect(report.unknown).not.toContain(key)
+    expect(report.ok).toBe(false)
+  })
+
+  test("boundary replacements make the real SessionPrompt graph fully classified", () => {
+    const report = validateSessionLayer(
+      LayerNode.group([SessionPrompt.node, clientGroup()]),
+      boundaryReplacements(workerSnapshot()),
+    )
+    expect(report.excluded).toEqual([])
+    expect(report.missingClients).toEqual([])
+    expect(report.unknown).toEqual([])
+    expect(report.ok).toBe(true)
   })
 })

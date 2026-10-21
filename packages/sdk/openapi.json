@@ -6695,7 +6695,48 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "boolean",
+                  "type": "object",
+                  "properties": {
+                    "sessionID": {
+                      "type": "string",
+                      "pattern": "^ses"
+                    },
+                    "mode": {
+                      "type": "string",
+                      "enum": ["cooperative", "terminated", "completed"]
+                    },
+                    "winner": {
+                      "type": "string",
+                      "enum": ["cancel", "completion"]
+                    },
+                    "acknowledged": {
+                      "type": "boolean"
+                    },
+                    "durationMs": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["NaN"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["-Infinity"]
+                        },
+                        {
+                          "type": "string",
+                          "enum": ["Infinity", "-Infinity", "NaN"]
+                        }
+                      ]
+                    }
+                  },
+                  "additionalProperties": false,
                   "description": "Aborted session"
                 }
               }
@@ -15399,6 +15440,9 @@
             "$ref": "#/components/schemas/EventSessionError"
           },
           {
+            "$ref": "#/components/schemas/EventSessionCancelled"
+          },
+          {
             "$ref": "#/components/schemas/EventInstallationUpdated"
           },
           {
@@ -19137,6 +19181,42 @@
                         ]
                       }
                     },
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["session.cancelled"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "mode": {
+                        "type": "string",
+                        "enum": ["cooperative", "terminated", "completed"]
+                      },
+                      "durationMs": {
+                        "type": "number"
+                      },
+                      "acknowledged": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": ["sessionID", "mode", "durationMs", "acknowledged"],
                     "additionalProperties": false
                   }
                 },
@@ -24202,6 +24282,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionError"
+          },
+          {
+            "$ref": "#/components/schemas/SessionCancelled"
           },
           {
             "$ref": "#/components/schemas/InstallationUpdated"
@@ -31727,6 +31810,64 @@
         "required": ["id", "type", "data"],
         "additionalProperties": false
       },
+      "SessionCancelled": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.cancelled"]
+          },
+          "durable": {
+            "type": "object",
+            "properties": {
+              "aggregateID": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "version": {
+                "type": "integer"
+              }
+            },
+            "required": ["aggregateID", "seq", "version"],
+            "additionalProperties": false
+          },
+          "location": {
+            "$ref": "#/components/schemas/LocationRef"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "mode": {
+                "type": "string",
+                "enum": ["cooperative", "terminated", "completed"]
+              },
+              "durationMs": {
+                "type": "number"
+              },
+              "acknowledged": {
+                "type": "boolean"
+              }
+            },
+            "required": ["sessionID", "mode", "durationMs", "acknowledged"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "data"],
+        "additionalProperties": false
+      },
       "InstallationUpdated": {
         "type": "object",
         "properties": {
@@ -35602,6 +35743,42 @@
                 ]
               }
             },
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventSessionCancelled": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.cancelled"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "mode": {
+                "type": "string",
+                "enum": ["cooperative", "terminated", "completed"]
+              },
+              "durationMs": {
+                "type": "number"
+              },
+              "acknowledged": {
+                "type": "boolean"
+              }
+            },
+            "required": ["sessionID", "mode", "durationMs", "acknowledged"],
             "additionalProperties": false
           }
         },

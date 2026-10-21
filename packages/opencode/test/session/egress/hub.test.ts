@@ -9,7 +9,8 @@ import { describe, expect, test } from "bun:test"
 import { EgressStreamOverflowError, createEgressHub } from "@/session/egress/hub"
 import { decodeFrame, encodeFrame, type EgressFrame } from "@/session/egress/frame"
 import { createEgressSender } from "@/session/egress/sender"
-import { delta, durable, durableFrame } from "../../lib/egress-fixtures"
+import { endFrame } from "@/session/worker/frame"
+import { delta, deltasFrame, durable, durableFrame } from "../../lib/egress-fixtures"
 
 async function pollUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -37,13 +38,13 @@ async function startConsumer(hub: ReturnType<typeof createEgressHub>, id: string
 }
 
 describe("egress hub over MessagePort", () => {
-  test("coalesced deltas arrive as one frame", async () => {
+  test("coalesced deltas arrive in order", async () => {
     const { hub, sender } = setup({ windowMs: 16 })
     const subscriber = hub.fanout.subscribe("c")
     sender.pushDelta(delta("1"))
     sender.pushDelta(delta("2"))
-    await pollUntil(() => hub.frames === 1)
-    expect(subscriber.drain()).toEqual([{ kind: "deltas", v: 1, events: [delta("1"), delta("2")] }])
+    await pollUntil(() => hub.frames === 2)
+    expect(subscriber.drain()).toEqual([deltasFrame("1"), deltasFrame("2")])
     // The hub forwarded the worker's bytes verbatim — no re-encode for clients.
     expect(hub.fanout.encodeCount).toBe(0)
     hub.close()
@@ -69,7 +70,7 @@ describe("egress hub over MessagePort", () => {
     sender.pushDurable(durable("b"), { generation: 1, ordinal: 2 })
     await pollUntil(() => hub.frames === 2)
     const frames = subscriber.drain()
-    expect(frames.map((frame) => (frame.kind === "durable" ? frame.meta.ordinal : -1))).toEqual([1, 2])
+    expect(frames.map((frame) => (frame.kind === "event" ? frame.payload.ordinal ?? -1 : -1))).toEqual([1, 2])
     hub.close()
   })
 
@@ -88,11 +89,7 @@ describe("egress hub over MessagePort", () => {
     sender.pushDurable(durable("done"), { generation: 1, ordinal: 1 })
     sender.end()
     await consumer.done
-    expect(consumer.frames).toEqual([
-      { kind: "deltas", v: 1, events: [delta("1")] },
-      durableFrame("done", 1),
-      { kind: "end", v: 1 },
-    ])
+    expect(consumer.frames).toEqual([deltasFrame("1"), durableFrame("done", 1), endFrame()])
     hub.close()
   })
 
@@ -103,7 +100,7 @@ describe("egress hub over MessagePort", () => {
     sender.pushDurable(durable("kept"), { generation: 1, ordinal: 1 })
     await pollUntil(() => hub.frames === 2)
     hub.close()
-    expect(subscriber.drain()).toEqual([durableFrame("kept", 1), { kind: "end", v: 1 }])
+    expect(subscriber.drain()).toEqual([durableFrame("kept", 1), endFrame()])
   })
 
   test("close is idempotent", () => {

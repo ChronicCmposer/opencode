@@ -9,6 +9,7 @@
 // directory B from state built for directory A.
 
 import { Effect, Exit, Scope } from "effect"
+import { WorkerCache, type WorkerCacheOptions } from "./cache"
 
 /** Raised when a second scope is requested for a session that is still open. */
 export class ConcurrentSessionScopeError extends Error {
@@ -127,19 +128,30 @@ export function createDirectoryState<A>(options: DirectoryStateOptions<A>): Dire
   let current: DirectoryEntry<A> | undefined
   let queue: Promise<unknown> = Promise.resolve()
 
-  const dispose = async (): Promise<void> => {
+  /** Serialize `work` behind every in-flight `use`/`dispose` so switches never interleave. */
+  const enqueue = <T>(work: () => Promise<T>): Promise<T> => {
+    const result = queue.then(work)
+    queue = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    return result
+  }
+
+  /** Drop the live entry and run its finalizer. Callers must hold the queue. */
+  const disposeCurrent = async (): Promise<void> => {
     if (current === undefined) return
     const entry = current
     current = undefined
     if (entry.ready) await options.dispose?.(entry.value, entry.directory)
   }
 
-  const use = <B>(directory: string, select: (value: A) => B | Promise<B>): Promise<B> => {
-    const result = queue.then(async () => {
+  const use = <B>(directory: string, select: (value: A) => B | Promise<B>): Promise<B> =>
+    enqueue(async () => {
       if (current !== undefined && current.directory === directory && current.ready) {
         return select(current.value)
       }
-      await dispose()
+      await disposeCurrent()
       current = { directory, ready: false }
       let value: A
       try {
@@ -151,20 +163,28 @@ export function createDirectoryState<A>(options: DirectoryStateOptions<A>): Dire
       current = { directory, ready: true, value }
       return select(value)
     })
-    queue = result.then(
-      () => undefined,
-      () => undefined,
-    )
-    return result
-  }
 
   return {
     get current() {
       return current?.directory
     },
     use,
-    dispose,
+    // Public disposal joins the same queue, so a dispose racing an in-flight build
+    // runs after it and cannot be undone by the build publishing afterwards.
+    dispose: () => enqueue(disposeCurrent),
   }
+}
+
+/**
+ * A per-directory {@link WorkerCache}. Concurrent sessions in one worker share
+ * the directory's cache (built once); switching directories disposes it, so a
+ * reused worker never serves directory B from state built for directory A.
+ */
+export function createDirectoryCache(options: WorkerCacheOptions = {}): DirectoryState<WorkerCache> {
+  return createDirectoryState<WorkerCache>({
+    build: () => new WorkerCache(options),
+    dispose: (cache) => cache.clear(),
+  })
 }
 
 export * as WorkerSessionScope from "./session-scope"

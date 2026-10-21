@@ -51,6 +51,7 @@ export type Event =
   | EventMessagePartDelta
   | EventSessionDiff
   | EventSessionError
+  | EventSessionCancelled
   | EventInstallationUpdated
   | EventInstallationUpdateAvailable
   | EventFileEdited
@@ -1223,6 +1224,16 @@ export type GlobalEvent = {
             | ContextOverflowError
             | ContentFilterError
             | ApiError
+        }
+      }
+    | {
+        id: string
+        type: "session.cancelled"
+        properties: {
+          sessionID: string
+          mode: "cooperative" | "terminated" | "completed"
+          durationMs: number
+          acknowledged: boolean
         }
       }
     | {
@@ -2919,6 +2930,7 @@ export type V2Event =
   | MessagePartDelta
   | SessionDiff
   | SessionError
+  | SessionCancelled
   | InstallationUpdated
   | InstallationUpdateAvailable
   | FileEdited
@@ -5385,6 +5397,26 @@ export type SessionError = {
   }
 }
 
+export type SessionCancelled = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.cancelled"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    mode: "cooperative" | "terminated" | "completed"
+    durationMs: number
+    acknowledged: boolean
+  }
+}
+
 export type InstallationUpdated = {
   id: string
   metadata?: {
@@ -6707,6 +6739,17 @@ export type EventSessionError = {
       | ContextOverflowError
       | ContentFilterError
       | ApiError
+  }
+}
+
+export type EventSessionCancelled = {
+  id: string
+  type: "session.cancelled"
+  properties: {
+    sessionID: string
+    mode: "cooperative" | "terminated" | "completed"
+    durationMs: number
+    acknowledged: boolean
   }
 }
 
@@ -10001,7 +10044,13 @@ export type SessionAbortResponses = {
   /**
    * Aborted session
    */
-  200: boolean
+  200: {
+    sessionID?: string
+    mode?: "cooperative" | "terminated" | "completed"
+    winner?: "cancel" | "completion"
+    acknowledged?: boolean
+    durationMs?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
 }
 
 export type SessionAbortResponse = SessionAbortResponses[keyof SessionAbortResponses]

@@ -62,7 +62,31 @@ export const SESSION_ALLOWLIST: readonly NodeEntry[] = [
   entry("Truncate", "@opencode/Truncate", ["session"], "worker-local"),
   entry("Format", "@opencode/Format", ["session"], "worker-local"),
   entry("RuntimeFlags", "@opencode/RuntimeFlags", ["session"], "worker-local"),
+  // Real session-pipeline dependencies (task 29): the reduced worker layer must
+  // be able to run the V1 `SessionPrompt` loop, not just the toy pipeline.
+  entry("SessionStatus", "@opencode/SessionStatus", ["session"], "hub-proxy", "hub-resident authority"),
+  entry("SessionCompaction", "@opencode/SessionCompaction", ["session"], "worker-local"),
+  entry("SessionRevert", "@opencode/SessionRevert", ["session"], "worker-local"),
+  entry("SessionSummary", "@opencode/SessionSummary", ["session"], "worker-local"),
+  entry("Instruction", "@opencode/Instruction", ["session"], "worker-local"),
+  entry("SystemPrompt", "@opencode/SystemPrompt", ["session"], "worker-local"),
+  entry("Command", "@opencode/Command", ["session"], "worker-local"),
+  entry("Image", "@opencode/Image", ["session"], "worker-local"),
+  entry("EventV2Bridge", "@opencode/EventV2Bridge", ["session"], "worker-local", "worker-local egress mesh"),
+  entry("Event", "@opencode/Event", ["session"], "worker-local"),
+  entry("Snapshot", "@opencode/Snapshot", ["session"], "worker-local"),
+  entry("LLMClient", "@opencode/LLMClient", ["session"], "worker-local", "platform HTTP client"),
+  entry("RequestExecutor", "@opencode/LLM/RequestExecutor", ["session"], "worker-local"),
+  entry("Env", "@opencode/Env", ["session"], "worker-local", "worker-isolate environment"),
+  entry("FileSystem", "@opencode/FileSystem", ["session"], "worker-local", "worker-isolate filesystem"),
   entry("EventEgressClient", "@opencode/session-worker/EventEgressClient", ["session"], "worker-local"),
+  entry(
+    "WorkerEventBridge",
+    "@opencode/session-worker/EventBridge",
+    ["session"],
+    "worker-local",
+    "worker EventV2 → events-port frames",
+  ),
   entry("WriterClient", "@opencode/session-worker/WriterClient", ["session"], "worker-local"),
   entry("BrokerClient", "@opencode/session-worker/BrokerClient", ["session"], "broker-proxy"),
   entry("BackgroundJobClient", "@opencode/session-worker/BackgroundJobClient", ["session"], "hub-proxy"),
@@ -86,6 +110,18 @@ export const SESSION_EXCLUDED: readonly NodeEntry[] = [
   entry("Installation", "@opencode/Installation", ["hub"], "excluded"),
   entry("Npm", "@opencode/Npm", ["hub"], "excluded", "no npm install in workers"),
   entry("ModelsDev", "@opencode/ModelsDev", ["hub"], "excluded", "hub-only catalog refresh"),
+  // Residual nodes reachable from the real `SessionPrompt` graph (task 29). They
+  // are hub/writer/broker/infra-owned, so they are classified `excluded` and
+  // supplied by boundary replacements rather than left fail-closed `unknown`.
+  entry("Storage", "@opencode/Storage", ["hub", "writer"], "excluded", "writer-owned storage"),
+  entry("Git", "@opencode/Git", ["hub"], "excluded", "hub-owned VCS"),
+  entry("BackgroundJob", "@opencode/BackgroundJob", ["hub"], "excluded", "hub-resident job registry"),
+  entry("Global", "@opencode/Global", ["hub"], "excluded", "process-global state"),
+  entry("AppProcess", "@opencode/AppProcess", ["hub"], "excluded", "OS child processes stay on the hub"),
+  entry("RipgrepBinary", "@opencode/RipgrepBinary", ["broker"], "excluded", "broker-owned binary"),
+  entry("v2/Ripgrep", "@opencode/v2/Ripgrep", ["broker"], "excluded", "broker-proxy only"),
+  entry("McpBrowser", "@opencode/McpBrowser", ["broker"], "excluded", "broker-proxy only"),
+  entry("LocationServiceMap", "@opencode/example/LocationServiceMap", ["hub"], "excluded", "hub-composed location map"),
 ]
 
 /**
@@ -98,12 +134,59 @@ export const EVENT_EGRESS_CLIENT_KEY = "@opencode/session-worker/EventEgressClie
 export const BROKER_CLIENT_KEY = "@opencode/session-worker/BrokerClient"
 export const BACKGROUND_JOB_CLIENT_KEY = "@opencode/session-worker/BackgroundJobClient"
 
+/**
+ * The worker's EventV2 → events-port bridge node. Worker-local (it subscribes to
+ * the in-isolate EventV2 and frames onto the egress channel), so it is allowlisted
+ * but not a port-backed client.
+ */
+export const EVENT_BRIDGE_KEY = "@opencode/session-worker/EventBridge"
+
 /** Client nodes the session layer MUST contain (task 6.5: writer RPC client present). */
 export const SESSION_CLIENT_KEYS: readonly string[] = [
   WRITER_CLIENT_KEY,
   EVENT_EGRESS_CLIENT_KEY,
   BROKER_CLIENT_KEY,
   BACKGROUND_JOB_CLIENT_KEY,
+]
+
+/**
+ * The real session-pipeline services a worker must run (task 29). Every key is
+ * allowlisted, so a reduced layer built from this set passes `assertSessionLayer`.
+ * `RUNNABLE_SESSION_NODES` (`layer.ts`) is derived from this list, so the keys
+ * are the single source of truth and the table and the layer cannot drift.
+ */
+export const REQUIRED_SESSION_NODE_KEYS: readonly string[] = [
+  "@opencode/Session",
+  "@opencode/SessionPrompt",
+  "@opencode/SessionProcessor",
+  "@opencode/SessionRunState",
+  "@opencode/SessionStatus",
+  "@opencode/SessionCompaction",
+  "@opencode/SessionRevert",
+  "@opencode/SessionSummary",
+  "@opencode/SessionTodo",
+  "@opencode/LLM",
+  "@opencode/Provider",
+  "@opencode/Agent",
+  "@opencode/Skill",
+  "@opencode/SkillDiscovery",
+  "@opencode/ToolRegistry",
+  "@opencode/Plugin",
+  "@opencode/Config",
+  "@opencode/Auth",
+  "@opencode/RuntimeFlags",
+  "@opencode/Question",
+  "@opencode/Permission",
+  "@opencode/Truncate",
+  "@opencode/Format",
+  "@opencode/Instruction",
+  "@opencode/SystemPrompt",
+  "@opencode/Command",
+  "@opencode/Image",
+  "@opencode/EventV2Bridge",
+  "@opencode/Event",
+  "@opencode/Snapshot",
+  "@opencode/LLMClient",
 ]
 
 const ALL_ENTRIES: readonly NodeEntry[] = [...SESSION_ALLOWLIST, ...SESSION_EXCLUDED]

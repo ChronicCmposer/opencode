@@ -28,6 +28,16 @@ interface QueuedFrame {
   readonly durable: boolean
 }
 
+/**
+ * A durable event is an `event` frame carrying BOTH `generation` and `ordinal`
+ * (frame metadata, not event fields); a non-durable delta carries neither.
+ * Mirrors the receiver's durability test so backpressure and commit ordering
+ * agree on exactly which frames may be dropped.
+ */
+function isDurable(frame: EgressFrame): boolean {
+  return frame.kind === "event" && frame.payload.generation !== undefined && frame.payload.ordinal !== undefined
+}
+
 export interface FanoutSubscriber {
   readonly id: string
   readonly depth: number
@@ -142,7 +152,7 @@ export function createFanout(options: FanoutOptions = {}): Fanout {
   }
 
   const publishBytes = (bytes: Uint8Array, frame: EgressFrame): PublishResult => {
-    const durable = frame.kind === "durable"
+    const durable = isDurable(frame)
     const overflowed: string[] = []
     for (const state of states.values()) {
       const outcome = enqueue(state, bytes, durable)
@@ -173,7 +183,7 @@ export function createFanout(options: FanoutOptions = {}): Fanout {
     finalize(frame) {
       const bytes = encode(frame)
       encodeCount++
-      const durable = frame.kind === "durable"
+      const durable = isDurable(frame)
       for (const state of states.values()) {
         const kept = state.queue.filter((entry) => entry.durable)
         state.queue.length = 0

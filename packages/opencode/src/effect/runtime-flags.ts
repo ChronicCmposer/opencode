@@ -15,6 +15,28 @@ const enabledByExperimental = (name: string) =>
     Config.map((flags) => Option.getOrElse(flags.enabled, () => flags.experimental)),
   )
 
+const TRUE_VALUES = new Set(["true", "yes", "on", "1", "y"])
+const FALSE_VALUES = new Set(["false", "no", "off", "0", "n"])
+
+const parseBoolean = (value: string | undefined): boolean | undefined => {
+  if (value === undefined) return undefined
+  if (TRUE_VALUES.has(value)) return true
+  if (FALSE_VALUES.has(value)) return false
+  return undefined
+}
+
+/**
+ * Pure mirror of {@link enabledByExperimental} for a plain environment map.
+ * The dedicated flag wins when it parses as a boolean; otherwise it falls back
+ * to the umbrella `OPENCODE_EXPERIMENTAL`, which itself defaults to `false`.
+ */
+export const experimentalSessionWorkersFromEnv = (
+  env: Record<string, string | undefined> = process.env,
+): boolean =>
+  parseBoolean(env["OPENCODE_EXPERIMENTAL_SESSION_WORKERS"]) ??
+  parseBoolean(env["OPENCODE_EXPERIMENTAL"]) ??
+  false
+
 export class Service extends ConfigService.Service<Service>()("@opencode/RuntimeFlags", {
   autoShare: bool("OPENCODE_AUTO_SHARE"),
   pure: bool("OPENCODE_PURE"),

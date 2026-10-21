@@ -10,6 +10,7 @@ import { Auth } from "@/auth"
 import { createSessionScopeHost } from "@/session/worker/session-scope"
 import {
   ModelClient,
+  RUNNABLE_SESSION_NODES,
   SESSION_NODES,
   SessionPipeline,
   WorkerEnvService,
@@ -24,6 +25,7 @@ import {
   type WorkerSnapshot,
 } from "@/session/worker/layer"
 import {
+  REQUIRED_SESSION_NODE_KEYS,
   SESSION_CLIENT_KEYS,
   collectNodeNames,
   validateSessionLayer,
@@ -63,21 +65,62 @@ const options = (overrides: Partial<SessionLayerOptions> = {}): SessionLayerOpti
 })
 
 describe("buildSessionWorkerLayer (6.5)", () => {
-  test("the full allowlist graph drops exclusions but surfaces unclassified app nodes (fail closed)", () => {
+  test("the full allowlist graph is exhaustively classified after boundary replacements", () => {
     const report = validateSessionLayer(SESSION_NODES, boundaryReplacements(snapshot()))
     expect(report.excluded).toEqual([])
     expect(report.missingClients).toEqual([])
-    // The declared allowlist is not yet exhaustive over its transitive app deps;
-    // fail-closed reports them instead of silently accepting them.
-    expect(report.unknown.length).toBeGreaterThan(0)
+    // Every reachable application node is now allowlisted, excluded+replaced, or
+    // a boundary replacement: the fail-closed `unknown` bucket is empty.
+    expect(report.unknown).toEqual([])
+    expect(report.ok).toBe(true)
+  })
+
+  test("the runnable graph contains every required session-node service", () => {
+    const names = collectNodeNames(RUNNABLE_SESSION_NODES)
+    for (const key of REQUIRED_SESSION_NODE_KEYS) expect(names.has(key)).toBe(true)
+  })
+
+  test("the runnable graph is fully classified with boundary replacements", () => {
+    const report = validateSessionLayer(RUNNABLE_SESSION_NODES, boundaryReplacements(snapshot(), clients().writer))
+    expect(report.excluded).toEqual([])
+    expect(report.missingClients).toEqual([])
+    expect(report.unknown).toEqual([])
+    expect(report.ok).toBe(true)
+  })
+
+  test("the runnable graph reaches the real SessionPrompt/SessionProcessor loop", () => {
+    const names = collectNodeNames(RUNNABLE_SESSION_NODES)
+    expect(names.has("@opencode/SessionPrompt")).toBe(true)
+    expect(names.has("@opencode/SessionProcessor")).toBe(true)
+    expect(names.has("@opencode/LLM")).toBe(true)
+    expect(names.has("@opencode/ToolRegistry")).toBe(true)
+  })
+
+  test("the runnable graph fails closed on an unknown reachable node", () => {
+    const orphan = LayerNode.make({
+      name: "@opencode/Unclassified",
+      layer: Layer.empty as Layer.Layer<never>,
+      deps: [] as const,
+    })
+    const report = validateSessionLayer(
+      LayerNode.group([RUNNABLE_SESSION_NODES, orphan]),
+      boundaryReplacements(snapshot()),
+    )
+    expect(report.unknown).toContain("@opencode/Unclassified")
     expect(report.ok).toBe(false)
   })
 
-  test("the runnable layer excludes Database and SessionProjector", () => {
+  test("the runnable layer replaces Database and SessionProjector with boundaries", () => {
     const built = buildSessionWorkerLayer(options())
-    const names = collectNodeNames(built.root)
-    expect(names.has("@opencode/v2/storage/Database")).toBe(false)
-    expect(names.has("session-projector")).toBe(false)
+    const replaced = new Set(built.replacements.map(([node]) => node.name))
+    expect(replaced.has("@opencode/v2/storage/Database")).toBe(true)
+    expect(replaced.has("session-projector")).toBe(true)
+    // The effective graph (replacements applied) is fully classified: neither
+    // boundary is instantiated as a real node.
+    const report = validateSessionLayer(built.root, built.replacements)
+    expect(report.excluded).toEqual([])
+    expect(report.unknown).toEqual([])
+    expect(report.ok).toBe(true)
   })
 
   test("the runnable layer contains all four client nodes", () => {

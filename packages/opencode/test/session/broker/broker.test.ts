@@ -15,10 +15,13 @@ import { threadId as mainThreadId } from "node:worker_threads"
 import {
   BrokerRequestError,
   createBroker,
+  serveBrokerPort,
+  type BrokerBackend,
   type BrokerClient,
   type SupervisionEvent,
 } from "@/session/broker/broker"
-import type { ServerSpec } from "@/session/broker/protocol"
+import { BrokerFailure, type ServerSpec } from "@/session/broker/protocol"
+import { createWorkerBrokerClient } from "@/session/worker/broker-client"
 import { createLeakDetector } from "../../lib/leak-detector"
 import { pollUntil } from "../../lib/poll"
 import {
@@ -436,5 +439,156 @@ describe("teardown + crash supervision (10.5, 10.8, 10.9)", () => {
 
     const report = detector.detect()
     expect(report.clean).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Hub-side proxy for session workers (plan step 19).
+//
+// A worker cannot spawn MCP/LSP children, so the hub exposes its broker over a
+// transferred `MessagePort` with `serveBrokerPort`. These tests pair the server
+// with the real worker client over an in-process `MessageChannel` (no broker
+// worker, no child processes) and assert typed round-trips, error mapping,
+// malformed-frame handling, and guarded replies.
+// ---------------------------------------------------------------------------
+
+function fakeBackend(overrides: Partial<BrokerBackend> = {}): BrokerBackend {
+  return {
+    acquire: async () => ({
+      instanceId: "inst-1",
+      servers: [{ name: "fake", pid: 11, pgid: 11, instanceId: "inst-1" }],
+    }),
+    call: async () => ({ content: ["pong"] }),
+    cancel: async () => {},
+    oauth: async () => ({ callbackUrl: "opencode://mcp/oauth/inst-1", instanceId: "inst-1", owner: "broker" }),
+    release: async () => {},
+    ping: async () => ({ threadId: 4, directories: 1 }),
+    teardown: async () => {},
+    ...overrides,
+  }
+}
+
+/** Assert `reason` is a coded broker failure and narrow it for field checks. */
+function expectFailure(reason: unknown): BrokerFailure {
+  expect(reason).toBeInstanceOf(BrokerFailure)
+  if (!(reason instanceof BrokerFailure)) throw new Error("expected a BrokerFailure")
+  return reason
+}
+
+describe("serveBrokerPort — hub-side worker broker proxy (step 19)", () => {
+  test("round-trips call/acquire/oauth/ping over an in-process port pair", async () => {
+    const { port1, port2 } = new MessageChannel()
+    const calls: string[] = []
+    const dispose = serveBrokerPort(
+      fakeBackend({
+        call: async (input) => {
+          calls.push(input.method)
+          return { content: ["pong"] }
+        },
+      }),
+      port1,
+    )
+    const client = createWorkerBrokerClient(port2)
+
+    expect(await client.call("/work/a", "fake", "tools/call", { name: "ping" })).toEqual({ content: ["pong"] })
+    expect(calls).toEqual(["tools/call"])
+
+    const acquired = await client.acquire({
+      directory: "/work/a",
+      servers: [{ name: "fake", kind: "mcp", command: ["x"] }],
+    })
+    expect(acquired.instanceId).toBe("inst-1")
+    expect(acquired.servers[0]?.pgid).toBe(11)
+
+    expect(await client.oauth("/work/a")).toEqual({
+      callbackUrl: "opencode://mcp/oauth/inst-1",
+      instanceId: "inst-1",
+      owner: "broker",
+    })
+    expect(await client.ping()).toEqual({ threadId: 4, directories: 1 })
+
+    client.dispose()
+    dispose()
+  })
+
+  test("maps backend failures onto coded error frames", async () => {
+    const { port1, port2 } = new MessageChannel()
+    const dispose = serveBrokerPort(
+      fakeBackend({
+        call: async () => {
+          throw new BrokerRequestError("timeout", "call timed out")
+        },
+        oauth: async () => {
+          throw new BrokerFailure("unknown-directory", "no directory")
+        },
+        release: async () => {
+          throw new Error("boom")
+        },
+      }),
+      port1,
+    )
+    const client = createWorkerBrokerClient(port2)
+
+    const timeout = expectFailure(await client.call("/work/a", "fake", "slow").catch((reason: unknown) => reason))
+    expect(timeout.code).toBe("timeout")
+
+    const unknownDirectory = expectFailure(await client.oauth("/work/a").catch((reason: unknown) => reason))
+    expect(unknownDirectory.code).toBe("unknown-directory")
+
+    const protocol = expectFailure(await client.release("/work/a").catch((reason: unknown) => reason))
+    expect(protocol.code).toBe("protocol")
+    expect(protocol.message).toBe("boom")
+
+    client.dispose()
+    dispose()
+  })
+
+  test("replies invalid-request to a malformed request frame", async () => {
+    const { port1, port2 } = new MessageChannel()
+    const dispose = serveBrokerPort(fakeBackend(), port1)
+
+    const replies: unknown[] = []
+    port2.addEventListener("message", (event) => replies.push(event.data))
+    port2.start()
+    port2.postMessage({ kind: "bogus", requestId: "r9" })
+
+    await pollUntil(() => replies.length > 0, { message: "no reply to a malformed frame" })
+    expect(replies[0]).toMatchObject({
+      kind: "response",
+      requestId: "r9",
+      ok: false,
+      error: { code: "invalid-request" },
+    })
+
+    dispose()
+  })
+
+  test("swallows a failed reply when the port is gone", async () => {
+    const listeners: Array<(event: { data: unknown }) => void> = []
+    const deadPort = {
+      postMessage: () => {
+        throw new Error("port closed")
+      },
+      addEventListener: (_type: string, listener: (event: { data: unknown }) => void) => {
+        listeners.push(listener)
+      },
+      removeEventListener: () => {},
+      start: () => {},
+    } as unknown as MessagePort
+
+    const rejections: unknown[] = []
+    const onRejection = (reason: unknown) => rejections.push(reason)
+    process.on("unhandledRejection", onRejection)
+    try {
+      const dispose = serveBrokerPort(fakeBackend(), deadPort)
+      const listener = listeners[0]
+      if (listener === undefined) throw new Error("serveBrokerPort did not subscribe")
+      listener({ data: { kind: "ping", requestId: "r1" } })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(rejections).toHaveLength(0)
+      dispose()
+    } finally {
+      process.off("unhandledRejection", onRejection)
+    }
   })
 })

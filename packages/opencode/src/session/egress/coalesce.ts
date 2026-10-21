@@ -1,10 +1,10 @@
-// Phase 8.3 + 8.4 — delta coalescing window (plan tasks 8.3, 8.4).
+// W2 — delta coalescing window over the events envelope (spec Q7).
 //
 // Non-durable deltas are the high-frequency channel (streamed text, part
-// updates). Buffering them for a short window and flushing as one frame keeps the
-// hub fan-out cheap without delaying durable boundaries:
+// updates). Buffering them for a short window and flushing as ONE batch of
+// `event` frames keeps the hub fan-out cheap without delaying durable boundaries:
 //
-//   * `pushDelta`  — buffers a non-durable event; flushes on idle (window
+//   * `pushDelta`  — buffers a non-durable event frame; flushes on idle (window
 //                    elapsed) or on threshold (batch full).
 //   * `pushDurable`— flushes buffered deltas first, then emits the durable frame
 //                    immediately. Durable events are never coalesced/reordered.
@@ -13,8 +13,9 @@
 // The clock and timer are injected so the window is deterministic in tests, and
 // so production can drive it from the cross-worker fake clock.
 
-import type { DurableMeta, EgressEvent, EgressFrame } from "./frame"
-import { FRAME_VERSION } from "./frame"
+import { type EventsFrame, type EventV2Event, endFrame, eventFrame } from "@/session/worker/frame"
+
+import type { DurableMeta } from "./frame"
 
 /** Default coalescing window, matching the TUI's 16 ms batching (plan line 69). */
 export const COALESCE_WINDOW_MS = 16
@@ -27,9 +28,16 @@ export interface CoalescerScheduler {
   cancel(handle: unknown): void
 }
 
+/** Narrow an injectable timer handle back to the platform timer type. */
+function isTimerHandle(handle: unknown): handle is ReturnType<typeof setTimeout> {
+  return typeof handle === "number" || (typeof handle === "object" && handle !== null)
+}
+
 const defaultScheduler: CoalescerScheduler = {
   schedule: (callback, delayMs) => setTimeout(callback, delayMs),
-  cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  cancel: (handle) => {
+    if (isTimerHandle(handle)) clearTimeout(handle)
+  },
 }
 
 export interface CoalescerOptions {
@@ -38,12 +46,13 @@ export interface CoalescerOptions {
   /** Eager flush threshold; defaults to 256. */
   readonly maxBatch?: number
   readonly scheduler?: CoalescerScheduler
-  readonly onFrame: (frame: EgressFrame) => void
+  /** Called with each flushed batch of frames, in order. */
+  readonly onBatch: (frames: readonly EventsFrame[]) => void
 }
 
 export interface Coalescer {
-  pushDelta(event: EgressEvent): void
-  pushDurable(event: EgressEvent, meta: DurableMeta): void
+  pushDelta(event: EventV2Event): void
+  pushDurable(event: EventV2Event, meta: DurableMeta): void
   /** Emit any buffered deltas now (no-op when empty or ended). */
   flush(): void
   /** Flush buffered deltas, then emit the `end` frame (idempotent). */
@@ -65,9 +74,9 @@ export function createCoalescer(options: CoalescerOptions): Coalescer {
   const windowMs = options.windowMs ?? COALESCE_WINDOW_MS
   const maxBatch = options.maxBatch ?? COALESCE_MAX_BATCH
   const scheduler = options.scheduler ?? defaultScheduler
-  const onFrame = options.onFrame
+  const onBatch = options.onBatch
 
-  let buffer: EgressEvent[] = []
+  let buffer: EventsFrame[] = []
   let timer: unknown
   let ended = false
 
@@ -81,9 +90,9 @@ export function createCoalescer(options: CoalescerOptions): Coalescer {
     cancelTimer()
     if (ended) return
     if (buffer.length === 0) return
-    const events = buffer
+    const frames = buffer
     buffer = []
-    onFrame({ kind: "deltas", v: FRAME_VERSION, events })
+    onBatch(frames)
   }
 
   const scheduleIdle = (): void => {
@@ -97,21 +106,21 @@ export function createCoalescer(options: CoalescerOptions): Coalescer {
   return {
     pushDelta(event) {
       if (ended) throw new CoalescerEndedError()
-      buffer.push(event)
+      buffer.push(eventFrame({ event }))
       if (buffer.length >= maxBatch) flush()
       else scheduleIdle()
     },
     pushDurable(event, meta) {
       if (ended) throw new CoalescerEndedError()
       flush()
-      onFrame({ kind: "durable", v: FRAME_VERSION, meta, event })
+      onBatch([eventFrame({ event, generation: meta.generation, ordinal: meta.ordinal })])
     },
     flush,
     end() {
       if (ended) return
       flush()
       ended = true
-      onFrame({ kind: "end", v: FRAME_VERSION })
+      onBatch([endFrame()])
     },
     get buffered() {
       return buffer.length
