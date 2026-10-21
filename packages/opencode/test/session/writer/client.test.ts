@@ -5,6 +5,7 @@
 // response handling are all exercised without a real database.
 
 import { describe, expect, test } from "bun:test"
+import path from "node:path"
 import {
   WriterCrashedError,
   WriterRemoteError,
@@ -14,9 +15,28 @@ import {
   type HubWriter,
 } from "@/session/writer/client"
 import { WorkerWriterError, createWorkerWriterClient } from "@/session/worker/writer-client"
+import { FAULTS_ENV } from "@/testing/faults"
 import { flush } from "../../lib/async"
+import { tmpdir } from "../../fixture/fixture"
+import { SCHEMA, healthyEnv } from "./fixtures"
 
 const fakeEntry = new URL("./fake-worker.ts", import.meta.url)
+
+/** Transaction methods for stubs whose tests never exercise them; fail loud if reached. */
+const noTx: Pick<HubWriter, "begin" | "txQuery" | "commit" | "rollback"> = {
+  begin: async () => {
+    throw new Error("begin was not expected in this test")
+  },
+  txQuery: async () => {
+    throw new Error("txQuery was not expected in this test")
+  },
+  commit: async () => {
+    throw new Error("commit was not expected in this test")
+  },
+  rollback: async () => {
+    throw new Error("rollback was not expected in this test")
+  },
+}
 
 describe("writer client: ready handshake (steps 9, 12, 29)", () => {
   test("accepts a matching ready generation and serves requests", async () => {
@@ -106,6 +126,7 @@ describe("writer port server (step 17)", () => {
         return [{ n: 1 }]
       },
       publish: async () => ({ seq: null, committed: false }),
+      ...noTx,
     }
     const channel = new MessageChannel()
     const dispose = serveWriterPort(hub, channel.port1)
@@ -127,6 +148,7 @@ describe("writer port server (step 17)", () => {
         published.push({ event, durable: options.durable })
         return { seq: 5, committed: true }
       },
+      ...noTx,
     }
     const channel = new MessageChannel()
     const dispose = serveWriterPort(hub, channel.port1)
@@ -148,6 +170,7 @@ describe("writer port server (step 17)", () => {
         throw new WriterRemoteError("SQLITE_BUSY", "database is locked")
       },
       publish: async () => ({ seq: null, committed: false }),
+      ...noTx,
     }
     const channel = new MessageChannel()
     const dispose = serveWriterPort(hub, channel.port1)
@@ -169,6 +192,7 @@ describe("writer port server (step 17)", () => {
     const hub: HubWriter = {
       query: async () => null,
       publish: async () => ({ seq: null, committed: false }),
+      ...noTx,
     }
     const channel = new MessageChannel()
     const dispose = serveWriterPort(hub, channel.port1)
@@ -196,6 +220,7 @@ describe("writer port server (step 17)", () => {
         return "late"
       },
       publish: async () => ({ seq: null, committed: false }),
+      ...noTx,
     }
     const channel = new MessageChannel()
     const dispose = serveWriterPort(hub, channel.port1)
@@ -213,5 +238,168 @@ describe("writer port server (step 17)", () => {
 
     // A guarded reply to a closed port must be swallowed, not thrown.
     expect(() => dispose()).not.toThrow()
+  })
+})
+
+describe("writer port server: transactions over the real writer (step 17)", () => {
+  const INSERT_SEQUENCE = "INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (?, ?, ?)"
+  const SELECT_SEQUENCES = "SELECT aggregate_id FROM event_sequence ORDER BY aggregate_id"
+
+  /** Open a real writer isolate over a temp file and serve it to a worker client. */
+  async function servedWriter(tmpPath: string) {
+    const writer = createWriterClient({ env: healthyEnv })
+    await writer.open(path.join(tmpPath, "writer.db"))
+    await writer.migrate(SCHEMA)
+    const channel = new MessageChannel()
+    const dispose = serveWriterPort(writer, channel.port1)
+    const client = createWorkerWriterClient(channel.port2)
+    return {
+      writer,
+      client,
+      async [Symbol.asyncDispose]() {
+        client.dispose()
+        dispose()
+        await writer.close()
+      },
+    }
+  }
+
+  test("begin → txQuery → commit persists, and a concurrent non-tx query queues behind the pin", async () => {
+    await using tmp = await tmpdir()
+    await using served = await servedWriter(tmp.path)
+
+    const handle = await served.client.begin()
+    await served.client.txQuery(handle, "run", INSERT_SEQUENCE, ["a", 0, null])
+
+    // A non-tx read issued while the transaction is pinned must not observe the
+    // uncommitted row and must not resolve until the pin clears (head-of-line).
+    let observed: unknown = undefined
+    const read = served.client.query("all", SELECT_SEQUENCES).then((rows) => {
+      observed = rows
+      return rows
+    })
+    await flush()
+    expect(observed).toBeUndefined()
+
+    await served.client.commit(handle)
+    expect(await read).toEqual([{ aggregate_id: "a" }])
+  })
+
+  test("rollback discards the pinned transaction's writes", async () => {
+    await using tmp = await tmpdir()
+    await using served = await servedWriter(tmp.path)
+
+    const handle = await served.client.begin()
+    await served.client.txQuery(handle, "run", INSERT_SEQUENCE, ["b", 0, null])
+    await served.client.rollback(handle)
+
+    expect(await served.client.query("all", SELECT_SEQUENCES)).toEqual([])
+  })
+
+  test("a failing txQuery surfaces a typed error and the rollback discards partial writes", async () => {
+    await using tmp = await tmpdir()
+    await using served = await servedWriter(tmp.path)
+
+    const handle = await served.client.begin()
+    await served.client.txQuery(handle, "run", INSERT_SEQUENCE, ["c", 0, null])
+
+    const error = await served.client
+      .txQuery(handle, "run", "INSERT INTO missing_table VALUES (1)")
+      .then(
+        () => undefined,
+        (cause: unknown) => cause,
+      )
+    expect(error).toBeInstanceOf(WorkerWriterError)
+    expect((error as WorkerWriterError).message).toContain("missing_table")
+
+    await served.client.rollback(handle)
+    expect(await served.client.query("all", SELECT_SEQUENCES)).toEqual([])
+
+    // The failed transaction released its pin: a fresh transaction can begin.
+    const next = await served.client.begin()
+    await served.client.rollback(next)
+  })
+
+  test("a mid-transaction abort invalidates the tx with a typed error and no hang", async () => {
+    await using tmp = await tmpdir()
+    const file = path.join(tmp.path, "writer.db")
+    {
+      await using seed = createWriterClient({ env: healthyEnv })
+      await seed.open(file)
+      await seed.migrate(SCHEMA)
+    }
+
+    const writer = createWriterClient({ env: { [FAULTS_ENV]: "abortTxAfter@writer:tx" } })
+    await writer.open(file)
+    const channel = new MessageChannel()
+    const dispose = serveWriterPort(writer, channel.port1)
+    const client = createWorkerWriterClient(channel.port2)
+
+    const handle = await client.begin()
+    const error = await client.txQuery(handle, "run", INSERT_SEQUENCE, ["e", 0, null]).then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+    expect(error).toBeInstanceOf(WorkerWriterError)
+    expect((error as WorkerWriterError).tag).toBe("ABORTED")
+
+    // The aborted transaction was abandoned (no hang): a fresh one begins and the
+    // abandoned write never landed.
+    const next = await client.begin()
+    await client.rollback(next)
+    expect(await client.query("all", SELECT_SEQUENCES)).toEqual([])
+
+    client.dispose()
+    dispose()
+    await writer.close()
+  })
+
+  test("a worker crash during a transaction commit surfaces a typed error and the client recovers", async () => {
+    await using tmp = await tmpdir()
+    const file = path.join(tmp.path, "writer.db")
+    {
+      await using seed = createWriterClient({ env: healthyEnv })
+      await seed.open(file)
+      await seed.migrate(SCHEMA)
+    }
+
+    const writer = createWriterClient({ env: { [FAULTS_ENV]: "crashWorker@writer:tx-commit" } })
+    await writer.open(file)
+    const channel = new MessageChannel()
+    const dispose = serveWriterPort(writer, channel.port1)
+    const client = createWorkerWriterClient(channel.port2)
+
+    const handle = await client.begin()
+    await client.txQuery(handle, "run", INSERT_SEQUENCE, ["d", 0, null])
+
+    // The isolate dies at the commit boundary: the caller is rejected (never
+    // retried, never observed as committed) and the request does not hang.
+    const commitError = await client.commit(handle).then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+    expect(commitError).toBeInstanceOf(WorkerWriterError)
+    expect((commitError as WorkerWriterError).tag).toBe("WRITER_CRASHED")
+
+    // The abandoned transaction left nothing partial behind, and a read respawns
+    // the writer with a bumped generation.
+    expect(await client.query("all", SELECT_SEQUENCES)).toEqual([])
+    expect(writer.generation).toBe(2)
+
+    // The old handle died with the isolate: it no longer names a pinned transaction.
+    const staleError = await client.txQuery(handle, "run", INSERT_SEQUENCE, ["e", 0, null]).then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+    expect(staleError).toBeInstanceOf(WorkerWriterError)
+    expect((staleError as WorkerWriterError).tag).toBe("TRANSACTION")
+
+    // A fresh transaction begins on the recovered writer.
+    const next = await client.begin()
+    await client.rollback(next)
+
+    client.dispose()
+    dispose()
+    await writer.close()
   })
 })

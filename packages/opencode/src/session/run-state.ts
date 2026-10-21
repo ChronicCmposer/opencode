@@ -82,7 +82,19 @@ export const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
       const hub = yield* hubIfEnabled
-      if (hub !== undefined) return yield* Effect.promise(() => hub.cancel(sessionID))
+      if (hub !== undefined) {
+        const outcome = yield* Effect.promise(() => hub.cancel(sessionID))
+        // Flag-ON parity with the flag-off branch below. Flag off, `Runner.cancel`
+        // emits the terminal `idle` through the runner's `onIdle` (runner.ts:180,
+        // wired at run-state.ts:65). Flag on, the run-state machine lives in the
+        // worker isolate and its executor runner has no `onIdle` seam
+        // (session-worker.ts:417); the cancel frame interrupts that outer fiber
+        // without ever reaching the worker-local run-state runner, so nothing else
+        // publishes `idle` and the UI stop button stays busy. Emit the same
+        // `session.status` idle the flag-off path emits, once, after the hub cancel.
+        yield* status.set(sessionID, { type: "idle" })
+        return outcome
+      }
       yield* cancelBackgroundJobs(background, sessionID)
       const runners = yield* InstanceState.get(state)
       if (!runners.busy(sessionID)) {

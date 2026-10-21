@@ -3,9 +3,9 @@
 // `sessionWorkerNodes` is the single seam the production app graphs use to decide
 // whether the session-hub node is a member of `LayerNode.group([...])`. It is pure:
 // it never spawns a worker, never reads the environment unless the caller omits an
-// explicit gate, and returns a fresh array each call. The default gate mirrors
-// `RuntimeFlags`'s `enabledByExperimental` precedence (runtime-flags.ts:12-16), so the
-// graph decision and the runtime flag cannot drift.
+// explicit gate, and returns a fresh array each call. The default gate delegates to
+// the canonical `RuntimeFlags.experimentalSessionWorkersFromEnv` (runtime-flags.ts),
+// so the graph decision and the runtime flag cannot drift.
 
 import { describe, expect, test } from "bun:test"
 import { Context, Effect, Layer } from "effect"
@@ -51,7 +51,7 @@ const hubNode = LayerNode.make({
   deps: [] as const,
 })
 
-describe("sessionWorkersEnabled — enabledByExperimental precedence", () => {
+describe("sessionWorkersEnabled — canonical experimentalSessionWorkersFromEnv precedence", () => {
   test("unset dedicated and umbrella is off", () => {
     expect(sessionWorkersEnabled({})).toBe(false)
   })
@@ -82,9 +82,76 @@ describe("sessionWorkersEnabled — enabledByExperimental precedence", () => {
     ).toBe(true)
   })
 
-  test("only the exact string 'true' counts", () => {
-    expect(sessionWorkersEnabled({ OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "1" })).toBe(false)
-    expect(sessionWorkersEnabled({ OPENCODE_EXPERIMENTAL: "yes" })).toBe(false)
+  test("invalid dedicated value falls back to the umbrella", () => {
+    expect(
+      sessionWorkersEnabled({
+        OPENCODE_EXPERIMENTAL: "true",
+        OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "nonsense",
+      }),
+    ).toBe(true)
+  })
+
+  test("invalid umbrella value is treated as absent", () => {
+    expect(sessionWorkersEnabled({ OPENCODE_EXPERIMENTAL: "nonsense" })).toBe(false)
+  })
+
+  test("undefined values are treated as absent", () => {
+    expect(
+      sessionWorkersEnabled({
+        OPENCODE_EXPERIMENTAL: undefined,
+        OPENCODE_EXPERIMENTAL_SESSION_WORKERS: undefined,
+      }),
+    ).toBe(false)
+  })
+
+  test("accepts every boolean true synonym on the dedicated flag", () => {
+    for (const value of ["true", "yes", "on", "1", "y"]) {
+      expect(sessionWorkersEnabled({ OPENCODE_EXPERIMENTAL_SESSION_WORKERS: value })).toBe(true)
+    }
+  })
+
+  test("accepts every boolean false synonym on the dedicated flag", () => {
+    for (const value of ["false", "no", "off", "0", "n"]) {
+      expect(sessionWorkersEnabled({ OPENCODE_EXPERIMENTAL_SESSION_WORKERS: value })).toBe(false)
+    }
+  })
+
+  test("accepts every boolean synonym on the umbrella flag", () => {
+    for (const value of ["true", "yes", "on", "1", "y"]) {
+      expect(sessionWorkersEnabled({ OPENCODE_EXPERIMENTAL: value })).toBe(true)
+    }
+    for (const value of ["false", "no", "off", "0", "n"]) {
+      expect(sessionWorkersEnabled({ OPENCODE_EXPERIMENTAL: value })).toBe(false)
+    }
+  })
+
+  test("boolean parsing is case-sensitive like Effect Config.boolean", () => {
+    expect(sessionWorkersEnabled({ OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "TRUE" })).toBe(false)
+    expect(sessionWorkersEnabled({ OPENCODE_EXPERIMENTAL: "TRUE" })).toBe(false)
+  })
+})
+
+describe("sessionWorkersEnabled agrees with runtime-flags for the same env", () => {
+  const envs: Record<string, string | undefined>[] = [
+    {},
+    { OPENCODE_EXPERIMENTAL: "true" },
+    { OPENCODE_EXPERIMENTAL: "false" },
+    { OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "true" },
+    { OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "false" },
+    { OPENCODE_EXPERIMENTAL: "true", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "false" },
+    { OPENCODE_EXPERIMENTAL: "false", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "true" },
+    { OPENCODE_EXPERIMENTAL: "yes", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "on" },
+    { OPENCODE_EXPERIMENTAL: "off", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "n" },
+    { OPENCODE_EXPERIMENTAL: "nonsense", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "1" },
+    { OPENCODE_EXPERIMENTAL: "nonsense", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "nonsense" },
+    { OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "TRUE" },
+    { OPENCODE_EXPERIMENTAL: undefined, OPENCODE_EXPERIMENTAL_SESSION_WORKERS: undefined },
+  ]
+
+  test("nodes.ts and runtime-flags.ts return the same boolean for every env", () => {
+    for (const env of envs) {
+      expect(sessionWorkersEnabled(env)).toBe(RuntimeFlags.experimentalSessionWorkersFromEnv(env))
+    }
   })
 })
 
@@ -316,7 +383,22 @@ describe("34a lazy production activation", () => {
         },
       })
     const backends = {
-      writer: { query: async () => [], publish: async () => ({ seq: null, committed: false }) },
+      writer: {
+        query: async () => [],
+        publish: async () => ({ seq: null, committed: false }),
+        begin: async () => {
+          throw new Error("begin was not expected in this test")
+        },
+        txQuery: async () => {
+          throw new Error("txQuery was not expected in this test")
+        },
+        commit: async () => {
+          throw new Error("commit was not expected in this test")
+        },
+        rollback: async () => {
+          throw new Error("rollback was not expected in this test")
+        },
+      },
       broker: {} as never,
     }
 

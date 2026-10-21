@@ -1,13 +1,29 @@
 // Phase 6.1 / 6.2 / 6.5 / 6.7 — reduced session layer tests (in-process).
 
+import { Database as BunDatabase } from "bun:sqlite"
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Effect, Exit, Layer, Schema, Stream } from "effect"
+import * as Reactivity from "effect/unstable/reactivity/Reactivity"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
+import type { Connection } from "effect/unstable/sql/SqlConnection"
+import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
+import * as Statement from "effect/unstable/sql/Statement"
+import { eq, sql } from "drizzle-orm"
+import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
+import { DatabaseMigration } from "@opencode-ai/core/database/migration"
+import { EventV2 } from "@opencode-ai/core/event"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
+import { ProjectV2 } from "@opencode-ai/core/project"
+import { SessionTable } from "@opencode-ai/core/session/sql"
 import { Config } from "@/config/config"
 import { Auth } from "@/auth"
+import { Session } from "@/session/session"
+import { SessionID } from "@/session/schema"
+import { InstanceRef } from "@/effect/instance-ref"
 import { createSessionScopeHost } from "@/session/worker/session-scope"
+import { EffectDrizzleSqlite } from "../../../../effect-drizzle-sqlite/src/index"
 import {
   ModelClient,
   RUNNABLE_SESSION_NODES,
@@ -21,8 +37,10 @@ import {
   snapshotAuthLayer,
   snapshotConfigLayer,
   snapshotModelsDevLayer,
+  writerDatabaseLayer,
   type SessionLayerOptions,
   type WorkerSnapshot,
+  type WriterClientHandle,
 } from "@/session/worker/layer"
 import {
   REQUIRED_SESSION_NODE_KEYS,
@@ -96,6 +114,14 @@ describe("buildSessionWorkerLayer (6.5)", () => {
     expect(names.has("@opencode/ToolRegistry")).toBe(true)
   })
 
+  test("the runnable graph carries the in-worker SessionProjector", () => {
+    const names = collectNodeNames(RUNNABLE_SESSION_NODES)
+    expect(names.has("session-projector")).toBe(true)
+    // The boundary replacements must not blank it out.
+    const replaced = new Set(boundaryReplacements(snapshot(), clients().writer).map(([node]) => node.name))
+    expect(replaced.has("session-projector")).toBe(false)
+  })
+
   test("the runnable graph fails closed on an unknown reachable node", () => {
     const orphan = LayerNode.make({
       name: "@opencode/Unclassified",
@@ -110,13 +136,16 @@ describe("buildSessionWorkerLayer (6.5)", () => {
     expect(report.ok).toBe(false)
   })
 
-  test("the runnable layer replaces Database and SessionProjector with boundaries", () => {
+  test("the runnable layer replaces Database but runs SessionProjector in-worker", () => {
     const built = buildSessionWorkerLayer(options())
     const replaced = new Set(built.replacements.map(([node]) => node.name))
     expect(replaced.has("@opencode/v2/storage/Database")).toBe(true)
-    expect(replaced.has("session-projector")).toBe(true)
-    // The effective graph (replacements applied) is fully classified: neither
-    // boundary is instantiated as a real node.
+    // The projector is now a real worker node: replacing it with `Layer.empty`
+    // would leave durable events with no materialized session/message/part rows.
+    expect(replaced.has("session-projector")).toBe(false)
+    expect(collectNodeNames(built.root).has("session-projector")).toBe(true)
+    // The effective graph (replacements applied) is fully classified: the
+    // Database boundary is replaced, the projector runs for real.
     const report = validateSessionLayer(built.root, built.replacements)
     expect(report.excluded).toEqual([])
     expect(report.unknown).toEqual([])
@@ -353,5 +382,296 @@ describe("node table report", () => {
     const node = LayerNode.make({ name: "test-node", layer: Layer.empty, deps: [] as const })
     expect(LayerNode.isNode(node)).toBe(true)
     expect(LayerNode.isNode(Layer.empty)).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// o1-w2 — the worker Database is a real writer-backed Drizzle database.
+//
+// The writer handle is backed by a real in-memory SQLite `SqlClient` so the
+// worker layer is compared apples-to-apples with the flag-OFF driver.
+// ---------------------------------------------------------------------------
+
+const widget = sqliteTable("widget", {
+  id: integer("id").primaryKey(),
+  name: text("name").notNull(),
+})
+
+/** A real in-memory SQLite `SqlClient`, mirroring the flag-OFF Bun driver. */
+function realSqliteClient(native: BunDatabase): Effect.Effect<SqlClient.SqlClient, never, Reactivity.Reactivity> {
+  const rows = (query: string, params: ReadonlyArray<unknown> = []) =>
+    Effect.try({
+      try: () => native.query(query).all(...(params as never[])) as Array<Record<string, unknown>>,
+      catch: (cause) =>
+        new SqlError({
+          reason: classifySqliteError(cause, { message: "reference sqlite failed", operation: "execute" }),
+        }),
+    })
+
+  const values = (query: string, params: ReadonlyArray<unknown> = []) =>
+    Effect.try({
+      try: () => native.query(query).values(...(params as never[])) as Array<Array<unknown>>,
+      catch: (cause) =>
+        new SqlError({
+          reason: classifySqliteError(cause, { message: "reference sqlite failed", operation: "execute" }),
+        }),
+    })
+
+  const connection: Connection = {
+    execute: (query, params, transformRows) =>
+      transformRows ? Effect.map(rows(query, params), transformRows) : rows(query, params),
+    executeRaw: (query, params) => rows(query, params),
+    executeValues: (query, params) => values(query, params),
+    executeUnprepared: (query, params, transformRows) =>
+      transformRows ? Effect.map(rows(query, params), transformRows) : rows(query, params),
+    executeStream: () => Stream.die("reference sqlite streaming is not implemented"),
+  }
+
+  return SqlClient.make({
+    acquirer: Effect.succeed(connection),
+    compiler: Statement.makeCompilerSqlite(),
+    transactionAcquirer: Effect.succeed(connection),
+    spanAttributes: [["db.system.name", "sqlite"]],
+  })
+}
+
+/** A writer handle backed by a real SQLite client, so transaction control is real. */
+function writerOver(reference: SqlClient.SqlClient): WriterClientHandle {
+  let nextTxId = 1
+  const runQuery = (method: string, sql: string, params?: readonly unknown[]) => {
+    const statement = reference.unsafe(sql, params)
+    return Effect.runPromise(method === "values" ? statement.values : statement.withoutTransform)
+  }
+  return {
+    query: (method, sql, params) => runQuery(method, sql, params),
+    publish: async () => ({ seq: null, committed: false }),
+    begin: async () => {
+      await Effect.runPromise(reference.unsafe("BEGIN IMMEDIATE").withoutTransform)
+      return `tx-${nextTxId++}`
+    },
+    txQuery: (_handle, method, sql, params) => runQuery(method, sql, params),
+    commit: async () => {
+      await Effect.runPromise(reference.unsafe("COMMIT").withoutTransform)
+    },
+    rollback: async () => {
+      await Effect.runPromise(reference.unsafe("ROLLBACK").withoutTransform)
+    },
+  }
+}
+
+/** Builds the Drizzle database exactly the way the worker layer does. */
+const drizzleOver = (client: SqlClient.SqlClient): Effect.Effect<EffectDrizzleSqlite.EffectSQLiteDatabase> =>
+  EffectDrizzleSqlite.makeWithDefaults().pipe(Effect.provideService(SqlClient.SqlClient, client))
+
+const runReactive = <A, E>(effect: Effect.Effect<A, E, Reactivity.Reactivity>) =>
+  Effect.runPromise(effect.pipe(Effect.provide(Reactivity.layer)))
+
+const crud = (db: EffectDrizzleSqlite.EffectSQLiteDatabase) =>
+  Effect.gen(function* () {
+    yield* db.run(sql`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`)
+    yield* db
+      .insert(widget)
+      .values([
+        { id: 1, name: "alpha" },
+        { id: 2, name: "beta" },
+      ])
+      .run()
+    yield* db.update(widget).set({ name: "ALPHA" }).where(eq(widget.id, 1)).run()
+    yield* db.delete(widget).where(eq(widget.id, 2)).run()
+    return yield* db.select().from(widget).orderBy(widget.id).all()
+  })
+
+describe("writer-backed worker Database (o1-w2)", () => {
+  test("CRUD round-trip matches the flag-OFF driver", async () => {
+    const flagNative = new BunDatabase(":memory:")
+    const workerNative = new BunDatabase(":memory:")
+    try {
+      const result = await runReactive(
+        Effect.gen(function* () {
+          const flagDb = yield* drizzleOver(yield* realSqliteClient(flagNative))
+          const workerDb = yield* Database.Service.pipe(
+            Effect.provide(writerDatabaseLayer(writerOver(yield* realSqliteClient(workerNative)))),
+          )
+          return {
+            flag: yield* crud(flagDb),
+            worker: yield* crud(workerDb.db),
+          }
+        }),
+      )
+
+      expect(result.worker).toEqual(result.flag)
+      expect(result.worker).toEqual([{ id: 1, name: "ALPHA" }])
+    } finally {
+      flagNative.close()
+      workerNative.close()
+    }
+  })
+
+  test("db.transaction is atomic: a throw leaves no partial rows", async () => {
+    const native = new BunDatabase(":memory:")
+    try {
+      const result = await runReactive(
+        Effect.gen(function* () {
+          const database = yield* Database.Service.pipe(
+            Effect.provide(writerDatabaseLayer(writerOver(yield* realSqliteClient(native)))),
+          )
+          const db = database.db
+          yield* db.run(sql`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`)
+          const exit = yield* db
+            .transaction((tx) =>
+              Effect.gen(function* () {
+                yield* tx.insert(widget).values({ id: 2, name: "beta" }).run()
+                yield* Effect.fail(new Error("boom"))
+              }),
+            )
+            .pipe(Effect.exit)
+          return { exit, rows: yield* db.select().from(widget).all() }
+        }),
+      )
+
+      expect(Exit.isFailure(result.exit)).toBe(true)
+      expect(result.rows).toEqual([])
+    } finally {
+      native.close()
+    }
+  })
+
+  test("writerDatabaseLayer type-checks as a Database.Service layer with no cast", () => {
+    const layer: Layer.Layer<Database.Service> = writerDatabaseLayer({
+      query: async () => [],
+      publish: async () => ({ seq: null, committed: false }),
+      begin: async () => "tx-1",
+      txQuery: async () => [],
+      commit: async () => {},
+      rollback: async () => {},
+    })
+    expect(layer).toBeDefined()
+  })
+
+  test("a missing writer transaction primitive fails loud, never silently", async () => {
+    const error = await runReactive(
+      Effect.gen(function* () {
+        const database = yield* Database.Service.pipe(
+          Effect.provide(
+            writerDatabaseLayer({
+              query: async () => [],
+              publish: async () => ({ seq: null, committed: false }),
+            }),
+          ),
+        )
+        return yield* database.db
+          .transaction((tx) => tx.insert(widget).values({ id: 1, name: "alpha" }).run())
+          .pipe(Effect.flip)
+      }),
+    )
+
+    expect(error).toBeInstanceOf(SqlError)
+    expect(String((error as { reason: { cause: unknown } }).reason.cause)).toMatch(/WriterClient.*begin/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// o1-w2 — the runnable graph gives Session/EventV2 the writer-backed Database.
+// ---------------------------------------------------------------------------
+
+const WorkerPing = EventV2.define({
+  type: "test.worker.ping",
+  durable: { version: 1, aggregate: "id" },
+  schema: { id: Schema.String },
+})
+
+describe("runnable graph persistence (o1-w2)", () => {
+  test("Session.get and a durable EventV2.publish succeed through the worker Database", async () => {
+    const native = new BunDatabase(":memory:")
+    try {
+      const reference = Effect.runSync(realSqliteClient(native).pipe(Effect.provide(Reactivity.layer)))
+      // The hub owns migrations: seed the shared store the worker writes through.
+      await runReactive(
+        Effect.gen(function* () {
+          const db = yield* drizzleOver(reference)
+          yield* DatabaseMigration.apply(db)
+          yield* db
+            .insert(SessionTable)
+            .values({
+              id: SessionID.make("ses_worker"),
+              project_id: ProjectV2.ID.make("prj_worker"),
+              slug: "worker",
+              directory: "/tmp/project-a",
+              title: "Worker session",
+              version: "1",
+            })
+            .run()
+        }),
+      )
+
+      const built = buildSessionWorkerLayer({
+        ...options(),
+        clients: {
+          ...clients(),
+          writer: writerOver(reference),
+        },
+      })
+
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const info = yield* session.get(SessionID.make("ses_worker"))
+          const events = yield* EventV2.Service
+          const published = yield* events.publish(WorkerPing, { id: "agg_worker" })
+          return { info, durable: published.durable }
+        }).pipe(Effect.provide(built.layer)),
+      )
+
+      expect(result.info.id).toBe(SessionID.make("ses_worker"))
+      expect(result.info.title).toBe("Worker session")
+      expect(result.durable).toMatchObject({ aggregateID: "agg_worker", seq: 0, version: 1 })
+    } finally {
+      native.close()
+    }
+  })
+
+  test("Session.create materializes the row through the DEFAULT graph's in-worker projector", async () => {
+    const native = new BunDatabase(":memory:")
+    try {
+      const reference = Effect.runSync(realSqliteClient(native).pipe(Effect.provide(Reactivity.layer)))
+      await runReactive(
+        Effect.gen(function* () {
+          const db = yield* drizzleOver(reference)
+          yield* DatabaseMigration.apply(db)
+        }),
+      )
+
+      // The DEFAULT production graph: no `nodes` override and no test-added
+      // projector. `Session.create` only PUBLISHES `session.created`; the session
+      // row exists only if the default graph's projector materialized it.
+      const built = buildSessionWorkerLayer({
+        ...options(),
+        clients: { ...clients(), writer: writerOver(reference) },
+      })
+
+      const instance = {
+        directory: "/tmp/project-a",
+        worktree: "/tmp/project-a",
+        project: { id: "prj_worker" } as never,
+      }
+
+      const created = await Effect.runPromise(
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const info = yield* session.create({ title: "projected", agent: "build" })
+          // Reading the row back proves projection: without it `get` fails loud.
+          return yield* session.get(info.id)
+        }).pipe(Effect.provide(built.layer), Effect.provideService(InstanceRef, instance)),
+      )
+
+      expect(created.title).toBe("projected")
+      // Exactly one durable row in the shared store.
+      const stored = await Effect.runPromise(
+        reference.unsafe("SELECT id FROM session").withoutTransform.pipe(Effect.provide(Reactivity.layer)),
+      )
+      expect(stored).toHaveLength(1)
+    } finally {
+      native.close()
+    }
   })
 })

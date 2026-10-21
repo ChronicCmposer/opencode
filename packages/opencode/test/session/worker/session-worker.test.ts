@@ -5,18 +5,29 @@
 // are exercised in-process here.
 
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer, Schema } from "effect"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { Effect, Latch, Layer, Schema } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { SessionID } from "@/session/schema"
+import { MessageID, PartID, SessionID } from "@/session/schema"
+import { Session } from "@/session/session"
+import { SessionRunState } from "@/session/run-state"
+import { SessionStatus } from "@/session/status"
+import { InstanceRef } from "@/effect/instance-ref"
 import { serveWriterPort, type HubWriter } from "@/session/writer/client"
 import type { EventV2Event } from "@/session/worker/frame"
 import { collectNodeNames } from "@/session/worker/node-table"
 import {
+  EventEgressClientNode,
+  EventEgressClientService,
   ModelClient,
   PIPELINE_SESSION_NODES,
   RUNNABLE_SESSION_NODES,
   buildSessionWorkerLayer,
+  createHubProxyClient,
+  serveHubProxy,
   type SessionLayerOptions,
 } from "@/session/worker/layer"
 import {
@@ -33,7 +44,11 @@ import {
   productionWorkRegistry,
   writerReadMessages,
 } from "@/session/worker/session-worker"
+import { createHubEventSink } from "@/session/worker/hub"
 import { workerSnapshot } from "../../lib/snapshot"
+import { withParts } from "../../lib/session-parts"
+import { startMockProvider } from "../../lib/mock-provider"
+import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
 
 const sid = (value: string) => SessionID.make(value)
 
@@ -156,6 +171,18 @@ describe("buildWorkerClients (step 22)", () => {
         published.push(event.type)
         return { seq: 9, committed: true }
       },
+      begin: async () => {
+        throw new Error("begin was not expected in this test")
+      },
+      txQuery: async () => {
+        throw new Error("txQuery was not expected in this test")
+      },
+      commit: async () => {
+        throw new Error("commit was not expected in this test")
+      },
+      rollback: async () => {
+        throw new Error("rollback was not expected in this test")
+      },
     }
     serveWriterPort(hubWriter, channels.writer.port2)
 
@@ -274,6 +301,13 @@ describe("worker event bridge wiring (Q6/Q13/Q15)", () => {
     expect(names.has("@opencode/Event")).toBe(true)
   })
 
+  test("the production runnable graph carries the in-worker SessionProjector", () => {
+    // Durable `message.updated` / `message.part.updated` events only become
+    // `session`/`message`/`part` rows when the projector runs. Production must
+    // include it; a test-added projector is no longer required.
+    expect(collectNodeNames(RUNNABLE_SESSION_NODES).has("session-projector")).toBe(true)
+  })
+
   test("the bridge forwards a worker-published session event to the egress sink verbatim", async () => {
     const forwarded: EventV2Event[] = []
     const built = buildSessionWorkerLayer({
@@ -350,4 +384,289 @@ describe("writerReadMessages", () => {
     })
     expect(await Effect.runPromise(failing("s1"))).toEqual([])
   })
+})
+
+// ---------------------------------------------------------------------------
+// Flag-on status parity: the worker-local run-state reaches idle via the
+// hub-proxy `SessionStatus`, the worker half of the flag-off cancel/completion
+// transition. (The hub half — cancel after `hub.cancel` — lives in
+// `hub-wiring.test.ts`.)
+// ---------------------------------------------------------------------------
+
+describe("worker run-state idle parity (flag-on)", () => {
+  /**
+   * The worker's `InstanceState`-backed services (e.g. `SessionRunState`) need an
+   * ambient `InstanceRef`; a worker owns no project loader, so the snapshot
+   * directory is both the working directory and the worktree.
+   */
+  const instance = {
+    directory: workerSnapshot().directory,
+    worktree: workerSnapshot().directory,
+    project: undefined as never,
+  }
+
+  /** Build the worker graph with a `SessionStatus` recorded on the hub side. */
+  const workerWithStatusStore = () => {
+    const channel = new MessageChannel()
+    const store = new Map<string, SessionStatus.Info>()
+    serveHubProxy(
+      {
+        get: (sessionID) => store.get(sessionID as string) ?? { type: "idle" },
+        set: (sessionID, status) => {
+          store.set(sessionID as string, status as SessionStatus.Info)
+        },
+        list: () => [...store.entries()],
+      },
+      channel.port2,
+    )
+    const hubProxyClient = createHubProxyClient(channel.port1)
+    const built = buildSessionWorkerLayer({
+      snapshot: workerSnapshot(),
+      env: { values: {} },
+      clients: stubClients(),
+      modelClient: modelLayer("worker text"),
+      hubProxies: { sessionStatus: hubProxyClient, permission: hubProxyClient, question: hubProxyClient },
+    })
+    return { built, store }
+  }
+
+  test("normal completion publishes session.status idle through the hub-proxy", async () => {
+    const { built, store } = workerWithStatusStore()
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const runState = yield* SessionRunState.Service
+        yield* runState.ensureRunning(
+          sid("ses_done"),
+          Effect.succeed(withParts(sid("ses_done"))),
+          Effect.succeed(withParts(sid("ses_done"))),
+        )
+      }).pipe(Effect.provide(built.layer), Effect.provideService(InstanceRef, instance)),
+    )
+
+    // The worker-local runner's `onIdle` crossed the hub-proxy port, so the hub
+    // observed the terminal idle — the same transition flag-off reaches through
+    // its in-process runner's `onIdle`.
+    expect(store.get("ses_done")).toEqual({ type: "idle" })
+  })
+
+
+  test("cancelling the worker-local runner also publishes idle through the hub-proxy", async () => {
+    const { built, store } = workerWithStatusStore()
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const runState = yield* SessionRunState.Service
+        const started = yield* Latch.make()
+        // A run that never settles keeps the runner busy until cancel interrupts it.
+        const work = Effect.andThen(started.open, Effect.never)
+        yield* runState
+          .ensureRunning(sid("ses_run"), Effect.succeed(withParts(sid("ses_run"))), work)
+          .pipe(Effect.forkChild)
+        // Wait for the runner to be registered before cancelling it.
+        yield* started.await
+        yield* runState.cancel(sid("ses_run"))
+      }).pipe(Effect.provide(built.layer), Effect.provideService(InstanceRef, instance)),
+    )
+
+    expect(store.get("ses_run")).toEqual({ type: "idle" })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// End-to-end: the REAL `SessionPrompt.loop` inside the worker over the real
+// writer-backed `Database`. This is the acceptance test for the worker DB fix:
+// before it, the worker's raw-SQL `Database` had no Drizzle methods, so the
+// loop died on `db.select`/`db.transaction` and wrote nothing.
+//
+// The production default graph (`RUNNABLE_SESSION_NODES`) now carries
+// `SessionProjector`: `Session.updateMessage` / `updatePart` publish durable
+// events, and the projector materializes the `session`/`message`/`part` rows the
+// loop reads back — inside the same writer-pinned transaction as the event
+// insert. The harness `createE2EContext` also names the projector explicitly, but
+// that is the SAME node object, so it runs exactly once (verified).
+// ---------------------------------------------------------------------------
+
+const mkModelConfig = (provider: { baseUrl: string; apiKey: string; model: string }) => ({
+  providerID: "mock",
+  modelID: provider.model,
+  apiId: provider.model,
+  npm: "@ai-sdk/openai-compatible",
+  baseUrl: provider.baseUrl,
+  apiKey: provider.apiKey,
+  headers: {},
+})
+
+/** Seed a session + one user message through the worker's own services. */
+function seedSession(ctx: E2EContext, modelID: string, prompt: string) {
+  return Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "e2e",
+      agent: "build",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const user = (yield* sessions.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      sessionID: session.id,
+      agent: "build",
+      model: { providerID: "mock", modelID },
+      time: { created: Date.now() },
+    } as never)) as { id: MessageID }
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: user.id,
+      sessionID: session.id,
+      type: "text",
+      text: prompt,
+    } as never)
+    return session.id
+  }).pipe(Effect.provide(ctx.layer), Effect.provideService(InstanceRef, ctx.instance))
+}
+
+describe("real SessionPrompt.loop over the writer-backed worker Database (E2E)", () => {
+  test("runs the loop against the mock provider and persists each durable row exactly once", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-e2e-"))
+    await using provider = startMockProvider({ chunks: ["hel", "lo"] })
+    const ctx = createE2EContext({
+      snapshot: workerSnapshot({ directory }),
+      modelConfig: mkModelConfig(provider),
+    })
+    try {
+      const sessionID = await Effect.runPromise(seedSession(ctx, provider.model, "hi"))
+      const work = createSessionWork({
+        layer: ctx.layer,
+        writer: ctx.writer,
+        threadId: 7,
+        prompt: true,
+        instance: ctx.instance,
+      })
+      const result = await Effect.runPromise(work(sessionID))
+      const value = result.value as { parts: ReadonlyArray<{ type: string; text?: string }> }
+      const text = value.parts
+        .filter((part) => part.type === "text")
+        .map((part) => part.text ?? "")
+        .join("")
+
+      // 1. Non-empty assistant text from the real streamed reply.
+      expect(text).toBe("hello")
+      expect(provider.requests.length).toBeGreaterThanOrEqual(1)
+
+      // 2. Durable rows written through the writer, exactly once. `data` is
+      // stored as JSON text by Drizzle, so parse it before inspecting.
+      const json = (value: unknown): Record<string, unknown> =>
+        typeof value === "string" ? (JSON.parse(value) as Record<string, unknown>) : (value as Record<string, unknown>)
+      const messages = ctx.rows("message")
+      expect(messages).toHaveLength(2)
+      const roles = messages.map((row) => json(row.data).role)
+      expect(roles.filter((role) => role === "assistant")).toHaveLength(1)
+      expect(roles.filter((role) => role === "user")).toHaveLength(1)
+      const texts = ctx
+        .rows("part")
+        .map((row) => json(row.data))
+        .filter((data) => data.type === "text")
+        .map((data) => data.text)
+      expect(texts.filter((value) => value === "hello")).toHaveLength(1)
+      expect(ctx.rows("event").length).toBeGreaterThan(0)
+
+      // 3. session.status busy -> idle (the worker half of completion parity).
+      const statuses = ctx.statusLog.filter((entry) => entry.sessionID === sessionID).map((entry) => entry.status)
+      expect(statuses[0]).toBe("busy")
+      expect(statuses[statuses.length - 1]).toBe("idle")
+
+      // 4. Every durable write serialized through the single writer.
+      expect(ctx.writerOps.length).toBeGreaterThan(0)
+      expect(ctx.writerOps.some((op) => op.startsWith("tx:") || op === "begin" || op === "commit")).toBe(true)
+      const eventIDs = ctx.rows("event").map((row) => row.id)
+      expect(new Set(eventIDs).size).toBe(eventIDs.length)
+    } finally {
+      await ctx.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  }, 60_000)
+})
+
+// ---------------------------------------------------------------------------
+// End-to-end: a real worker `SessionPrompt.loop` run that ERRORS. The processor
+// halts on the provider failure and publishes a NON-durable `session.error`,
+// which the worker's EventV2→egress bridge forwards verbatim across the isolate
+// to the hub-side sink. The audit (`.parallel-implement/o1-w4-audit.md`, phase 5)
+// flagged that `session.error` was only unit-covered at the hub sink, never over
+// a real worker error run.
+//
+// The verbatim shape is the flag-OFF EventV2 wire shape `{ id, type, properties }`
+// (`properties` is the event `data`), NOT the writer-style `{ id, type, data }`.
+// ---------------------------------------------------------------------------
+
+describe("real SessionPrompt.loop error over the worker (E2E)", () => {
+  test("a provider failure crosses the isolate as one verbatim session.error and persists one error row", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-e2e-err-"))
+    // A non-retryable status (400) makes the processor halt on the first failure
+    // instead of backing off through the 5xx retry ladder (~60s).
+    await using provider = startMockProvider({
+      status: 400,
+      errorBody: { error: { message: "bad request from mock provider" } },
+    })
+
+    // Observe the hub-side events-port sink: the worker's egress handle IS that
+    // sink, so replacing the egress client node captures exactly what crosses.
+    const crossed: EventV2Event[] = []
+    const ctx = createE2EContext({
+      snapshot: workerSnapshot({ directory }),
+      modelConfig: mkModelConfig(provider),
+      replacements: [
+        [
+          EventEgressClientNode,
+          Layer.succeed(EventEgressClientService, { emit: (event) => void crossed.push(event) }),
+        ],
+      ],
+    })
+    try {
+      const sessionID = await Effect.runPromise(seedSession(ctx, provider.model, "hi"))
+      const work = createSessionWork({
+        layer: ctx.layer,
+        writer: ctx.writer,
+        threadId: 7,
+        prompt: true,
+        instance: ctx.instance,
+      })
+      await Effect.runPromise(work(sessionID))
+
+      // 1. The error crossed the isolate exactly once, verbatim.
+      const errors = crossed.filter((event) => event.type === "session.error")
+      expect(errors).toHaveLength(1)
+      const error = errors[0]
+      expect(Object.keys(error).sort()).toEqual(["id", "properties", "type"])
+      expect(error.id).toStartWith("evt_")
+      const properties = error.properties as { sessionID?: string; error?: { name?: string; message?: string } }
+      expect(properties.sessionID).toBe(sessionID)
+      expect(properties.error).toBeDefined()
+
+      // The hub sink accepts that same verbatim event and republishes it
+      // live-only — closing the "real run -> hub sink" gap the audit flagged.
+      const republished: Array<{ id?: string; type: string; data: unknown }> = []
+      createHubEventSink({
+        publisher: {
+          publish: (event) => void republished.push(event),
+          publishDefinition: (definition, data) => void republished.push({ type: definition.type, data }),
+        },
+      }).event(error)
+      expect(republished).toEqual([{ id: error.id, type: "session.error", data: properties }])
+
+      // 2. The durable error row is persisted exactly once: one assistant message
+      //    carrying the error, and no duplicate of it.
+      const json = (value: unknown): Record<string, unknown> =>
+        typeof value === "string" ? (JSON.parse(value) as Record<string, unknown>) : (value as Record<string, unknown>)
+      const assistants = ctx
+        .rows("message")
+        .map((row) => json(row.data))
+        .filter((data) => data.role === "assistant")
+      expect(assistants).toHaveLength(1)
+      expect(assistants[0].error).toBeDefined()
+    } finally {
+      await ctx.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  }, 60_000)
 })

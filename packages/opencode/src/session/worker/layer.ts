@@ -10,14 +10,17 @@
 //   * four client nodes (`WriterClient` / `EventEgressClient` / `BrokerClient` /
 //     `BackgroundJobClient`) that proxy to the writer, egress and hub authorities;
 //   * an immutable per-worker `WorkerSnapshot` + `WorkerEnv` (plan decision 67/68);
-//   * boundary replacement layers for the excluded nodes (Database, projector,
-//     MCP/LSP, Npm, ModelsDev, …), which production supplies from Phases 7/10.
+//   * boundary replacement layers for the excluded nodes (Database, MCP/LSP, Npm,
+//     ModelsDev, …), which production supplies from Phases 7/10. `SessionProjector`
+//     is NOT replaced: it runs in-worker so durable events materialize the
+//     session/message/part rows the loop reads back.
 //
 // `buildSessionWorkerLayer` composes the graph and then asserts it against the
-// node table, so a regression that reintroduces `Database`/`SessionProjector`
-// into the session graph fails at build time, not at run time.
+// node table, so a regression that reintroduces an excluded node such as
+// `Database` into the session graph fails at build time, not at run time.
 
 import { Context, Effect, Layer, Stream } from "effect"
+import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
@@ -98,12 +101,34 @@ import { createWorkerEventBridge } from "./event-bridge"
 import type { EventV2Event } from "./frame"
 import { messageOf, portFromMessagePort } from "./port"
 import type { JobClient } from "./job-client"
+import { writerSqlClientLayer, type WriterSqlHandle } from "./writer-sql-client"
 
 // ---------------------------------------------------------------------------
 // Client nodes — the worker-side handles to the writer / egress / hub.
 // ---------------------------------------------------------------------------
 
-export interface WriterClientHandle {
+/**
+ * The transaction primitives the worker writer exposes. They mirror
+ * `WorkerWriterClient` in `writer-client.ts`: a pinned transaction is identified
+ * by an opaque handle, statements run against it, then it commits or rolls back.
+ *
+ * A production writer (`createWorkerWriterClient`) always provides all four. They
+ * are optional here so reduced test/degraded handles remain structurally
+ * assignable; {@link writerDatabaseLayer} turns a missing primitive into a loud
+ * failure rather than a silent `undefined`.
+ */
+export interface WriterTransactionHandle {
+  /** Pin a transaction and return its opaque handle (e.g. `"tx-1"`). */
+  begin(): Promise<string>
+  /** Run a statement against the pinned transaction; rejects on a typed failure. */
+  txQuery(handle: string, method: string, sql: string, params?: readonly unknown[]): Promise<unknown>
+  /** Commit the pinned transaction; the handle is spent. */
+  commit(handle: string): Promise<void>
+  /** Roll back the pinned transaction, discarding its writes. */
+  rollback(handle: string): Promise<void>
+}
+
+export interface WriterClientHandle extends Partial<WriterTransactionHandle> {
   readonly query: (method: string, sql: string, params?: readonly unknown[]) => Promise<unknown>
   readonly publish: (event: { id: string; type: string; aggregateID: string; data: unknown }) => Promise<{
     readonly seq: number | null
@@ -565,37 +590,42 @@ export function databaseBoundaryLayer(): Layer.Layer<Database.Service> {
   return Layer.succeed(Database.Service, database)
 }
 
+/** A writer primitive the reduced/degraded handle did not implement. */
+const missingWriterPrimitive =
+  (method: keyof WriterTransactionHandle) => (): Promise<never> =>
+    Promise.reject(new SessionLayerBoundaryError("WriterClient", method))
+
 /**
- * The worker-side Database surface. Workers hold no SQLite connection: every
- * statement is forwarded to the hub-owned writer over the writer client port
- * (plan decision 24). The writer speaks `query(method, sql, params)` with
- * `method` one of `all` / `values` / `run` / `exec`.
+ * Parse the worker writer handle into the statement surface the writer-backed
+ * `SqlClient` drives. A production writer supplies every primitive; a partial
+ * handle yields a method that fails loud when the Database actually needs it.
  */
-export interface WorkerDatabaseHandle {
-  readonly run: (sql: string, params?: readonly unknown[]) => Promise<unknown>
-  readonly all: (sql: string, params?: readonly unknown[]) => Promise<unknown>
-  readonly get: (sql: string, params?: readonly unknown[]) => Promise<unknown>
-  readonly values: (sql: string, params?: readonly unknown[]) => Promise<unknown>
-  readonly exec: (sql: string, params?: readonly unknown[]) => Promise<unknown>
+function writerSqlHandle(writer: WriterClientHandle): WriterSqlHandle {
+  return {
+    query: writer.query,
+    begin: writer.begin ?? missingWriterPrimitive("begin"),
+    txQuery: writer.txQuery ?? missingWriterPrimitive("txQuery"),
+    commit: writer.commit ?? missingWriterPrimitive("commit"),
+    rollback: writer.rollback ?? missingWriterPrimitive("rollback"),
+  }
 }
 
 /**
- * A `Database` replacement that routes reads and writes through the writer
- * client instead of throwing. `Database.db` is typed as the drizzle shape in
- * the app graph; here it carries the reduced {@link WorkerDatabaseHandle}
- * surface (the SQL RPC the writer protocol exposes).
+ * The worker `Database`, backed by the hub-owned writer (plan decision 24).
+ *
+ * Workers hold no SQLite connection: `writerSqlClientLayer` turns the writer's
+ * `query` / transaction primitives into a real Effect `SqlClient`, and the same
+ * `EffectDrizzleSqlite.makeWithDefaults()` construction as the flag-OFF database
+ * builds the Drizzle `Database.Interface`. `select` / `insert` / `update` /
+ * `delete` / `transaction` therefore return Effects and run unchanged inside the
+ * worker. The result is structurally a `Database.Interface` — no cast.
  */
 export function writerDatabaseLayer(writer: WriterClientHandle): Layer.Layer<Database.Service> {
-  const statement = (method: string) => (sql: string, params?: readonly unknown[]) =>
-    writer.query(method, sql, params)
-  const db: WorkerDatabaseHandle = {
-    run: statement("run"),
-    all: statement("all"),
-    get: statement("values"),
-    values: statement("values"),
-    exec: statement("exec"),
-  }
-  return Layer.succeed(Database.Service, { db } as unknown as Database.Interface)
+  const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
+  return Layer.effect(
+    Database.Service,
+    Effect.map(makeDatabase, (db): Database.Interface => ({ db })),
+  ).pipe(Layer.provide(writerSqlClientLayer(writerSqlHandle(writer))))
 }
 
 /**
@@ -619,11 +649,12 @@ export function backgroundJobClientLayer(client: JobClient): Layer.Layer<Backgro
 }
 
 /**
- * Boundary replacements every session layer needs. `Database` and
- * `SessionProjector` are replaced so the worker never opens SQLite nor runs
- * durable projectors; MCP/LSP are reached through the broker client instead.
- * When a `writer` client is supplied, `Database` is a real writer-proxy (plan
- * decision 24); otherwise it stays the loud boundary stub.
+ * Boundary replacements every session layer needs. `Database` is replaced so the
+ * worker never opens SQLite (a real writer-proxy when a `writer` client is
+ * supplied — plan decision 24); MCP/LSP are reached through the broker client
+ * instead. `SessionProjector` is intentionally NOT replaced: it runs in-worker,
+ * registering `EventV2.project` subscribers so durable session events materialize
+ * the `session`/`message`/`part` rows, inside the writer-pinned transaction.
  *
  * Every other hub/writer/broker-owned node reachable from the real
  * `SessionPrompt` graph is replaced by a FUNCTIONAL boundary layer, not
@@ -642,9 +673,13 @@ export function boundaryReplacements(
     [Auth.node, snapshotAuthLayer(snapshot)],
     [ModelsDev.node, snapshotModelsDevLayer(snapshot)],
     [Database.node, writer === undefined ? databaseBoundaryLayer() : writerDatabaseLayer(writer)],
-    // Effect-only node: `session-projector` provides no service, so an empty
-    // layer is the correct (and complete) replacement.
-    [SessionProjector.node, Layer.empty],
+    // `SessionProjector` deliberately has NO boundary replacement: it runs IN the
+    // worker. `Session.updateMessage`/`updatePart` publish durable events, and the
+    // projector materializes the `session`/`message`/`part` rows the loop reads
+    // back. Its `EventV2.project` subscribers run inside `EventV2`'s durable-commit
+    // `db.transaction`, which the writer-backed Database routes through the writer
+    // tx primitives — so projection is atomic with the event insert, exactly as
+    // flag-off. (The node-table classifies it `worker-local`.)
     // Hub-owned / broker-owned authorities the reduced graph yields. A mock
     // provides the service shape so the graph BOOTS (an `Layer.empty` provides
     // nothing, so `SessionPrompt`'s `yield* MCP.Service`/`LSP.Service` would
@@ -860,6 +895,7 @@ const SESSION_NODE_BY_KEY: ReadonlyMap<string, LayerNode.AnyNode> = new Map<stri
   [SessionPrompt.node.name, SessionPrompt.node],
   [SessionProcessor.node.name, SessionProcessor.node],
   [SessionRunState.node.name, SessionRunState.node],
+  [SessionProjector.node.name, SessionProjector.node],
   [SessionStatus.node.name, SessionStatus.node],
   [SessionCompaction.node.name, SessionCompaction.node],
   [SessionRevert.node.name, SessionRevert.node],

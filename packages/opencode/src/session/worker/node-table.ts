@@ -47,6 +47,13 @@ export const SESSION_ALLOWLIST: readonly NodeEntry[] = [
   entry("SessionPrompt", "@opencode/SessionPrompt", ["session"], "worker-local"),
   entry("SessionProcessor", "@opencode/SessionProcessor", ["session"], "worker-local"),
   entry("SessionRunState", "@opencode/SessionRunState", ["session"], "worker-local"),
+  entry(
+    "SessionProjector",
+    "session-projector",
+    ["session"],
+    "worker-local",
+    "materializes session/message/part rows from durable events",
+  ),
   entry("LLM", "@opencode/LLM", ["session"], "worker-local"),
   entry("Plugin", "@opencode/Plugin", ["session"], "worker-local", "worker-hosted hooks only"),
   entry("ToolRegistry", "@opencode/ToolRegistry", ["session"], "worker-local"),
@@ -100,7 +107,6 @@ export const SESSION_ALLOWLIST: readonly NodeEntry[] = [
 /** Nodes that must NEVER be instantiated inside a session worker (task exclusions). */
 export const SESSION_EXCLUDED: readonly NodeEntry[] = [
   entry("Database", "@opencode/v2/storage/Database", ["hub", "writer"], "excluded", "writer owns the sole connection"),
-  entry("SessionProjector", "session-projector", ["writer"], "excluded", "durable projectors run in the writer isolate"),
   entry("LSP", "@opencode/LSP", ["broker"], "excluded", "broker-proxy only"),
   entry("MCP", "@opencode/MCP", ["broker"], "excluded", "broker-proxy only"),
   entry("McpAuth", "@opencode/McpAuth", ["broker"], "excluded", "broker-proxy only"),
@@ -160,6 +166,7 @@ export const REQUIRED_SESSION_NODE_KEYS: readonly string[] = [
   "@opencode/SessionPrompt",
   "@opencode/SessionProcessor",
   "@opencode/SessionRunState",
+  "session-projector",
   "@opencode/SessionStatus",
   "@opencode/SessionCompaction",
   "@opencode/SessionRevert",
