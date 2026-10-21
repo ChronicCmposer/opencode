@@ -214,4 +214,67 @@ export const make = <A, E = never>(
   }
 }
 
+/**
+ * A table of per-key runners: the run-state machine the hub keeps in-process
+ * (flag off) and the session worker keeps isolate-local (flag on). `onIdle`
+ * removes the key so an idle runner is never reused; `onInterrupt` is captured
+ * when the key's runner is first created (the first caller wins), matching the
+ * long-standing `SessionRunState` semantics.
+ */
+export interface RunnerTable<K extends string, A, E = never> {
+  readonly size: number
+  busy(key: K): boolean
+  ensureRunning(key: K, work: Effect.Effect<A, E>, onInterrupt?: Effect.Effect<A, E>): Effect.Effect<A, E>
+  startShell(
+    key: K,
+    work: Effect.Effect<A, E>,
+    ready?: Latch.Latch,
+    onInterrupt?: Effect.Effect<A, E>,
+  ): Effect.Effect<A, E | Busy>
+  cancel(key: K): Effect.Effect<void>
+  readonly cancelAll: Effect.Effect<void>
+}
+
+export interface RunnerTableOptions<K extends string, A, E = never> {
+  readonly scope: Scope.Scope
+  readonly onIdle?: (key: K) => Effect.Effect<void>
+  readonly onBusy?: (key: K) => Effect.Effect<void>
+}
+
+export function createRunnerTable<K extends string, A, E = never>(
+  options: RunnerTableOptions<K, A, E>,
+): RunnerTable<K, A, E> {
+  const runners = new Map<K, Runner<A, E>>()
+
+  const runnerFor = (key: K, onInterrupt?: Effect.Effect<A, E>): Runner<A, E> => {
+    const existing = runners.get(key)
+    if (existing) return existing
+    const next = make<A, E>(options.scope, {
+      onIdle: Effect.suspend(() => {
+        runners.delete(key)
+        return options.onIdle?.(key) ?? Effect.void
+      }),
+      onBusy: options.onBusy?.(key) ?? Effect.void,
+      ...(onInterrupt ? { onInterrupt } : {}),
+    })
+    runners.set(key, next)
+    return next
+  }
+
+  return {
+    get size() {
+      return runners.size
+    },
+    busy: (key) => runners.get(key)?.busy ?? false,
+    ensureRunning: (key, work, onInterrupt) => runnerFor(key, onInterrupt).ensureRunning(work),
+    startShell: (key, work, ready, onInterrupt) => runnerFor(key, onInterrupt).startShell(work, ready),
+    cancel: (key) => runners.get(key)?.cancel ?? Effect.void,
+    cancelAll: Effect.suspend(() => {
+      const active = [...runners.values()]
+      runners.clear()
+      return Effect.forEach(active, (runner) => runner.cancel, { concurrency: "unbounded", discard: true })
+    }),
+  }
+}
+
 export * as Runner from "./runner"

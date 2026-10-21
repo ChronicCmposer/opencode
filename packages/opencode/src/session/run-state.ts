@@ -3,10 +3,13 @@ import { InstanceState } from "@/effect/instance-state"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
-import { Effect, Latch, Layer, Scope, Context } from "effect"
+import { RuntimeFlags } from "@/effect/runtime-flags"
+import { Effect, Latch, Layer, Option, Schema, Scope, Context } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
+import { SessionHubService, type SessionHub } from "./worker/hub"
+import type { SessionExecutionResult } from "./worker/execute"
 
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
@@ -26,63 +29,64 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionRunState") {}
 
-const layer = Layer.effect(
+export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const background = yield* BackgroundJob.Service
     const status = yield* SessionStatus.Service
 
+    // Phase 12 flag-on seam: when `experimentalSessionWorkers` is on AND the hub
+    // pool layer is present, the run-state machine lives in a worker isolate and
+    // every method delegates to the hub (`session/worker/hub.ts`). Both services
+    // are resolved from the CALLER's context (not the layer's declared deps), so
+    // the flag-off layer graph is byte-identical to the pre-Phase-12 hub path.
+    const hubIfEnabled: Effect.Effect<SessionHub | undefined> = Effect.gen(function* () {
+      const hub = yield* Effect.serviceOption(SessionHubService)
+      if (Option.isNone(hub)) return undefined
+      const flags = yield* Effect.serviceOption(RuntimeFlags.Service)
+      if (Option.isNone(flags) || !flags.value.experimentalSessionWorkers) return undefined
+      return hub.value
+    })
+
+    // The run-state machine is the portable `Runner` table shared with the
+    // session worker (`session/worker/execute.ts`): flag off it lives here in
+    // the hub, flag on it lives inside the worker isolate (plan decision 18).
     const state = yield* InstanceState.make(
       Effect.fn("SessionRunState.state")(function* () {
         const scope = yield* Scope.Scope
-        const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts>>()
-        yield* Effect.addFinalizer(
-          Effect.fnUntraced(function* () {
-            yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
-              concurrency: "unbounded",
-              discard: true,
-            })
-            runners.clear()
-          }),
-        )
-        return { runners, scope }
+        const runners = Runner.createRunnerTable<SessionID, SessionV1.WithParts>({
+          scope,
+          onIdle: (sessionID) => status.set(sessionID, { type: "idle" }),
+          onBusy: (sessionID) => status.set(sessionID, { type: "busy" }),
+        })
+        yield* Effect.addFinalizer(() => runners.cancelAll)
+        return runners
       }),
     )
 
-    const runner = Effect.fn("SessionRunState.runner")(function* (
-      sessionID: SessionID,
-      onInterrupt: Effect.Effect<SessionV1.WithParts>,
-    ) {
-      const data = yield* InstanceState.get(state)
-      const existing = data.runners.get(sessionID)
-      if (existing) return existing
-      const next = Runner.make<SessionV1.WithParts>(data.scope, {
-        onIdle: Effect.gen(function* () {
-          data.runners.delete(sessionID)
-          yield* status.set(sessionID, { type: "idle" })
-        }),
-        onBusy: status.set(sessionID, { type: "busy" }),
-        onInterrupt,
-      })
-      data.runners.set(sessionID, next)
-      return next
-    })
-
     const assertNotBusy = Effect.fn("SessionRunState.assertNotBusy")(function* (sessionID: SessionID) {
-      const data = yield* InstanceState.get(state)
-      const existing = data.runners.get(sessionID)
-      if (existing?.busy) yield* busyError(sessionID)
+      const hub = yield* hubIfEnabled
+      if (hub !== undefined) {
+        if (yield* Effect.promise(() => hub.assertNotBusy(sessionID))) yield* busyError(sessionID)
+        return
+      }
+      const runners = yield* InstanceState.get(state)
+      if (runners.busy(sessionID)) yield* busyError(sessionID)
     })
 
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
+      const hub = yield* hubIfEnabled
+      if (hub !== undefined) {
+        yield* Effect.promise(() => hub.cancel(sessionID))
+        return
+      }
       yield* cancelBackgroundJobs(background, sessionID)
-      const data = yield* InstanceState.get(state)
-      const existing = data.runners.get(sessionID)
-      if (!existing) {
+      const runners = yield* InstanceState.get(state)
+      if (!runners.busy(sessionID)) {
         yield* status.set(sessionID, { type: "idle" })
         return
       }
-      yield* existing.cancel
+      yield* runners.cancel(sessionID)
     })
 
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
@@ -90,7 +94,12 @@ const layer = Layer.effect(
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
+      const hub = yield* hubIfEnabled
+      if (hub !== undefined) {
+        return yield* Effect.promise(() => hub.ensureRunning(sessionID)).pipe(Effect.flatMap(parseSessionResult))
+      }
+      const runners = yield* InstanceState.get(state)
+      return yield* runners.ensureRunning(sessionID, work, onInterrupt)
     })
 
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
@@ -99,8 +108,14 @@ const layer = Layer.effect(
       work: Effect.Effect<SessionV1.WithParts>,
       ready?: Latch.Latch,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt))
-        .startShell(work, ready)
+      const hub = yield* hubIfEnabled
+      if (hub !== undefined) {
+        if (yield* Effect.promise(() => hub.assertNotBusy(sessionID))) yield* busyError(sessionID)
+        return yield* Effect.promise(() => hub.ensureRunning(sessionID)).pipe(Effect.flatMap(parseSessionResult))
+      }
+      const runners = yield* InstanceState.get(state)
+      return yield* runners
+        .startShell(sessionID, work, ready, onInterrupt)
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
@@ -144,6 +159,11 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
 
 function busyError(sessionID: SessionID) {
   return new Session.BusyError({ sessionID })
+}
+
+/** Parse a worker's JSON result into the trusted `WithParts` at the hub boundary. */
+function parseSessionResult(result: SessionExecutionResult): Effect.Effect<SessionV1.WithParts> {
+  return Effect.sync(() => Schema.decodeUnknownSync(SessionV1.WithParts)(result.value) as SessionV1.WithParts)
 }
 
 export const node = LayerNode.make({ service: Service, layer: layer, deps: [BackgroundJob.node, SessionStatus.node] })
