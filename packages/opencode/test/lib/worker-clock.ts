@@ -187,27 +187,62 @@ export interface ClockController {
 
 export interface ClockControllerOptions {
   readonly port: MessagePort
+  /** Per-request timeout in ms; a silent worker then fails loudly. Defaults to 5000. */
+  readonly timeoutMs?: number
 }
+
+interface PendingClockRequest {
+  readonly resolve: (state: ClockState) => void
+  readonly reject: (error: Error) => void
+  readonly timer: ReturnType<typeof setTimeout>
+}
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 5000
 
 /** Build the hub-side controller for an `attachClock` worker. */
 export function createClockController(options: ClockControllerOptions): ClockController {
   const port = options.port
-  const pending = new Map<number, { resolve: (state: ClockState) => void; reject: (error: Error) => void }>()
+  const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error(`clock request timeoutMs must be a positive number, got: ${String(timeoutMs)}`)
+  }
+
+  const pending = new Map<number, PendingClockRequest>()
   let nextId = 1
+
+  const settle = (id: number, state: ClockState): void => {
+    const waiter = pending.get(id)
+    if (!waiter) return
+    pending.delete(id)
+    clearTimeout(waiter.timer)
+    waiter.resolve(state)
+  }
+
+  const failAll = (error: Error): void => {
+    for (const waiter of pending.values()) {
+      clearTimeout(waiter.timer)
+      waiter.reject(error)
+    }
+    pending.clear()
+  }
 
   port.onmessage = (event: MessageEvent) => {
     const frame = event.data as ClockStateFrame | undefined
     if (!frame || frame.type !== "clock.state") return
-    const waiter = pending.get(frame.id)
-    if (!waiter) return
-    pending.delete(frame.id)
-    waiter.resolve({ timestamp: frame.timestamp, pending: frame.pending })
+    settle(frame.id, { timestamp: frame.timestamp, pending: frame.pending })
+  }
+  port.onmessageerror = (event: MessageEvent) => {
+    failAll(new Error(`clock control port message error: ${String(event.data)}`))
   }
   port.start()
 
   const request = (frame: ClockControlFrame): Promise<ClockState> =>
     new Promise<ClockState>((resolve, reject) => {
-      pending.set(frame.id, { resolve, reject })
+      const timer = setTimeout(() => {
+        pending.delete(frame.id)
+        reject(new Error(`clock ${frame.type} timed out after ${timeoutMs}ms`))
+      }, timeoutMs)
+      pending.set(frame.id, { resolve, reject, timer })
       port.postMessage(frame)
     })
 
@@ -217,8 +252,7 @@ export function createClockController(options: ClockControllerOptions): ClockCon
     set: (timestamp) => request({ type: "clock.set", id: nextId++, timestamp }),
     dispose: () => {
       port.close()
-      for (const waiter of pending.values()) waiter.reject(new Error("clock controller disposed"))
-      pending.clear()
+      failAll(new Error("clock controller disposed"))
     },
   }
 }

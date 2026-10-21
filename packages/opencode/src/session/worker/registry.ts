@@ -1,13 +1,13 @@
 // Phase 4.8 — key→worker map lifecycle (plan task 4.8, plan line 61).
 //
 // The hub's only per-key state: a `SessionID`→worker reservation. The state
-// machine is `idle → reserved → running → cancelling → released`; `idle` and
-// `released` are represented by absence (there is no mapping). Insert on
-// dispatch, delete on completion/cancel/crash, clear on terminate.
+// machine is `reserved → running → cancelling`; the terminal `idle`/`released`
+// states are represented by absence (there is no mapping). Insert on dispatch,
+// delete on completion/cancel/crash, clear on terminate.
 
 import type { SessionID } from "@/session/schema"
 
-export type ReservationState = "idle" | "reserved" | "running" | "cancelling" | "released"
+export type ReservationState = "reserved" | "running" | "cancelling"
 
 export interface Reservation {
   readonly sessionID: SessionID

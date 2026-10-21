@@ -18,6 +18,9 @@
 
 import { Schema } from "effect"
 import type { SessionID } from "@/session/schema"
+import { defined } from "@/util/object"
+import { parsePositiveInt } from "@/util/parse"
+import { defaultSchedule, portFromMessagePort } from "./port"
 
 export const CANCEL_GRACE_ENV = "OPENCODE_SESSION_CANCEL_GRACE_MS"
 export const DEFAULT_CANCEL_GRACE_MS = 500
@@ -28,11 +31,7 @@ export type Env = Record<string, string | undefined>
 export function resolveCancelGraceMs(env: Env = process.env): number {
   const raw = env[CANCEL_GRACE_ENV]
   if (raw === undefined || raw.trim() === "") return DEFAULT_CANCEL_GRACE_MS
-  const parsed = Number(raw)
-  if (!Number.isInteger(parsed) || parsed < 1) {
-    throw new Error(`invalid ${CANCEL_GRACE_ENV}: ${raw} (expected a positive integer)`)
-  }
-  return parsed
+  return parsePositiveInt(raw, CANCEL_GRACE_ENV)
 }
 
 /** Raised at a checkpoint once cancellation has been requested. */
@@ -117,9 +116,14 @@ export async function runModelStep<T>(
   step: () => T | Promise<T>,
 ): Promise<T> {
   checkpoints.at(`model:${label}:before`)
-  const result = await step()
-  checkpoints.at(`model:${label}:after`)
-  return result
+  try {
+    return await step()
+  } finally {
+    // The `:after` boundary is recorded even when the step throws, so the
+    // checkpoint trace always brackets the step. Cancellation at this boundary
+    // still wins over a step error, which is the intent during a cancel.
+    checkpoints.at(`model:${label}:after`)
+  }
 }
 
 /** Checkpoint before and after a tool call (plan 11.2). */
@@ -129,9 +133,11 @@ export async function runToolCall<T>(
   call: () => T | Promise<T>,
 ): Promise<T> {
   checkpoints.at(`tool:${label}:before`)
-  const result = await call()
-  checkpoints.at(`tool:${label}:after`)
-  return result
+  try {
+    return await call()
+  } finally {
+    checkpoints.at(`tool:${label}:after`)
+  }
 }
 
 // ---- control-port frames ------------------------------------------------------
@@ -153,15 +159,8 @@ export interface CancelPort {
 }
 
 export function cancelPortFromMessagePort(port: MessagePort): CancelPort {
-  return {
-    notify: (frame) => port.postMessage(frame),
-    onMessage: (handler) => {
-      const listener = (event: MessageEvent) => handler(event.data as CancelFrame)
-      port.addEventListener("message", listener)
-      port.start()
-      return () => port.removeEventListener("message", listener)
-    },
-  }
+  const channel = portFromMessagePort<CancelFrame>(port)
+  return { notify: channel.post, onMessage: channel.onMessage }
 }
 
 // ---- worker side --------------------------------------------------------------
@@ -179,26 +178,56 @@ export interface CancelServer {
 }
 
 /**
- * Worker-side cancel handler: on a `cancel` frame, cancel the token, run the
- * graceful cleanup (children → Scope), then acknowledge. Cleanup is serialized
- * and runs once; a repeat `cancel` merely acknowledges (idempotent).
+ * Worker-side cancel handler: on a `cancel` frame for the session this worker
+ * owns, cancel the token, run the graceful cleanup (children → Scope), then
+ * acknowledge. Cleanup is serialized and runs once; a repeat `cancel` merely
+ * acknowledges (idempotent). A frame for a different session is rejected with
+ * `accepted: false` and never touches the token, so a late cancel for a previous
+ * run cannot abort the run currently in flight.
+ *
+ * A throwing `killChildren`/`closeScope` is acknowledged with `accepted: false`
+ * and never breaks the queue: the next cancel is still processed.
  */
-export function serveCancel(port: CancelPort, token: CancelToken, hooks: WorkerCancelHooks = {}): CancelServer {
+export function serveCancel(
+  port: CancelPort,
+  token: CancelToken,
+  ownedSessionID: SessionID,
+  hooks: WorkerCancelHooks = {},
+): CancelServer {
   let handled = 0
   let queue: Promise<void> = Promise.resolve()
 
+  const ack = (sessionID: string, accepted: boolean): void => {
+    try {
+      port.notify({ type: "cancel-ack", sessionID, accepted })
+    } catch {
+      // The control channel is gone; there is nothing left to notify.
+    }
+  }
+
   const unsubscribe = port.onMessage((frame) => {
     if (frame.type !== "cancel") return
-    const won = token.cancel(frame.reason)
-    if (!won) {
-      port.notify({ type: "cancel-ack", sessionID: frame.sessionID, accepted: true })
+    if (frame.sessionID !== ownedSessionID) {
+      ack(frame.sessionID, false)
       return
     }
+    if (!token.cancel(frame.reason)) {
+      ack(frame.sessionID, true)
+      return
+    }
+    // Keep the queue fulfilled even if a hook throws: catch inside the chain so
+    // one failed cleanup cannot stall every later cancel.
     queue = queue.then(async () => {
-      if (hooks.killChildren) await hooks.killChildren()
-      if (hooks.closeScope) await hooks.closeScope()
-      handled++
-      port.notify({ type: "cancel-ack", sessionID: frame.sessionID, accepted: true })
+      let accepted = true
+      try {
+        if (hooks.killChildren) await hooks.killChildren()
+        if (hooks.closeScope) await hooks.closeScope()
+      } catch {
+        accepted = false
+      } finally {
+        handled++
+        ack(frame.sessionID, accepted)
+      }
     })
   })
 
@@ -216,7 +245,12 @@ export type Outcome = "cancel" | "completion"
 
 export interface OutcomeGate {
   readonly winner: Outcome | undefined
-  /** Claim the outcome; returns `true` only for the first claimant. */
+  /**
+   * Claim the outcome. Returns `true` only for the very first claimant; every
+   * later claim (even for the same outcome) returns `false` and never overwrites
+   * the winner. This is the single first-writer-wins arbiter for cancel vs
+   * completion.
+   */
   claim(outcome: Outcome): boolean
 }
 
@@ -227,7 +261,7 @@ export function createOutcomeGate(): OutcomeGate {
       return winner
     },
     claim(outcome) {
-      if (winner !== undefined) return winner === outcome
+      if (winner !== undefined) return false
       winner = outcome
       return true
     },
@@ -242,6 +276,11 @@ export interface CancelOutcome {
   readonly sessionID: SessionID
   readonly mode: CancelMode
   readonly winner: Outcome
+  /**
+   * Whether this request observed a matching `cancel-ack` by the time the outcome
+   * was decided. Scoped to this request only: a stale ack from an earlier run is
+   * never reused, and a completion that skipped the cancel is never acknowledged.
+   */
   readonly acknowledged: boolean
   readonly durationMs: number
 }
@@ -271,22 +310,34 @@ export interface CancelController {
   dispose(): void
 }
 
-const defaultCancelSchedule: CancelScheduler = (delayMs, run) => {
-  const timer = setTimeout(run, delayMs)
-  ;(timer as { unref?: () => void }).unref?.()
-  return () => clearTimeout(timer)
-}
-
 export function createCancelController(options: CancelControllerOptions): CancelController {
   const graceMs = options.graceMs ?? resolveCancelGraceMs()
-  const schedule = options.schedule ?? defaultCancelSchedule
+  const schedule = options.schedule ?? defaultSchedule
   const now = options.now ?? (() => Date.now())
   const inFlight = new Map<SessionID, Promise<CancelOutcome>>()
-  const acknowledged = new Set<SessionID>()
+  // Per-run ack waiters, keyed by the raw session id string (no brand cast). The
+  // waiter is registered before the cancel frame is sent and pruned in `run`'s
+  // finally, so a late ack from a previous request can never satisfy a later one.
+  const ackWaiters = new Map<string, (accepted: boolean) => void>()
   let disposed = false
 
   const unsubscribe = options.port.onMessage((frame) => {
-    if (frame.type === "cancel-ack") acknowledged.add(frame.sessionID as SessionID)
+    if (frame.type !== "cancel-ack") return
+    ackWaiters.get(frame.sessionID)?.(frame.accepted)
+  })
+
+  const finish = (
+    sessionID: SessionID,
+    mode: CancelMode,
+    winner: Outcome,
+    started: number,
+    acknowledged: boolean,
+  ): CancelOutcome => ({
+    sessionID,
+    mode,
+    winner,
+    acknowledged,
+    durationMs: now() - started,
   })
 
   const run = async (sessionID: SessionID, request: CancelRequestOptions | undefined): Promise<CancelOutcome> => {
@@ -294,61 +345,61 @@ export function createCancelController(options: CancelControllerOptions): Cancel
     const gate = createOutcomeGate()
     const complete = request?.complete
 
-    // First-writer-wins: a completion that already landed beats the cancel.
-    if (complete !== undefined) {
-      let completionLanded = false
-      void complete.then(
-        () => {
-          completionLanded = true
-        },
-        () => {
-          completionLanded = true
-        },
-      )
-      await Promise.resolve()
-      if (completionLanded) {
-        gate.claim("completion")
-        return finish(sessionID, "completed", "completion", started)
+    let acknowledged = false
+    ackWaiters.set(sessionID, (accepted) => {
+      acknowledged = accepted
+    })
+
+    try {
+      // First-writer-wins: a completion that already landed beats the cancel.
+      // The completion claims the gate; the cancel claims it one microtask later.
+      // When `complete` is already settled its reaction is queued first, so the
+      // race deterministically resolves to the completion.
+      if (complete !== undefined) {
+        const completionWon = await Promise.race([
+          complete.then(
+            () => gate.claim("completion"),
+            () => gate.claim("completion"),
+          ),
+          Promise.resolve().then(() => false),
+        ])
+        if (completionWon) {
+          return finish(sessionID, "completed", "completion", started, acknowledged)
+        }
       }
+
+      gate.claim("cancel")
+      options.port.notify({
+        type: "cancel",
+        sessionID,
+        ...defined({ reason: request?.reason }),
+      })
+
+      let cancelTimer: (() => void) | undefined
+      const grace = new Promise<"grace">((resolve) => {
+        cancelTimer = schedule(graceMs, () => resolve("grace"))
+      })
+      const settled: Promise<"complete"> =
+        complete === undefined
+          ? new Promise<"complete">(() => {})
+          : complete.then(
+              () => "complete" as const,
+              () => "complete" as const,
+            )
+
+      const first = await Promise.race([settled, grace])
+      cancelTimer?.()
+
+      if (first === "grace") {
+        await options.terminate()
+        await options.reap?.()
+        return finish(sessionID, "terminated", "cancel", started, acknowledged)
+      }
+      return finish(sessionID, "cooperative", "cancel", started, acknowledged)
+    } finally {
+      ackWaiters.delete(sessionID)
     }
-
-    gate.claim("cancel")
-    options.port.notify({
-      type: "cancel",
-      sessionID,
-      ...(request?.reason === undefined ? {} : { reason: request.reason }),
-    })
-
-    let cancelTimer: (() => void) | undefined
-    const grace = new Promise<"grace">((resolve) => {
-      cancelTimer = schedule(graceMs, () => resolve("grace"))
-    })
-    const settled: Promise<"complete"> =
-      complete === undefined
-        ? new Promise<"complete">(() => {})
-        : complete.then(
-            () => "complete" as const,
-            () => "complete" as const,
-          )
-
-    const first = await Promise.race([settled, grace])
-    cancelTimer?.()
-
-    if (first === "grace") {
-      await options.terminate()
-      await options.reap?.()
-      return finish(sessionID, "terminated", "cancel", started)
-    }
-    return finish(sessionID, "cooperative", "cancel", started)
   }
-
-  const finish = (sessionID: SessionID, mode: CancelMode, winner: Outcome, started: number): CancelOutcome => ({
-    sessionID,
-    mode,
-    winner,
-    acknowledged: acknowledged.has(sessionID),
-    durationMs: now() - started,
-  })
 
   return {
     cancel(sessionID, request) {
@@ -366,6 +417,7 @@ export function createCancelController(options: CancelControllerOptions): Cancel
       disposed = true
       unsubscribe()
       inFlight.clear()
+      ackWaiters.clear()
     },
   }
 }

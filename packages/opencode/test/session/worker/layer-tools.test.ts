@@ -52,6 +52,34 @@ describe("worker tool host", () => {
     expect(result.metadata).toEqual({ args: { a: 1, injected: true }, stamped: true })
   })
 
+  test("before/after hooks receive the same input shape, including the live args", async () => {
+    const seen: Array<{ phase: string; tool: string; sessionID: string; callID: string; args: unknown }> = []
+    const plugins = createWorkerPluginHost([
+      {
+        name: "spy",
+        hooks: {
+          "tool.execute.before": (input) => {
+            const value = input as { tool: string; sessionID: string; callID: string; args: unknown }
+            seen.push({ phase: "before", ...value })
+          },
+          "tool.execute.after": (input) => {
+            const value = input as { tool: string; sessionID: string; callID: string; args: unknown }
+            seen.push({ phase: "after", ...value })
+          },
+        },
+      },
+    ])
+    const host = createWorkerToolHost({ plugins })
+    host.register(echoTool())
+
+    await host.execute("echo", { a: 1 }, { sessionID: "s", callID: "c" })
+
+    expect(seen).toEqual([
+      { phase: "before", tool: "echo", sessionID: "s", callID: "c", args: { a: 1 } },
+      { phase: "after", tool: "echo", sessionID: "s", callID: "c", args: { a: 1 } },
+    ])
+  })
+
   test("unknown tool fails loud", async () => {
     const host = createWorkerToolHost()
     await expect(host.execute("nope", {}, { sessionID: "s", callID: "c" })).rejects.toBeInstanceOf(UnknownToolError)

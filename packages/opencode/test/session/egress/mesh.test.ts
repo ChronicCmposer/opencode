@@ -2,8 +2,10 @@
 //
 // The hub registry keys subscriptions by `(worker, pattern)`; a worker `listen`
 // request/reply flows over its control port, and matching durable commits wake
-// the worker's `durable()` subscribers. Each worker's backlog is bounded, and an
-// overflow drops the commit then instructs a `resync`.
+// the worker's `durable()` subscribers. Each worker's backlog is bounded by an
+// OUTSTANDING-DELIVERY COUNTER: an un-acknowledged delivery occupies one slot,
+// so a worker that keeps acknowledging keeps receiving. An over-full worker drops
+// the commit and is told to `resync` (task 8.11).
 
 import { describe, expect, test } from "bun:test"
 import {
@@ -13,13 +15,22 @@ import {
   createMeshWorkerClient,
   matchesMeshPattern,
   type DurableCommit,
+  type MeshSink,
 } from "@/session/egress/mesh"
-import type { EgressEvent } from "@/session/egress/frame"
+import { durable } from "../../lib/egress-fixtures"
 
 const commit = (id: string, type: string, ordinal: number): DurableCommit => ({
   meta: { generation: 1, ordinal },
-  event: { id, type, data: { id } } as EgressEvent,
+  event: durable(id, type),
 })
+
+/** A sink that records the durable ids and resync patterns it is pushed. */
+function recordingSink(sent: string[], resyncs: string[] = []): MeshSink {
+  return {
+    sendDurable: (c) => sent.push(`durable:${c.event.id}`),
+    sendResync: (pattern) => resyncs.push(pattern),
+  }
+}
 
 async function pollUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -45,18 +56,20 @@ describe("event mesh registry", () => {
 
   test("delivers a matching commit to a listening worker", () => {
     const mesh = createEgressMesh()
+    const sent: string[] = []
+    mesh.attach("w1", recordingSink(sent))
     mesh.listen("w1", "session.*")
     const result = mesh.publish(commit("e1", "session.message", 1))
     expect(result).toEqual({ delivered: ["w1"], dropped: [] })
-    expect(mesh.depth("w1")).toBe(1)
-    expect(mesh.drain("w1")).toEqual([commit("e1", "session.message", 1)])
+    expect(sent).toEqual(["durable:e1"])
+    expect(mesh.outstanding("w1")).toBe(1)
   })
 
   test("does not deliver to a non-matching subscription", () => {
     const mesh = createEgressMesh()
     mesh.listen("w1", "session.*")
     expect(mesh.publish(commit("e1", "message.updated", 1))).toEqual({ delivered: [], dropped: [] })
-    expect(mesh.depth("w1")).toBe(0)
+    expect(mesh.outstanding("w1")).toBe(0)
   })
 
   test("delivers once per worker even with overlapping patterns", () => {
@@ -64,7 +77,7 @@ describe("event mesh registry", () => {
     mesh.listen("w1", "session.*")
     mesh.listen("w1", "*")
     expect(mesh.publish(commit("e1", "session.message", 1)).delivered).toEqual(["w1"])
-    expect(mesh.depth("w1")).toBe(1)
+    expect(mesh.outstanding("w1")).toBe(1)
   })
 
   test("fans out to every subscribed worker", () => {
@@ -74,24 +87,40 @@ describe("event mesh registry", () => {
     expect([...mesh.publish(commit("e1", "session.message", 1)).delivered].sort()).toEqual(["w1", "w2"])
   })
 
-  test("unlisten stops delivery", () => {
+  test("unlisten stops delivery and reclaims the worker entry", () => {
     const mesh = createEgressMesh()
     mesh.listen("w1", "session.*")
     mesh.unlisten("w1", "session.*")
+    expect(mesh.subscriptions()).toEqual([])
+    // A later publish must not resurrect the reclaimed worker.
     expect(mesh.publish(commit("e1", "session.message", 1))).toEqual({ delivered: [], dropped: [] })
+    expect(mesh.subscriptions()).toEqual([])
+  })
+
+  test("detach clears the worker's subscriptions and backlog", () => {
+    const mesh = createEgressMesh()
+    const detach = mesh.attach("w1", recordingSink([]))
+    mesh.listen("w1", "session.*")
+    mesh.publish(commit("e1", "session.message", 1))
+    expect(mesh.outstanding("w1")).toBe(1)
+
+    detach()
+    expect(mesh.subscriptions()).toEqual([])
+    expect(mesh.outstanding("w1")).toBe(0)
+    expect(mesh.publish(commit("e2", "session.message", 2))).toEqual({ delivered: [], dropped: [] })
   })
 
   test("overflow drops the commit and flags resync instead of blocking", () => {
     const mesh = createEgressMesh({ bound: 1 })
     const resyncs: string[] = []
-    mesh.attach("w1", { sendDurable: () => {}, sendResync: (pattern) => resyncs.push(pattern) })
+    mesh.attach("w1", recordingSink([], resyncs))
     mesh.listen("w1", "session.*")
     mesh.publish(commit("e1", "session.message", 1))
     const result = mesh.publish(commit("e2", "session.message", 2))
     expect(result).toEqual({ delivered: [], dropped: ["w1"] })
     expect(mesh.resyncPending).toEqual(["w1"])
     expect(resyncs).toEqual(["session.*"])
-    expect(mesh.depth("w1")).toBe(1)
+    expect(mesh.outstanding("w1")).toBe(1)
   })
 
   test("ack lowers the backlog so delivery resumes", () => {
@@ -99,17 +128,28 @@ describe("event mesh registry", () => {
     mesh.listen("w1", "session.*")
     mesh.publish(commit("e1", "session.message", 1))
     mesh.ack("w1")
-    expect(mesh.depth("w1")).toBe(0)
+    expect(mesh.outstanding("w1")).toBe(0)
     expect(mesh.publish(commit("e2", "session.message", 2)).delivered).toEqual(["w1"])
+  })
+
+  test("tracks resync per pattern and acknowledges them individually", () => {
+    const mesh = createEgressMesh({ bound: 1 })
+    mesh.listen("w1", "a.*")
+    mesh.listen("w1", "b.*")
+    mesh.publish(commit("a1", "a.event", 1)) // occupies the only slot
+    mesh.publish(commit("b1", "b.event", 2)) // overflow -> resync b.*
+    mesh.publish(commit("a2", "a.event", 3)) // overflow -> resync a.*
+    expect(mesh.resyncPending).toEqual(["w1"])
+    mesh.acknowledgeResync("w1", "b.*")
+    expect(mesh.resyncPending).toEqual(["w1"])
+    mesh.acknowledgeResync("w1", "a.*")
+    expect(mesh.resyncPending).toEqual([])
   })
 
   test("the attached sink receives durable and resync pushes", () => {
     const mesh = createEgressMesh()
     const sent: string[] = []
-    mesh.attach("w1", {
-      sendDurable: (c) => sent.push(`durable:${c.event.id}`),
-      sendResync: (pattern) => sent.push(`resync:${pattern}`),
-    })
+    mesh.attach("w1", recordingSink(sent))
     mesh.listen("w1", "*")
     mesh.publish(commit("e1", "session.message", 1))
     expect(sent).toEqual(["durable:e1"])
@@ -135,7 +175,7 @@ describe("event mesh transport over a control port", () => {
     await pollUntil(() => woken.length === 1)
     expect(woken).toEqual(["e1"])
 
-    // Backlog bound is 1 → the second commit overflows and resyncs.
+    // Backlog bound is 1 and e1 is still un-acknowledged → the second commit overflows.
     mesh.publish(commit("e2", "session.message", 2))
     await pollUntil(() => resyncs.length === 1)
     expect(resyncs).toEqual(["session.*"])
@@ -143,6 +183,30 @@ describe("event mesh transport over a control port", () => {
 
     client.acknowledgeResync("session.*")
     await pollUntil(() => mesh.resyncPending.length === 0)
+
+    client.dispose()
+    attachment.dispose()
+  })
+
+  test("a worker keeps receiving after the bound once it acknowledges deliveries", async () => {
+    const mesh = createEgressMesh({ bound: 1 })
+    const channel = new MessageChannel()
+    const attachment = attachMeshWorker(mesh, "w1", channel.port2)
+    const client = createMeshWorkerClient(channel.port1)
+
+    const woken: string[] = []
+    client.onDurable((c) => woken.push(c.event.id))
+    await client.listen("*")
+
+    // Without a routed ack this wedges at the bound; with it, every commit lands.
+    for (let ordinal = 1; ordinal <= 3; ordinal++) {
+      mesh.publish(commit(`e${ordinal}`, "session.message", ordinal))
+      await pollUntil(() => woken.length === ordinal)
+      client.acknowledgeDelivery()
+      await pollUntil(() => mesh.outstanding("w1") === 0)
+    }
+
+    expect(woken).toEqual(["e1", "e2", "e3"])
 
     client.dispose()
     attachment.dispose()

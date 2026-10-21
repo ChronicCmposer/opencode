@@ -8,6 +8,7 @@
 
 import { createCoalescer, type Coalescer, type CoalescerScheduler } from "./coalesce"
 import { encodeFrame, type DurableMeta, type EgressEvent } from "./frame"
+import { createMonotonicOrdinalSource } from "./ordinal"
 
 export interface EgressSenderOptions {
   readonly port: MessagePort
@@ -29,8 +30,7 @@ export interface EgressSender {
 }
 
 export function createEgressSender(options: EgressSenderOptions): EgressSender {
-  const generation = options.generation ?? 1
-  let ordinal = 0
+  const ordinals = createMonotonicOrdinalSource({ generation: options.generation ?? 1 })
 
   const coalescer: Coalescer = createCoalescer({
     windowMs: options.windowMs,
@@ -44,7 +44,7 @@ export function createEgressSender(options: EgressSenderOptions): EgressSender {
 
   return {
     pushDelta: (event) => coalescer.pushDelta(event),
-    pushDurable: (event, meta) => coalescer.pushDurable(event, meta ?? { generation, ordinal: ++ordinal }),
+    pushDurable: (event, meta) => coalescer.pushDurable(event, meta ?? ordinals.next()),
     end: () => coalescer.end(),
     get buffered() {
       return coalescer.buffered

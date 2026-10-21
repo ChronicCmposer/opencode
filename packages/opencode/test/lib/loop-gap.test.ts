@@ -75,6 +75,17 @@ describe("event-loop-gap probe", () => {
     expect(probe.stop().ticks).toBe(stopped.ticks)
   })
 
+  test("post-stop sample reports the same window as stop (no double-subtract)", () => {
+    let now = 1000
+    const probe = createLoopGapProbe({ intervalMs: 5, clock: () => now })
+    now = 1200
+
+    const stopped = probe.stop()
+
+    expect(stopped.windowMs).toBe(200)
+    expect(probe.sample().windowMs).toBe(stopped.windowMs)
+  })
+
   test("fails loudly on a non-positive interval or window", () => {
     expect(() => createLoopGapProbe({ intervalMs: 0 })).toThrow(/intervalMs/)
     expect(() => createLoopGapProbe({ intervalMs: -1 })).toThrow(/intervalMs/)

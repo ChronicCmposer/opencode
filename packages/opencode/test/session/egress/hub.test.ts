@@ -6,12 +6,10 @@
 // and hub-owned termination.
 
 import { describe, expect, test } from "bun:test"
-import { createEgressHub } from "@/session/egress/hub"
-import { decodeFrame, encodeFrame, type EgressEvent, type EgressFrame } from "@/session/egress/frame"
+import { EgressStreamOverflowError, createEgressHub } from "@/session/egress/hub"
+import { decodeFrame, encodeFrame, type EgressFrame } from "@/session/egress/frame"
 import { createEgressSender } from "@/session/egress/sender"
-
-const delta = (id: string): EgressEvent => ({ id, type: "message.part.updated", data: { id } })
-const durable = (id: string): EgressEvent => ({ id, type: "message.updated", data: { id } })
+import { delta, durable, durableFrame } from "../../lib/egress-fixtures"
 
 async function pollUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -54,15 +52,13 @@ describe("egress hub over MessagePort", () => {
   test("reassembles a frame split across two port deliveries", async () => {
     const { hub, channel } = setup()
     const subscriber = hub.fanout.subscribe("c")
-    const bytes = encodeFrame({ kind: "durable", v: 1, meta: { generation: 1, ordinal: 1 }, event: durable("d") })
+    const bytes = encodeFrame(durableFrame("d", 1))
     const split = bytes.byteLength - 5
     channel.port1.postMessage(bytes.subarray(0, split))
     channel.port1.postMessage(bytes.subarray(split))
     await pollUntil(() => hub.frames === 1)
     expect(hub.receiver.pendingBytes).toBe(0)
-    expect(subscriber.drain()).toEqual([
-      { kind: "durable", v: 1, meta: { generation: 1, ordinal: 1 }, event: durable("d") },
-    ])
+    expect(subscriber.drain()).toEqual([durableFrame("d", 1)])
     hub.close()
   })
 
@@ -94,7 +90,7 @@ describe("egress hub over MessagePort", () => {
     await consumer.done
     expect(consumer.frames).toEqual([
       { kind: "deltas", v: 1, events: [delta("1")] },
-      { kind: "durable", v: 1, meta: { generation: 1, ordinal: 1 }, event: durable("done") },
+      durableFrame("done", 1),
       { kind: "end", v: 1 },
     ])
     hub.close()
@@ -107,10 +103,7 @@ describe("egress hub over MessagePort", () => {
     sender.pushDurable(durable("kept"), { generation: 1, ordinal: 1 })
     await pollUntil(() => hub.frames === 2)
     hub.close()
-    expect(subscriber.drain()).toEqual([
-      { kind: "durable", v: 1, meta: { generation: 1, ordinal: 1 }, event: durable("kept") },
-      { kind: "end", v: 1 },
-    ])
+    expect(subscriber.drain()).toEqual([durableFrame("kept", 1), { kind: "end", v: 1 }])
   })
 
   test("close is idempotent", () => {
@@ -118,5 +111,25 @@ describe("egress hub over MessagePort", () => {
     hub.close()
     hub.close()
     expect(hub.closed).toBe(true)
+  })
+
+  test("surfaces a typed error when a subscriber's durable queue overflows", async () => {
+    const channel = new MessageChannel()
+    const hub = createEgressHub({ egressPort: channel.port2, bound: 1 })
+    const sender = createEgressSender({ port: channel.port1 })
+    // Occupy the only slot and never drain, so the second durable saturates it.
+    const occupied = hub.fanout.subscribe("c")
+    sender.pushDurable(durable("a"), { generation: 1, ordinal: 1 })
+    sender.pushDurable(durable("b"), { generation: 1, ordinal: 2 })
+    await pollUntil(() => hub.frames === 2)
+    expect(occupied.overflowed).toBe(true)
+
+    const consumer = (async () => {
+      for await (const _bytes of hub.stream("c")) {
+        // Overflow is terminal: the stream must reject before delivering more.
+      }
+    })()
+    await expect(consumer).rejects.toThrow(EgressStreamOverflowError)
+    hub.close()
   })
 })

@@ -8,10 +8,14 @@
 
 import { describe, expect, test } from "bun:test"
 import {
+  BrokerFailure,
   BrokerProtocolError,
   DEFAULT_MCP_TIMEOUT_MS,
   isBrokerRequest,
+  parseAcquireResult,
   parseBrokerRequest,
+  parseOAuthResult,
+  parsePingResult,
   resolveRequestTimeout,
 } from "@/session/broker/protocol"
 
@@ -57,6 +61,27 @@ describe("parseBrokerRequest", () => {
     expect(parsed.servers[1]?.kind).toBe("lsp")
   })
 
+  test("builds a genuinely string[]-typed command (not a re-cast unknown[])", () => {
+    const parsed = parseBrokerRequest({
+      kind: "acquire",
+      requestId: "r1",
+      directory: "/d",
+      servers: [{ name: "m", kind: "mcp", command: ["bun", "run", ""] }],
+    })
+    if (parsed.kind !== "acquire") throw new Error("expected acquire")
+    const command: ReadonlyArray<string> = parsed.servers[0]!.command
+    expect(command).toEqual(["bun", "run", ""])
+    // A non-string element is rejected at the boundary, not silently tolerated.
+    expect(() =>
+      parseBrokerRequest({
+        kind: "acquire",
+        requestId: "r1",
+        directory: "/d",
+        servers: [{ name: "m", kind: "mcp", command: ["bun", 7] }],
+      }),
+    ).toThrow(BrokerProtocolError)
+  })
+
   test("rejects a non-object, a missing kind and an unknown kind", () => {
     expect(() => parseBrokerRequest(null)).toThrow(BrokerProtocolError)
     expect(() => parseBrokerRequest("acquire")).toThrow(BrokerProtocolError)
@@ -80,11 +105,47 @@ describe("parseBrokerRequest", () => {
     ).toThrow(/command/)
   })
 
-  test("isBrokerRequest is a total predicate that never throws", () => {
+  test("isBrokerRequest is a total predicate that never throws and narrows the type", () => {
     expect(isBrokerRequest({ kind: "ping", requestId: "r" })).toBe(true)
     expect(isBrokerRequest({ kind: "nope" })).toBe(false)
     expect(isBrokerRequest(undefined)).toBe(false)
     expect(isBrokerRequest(() => {})).toBe(false)
+
+    const value: unknown = { kind: "ping", requestId: "r" }
+    if (!isBrokerRequest(value)) throw new Error("expected a broker request")
+    // `value` is now `BrokerRequest`: this property access only compiles because
+    // the predicate is a type guard.
+    expect(value.kind).toBe("ping")
+  })
+})
+
+describe("response-value parsers (parse, don't validate)", () => {
+  test("parseAcquireResult trusts a well-formed value and rejects junk", () => {
+    const parsed = parseAcquireResult({
+      instanceId: "inst",
+      servers: [{ name: "m", pid: 10, pgid: 10, instanceId: "inst" }],
+    })
+    expect(parsed.instanceId).toBe("inst")
+    expect(parsed.servers[0]).toEqual({ name: "m", pid: 10, pgid: 10, instanceId: "inst" })
+    expect(() => parseAcquireResult(null)).toThrow(BrokerProtocolError)
+    expect(() => parseAcquireResult({ instanceId: "i" })).toThrow(/servers/)
+    expect(() => parseAcquireResult({ instanceId: "i", servers: [{ name: "m", pid: 0, pgid: 1, instanceId: "i" }] })).toThrow(
+      /pid/,
+    )
+  })
+
+  test("parseOAuthResult enforces the broker-owned shape", () => {
+    expect(parseOAuthResult({ callbackUrl: "u", instanceId: "i", owner: "broker" })).toEqual({
+      callbackUrl: "u",
+      instanceId: "i",
+      owner: "broker",
+    })
+    expect(() => parseOAuthResult({ callbackUrl: "u", instanceId: "i", owner: "someone" })).toThrow(/owner/)
+  })
+
+  test("parsePingResult requires integer fields", () => {
+    expect(parsePingResult({ threadId: 3, directories: 1 })).toEqual({ threadId: 3, directories: 1 })
+    expect(() => parsePingResult({ threadId: "3", directories: 1 })).toThrow(/threadId/)
   })
 })
 
@@ -95,8 +156,17 @@ describe("resolveRequestTimeout", () => {
     expect(resolveRequestTimeout(undefined, undefined)).toBe(DEFAULT_MCP_TIMEOUT_MS)
   })
 
-  test("fails loud on a non-positive timeout", () => {
+  test("fails loud with a BrokerFailure (not a parse error) on a non-positive timeout", () => {
     expect(() => resolveRequestTimeout(0, undefined)).toThrow(/timeout/i)
     expect(() => resolveRequestTimeout(undefined, -1)).toThrow(/timeout/i)
+    const error = (() => {
+      try {
+        resolveRequestTimeout(0, undefined)
+      } catch (thrown) {
+        return thrown
+      }
+    })()
+    expect(error).toBeInstanceOf(BrokerFailure)
+    expect((error as BrokerFailure).code).toBe("invalid-request")
   })
 })

@@ -44,10 +44,13 @@ export interface MonotonicOrdinalOptions {
  */
 export function createMonotonicOrdinalSource(options: MonotonicOrdinalOptions = {}): OrdinalSource {
   const generation = options.generation ?? 1
-  let ordinal = (options.start ?? 1) - 1
+  const start = options.start ?? 1
+  if (!Number.isInteger(generation)) throw new Error(`invalid ordinal generation: ${generation} (expected an integer)`)
+  if (!Number.isInteger(start)) throw new Error(`invalid ordinal start: ${start} (expected an integer)`)
+  let ordinal = start - 1
   return {
     next: () => ({ generation, ordinal: ++ordinal }),
   }
 }
 
-export * as WriterOrdinalModule from "./ordinal"
+export * as EgressOrdinal from "./ordinal"

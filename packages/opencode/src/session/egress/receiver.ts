@@ -35,7 +35,11 @@ const EMPTY = new Uint8Array(0)
 
 function asBytes(data: unknown): Uint8Array {
   if (data instanceof Uint8Array) return data
-  throw new Error(`egress receiver expected Uint8Array, got: ${Object.prototype.toString.call(data)}`)
+  if (data instanceof ArrayBuffer) return new Uint8Array(data)
+  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+  throw new Error(
+    `egress receiver expected Uint8Array, ArrayBuffer, or ArrayBufferView, got: ${Object.prototype.toString.call(data)}`,
+  )
 }
 
 function concat(left: Uint8Array, right: Uint8Array): Uint8Array {
@@ -84,8 +88,10 @@ export function createEgressReceiver(options: EgressReceiverOptions): EgressRece
     try {
       const chunk = asBytes(event.data)
       const { frames, rest: nextRest } = decodeFrameChunks(concat(rest, chunk))
-      rest = nextRest
+      // Commit the trailing bytes only once every frame in the batch is handled:
+      // a mid-batch failure must not advance `rest` past undelivered frames.
       for (const { frame, bytes } of frames) handleFrame(frame, bytes)
+      rest = nextRest
     } catch (error) {
       fail(error instanceof Error ? error : new Error(String(error)))
     }

@@ -108,3 +108,17 @@ export async function resolveAnchor(anchor: Anchor): Promise<unknown> {
   const namespace: Record<string, unknown> = await import(anchor.module)
   return namespace[anchor.symbol]
 }
+
+/**
+ * A dialled result of resolving an anchor: `found` discriminates presence, so a
+ * caller cannot silently confuse an `undefined` export with a missing one.
+ */
+export type AnchorResolution =
+  | { readonly found: true; readonly value: unknown }
+  | { readonly found: false }
+
+/** Discriminated variant of {@link resolveAnchor} for presence-sensitive callers. */
+export async function resolveAnchorResult(anchor: Anchor): Promise<AnchorResolution> {
+  const value = await resolveAnchor(anchor)
+  return value === undefined ? { found: false } : { found: true, value }
+}

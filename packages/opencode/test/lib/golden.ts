@@ -12,6 +12,7 @@
 
 import { isDeepStrictEqual } from "node:util"
 import { createCapture, type CaptureHarness } from "./capture"
+import { deepFreeze } from "./deep-freeze"
 
 export interface DurableRow {
   readonly aggregate_id: string
@@ -83,13 +84,6 @@ export type GoldenDifference =
 const DURABLE_KIND = "durable"
 const COMPARED_FIELDS = ["type", "data", "owner_id"] as const
 
-function deepFreeze<T>(value: T): T {
-  if (value === null || typeof value !== "object") return value
-  Object.freeze(value)
-  for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested)
-  return value
-}
-
 /** Parse an untrusted durable row into a trusted `GoldenRow`, failing loudly. */
 function parseDurableRow(row: DurableRow): GoldenRow {
   if (typeof row.aggregate_id !== "string" || row.aggregate_id.length === 0) {
@@ -152,7 +146,9 @@ export function createGoldenCapture(options: GoldenCaptureOptions = {}): GoldenC
     capture
       .dbWrites()
       .filter((record) => record.kind === DURABLE_KIND)
-      .map((record) => record.data as GoldenRow)
+      // Records are parsed, not cast: a raw `db` record written directly onto
+      // the shared timeline cannot smuggle an invalid row past `rows`/`snapshot`.
+      .map((record) => parseDurableRow(record.data as DurableRow))
 
   return {
     capture,

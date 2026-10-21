@@ -3,7 +3,10 @@
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { RuntimeFlags } from "@/effect/runtime-flags"
+import { Database } from "@opencode-ai/core/database/database"
+import { ModelsDev } from "@opencode-ai/core/models-dev"
+import { Config } from "@/config/config"
+import { Auth } from "@/auth"
 import { createSessionScopeHost } from "@/session/worker/session-scope"
 import {
   ModelClient,
@@ -11,7 +14,12 @@ import {
   SessionPipeline,
   WorkerEnvService,
   WorkerSnapshotService,
+  boundaryReplacements,
   buildSessionWorkerLayer,
+  databaseBoundaryLayer,
+  snapshotAuthLayer,
+  snapshotConfigLayer,
+  snapshotModelsDevLayer,
   type SessionLayerOptions,
   type WorkerSnapshot,
 } from "@/session/worker/layer"
@@ -20,17 +28,16 @@ import {
   collectNodeNames,
   validateSessionLayer,
 } from "@/session/worker/node-table"
+import { workerSnapshot } from "../../lib/snapshot"
 
-const snapshot = (overrides: Partial<WorkerSnapshot> = {}): WorkerSnapshot => ({
-  epoch: 1,
-  directory: "/tmp/project-a",
-  config: { model: "test/test-model" },
-  auth: { test: { type: "api", key: "secret-a" } },
-  modelsDev: {},
-  flags: {} as RuntimeFlags.Info,
-  workerCount: 2,
-  ...overrides,
-})
+/** Project defaults layered on the shared builder (config/auth are asserted). */
+const snapshot = (overrides: Partial<WorkerSnapshot> = {}): WorkerSnapshot =>
+  workerSnapshot({
+    directory: "/tmp/project-a",
+    config: { model: "test/test-model" },
+    auth: { test: { type: "api", key: "secret-a" } },
+    ...overrides,
+  })
 
 const clients = (): SessionLayerOptions["clients"] => ({
   writer: {
@@ -56,11 +63,14 @@ const options = (overrides: Partial<SessionLayerOptions> = {}): SessionLayerOpti
 })
 
 describe("buildSessionWorkerLayer (6.5)", () => {
-  test("the full allowlist graph validates once excluded nodes are replaced", () => {
-    const built = buildSessionWorkerLayer(options({ nodes: SESSION_NODES }))
-    const report = validateSessionLayer(built.root, built.replacements)
-    expect(report.ok).toBe(true)
+  test("the full allowlist graph drops exclusions but surfaces unclassified app nodes (fail closed)", () => {
+    const report = validateSessionLayer(SESSION_NODES, boundaryReplacements(snapshot()))
     expect(report.excluded).toEqual([])
+    expect(report.missingClients).toEqual([])
+    // The declared allowlist is not yet exhaustive over its transitive app deps;
+    // fail-closed reports them instead of silently accepting them.
+    expect(report.unknown.length).toBeGreaterThan(0)
+    expect(report.ok).toBe(false)
   })
 
   test("the runnable layer excludes Database and SessionProjector", () => {
@@ -156,6 +166,115 @@ describe("session pipeline (6.1)", () => {
     expect(emitted).toEqual(["session.text"])
     expect(published).toEqual(["message.assistant"])
   })
+
+  test("a non-committed publish is not emitted and reports emitted 0", async () => {
+    const emitted: string[] = []
+    const built = buildSessionWorkerLayer(
+      options({
+        clients: {
+          writer: { query: async () => [], publish: async () => ({ seq: null, committed: false }) },
+          egress: { emit: (event) => void emitted.push(event.type) },
+          broker: { call: async () => null },
+          backgroundJob: { wait: async () => null, cancel: async () => {} },
+        },
+      }),
+    )
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const pipeline = yield* SessionPipeline
+        return yield* pipeline.run({ sessionID: "s1", messages: [] })
+      }).pipe(Effect.provide(built.layer)),
+    )
+
+    expect(result.publishedSeq).toBeNull()
+    expect(result.emitted).toBe(0)
+    expect(emitted).toEqual([])
+  })
+
+  test("a writer rejection surfaces in the typed error channel", async () => {
+    const built = buildSessionWorkerLayer(
+      options({
+        clients: {
+          writer: {
+            query: async () => [],
+            publish: async () => {
+              throw new Error("writer down")
+            },
+          },
+          egress: { emit: () => {} },
+          broker: { call: async () => null },
+          backgroundJob: { wait: async () => null, cancel: async () => {} },
+        },
+      }),
+    )
+
+    await expect(
+      Effect.runPromise(
+        Effect.gen(function* () {
+          const pipeline = yield* SessionPipeline
+          return yield* pipeline.run({ sessionID: "s1", messages: [] })
+        }).pipe(Effect.provide(built.layer)),
+      ),
+    ).rejects.toThrow("writer down")
+  })
+})
+
+describe("boundary layers (6.x)", () => {
+  test("snapshot Config serves reads but rejects writes loudly", async () => {
+    const layer = snapshotConfigLayer(snapshot())
+    const read = await Effect.runPromise(
+      Effect.gen(function* () {
+        const config = yield* Config.Service
+        return yield* config.get()
+      }).pipe(Effect.provide(layer)),
+    )
+    expect(read).toEqual({ model: "test/test-model" })
+
+    await expect(
+      Effect.runPromise(
+        Effect.gen(function* () {
+          const config = yield* Config.Service
+          return yield* config.update({})
+        }).pipe(Effect.provide(layer)),
+      ),
+    ).rejects.toThrow(/Config.*update/)
+  })
+
+  test("snapshot Auth serves reads but rejects writes loudly", async () => {
+    const layer = snapshotAuthLayer(snapshot())
+    await expect(
+      Effect.runPromise(
+        Effect.gen(function* () {
+          const auth = yield* Auth.Service
+          return yield* auth.set("test", Auth.Api.make({ type: "api", key: "x" }))
+        }).pipe(Effect.provide(layer)),
+      ),
+    ).rejects.toThrow(/Auth.*set/)
+  })
+
+  test("snapshot ModelsDev rejects refresh loudly", async () => {
+    const layer = snapshotModelsDevLayer(snapshot())
+    await expect(
+      Effect.runPromise(
+        Effect.gen(function* () {
+          const modelsDev = yield* ModelsDev.Service
+          return yield* modelsDev.refresh()
+        }).pipe(Effect.provide(layer)),
+      ),
+    ).rejects.toThrow(/ModelsDev.*refresh/)
+  })
+
+  test("the Database boundary throws when the connection is touched", () => {
+    expect(() =>
+      Effect.runSync(
+        Effect.gen(function* () {
+          const database = yield* Database.Service
+          return database.db
+        }).pipe(Effect.provide(databaseBoundaryLayer())),
+      ),
+    ).toThrow(/Database/)
+  })
 })
 
 describe("session scope integration (6.7)", () => {
@@ -185,5 +304,11 @@ describe("session scope integration (6.7)", () => {
 describe("node table report", () => {
   test("describes the table without throwing", () => {
     expect(typeof LayerNode.group).toBe("function")
+  })
+
+  test("the shared isNode predicate separates layer nodes from raw layers", () => {
+    const node = LayerNode.make({ name: "test-node", layer: Layer.empty, deps: [] as const })
+    expect(LayerNode.isNode(node)).toBe(true)
+    expect(LayerNode.isNode(Layer.empty)).toBe(false)
   })
 })

@@ -9,58 +9,111 @@
 import type { EgressEvent } from "./frame"
 import type { WriterOrdinal } from "./ordinal"
 
-/** A control frame; replies echo the request `id`. */
+/**
+ * Permissive control-frame envelope: the transport base every frame satisfies.
+ *
+ * Kept structurally open (`[key: string]: unknown`) so a protocol can carry its
+ * own fields and so unknown / forward-compatible frames survive the boundary.
+ * Prefer the typed {@link ControlFrame} union for consumer-side handling.
+ */
 export interface ControlEnvelope {
   readonly type: string
   readonly id?: number
   readonly [key: string]: unknown
 }
 
-/** Control frames the worker sends to the hub (requests + notifications). */
-export type ControlInbound =
+/**
+ * Every typed control frame (plan task 8.13).
+ *
+ * `id` is present on requests and their replies; `durable` / `resync` are
+ * hub→worker pushes; `durable.ack` / `resync.ack` acknowledge them back.
+ */
+export type ControlFrame =
   | { readonly type: "ping"; readonly id: number }
+  | { readonly type: "pong"; readonly id: number }
   | { readonly type: "listen"; readonly id: number; readonly pattern: string }
   | { readonly type: "unlisten"; readonly id: number; readonly pattern: string }
-  | { readonly type: "resync.ack"; readonly pattern: string }
-
-/** Control frames the hub sends to the worker (replies + notifications). */
-export type ControlOutbound =
-  | { readonly type: "pong"; readonly id: number }
   | { readonly type: "listen.ok"; readonly id: number }
   | { readonly type: "durable"; readonly meta: WriterOrdinal; readonly event: EgressEvent }
   | { readonly type: "resync"; readonly pattern: string }
+  | { readonly type: "durable.ack"; readonly count: number }
+  | { readonly type: "resync.ack"; readonly pattern?: string }
+
+/** Hub → worker control frames. */
+export type ControlOutbound = Extract<ControlFrame, { readonly type: "ping" | "listen.ok" | "durable" | "resync" }>
+
+/** Worker → hub control frames. */
+export type ControlInbound = Exclude<ControlFrame, ControlOutbound>
+
+/** A request frame: the link stamps `id`, so callers may omit it. */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
+export type ControlRequest = DistributiveOmit<ControlFrame, "id"> & { readonly id?: number }
 
 export interface ControlLink {
   /** Send a request and resolve with the reply carrying the same `id`. */
-  request(frame: { readonly type: string; readonly [key: string]: unknown }): Promise<ControlEnvelope>
+  request(frame: ControlRequest): Promise<ControlFrame>
   /** Send a one-way notification. */
   notify(frame: ControlEnvelope): void
   /** Register the handler for inbound frames that are not replies. */
-  onMessage(handler: (frame: ControlEnvelope) => void): void
+  onMessage(handler: (frame: ControlFrame) => void): void
   dispose(): void
   readonly lastError: Error | undefined
 }
 
-export function createControlLink(port: MessagePort): ControlLink {
-  const pending = new Map<number, { resolve: (frame: ControlEnvelope) => void; reject: (error: Error) => void }>()
-  let handler: ((frame: ControlEnvelope) => void) | undefined
+export interface ControlLinkOptions {
+  /** Reject a request that receives no reply within this many ms. */
+  readonly timeoutMs?: number
+}
+
+const DISPOSED_ERROR = "control link disposed"
+
+interface PendingRequest {
+  resolve(frame: ControlFrame): void
+  reject(error: Error): void
+  readonly timer: ReturnType<typeof setTimeout> | undefined
+}
+
+/**
+ * Shape check for the port boundary: accepts any object carrying a string
+ * `type`, so unknown / forward-compatible frames are still forwarded to
+ * `onMessage` rather than dropped.
+ */
+function isControlFrame(data: unknown): data is ControlFrame {
+  if (typeof data !== "object" || data === null || !("type" in data)) return false
+  return typeof data.type === "string"
+}
+
+export function createControlLink(port: MessagePort, options: ControlLinkOptions = {}): ControlLink {
+  const timeoutMs = options.timeoutMs
+  const pending = new Map<number, PendingRequest>()
+  let handler: ((frame: ControlFrame) => void) | undefined
   let nextId = 1
   let lastError: Error | undefined
+  let disposed = false
+
+  const clearPending = (error: Error): void => {
+    for (const waiter of pending.values()) {
+      if (waiter.timer !== undefined) clearTimeout(waiter.timer)
+      waiter.reject(error)
+    }
+    pending.clear()
+  }
 
   port.onmessage = (event: MessageEvent) => {
-    const frame = event.data as ControlEnvelope | undefined
-    if (!frame || typeof frame.type !== "string") return
-    if (typeof frame.id === "number") {
-      const waiter = pending.get(frame.id)
+    const data: unknown = event.data
+    if (!isControlFrame(data)) return
+    if ("id" in data && typeof data.id === "number") {
+      const waiter = pending.get(data.id)
       if (waiter) {
-        pending.delete(frame.id)
-        waiter.resolve(frame)
+        pending.delete(data.id)
+        if (waiter.timer !== undefined) clearTimeout(waiter.timer)
+        waiter.resolve(data)
         return
       }
     }
     if (!handler) return
     try {
-      handler(frame)
+      handler(data)
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error))
     }
@@ -69,20 +122,37 @@ export function createControlLink(port: MessagePort): ControlLink {
 
   return {
     request(frame) {
+      if (disposed) return Promise.reject(new Error(DISPOSED_ERROR))
       const id = nextId++
-      return new Promise<ControlEnvelope>((resolve, reject) => {
-        pending.set(id, { resolve, reject })
-        port.postMessage({ ...frame, id })
+      return new Promise<ControlFrame>((resolve, reject) => {
+        const timer =
+          timeoutMs === undefined
+            ? undefined
+            : setTimeout(() => {
+                if (!pending.delete(id)) return
+                reject(new Error(`control request ${id} timed out after ${timeoutMs}ms`))
+              }, timeoutMs)
+        pending.set(id, { resolve, reject, timer })
+        try {
+          port.postMessage({ ...frame, id })
+        } catch (error) {
+          pending.delete(id)
+          if (timer !== undefined) clearTimeout(timer)
+          reject(error instanceof Error ? error : new Error(String(error)))
+        }
       })
     },
-    notify: (frame) => port.postMessage(frame),
+    notify: (frame) => {
+      if (!disposed) port.postMessage(frame)
+    },
     onMessage: (next) => {
       handler = next
     },
     dispose: () => {
+      if (disposed) return
+      disposed = true
       port.close()
-      for (const waiter of pending.values()) waiter.reject(new Error("control link disposed"))
-      pending.clear()
+      clearPending(new Error(DISPOSED_ERROR))
     },
     get lastError() {
       return lastError

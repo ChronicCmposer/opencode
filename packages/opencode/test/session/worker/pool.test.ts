@@ -67,4 +67,19 @@ describe("worker pool spawn", () => {
     await pool.terminateAll()
     expect(pool.workers.every((worker) => !worker.alive)).toBe(true)
   })
+
+  test("terminate resolves with a numeric exit code and is idempotent", async () => {
+    const pool = createWorkerPool({ availableParallelism: () => 4, env: {} })
+    await pool.ready()
+
+    const worker = pool.workers[0]
+    const first = await worker.terminate()
+    expect(typeof first).toBe("number")
+
+    // A second terminate reports the cached exit code, not the fallback.
+    const second = await worker.terminate(99)
+    expect(second).toBe(first)
+
+    await pool.terminateAll()
+  })
 })

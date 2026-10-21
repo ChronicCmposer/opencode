@@ -5,7 +5,7 @@
 // with optional fields defaulted.
 
 import { describe, expect, test } from "bun:test"
-import { ProtocolError, parseWriterRequest } from "@/session/writer/protocol"
+import { ProtocolError, isEnoent, parseWriterRequest, parseWriterResponse } from "@/session/writer/protocol"
 
 describe("parseWriterRequest: remote-query proxy", () => {
   test("parses a positional query carrying {method, sql, params}", () => {
@@ -130,5 +130,50 @@ describe("parseWriterRequest: malformed frames", () => {
     expect(() => parseWriterRequest("query")).toThrow(ProtocolError)
     expect(() => parseWriterRequest({ type: "query", method: "all", sql: "x" })).toThrow(ProtocolError)
     expect(() => parseWriterRequest({ type: "explode", id: 1 })).toThrow(/unknown request type/)
+  })
+
+  test("rejects a non-boolean durable rather than coercing it (step 20)", () => {
+    const event = { id: "e", type: "t", aggregateID: "a", data: {} }
+    expect(() => parseWriterRequest({ type: "publish", id: 1, event, durable: "yes" })).toThrow(ProtocolError)
+    expect(() => parseWriterRequest({ type: "publish", id: 1, event, durable: 1 })).toThrow(ProtocolError)
+  })
+
+  test("rejects an array where a record is required (step 21)", () => {
+    expect(() => parseWriterRequest({ type: "publish", id: 1, event: [], durable: true })).toThrow(ProtocolError)
+    expect(() => parseWriterRequest({ type: "publish", id: 1, event: { id: "e", type: "t", aggregateID: "a", data: [] } })).toThrow(
+      ProtocolError,
+    )
+  })
+})
+
+describe("parseWriterResponse (step 15)", () => {
+  test("parses ready, result and failure frames", () => {
+    expect(parseWriterResponse({ type: "ready", generation: 3 })).toEqual({ type: "ready", generation: 3 })
+    expect(parseWriterResponse({ type: "result", id: 1, value: { a: 1 } })).toEqual({
+      type: "result",
+      id: 1,
+      value: { a: 1 },
+    })
+    expect(parseWriterResponse({ type: "failure", id: 2, error: { tag: "X", message: "m" } })).toEqual({
+      type: "failure",
+      id: 2,
+      error: { tag: "X", message: "m" },
+    })
+  })
+
+  test("fails loud on malformed responses", () => {
+    expect(() => parseWriterResponse(null)).toThrow(ProtocolError)
+    expect(() => parseWriterResponse({ type: "result", id: "x" })).toThrow(ProtocolError)
+    expect(() => parseWriterResponse({ type: "failure", id: 1 })).toThrow(ProtocolError)
+    expect(() => parseWriterResponse({ type: "nope" })).toThrow(/unknown response type/)
+  })
+})
+
+describe("isEnoent (step 24)", () => {
+  test("recognizes only the ENOENT code", () => {
+    expect(isEnoent({ code: "ENOENT" })).toBe(true)
+    expect(isEnoent({ code: "EACCES" })).toBe(false)
+    expect(isEnoent(null)).toBe(false)
+    expect(isEnoent("ENOENT")).toBe(false)
   })
 })

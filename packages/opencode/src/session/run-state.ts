@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import type { DeepMutable } from "@opencode-ai/core/schema"
 import { InstanceState } from "@/effect/instance-state"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
@@ -9,7 +10,7 @@ import { Session } from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
 import { SessionHubService, type SessionHub } from "./worker/hub"
-import type { SessionExecutionResult } from "./worker/execute"
+import { SessionBusyError, type SessionExecutionResult } from "./worker/execute"
 
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
@@ -40,13 +41,17 @@ export const layer = Layer.effect(
     // every method delegates to the hub (`session/worker/hub.ts`). Both services
     // are resolved from the CALLER's context (not the layer's declared deps), so
     // the flag-off layer graph is byte-identical to the pre-Phase-12 hub path.
-    const hubIfEnabled: Effect.Effect<SessionHub | undefined> = Effect.gen(function* () {
-      const hub = yield* Effect.serviceOption(SessionHubService)
-      if (Option.isNone(hub)) return undefined
-      const flags = yield* Effect.serviceOption(RuntimeFlags.Service)
-      if (Option.isNone(flags) || !flags.value.experimentalSessionWorkers) return undefined
-      return hub.value
-    })
+    // `Effect.cached` resolves the pair ONCE per layer instance: the graph is
+    // fixed for a runtime, so re-reading it on every call is pure waste.
+    const hubIfEnabled: Effect.Effect<SessionHub | undefined> = yield* Effect.cached(
+      Effect.gen(function* () {
+        const hub = yield* Effect.serviceOption(SessionHubService)
+        if (Option.isNone(hub)) return undefined
+        const flags = yield* Effect.serviceOption(RuntimeFlags.Service)
+        if (Option.isNone(flags) || !flags.value.experimentalSessionWorkers) return undefined
+        return hub.value
+      }),
+    )
 
     // The run-state machine is the portable `Runner` table shared with the
     // session worker (`session/worker/execute.ts`): flag off it lives here in
@@ -110,8 +115,23 @@ export const layer = Layer.effect(
     ) {
       const hub = yield* hubIfEnabled
       if (hub !== undefined) {
-        if (yield* Effect.promise(() => hub.assertNotBusy(sessionID))) yield* busyError(sessionID)
-        return yield* Effect.promise(() => hub.ensureRunning(sessionID)).pipe(Effect.flatMap(parseSessionResult))
+        // The hub protocol carries only the session id: the worker resolves the
+        // work by kind and owns the interrupt, so the caller's `work`/`onInterrupt`
+        // closures cannot cross the isolate (exactly as `ensureRunning` does). The
+        // `ready` latch has no hub-side equivalent, so open it here rather than
+        // leave a caller waiting on a signal the hub will never send.
+        if (ready !== undefined) yield* ready.open
+        // `hub.startShell` performs its own busy assertion and rejects with a
+        // worker-local `SessionBusyError`; map it onto the domain `Session.BusyError`.
+        return yield* Effect.tryPromise({
+          try: () => hub.startShell(sessionID),
+          catch: (error) => error,
+        }).pipe(
+          Effect.flatMap(parseSessionResult),
+          Effect.catch((error) =>
+            error instanceof SessionBusyError ? Effect.fail(busyError(sessionID)) : Effect.die(error),
+          ),
+        )
       }
       const runners = yield* InstanceState.get(state)
       return yield* runners
@@ -163,7 +183,14 @@ function busyError(sessionID: SessionID) {
 
 /** Parse a worker's JSON result into the trusted `WithParts` at the hub boundary. */
 function parseSessionResult(result: SessionExecutionResult): Effect.Effect<SessionV1.WithParts> {
-  return Effect.sync(() => Schema.decodeUnknownSync(SessionV1.WithParts)(result.value) as SessionV1.WithParts)
+  // The schema decodes to a deeply `readonly` tree while the runner contract is
+  // the mutable `WithParts` alias, so the boundary widens via `DeepMutable`
+  // (the repo's parse idiom, cf. `config/parse.ts`). A malformed worker result
+  // is a defect (a broken isolate), not a recoverable typed failure: `orDie`.
+  return Schema.decodeUnknownEffect(SessionV1.WithParts)(result.value).pipe(
+    Effect.orDie,
+    Effect.map((decoded) => decoded as DeepMutable<typeof decoded>),
+  )
 }
 
 export const node = LayerNode.make({ service: Service, layer: layer, deps: [BackgroundJob.node, SessionStatus.node] })

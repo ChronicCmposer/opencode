@@ -10,13 +10,16 @@
 //     `generation`, delivered to the isolate via `workerData` and echoed in its
 //     `ready` frame, so survivors can detect a stale writer.
 
+import { mergeEnv } from "@/session/broker/env"
+import { defined } from "@/util/object"
 import type { StorageReadResult } from "./core"
-import type { QueryMethod, WriterEvent, WriterRequest, WriterResponse } from "./protocol"
+import { parseWriterResponse, type QueryMethod, type WriterEvent, type WriterRequest, type WriterResponse } from "./protocol"
 
 export interface PublishResult {
   readonly seq: number | null
   readonly committed: boolean
-  readonly ordinal: number
+  /** Egress ordinal; `null` for frames that carry no durable event. */
+  readonly ordinal: number | null
   readonly idempotent: boolean
 }
 
@@ -25,6 +28,15 @@ export class WriterCrashedError extends Error {
   constructor(message: string) {
     super(message)
     this.name = "WRITER_CRASHED"
+  }
+}
+
+/** A ready/request deadline elapsed; carries a tag so callers can branch on it. */
+export class WriterTimeoutError extends Error {
+  readonly tag = "WRITER_TIMEOUT"
+  constructor(message: string) {
+    super(message)
+    this.name = "WRITER_TIMEOUT"
   }
 }
 
@@ -50,6 +62,25 @@ export interface WriterClientOptions {
   readonly onCrash?: (error: WriterCrashedError) => void
 }
 
+/** Per-query cache toggle. */
+export interface QueryOptions {
+  readonly cache?: boolean
+}
+
+/** Options for a durable/non-durable publish. */
+export interface PublishOptions {
+  readonly durable: boolean
+  readonly ownerID?: string
+  readonly strictOwner?: boolean
+  readonly commitId?: string
+}
+
+/** Options for an idempotent replay. */
+export interface ReplayOptions {
+  readonly ownerID?: string
+  readonly strictOwner?: boolean
+}
+
 interface Pending {
   readonly resolve: (value: unknown) => void
   readonly reject: (error: unknown) => void
@@ -62,16 +93,6 @@ const DEFAULT_TIMEOUT_MS = 10_000
 /** `Omit` over a union collapses to common keys; distribute so each frame keeps its fields. */
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
 type WriterFrame = DistributiveOmit<WriterRequest, "id">
-
-function mergeEnv(overlay?: Record<string, string | undefined>): Record<string, string> {
-  const env: Record<string, string> = {}
-  for (const [key, value] of Object.entries(process.env)) if (value !== undefined) env[key] = value
-  for (const [key, value] of Object.entries(overlay ?? {})) {
-    if (value === undefined) delete env[key]
-    else env[key] = value
-  }
-  return env
-}
 
 export class WriterClient {
   private readonly entry: string | URL
@@ -88,8 +109,11 @@ export class WriterClient {
   private starting = false
   private closed = false
   private readyPromise: Promise<void> | undefined
+  private readyReject: ((error: unknown) => void) | undefined
   /** Connection config replayed on every (re)spawn so a fresh isolate reopens the same database. */
   private openFilename: string | undefined
+  /** File-KV backend replayed on every (re)spawn alongside the database. */
+  private storageDir: string | undefined
 
   constructor(options: WriterClientOptions = {}) {
     this.entry = options.entry ?? DEFAULT_ENTRY
@@ -111,8 +135,7 @@ export class WriterClient {
 
   private ensure(): Promise<void> {
     if (this.closed) return Promise.reject(new WriterCrashedError("writer client is closed"))
-    if (this.alive && this.readyPromise !== undefined) return this.readyPromise
-    if (this.starting && this.readyPromise !== undefined) return this.readyPromise
+    if ((this.alive || this.starting) && this.readyPromise !== undefined) return this.readyPromise
     return this.spawn()
   }
 
@@ -127,36 +150,73 @@ export class WriterClient {
     this.starting = true
 
     const ready = new Promise<void>((resolve, reject) => {
+      this.readyReject = reject
       const timer = setTimeout(() => {
-        reject(new WriterCrashedError(`writer worker did not become ready within ${this.timeoutMs}ms`))
+        if (worker !== this.worker) return
+        // A worker that never became ready is an orphan: drop it before giving up.
+        reject(new WriterTimeoutError(`writer worker did not become ready within ${this.timeoutMs}ms`))
+        void worker.terminate()
+        this.crash(new WriterCrashedError(`writer worker did not become ready within ${this.timeoutMs}ms`))
       }, this.timeoutMs)
 
-      const becomeReady = () => {
-        this.alive = true
-        const filename = this.openFilename
-        if (filename === undefined) {
-          resolve()
+      const becomeReady = async (echoedGeneration: number): Promise<void> => {
+        if (echoedGeneration !== generation) {
+          reject(
+            new WriterCrashedError(
+              `writer ready generation ${echoedGeneration} does not match spawn generation ${generation}`,
+            ),
+          )
+          void worker.terminate()
+          this.crash(new WriterCrashedError("writer generation mismatch"))
           return
         }
-        // A fresh isolate owns no connection: reopen the same database before
-        // callers are admitted.
-        this.send<{ opened: boolean }>({ type: "admin.open", filename }).then(
-          () => resolve(),
-          (error) => reject(error instanceof Error ? error : new WriterCrashedError(String(error))),
-        )
+        try {
+          // A fresh isolate owns no connection: restore the replayed state before
+          // admitting any other caller.
+          if (this.openFilename !== undefined) {
+            await this.post<{ opened: boolean }>({ type: "admin.open", filename: this.openFilename })
+          }
+          if (this.storageDir !== undefined) {
+            await this.post<unknown>({ type: "admin.openStorage", dir: this.storageDir })
+          }
+        } catch (error) {
+          // Reopen failed: never mark the worker alive, so callers respawn instead
+          // of posting into a half-initialised isolate.
+          this.alive = false
+          reject(error instanceof Error ? error : new WriterCrashedError(String(error)))
+          this.crash(new WriterCrashedError("writer failed to restore state after respawn"))
+          return
+        }
+        this.alive = true
+        resolve()
       }
 
       worker.onmessage = (event: MessageEvent) => {
-        const message = event.data as WriterResponse
+        if (worker !== this.worker) return
+        let message: WriterResponse
+        try {
+          message = parseWriterResponse(event.data)
+        } catch (error) {
+          // A worker we cannot understand is unusable: drop it before crashing.
+          void worker.terminate()
+          this.crash(new WriterCrashedError(error instanceof Error ? error.message : String(error)))
+          return
+        }
         if (message.type === "ready") {
           clearTimeout(timer)
-          becomeReady()
+          void becomeReady(message.generation)
           return
         }
         this.handleResponse(message)
       }
-      worker.onerror = (event: ErrorEvent) => this.crash(new WriterCrashedError(`writer worker error: ${event.message}`))
-      worker.addEventListener("close", () => this.crash(new WriterCrashedError("writer worker exited")))
+      worker.onerror = (event: ErrorEvent) => {
+        if (worker !== this.worker) return
+        this.crash(new WriterCrashedError(`writer worker error: ${event.message}`))
+      }
+      worker.addEventListener("close", () => {
+        if (worker !== this.worker) return
+        this.crash(new WriterCrashedError("writer worker exited"))
+      })
     })
 
     ready.catch(() => undefined).finally(() => {
@@ -168,6 +228,14 @@ export class WriterClient {
 
   private handleResponse(message: WriterResponse): void {
     if (message.type === "ready") return
+    if (message.id === -1) {
+      // The isolate could not parse a frame we sent — a protocol violation. Treat it
+      // as fatal for this worker: reject every in-flight request and drop it.
+      const detail = message.type === "failure" ? message.error.tag : "unknown"
+      void this.worker?.terminate()
+      this.crash(new WriterCrashedError(`writer rejected a malformed frame (${detail})`))
+      return
+    }
     const pending = this.pending.get(message.id)
     if (pending === undefined) return
     this.pending.delete(message.id)
@@ -176,9 +244,19 @@ export class WriterClient {
     else pending.reject(new WriterRemoteError(message.error.tag, message.error.message))
   }
 
+  /**
+   * Tear the worker down: reject the ready promise and every in-flight request, and
+   * forget the worker so the next call respawns. Never requeues (at-most-once).
+   */
   private crash(error: WriterCrashedError): void {
     const wasAlive = this.alive
     this.alive = false
+    this.starting = false
+    this.worker = undefined
+    const rejectReady = this.readyReject
+    this.readyReject = undefined
+    this.readyPromise = undefined
+    rejectReady?.(error)
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer)
       pending.reject(error)
@@ -191,7 +269,6 @@ export class WriterClient {
     if (this.closed) return
     this.closed = true
     const worker = this.worker
-    this.worker = undefined
     this.crash(new WriterCrashedError("writer client is closed"))
     if (worker !== undefined) await worker.terminate()
   }
@@ -209,13 +286,19 @@ export class WriterClient {
 
   /** Post a frame to the live isolate; the caller has already awaited `ensure()`. */
   private send<T>(frame: WriterFrame): Promise<T> {
+    if (this.worker === undefined || !this.alive) return Promise.reject(new WriterCrashedError("writer is not running"))
+    return this.post<T>(frame)
+  }
+
+  /** Post a frame without the liveness gate, for the respawn re-open handshake. */
+  private post<T>(frame: WriterFrame): Promise<T> {
     const worker = this.worker
-    if (worker === undefined || !this.alive) return Promise.reject(new WriterCrashedError("writer is not running"))
+    if (worker === undefined) return Promise.reject(new WriterCrashedError("writer is not running"))
     return new Promise<T>((resolve, reject) => {
       const id = this.nextId++
       const timer = setTimeout(() => {
         this.pending.delete(id)
-        reject(new Error(`writer request ${id} timed out after ${this.timeoutMs}ms`))
+        reject(new WriterTimeoutError(`writer request ${id} timed out after ${this.timeoutMs}ms`))
       }, this.timeoutMs)
       this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer })
       worker.postMessage({ ...frame, id })
@@ -246,14 +329,14 @@ export class WriterClient {
     method: QueryMethod,
     sql: string,
     params: ReadonlyArray<unknown> = [],
-    options: { readonly cache?: boolean } = {},
+    options: QueryOptions = {},
   ): Promise<unknown> {
     return this.request({
       type: "query",
       method,
       sql,
       params,
-      ...(options.cache === undefined ? {} : { cache: options.cache }),
+      ...defined({ cache: options.cache }),
     })
   }
 
@@ -282,17 +365,12 @@ export class WriterClient {
     return this.request({ type: "tx.rollback", handle })
   }
 
-  publish(
-    event: WriterEvent,
-    options: { readonly durable: boolean; readonly ownerID?: string; readonly strictOwner?: boolean; readonly commitId?: string },
-  ): Promise<PublishResult> {
+  publish(event: WriterEvent, options: PublishOptions): Promise<PublishResult> {
     return this.request({
       type: "publish",
       event,
       durable: options.durable,
-      ...(options.ownerID === undefined ? {} : { ownerID: options.ownerID }),
-      ...(options.strictOwner === undefined ? {} : { strictOwner: options.strictOwner }),
-      ...(options.commitId === undefined ? {} : { commitId: options.commitId }),
+      ...defined({ ownerID: options.ownerID, strictOwner: options.strictOwner, commitId: options.commitId }),
     })
   }
 
@@ -310,8 +388,9 @@ export class WriterClient {
 
   // -- file-KV storage (plan 7.13) -----------------------------------------
 
-  openStorage(dir: string): Promise<void> {
-    return this.request({ type: "admin.openStorage", dir })
+  async openStorage(dir: string): Promise<void> {
+    await this.request({ type: "admin.openStorage", dir })
+    this.storageDir = dir
   }
 
   storageRead(key: ReadonlyArray<string>): Promise<StorageReadResult> {
@@ -330,17 +409,12 @@ export class WriterClient {
     return this.request({ type: "storage.list", prefix })
   }
 
-  replay(
-    event: WriterEvent,
-    seq: number,
-    options: { readonly ownerID?: string; readonly strictOwner?: boolean } = {},
-  ): Promise<PublishResult> {
+  replay(event: WriterEvent, seq: number, options: ReplayOptions = {}): Promise<PublishResult> {
     return this.request({
       type: "replay",
       event,
       seq,
-      ...(options.ownerID === undefined ? {} : { ownerID: options.ownerID }),
-      ...(options.strictOwner === undefined ? {} : { strictOwner: options.strictOwner }),
+      ...defined({ ownerID: options.ownerID, strictOwner: options.strictOwner }),
     })
   }
 }

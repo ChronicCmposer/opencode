@@ -24,21 +24,23 @@
 //   BROKER_CHILD_JOURNAL     path to append JSONL concurrency events
 //   BROKER_CHILD_MANIFEST    path to write { pid, pgid, mode } at startup
 //   BROKER_CHILD_ROLE        "root" (default) | "descendant"
+//   BROKER_CHILD_FAIL_INIT   "1" to reject the initialize handshake (JSON-RPC error)
 //
 // The broker always spawns the root detached, making it a group leader; this
 // child never sets a process group itself.
 
-import { appendFileSync, readFileSync } from "node:fs"
+import { appendFileSync } from "node:fs"
+import {
+  type JsonRpcMessage,
+  processGroupId,
+  readInt,
+  sendLsp,
+  sendMcp,
+  serveLsp,
+  serveMcp,
+} from "../../fixture/stdio-server"
 
 type Mode = "mcp" | "lsp"
-
-function readInt(name: string, fallback: number): number {
-  const raw = process.env[name]
-  if (raw === undefined || raw === "") return fallback
-  const value = Number.parseInt(raw, 10)
-  if (!Number.isInteger(value) || value < 0) throw new Error(`${name} must be a non-negative integer, got ${raw}`)
-  return value
-}
 
 const MODE: Mode = (process.env.BROKER_CHILD_MODE as Mode | undefined) ?? "mcp"
 if (MODE !== "mcp" && MODE !== "lsp") throw new Error(`BROKER_CHILD_MODE must be "mcp" or "lsp", got ${MODE}`)
@@ -47,6 +49,7 @@ const DESCENDANTS = readInt("BROKER_CHILD_DESCENDANTS", 0)
 const JOURNAL = process.env.BROKER_CHILD_JOURNAL
 const MANIFEST = process.env.BROKER_CHILD_MANIFEST
 const ROLE = process.env.BROKER_CHILD_ROLE ?? "root"
+const FAIL_INIT = process.env.BROKER_CHILD_FAIL_INIT === "1"
 
 let active = 0
 
@@ -58,27 +61,6 @@ function journal(event: Record<string, unknown>): void {
   } catch {
     /* best-effort: the child may be mid-teardown */
   }
-}
-
-function processGroupId(): number {
-  try {
-    const stat = readFileSync("/proc/self/stat", "utf8")
-    const close = stat.lastIndexOf(")")
-    if (close === -1) throw new Error("malformed /proc/self/stat")
-    const fields = stat.slice(close + 2).split(" ")
-    const pgrp = Number.parseInt(fields[2] ?? "", 10)
-    if (Number.isInteger(pgrp) && pgrp > 0) return pgrp
-  } catch {
-    /* fall through to ps / self */
-  }
-  try {
-    const result = Bun.spawnSync(["ps", "-o", "pgid=", "-p", String(process.pid)])
-    const pgrp = Number.parseInt(result.stdout.toString().trim(), 10)
-    if (Number.isInteger(pgrp) && pgrp > 0) return pgrp
-  } catch {
-    /* fall through to self */
-  }
-  return process.pid
 }
 
 function sleep(ms: number): Promise<void> {
@@ -96,23 +78,16 @@ function spawnDescendants(): void {
   }
 }
 
-interface JsonRpcMessage {
-  readonly jsonrpc?: string
-  readonly id?: unknown
-  readonly method?: string
-  readonly params?: unknown
-}
-
-function sendMcp(message: unknown): void {
-  process.stdout.write(`${JSON.stringify(message)}\n`)
-}
-
 /** Handle one JSON-RPC request. Responses/notifications may be asynchronous. */
 async function handleMcp(message: JsonRpcMessage): Promise<void> {
   if (message.id === undefined) return // a notification; ignore
   const id = message.id
 
   if (message.method === "initialize") {
+    if (FAIL_INIT) {
+      sendMcp({ jsonrpc: "2.0", id, error: { code: -32000, message: "initialize refused" } })
+      return
+    }
     sendMcp({
       jsonrpc: "2.0",
       id,
@@ -146,36 +121,6 @@ async function handleMcp(message: JsonRpcMessage): Promise<void> {
   sendMcp({ jsonrpc: "2.0", id, result: {} })
 }
 
-async function serveMcp(): Promise<void> {
-  const decoder = new TextDecoder()
-  const reader = Bun.stdin.stream().getReader()
-  let buffer = ""
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) return
-    buffer += decoder.decode(value, { stream: true })
-    let newline: number
-    while ((newline = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, newline).trim()
-      buffer = buffer.slice(newline + 1)
-      if (!line) continue
-      let parsed: JsonRpcMessage
-      try {
-        parsed = JSON.parse(line) as JsonRpcMessage
-      } catch {
-        continue
-      }
-      // Deliberately do not await: the broker must serialize, not this child.
-      void handleMcp(parsed)
-    }
-  }
-}
-
-function sendLsp(message: unknown): void {
-  const json = JSON.stringify(message)
-  process.stdout.write(`Content-Length: ${Buffer.byteLength(json, "utf8")}\r\n\r\n${json}`)
-}
-
 async function handleLsp(message: JsonRpcMessage): Promise<void> {
   if (message.id === undefined) return
   const id = message.id
@@ -200,36 +145,6 @@ async function handleLsp(message: JsonRpcMessage): Promise<void> {
   sendLsp({ jsonrpc: "2.0", id, result: null })
 }
 
-async function serveLsp(): Promise<void> {
-  const reader = Bun.stdin.stream().getReader()
-  let buffer = Buffer.alloc(0)
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) return
-    buffer = Buffer.concat([buffer, Buffer.from(value)])
-    for (;;) {
-      const headerEnd = buffer.indexOf("\r\n\r\n")
-      if (headerEnd < 0) break
-      const header = buffer.slice(0, headerEnd).toString("utf8")
-      const match = /Content-Length:\s*(\d+)/i.exec(header)
-      if (!match) {
-        buffer = buffer.slice(headerEnd + 4)
-        continue
-      }
-      const length = Number.parseInt(match[1]!, 10)
-      const bodyStart = headerEnd + 4
-      if (buffer.length < bodyStart + length) break
-      const body = buffer.slice(bodyStart, bodyStart + length).toString("utf8")
-      buffer = buffer.slice(bodyStart + length)
-      try {
-        void handleLsp(JSON.parse(body) as JsonRpcMessage)
-      } catch {
-        /* ignore malformed body */
-      }
-    }
-  }
-}
-
 if (ROLE === "root" && MANIFEST) {
   await Bun.write(MANIFEST, JSON.stringify({ pid: process.pid, pgid: processGroupId(), mode: MODE }))
 }
@@ -241,6 +156,6 @@ if (ROLE === "root") spawnDescendants()
 setInterval(() => {}, 1 << 30)
 
 if (ROLE === "root") {
-  if (MODE === "mcp") await serveMcp()
-  else await serveLsp()
+  if (MODE === "mcp") await serveMcp(handleMcp)
+  else await serveLsp(handleLsp)
 }

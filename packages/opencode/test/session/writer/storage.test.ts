@@ -5,14 +5,76 @@
 // over the storage frames (openStorage / storage.read|write|remove|list).
 
 import { describe, expect, test } from "bun:test"
+import { mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { createWriterClient } from "@/session/writer/client"
+import { createBunSqliteConnection } from "@/session/writer/connection"
+import { createWriterCore } from "@/session/writer/core"
 import { createFileStorage } from "@/session/writer/storage"
-import { FAULTS_ENV } from "@/testing/faults"
 import { tmpdir } from "../../fixture/fixture"
+import { healthyEnv } from "./fixtures"
 
-/** A client whose writer isolate never sees an armed fault. */
-const healthyEnv = { [FAULTS_ENV]: undefined }
+describe("atomic file-KV update (step 1)", () => {
+  test("createFileStorage.update reads-modifies-writes and reports absence", async () => {
+    await using tmp = await tmpdir()
+    const storage = createFileStorage(path.join(tmp.path, "storage"))
+
+    expect(await storage.update(["a"], () => {})).toEqual({ found: false })
+
+    await storage.write(["a"], { n: 0 })
+    const result = await storage.update(["a"], (content) => {
+      ;(content as { n: number }).n += 1
+    })
+    expect(result).toEqual({ found: true, content: { n: 1 } })
+    expect(await storage.read(["a"])).toEqual({ found: true, content: { n: 1 } })
+  })
+
+  test("concurrent writer updates serialize: no lost update", async () => {
+    await using tmp = await tmpdir()
+    const connection = createBunSqliteConnection({ filename: ":memory:" })
+    const core = createWriterCore({ connection, storage: createFileStorage(path.join(tmp.path, "storage")) })
+
+    await core.storageWrite(["counter"], { n: 0 })
+    const bump = (content: unknown) => {
+      ;(content as { n: number }).n += 1
+    }
+    await Promise.all([
+      core.storageUpdate(["counter"], bump),
+      core.storageUpdate(["counter"], bump),
+      core.storageUpdate(["counter"], bump),
+    ])
+
+    expect(await core.storageRead(["counter"])).toEqual({ found: true, content: { n: 3 } })
+    await core.close()
+  })
+})
+
+describe("file-KV key safety (steps 22, 23)", () => {
+  test("rejects path-traversal and empty keys", async () => {
+    await using tmp = await tmpdir()
+    const storage = createFileStorage(path.join(tmp.path, "storage"))
+
+    await expect(storage.read(["..", "escape"])).rejects.toThrow(/invalid storage key segment|escapes/)
+    await expect(storage.write(["a/b"], {})).rejects.toThrow(/invalid storage key segment/)
+    await expect(storage.list([".."])).rejects.toThrow(/invalid storage key segment|escapes/)
+    await expect(storage.read([])).rejects.toThrow(/must not be empty/)
+  })
+
+  test("a corrupt JSON file surfaces a typed STORAGE_PARSE error", async () => {
+    await using tmp = await tmpdir()
+    const root = path.join(tmp.path, "storage")
+    await mkdir(root, { recursive: true })
+    await writeFile(path.join(root, "bad.json"), "{not json")
+
+    const storage = createFileStorage(root)
+    const error = await storage.read(["bad"]).then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+    expect(error).toBeInstanceOf(Error)
+    expect((error as { tag?: string }).tag).toBe("STORAGE_PARSE")
+  })
+})
 
 describe("7.13 file-KV backend", () => {
   test("writes, reads, lists and removes JSON entries", async () => {

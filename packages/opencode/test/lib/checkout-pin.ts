@@ -19,20 +19,52 @@ export const DECLARED_PIN: DeclaredPin = {
   revision: "e3c4eb242585dcd77be1a867391b7c25fd47ce52",
 }
 
+/** Default ceiling for a read-only git call; a hung git fails instead of blocking. */
+export const DEFAULT_GIT_TIMEOUT_MS = 10_000
+
+export interface RevisionReadOptions {
+  /** Kill the git invocation after this many ms. Defaults to `DEFAULT_GIT_TIMEOUT_MS`. */
+  readonly timeoutMs?: number
+}
+
+/** Build the descriptive detail for a failed git read, preferring real stderr. */
+export function revisionFailureDetail(input: {
+  readonly exitCode: number | null
+  readonly signalCode: string | null
+  readonly stderr: string
+  readonly timeoutMs: number
+}): string {
+  const stderr = input.stderr.trim()
+  if (stderr.length > 0) return stderr
+  if (input.signalCode !== null) return `terminated by ${input.signalCode} after ${input.timeoutMs}ms`
+  return `exit code ${input.exitCode}`
+}
+
 /**
- * Resolves a git ref to its commit revision. Read-only and shell-free. Throws a
- * descriptive error if git cannot resolve the ref, so a broken checkout fails
- * loudly instead of silently comparing against empty output.
+ * Resolves a git ref to its commit revision. Read-only and shell-free, with a
+ * bounded timeout so a hung git fails loudly instead of blocking the suite.
+ * Throws a descriptive error if git cannot resolve the ref, so a broken checkout
+ * fails loudly instead of silently comparing against empty output.
  */
-export function readRevision(ref: string, cwd?: string): string {
+export function readRevision(ref: string, cwd?: string, options: RevisionReadOptions = {}): string {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error(`git read timeoutMs must be a positive number, got: ${String(timeoutMs)}`)
+  }
   const proc = Bun.spawnSync({
     cmd: ["git", "rev-parse", "--verify", ref],
     cwd,
     stdout: "pipe",
     stderr: "pipe",
+    timeout: timeoutMs,
   })
   if (proc.exitCode !== 0) {
-    const detail = proc.stderr.toString().trim() || `exit code ${proc.exitCode}`
+    const detail = revisionFailureDetail({
+      exitCode: proc.exitCode,
+      signalCode: proc.signalCode ?? null,
+      stderr: proc.stderr.toString(),
+      timeoutMs,
+    })
     throw new Error(`git rev-parse --verify ${ref} failed: ${detail}`)
   }
   return proc.stdout.toString().trim()

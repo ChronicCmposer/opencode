@@ -20,6 +20,8 @@
 // fire-and-forget (the caller need not await the response). Projectors cross the
 // port as DATA — a registered SQL statement — never as closures (plan line 31).
 
+import { defined } from "@/util/object"
+
 /** The four execution shapes the Effect SQL connection reduces to. */
 export type QueryMethod = "all" | "values" | "run" | "exec"
 
@@ -29,20 +31,6 @@ export interface WriterEvent {
   readonly type: string
   readonly aggregateID: string
   readonly data: Record<string, unknown>
-}
-
-/**
- * A registered projector is a SQL statement run inside the writer isolate,
- * atomically with the event insert and sequence upsert. It is bound, in order, to
- * `[aggregateID, seq, type, id, dataJson]` so the most useful projections
- * (`aggregate_id`, `seq`, `type`) are the first three positional parameters.
- */
-export interface ProjectorBinding {
-  readonly aggregateID: string
-  readonly seq: number
-  readonly type: string
-  readonly id: string
-  readonly dataJson: string
 }
 
 export type WriterRequest =
@@ -146,8 +134,19 @@ export class ProtocolError extends Error {
 
 const QUERY_METHODS: ReadonlySet<string> = new Set<QueryMethod>(["all", "values", "run", "exec"])
 
+/**
+ * True when `error` is a Node-style ENOENT (missing file or directory). Declared in
+ * this dependency-free module so both the writer's FS backend and the direct-FS
+ * `Storage` service can share it without either pulling in the other's stack.
+ * Effect's FS adapter additionally recognizes `reason._tag === "NotFound"` itself.
+ */
+export function isEnoent(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code: unknown }).code === "ENOENT"
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null
+  // Arrays are objects but never valid records here, so exclude them explicitly.
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function requireString(record: Record<string, unknown>, field: string): string {
@@ -244,15 +243,17 @@ export function parseWriterRequest(input: unknown): WriterRequest {
     }
     case "admin.checkpoint":
       return { type, id }
-    case "query":
+    case "query": {
+      const params = optionalParams(input)
+      const cache = optionalBoolean(input, "cache")
       return {
         type,
         id,
         method: parseMethod(input),
         sql: requireString(input, "sql"),
-        ...(optionalParams(input) ? { params: optionalParams(input) } : {}),
-        ...(optionalBoolean(input, "cache") === undefined ? {} : { cache: optionalBoolean(input, "cache") }),
+        ...defined({ params, cache }),
       }
+    }
     case "register":
       return {
         type,
@@ -263,31 +264,33 @@ export function parseWriterRequest(input: unknown): WriterRequest {
       }
     case "tx.begin":
       return { type, id }
-    case "tx.query":
+    case "tx.query": {
+      const params = optionalParams(input)
       return {
         type,
         id,
         handle: requireString(input, "handle"),
         method: parseMethod(input),
         sql: requireString(input, "sql"),
-        ...(optionalParams(input) ? { params: optionalParams(input) } : {}),
+        ...defined({ params }),
       }
+    }
     case "tx.commit":
       return { type, id, handle: requireString(input, "handle") }
     case "tx.rollback":
       return { type, id, handle: requireString(input, "handle") }
-    case "publish":
+    case "publish": {
+      const ownerID = optionalString(input, "ownerID")
+      const strictOwner = optionalBoolean(input, "strictOwner")
+      const commitId = optionalString(input, "commitId")
       return {
         type,
         id,
         event: parseEvent(input),
-        durable: input["durable"] === true,
-        ...(optionalString(input, "ownerID") === undefined ? {} : { ownerID: optionalString(input, "ownerID") }),
-        ...(optionalBoolean(input, "strictOwner") === undefined
-          ? {}
-          : { strictOwner: optionalBoolean(input, "strictOwner") }),
-        ...(optionalString(input, "commitId") === undefined ? {} : { commitId: optionalString(input, "commitId") }),
+        durable: optionalBoolean(input, "durable") ?? false,
+        ...defined({ ownerID, strictOwner, commitId }),
       }
+    }
     case "claim":
       return { type, id, aggregateID: requireString(input, "aggregateID"), ownerID: requireString(input, "ownerID") }
     case "steal":
@@ -304,19 +307,46 @@ export function parseWriterRequest(input: unknown): WriterRequest {
       return { type, id, key: requireStringArray(input, "key") }
     case "storage.list":
       return { type, id, prefix: requireStringArray(input, "prefix") }
-    case "replay":
+    case "replay": {
+      const ownerID = optionalString(input, "ownerID")
+      const strictOwner = optionalBoolean(input, "strictOwner")
       return {
         type,
         id,
         event: parseEvent(input),
         seq: requireNumber(input, "seq"),
-        ...(optionalString(input, "ownerID") === undefined ? {} : { ownerID: optionalString(input, "ownerID") }),
-        ...(optionalBoolean(input, "strictOwner") === undefined
-          ? {}
-          : { strictOwner: optionalBoolean(input, "strictOwner") }),
+        ...defined({ ownerID, strictOwner }),
       }
+    }
     default:
       throw new ProtocolError(`unknown request type "${type}"`)
+  }
+}
+
+/**
+ * Parse an untrusted worker response. The client is the boundary here: a message
+ * that does not match the protocol is a bug in the writer isolate and must fail
+ * loud rather than be trusted by field.
+ */
+export function parseWriterResponse(input: unknown): WriterResponse {
+  if (!isRecord(input)) throw new ProtocolError(`response must be an object (got ${JSON.stringify(input)})`)
+  const type = input["type"]
+  switch (type) {
+    case "ready":
+      return { type: "ready", generation: requireNumber(input, "generation") }
+    case "result":
+      return { type: "result", id: requireNumber(input, "id"), value: input["value"] }
+    case "failure": {
+      const error = input["error"]
+      if (!isRecord(error)) throw new ProtocolError(`field "error" must be an object (got ${JSON.stringify(error)})`)
+      return {
+        type: "failure",
+        id: requireNumber(input, "id"),
+        error: { tag: requireString(error, "tag"), message: requireString(error, "message") },
+      }
+    }
+    default:
+      throw new ProtocolError(`unknown response type "${String(type)}"`)
   }
 }
 

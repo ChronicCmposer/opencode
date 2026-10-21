@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { ANCHORS, resolveAnchor } from "./lib/anchor-manifest"
+import { ANCHORS, resolveAnchorResult } from "./lib/anchor-manifest"
 
 describe("anchor manifest (plan 3.2)", () => {
   test("anchors are unique and non-trivial", () => {
@@ -10,8 +10,9 @@ describe("anchor manifest (plan 3.2)", () => {
 
   for (const anchor of ANCHORS) {
     test(`resolves ${anchor.id}: ${anchor.module ?? "globalThis"}#${anchor.symbol}`, async () => {
-      const value = await resolveAnchor(anchor)
-      expect(value, `${anchor.plan}: missing ${anchor.module ?? "globalThis"}#${anchor.symbol}`).toBeDefined()
+      const resolution = await resolveAnchorResult(anchor)
+      expect(resolution.found, `${anchor.plan}: missing ${anchor.module ?? "globalThis"}#${anchor.symbol}`).toBe(true)
+      if (resolution.found) expect(resolution.value).toBeDefined()
     })
   }
 })

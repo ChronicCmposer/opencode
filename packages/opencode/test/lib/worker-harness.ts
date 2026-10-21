@@ -123,6 +123,7 @@ function createHandle<TOut, TIn>(
   const messages: TOut[] = []
   const waiters = new Set<PendingWaiter<TOut>>()
   let alive = true
+  let terminating = false
   let exitCode: number | undefined
 
   let resolveExit!: (code: number) => void
@@ -130,11 +131,17 @@ function createHandle<TOut, TIn>(
     resolveExit = resolve
   })
 
-  const settleExit = (code: number) => {
+  /**
+   * Latch the worker's death exactly once. Pending waiters are rejected with a
+   * descriptive `reason` (defaulting to a generic termination notice) so a real
+   * worker error surfaces its own message instead of being overwritten.
+   */
+  const settleExit = (code: number, reason?: Error) => {
     if (!alive) return
     alive = false
     exitCode = code
-    for (const waiter of [...waiters]) waiter.reject(new Error("worker terminated"))
+    const error = reason ?? new Error("worker terminated")
+    for (const waiter of [...waiters]) waiter.reject(error)
     resolveExit(code)
   }
 
@@ -147,9 +154,18 @@ function createHandle<TOut, TIn>(
   }
 
   worker.onerror = (event: ErrorEvent) => {
-    settleExit(1)
-    for (const waiter of [...waiters]) waiter.reject(new Error(`worker error: ${event.message}`))
+    settleExit(1, new Error(`worker error: ${event.message}`))
   }
+
+  // A worker that exits on its own (e.g. `self.close()`, or a normal return from
+  // its entry point) must still settle `alive`/`exited`; without this the handle
+  // would stay "alive" and `exited` would never resolve. A `terminate()`-driven
+  // close is ignored here so the terminate path owns the exit code.
+  worker.addEventListener("close", (event: Event) => {
+    if (terminating) return
+    const code = (event as { readonly code?: number }).code
+    settleExit(typeof code === "number" ? code : exitCode ?? 0)
+  })
 
   function waitFor<TType extends string>(
     match: TType,
@@ -187,6 +203,7 @@ function createHandle<TOut, TIn>(
 
   const terminate = async (code = 0): Promise<number> => {
     if (!alive) return exitCode ?? code
+    terminating = true
     const resolved = await worker.terminate()
     settleExit(typeof resolved === "number" ? resolved : code)
     return exitCode ?? code

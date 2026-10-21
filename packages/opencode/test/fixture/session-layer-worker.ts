@@ -119,7 +119,24 @@ function modelLayer(bootstrap: MockModelBootstrap): Layer.Layer<ModelClient> {
 
 let runtime: ReturnType<typeof buildSessionWorkerLayer> | undefined
 
+/**
+ * Tear down the layer built by a previous `init`.
+ *
+ * `buildSessionWorkerLayer` returns a compiled layer descriptor; every run
+ * builds and releases its own services through `Effect.provide(runtime.layer)`,
+ * so there is no long-lived scope to interrupt. Closing therefore drops the
+ * handle so a restarted worker can never reuse the stale layer.
+ */
+async function close(layer: ReturnType<typeof buildSessionWorkerLayer>): Promise<void> {
+  if (layer === runtime) runtime = undefined
+}
+
 async function handleInit(message: InitMessage): Promise<void> {
+  if (runtime !== undefined) await close(runtime)
+  // A restart must start from a clean slate: the previous init's publishes and
+  // emitted events must not leak into the new worker.
+  published.length = 0
+  emitted.length = 0
   runtime = buildSessionWorkerLayer({
     snapshot: message.snapshot,
     env: message.env,

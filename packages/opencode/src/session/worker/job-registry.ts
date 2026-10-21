@@ -18,6 +18,8 @@
 // Pure and deterministic: `now` and `schedule` are injectable, so the registry
 // is tested directly with no threads and no model APIs.
 
+import { defaultSchedule, messageOf } from "./port"
+
 /** A `BackgroundJob` status; identical to the core union. */
 export type JobStatus = "running" | "completed" | "error" | "cancelled"
 
@@ -62,6 +64,16 @@ export interface JobRegistryOptions {
   readonly schedule?: JobScheduler
   /** Deliver a settled child's info to the worker hosting `parentID` (9.4). */
   readonly routeResult?: (parentID: string, result: JobInfo) => void
+  /**
+   * How long a settled job is retained before eviction; defaults to
+   * `DEFAULT_JOB_RETENTION_MS`. `Infinity` disables TTL eviction.
+   */
+  readonly retentionMs?: number
+  /**
+   * Upper bound on retained jobs. When exceeded, settled jobs are evicted
+   * oldest-first; the default is generous, so it only bounds runaway growth.
+   */
+  readonly maxJobs?: number
 }
 
 export interface JobRegistry {
@@ -95,31 +107,105 @@ interface Active {
   readonly promoteWaiters: Set<(info: JobInfo) => void>
 }
 
-const defaultSchedule: JobScheduler = (delayMs, run) => {
-  const timer = setTimeout(run, delayMs)
-  ;(timer as { unref?: () => void }).unref?.()
-  return () => clearTimeout(timer)
-}
+/** Settled jobs are retained for five minutes by default. */
+export const DEFAULT_JOB_RETENTION_MS = 5 * 60_000
 
-const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error))
+/** A generous upper bound so a leaked registry cannot grow without limit. */
+export const DEFAULT_JOB_RETENTION_MAX = 10_000
 
 export function createJobRegistry(options: JobRegistryOptions = {}): JobRegistry {
   const now = options.now ?? (() => Date.now())
   const schedule = options.schedule ?? defaultSchedule
   const routeResult = options.routeResult
+  const retentionMs = options.retentionMs ?? DEFAULT_JOB_RETENTION_MS
+  const maxJobs = options.maxJobs ?? DEFAULT_JOB_RETENTION_MAX
   const jobs = new Map<string, Active>()
   const childrenByParent = new Map<string, Set<string>>()
   const parentByChild = new Map<string, string>()
+  /** Pending TTL eviction per settled job id. */
+  const evictions = new Map<string, () => void>()
 
   const snapshot = (active: Active): JobInfo => ({
     ...active.info,
     ...(active.info.metadata ? { metadata: { ...active.info.metadata } } : {}),
   })
 
+  /** Remove `childID` from the parent→children index (both directions). */
+  const unlink = (childID: string): void => {
+    const parentID = parentByChild.get(childID)
+    if (parentID === undefined) return
+    parentByChild.delete(childID)
+    const children = childrenByParent.get(parentID)
+    if (children === undefined) return
+    children.delete(childID)
+    if (children.size === 0) childrenByParent.delete(parentID)
+  }
+
+  /** Drop every index entry that names `id` (as a child or as a parent). */
+  const pruneIndex = (id: string): void => {
+    unlink(id)
+    const children = childrenByParent.get(id)
+    if (children === undefined) return
+    for (const child of children) parentByChild.delete(child)
+    childrenByParent.delete(id)
+  }
+
+  const evict = (id: string): void => {
+    const cancelPending = evictions.get(id)
+    if (cancelPending !== undefined) {
+      evictions.delete(id)
+      cancelPending()
+    }
+    if (!jobs.delete(id)) return
+    pruneIndex(id)
+  }
+
+  const scheduleEviction = (id: string): void => {
+    const cancelPending = evictions.get(id)
+    if (cancelPending !== undefined) {
+      evictions.delete(id)
+      cancelPending()
+    }
+    if (retentionMs === Infinity) return
+    evictions.set(
+      id,
+      schedule(retentionMs, () => {
+        evictions.delete(id)
+        evict(id)
+      }),
+    )
+  }
+
+  /** Keep retention bounded: evict the oldest settled jobs beyond `maxJobs`. */
+  const pruneOverflow = (): void => {
+    if (jobs.size <= maxJobs) return
+    const settled = [...jobs.values()]
+      .filter((active) => active.info.status !== "running")
+      .toSorted((a, b) => a.info.started_at - b.info.started_at)
+    for (const active of settled) {
+      if (jobs.size <= maxJobs) break
+      evict(active.info.id)
+    }
+  }
+
   const resolveWaiters = (active: Active, result: JobWaitResult): void => {
-    for (const waiter of active.waiters) waiter(result)
+    // Each waiter is isolated: one throwing callback must not strand the rest,
+    // and promote-waiters are woken independently of the completion waiters.
+    for (const waiter of active.waiters) {
+      try {
+        waiter(result)
+      } catch {
+        // Isolated waiter fault.
+      }
+    }
     active.waiters.clear()
-    for (const waiter of active.promoteWaiters) waiter(snapshot(active))
+    for (const waiter of active.promoteWaiters) {
+      try {
+        waiter(snapshot(active))
+      } catch {
+        // Isolated waiter fault.
+      }
+    }
     active.promoteWaiters.clear()
   }
 
@@ -129,12 +215,17 @@ export function createJobRegistry(options: JobRegistryOptions = {}): JobRegistry
     const info = snapshot(active)
     resolveWaiters(active, { info, timedOut: false })
     if (routeResult && info.parentID !== undefined) routeResult(info.parentID, info)
+    scheduleEviction(info.id)
+    pruneOverflow()
     return info
   }
 
   const start = (input: StartJobInput): JobInfo => {
     const existing = jobs.get(input.id)
     if (existing?.info.status === "running") return snapshot(existing)
+    // A settled id may be reused: drop the prior incarnation and its links
+    // before installing the new Active (no stale parent/child edges survive).
+    if (existing !== undefined) evict(input.id)
 
     const active: Active = {
       info: {
@@ -232,7 +323,13 @@ export function createJobRegistry(options: JobRegistryOptions = {}): JobRegistry
     if (active.info.metadata?.background === true) return snapshot(active)
     active.info = { ...active.info, metadata: { ...active.info.metadata, background: true } }
     const info = snapshot(active)
-    for (const waiter of active.promoteWaiters) waiter(info)
+    for (const waiter of active.promoteWaiters) {
+      try {
+        waiter(info)
+      } catch {
+        // Isolated waiter fault.
+      }
+    }
     active.promoteWaiters.clear()
     return info
   }

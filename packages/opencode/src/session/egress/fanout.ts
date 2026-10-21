@@ -6,9 +6,10 @@
 //
 // Backpressure is per subscriber and never blocks the publisher: each subscriber
 // holds at most `bound` (default 256) frames. On overflow the OLDEST non-durable
-// frame is dropped; if every queued frame is durable the subscriber is surfaced as
-// overflowed via `SubscriberOverflowError` (plan decision line 70 / task 8.8).
-// Durable frames are never dropped, so a durable boundary is always observable.
+// frame is dropped; if every queued frame is durable the subscriber is reported
+// in `PublishResult.overflowed` and flagged until it drains (plan decision line 70
+// / task 8.8). Durable frames are never dropped, so a durable boundary is always
+// observable.
 
 import { decodeFrame, encodeFrame, type EgressFrame } from "./frame"
 
@@ -30,10 +31,8 @@ interface QueuedFrame {
 export interface FanoutSubscriber {
   readonly id: string
   readonly depth: number
-  /** Whether this subscriber has overflowed its durable-saturated bound. */
+  /** Whether this subscriber has overflowed its durable-saturated bound since last drained. */
   readonly overflowed: boolean
-  /** Snapshot of queued byte buffers, oldest first (same references as published). */
-  queued(): readonly Uint8Array[]
   /** Remove and decode up to `limit` frames, oldest first. Default: all. */
   drain(limit?: number): readonly EgressFrame[]
   /** Remove and return up to `limit` raw frame buffers, oldest first. Default: all. */
@@ -80,7 +79,10 @@ interface SubscriberState {
   readonly id: string
   readonly queue: QueuedFrame[]
   overflowed: boolean
+  handle?: FanoutSubscriber
 }
+
+type EnqueueOutcome = { readonly enqueued: true } | { readonly enqueued: false }
 
 export function createFanout(options: FanoutOptions = {}): Fanout {
   const bound = options.bound ?? SUBSCRIBER_BOUND
@@ -92,58 +94,63 @@ export function createFanout(options: FanoutOptions = {}): Fanout {
   const states = new Map<string, SubscriberState>()
   let encodeCount = 0
 
-  const enqueue = (state: SubscriberState, bytes: Uint8Array, durable: boolean): void => {
+  const enqueue = (state: SubscriberState, bytes: Uint8Array, durable: boolean): EnqueueOutcome => {
     if (state.queue.length < bound) {
       state.queue.push({ bytes, durable })
-      return
+      return { enqueued: true }
     }
     const oldestNonDurable = state.queue.findIndex((entry) => !entry.durable)
-    if (oldestNonDurable === -1) throw new SubscriberOverflowError(state.id)
+    if (oldestNonDurable === -1) return { enqueued: false }
     state.queue.splice(oldestNonDurable, 1)
     state.queue.push({ bytes, durable })
+    return { enqueued: true }
   }
 
   const drainBytes = (state: SubscriberState, limit?: number): Uint8Array[] => {
     const count = limit === undefined ? state.queue.length : Math.min(limit, state.queue.length)
-    return state.queue.splice(0, count).map((entry) => entry.bytes)
+    const drained = state.queue.splice(0, count).map((entry) => entry.bytes)
+    if (state.queue.length < bound) state.overflowed = false
+    return drained
   }
 
-  const handle = (state: SubscriberState): FanoutSubscriber => ({
-    get id() {
-      return state.id
-    },
-    get depth() {
-      return state.queue.length
-    },
-    get overflowed() {
-      return state.overflowed
-    },
-    queued: () => state.queue.map((entry) => entry.bytes),
-    drainBytes: (limit) => drainBytes(state, limit),
-    drain: (limit) => drainBytes(state, limit).map((bytes) => decodeFrame(bytes)),
-    dropNonDurable: () => {
-      const durable = state.queue.filter((entry) => entry.durable)
-      state.queue.length = 0
-      state.queue.push(...durable)
-    },
-    clear: () => {
-      state.queue.length = 0
-    },
-  })
+  const handle = (state: SubscriberState): FanoutSubscriber => {
+    if (state.handle) return state.handle
+    const created: FanoutSubscriber = {
+      get id() {
+        return state.id
+      },
+      get depth() {
+        return state.queue.length
+      },
+      get overflowed() {
+        return state.overflowed
+      },
+      drainBytes: (limit) => drainBytes(state, limit),
+      drain: (limit) => drainBytes(state, limit).map((bytes) => decodeFrame(bytes)),
+      dropNonDurable: () => {
+        const durable = state.queue.filter((entry) => entry.durable)
+        state.queue.length = 0
+        state.queue.push(...durable)
+      },
+      clear: () => {
+        state.queue.length = 0
+        state.overflowed = false
+      },
+    }
+    state.handle = created
+    return created
+  }
 
   const publishBytes = (bytes: Uint8Array, frame: EgressFrame): PublishResult => {
     const durable = frame.kind === "durable"
     const overflowed: string[] = []
     for (const state of states.values()) {
-      try {
-        enqueue(state, bytes, durable)
-      } catch (error) {
-        if (!(error instanceof SubscriberOverflowError)) throw error
-        state.overflowed = true
-        overflowed.push(state.id)
-      }
+      const outcome = enqueue(state, bytes, durable)
+      if (outcome.enqueued) continue
+      state.overflowed = true
+      overflowed.push(state.id)
     }
-    return { delivered: states.size, overflowed }
+    return { delivered: states.size - overflowed.length, overflowed }
   }
 
   return {

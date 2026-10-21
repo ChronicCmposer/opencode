@@ -12,23 +12,7 @@ import { WriterCrashedError, createWriterClient } from "@/session/writer/client"
 import { createRemoteConnection } from "@/session/writer/sql-proxy"
 import { FAULTS_ENV } from "@/testing/faults"
 import { tmpdir } from "../../fixture/fixture"
-
-const SCHEMA = [
-  "CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, owner_id TEXT)",
-  "CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL)",
-  "CREATE TABLE projector_log (aggregate_id TEXT, seq INTEGER NOT NULL, type TEXT)",
-]
-
-/** A client whose writer isolate never sees an armed fault. */
-const healthyEnv = { [FAULTS_ENV]: undefined }
-
-let counter = 0
-const ev = (aggregateID: string, data: Record<string, unknown> = {}) => ({
-  id: `evt-${++counter}`,
-  type: "t",
-  aggregateID,
-  data,
-})
+import { SCHEMA, ev, healthyEnv } from "./fixtures"
 
 describe("writer worker: admin RPC and remote-query proxy (7.2, 7.3, 7.13)", () => {
   test("opens, migrates, proxies reads/writes, and checkpoints", async () => {
@@ -84,7 +68,7 @@ describe("writer worker: durable publish and read-your-writes (7.5, 7.7)", () =>
     await client.open(path.join(tmp.path, "writer.db"))
     await client.migrate(SCHEMA)
 
-    const result = await client.publish(ev("a"), { durable: true })
+    const result = await client.publish(ev("t", "a"), { durable: true })
     expect(result).toMatchObject({ seq: 0, committed: true })
     expect(result.ordinal).toBeGreaterThan(0)
 
@@ -107,7 +91,7 @@ describe("writer worker: durable publish and read-your-writes (7.5, 7.7)", () =>
       "t",
       "INSERT INTO projector_log (aggregate_id, seq, type) VALUES ($aggregate_id, $seq, $type)",
     )
-    await client.publish(ev("a"), { durable: true, commitId: "log" })
+    await client.publish(ev("t", "a"), { durable: true, commitId: "log" })
 
     expect(await client.query("all", "SELECT aggregate_id, seq, type FROM projector_log")).toEqual([
       { aggregate_id: "a", seq: 0, type: "t" },
@@ -120,8 +104,8 @@ describe("writer worker: durable publish and read-your-writes (7.5, 7.7)", () =>
     await client.open(path.join(tmp.path, "writer.db"))
     await client.migrate(SCHEMA)
 
-    const result = await client.publish(ev("a"), { durable: false })
-    expect(result).toEqual({ seq: null, committed: false, ordinal: 0, idempotent: false })
+    const result = await client.publish(ev("t", "a"), { durable: false })
+    expect(result).toEqual({ seq: null, committed: false, ordinal: null, idempotent: false })
   })
 })
 
@@ -164,7 +148,7 @@ describe("writer worker: crash semantics (7.9, 7.16)", () => {
       await using client = createWriterClient({ env: healthyEnv })
       await client.open(file)
       await client.migrate(SCHEMA)
-      await client.publish(ev("a", { v: 0 }), { durable: true })
+      await client.publish(ev("t", "a", { v: 0 }), { durable: true })
     }
 
     const crashed: string[] = []
@@ -177,8 +161,8 @@ describe("writer worker: crash semantics (7.9, 7.16)", () => {
 
     // The publish reaches the commit boundary, the isolate exits, and the caller is
     // rejected — never retried (at-most-once).
-    await expect(client.publish(ev("a", { v: 1 }), { durable: true })).rejects.toBeInstanceOf(WriterCrashedError)
-    expect(crashed.length).toBe(1)
+    await expect(client.publish(ev("t", "a", { v: 1 }), { durable: true })).rejects.toBeInstanceOf(WriterCrashedError)
+    expect(crashed).toHaveLength(1)
 
     // The aborted commit left nothing partial behind.
     const inspect = createBunSqliteConnection({ filename: file })

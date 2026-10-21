@@ -9,8 +9,10 @@
 //
 //   * ONE serialized queue. Every operation — query, transaction, publish, admin —
 //     is admitted through `enqueue`, so all mutations serialize and per-aggregate
-//     order is deterministic (7.1, 7.15). The queue is bounded; overflow
-//     backpressures the caller rather than dropping work.
+//     order is deterministic (7.1, 7.15). The bound governs admitted operations
+//     (`depth()`); callers beyond it park in an overflow list that backpressures
+//     rather than dropping work. Both counts are surfaced by `pending()`, which
+//     reports the runnable `depth` alongside the `overflow` waiters.
 //   * Reserved-handle transactions. One transaction may be pinned at a time; other
 //     operations queue behind it (documented head-of-line blocking). A pinned
 //     transaction is rolled back after `txIdleMs` of inactivity and on close (7.4).
@@ -62,7 +64,8 @@ export interface PublishInput {
 export interface PublishResult {
   readonly seq: number | null
   readonly committed: boolean
-  readonly ordinal: number
+  /** Egress ordinal; `null` for frames that carry no durable event (non-durable, idempotent replay). */
+  readonly ordinal: number | null
   readonly idempotent: boolean
 }
 
@@ -93,6 +96,13 @@ export interface StorageReadResult {
 export interface WriterStorage {
   read(key: ReadonlyArray<string>): Promise<StorageReadResult>
   write(key: ReadonlyArray<string>, content: unknown): Promise<void>
+  /**
+   * Atomic read-modify-write. The backend reads the current value, applies `fn` to
+   * it in place, then persists it — all before the next queued operation runs, so a
+   * concurrent update can never lose a write. `found: false` (no `fn`, no write)
+   * when the entry is absent.
+   */
+  update(key: ReadonlyArray<string>, fn: (content: unknown) => void): Promise<StorageReadResult>
   remove(key: ReadonlyArray<string>): Promise<void>
   list(prefix: ReadonlyArray<string>): Promise<ReadonlyArray<ReadonlyArray<string>>>
 }
@@ -312,6 +322,8 @@ export class WriterCore {
   private pinned: PinnedTransaction | undefined
   private txCounter = 0
   private ordinalCounter = 0
+  /** Settles when the currently-running job finishes; `close()` awaits it. */
+  private inflight: Promise<void> | undefined
 
   constructor(options: WriterCoreOptions) {
     this.connection = options.connection
@@ -335,14 +347,23 @@ export class WriterCore {
     return this.ordinalCounter
   }
 
+  /** Allocate the next egress ordinal; every durable commit site calls this once. */
+  private nextOrdinal(): number {
+    return (this.ordinalCounter += 1)
+  }
+
   /** Admitted-but-unfinished operations (queue length + the running one). */
   depth(): number {
     return this.jobs.length + (this.draining ? 1 : 0)
   }
 
-  /** Queue observability: admitted jobs, backpressured callers, running flag. */
-  pending(): { readonly queue: number; readonly overflow: number; readonly running: boolean } {
-    return { queue: this.jobs.length, overflow: this.overflow.length, running: this.draining }
+  /**
+   * Queue observability. `depth` is the admitted operation count that the bound
+   * governs; `overflow` counts callers parked off-queue awaiting a free slot, so
+   * total memory is `depth + overflow` even though only `depth` is bounded.
+   */
+  pending(): { readonly queue: number; readonly overflow: number; readonly running: boolean; readonly depth: number } {
+    return { queue: this.jobs.length, overflow: this.overflow.length, running: this.draining, depth: this.depth() }
   }
 
   cacheStats(): CacheStats {
@@ -365,7 +386,7 @@ export class WriterCore {
           reject,
           run: () => {
             this.draining = true
-            Promise.resolve()
+            this.inflight = Promise.resolve()
               .then(task)
               .then(
                 (value) => {
@@ -388,12 +409,26 @@ export class WriterCore {
     })
   }
 
+  /**
+   * A job may run when nothing is pinned, when it is a control job (it must be
+   * able to reject while a transaction is pinned), or when it belongs to the
+   * pinned transaction handle.
+   */
+  private isRunnable(job: Job): boolean {
+    return this.pinned === undefined || job.control === true || job.txHandle === this.pinned.handle
+  }
+
   private pump(): void {
     if (this.draining || this.closed) return
-    const index = this.jobs.findIndex(
-      (job) => this.pinned === undefined || job.control === true || job.txHandle === this.pinned.handle,
-    )
-    if (index < 0) return
+    // Unpinned: every job is runnable, so take the FIFO head in O(1). Pinned: only
+    // control jobs and the pinned handle may run; scan for the first such job.
+    let index = 0
+    if (this.pinned !== undefined) {
+      index = this.jobs.findIndex((job) => this.isRunnable(job))
+      if (index < 0) return
+    } else if (this.jobs.length === 0) {
+      return
+    }
     const [job] = this.jobs.splice(index, 1)
     job!.run()
   }
@@ -578,6 +613,12 @@ export class WriterCore {
     if (input.commitId !== undefined) {
       const registered = this.registeredProjectors.get(input.commitId)
       if (registered === undefined) throw new WriterError("PROJECTOR", `unknown projector "${input.commitId}"`)
+      if (registered.eventType !== event.type) {
+        throw new WriterError(
+          "PROJECTOR",
+          `projector "${input.commitId}" is registered for event type "${registered.eventType}", not "${event.type}"`,
+        )
+      }
       this.connection.run(registered.sql, projectorBinding(event))
     }
   }
@@ -586,8 +627,8 @@ export class WriterCore {
 
   publish(input: PublishInput): Promise<PublishResult> {
     if (!input.durable) {
-      // Fire-and-forget: no database work, no sequence, liveness only.
-      return this.enqueue(() => ({ seq: null, committed: false, ordinal: this.ordinalCounter, idempotent: false }))
+      // Fire-and-forget: no database work, no sequence, no ordinal, liveness only.
+      return this.enqueue(() => ({ seq: null, committed: false, ordinal: null, idempotent: false }))
     }
     return this.enqueue(() =>
       this.runBusyRetried("writer:commit", () =>
@@ -596,16 +637,7 @@ export class WriterCore {
 
           const { event } = input
           const latest = this.readLatest(event.aggregateID)
-          if (input.strictOwner && latest.owner !== null && latest.owner !== input.ownerID) {
-            throw new OwnerMismatchError(
-              `owner mismatch for aggregate ${event.aggregateID}: held by ${latest.owner}, publish by ${input.ownerID ?? "none"}`,
-            )
-          }
-          if (input.ownerID !== undefined && latest.owner !== null && latest.owner !== input.ownerID) {
-            throw new OwnerMismatchError(
-              `owner mismatch for aggregate ${event.aggregateID}: held by ${latest.owner}, publish by ${input.ownerID}`,
-            )
-          }
+          this.fenceOwner(event.aggregateID, latest.owner, input.ownerID, input.strictOwner, "publish")
 
           const seq = latest.seq + 1
           const committed: CommittedEvent = { id: event.id, type: event.type, aggregateID: event.aggregateID, seq, data: event.data }
@@ -621,8 +653,7 @@ export class WriterCore {
           Faults.crashWorker("writer:commit")
 
           this.cache.invalidateTables(["event", "event_sequence"])
-          this.ordinalCounter += 1
-          return { seq, committed: true, ordinal: this.ordinalCounter, idempotent: false }
+          return { seq, committed: true, ordinal: this.nextOrdinal(), idempotent: false }
         }),
       ),
     )
@@ -636,16 +667,7 @@ export class WriterCore {
         this.inTransaction(async () => {
           const { event, seq } = input
           const latest = this.readLatest(event.aggregateID)
-          if (input.strictOwner && latest.owner !== null && latest.owner !== input.ownerID) {
-            throw new OwnerMismatchError(
-              `replay owner mismatch for aggregate ${event.aggregateID}: expected ${latest.owner}, got ${input.ownerID ?? "none"}`,
-            )
-          }
-          if (latest.owner !== null && input.ownerID !== undefined && latest.owner !== input.ownerID) {
-            throw new OwnerMismatchError(
-              `replay owner mismatch for aggregate ${event.aggregateID}: expected ${latest.owner}, got ${input.ownerID}`,
-            )
-          }
+          this.fenceOwner(event.aggregateID, latest.owner, input.ownerID, input.strictOwner, "replay")
 
           if (seq <= latest.seq) {
             // Never republish a sequence at or below the latest: idempotent when
@@ -660,7 +682,7 @@ export class WriterCore {
               stored.type === event.type &&
               this.sameData(stored.data, event.data)
             ) {
-              return { seq, committed: false, ordinal: this.ordinalCounter, idempotent: true }
+              return { seq, committed: false, ordinal: null, idempotent: true }
             }
             throw new SequenceError(`replay diverged at aggregate ${event.aggregateID} sequence ${seq}`)
           }
@@ -676,8 +698,7 @@ export class WriterCore {
           this.writeSequence(event.aggregateID, seq, input.ownerID)
           this.writeEvent(committed)
           this.cache.invalidateTables(["event", "event_sequence"])
-          this.ordinalCounter += 1
-          return { seq, committed: true, ordinal: this.ordinalCounter, idempotent: false }
+          return { seq, committed: true, ordinal: this.nextOrdinal(), idempotent: false }
         }),
       ),
     )
@@ -685,19 +706,51 @@ export class WriterCore {
 
   // -- ownership ------------------------------------------------------------
 
+  /** Last-wins assignment used by `steal`; `onlyIfUnowned` is the fenced `claim`. */
+  private setOwner(aggregateID: string, ownerID: string, options: { readonly onlyIfUnowned: boolean }): void {
+    const sql = options.onlyIfUnowned
+      ? "UPDATE event_sequence SET owner_id = ? WHERE aggregate_id = ? AND owner_id IS NULL"
+      : "UPDATE event_sequence SET owner_id = ? WHERE aggregate_id = ?"
+    const outcome = this.connection.run(sql, [ownerID, aggregateID])
+    if (options.onlyIfUnowned && outcome.changes === 0) {
+      throw new OwnerMismatchError(
+        `claim rejected for aggregate ${aggregateID}: already owned (or absent), cannot become ${ownerID}`,
+      )
+    }
+    this.cache.invalidateTables(["event_sequence"])
+  }
+
+  /**
+   * Fenced claim: only succeeds while the aggregate is unowned. Unlike `steal`, a
+   * claim never overwrites an existing owner.
+   */
   claim(aggregateID: string, ownerID: string): Promise<void> {
-    return this.enqueue(() => {
-      this.connection.run("UPDATE event_sequence SET owner_id = ? WHERE aggregate_id = ?", [ownerID, aggregateID])
-      this.cache.invalidateTables(["event_sequence"])
-    })
+    return this.enqueue(() => this.setOwner(aggregateID, ownerID, { onlyIfUnowned: true }))
   }
 
   /** Explicit takeover: unlike a live publish, this unconditionally reassigns. */
   steal(aggregateID: string, ownerID: string): Promise<void> {
-    return this.enqueue(() => {
-      this.connection.run("UPDATE event_sequence SET owner_id = ? WHERE aggregate_id = ?", [ownerID, aggregateID])
-      this.cache.invalidateTables(["event_sequence"])
-    })
+    return this.enqueue(() => this.setOwner(aggregateID, ownerID, { onlyIfUnowned: false }))
+  }
+
+  /**
+   * Owner fencing shared by `publish` and `replay`. A strict operation rejects any
+   * mismatch (including when the caller names no owner); a non-strict operation
+   * rejects only when the caller names a different owner.
+   */
+  private fenceOwner(
+    aggregateID: string,
+    owner: string | null,
+    ownerID: string | undefined,
+    strict: boolean | undefined,
+    what: string,
+  ): void {
+    if (owner === null) return
+    if ((strict || ownerID !== undefined) && owner !== ownerID) {
+      throw new OwnerMismatchError(
+        `${what} owner mismatch for aggregate ${aggregateID}: held by ${owner}, ${what} by ${ownerID ?? "none"}`,
+      )
+    }
   }
 
   remove(aggregateID: string): Promise<void> {
@@ -725,6 +778,15 @@ export class WriterCore {
 
   storageWrite(key: ReadonlyArray<string>, content: unknown): Promise<void> {
     return this.enqueue(() => this.requireStorage().write(key, content))
+  }
+
+  /**
+   * Atomic read-modify-write through the writer's serialized queue: the read, the
+   * mutation, and the write happen in one job, so concurrent updates cannot lose a
+   * write. Returns `found: false` (and writes nothing) when the entry is absent.
+   */
+  storageUpdate(key: ReadonlyArray<string>, fn: (content: unknown) => void): Promise<StorageReadResult> {
+    return this.enqueue(() => this.requireStorage().update(key, fn))
   }
 
   storageRemove(key: ReadonlyArray<string>): Promise<void> {
@@ -778,6 +840,16 @@ export class WriterCore {
         // best effort
       }
       this.pinned = undefined
+    }
+    // Let the running job finish before the connection goes away; otherwise a job
+    // admitted just before close could resume as a microtask against a closed
+    // connection. `closed` stops any further admission/pumping.
+    if (this.inflight !== undefined) {
+      try {
+        await this.inflight
+      } catch {
+        // the job's own caller observes the failure
+      }
     }
     // Reject every admitted-but-unfinished operation and admit the backpressured
     // callers so they observe the closure instead of hanging forever.

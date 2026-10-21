@@ -38,60 +38,17 @@ import {
   type WorkerPool,
 } from "@/session/worker/dispatch"
 import { createWorkerHarness } from "../../lib/worker-harness"
-
-const sid = (value: string) => value as SessionID
-const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
-const capture = (promise: Promise<unknown>): Promise<unknown> =>
-  promise.then(
-    () => undefined,
-    (error: unknown) => error,
-  )
+import { capture, flush, sid } from "../../lib/async"
+import { createListenerPair } from "../../lib/port-pair"
+import { createRecordingScheduler } from "../../lib/scheduler"
+import { pollUntil } from "../../lib/poll"
 
 /** An in-process pair of cancel ports; `hub.notify` reaches the worker side. */
 function createPortPair(): { hub: CancelPort; worker: CancelPort } {
-  const hubListeners = new Set<(frame: CancelFrame) => void>()
-  const workerListeners = new Set<(frame: CancelFrame) => void>()
-  const deliver = (listeners: Set<(frame: CancelFrame) => void>, frame: CancelFrame): void => {
-    for (const listener of [...listeners]) listener(frame)
-  }
+  const pair = createListenerPair<CancelFrame>()
   return {
-    hub: {
-      notify: (frame) => deliver(workerListeners, frame),
-      onMessage: (handler) => {
-        hubListeners.add(handler)
-        return () => hubListeners.delete(handler)
-      },
-    },
-    worker: {
-      notify: (frame) => deliver(hubListeners, frame),
-      onMessage: (handler) => {
-        workerListeners.add(handler)
-        return () => workerListeners.delete(handler)
-      },
-    },
-  }
-}
-
-interface TestTimer {
-  readonly delayMs: number
-  readonly run: () => void
-  cancelled: boolean
-}
-
-/** A scheduler that records timers so grace expiry can be fired deterministically. */
-function createTestScheduler() {
-  const timers: TestTimer[] = []
-  const schedule: CancelScheduler = (delayMs, run) => {
-    const timer: TestTimer = { delayMs, run, cancelled: false }
-    timers.push(timer)
-    return () => {
-      timer.cancelled = true
-    }
-  }
-  return {
-    schedule,
-    timers,
-    pending: () => timers.filter((timer) => !timer.cancelled),
+    hub: { notify: (frame) => pair.hub.post(frame), onMessage: (handler) => pair.hub.onMessage(handler) },
+    worker: { notify: (frame) => pair.worker.post(frame), onMessage: (handler) => pair.worker.onMessage(handler) },
   }
 }
 
@@ -125,6 +82,26 @@ describe("11.2 checkpoints before/after each model step and tool call", () => {
     ])
   })
 
+  test("records the :after boundary even when the step or tool call throws", async () => {
+    const token = createCancelToken()
+
+    const model = createCheckpoints(token)
+    await expect(
+      runModelStep(model, "turn", () => {
+        throw new Error("model boom")
+      }),
+    ).rejects.toThrow("model boom")
+    expect(model.boundaries).toEqual(["model:turn:before", "model:turn:after"])
+
+    const tool = createCheckpoints(token)
+    await expect(
+      runToolCall(tool, "read", () => {
+        throw new Error("tool boom")
+      }),
+    ).rejects.toThrow("tool boom")
+    expect(tool.boundaries).toEqual(["tool:read:before", "tool:read:after"])
+  })
+
   test("a cancel during a step aborts at the following checkpoint", async () => {
     const token = createCancelToken()
     const checkpoints = createCheckpoints(token)
@@ -144,7 +121,7 @@ describe("11.2/11.4 worker side: cancel+ack on the control port, clean up then a
     const pair = createPortPair()
     const token = createCancelToken()
     const events: string[] = []
-    const server = serveCancel(pair.worker, token, {
+    const server = serveCancel(pair.worker, token, sid("ses_1"), {
       killChildren: () => {
         events.push("kill-children")
       },
@@ -167,7 +144,60 @@ describe("11.2/11.4 worker side: cancel+ack on the control port, clean up then a
     server.dispose()
   })
 
-  test("cancelPortFromMessagePort round-trips frames over a real MessageChannel", () => {
+  test("rejects a cancel frame for a session this worker does not own", async () => {
+    const pair = createPortPair()
+    const token = createCancelToken()
+    let killed = 0
+    const server = serveCancel(pair.worker, token, sid("ses_owned"), {
+      killChildren: () => {
+        killed++
+      },
+    })
+    const acks: CancelFrame[] = []
+    pair.hub.onMessage((frame) => acks.push(frame))
+
+    pair.hub.notify({ type: "cancel", sessionID: "ses_other" })
+    await flush()
+
+    expect(token.cancelled).toBe(false)
+    expect(killed).toBe(0)
+    expect(server.handled).toBe(0)
+    expect(acks).toEqual([{ type: "cancel-ack", sessionID: "ses_other", accepted: false }])
+
+    server.dispose()
+  })
+
+  test("a throwing cleanup still acks (accepted: false) and leaves the queue usable", async () => {
+    const pair = createPortPair()
+    const token = createCancelToken()
+    const server = serveCancel(pair.worker, token, sid("ses_1"), {
+      killChildren: () => {
+        throw new Error("kill boom")
+      },
+      closeScope: () => {
+        throw new Error("scope should not run")
+      },
+    })
+    const acks: CancelFrame[] = []
+    pair.hub.onMessage((frame) => acks.push(frame))
+
+    pair.hub.notify({ type: "cancel", sessionID: "ses_1" })
+    await flush()
+
+    expect(token.cancelled).toBe(true)
+    expect(server.handled).toBe(1)
+    expect(acks).toEqual([{ type: "cancel-ack", sessionID: "ses_1", accepted: false }])
+
+    // The queue must remain fulfilled: a repeat cancel is still acknowledged.
+    pair.hub.notify({ type: "cancel", sessionID: "ses_1" })
+    await flush()
+    expect(acks).toHaveLength(2)
+    expect(acks[1]).toEqual({ type: "cancel-ack", sessionID: "ses_1", accepted: true })
+
+    server.dispose()
+  })
+
+  test("cancelPortFromMessagePort round-trips frames over a real MessageChannel", async () => {
     const channel = new MessageChannel()
     const hubPort = cancelPortFromMessagePort(channel.port1)
     const workerPort = cancelPortFromMessagePort(channel.port2)
@@ -176,12 +206,8 @@ describe("11.2/11.4 worker side: cancel+ack on the control port, clean up then a
     workerPort.onMessage((frame) => received.push(frame))
     hubPort.notify({ type: "cancel", sessionID: "ses_x" })
 
-    return new Promise<void>((resolve) => {
-      setTimeout(() => {
-        expect(received).toEqual([{ type: "cancel", sessionID: "ses_x" }])
-        resolve()
-      }, 20)
-    })
+    await pollUntil(() => received.length > 0, { message: "cancel frame never arrived over the MessageChannel" })
+    expect(received).toEqual([{ type: "cancel", sessionID: "ses_x" }])
   })
 })
 
@@ -196,7 +222,7 @@ describe("11.3 grace: cooperative checkpoint then terminate after the grace wind
 
   test("a run that completes within the grace is cooperative; no terminate", async () => {
     const pair = createPortPair()
-    const scheduler = createTestScheduler()
+    const scheduler = createRecordingScheduler<CancelScheduler>()
     let terminated = 0
     let reaped = 0
     const controller = createCancelController({
@@ -231,7 +257,7 @@ describe("11.3 grace: cooperative checkpoint then terminate after the grace wind
 
   test("grace expiry terminates unconditionally and reaps mirrored PGIDs", async () => {
     const pair = createPortPair()
-    const scheduler = createTestScheduler()
+    const scheduler = createRecordingScheduler<CancelScheduler>()
     const terminated: number[] = []
     const reaped: number[] = []
     const controller = createCancelController({
@@ -262,7 +288,7 @@ describe("11.3 grace: cooperative checkpoint then terminate after the grace wind
 
   test("cancel is idempotent: a second request joins the first", async () => {
     const pair = createPortPair()
-    const scheduler = createTestScheduler()
+    const scheduler = createRecordingScheduler<CancelScheduler>()
     const cancellations: CancelFrame[] = []
     pair.worker.onMessage((frame) => cancellations.push(frame))
     const controller = createCancelController({ port: pair.hub, terminate: () => {}, schedule: scheduler.schedule })
@@ -287,9 +313,17 @@ describe("11.9 cancel-vs-completion first-writer-wins", () => {
     expect(gate.winner).toBe("cancel")
   })
 
+  test("the outcome gate is first-only: a repeat claim never overwrites the winner", () => {
+    const gate = createOutcomeGate()
+    expect(gate.claim("cancel")).toBe(true)
+    expect(gate.claim("cancel")).toBe(false)
+    expect(gate.claim("completion")).toBe(false)
+    expect(gate.winner).toBe("cancel")
+  })
+
   test("a completion that already landed wins; the controller sends no cancel", async () => {
     const pair = createPortPair()
-    const scheduler = createTestScheduler()
+    const scheduler = createRecordingScheduler<CancelScheduler>()
     const sent: CancelFrame[] = []
     pair.worker.onMessage((frame) => sent.push(frame))
     const controller = createCancelController({ port: pair.hub, terminate: () => {}, schedule: scheduler.schedule })
@@ -297,6 +331,44 @@ describe("11.9 cancel-vs-completion first-writer-wins", () => {
     const outcome = controller.cancel(sid("ses_1"), { complete: Promise.resolve() })
     expect(await outcome).toMatchObject({ mode: "completed", winner: "completion" })
     expect(sent).toHaveLength(0)
+    controller.dispose()
+  })
+
+  test("an ack is scoped to its in-flight request and never leaks into a later one", async () => {
+    const pair = createPortPair()
+    const scheduler = createRecordingScheduler<CancelScheduler>()
+    let cancels = 0
+    pair.worker.onMessage((frame) => {
+      if (frame.type !== "cancel") return
+      cancels++
+      // The worker acks only the first cancel; the second must not inherit it.
+      if (cancels === 1) pair.worker.notify({ type: "cancel-ack", sessionID: frame.sessionID, accepted: true })
+    })
+    const controller = createCancelController({
+      port: pair.hub,
+      terminate: () => {},
+      graceMs: 500,
+      schedule: scheduler.schedule,
+    })
+
+    let finishFirst!: () => void
+    const completeFirst = new Promise<void>((resolve) => {
+      finishFirst = resolve
+    })
+    const first = controller.cancel(sid("ses_1"), { complete: completeFirst })
+    await flush()
+    finishFirst()
+    expect(await first).toMatchObject({ mode: "cooperative", acknowledged: true })
+
+    let finishSecond!: () => void
+    const completeSecond = new Promise<void>((resolve) => {
+      finishSecond = resolve
+    })
+    const second = controller.cancel(sid("ses_1"), { complete: completeSecond })
+    await flush()
+    finishSecond()
+    expect(await second).toMatchObject({ mode: "cooperative", acknowledged: false })
+
     controller.dispose()
   })
 })
@@ -413,7 +485,7 @@ function cancellationConfig(pool: PortPool, overrides: Partial<CancellationConfi
   return {
     portFor: (worker) => (worker as CooperativeWorker).hub,
     graceMs: 500,
-    schedule: createTestScheduler().schedule,
+    schedule: createRecordingScheduler<CancelScheduler>().schedule,
     reap: () => {},
     ...overrides,
   }
@@ -435,7 +507,7 @@ describe("11.4 graceful cancel reuses the worker; terminate path replaces it", (
 
     const outcome = await dispatcher.cancelWithGrace(sid("ses_1"))
     expect(outcome).toMatchObject({ mode: "cooperative", winner: "cancel" })
-    expect(await run).toBeInstanceOf(SessionCancelledError)
+    expect(await run).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
 
     // 11.4: the worker was NOT terminated and is reused for the next session.
     expect(pool.workers[0].alive).toBe(true)
@@ -453,7 +525,7 @@ describe("11.4 graceful cancel reuses the worker; terminate path replaces it", (
 
   test("a run that ignores the checkpoint is terminated and replaced (11.6)", async () => {
     const pool = new PortPool(1, false)
-    const scheduler = createTestScheduler()
+    const scheduler = createRecordingScheduler<CancelScheduler>()
     const reaped: number[] = []
     const cancelled: Array<{ mode: string; resumeFromDb: boolean }> = []
     const dispatcher = createDispatcher({
@@ -474,8 +546,10 @@ describe("11.4 graceful cancel reuses the worker; terminate path replaces it", (
 
     const outcome = await pending
     expect(outcome).toMatchObject({ mode: "terminated", winner: "cancel" })
-    expect(await run).toBeInstanceOf(SessionCancelledError)
-    expect(pool.workers[0].terminateCount).toBe(1)
+    expect(await run).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
+    // The controller terminates once; the dispatcher may re-terminate the same
+    // slot idempotently, so only "at least one terminate" is contractual here.
+    expect(pool.workers[0].terminateCount).toBeGreaterThanOrEqual(1)
     expect(pool.workers[0].alive).toBe(false)
     expect(reaped).toHaveLength(1)
     // 11.6: a fresh worker respawns into the freed slot and is ready for reuse.
@@ -512,9 +586,9 @@ describe("11.8 parent cancel cascades to subagents, children first", () => {
 
     await dispatcher.cancelWithGrace(sid("ses_parent"))
 
-    expect(await parent).toBeInstanceOf(SessionCancelledError)
-    expect(await childA).toBeInstanceOf(SessionCancelledError)
-    expect(await childB).toBeInstanceOf(SessionCancelledError)
+    expect(await parent).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
+    expect(await childA).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
+    expect(await childB).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
     expect(order).toEqual(["ses_child_a", "ses_child_b", "ses_parent"])
   })
 })

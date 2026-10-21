@@ -21,15 +21,13 @@ export const COALESCE_WINDOW_MS = 16
 /** Default maximum deltas per frame before an eager threshold flush. */
 export const COALESCE_MAX_BATCH = 256
 
-/** Injectable time + timer so the window is not tied to wall-clock in tests. */
+/** Injectable timer so the window is not tied to wall-clock in tests. */
 export interface CoalescerScheduler {
-  now(): number
   schedule(callback: () => void, delayMs: number): unknown
   cancel(handle: unknown): void
 }
 
 const defaultScheduler: CoalescerScheduler = {
-  now: () => Date.now(),
   schedule: (callback, delayMs) => setTimeout(callback, delayMs),
   cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 }
@@ -55,7 +53,13 @@ export interface Coalescer {
   readonly ended: boolean
 }
 
-const ENDED_ERROR = "coalescer has ended"
+/** Thrown when a delta or durable is pushed after `end()`. */
+export class CoalescerEndedError extends Error {
+  constructor() {
+    super("coalescer has ended")
+    this.name = "CoalescerEndedError"
+  }
+}
 
 export function createCoalescer(options: CoalescerOptions): Coalescer {
   const windowMs = options.windowMs ?? COALESCE_WINDOW_MS
@@ -74,10 +78,11 @@ export function createCoalescer(options: CoalescerOptions): Coalescer {
   }
 
   const flush = (): void => {
+    cancelTimer()
+    if (ended) return
     if (buffer.length === 0) return
     const events = buffer
     buffer = []
-    cancelTimer()
     onFrame({ kind: "deltas", v: FRAME_VERSION, events })
   }
 
@@ -91,13 +96,13 @@ export function createCoalescer(options: CoalescerOptions): Coalescer {
 
   return {
     pushDelta(event) {
-      if (ended) throw new Error(ENDED_ERROR)
+      if (ended) throw new CoalescerEndedError()
       buffer.push(event)
       if (buffer.length >= maxBatch) flush()
       else scheduleIdle()
     },
     pushDurable(event, meta) {
-      if (ended) throw new Error(ENDED_ERROR)
+      if (ended) throw new CoalescerEndedError()
       flush()
       onFrame({ kind: "durable", v: FRAME_VERSION, meta, event })
     },
@@ -106,7 +111,6 @@ export function createCoalescer(options: CoalescerOptions): Coalescer {
       if (ended) return
       flush()
       ended = true
-      cancelTimer()
       onFrame({ kind: "end", v: FRAME_VERSION })
     },
     get buffered() {

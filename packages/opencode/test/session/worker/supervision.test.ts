@@ -28,6 +28,13 @@ describe("crash backoff schedule", () => {
     expect(CRASH_BACKOFF_MAX_MS).toBe(30_000)
     expect(CRASH_ATTEMPTS_BEFORE_DEGRADED).toBe(5)
   })
+
+  test("caps without overflow and maps non-finite counts to no backoff", () => {
+    expect(crashBackoffMs(1e9)).toBe(30_000)
+    expect(crashBackoffMs(Number.POSITIVE_INFINITY)).toBe(0)
+    expect(crashBackoffMs(Number.NaN)).toBe(0)
+    expect(crashBackoffMs(0)).toBe(0)
+  })
 })
 
 describe("supervision", () => {
@@ -66,5 +73,26 @@ describe("supervision", () => {
     expect(supervision.isDegraded(2)).toBe(false)
     expect(supervision.recordCrash(2).degraded).toBe(false)
     expect(supervision.degradedCount).toBe(1)
+  })
+
+  test("forget drops a removed slot's state so degraded entries do not leak", () => {
+    const supervision = createSupervision()
+    for (let i = 0; i < CRASH_ATTEMPTS_BEFORE_DEGRADED; i++) supervision.recordCrash(7)
+    expect(supervision.isDegraded(7)).toBe(true)
+    expect(supervision.degradedCount).toBe(1)
+
+    supervision.forget(7)
+    expect(supervision.isDegraded(7)).toBe(false)
+    expect(supervision.degradedCount).toBe(0)
+    expect(supervision.recordCrash(7).attempts).toBe(1)
+  })
+
+  test("fails loud on an invalid worker id", () => {
+    const supervision = createSupervision()
+    expect(() => supervision.recordCrash(-1)).toThrow()
+    expect(() => supervision.recordCrash(1.5)).toThrow()
+    expect(() => supervision.recordHealthy(Number.NaN)).toThrow()
+    expect(() => supervision.isDegraded(-2)).toThrow()
+    expect(() => supervision.forget(-3)).toThrow()
   })
 })

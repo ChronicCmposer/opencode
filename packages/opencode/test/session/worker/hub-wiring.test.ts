@@ -1,46 +1,37 @@
-// Phase 12 — flag-on wiring: `run-state.ts` delegates to the hub/executor, and the
-// hub routes UI stop through the Phase 11 cooperative `cancelWithGrace` path.
+// Phase 12 — flag-on hub wiring: `run-state.ts` forwards `startShell` and
+// `cancel` to the hub, and the hub routes UI stop through the Phase 11
+// cooperative `cancelWithGrace` path.
 //
-// Flag off (or no `SessionHubService`) must remain the in-hub `RunnerTable` path;
-// flag on delegates `ensureRunning`/`startShell`/`assertNotBusy`/`cancel` to the
-// hub. The hub here runs over an in-memory executor pool so the wiring is tested
-// deterministically without spawning isolates.
+// The flag-on/flag-off `ensureRunning` delegation matrix lives in
+// `rollout/flag-gating.test.ts` (finding #186). What is unique here is the
+// control wiring: `startShell` opens the caller's `ready` latch (the hub cannot
+// carry it), maps a hub busy rejection to `Session.BusyError`, and `cancel`
+// reaches the hub. The hub runs over an in-memory executor pool so the wiring is
+// tested deterministically without spawning isolates.
 
 import { describe, expect } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Effect, Latch, Layer } from "effect"
 import type { SessionID } from "@/session/schema"
-import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { BackgroundJob } from "@/background/job"
+import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
 import { SessionRunState } from "@/session/run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { createSessionHub, SessionHubService, type SessionHub } from "@/session/worker/hub"
-import type {
-  ExecutorRun,
-  ExecutorSessionWorker,
-  ExecutorWorker,
-  ExecutorWorkerPool,
-  SessionExecutionResult,
+import {
+  SessionBusyError,
+  type ExecutorRun,
+  type ExecutorSessionWorker,
+  type ExecutorWorker,
+  type ExecutorWorkerPool,
+  type SessionExecutionResult,
 } from "@/session/worker/execute"
 import { withTmpdirInstance } from "../../fixture/fixture"
 import { testEffect } from "../../lib/effect"
+import { sid } from "../../lib/async"
+import { withParts } from "../../lib/session-parts"
 
 const it = testEffect(Layer.empty)
-const sid = (value: string) => value as SessionID
-
-/** A minimal valid `SessionV1.WithParts` (the worker result payload). */
-const withParts = (sessionID: SessionID): SessionV1.WithParts =>
-  ({
-    info: {
-      id: "msg_phase12",
-      sessionID,
-      role: "user",
-      time: { created: 0 },
-      agent: "build",
-      model: { providerID: "test", modelID: "test" },
-    },
-    parts: [],
-  }) as unknown as SessionV1.WithParts
 
 class FakeWorker implements ExecutorWorker {
   busy = false
@@ -110,24 +101,61 @@ const runStateLayer = SessionRunState.layer.pipe(
 )
 const flagsOn = RuntimeFlags.layer({ experimentalSessionWorkers: true })
 
-describe("12 — flag-on run-state delegation", () => {
-  it.live("ensureRunning delegates to the hub; the hub-authored work effect never runs", () => {
-    const pool = new FakePool(1, withParts(sid("ses_1")))
-    const hub = createSessionHub({ pool })
+describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
+  it.live("startShell calls the hub's startShell and opens the caller's ready latch", () => {
+    const pool = new FakePool(1, withParts(sid("ses_shell")))
+    const base = createSessionHub({ pool })
+    let shellCalls = 0
+    const hub: SessionHub = {
+      ...base,
+      startShell: async (sessionID) => {
+        shellCalls += 1
+        return base.startShell(sessionID)
+      },
+    }
     return withTmpdirInstance()(
       Effect.gen(function* () {
         const state = yield* SessionRunState.Service
-        let workRan = false
-        const result = yield* state.ensureRunning(
-          sid("ses_1"),
-          Effect.succeed(withParts(sid("ses_1"))),
-          Effect.sync(() => {
-            workRan = true
-            return withParts(sid("ses_1"))
-          }),
+        const ready = yield* Latch.make()
+        const result = yield* state.startShell(
+          sid("ses_shell"),
+          Effect.succeed(withParts(sid("ses_shell"))),
+          Effect.succeed(withParts(sid("ses_shell"))),
+          ready,
         )
-        expect(result).toEqual(withParts(sid("ses_1")))
-        expect(workRan).toBe(false)
+        expect(result).toEqual(withParts(sid("ses_shell")))
+        expect(shellCalls).toBe(1)
+        // The hub cannot carry the caller's latch, so run-state must open it:
+        // awaiting would suspend forever (and time the test out) otherwise.
+        yield* ready.await
+      }).pipe(
+        Effect.provide(runStateLayer),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+      ),
+    )
+  })
+
+  it.live("startShell maps a hub busy rejection to Session.BusyError", () => {
+    const pool = new FakePool(1, undefined)
+    const base = createSessionHub({ pool })
+    const hub: SessionHub = {
+      ...base,
+      startShell: async (sessionID) => {
+        throw new SessionBusyError({ sessionID })
+      },
+    }
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const error = yield* state
+          .startShell(
+            sid("ses_busy"),
+            Effect.succeed(withParts(sid("ses_busy"))),
+            Effect.succeed(withParts(sid("ses_busy"))),
+          )
+          .pipe(Effect.flip)
+        expect(error).toBeInstanceOf(Session.BusyError)
       }).pipe(
         Effect.provide(runStateLayer),
         Effect.provideService(SessionHubService, hub),
@@ -156,32 +184,6 @@ describe("12 — flag-on run-state delegation", () => {
         Effect.provide(runStateLayer),
         Effect.provideService(SessionHubService, hub),
         Effect.provide(flagsOn),
-      ),
-    )
-  })
-
-  it.live("flag off keeps the in-hub runner path (no hub service provided)", () => {
-    const pool = new FakePool(1, withParts(sid("ses_1")))
-    const hub = createSessionHub({ pool })
-    return withTmpdirInstance()(
-      Effect.gen(function* () {
-        const state = yield* SessionRunState.Service
-        let workRan = false
-        const result = yield* state.ensureRunning(
-          sid("ses_1"),
-          Effect.succeed(withParts(sid("ses_1"))),
-          Effect.sync(() => {
-            workRan = true
-            return withParts(sid("ses_1"))
-          }),
-        )
-        expect(result).toEqual(withParts(sid("ses_1")))
-        expect(workRan).toBe(true)
-        expect(hub.dispatcher.registry.size).toBe(0)
-      }).pipe(
-        Effect.provide(runStateLayer),
-        Effect.provideService(SessionHubService, hub),
-        // RuntimeFlags absent → flag treated as off → in-hub runner used.
       ),
     )
   })

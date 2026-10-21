@@ -21,6 +21,7 @@ import { Context, Effect, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
+import { emptyConsoleState } from "@opencode-ai/core/v1/config/console-state"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 
 import { Session } from "@/session/session"
@@ -51,7 +52,13 @@ import { Npm } from "@opencode-ai/core/npm"
 import { Account } from "@/account/account"
 import { AccountRepo } from "@/account/repo"
 
-import { assertSessionLayer } from "./node-table"
+import {
+  BACKGROUND_JOB_CLIENT_KEY,
+  BROKER_CLIENT_KEY,
+  EVENT_EGRESS_CLIENT_KEY,
+  WRITER_CLIENT_KEY,
+  assertSessionLayer,
+} from "./node-table"
 
 // ---------------------------------------------------------------------------
 // Client nodes — the worker-side handles to the writer / egress / hub.
@@ -78,25 +85,36 @@ export interface BackgroundJobClientHandle {
   readonly cancel: (id: string) => Promise<void>
 }
 
-export class WriterClientService extends Context.Service<WriterClientService, WriterClientHandle>()(
-  "@opencode/session-worker/WriterClient",
-) {}
-export class EventEgressClientService extends Context.Service<EventEgressClientService, EventEgressClientHandle>()(
-  "@opencode/session-worker/EventEgressClient",
-) {}
-export class BrokerClientService extends Context.Service<BrokerClientService, BrokerClientHandle>()(
-  "@opencode/session-worker/BrokerClient",
-) {}
-export class BackgroundJobClientService extends Context.Service<BackgroundJobClientService, BackgroundJobClientHandle>()(
-  "@opencode/session-worker/BackgroundJobClient",
-) {}
-
 const workerTags = LayerNode.tags({ worker: [] })
 
-export const WriterClientNode = LayerNode.unbound(WriterClientService, workerTags.values.worker)
-export const EventEgressClientNode = LayerNode.unbound(EventEgressClientService, workerTags.values.worker)
-export const BrokerClientNode = LayerNode.unbound(BrokerClientService, workerTags.values.worker)
-export const BackgroundJobClientNode = LayerNode.unbound(BackgroundJobClientService, workerTags.values.worker)
+/**
+ * A client node is a service class, its unbound graph node, and the replacement
+ * layer that installs a handle. The service key comes from `node-table.ts`, so
+ * the table and the layer can never drift apart.
+ */
+function defineClientNode<Shape>(key: string) {
+  class Service extends Context.Service<Service, Shape>()(key) {}
+  return {
+    Service,
+    node: LayerNode.unbound(Service, workerTags.values.worker),
+    layer: (handle: Shape) => Layer.succeed(Service, handle),
+  }
+}
+
+const writerClient = defineClientNode<WriterClientHandle>(WRITER_CLIENT_KEY)
+const eventEgressClient = defineClientNode<EventEgressClientHandle>(EVENT_EGRESS_CLIENT_KEY)
+const brokerClient = defineClientNode<BrokerClientHandle>(BROKER_CLIENT_KEY)
+const backgroundJobClient = defineClientNode<BackgroundJobClientHandle>(BACKGROUND_JOB_CLIENT_KEY)
+
+export const WriterClientService = writerClient.Service
+export const EventEgressClientService = eventEgressClient.Service
+export const BrokerClientService = brokerClient.Service
+export const BackgroundJobClientService = backgroundJobClient.Service
+
+export const WriterClientNode = writerClient.node
+export const EventEgressClientNode = eventEgressClient.node
+export const BrokerClientNode = brokerClient.node
+export const BackgroundJobClientNode = backgroundJobClient.node
 
 // ---------------------------------------------------------------------------
 // Immutable per-worker snapshot + environment overlay (plan decisions 67/68).
@@ -183,24 +201,32 @@ const pipelineLayer = Layer.effect(
     const run = (input: PipelineInput): Effect.Effect<PipelineResult, Error> =>
       Effect.gen(function* () {
         const completion = yield* model.complete(input)
-        egress.emit({
-          id: `${input.sessionID}-text`,
-          type: "session.text",
-          data: { text: completion.text, epoch: snapshot.epoch },
+        // A rejected publish is a typed error, not an unhandled defect.
+        const published = yield* Effect.tryPromise({
+          try: () =>
+            writer.publish({
+              id: `${input.sessionID}-assistant`,
+              type: "message.assistant",
+              aggregateID: input.sessionID,
+              data: { text: completion.text },
+            }),
+          catch: (error) => (error instanceof Error ? error : new Error(String(error))),
         })
-        const published = yield* Effect.promise(() =>
-          writer.publish({
-            id: `${input.sessionID}-assistant`,
-            type: "message.assistant",
-            aggregateID: input.sessionID,
-            data: { text: completion.text },
-          }),
-        )
+        // Only a durable commit is egressed; a non-committed (idempotent replay
+        // or non-durable) publish emits nothing.
+        const emitted = published.committed ? 1 : 0
+        if (published.committed) {
+          egress.emit({
+            id: `${input.sessionID}-text`,
+            type: "session.text",
+            data: { text: completion.text, epoch: snapshot.epoch },
+          })
+        }
         return {
           text: completion.text,
           ...(completion.usage === undefined ? {} : { usage: completion.usage }),
           publishedSeq: published.seq,
-          emitted: 1,
+          emitted,
         }
       })
 
@@ -218,37 +244,63 @@ export const SessionPipelineNode = LayerNode.make({
 // Boundary replacement layers (production wiring is Phases 7/10).
 // ---------------------------------------------------------------------------
 
+/** Raised when worker code reaches a boundary owned by the hub / writer / broker. */
+export class SessionLayerBoundaryError extends Error {
+  constructor(
+    readonly boundary: string,
+    readonly member: string,
+  ) {
+    super(`session worker boundary "${boundary}" cannot use "${member}": ${boundary} is hub/writer/broker-owned`)
+    this.name = "SessionLayerBoundaryError"
+  }
+}
+
+const boundaryViolation = (boundary: string, member: string): Effect.Effect<never> =>
+  Effect.die(new SessionLayerBoundaryError(boundary, member))
+
 /** Immutable snapshot-backed Config: workers never read files or write config. */
 export function snapshotConfigLayer(snapshot: WorkerSnapshot): Layer.Layer<Config.Service> {
-  return Layer.succeed(Config.Service, {
+  const config: Config.Interface = {
     get: () => Effect.succeed(snapshot.config),
     getGlobal: () => Effect.succeed(snapshot.config),
-    getConsoleState: () =>
-      Effect.succeed({ consoleManagedProviders: [], activeOrgName: undefined, switchableOrgCount: 0 }),
-    update: () => Effect.void,
-    updateGlobal: () => Effect.succeed({ info: snapshot.config, changed: false }),
-    invalidate: () => Effect.void,
+    getConsoleState: () => Effect.succeed(emptyConsoleState),
+    update: () => boundaryViolation("Config", "update"),
+    updateGlobal: () => boundaryViolation("Config", "updateGlobal"),
+    invalidate: () => boundaryViolation("Config", "invalidate"),
     directories: () => Effect.succeed([snapshot.directory]),
     waitForDependencies: () => Effect.void,
-  } as unknown as Config.Interface)
+  }
+  return Layer.succeed(Config.Service, config)
 }
 
 /** Immutable snapshot-backed Auth: credentials never touch `process.env`. */
 export function snapshotAuthLayer(snapshot: WorkerSnapshot): Layer.Layer<Auth.Service> {
-  return Layer.succeed(Auth.Service, {
-    get: (providerID: string) => Effect.succeed(snapshot.auth[providerID] as never),
-    all: () => Effect.succeed(snapshot.auth as never),
-    set: () => Effect.void,
-    remove: () => Effect.void,
-  } as unknown as Auth.Interface)
+  const auth: Auth.Interface = {
+    get: (providerID: string) => Effect.succeed(snapshot.auth[providerID] as Auth.Info | undefined),
+    all: () => Effect.succeed(snapshot.auth as Record<string, Auth.Info>),
+    set: () => boundaryViolation("Auth", "set"),
+    remove: () => boundaryViolation("Auth", "remove"),
+  }
+  return Layer.succeed(Auth.Service, auth)
 }
 
 /** Immutable snapshot-backed ModelsDev: catalog refresh is hub-only. */
 export function snapshotModelsDevLayer(snapshot: WorkerSnapshot): Layer.Layer<ModelsDev.Service> {
-  return Layer.succeed(ModelsDev.Service, {
-    get: () => Effect.succeed(snapshot.modelsDev),
-    refresh: () => Effect.void,
-  } as unknown as ModelsDev.Interface)
+  const modelsDev: ModelsDev.Interface = {
+    get: () => Effect.succeed(snapshot.modelsDev as Record<string, ModelsDev.Provider>),
+    refresh: () => boundaryViolation("ModelsDev", "refresh"),
+  }
+  return Layer.succeed(ModelsDev.Service, modelsDev)
+}
+
+/** Database is writer-owned: any access is a loud violation, never a silent `{}`. */
+export function databaseBoundaryLayer(): Layer.Layer<Database.Service> {
+  const database: Database.Interface = {
+    get db(): never {
+      throw new SessionLayerBoundaryError("Database", "db")
+    },
+  }
+  return Layer.succeed(Database.Service, database)
 }
 
 /**
@@ -262,7 +314,7 @@ export function boundaryReplacements(snapshot: WorkerSnapshot): LayerNode.Replac
     [Config.node, snapshotConfigLayer(snapshot)],
     [Auth.node, snapshotAuthLayer(snapshot)],
     [ModelsDev.node, snapshotModelsDevLayer(snapshot)],
-    [Database.node, Layer.succeed(Database.Service, { db: {} } as unknown as Database.Interface)],
+    [Database.node, databaseBoundaryLayer()],
     [SessionProjector.node, Layer.empty],
     [MCP.node, Layer.empty],
     [LSP.node, Layer.empty],
@@ -354,10 +406,10 @@ export interface SessionWorkerLayer {
 export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWorkerLayer {
   const root = options.nodes ?? RUNNABLE_SESSION_NODES
   const replacements: LayerNode.Replacements = [
-    [WriterClientNode, Layer.succeed(WriterClientService, options.clients.writer)],
-    [EventEgressClientNode, Layer.succeed(EventEgressClientService, options.clients.egress)],
-    [BrokerClientNode, Layer.succeed(BrokerClientService, options.clients.broker)],
-    [BackgroundJobClientNode, Layer.succeed(BackgroundJobClientService, options.clients.backgroundJob)],
+    [WriterClientNode, writerClient.layer(options.clients.writer)],
+    [EventEgressClientNode, eventEgressClient.layer(options.clients.egress)],
+    [BrokerClientNode, brokerClient.layer(options.clients.broker)],
+    [BackgroundJobClientNode, backgroundJobClient.layer(options.clients.backgroundJob)],
     [WorkerSnapshotNode, Layer.succeed(WorkerSnapshotService, options.snapshot)],
     [WorkerEnvNode, Layer.succeed(WorkerEnvService, options.env)],
     [ModelClientNode, options.modelClient],

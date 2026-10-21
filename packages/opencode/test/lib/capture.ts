@@ -9,6 +9,9 @@
 // comparable value. Data is structured-cloned at the boundary, so a capture
 // owns a private copy of whatever it records.
 
+import { assertNonEmptyString } from "./assert"
+import { deepFreeze } from "./deep-freeze"
+
 export type CaptureChannel = "event" | "db" | "worker"
 
 export interface CaptureRecord {
@@ -55,13 +58,6 @@ export interface CaptureHarness {
 
 const CHANNELS: ReadonlySet<string> = new Set<CaptureChannel>(["event", "db", "worker"])
 
-function deepFreeze<T>(value: T): T {
-  if (value === null || typeof value !== "object") return value
-  Object.freeze(value)
-  for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested)
-  return value
-}
-
 export function createCapture(options: CaptureOptions = {}): CaptureHarness {
   const clock = options.clock ?? (() => Date.now())
   let counter = 0
@@ -71,6 +67,7 @@ export function createCapture(options: CaptureOptions = {}): CaptureHarness {
     if (!CHANNELS.has(input.channel)) {
       throw new Error(`unknown capture channel: ${String(input.channel)}`)
     }
+    assertNonEmptyString(input.kind, "capture kind")
     const entry: CaptureRecord = Object.freeze({
       seq: ++counter,
       at: clock(),

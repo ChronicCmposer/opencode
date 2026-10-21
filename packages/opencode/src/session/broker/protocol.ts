@@ -112,6 +112,21 @@ export class BrokerProtocolError extends Error {
   }
 }
 
+/**
+ * A broker-level failure carrying the wire error taxonomy. Shared by the pure
+ * protocol boundary (`resolveRequestTimeout`) and the broker worker, so both
+ * speak one failure type; the worker's `toBrokerError` maps it onto a
+ * `BrokerError` frame.
+ */
+export class BrokerFailure extends Error {
+  readonly code: BrokerErrorCode
+  constructor(code: BrokerErrorCode, message: string) {
+    super(message)
+    this.name = "BrokerFailure"
+    this.code = code
+  }
+}
+
 export interface ResponseValueFrame {
   readonly kind: "response"
   readonly requestId: string
@@ -216,19 +231,54 @@ function requireString(value: unknown, field: string): string {
   return value
 }
 
+function requireInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new BrokerProtocolError(`${field} must be an integer`)
+  }
+  return value
+}
+
+function requirePositiveInteger(value: unknown, field: string): number {
+  const parsed = requireInteger(value, field)
+  if (parsed <= 0) throw new BrokerProtocolError(`${field} must be a positive integer`)
+  return parsed
+}
+
+function isServerKind(value: string): value is ServerKind {
+  return (SERVER_KINDS as ReadonlyArray<string>).includes(value)
+}
+
+function parseServerKind(value: unknown, field: string): ServerKind {
+  const kind = requireString(value, field)
+  if (!isServerKind(kind)) {
+    throw new BrokerProtocolError(`${field} must be "mcp" or "lsp", got "${kind}"`)
+  }
+  return kind
+}
+
+/** Build a genuinely `string[]`-typed command, not a re-cast `unknown[]`. */
+function parseCommand(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new BrokerProtocolError(`${field} must be a non-empty string array`)
+  }
+  const command: string[] = []
+  for (const part of value) {
+    if (typeof part !== "string") {
+      throw new BrokerProtocolError(`${field} must be a non-empty string array`)
+    }
+    command.push(part)
+  }
+  return command
+}
+
 function parseServer(value: unknown, index: number): ServerSpec {
   if (!isRecord(value)) throw new BrokerProtocolError(`servers[${index}] must be an object`)
   const name = requireString(value.name, `servers[${index}].name`)
-  const kind = requireString(value.kind, `servers[${index}].kind`)
-  if (!SERVER_KINDS.includes(kind as ServerKind)) {
-    throw new BrokerProtocolError(`servers[${index}].kind must be "mcp" or "lsp", got "${kind}"`)
-  }
-  if (!Array.isArray(value.command) || value.command.length === 0 || !value.command.every((part) => typeof part === "string")) {
-    throw new BrokerProtocolError(`servers[${index}].command must be a non-empty string array`)
-  }
+  const kind = parseServerKind(value.kind, `servers[${index}].kind`)
+  const command = parseCommand(value.command, `servers[${index}].command`)
   const env = parseEnv(value.env, `servers[${index}].env`)
   const timeoutMs = parseOptionalTimeout(value.timeoutMs, `servers[${index}].timeoutMs`)
-  return { name, kind: kind as ServerKind, command: value.command, ...(env ? { env } : {}), ...(timeoutMs === undefined ? {} : { timeoutMs }) }
+  return { name, kind, command, ...(env ? { env } : {}), ...(timeoutMs === undefined ? {} : { timeoutMs }) }
 }
 
 function parseEnv(value: unknown, field: string): Readonly<Record<string, string>> | undefined {
@@ -290,8 +340,8 @@ export function parseBrokerRequest(value: unknown): BrokerRequest {
   }
 }
 
-/** Total, non-throwing membership predicate. */
-export function isBrokerRequest(value: unknown): boolean {
+/** Total, non-throwing membership predicate; narrows to `BrokerRequest`. */
+export function isBrokerRequest(value: unknown): value is BrokerRequest {
   try {
     parseBrokerRequest(value)
     return true
@@ -300,15 +350,52 @@ export function isBrokerRequest(value: unknown): boolean {
   }
 }
 
+function parseAcquiredServer(value: unknown, index: number): AcquiredServer {
+  if (!isRecord(value)) throw new BrokerProtocolError(`servers[${index}] must be an object`)
+  return {
+    name: requireString(value.name, `servers[${index}].name`),
+    pid: requirePositiveInteger(value.pid, `servers[${index}].pid`),
+    pgid: requirePositiveInteger(value.pgid, `servers[${index}].pgid`),
+    instanceId: requireString(value.instanceId, `servers[${index}].instanceId`),
+  }
+}
+
+/** Parse an untrusted `acquire` response value into a trusted `AcquireResult`. */
+export function parseAcquireResult(value: unknown): AcquireResult {
+  if (!isRecord(value)) throw new BrokerProtocolError("acquire result must be an object")
+  const instanceId = requireString(value.instanceId, "instanceId")
+  if (!Array.isArray(value.servers)) throw new BrokerProtocolError("acquire result servers must be an array")
+  return { instanceId, servers: value.servers.map(parseAcquiredServer) }
+}
+
+/** Parse an untrusted `oauth` response value into a trusted `OAuthResult`. */
+export function parseOAuthResult(value: unknown): OAuthResult {
+  if (!isRecord(value)) throw new BrokerProtocolError("oauth result must be an object")
+  const callbackUrl = requireString(value.callbackUrl, "callbackUrl")
+  const instanceId = requireString(value.instanceId, "instanceId")
+  if (value.owner !== "broker") throw new BrokerProtocolError('oauth result owner must be "broker"')
+  return { callbackUrl, instanceId, owner: "broker" }
+}
+
+/** Parse an untrusted `ping` response value into a trusted `PingResult`. */
+export function parsePingResult(value: unknown): PingResult {
+  if (!isRecord(value)) throw new BrokerProtocolError("ping result must be an object")
+  return {
+    threadId: requireInteger(value.threadId, "threadId"),
+    directories: requireInteger(value.directories, "directories"),
+  }
+}
+
 /**
  * Resolve the effective timeout for a request: explicit request override, then
  * the server spec, then `DEFAULT_MCP_TIMEOUT_MS`. A non-positive value is a
- * configuration bug and throws.
+ * configuration bug and throws a `BrokerFailure` (not a parse error), because
+ * the value reached internal logic already parsed.
  */
 export function resolveRequestTimeout(requestTimeout?: number, specTimeout?: number): number {
   const chosen = requestTimeout ?? specTimeout ?? DEFAULT_MCP_TIMEOUT_MS
   if (typeof chosen !== "number" || !Number.isFinite(chosen) || chosen <= 0) {
-    throw new BrokerProtocolError(`timeout must be a positive number, got ${String(chosen)}`)
+    throw new BrokerFailure("invalid-request", `timeout must be a positive number, got ${String(chosen)}`)
   }
   return chosen
 }

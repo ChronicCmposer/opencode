@@ -26,14 +26,14 @@ import {
   type AcquireResult,
   type AcquiredServer,
   type BrokerError,
-  type BrokerErrorCode,
   type BrokerFrame,
   type BrokerRequest,
   type BrokerWorkerInbound,
   type CallRequest,
   type ServerSpec,
 } from "./protocol"
-import { parseBrokerRequest, resolveRequestTimeout } from "./protocol"
+import { BrokerFailure, parseBrokerRequest, resolveRequestTimeout } from "./protocol"
+import { mergeEnv } from "./env"
 
 // ---------------------------------------------------------------------------
 // Framing
@@ -117,15 +117,6 @@ function framerFor(kind: ServerSpec["kind"]): Framer {
 // Failures
 // ---------------------------------------------------------------------------
 
-class BrokerFailure extends Error {
-  readonly code: BrokerErrorCode
-  constructor(code: BrokerErrorCode, message: string) {
-    super(message)
-    this.name = "BrokerFailure"
-    this.code = code
-  }
-}
-
 function toBrokerError(reason: unknown): BrokerError {
   if (reason instanceof BrokerFailure) return { code: reason.code, message: reason.message }
   if (reason instanceof Error) return { code: "protocol", message: reason.message }
@@ -190,15 +181,6 @@ let rpc: MessagePort | null = null
 
 function postFrame(frame: BrokerFrame): void {
   rpc?.postMessage(frame)
-}
-
-function mergeEnv(overlay?: Readonly<Record<string, string>>): Record<string, string> {
-  const env: Record<string, string> = {}
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined) env[key] = value
-  }
-  for (const [key, value] of Object.entries(overlay ?? {})) env[key] = value
-  return env
 }
 
 function writeChild(child: ChildHandle, text: string): void {
@@ -341,23 +323,45 @@ function existsDirectory(directory: string): boolean {
   }
 }
 
-function sendChildRequest(child: ChildHandle, method: string, params: unknown, timeoutMs: number): Promise<unknown> {
+interface DispatchHooks {
+  /** Called once when the request settles (reply, reject, or timeout). */
+  readonly onSettle?: () => void
+  /** Called with the abort fn synchronously before the frame is written. */
+  readonly onAbort?: (abort: (error: BrokerFailure) => void) => void
+}
+
+/**
+ * Send one JSON-RPC request to a child and resolve with its reply (or reject on
+ * timeout). This is the single implementation shared by the initialize
+ * handshake and by call dispatch. `childId` and `timer` are declared before
+ * `settle`, so no settle path can touch a TDZ binding.
+ */
+function dispatch(
+  child: ChildHandle,
+  method: string,
+  params: unknown,
+  timeoutMs: number,
+  hooks: DispatchHooks = {},
+): Promise<unknown> {
   return new Promise<unknown>((resolve, reject) => {
+    const childId = child.nextId++
     let done = false
-    let timer: ReturnType<typeof setTimeout>
+    let timer!: ReturnType<typeof setTimeout>
     const settle = (finish: () => void) => {
       if (done) return
       done = true
       clearTimeout(timer)
       child.pending.delete(childId)
+      hooks.onSettle?.()
       finish()
     }
-    const childId = child.nextId++
-    timer = setTimeout(() => settle(() => reject(new BrokerFailure("timeout", `${method} timed out after ${timeoutMs}ms`))), timeoutMs)
+    const abort = (error: BrokerFailure) => settle(() => reject(error))
+    timer = setTimeout(() => abort(new BrokerFailure("timeout", `${method} timed out after ${timeoutMs}ms`)), timeoutMs)
     child.pending.set(childId, {
       settleResolve: (value) => settle(() => resolve(value)),
       settleReject: (error) => settle(() => reject(error)),
     })
+    hooks.onAbort?.(abort)
     writeChild(child, child.framer.encode({ jsonrpc: "2.0", id: childId, method, ...(params === undefined ? {} : { params }) }))
   })
 }
@@ -395,64 +399,50 @@ function runSerial<T>(state: DirectoryState, task: () => Promise<T>): Promise<T>
 // Request handlers
 // ---------------------------------------------------------------------------
 
+/** A failed initialize handshake is `handshake-failed`, except a real timeout. */
+function asHandshakeFailure(name: string, error: unknown): BrokerFailure {
+  if (error instanceof BrokerFailure && error.code === "timeout") return error
+  const detail = error instanceof Error ? error.message : String(error)
+  return new BrokerFailure("handshake-failed", `${name} initialize handshake failed: ${detail}`)
+}
+
 async function handleAcquire(request: BrokerRequest & { kind: "acquire" }): Promise<AcquireResult> {
   const state = directoryState(request.directory)
-  const servers: AcquiredServer[] = []
+  // Serialize acquisitions per directory: two concurrent acquires of the same
+  // (directory, server) must observe one child, not race to spawn two.
+  return runSerial(state, async () => {
+    const servers: AcquiredServer[] = []
 
-  for (const spec of request.servers) {
-    let child = state.children.get(spec.name)
-    if (!child) {
-      child = spawnChild(request.directory, spec)
-      state.children.set(spec.name, child)
-      try {
-        await sendChildRequest(
-          child,
-          "initialize",
-          { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "opencode-broker", version: "1.0.0" } },
-          resolveRequestTimeout(undefined, spec.timeoutMs),
-        )
-      } catch (error) {
-        state.children.delete(spec.name)
-        stopChild(child)
-        await awaitExit(child)
-        throw error
+    for (const spec of request.servers) {
+      let child = state.children.get(spec.name)
+      if (!child) {
+        child = spawnChild(request.directory, spec)
+        state.children.set(spec.name, child)
+        try {
+          await dispatch(
+            child,
+            "initialize",
+            { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "opencode-broker", version: "1.0.0" } },
+            resolveRequestTimeout(undefined, spec.timeoutMs),
+          )
+        } catch (error) {
+          state.children.delete(spec.name)
+          stopChild(child)
+          await awaitExit(child)
+          throw asHandshakeFailure(spec.name, error)
+        }
       }
+      servers.push({ name: spec.name, pid: child.pid, pgid: child.pgid, instanceId: state.instanceId })
     }
-    servers.push({ name: spec.name, pid: child.pid, pgid: child.pgid, instanceId: state.instanceId })
-  }
 
-  return { instanceId: state.instanceId, servers }
+    return { instanceId: state.instanceId, servers }
+  })
 }
 
 function dispatchCall(request: CallRequest, child: ChildHandle, timeoutMs: number): Promise<unknown> {
-  let done = false
-  let timer: ReturnType<typeof setTimeout>
-  return new Promise<unknown>((resolve, reject) => {
-    const childId = child.nextId++
-    const settle = (finish: () => void) => {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      child.pending.delete(childId)
-      activeCalls.delete(request.requestId)
-      finish()
-    }
-    timer = setTimeout(
-      () => settle(() => reject(new BrokerFailure("timeout", `${request.method} timed out after ${timeoutMs}ms`))),
-      timeoutMs,
-    )
-    child.pending.set(childId, {
-      settleResolve: (value) => settle(() => resolve(value)),
-      settleReject: (error) => settle(() => reject(error)),
-    })
-    activeCalls.set(request.requestId, {
-      child,
-      abort: (error) => settle(() => reject(error)),
-    })
-    writeChild(
-      child,
-      child.framer.encode({ jsonrpc: "2.0", id: childId, method: request.method, ...(request.params === undefined ? {} : { params: request.params }) }),
-    )
+  return dispatch(child, request.method, request.params, timeoutMs, {
+    onSettle: () => activeCalls.delete(request.requestId),
+    onAbort: (abort) => activeCalls.set(request.requestId, { child, abort }),
   })
 }
 

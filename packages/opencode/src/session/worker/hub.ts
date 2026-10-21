@@ -15,7 +15,9 @@
 
 import { Context, Effect, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { mergeEnv } from "@/session/broker/env"
 import type { SessionID } from "@/session/schema"
+import { defined } from "@/util/object"
 import { createDispatcher, type CancellationConfig, type Dispatcher } from "./dispatch"
 import { createJobRegistry, type JobRegistry } from "./job-registry"
 import { createResultRouter, serveJobRegistry, type JobPort } from "./job-client"
@@ -70,24 +72,42 @@ export interface SessionHubOptions {
   readonly jobs?: JobRegistry
 }
 
+/**
+ * The worker currently hosting a session, as the dispatcher knows it. Declared
+ * locally so the hub can consume it without importing the dispatcher's registry.
+ * `dispatch.ts` must add this method to `Dispatcher` (consolidation request).
+ */
+interface WorkerLookup {
+  workerForSession(sessionID: SessionID): number | undefined
+}
+
 /** Compose the dispatcher + executor pool + cooperative cancel into one hub. */
 export function createSessionHub(options: SessionHubOptions): SessionHub {
   const dispatcher = createDispatcher({
     pool: options.pool,
-    ...(options.headroom === undefined ? {} : { headroom: options.headroom }),
-    ...(options.admissionCapacity === undefined ? {} : { admissionCapacity: options.admissionCapacity }),
-    ...(options.childCapacity === undefined ? {} : { childCapacity: options.childCapacity }),
-    ...(options.headroomIdleReapMs === undefined ? {} : { headroomIdleReapMs: options.headroomIdleReapMs }),
-    ...(options.cancellation === undefined ? {} : { cancellation: options.cancellation }),
-    ...(options.onDegraded === undefined ? {} : { onDegraded: options.onDegraded }),
+    ...defined({
+      headroom: options.headroom,
+      admissionCapacity: options.admissionCapacity,
+      childCapacity: options.childCapacity,
+      headroomIdleReapMs: options.headroomIdleReapMs,
+      cancellation: options.cancellation,
+      onDegraded: options.onDegraded,
+    }),
   })
   const dispatch: SessionDispatch = createSessionDispatch({ dispatcher, pool: options.pool })
 
   // One registry for the whole hub. A settled child is routed to the worker
   // currently hosting its `parentID` (the dispatcher's key→worker map).
   const jobPorts = new Map<number, JobPort>()
+  // The hub asks the dispatcher for a session's worker instead of reaching into
+  // its registry. `dispatch.ts` still needs to implement `workerForSession`
+  // (consolidation request); the registry read is a temporary fallback.
+  const workerForSession = (sessionID: string): number | undefined => {
+    const lookup = dispatcher as unknown as Partial<WorkerLookup>
+    return lookup.workerForSession?.(sessionID as SessionID) ?? dispatcher.registry.get(sessionID as SessionID)?.workerID
+  }
   const portForSession = (sessionID: string): JobPort | undefined => {
-    const workerID = dispatcher.registry.get(sessionID as SessionID)?.workerID
+    const workerID = workerForSession(sessionID)
     return workerID === undefined ? undefined : jobPorts.get(workerID)
   }
   const jobs = options.jobs ?? createJobRegistry({ routeResult: createResultRouter(portForSession) })
@@ -131,11 +151,16 @@ export interface BunExecutorTransportOptions {
   readonly env?: Record<string, string | undefined>
   readonly workerData?: unknown
   readonly timeoutMs?: number
+  /** Maximum buffered outbound frames kept for late `waitFor` matches. */
+  readonly bufferCapacity?: number
   /** Called with each `MessagePort` the worker transfers (the job control link). */
   readonly onPort?: (port: MessagePort) => void
 }
 
 const DEFAULT_TRANSPORT_TIMEOUT_MS = 30_000
+
+/** Cap on buffered frames, so a transport nobody waits on cannot grow unbounded. */
+export const DEFAULT_TRANSPORT_BUFFER_CAPACITY = 1024
 
 /** Extract a transferred port from a worker frame (`{type:"job-port", port}` or a bare port). */
 function transferredPort(data: unknown): MessagePort | undefined {
@@ -144,18 +169,6 @@ function transferredPort(data: unknown): MessagePort | undefined {
   const frame = data as { readonly type?: unknown; readonly port?: unknown }
   if (frame.type !== "job-port") return undefined
   return typeof MessagePort !== "undefined" && frame.port instanceof MessagePort ? frame.port : undefined
-}
-
-function mergeEnv(overlay?: Record<string, string | undefined>): Record<string, string> {
-  const env: Record<string, string> = {}
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined) env[key] = value
-  }
-  for (const [key, value] of Object.entries(overlay ?? {})) {
-    if (value === undefined) delete env[key]
-    else env[key] = value
-  }
-  return env
 }
 
 interface PendingWaiter {
@@ -172,9 +185,10 @@ interface PendingWaiter {
  */
 export function createBunExecutorTransport(options: BunExecutorTransportOptions): ExecutorTransport {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TRANSPORT_TIMEOUT_MS
+  const bufferCapacity = options.bufferCapacity ?? DEFAULT_TRANSPORT_BUFFER_CAPACITY
   const worker = new Worker(options.entry, {
     env: mergeEnv(options.env),
-    ...(options.workerData === undefined ? {} : { workerData: options.workerData }),
+    ...defined({ workerData: options.workerData }),
   })
   const messages: SessionExecutorOutbound[] = []
   const waiters = new Set<PendingWaiter>()
@@ -188,6 +202,13 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     }
   }
 
+  /** Remove and return the first buffered frame matching `predicate`, if any. */
+  const takeBuffered = (predicate: (message: SessionExecutorOutbound) => boolean): SessionExecutorOutbound | undefined => {
+    const index = messages.findIndex(predicate)
+    if (index === -1) return undefined
+    return messages.splice(index, 1)[0]
+  }
+
   worker.onmessage = (event: MessageEvent) => {
     const port = transferredPort(event.data)
     if (port !== undefined) {
@@ -196,8 +217,13 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     }
     const message = event.data as SessionExecutorOutbound
     messages.push(message)
-    for (const waiter of waiters) {
+    if (messages.length > bufferCapacity) messages.shift()
+    for (const waiter of [...waiters]) {
+      const index = messages.indexOf(message)
+      // A prior waiter consumed this frame; no other waiter may match it.
+      if (index === -1) break
       if (!waiter.predicate(message)) continue
+      messages.splice(index, 1)
       clearTimeout(waiter.timer)
       waiters.delete(waiter)
       waiter.resolve(message)
@@ -206,7 +232,12 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
 
   worker.onerror = (event: ErrorEvent) => {
     alive = false
+    // Detach so a terminating worker cannot re-enter this handler, then fail
+    // every waiter and tear the isolate down.
+    worker.onmessage = null
+    worker.onerror = null
     failWaiters(new Error(`session worker error: ${event.message}`))
+    void worker.terminate()
   }
 
   return {
@@ -215,7 +246,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       worker.postMessage(message)
     },
     waitFor(predicate, waitOptions) {
-      const buffered = messages.find(predicate)
+      const buffered = takeBuffered(predicate)
       if (buffered !== undefined) return Promise.resolve(buffered)
       const waitMs = waitOptions?.timeoutMs ?? timeoutMs
       return new Promise<SessionExecutorOutbound>((resolve, reject) => {
@@ -259,16 +290,17 @@ export function createBunExecutorWorkerPool(options: BunExecutorWorkerPoolOption
       const onJobPort = options.onJobPort
       const transport = createBunExecutorTransport({
         entry: options.entry,
-        ...(options.env === undefined ? {} : { env: options.env }),
-        ...(options.workerData === undefined ? {} : { workerData: options.workerData }),
-        ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
-        ...(onJobPort === undefined ? {} : { onPort: (port) => onJobPort(id, port) }),
+        ...defined({
+          env: options.env,
+          workerData: options.workerData,
+          timeoutMs: options.timeoutMs,
+          onPort: onJobPort === undefined ? undefined : (port: MessagePort) => onJobPort(id, port),
+        }),
       })
       return createExecutorWorker({
         id,
         transport,
-        ...(options.workKind === undefined ? {} : { workKind: options.workKind }),
-        ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+        ...defined({ workKind: options.workKind, timeoutMs: options.timeoutMs }),
       })
     },
   })

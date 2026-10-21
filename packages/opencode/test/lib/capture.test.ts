@@ -49,6 +49,13 @@ describe("capture harness", () => {
     expect(() => capture.record({ channel: "nope" as never, kind: "x" })).toThrow(/unknown capture channel/)
   })
 
+  test("rejects an empty kind loudly", () => {
+    const capture = createCapture()
+
+    expect(() => capture.event("")).toThrow(/capture kind/)
+    expect(() => capture.record({ channel: "event", kind: "" })).toThrow(/capture kind/)
+  })
+
   test("reset clears the timeline and restarts the sequence", () => {
     const capture = createCapture()
     capture.event("a")

@@ -11,22 +11,28 @@
 // integration-gated on Phase 9/12; see `.parallel-implement/phase13-e2e.md`.
 
 import { describe, expect, test } from "bun:test"
+import { existsSync } from "node:fs"
 import { Effect } from "effect"
 import { testEffect } from "../../lib/effect"
 import { TestLLMServer } from "../../lib/llm-server"
-import { measureSessionWorkerBoot, runParallelSessions } from "../../lib/mock-sse-harness"
+import { DEFAULT_BURN_ITERATIONS, measureSessionWorkerBoot, runParallelSessions } from "../../lib/mock-sse-harness"
 
 const it = testEffect(TestLLMServer.layer)
 
 const CORES = 4
 const SESSIONS = 4
-const BURN_ITERATIONS = 20_000_000
+const BURN_ITERATIONS = DEFAULT_BURN_ITERATIONS
 
-/** The POSIX per-thread CPU reader (and thus busy-thread accounting) is available. */
-const hasThreadCpu = (source: string): boolean => source === "proc"
+/**
+ * The per-thread CPU reader (and therefore busy-thread accounting) needs the
+ * Linux `/proc` thread-stat files. When they are absent the CPU-law tests are
+ * skipped loudly instead of passing vacuously.
+ */
+const procCpuAvailable = existsSync("/proc/thread-self") || existsSync("/proc/self/task")
+const cpuIt = procCpuAvailable ? it.live : it.live.skip
 
 describe("13.1 mock-SSE harness drives N concurrent sessions through the pool", () => {
-  it.live("a 1-worker pool runs every session on one hot thread", () =>
+  cpuIt("a 1-worker pool runs every session on one hot thread", () =>
     Effect.gen(function* () {
       const llm = yield* TestLLMServer
       const report = yield* Effect.promise(() =>
@@ -45,11 +51,11 @@ describe("13.1 mock-SSE harness drives N concurrent sessions through the pool", 
       expect(report.throughputPerSec).toBeGreaterThan(0)
 
       // Structural baseline: exactly one worker thread accrued CPU.
-      if (hasThreadCpu(report.hubLoopGap.source)) expect(report.busyThreads).toBe(1)
+      expect(report.busyThreads).toBe(1)
     }),
   )
 
-  it.live("a K-worker pool spreads the same sessions over at least two busy threads", () =>
+  cpuIt("a K-worker pool spreads the same sessions over at least two busy threads", () =>
     Effect.gen(function* () {
       const llm = yield* TestLLMServer
       const report = yield* Effect.promise(() =>
@@ -64,7 +70,7 @@ describe("13.1 mock-SSE harness drives N concurrent sessions through the pool", 
 
       expect(report.results).toHaveLength(SESSIONS)
       for (const result of report.results) expect(result.value).toMatchObject({ text: "ok" })
-      if (hasThreadCpu(report.hubLoopGap.source)) expect(report.busyThreads).toBeGreaterThanOrEqual(2)
+      expect(report.busyThreads).toBeGreaterThanOrEqual(2)
     }),
   )
 })

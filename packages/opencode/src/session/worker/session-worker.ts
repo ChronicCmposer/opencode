@@ -48,8 +48,59 @@ interface WorkerScope {
   onmessage: ((event: { data: unknown }) => void) | null
 }
 
+/**
+ * Parse the structured-cloned `workerData` at the isolate boundary. A missing or
+ * malformed payload must fail loud with a descriptive error, not surface later
+ * as an opaque `undefined` property access.
+ */
+export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
+  if (typeof data !== "object" || data === null) {
+    throw new Error(`session worker requires a SessionWorkerInit workerData, received ${typeof data}`)
+  }
+  const candidate = data as Partial<SessionWorkerInit>
+  if (typeof candidate.snapshot !== "object" || candidate.snapshot === null) {
+    throw new Error("session worker workerData.snapshot is required")
+  }
+  if (typeof candidate.env !== "object" || candidate.env === null) {
+    throw new Error("session worker workerData.env is required")
+  }
+  if (candidate.model === undefined || typeof candidate.model.baseUrl !== "string") {
+    throw new Error("session worker workerData.model.baseUrl is required")
+  }
+  return candidate as SessionWorkerInit
+}
+
 const scope = globalThis as unknown as WorkerScope
-const init = workerData as SessionWorkerInit
+const init = parseSessionWorkerInit(workerData)
+
+/** Observability sink the worker's mock writer/egress adapters record into. */
+export interface WorkerRecordSink {
+  readonly publish: (result: { readonly seq: number; readonly committed: boolean }) => void
+  readonly emit: (type: string) => void
+}
+
+/**
+ * Build the worker-local mock clients. This replaces the former module-level
+ * `published`/`emitted` arrays: the adapters are now pure over an injected sink,
+ * so the only mutable state is the writer's monotonic `seq` counter.
+ */
+function createMockClients(sink: WorkerRecordSink) {
+  let publishedCount = 0
+  return {
+    writer: {
+      query: async () => [],
+      publish: async () => {
+        publishedCount += 1
+        const result = { seq: publishedCount, committed: true }
+        sink.publish(result)
+        return result
+      },
+    },
+    egress: { emit: (event: { type: string }) => sink.emit(event.type) },
+    broker: { call: async () => null },
+    backgroundJob,
+  }
+}
 
 // The worker's dedicated job control link: transfer one end to the hub (which
 // serves the cross-worker registry on it) and drive the thin client with the
@@ -58,9 +109,6 @@ const init = workerData as SessionWorkerInit
 const jobChannel = new MessageChannel()
 scope.postMessage({ type: "job-port", port: jobChannel.port2 }, [jobChannel.port2 as unknown as Transferable])
 const backgroundJob = createJobClient(jobPortFromMessagePort(jobChannel.port1))
-
-const published: Array<{ seq: number; committed: boolean }> = []
-const emitted: string[] = []
 
 /** Consume a mock-provider SSE body into the concatenated assistant text. */
 async function consumeChat(model: SessionWorkerModel): Promise<string> {
@@ -123,19 +171,7 @@ function modelLayer(model: SessionWorkerModel): Layer.Layer<ModelClient> {
 const runtime = buildSessionWorkerLayer({
   snapshot: init.snapshot,
   env: init.env,
-  clients: {
-    writer: {
-      query: async () => [],
-      publish: async () => {
-        const result = { seq: published.length + 1, committed: true }
-        published.push(result)
-        return result
-      },
-    },
-    egress: { emit: (event) => void emitted.push(event.type) },
-    broker: { call: async () => null },
-    backgroundJob,
-  },
+  clients: createMockClients({ publish: () => {}, emit: () => {} }),
   modelClient: modelLayer(init.model),
 })
 

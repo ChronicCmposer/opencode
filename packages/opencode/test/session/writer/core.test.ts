@@ -18,12 +18,9 @@ import {
   type WriterCoreOptions,
 } from "@/session/writer/core"
 import { FAULTS_ENV } from "@/testing/faults"
-
-const SCHEMA = `
-CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, owner_id TEXT);
-CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL);
-CREATE TABLE projector_log (aggregate_id TEXT, seq INTEGER NOT NULL, type TEXT);
-`
+import { capture } from "../../lib/async"
+import { pollUntil } from "../../lib/poll"
+import { SCHEMA_SQL, ev } from "./fixtures"
 
 const originalGate = process.env[FAULTS_ENV]
 afterEach(() => {
@@ -38,18 +35,10 @@ interface Harness {
 
 function harness(options: Omit<WriterCoreOptions, "connection"> = {}): Harness {
   const connection = createBunSqliteConnection({ filename: ":memory:" })
-  connection.exec(SCHEMA)
+  connection.exec(SCHEMA_SQL)
   const core = createWriterCore({ connection, sleep: async () => {}, ...options })
   return { core, rows: (sql, params = []) => connection.all(sql, params) }
 }
-
-let eventCounter = 0
-const ev = (type: string, aggregateID: string, data: Record<string, unknown> = {}) => ({
-  id: `evt-${++eventCounter}`,
-  type,
-  aggregateID,
-  data,
-})
 
 const sequenceOf = (rows: ReadonlyArray<Record<string, unknown>>): number[] => rows.map((row) => Number(row.seq))
 
@@ -83,7 +72,7 @@ describe("writer core: serialization and sequence allocation (7.1, 7.10, 7.17)",
     const { core, rows } = harness()
     const result = await core.publish({ event: ev("t", "a"), durable: false })
 
-    expect(result).toEqual({ seq: null, committed: false, ordinal: 0, idempotent: false })
+    expect(result).toEqual({ seq: null, committed: false, ordinal: null, idempotent: false })
     expect(rows("SELECT seq FROM event_sequence")).toEqual([])
     expect(rows("SELECT id FROM event")).toEqual([])
   })
@@ -155,11 +144,25 @@ describe("writer core: owner fencing and steal (7.14)", () => {
     expect(result.seq).toBe(1)
   })
 
-  test("claim reassigns unconditionally (last wins)", async () => {
+  test("claim is fenced: it never overwrites an existing owner, while steal is unconditional", async () => {
     const { core, rows } = harness()
     await core.publish({ event: ev("t", "a"), durable: true, ownerID: "o1" })
-    await core.claim("a", "o3")
+
+    await expect(core.claim("a", "o3")).rejects.toBeInstanceOf(OwnerMismatchError)
+    expect(rows("SELECT owner_id FROM event_sequence WHERE aggregate_id = 'a'")).toEqual([{ owner_id: "o1" }])
+
+    await core.steal("a", "o3")
     expect(rows("SELECT owner_id FROM event_sequence WHERE aggregate_id = 'a'")).toEqual([{ owner_id: "o3" }])
+  })
+
+  test("claim succeeds while the aggregate is unowned and is rejected when absent", async () => {
+    const { core, rows } = harness()
+    // A publish without an owner leaves the sequence row owned by nobody.
+    await core.publish({ event: ev("t", "a"), durable: true })
+    await core.claim("a", "o1")
+    expect(rows("SELECT owner_id FROM event_sequence WHERE aggregate_id = 'a'")).toEqual([{ owner_id: "o1" }])
+
+    await expect(core.claim("absent", "o1")).rejects.toBeInstanceOf(OwnerMismatchError)
   })
 })
 
@@ -168,7 +171,7 @@ describe("writer core: SQLITE_BUSY retry (7.8)", () => {
     process.env[FAULTS_ENV] = "failCommitAt@writer:commit"
     const delays: number[] = []
     const connection = createBunSqliteConnection({ filename: ":memory:" })
-    connection.exec(SCHEMA)
+    connection.exec(SCHEMA_SQL)
     const core = createWriterCore({
       connection,
       sleep: async (ms) => {
@@ -185,7 +188,7 @@ describe("writer core: SQLITE_BUSY retry (7.8)", () => {
   test("a busy that clears before exhaustion succeeds and consumes one sequence", async () => {
     process.env[FAULTS_ENV] = "failCommitAt@writer:commit"
     const connection = createBunSqliteConnection({ filename: ":memory:" })
-    connection.exec(SCHEMA)
+    connection.exec(SCHEMA_SQL)
     let attempts = 0
     const core = createWriterCore({
       connection,
@@ -250,7 +253,17 @@ describe("writer core: reserved-handle transactions (7.4)", () => {
       "{}",
     ])
 
-    await new Promise((resolve) => setTimeout(resolve, 60))
+    // The idle window is a real timer; wait for its observable effect — a fresh
+    // pin now succeeds — instead of sleeping a fixed multiple of it.
+    await pollUntil(
+      async () => {
+        const outcome = await capture(core.beginTransaction())
+        if (!outcome.ok) return false
+        await core.rollbackTransaction(outcome.value)
+        return true
+      },
+      { message: "idle transaction was never rolled back" },
+    )
     expect(rows("SELECT id FROM event")).toEqual([])
     await expect(core.txQuery(handle, "all", "SELECT 1")).rejects.toBeInstanceOf(TransactionError)
   })
@@ -356,7 +369,7 @@ describe("writer core: bounded queue backpressure (7.15)", () => {
       core.publish({ event: ev("t", "a"), durable: true }),
     ]
 
-    await new Promise((resolve) => setTimeout(resolve, 5))
+    await pollUntil(() => core.pending().overflow > 0, { message: "queue never started overflowing" })
     expect(core.pending().overflow).toBeGreaterThan(0)
     expect(core.depth()).toBeLessThanOrEqual(2)
 
@@ -379,6 +392,69 @@ describe("writer core: remove (7.13)", () => {
   })
 })
 
+describe("writer core: egress ordinal (step 4)", () => {
+  test("durable commits increment the ordinal; non-events carry none", async () => {
+    const { core } = harness()
+    const first = await core.publish({ event: ev("t", "a"), durable: true })
+    const second = await core.publish({ event: ev("t", "b"), durable: true })
+    expect(first.ordinal).toBe(1)
+    expect(second.ordinal).toBe(2)
+
+    const nonDurable = await core.publish({ event: ev("t", "a"), durable: false })
+    expect(nonDurable.ordinal).toBeNull()
+
+    const event = ev("t", "c")
+    await core.publish({ event, durable: true })
+    const replay = await core.replay({ event, seq: 0 })
+    expect(replay).toMatchObject({ idempotent: true })
+    expect(replay.ordinal).toBeNull()
+  })
+
+  test("a replay that commits consumes an ordinal", async () => {
+    const { core } = harness()
+    const result = await core.replay({ event: ev("t", "a"), seq: 0 })
+    expect(result).toMatchObject({ committed: true, ordinal: 1 })
+  })
+})
+
+describe("writer core: registered projector type enforcement (step 7)", () => {
+  test("a registered projector refuses an event of a different type", async () => {
+    const { core, rows } = harness()
+    await core.registerProjector(
+      "log",
+      "t",
+      "INSERT INTO projector_log (aggregate_id, seq, type) VALUES ($aggregate_id, $seq, $type)",
+    )
+
+    await expect(core.publish({ event: ev("other", "a"), durable: true, commitId: "log" })).rejects.toThrow(
+      /registered for event type/,
+    )
+    expect(rows("SELECT id FROM event")).toEqual([])
+  })
+})
+
+describe("writer core: pending depth (step 5)", () => {
+  test("pending surfaces the admitted depth alongside the overflow waiters", async () => {
+    const { core } = harness({ maxQueue: 1 })
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+
+    const running = core.publish({ event: ev("t", "a"), durable: true, commit: async () => gate })
+    void core.publish({ event: ev("t", "a"), durable: true })
+    void core.publish({ event: ev("t", "a"), durable: true })
+
+    await pollUntil(() => core.pending().overflow > 0, { message: "queue never started overflowing" })
+    const pending = core.pending()
+    expect(pending.depth).toBe(1)
+    expect(pending.overflow).toBeGreaterThan(0)
+
+    release()
+    await running
+  })
+})
+
 describe("writer core: lifecycle", () => {
   test("close rejects queued operations instead of orphaning them", async () => {
     const { core } = harness()
@@ -387,5 +463,22 @@ describe("writer core: lifecycle", () => {
 
     await core.close()
     await expect(queued).rejects.toBeInstanceOf(WriterClosedError)
+  })
+
+  test("close awaits the in-flight job so it cannot run against a closed connection", async () => {
+    const { core } = harness()
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+
+    const job = core.publish({ event: ev("t", "a"), durable: true, commit: async () => gate })
+    // The publish is admitted and started synchronously; closing must let it finish.
+    const closing = core.close()
+    release()
+
+    // If close did not await the job, this would reject against the closed handle.
+    await expect(job).resolves.toMatchObject({ seq: 0, committed: true })
+    await closing
   })
 })

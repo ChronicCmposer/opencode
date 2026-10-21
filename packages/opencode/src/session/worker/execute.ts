@@ -12,7 +12,7 @@
 // kind to a session work Effect. Phase 5 ships a `"noop"` placeholder; Phase 6
 // registers the reduced-`AppLayer` pipeline.
 
-import { Effect, Schema, Scope } from "effect"
+import { Cause, Effect, Exit, Schema, Scope } from "effect"
 import type { Latch } from "effect"
 import { Runner } from "@/effect/runner"
 import type { SessionID } from "@/session/schema"
@@ -163,8 +163,10 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
     effect: Effect.Effect<SessionExecutionResult, unknown>,
   ): Effect.Effect<SessionExecutorOutbound> =>
     effect.pipe(
-      Effect.match({
-        onFailure: (error): SessionExecutorOutbound => failed(id, error),
+      // `matchCause` (not `match`) so a defect — not just a typed failure —
+      // folds into a structured error frame instead of rejecting the handler.
+      Effect.matchCause({
+        onFailure: (cause): SessionExecutorOutbound => failed(id, Cause.squash(cause)),
         onSuccess: (result): SessionExecutorOutbound => ({ type: "done", id, result }),
       }),
     )
@@ -219,8 +221,14 @@ export interface SessionExecutorInstallOptions {
   readonly onIdle?: (sessionID: SessionID) => Effect.Effect<void>
   readonly onBusy?: (sessionID: SessionID) => Effect.Effect<void>
   readonly threadId?: number
-  /** Scope seam for tests; a fresh scope is created when omitted. */
+  /** Scope seam for tests; a fresh scope is created (and owned) when omitted. */
   readonly scope?: Scope.Scope
+}
+
+/** An installed executor plus disposal of the scope it owns when none was supplied. */
+export interface InstalledSessionExecutor extends SessionExecutor {
+  /** Close the executor's owned worker scope; no-op when a scope was supplied. */
+  dispose(): Promise<void>
 }
 
 /**
@@ -230,7 +238,8 @@ export interface SessionExecutorInstallOptions {
 export function installSessionExecutor(
   scope: ExecutorWorkerScope,
   options: SessionExecutorInstallOptions,
-): SessionExecutor {
+): InstalledSessionExecutor {
+  const ownsScope = options.scope === undefined
   const workerScope = options.scope ?? Effect.runSync(Scope.make())
   const machine = createSessionRunMachine({ scope: workerScope, onIdle: options.onIdle, onBusy: options.onBusy })
   const executor = createSessionExecutor({ machine, work: options.work })
@@ -251,7 +260,13 @@ export function installSessionExecutor(
   }
 
   scope.postMessage({ type: "ready", threadId: options.threadId ?? 0 })
-  return executor
+  return {
+    handle: executor.handle,
+    dispose: async () => {
+      if (!ownsScope) return
+      await Effect.runPromise(Scope.close(workerScope, Exit.void))
+    },
+  }
 }
 
 // --- Hub-side adapter -------------------------------------------------------
@@ -339,7 +354,12 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     cancel,
     assertNotBusy,
     resultFor: (sessionID) => results.get(sessionID),
-    terminate: () => transport.terminate().then(() => undefined),
+    terminate: async () => {
+      // Evict recorded results with the isolate so the map cannot grow without
+      // bound across a long-lived pool.
+      results.clear()
+      await transport.terminate()
+    },
   }
 }
 
@@ -361,6 +381,9 @@ export interface ExecutorWorkerPool {
 export function createExecutorWorkerPool(options: ExecutorWorkerPoolOptions): ExecutorWorkerPool {
   const foreground = Array.from({ length: options.k }, (_, index) => options.spawn(index + 1))
   const extra: ExecutorWorker[] = []
+  // One monotonic counter shared by foreground and extra, so a slot that is
+  // terminated and replaced never reuses an id.
+  let nextId = options.k + 1
   const all = (): ExecutorWorker[] => [...foreground, ...extra]
 
   return {
@@ -368,12 +391,33 @@ export function createExecutorWorkerPool(options: ExecutorWorkerPoolOptions): Ex
       return foreground.slice()
     },
     spawn() {
-      const worker = options.spawn(100 + extra.length)
+      const worker = options.spawn(nextId++)
       extra.push(worker)
-      return worker
+      const wrapped: ExecutorWorker = {
+        get id() {
+          return worker.id
+        },
+        get alive() {
+          return worker.alive
+        },
+        execute: (run) => worker.execute(run),
+        cancel: (sessionID) => worker.cancel(sessionID),
+        assertNotBusy: (sessionID) => worker.assertNotBusy(sessionID),
+        resultFor: (sessionID) => worker.resultFor(sessionID),
+        terminate: async () => {
+          // Drop the terminated worker from the headroom set so the pool's
+          // bookkeeping tracks live workers only.
+          const index = extra.indexOf(worker)
+          if (index >= 0) extra.splice(index, 1)
+          await worker.terminate()
+        },
+      }
+      return wrapped
     },
     async terminateAll() {
-      await Promise.all(all().map((worker) => worker.terminate().catch(() => undefined)))
+      const workers = all()
+      extra.length = 0
+      await Promise.all(workers.map((worker) => worker.terminate().catch(() => undefined)))
     },
     byID: (id) => all().find((worker) => worker.id === id),
     resultFor: (sessionID) => {

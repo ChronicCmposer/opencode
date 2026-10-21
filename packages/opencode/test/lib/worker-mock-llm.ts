@@ -39,6 +39,8 @@ export interface MockLlmUsage {
 
 export interface MockLlmChatResult {
   readonly type: "chat-result"
+  /** Echoes the originating `MockLlmChatRequest.id` so the hub can correlate. */
+  readonly id: string
   readonly text: string
   usage?: MockLlmUsage
   toolCalls?: readonly MockLlmToolCall[]
@@ -46,6 +48,8 @@ export interface MockLlmChatResult {
 
 export interface MockLlmError {
   readonly type: "chat-error"
+  /** Echoes the originating `MockLlmChatRequest.id` so the hub can correlate. */
+  readonly id: string
   readonly message: string
 }
 
@@ -141,7 +145,7 @@ function applyFrame(accumulator: ChatAccumulator, frame: string): void {
   }
 }
 
-async function readChatStream(response: Response): Promise<MockLlmChatResult> {
+async function readChatStream(response: Response, id: string): Promise<MockLlmChatResult> {
   if (!response.body) throw new Error("mock provider returned an empty body")
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
@@ -162,7 +166,7 @@ async function readChatStream(response: Response): Promise<MockLlmChatResult> {
   buffer += decoder.decode()
   if (buffer.trim()) applyFrame(accumulator, buffer)
 
-  const result: MockLlmChatResult = { type: "chat-result", text: accumulator.text }
+  const result: MockLlmChatResult = { type: "chat-result", id, text: accumulator.text }
   if (accumulator.usage) result.usage = accumulator.usage
   if (accumulator.toolCalls.length > 0) result.toolCalls = accumulator.toolCalls
   return result
@@ -182,7 +186,7 @@ async function consumeChat(bootstrap: MockLlmBootstrap, request: MockLlmChatRequ
     }),
   })
   if (!response.ok) throw new MockProviderError(response.status)
-  return readChatStream(response)
+  return readChatStream(response, request.id)
 }
 
 function describeError(error: unknown): string {
@@ -210,14 +214,22 @@ export function installMockLlmWorker(scope: MockLlmWorkerScope): void {
 
     if (message.type === "chat") {
       if (!bootstrap) {
-        scope.postMessage({ type: "chat-error", message: "worker received chat before init" } satisfies MockLlmError)
+        scope.postMessage({
+          type: "chat-error",
+          id: message.id,
+          message: "worker received chat before init",
+        } satisfies MockLlmError)
         return
       }
       const current = bootstrap
       void consumeChat(current, message).then(
         (result) => scope.postMessage(result),
         (error) =>
-          scope.postMessage({ type: "chat-error", message: describeError(error) } satisfies MockLlmError),
+          scope.postMessage({
+            type: "chat-error",
+            id: message.id,
+            message: describeError(error),
+          } satisfies MockLlmError),
       )
     }
   }

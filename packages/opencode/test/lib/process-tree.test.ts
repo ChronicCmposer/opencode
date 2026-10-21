@@ -116,6 +116,52 @@ describe("fake MCP/LSP child-process fixture (3.8)", () => {
     )
   }
 
+  test("a read timeout leaves no leaked read (the next line still arrives)", async () => {
+    const child = spawnDetached(
+      [
+        process.execPath,
+        "-e",
+        "setTimeout(() => process.stdout.write('late-1\\n'), 150); setTimeout(() => process.exit(0), 600)",
+      ],
+      { stdout: "pipe" },
+    )
+    try {
+      await expect(child.reader.readLine(30)).rejects.toThrow(/timed out reading child output/)
+      // Before the fix the abandoned read consumed `late-1` and dropped it.
+      await expect(child.reader.readLine(2000)).resolves.toBe("late-1")
+    } finally {
+      child.kill("SIGKILL")
+      await child.exited
+    }
+  })
+
+  test("readLine aborts on an AbortSignal", async () => {
+    const child = spawnDetached([process.execPath, "-e", "setInterval(() => {}, 1000)"], { stdout: "pipe" })
+    const controller = new AbortController()
+    try {
+      const reading = child.reader.readLine(5000, controller.signal)
+      setTimeout(() => controller.abort(new Error("stop-reading")), 30)
+      await expect(reading).rejects.toThrow(/stop-reading/)
+    } finally {
+      child.kill("SIGKILL")
+      await child.exited
+    }
+  })
+
+  test("write resolves once flushed stdin reaches the child", async () => {
+    const child = spawnDetached(
+      [process.execPath, "-e", "process.stdin.on('data', (d) => process.stdout.write('got:' + d.toString().trim() + '\\n'))"],
+      { stdin: "pipe", stdout: "pipe" },
+    )
+    try {
+      await child.write("hello\n")
+      await expect(child.reader.readLine(2000)).resolves.toBe("got:hello")
+    } finally {
+      child.kill("SIGKILL")
+      await child.exited
+    }
+  })
+
   test.skipIf(!support.supported)(
     "killing only the root PID leaves descendants alive (why PGID kill is required)",
     async () => {

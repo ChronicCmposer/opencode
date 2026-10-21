@@ -17,12 +17,12 @@ import {
 } from "@/session/worker/job-client"
 import { createJobRegistry, type JobInfo } from "@/session/worker/job-registry"
 import type { BackgroundJobClientHandle } from "@/session/worker/layer"
-
-const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+import { flush } from "../../lib/async"
+import { createListenerPair, type ListenerPair } from "../../lib/port-pair"
 
 describe("9.2 the thin client is a drop-in for the landed worker handle", () => {
   test("a JobClient structurally satisfies BackgroundJobClientHandle", () => {
-    const ports = createPortPair()
+    const ports = createListenerPair<JobFrame>()
     const client = createJobClient(ports.worker)
     // Compile-time proof only: `wait`/`cancel` are the handle's whole surface.
     const handle: BackgroundJobClientHandle = client
@@ -32,40 +32,15 @@ describe("9.2 the thin client is a drop-in for the landed worker handle", () => 
   })
 })
 
-/** An in-process hub↔worker port pair; `hub.post` reaches the worker client. */
-function createPortPair(): { hub: JobPort; worker: JobPort } {
-  const hubListeners = new Set<(frame: JobFrame) => void>()
-  const workerListeners = new Set<(frame: JobFrame) => void>()
-  const deliver = (listeners: Set<(frame: JobFrame) => void>, frame: JobFrame): void => {
-    for (const listener of listeners) listener(frame)
-  }
-  return {
-    hub: {
-      post: (frame) => deliver(workerListeners, frame),
-      onMessage: (handler) => {
-        hubListeners.add(handler)
-        return () => hubListeners.delete(handler)
-      },
-    },
-    worker: {
-      post: (frame) => deliver(hubListeners, frame),
-      onMessage: (handler) => {
-        workerListeners.add(handler)
-        return () => workerListeners.delete(handler)
-      },
-    },
-  }
-}
-
 interface Hub {
   readonly clients: JobClient[]
-  readonly ports: Array<{ hub: JobPort; worker: JobPort }>
+  readonly ports: ListenerPair<JobFrame>[]
   dispose(): void
 }
 
 /** One registry served on `count` worker ports. */
 function createHub(registry: ReturnType<typeof createJobRegistry>, count: number): Hub {
-  const ports = Array.from({ length: count }, () => createPortPair())
+  const ports = Array.from({ length: count }, () => createListenerPair<JobFrame>())
   const disposes = ports.map((pair) => serveJobRegistry(registry, pair.hub))
   const clients = ports.map((pair) => createJobClient(pair.worker))
   return { clients, ports, dispose: () => disposes.forEach((dispose) => dispose()) }
@@ -143,9 +118,60 @@ describe("9.3 background.wait resolves across workers", () => {
   })
 })
 
+describe("job client lifecycle (dispose / timeout / server faults)", () => {
+  test("dispose rejects pending requests and fails later requests fast", async () => {
+    const ports = createListenerPair<JobFrame>()
+    const client = createJobClient(ports.worker)
+    const pending = client.get("ses_none")
+    client.dispose()
+    await expect(pending).rejects.toThrow("job client disposed")
+    await expect(client.get("ses_none")).rejects.toThrow("job client disposed")
+  })
+
+  test("a request timeout rejects and drops its pending entry", async () => {
+    const ports = createListenerPair<JobFrame>()
+    const client = createJobClient(ports.worker, { timeoutMs: 10 })
+    await expect(client.get("ses_none")).rejects.toThrow(/timed out after 10ms/)
+    client.dispose()
+  })
+
+  test("serveJobRegistry replies with an error when the registry rejects", async () => {
+    const ports = createListenerPair<JobFrame>()
+    const registry = createJobRegistry()
+    const failing: typeof registry = {
+      ...registry,
+      wait: () => Promise.reject(new Error("wait failed")),
+      waitForPromotion: () => Promise.reject(new Error("promotion failed")),
+    }
+    serveJobRegistry(failing, ports.hub)
+    const client = createJobClient(ports.worker)
+
+    await expect(client.wait("ses_x")).rejects.toThrow("wait failed")
+    await expect(client.waitForPromotion("ses_x")).rejects.toThrow("promotion failed")
+    client.dispose()
+  })
+
+  test("a reply post failure does not crash the server", () => {
+    const handlers = new Set<(frame: JobFrame) => void>()
+    const port: JobPort = {
+      post: () => {
+        throw new Error("port closed")
+      },
+      onMessage: (handler) => {
+        handlers.add(handler)
+        return () => handlers.delete(handler)
+      },
+    }
+    serveJobRegistry(createJobRegistry(), port)
+    expect(() => {
+      for (const handler of handlers) handler({ kind: "request", id: 1, op: "list" })
+    }).not.toThrow()
+  })
+})
+
 describe("9.4 child result routed to the parent worker by parentID", () => {
   test("only the parent worker's client receives the child result", async () => {
-    const ports = [createPortPair(), createPortPair(), createPortPair()]
+    const ports = [createListenerPair<JobFrame>(), createListenerPair<JobFrame>(), createListenerPair<JobFrame>()]
     const registry = createJobRegistry({
       routeResult: createResultRouter((sessionID) => (sessionID === "ses_parent" ? ports[0].hub : undefined)),
     })

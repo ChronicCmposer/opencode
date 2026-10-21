@@ -27,6 +27,11 @@ export function posixSupport(platform: NodeJS.Platform = process.platform): Posi
   return { supported: true, reason: "" }
 }
 
+/** POSIX platforms support process-group/PGID semantics; Windows does not. */
+export function isPosix(platform: string = process.platform): boolean {
+  return posixSupport(platform as NodeJS.Platform).supported
+}
+
 /** Total descendants for a full `fanout`-ary tree of the given depth below the root. */
 export function expectedDescendantCount(fanout: number, depth: number): number {
   if (!Number.isInteger(fanout) || fanout < 1) throw new Error(`fanout must be a positive integer, got ${fanout}`)
@@ -203,8 +208,9 @@ export async function waitForDeath(pids: ReadonlyArray<number>, options: WaitFor
 }
 
 export interface StreamReader {
-  readLine(timeoutMs?: number): Promise<string>
-  readExact(length: number, timeoutMs?: number): Promise<string>
+  /** Read one line; `signal` aborts the wait and cancels the underlying stream. */
+  readLine(timeoutMs?: number, signal?: AbortSignal): Promise<string>
+  readExact(length: number, timeoutMs?: number, signal?: AbortSignal): Promise<string>
 }
 
 export interface SpawnDetachedOptions {
@@ -220,7 +226,8 @@ export interface DetachedChild {
   /** Equal to `pid`: a detached spawn makes the child its own group leader. */
   readonly pgid: number
   readonly process: Bun.Subprocess
-  write(text: string): void
+  /** Write to the child's stdin and resolve once the bytes are flushed. */
+  write(text: string): Promise<void>
   readonly reader: StreamReader
   kill(signal?: NodeJS.Signals): void
   killGroup(signal?: NodeJS.Signals): void
@@ -243,39 +250,69 @@ function createReader(stream: ReadableStream<Uint8Array>): StreamReader {
   const source = stream.getReader()
   const decoder = new TextDecoder()
   let buffer: Uint8Array = new Uint8Array(0)
+  let closed = false
+  // The single outstanding `read()`. A per-call timeout must NOT abandon it: an
+  // abandoned read keeps consuming the next chunk off the stream and would
+  // silently drop that data. Instead the in-flight read is retained and reused
+  // by the next `fill`, so a timeout loses no bytes and leaks no read. Only an
+  // explicit abort is terminal, and it cancels the stream so the read settles.
+  let pending: ReturnType<typeof source.read> | undefined
 
-  const fill = async (deadline: number): Promise<void> => {
+  const fill = async (deadline: number, signal?: AbortSignal): Promise<void> => {
+    if (closed) throw new Error("child output stream closed")
+    signal?.throwIfAborted()
     const remaining = deadline - Date.now()
     if (remaining <= 0) throw new Error("timed out reading child output")
+
+    if (pending === undefined) pending = source.read()
+    const read = pending
+
     let timer: ReturnType<typeof setTimeout> | undefined
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new Error("timed out reading child output")), remaining)
     })
+    let rejectAbort: ((error: unknown) => void) | undefined
+    const aborted = new Promise<never>((_, reject) => {
+      rejectAbort = reject
+    })
+    const onAbort = (): void => {
+      closed = true
+      pending = undefined
+      // Reject before cancelling so the caller observes the abort reason rather
+      // than the "stream closed" result that `cancel()` makes the read produce.
+      rejectAbort?.(signal?.reason instanceof Error ? signal.reason : new Error("read aborted"))
+      void source.cancel().catch(() => undefined)
+    }
+    signal?.addEventListener("abort", onAbort, { once: true })
+
     try {
-      const result = await Promise.race([source.read(), timeout])
+      const result = await Promise.race([read, timeout, aborted])
+      pending = undefined
       if (result.done) throw new Error("child output stream closed")
       buffer = concat(buffer, result.value)
     } finally {
       if (timer) clearTimeout(timer)
+      signal?.removeEventListener("abort", onAbort)
     }
   }
 
   return {
-    readLine: async (timeoutMs = 5000) => {
+    readLine: async (timeoutMs = 5000, signal?: AbortSignal) => {
       const deadline = Date.now() + timeoutMs
       for (;;) {
+        signal?.throwIfAborted()
         const newline = buffer.indexOf(0x0a)
         if (newline >= 0) {
           const line = decoder.decode(buffer.slice(0, newline)).replace(/\r$/, "")
           buffer = buffer.slice(newline + 1)
           return line
         }
-        await fill(deadline)
+        await fill(deadline, signal)
       }
     },
-    readExact: async (length, timeoutMs = 5000) => {
+    readExact: async (length, timeoutMs = 5000, signal?: AbortSignal) => {
       const deadline = Date.now() + timeoutMs
-      while (buffer.length < length) await fill(deadline)
+      while (buffer.length < length) await fill(deadline, signal)
       const value = decoder.decode(buffer.slice(0, length))
       buffer = buffer.slice(length)
       return value
@@ -307,11 +344,11 @@ export function spawnDetached(command: ReadonlyArray<string>, options: SpawnDeta
     pid,
     pgid: pid,
     process: process_,
-    write: (text) => {
+    write: async (text) => {
       const sink = process_.stdin as Bun.FileSink | undefined
       if (!sink) throw new Error("child stdin is not piped")
-      void sink.write(text)
-      void sink.flush()
+      await sink.write(text)
+      await sink.flush()
     },
     reader,
     kill: (signal = "SIGTERM") => {

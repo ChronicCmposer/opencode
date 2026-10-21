@@ -137,3 +137,41 @@ describe("worker fake clock", () => {
     })
   })
 })
+
+describe("clock controller resilience", () => {
+  test("a silent worker fails loudly after the per-request timeout", async () => {
+    const channel = new MessageChannel()
+    const controller = createClockController({ port: channel.port1, timeoutMs: 30 })
+    try {
+      await expect(controller.read()).rejects.toThrow(/clock clock\.read timed out after 30ms/)
+    } finally {
+      controller.dispose()
+      channel.port1.close()
+      channel.port2.close()
+    }
+  })
+
+  test("a port message error rejects in-flight requests", async () => {
+    const channel = new MessageChannel()
+    const controller = createClockController({ port: channel.port1, timeoutMs: 5000 })
+    try {
+      const inFlight = controller.read()
+      channel.port1.dispatchEvent(new MessageEvent("messageerror", { data: "boom" }))
+      await expect(inFlight).rejects.toThrow(/message error: boom/)
+    } finally {
+      controller.dispose()
+      channel.port1.close()
+      channel.port2.close()
+    }
+  })
+
+  test("rejects a non-positive timeout loudly", () => {
+    const channel = new MessageChannel()
+    try {
+      expect(() => createClockController({ port: channel.port1, timeoutMs: 0 })).toThrow(/positive number/)
+    } finally {
+      channel.port1.close()
+      channel.port2.close()
+    }
+  })
+})

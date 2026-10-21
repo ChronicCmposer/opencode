@@ -108,7 +108,7 @@ describe("9.6 parent CRASH implicitly cancels its children (children-first)", ()
     const parent = capture(dispatcher.dispatch({ sessionID: sid("ses_parent") }))
     const child = capture(dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 }))
     await flush()
-    expect(dispatcher.headroomCount).toBe(1)
+    expect(dispatcher.headroomSlotCount).toBe(1)
 
     pool.workers[0].crash(sid("ses_parent"))
 
@@ -132,7 +132,7 @@ describe("9.6 parent CRASH implicitly cancels its children (children-first)", ()
     const child = capture(dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 }))
     const grandchild = capture(dispatcher.dispatch({ sessionID: sid("ses_grandchild"), depth: 2 }))
     await flush()
-    expect(dispatcher.headroomCount).toBe(2)
+    expect(dispatcher.headroomSlotCount).toBe(2)
 
     pool.workers[0].crash(sid("ses_parent"))
 

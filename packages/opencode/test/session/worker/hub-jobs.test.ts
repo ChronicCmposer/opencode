@@ -11,15 +11,9 @@
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
 import type { SessionID } from "@/session/schema"
-import { RuntimeFlags } from "@/effect/runtime-flags"
 import { createSessionHub } from "@/session/worker/hub"
 import { createJobClient, jobPortFromMessagePort } from "@/session/worker/job-client"
-import {
-  BackgroundJobClientService,
-  ModelClient,
-  buildSessionWorkerLayer,
-  type WorkerSnapshot,
-} from "@/session/worker/layer"
+import { BackgroundJobClientService, ModelClient, buildSessionWorkerLayer } from "@/session/worker/layer"
 import type {
   ExecutorRun,
   ExecutorSessionWorker,
@@ -27,9 +21,8 @@ import type {
   ExecutorWorkerPool,
   SessionExecutionResult,
 } from "@/session/worker/execute"
-
-const sid = (value: string) => value as SessionID
-const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+import { flush, sid } from "../../lib/async"
+import { workerSnapshot } from "../../lib/snapshot"
 
 /** A worker whose run the test completes explicitly, so a session stays running. */
 class ControlledWorker implements ExecutorWorker {
@@ -88,17 +81,6 @@ class ControlledPool implements ExecutorWorkerPool {
     return this.workers.find((worker) => worker.resultFor(sessionID) !== undefined)?.resultFor(sessionID)
   }
 }
-
-const snapshot = (overrides: Partial<WorkerSnapshot> = {}): WorkerSnapshot => ({
-  epoch: 1,
-  directory: "/tmp/phase14-hub-jobs",
-  config: {},
-  auth: {},
-  modelsDev: {},
-  flags: {} as RuntimeFlags.Info,
-  workerCount: 2,
-  ...overrides,
-})
 
 describe("hub-hosted job registry (9.2)", () => {
   test("the hub serves one registry to a worker's job port", async () => {
@@ -165,7 +147,7 @@ describe("worker layer injection (14)", () => {
     const channel = new MessageChannel()
     const client = createJobClient(jobPortFromMessagePort(channel.port1))
     const built = buildSessionWorkerLayer({
-      snapshot: snapshot(),
+      snapshot: workerSnapshot(),
       env: { values: {} },
       clients: {
         writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
@@ -185,5 +167,34 @@ describe("worker layer injection (14)", () => {
     expect(typeof resolved.wait).toBe("function")
 
     client.dispose()
+  })
+})
+
+describe("hub decoupled worker lookup", () => {
+  test("routeResult consults dispatcher.workerForSession when it is present", async () => {
+    const pool = new ControlledPool(2)
+    const hub = createSessionHub({ pool })
+    // Simulate the dispatcher gaining `workerForSession` (consolidation request):
+    // it must win over the registry fallback. No session is reserved, so the
+    // registry alone would route nowhere.
+    ;(hub.dispatcher as unknown as { workerForSession: (sessionID: SessionID) => number | undefined }).workerForSession =
+      () => 2
+
+    const channel = new MessageChannel()
+    const client = createJobClient(jobPortFromMessagePort(channel.port2))
+    const dispose = hub.attachJobPort(2, jobPortFromMessagePort(channel.port1))
+
+    const received: string[] = []
+    client.onChildResult((info) => received.push(info.id))
+
+    await client.start({ id: "ses_child", type: "task", parentID: "ses_parent" })
+    await client.complete("ses_child", "done")
+    await flush()
+
+    expect(received).toEqual(["ses_child"])
+
+    dispose()
+    client.dispose()
+    await hub.terminateAll()
   })
 })

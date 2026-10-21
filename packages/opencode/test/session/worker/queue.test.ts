@@ -7,6 +7,8 @@ import { describe, expect, test } from "bun:test"
 import {
   ADMISSION_QUEUE_CAPACITY,
   CHILD_QUEUE_CAPACITY,
+  WAITER_QUEUE_CAPACITY,
+  assertPositiveInteger,
   createBoundedQueue,
   SessionQueueFullError,
 } from "@/session/worker/queue"
@@ -31,16 +33,8 @@ describe("bounded queue", () => {
     queue.enqueue("b")
 
     expect(queue.full).toBe(true)
-    let thrown: unknown
-    try {
-      queue.enqueue("c")
-    } catch (error) {
-      thrown = error
-    }
-    expect(thrown).toBeInstanceOf(SessionQueueFullError)
-    if (!(thrown instanceof SessionQueueFullError)) throw new Error("expected SessionQueueFullError")
-    expect(thrown.queue).toBe("admission")
-    expect(thrown.capacity).toBe(2)
+    expect(() => queue.enqueue("c")).toThrow(SessionQueueFullError)
+    expect(() => queue.enqueue("c")).toThrow(expect.objectContaining({ queue: "admission", capacity: 2 }))
     expect(queue.size).toBe(2)
   })
 
@@ -70,5 +64,18 @@ describe("bounded queue", () => {
   test("fails loud on an invalid capacity", () => {
     expect(() => createBoundedQueue<string>("admission", 0)).toThrow(/capacity/)
     expect(() => createBoundedQueue<string>("admission", 1.5)).toThrow(/capacity/)
+  })
+})
+
+describe("shared worker-core numeric helper", () => {
+  test("assertPositiveInteger returns positives and rejects the rest", () => {
+    expect(assertPositiveInteger(3, "count")).toBe(3)
+    expect(() => assertPositiveInteger(0, "count")).toThrow(/count/)
+    expect(() => assertPositiveInteger(-1, "count")).toThrow(/count/)
+    expect(() => assertPositiveInteger(1.5, "count")).toThrow(/count/)
+  })
+
+  test("the waiter queue bound is 64", () => {
+    expect(WAITER_QUEUE_CAPACITY).toBe(64)
   })
 })

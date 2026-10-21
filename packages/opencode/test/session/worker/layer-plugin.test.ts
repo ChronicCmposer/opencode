@@ -1,7 +1,7 @@
 // Phase 6.3 — worker plugin host tests (`chat.params` / `chat.headers` in-worker).
 
 import { describe, expect, test } from "bun:test"
-import { createWorkerPluginHost, type WorkerPlugin } from "@/session/worker/plugin-host"
+import { DuplicatePluginError, createWorkerPluginHost, type WorkerPlugin } from "@/session/worker/plugin-host"
 
 describe("worker plugin host", () => {
   test("chat.params hooks run in registration order and compose mutations", async () => {
@@ -90,5 +90,21 @@ describe("worker plugin host", () => {
     const host = createWorkerPluginHost([{ name: "empty", hooks: {} }])
     const result = await host.chatParams({}, { temperature: 1, topP: 1, topK: 1, maxOutputTokens: undefined, options: {} })
     expect(result.temperature).toBe(1)
+  })
+
+  test("duplicate plugin names are rejected (fail loud)", () => {
+    expect(() =>
+      createWorkerPluginHost([
+        { name: "dup", hooks: {} },
+        { name: "dup", hooks: {} },
+      ]),
+    ).toThrow(DuplicatePluginError)
+  })
+
+  test("names are snapshotted once at construction", () => {
+    const plugins: WorkerPlugin[] = [{ name: "a", hooks: {} }]
+    const host = createWorkerPluginHost(plugins)
+    plugins.push({ name: "b", hooks: {} })
+    expect(host.names).toEqual(["a"])
   })
 })
