@@ -89,6 +89,8 @@ type ExecutorPoolFitsWorkerPool = Assignable<ExecutorWorkerPool, WorkerPool>
 export class SessionCrashedError extends Schema.TaggedErrorClass<SessionCrashedError>()("SessionCrashedError", {
   message: Schema.String,
   workerID: Schema.Number,
+  /** The underlying isolate failure, when one was captured. */
+  cause: Schema.optional(Schema.Defect()),
 }) {}
 
 /**
@@ -99,7 +101,14 @@ export class SessionCrashedError extends Schema.TaggedErrorClass<SessionCrashedE
 export class WorkerCrashedError extends Schema.TaggedErrorClass<WorkerCrashedError>()("WorkerCrashedError", {
   message: Schema.String,
   workerID: Schema.Number,
+  /** The underlying isolate failure, when one was captured. */
+  cause: Schema.optional(Schema.Defect()),
 }) {}
+
+/** The underlying failure's text, embedded in a crash error so its cause is never lost. */
+function describeFailure(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
 
 // A crashed session failed, so `WorkerCrashedError` is also a
 // `SessionCrashedError`: re-parent its prototype to keep `instanceof
@@ -404,7 +413,11 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       pending.reject(
         error instanceof WorkerCrashedError
           ? error
-          : new WorkerCrashedError({ message: `worker ${slot.worker.id} crashed`, workerID: slot.worker.id }),
+          : new WorkerCrashedError({
+              message: `worker ${slot.worker.id} crashed: ${describeFailure(error)}`,
+              workerID: slot.worker.id,
+              cause: error,
+            }),
       )
       // Plan 9.6: a parent CRASH is an implicit cancel of its subagent children.
       // The parent's own reservation is already released above, so cascading

@@ -16,7 +16,10 @@
 
 import { threadId, workerData } from "node:worker_threads"
 import { Effect, Layer, Option } from "effect"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Project } from "@opencode-ai/schema/project"
 import { SessionPrompt } from "@/session/prompt"
+import { Snapshot } from "@/snapshot"
 import { InstanceRef } from "@/effect/instance-ref"
 import type { InstanceContext } from "@/project/instance-context"
 import { Provider } from "@/provider/provider"
@@ -51,6 +54,7 @@ import {
   type WorkerSnapshot,
   type WriterClientHandle,
 } from "./layer"
+import { workerSnapshotBoundaryLayer } from "./snapshot"
 
 export interface SessionWorkerModel {
   readonly baseUrl: string
@@ -163,7 +167,10 @@ export function buildWorkerClients(ports: WorkerClientPorts, options: { jobClien
   const job = options.jobClient ?? createBackgroundJobClient(requirePort(ports.backgroundJob, "backgroundJob"))
   return {
     writer: createWorkerWriterClient(writer),
-    egress: createWorkerEgressClient(egress, ports.egressControl === undefined ? {} : { controlPort: ports.egressControl }),
+    egress: createWorkerEgressClient(
+      egress,
+      ports.egressControl === undefined ? {} : { controlPort: ports.egressControl },
+    ),
     broker: createWorkerBrokerClient(broker),
     backgroundJob: backgroundJobHandle(job),
   }
@@ -346,6 +353,19 @@ function directClients(backgroundJob: BackgroundJobClientHandle): WorkerClients 
 }
 
 /**
+ * The worker-appropriate graph replacements: the reduced provider (the isolate
+ * serves exactly one serialized model) and the fail-soft `Snapshot` boundary (the
+ * isolate cannot run `git`). Kept as one seam so the production entry and its
+ * tests wire the identical replacements.
+ */
+export function workerGraphReplacements(config: WorkerModelConfig): LayerNode.Replacements {
+  return [
+    [Provider.node, reducedModelProviderLayer(config)],
+    [Snapshot.node, workerSnapshotBoundaryLayer()],
+  ]
+}
+
+/**
  * Build the reduced layer and install the executor. Split from module scope so
  * tests can import this module (`buildWorkerClients`, the registry) without a
  * worker context; the module only bootstraps when `workerData` is present.
@@ -380,9 +400,7 @@ export function bootstrapSessionWorker(init: SessionWorkerInit, scope: WorkerSco
         egress: egressChannel.port2,
         broker: brokerChannel.port2,
       },
-      [writerChannel.port2, egressChannel.port2, brokerChannel.port2].map(
-        (port) => port as unknown as Transferable,
-      ),
+      [writerChannel.port2, egressChannel.port2, brokerChannel.port2].map((port) => port as unknown as Transferable),
     )
     clients = buildWorkerClients(
       { writer: writerChannel.port1, egress: egressChannel.port1, broker: brokerChannel.port1 },
@@ -417,8 +435,9 @@ export function bootstrapSessionWorker(init: SessionWorkerInit, scope: WorkerSco
     modelClient,
     backgroundJob: backgroundJobClientLayer(jobClient),
     // The worker serves exactly one serialized model, so the reduced provider is
-    // the graph's provider (the real loop's `LLM` and `SessionPrompt` use it).
-    replacements: [[Provider.node, reducedModelProviderLayer(config)]],
+    // the graph's provider (the real loop's `LLM` and `SessionPrompt` use it), and
+    // snapshot tracking is a fail-soft no-op (the isolate cannot run `git`).
+    replacements: workerGraphReplacements(config),
     ...(hubProxies === undefined ? {} : { hubProxies }),
   })
 
@@ -428,19 +447,39 @@ export function bootstrapSessionWorker(init: SessionWorkerInit, scope: WorkerSco
       writer: clients.writer,
       threadId,
       prompt: usePrompt,
-      instance: workerInstanceContext(init.snapshot.directory),
+      instance: workerInstanceContext(init.snapshot),
     }),
   )
   installSessionExecutor(scope, { work, threadId })
 }
 
 /**
- * The worker's ambient `InstanceRef`. The isolate owns no project loader, so the
- * snapshot directory is both the working directory and the worktree; `project`
- * is unused by the reduced session graph.
+ * The worker's ambient `InstanceRef`, rebuilt from the hub-shipped snapshot. The
+ * isolate owns no project loader, so the snapshot is the single source of truth:
+ * the directory is the working directory, the worktree defaults to it, and the
+ * project identity comes from the hub's real instance context. The old
+ * `project: undefined as never` placeholder made every `ctx.project.id` reader
+ * (`Snapshot.state`, `Session.create`, the event bridge) throw on boot.
+ *
+ * The project id falls back to the directory only when the hub dispatched with
+ * no ambient project (a hub-side gap, see `hub.ts` `fallbackInstanceContext`),
+ * so the worker still boots instead of crashing on a missing id.
  */
-function workerInstanceContext(directory: string): InstanceContext {
-  return { directory, worktree: directory, project: undefined as never }
+export function workerInstanceContext(snapshot: WorkerSnapshot): InstanceContext {
+  const worktree = snapshot.worktree ?? snapshot.directory
+  return {
+    directory: snapshot.directory,
+    worktree,
+    project: {
+      id: Project.ID.make(snapshot.projectId ?? snapshot.directory),
+      worktree,
+      ...(snapshot.projectVcs === undefined ? {} : { vcs: snapshot.projectVcs }),
+      // `Project.Info` requires a time span and sandboxes; the readers only touch
+      // `id`/`vcs`, so a zero span and no sandboxes is a faithful minimum.
+      time: { created: 0, updated: 0 },
+      sandboxes: [],
+    },
+  }
 }
 
 if (workerData !== null && workerData !== undefined) {

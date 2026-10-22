@@ -58,6 +58,14 @@ class FakeWorker implements SessionWorker {
     pending?.reject(new WorkerCrashedError({ message: `worker ${this.id} crashed`, workerID: this.id }))
   }
 
+  /** Kill the worker with an arbitrary isolate error (a dead isolate, not a typed crash). */
+  crashWith(sessionID: SessionID, error: unknown): void {
+    this.alive = false
+    const pending = this.pending.get(sessionID)
+    this.pending.delete(sessionID)
+    pending?.reject(error)
+  }
+
   async terminate(): Promise<void> {
     this.alive = false
     const pending = [...this.pending.values()]
@@ -154,6 +162,28 @@ describe("9.6 parent CRASH implicitly cancels its children (children-first)", ()
 
     pool.workers[0].crash(sid("ses_parent"))
     expect(await parent).toBeInstanceOf(WorkerCrashedError)
+
+    await dispatcher.terminateAll()
+  })
+
+  test("a parent crash preserves the underlying isolate error", async () => {
+    const pool = new FakePool(1)
+    const { config, cancelled } = cancellation({ ses_parent: ["ses_child"] })
+    const dispatcher = createDispatcher({ pool, cancellation: config })
+
+    const parent = capture(dispatcher.dispatch({ sessionID: sid("ses_parent") }))
+    const child = capture(dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 }))
+    await flush()
+
+    const cause = new Error("worker isolate died: TypeError: db.select is not a function")
+    pool.workers[0].crashWith(sid("ses_parent"), cause)
+
+    const error = await parent
+    expect(error).toBeInstanceOf(WorkerCrashedError)
+    expect((error as WorkerCrashedError).message).toContain("db.select is not a function")
+    expect((error as WorkerCrashedError).cause).toBe(cause)
+    expect(await child).toBeInstanceOf(SessionCancelledError)
+    expect(cancelled).toContain(sid("ses_child"))
 
     await dispatcher.terminateAll()
   })

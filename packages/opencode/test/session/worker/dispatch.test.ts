@@ -37,6 +37,12 @@ const capture = (promise: Promise<unknown>): Promise<unknown> =>
     (error: unknown) => error,
   )
 
+/** A one-shot worker entry that announces ready, then throws `message` on its first run. */
+function throwingWorkerEntry(message: string): string {
+  const source = `globalThis.postMessage({ type: "ready", threadId: 1 });globalThis.onmessage = () => { throw new Error(${JSON.stringify(message)}) }`
+  return `data:text/javascript,${encodeURIComponent(source)}`
+}
+
 interface PendingRun {
   readonly resolve: () => void
   readonly reject: (error: unknown) => void
@@ -71,6 +77,14 @@ class FakeWorker implements SessionWorker {
   }
 
   fail(sessionID: SessionID, error: unknown): void {
+    const pending = this.pending.get(sessionID)
+    this.pending.delete(sessionID)
+    pending?.reject(error)
+  }
+
+  /** Kill the worker with an arbitrary error (a dead isolate, not a typed crash). */
+  crashWith(sessionID: SessionID, error: unknown): void {
+    this.alive = false
     const pending = this.pending.get(sessionID)
     this.pending.delete(sessionID)
     pending?.reject(error)
@@ -667,5 +681,50 @@ describe("4.9 WorkerPool interface", () => {
 
     expect(dispatcher.busySlotCount).toBe(0)
     expect(dispatcher.registry.size).toBe(0)
+  })
+})
+
+describe("crash error surfacing", () => {
+  test("a worker that dies with a real error surfaces its message and cause", async () => {
+    const pool = new FakePool(1)
+    const scheduler = createTestScheduler()
+    const dispatcher = createDispatcher({ pool, schedule: scheduler.schedule })
+
+    const running = dispatcher.dispatch({ sessionID: sid("ses_crash_message") })
+    const settled = capture(running)
+    await flush()
+
+    const cause = new Error("ModuleNotFound resolving './session-worker.ts' (entry point)")
+    pool.workers[0].crashWith(sid("ses_crash_message"), cause)
+
+    const error = await settled
+    expect(error).toBeInstanceOf(WorkerCrashedError)
+    expect((error as WorkerCrashedError).message).toContain("ModuleNotFound resolving './session-worker.ts'")
+    expect((error as WorkerCrashedError).cause).toBe(cause)
+
+    await dispatcher.terminateAll()
+  })
+
+  test("a real throwing isolate surfaces its error through the dispatcher", async () => {
+    const scheduler = createTestScheduler()
+    await using pool = createBunWorkerPool({ k: 1, entry: throwingWorkerEntry("KNOWN_DISPATCH_FAILURE") })
+    await using dispatcher = createDispatcher({ pool, schedule: scheduler.schedule })
+
+    const error = await capture(dispatcher.dispatch({ sessionID: sid("ses_real_crash") }))
+
+    expect(error).toBeInstanceOf(WorkerCrashedError)
+    expect((error as WorkerCrashedError).message).toContain("KNOWN_DISPATCH_FAILURE")
+    expect((error as WorkerCrashedError).cause).toBeDefined()
+  })
+
+  test("a real boot failure surfaces the module-not-found message through the dispatcher", async () => {
+    const scheduler = createTestScheduler()
+    await using pool = createBunWorkerPool({ k: 1, entry: "no-such-worker-entry.ts" })
+    await using dispatcher = createDispatcher({ pool, schedule: scheduler.schedule })
+
+    const error = await capture(dispatcher.dispatch({ sessionID: sid("ses_boot_fail") }))
+
+    expect(error).toBeInstanceOf(WorkerCrashedError)
+    expect((error as WorkerCrashedError).message).toContain("no-such-worker-entry.ts")
   })
 })

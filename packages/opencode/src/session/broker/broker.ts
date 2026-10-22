@@ -125,7 +125,35 @@ export interface BrokerClient extends AsyncDisposable {
   onSupervision(handler: (event: SupervisionEvent) => void): () => void
 }
 
-const DEFAULT_ENTRY = new URL("./broker-worker.ts", import.meta.url)
+declare global {
+  /**
+   * Compile-time path to the bundled broker isolate, injected by `script/build.ts`
+   * (mirrors `OPENCODE_SESSION_WORKER_PATH`). Absent in dev/test.
+   */
+  const OPENCODE_BROKER_WORKER_PATH: string | undefined
+}
+
+/**
+ * Resolve the broker isolate entry: the runtime env override, else the build-time
+ * define, else the source-relative isolate. The packaged binary cannot resolve
+ * the source path (`new URL("./broker-worker.ts", import.meta.url)` becomes
+ * `/$bunfs/root/broker-worker.ts`), so this mirrors `resolveSessionWorkerEntry`
+ * to load the bundled worker. Pure so the resolution is testable without
+ * re-importing.
+ */
+export function resolveBrokerWorkerEntry(
+  options: { readonly env?: Record<string, string | undefined>; readonly definedPath?: string } = {},
+): string | URL {
+  const defined =
+    options.definedPath ??
+    (typeof OPENCODE_BROKER_WORKER_PATH !== "undefined" ? OPENCODE_BROKER_WORKER_PATH : undefined)
+  const fromEnv = (options.env ?? process.env).OPENCODE_BROKER_WORKER_PATH
+  const resolved = fromEnv ?? defined
+  if (resolved === undefined || resolved === "") return new URL("./broker-worker.ts", import.meta.url)
+  return resolved
+}
+
+const DEFAULT_ENTRY = resolveBrokerWorkerEntry()
 
 const defaultReaper: ProcessReaper = {
   reap(pgid: number): void {

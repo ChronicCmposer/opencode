@@ -10,13 +10,14 @@
 // never regress, otherwise a worker could adopt an "older" generation and keep
 // stale-tolerant cache entries alive.
 
-import { Effect } from "effect"
+import { Effect, Layer } from "effect"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 
 import { Auth } from "@/auth"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceState } from "@/effect/instance-state"
+import { Snapshot } from "@/snapshot"
 
 import type { WorkerSnapshot } from "./layer"
 import { resolveWorkerCount } from "./pool"
@@ -51,7 +52,7 @@ export const buildWorkerSnapshot = Effect.fn("WorkerSnapshot.build")(function* (
   const auth = yield* Auth.Service
   const modelsDev = yield* ModelsDev.Service
   const flags = yield* RuntimeFlags.Service
-  const directory = yield* InstanceState.directory
+  const ctx = yield* InstanceState.context
 
   const [configInfo, authInfo, models] = yield* Effect.all([config.get(), auth.all(), modelsDev.get()])
 
@@ -61,7 +62,15 @@ export const buildWorkerSnapshot = Effect.fn("WorkerSnapshot.build")(function* (
 
   return {
     epoch,
-    directory,
+    directory: ctx.directory,
+    // Ship the hub project's identity so the worker's ambient `InstanceRef` is
+    // real, not the old `project: undefined as never` placeholder. `project` is
+    // typed non-optional but the hub's fallback context leaves it undefined at
+    // runtime, so the optional chain and conditional spreads keep the snapshot
+    // honest (and JSON-serializable) in that degraded case.
+    ...(ctx.project?.id === undefined ? {} : { projectId: ctx.project.id }),
+    ...(ctx.project?.vcs === undefined ? {} : { projectVcs: ctx.project.vcs }),
+    worktree: ctx.worktree,
     config: configInfo,
     auth: authInfo,
     modelsDev: models,
@@ -69,5 +78,27 @@ export const buildWorkerSnapshot = Effect.fn("WorkerSnapshot.build")(function* (
     workerCount: options.workerCount ?? resolveWorkerCount(),
   } satisfies WorkerSnapshot
 })
+
+/**
+ * A worker-appropriate `Snapshot` boundary.
+ *
+ * The worker isolate owns no OS child-process authority — `AppProcess` is a
+ * hub-owned node replaced by a mock in the worker graph — so the real `Snapshot`
+ * service dies with `UnimplementedError` as soon as a git-backed project tracks a
+ * turn. This boundary degrades snapshot tracking to a fail-soft no-op: the session
+ * completes, and snapshot/revert is simply unavailable inside the isolate (the hub
+ * remains the snapshot authority).
+ */
+export const workerSnapshotBoundaryLayer = (): Layer.Layer<Snapshot.Service> =>
+  Layer.succeed(Snapshot.Service, {
+    init: () => Effect.void,
+    cleanup: () => Effect.void,
+    track: () => Effect.succeed(undefined),
+    patch: () => Effect.succeed({ hash: "", files: [] }),
+    restore: () => Effect.void,
+    revert: () => Effect.void,
+    diff: () => Effect.succeed(""),
+    diffFull: () => Effect.succeed([]),
+  })
 
 export * as WorkerSnapshotModule from "./snapshot"

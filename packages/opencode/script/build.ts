@@ -50,6 +50,20 @@ const createEmbeddedWebUIBundle = async () => {
 const embeddedFileMap = skipEmbedWebUi ? null : await createEmbeddedWebUIBundle()
 const treeSitterWorker = await Bun.file(fileURLToPath(import.meta.resolve("@opentui/core/parser.worker"))).text()
 
+/**
+ * The flat bunfs name a bundled worker source resolves to: `./src/x/y.ts` becomes
+ * `/src/x/y.js`. A `new Worker` can only address a flat embedded name.
+ */
+const bundledWorkerModule = (sourcePath: string): string => "/" + sourcePath.slice(2).replace(/\.ts$/, ".js")
+
+/**
+ * A flat-named shim that imports the bundled worker at runtime. The path is built
+ * from `import.meta.dir` so the bundler cannot statically resolve it (a literal
+ * would be inlined and defeat the flat-name indirection).
+ */
+const workerShim = (sourcePath: string): string =>
+  `await import(import.meta.dir + ${JSON.stringify(bundledWorkerModule(sourcePath))})`
+
 const allTargets: {
   os: string
   arch: "arm64" | "x64"
@@ -158,8 +172,25 @@ for (const item of targets) {
   await $`mkdir -p dist/${name}/bin`
 
   const workerPath = "./src/cli/tui/worker.ts"
+  const sessionWorkerSourcePath = "./src/session/worker/session-worker.ts"
+  const sessionWorkerPath = "session-worker.js"
+  const writerWorkerSourcePath = "./src/session/writer/worker.ts"
+  const writerWorkerPath = "writer-worker.js"
+  const brokerWorkerSourcePath = "./src/session/broker/broker-worker.ts"
+  const brokerWorkerPath = "broker-worker.js"
+  const poolWorkerSourcePath = "./src/session/worker/bootstrap.ts"
+  const poolWorkerPath = "pool-bootstrap.js"
   const treeSitterWorkerPath = "opentui-tree-sitter-worker.js"
   const bunfsRoot = item.os === "win32" ? "B:/~BUN/root/" : "/$bunfs/root/"
+
+  // A bundled worker entrypoint lands in the bunfs module graph at its source path
+  // with a .js extension. Workers embedded through `files` are only resolvable by a
+  // flat bunfs name, so embed a tiny shim that imports the bundled entrypoint rather
+  // than duplicating the worker bundle.
+  const sessionWorkerShim = workerShim(sessionWorkerSourcePath)
+  const writerWorkerShim = workerShim(writerWorkerSourcePath)
+  const brokerWorkerShim = workerShim(brokerWorkerSourcePath)
+  const poolWorkerShim = workerShim(poolWorkerSourcePath)
 
   await Bun.build({
     conditions: ["bun", "node"],
@@ -181,12 +212,24 @@ for (const item of targets) {
       windows: {},
     },
     files: {
+      [sessionWorkerPath]: sessionWorkerShim,
+      [writerWorkerPath]: writerWorkerShim,
+      [brokerWorkerPath]: brokerWorkerShim,
+      [poolWorkerPath]: poolWorkerShim,
       [treeSitterWorkerPath]: treeSitterWorker,
       ...(embeddedFileMap ? { "opencode-web-ui.gen.ts": embeddedFileMap } : {}),
     },
     entrypoints: [
       "./src/index.ts",
       workerPath,
+      sessionWorkerSourcePath,
+      sessionWorkerPath,
+      writerWorkerSourcePath,
+      writerWorkerPath,
+      brokerWorkerSourcePath,
+      brokerWorkerPath,
+      poolWorkerSourcePath,
+      poolWorkerPath,
       treeSitterWorkerPath,
       ...(embeddedFileMap ? ["opencode-web-ui.gen.ts"] : []),
     ],
@@ -196,6 +239,10 @@ for (const item of targets) {
       OPENCODE_MODELS_DEV: generated.modelsData,
       OTUI_TREE_SITTER_WORKER_PATH: bunfsRoot + treeSitterWorkerPath,
       OPENCODE_WORKER_PATH: workerPath,
+      OPENCODE_SESSION_WORKER_PATH: bunfsRoot + sessionWorkerPath,
+      OPENCODE_WRITER_WORKER_PATH: bunfsRoot + writerWorkerPath,
+      OPENCODE_BROKER_WORKER_PATH: bunfsRoot + brokerWorkerPath,
+      OPENCODE_POOL_WORKER_PATH: bunfsRoot + poolWorkerPath,
       OPENCODE_CHANNEL: `'${Script.channel}'`,
       OPENCODE_LIBC: item.os === "linux" ? `'${item.abi ?? "glibc"}'` : "",
       ...(item.os === "linux" ? { "process.env.OPENTUI_LIBC": JSON.stringify(item.abi ?? "glibc") } : {}),

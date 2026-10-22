@@ -106,14 +106,14 @@ const layer = Layer.effect(
         const workspaceID = (yield* WorkspaceRef) ?? event.location?.workspaceID
         GlobalBus.emit("event", {
           directory: event.location?.directory ?? ctx?.directory,
-          project: ctx?.project.id,
+          project: ctx?.project?.id,
           workspace: workspaceID,
           payload: { id: event.id, type: event.type, properties: event.data },
         })
         if (event.durable === undefined) return
         GlobalBus.emit("event", {
           directory: event.location?.directory ?? ctx?.directory,
-          project: ctx?.project.id,
+          project: ctx?.project?.id,
           workspace: workspaceID,
           payload: {
             type: "sync",

@@ -19,6 +19,7 @@ import { SessionProcessor } from "@/session/processor"
 import { LLM } from "@/session/llm"
 import { SessionStatus } from "@/session/status"
 import { InstanceRef } from "@/effect/instance-ref"
+import type { InstanceContext } from "@/project/instance-context"
 import {
   ModelClient,
   PIPELINE_SESSION_NODES,
@@ -31,7 +32,7 @@ import {
   type SessionLayerOptions,
   type WorkerModelConfig,
 } from "@/session/worker/layer"
-import { createSessionWork } from "@/session/worker/session-worker"
+import { createSessionWork, workerGraphReplacements, workerInstanceContext } from "@/session/worker/session-worker"
 import { collectNodeNames } from "@/session/worker/node-table"
 import {
   buildHubProxyHandlers,
@@ -365,6 +366,115 @@ describe("full-graph prompt path against the mock provider", () => {
       // The durable rows prove the writer-backed Database actually ran.
       expect(ctx.rows("message")).toHaveLength(2)
       expect(ctx.rows("part").length).toBeGreaterThanOrEqual(2)
+    } finally {
+      await ctx.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  }, 60_000)
+
+  test("the DEFAULT production boundary carries SessionPrompt.loop past the mock boundary (f-w5)", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-layer-default-"))
+    await using provider = startMockProvider({ chunks: ["pas", "t"] })
+    const snapshot = workerSnapshot({ directory })
+    const ctx = createE2EContext({ snapshot, modelConfig: modelConfig(provider) })
+    try {
+      const sessionID = await Effect.runPromise(seed(ctx, provider.model, "hi"))
+      // A second layer built ONLY from production defaults: unlike `ctx.layer`
+      // it omits the harness's functional MCP/LSP overrides, so it exercises the
+      // real `boundaryReplacements` — the exact path the packaged gate bundles.
+      const config = modelConfig(provider)
+      const built = buildSessionWorkerLayer({
+        snapshot,
+        env: { values: {} },
+        clients: {
+          writer: ctx.writer,
+          egress: { emit: () => {}, emitDurable: () => {} },
+          broker: { call: async () => null },
+          backgroundJob: { wait: async () => null, cancel: async () => {} },
+        },
+        modelClient: llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(snapshot, config))),
+        // The hub-shipped provider/snapshot the production worker installs; MCP
+        // and LSP are intentionally left to `boundaryReplacements`.
+        replacements: workerGraphReplacements(config),
+      })
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          const prompt = yield* SessionPrompt.Service
+          return yield* prompt.loop({ sessionID })
+        }).pipe(Effect.provide(built.layer), Effect.provideService(InstanceRef, ctx.instance)),
+      )
+      const value = result as { parts: ReadonlyArray<{ type: string; text?: string }> }
+      const text = value.parts
+        .filter((part) => part.type === "text")
+        .map((part) => part.text ?? "")
+        .join("")
+      expect(text).toBe("past")
+      // The durable rows prove the writer-backed Database ran through the
+      // production graph, not just the harness's overridden one.
+      expect(ctx.rows("message")).toHaveLength(2)
+    } finally {
+      await ctx.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  }, 60_000)
+})
+
+// ---------------------------------------------------------------------------
+// Fix B — the worker's ambient `InstanceRef` carries a REAL project id (the hub
+// ships it on the snapshot), so `SessionPrompt.loop` never hits the
+// `ctx.project.id` `TypeError` that the old `project: undefined as never` caused.
+// ---------------------------------------------------------------------------
+
+describe("real project ambient InstanceRef (Fix B)", () => {
+  const seedWith = (ctx: E2EContext, instance: InstanceContext, modelID: string, prompt: string) =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "real-project",
+        agent: "build",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const user = (yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: session.id,
+        agent: "build",
+        model: { providerID: "mock", modelID },
+        time: { created: Date.now() },
+      } as never)) as { id: MessageID }
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: user.id,
+        sessionID: session.id,
+        type: "text",
+        text: prompt,
+      } as never)
+      return session.id
+    }).pipe(Effect.provide(ctx.layer), Effect.provideService(InstanceRef, instance))
+
+  test("SessionPrompt.loop completes a mock session from a real project without a TypeError", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-realproj-"))
+    await using provider = startMockProvider({ chunks: ["re", "al"] })
+    // No `vcs`: the project is real (a stable id + worktree) but not a git
+    // checkout, so `Snapshot.track` short-circuits instead of shelling out.
+    const snapshot = workerSnapshot({ directory, projectId: "prj_real", worktree: directory })
+    const ctx = createE2EContext({ snapshot, modelConfig: modelConfig(provider) })
+    const instance = workerInstanceContext(snapshot)
+    try {
+      const sessionID = await Effect.runPromise(seedWith(ctx, instance, provider.model, "hi"))
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          const prompt = yield* SessionPrompt.Service
+          return yield* prompt.loop({ sessionID })
+        }).pipe(Effect.provide(ctx.layer), Effect.provideService(InstanceRef, instance)),
+      )
+      const value = result as { parts: ReadonlyArray<{ type: string; text?: string }> }
+      const text = value.parts
+        .filter((part) => part.type === "text")
+        .map((part) => part.text ?? "")
+        .join("")
+      expect(text).toBe("real")
+      expect(ctx.rows("message")).toHaveLength(2)
     } finally {
       await ctx.dispose()
       fs.rmSync(directory, { recursive: true, force: true })

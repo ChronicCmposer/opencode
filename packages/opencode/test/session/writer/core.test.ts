@@ -18,7 +18,7 @@ import {
   type WriterCoreOptions,
 } from "@/session/writer/core"
 import { FAULTS_ENV } from "@/testing/faults"
-import { capture } from "../../lib/async"
+import { capture, flush } from "../../lib/async"
 import { pollUntil } from "../../lib/poll"
 import { SCHEMA_SQL, ev } from "./fixtures"
 
@@ -236,10 +236,33 @@ describe("writer core: reserved-handle transactions (7.4)", () => {
     expect(rows("SELECT id FROM event")).toEqual([])
   })
 
-  test("a second pinned transaction is rejected while one is open", async () => {
-    const { core } = harness()
-    await core.beginTransaction()
-    await expect(core.beginTransaction()).rejects.toBeInstanceOf(TransactionError)
+  test("a concurrent transaction queues behind the pinned one instead of rejecting", async () => {
+    const { core, rows } = harness()
+    const first = await core.beginTransaction()
+    const second = capture(core.beginTransaction())
+    await flush()
+
+    await core.txQuery(first, "run", "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)", [
+      "first",
+      "a",
+      0,
+      "t",
+      "{}",
+    ])
+    await core.commitTransaction(first)
+
+    const outcome = await second
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) throw outcome.error
+    await core.txQuery(
+      outcome.value,
+      "run",
+      "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)",
+      ["second", "b", 0, "t", "{}"],
+    )
+    await core.commitTransaction(outcome.value)
+
+    expect(rows("SELECT id FROM event ORDER BY id")).toEqual([{ id: "first" }, { id: "second" }])
   })
 
   test("an idle pinned transaction is rolled back after the idle window", async () => {
