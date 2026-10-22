@@ -159,3 +159,13 @@ const table = sqliteTable("session", {
 - Keep delivery vocabulary explicit. Prompts steer by default and promote at the next safe provider-turn boundary while the current drain requires continuation. An explicit `queue` input remains pending until the Session would otherwise become idle; promote one queued input at that boundary, then reevaluate continuation before promoting another. Promoting any new user input resets the selected agent's provider-turn allowance; a batch of steers resets it once.
 - Keep EventV2 replay owner claims separate from clustered Session execution ownership.
 - Keep the System Context algebra, registry, and built-ins in `src/system-context`; keep Context Source producers with their observed domains, and keep Session History selection plus Context Epoch persistence Session-owned.
+
+## Database maintenance
+
+The live SQLite database (`~/.local/share/opencode/opencode.db`) grows through tool output and event history. Keep it bounded and never run an in-place `VACUUM` against a live server.
+
+- **WAL ceiling + periodic checkpoint.** Keep `journal_size_limit` set so a checkpoint truncates the WAL back to a bounded size instead of leaving its high-water mark behind, and checkpoint periodically so the WAL is recycled. Never let `journal_size_limit = -1` stand with no periodic checkpoint: the WAL will grow without bound. Prefer `PRAGMA wal_checkpoint(TRUNCATE)` after large writes or deletes.
+- **Compact part payloads.** The `part` table is the dominant consumer because edit/write/read tool outputs embed full file contents. Cap how much tool output is persisted and compact existing `part` payloads rather than storing unbounded content.
+- **Run maintenance via systemd timers.** Schedule WAL checkpointing and backups as systemd `.timer` units running as the `opencode` user, staggered so a backup never overlaps a compaction. Do not run two maintenance jobs at once.
+- **Back up with `VACUUM INTO`.** `VACUUM INTO 'path'` writes a consistent, compacted copy to a new file and is safe while the server runs. Verify the copy with `PRAGMA integrity_check` before trusting it.
+- **NEVER run an in-place `VACUUM` on a live server.** A bare `VACUUM;` rewrites the whole database through the WAL, which can balloon `-wal` to the size of the database and fill the disk (this is how the 13.75 GB stale WAL was produced). Use `VACUUM INTO` and swap files instead.

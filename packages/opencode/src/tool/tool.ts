@@ -132,15 +132,15 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
             return result
           }
           const agent = yield* agents.get(ctx.agent)
-          const truncated = yield* truncate.output(result.output, {}, agent)
+          const bounded = yield* Truncate.boundResult(
+            truncate,
+            { output: result.output, metadata: result.metadata },
+            agent,
+          )
           return {
             ...result,
-            output: truncated.content,
-            metadata: {
-              ...result.metadata,
-              truncated: truncated.truncated,
-              ...(truncated.truncated && { outputPath: truncated.outputPath }),
-            },
+            output: bounded.output,
+            metadata: bounded.metadata as Result,
           }
         }).pipe(Effect.orDie, Effect.withSpan("Tool.execute", { attributes: attrs }))
       }

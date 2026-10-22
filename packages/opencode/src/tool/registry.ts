@@ -156,16 +156,12 @@ const layer = Layer.effect(
                 const metadata = typeof result === "string" ? {} : (result.metadata ?? {})
                 const attachments = typeof result === "string" ? undefined : result.attachments
                 const info = yield* agent.get(toolCtx.agent)
-                const out = yield* truncate.output(output, {}, info)
+                const bounded = yield* Truncate.boundResult(truncate, { output, metadata }, info)
                 return {
                   title: typeof result === "string" ? "" : (result.title ?? ""),
-                  output: out.truncated ? out.content : output,
+                  output: bounded.output,
                   attachments,
-                  metadata: {
-                    ...metadata,
-                    truncated: out.truncated,
-                    ...(out.truncated && { outputPath: out.outputPath }),
-                  },
+                  metadata: bounded.metadata,
                 }
               }).pipe(
                 Effect.withSpan("Tool.execute", {
