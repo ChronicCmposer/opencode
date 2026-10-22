@@ -40,8 +40,9 @@ import {
   type WorkerPortBackends,
   type WorkerTransferredPorts,
 } from "@/session/worker/hub"
-import { endFrame, eventFrame } from "@/session/worker/frame"
+import { ackFrame, endFrame, eventFrame, resyncFrame } from "@/session/worker/frame"
 import { encodeFrame } from "@/session/egress/frame"
+import { createMeshWorkerClient, type DurableCommit } from "@/session/egress/mesh"
 import { createLiveEventPublisher, EventV2Bridge, type LiveEvent, type LiveEventPublisher } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Database } from "@opencode-ai/core/database/database"
@@ -575,7 +576,157 @@ describe("13 cooperative cancel within grace", () => {
     } finally {
       await hub.terminateAll()
     }
-  }, 20_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// W11 — production depth plumbing: a session registered in the hub job registry
+// at depth ≥ 1 must dispatch on the on-demand headroom path. Before the hub
+// passed `depthOf` into `createSessionDispatch`, every production dispatch
+// resolved `depth: 0`, so a real child was scheduled as a foreground root and
+// the headroom/child-queue paths (`dispatch.ts`) never ran.
+// ---------------------------------------------------------------------------
+
+describe("W11 production depth plumbing", () => {
+  test("a depth ≥ 1 child admitted through the hub selects the headroom kind", async () => {
+    const childID = sid("ses_w11_depth_child")
+    const created: ImmediateWorker[] = []
+    const hub = createSessionHub({ pool: trackedLazyPool(1, created) })
+    try {
+      // A subagent child, linked to a parent at depth 1, is the production shape
+      // the hub registry holds (`subagent.dispatchSubagent` registers it this way).
+      hub.jobs.start({ id: childID, type: "task", parentID: sid("ses_w11_depth_parent"), depth: 1 })
+
+      const result = await hub.ensureRunning(childID)
+
+      expect(result.sessionID).toBe(childID)
+      // depth ≥ 1 → headroom; the single foreground worker must not be reused, so
+      // the hub grows the headroom pool (and materialises an isolate for it).
+      expect(hub.dispatcher.headroomSlotCount).toBe(1)
+      expect(created.length).toBeGreaterThan(0)
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+
+  test("a depth 0 root still runs on the foreground pool (no headroom)", async () => {
+    const sessionID = sid("ses_w11_root")
+    const created: ImmediateWorker[] = []
+    const hub = createSessionHub({ pool: trackedLazyPool(1, created) })
+    try {
+      const result = await hub.ensureRunning(sessionID)
+
+      expect(result.sessionID).toBe(sessionID)
+      expect(hub.dispatcher.headroomSlotCount).toBe(0)
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// W11 — hub-side egress mesh. W5 wired the worker's `egressControl` port; the
+// hub must create ONE mesh, attach each worker's control port to it, and publish
+// durable commits on the commit path so `events.durable()` subscribers wake.
+// ---------------------------------------------------------------------------
+
+describe("W11 production egress mesh", () => {
+  test("the production egress backend attaches a mesh and publishes durable commits under load", async () => {
+    const { publisher, published } = recordingPublisher()
+    const backends = buildProductionPortBackends({
+      writer: {
+        query: async () => [],
+        publish: async () => ({ seq: null, committed: false }),
+        ...unusedHubWriterTx,
+      },
+      broker: fakeBroker(),
+      events: publisher,
+      // A tiny bound makes the overflow (resync) path deterministic without
+      // driving hundreds of frames.
+      egressMeshBound: 2,
+    })
+    const data = new MessageChannel()
+    const control = new MessageChannel()
+    const dispose = backends.egress!(1, data.port1, control.port1)
+    const mesh = createMeshWorkerClient(control.port2)
+    const commits: DurableCommit[] = []
+    const resyncs: string[] = []
+    mesh.onDurable((commit) => void commits.push(commit))
+    mesh.onResync((pattern) => void resyncs.push(pattern))
+    try {
+      await mesh.listen("*")
+
+      // Three durable commits against a bound of two: the first two deliver to
+      // the attached worker, the third overflows and is answered with a resync.
+      for (let ordinal = 1; ordinal <= 3; ordinal++) {
+        data.port2.postMessage(
+          encodeFrame(
+            eventFrame({
+              event: { id: `evt_${ordinal}`, type: "session.message", properties: { ordinal } },
+              generation: 1,
+              ordinal,
+            }),
+          ),
+        )
+      }
+
+      await pollUntil(() => resyncs.length === 1, { message: "mesh never overflowed to a resync" })
+      expect(commits.map((commit) => commit.meta.ordinal)).toEqual([1, 2])
+      expect(resyncs).toEqual(["*"])
+      // The hub still republishes every durable event live-only (the mesh is an
+      // additive wakeup channel, not a replacement for the event surface).
+      expect(published).toHaveLength(3)
+
+      // An ack frees a backlog slot, so the next durable commit lands again.
+      mesh.acknowledgeDelivery()
+      data.port2.postMessage(
+        encodeFrame(
+          eventFrame({
+            event: { id: "evt_4", type: "session.message", properties: { ordinal: 4 } },
+            generation: 1,
+            ordinal: 4,
+          }),
+        ),
+      )
+      await pollUntil(() => commits.length === 3, { message: "ack never freed a delivery slot" })
+      expect(commits.map((commit) => commit.meta.ordinal)).toEqual([1, 2, 4])
+    } finally {
+      mesh.dispose()
+      dispose()
+      data.port1.close()
+      data.port2.close()
+      control.port1.close()
+      control.port2.close()
+      await backends.dispose()
+    }
+  })
+
+  test("the hub event sink's ack/resync counters become non-zero under load", async () => {
+    const { publisher } = recordingPublisher()
+    const sink = createHubEventSink({ publisher })
+    const channel = new MessageChannel()
+    const dispose = serveEventsPort(channel.port1, sink)
+    try {
+      // Load: many deltas, then the two flow-control frames the worker sends back.
+      for (let i = 0; i < 50; i++) {
+        channel.port2.postMessage(
+          encodeFrame(eventFrame({ event: { id: `delta_${i}`, type: "message.part.delta", properties: { i } } })),
+        )
+      }
+      channel.port2.postMessage(encodeFrame(resyncFrame({ pattern: "message.*" })))
+      channel.port2.postMessage(encodeFrame(ackFrame({ count: 50 })))
+
+      await pollUntil(() => sink.acks > 0 && sink.resyncs > 0, {
+        message: "sink flow-control counters never advanced",
+      })
+      expect(sink.resyncs).toBe(1)
+      expect(sink.acks).toBe(1)
+    } finally {
+      dispose()
+      channel.port1.close()
+      channel.port2.close()
+    }
+  })
 })
 
 describe("14 makeSessionHubNode", () => {
@@ -1923,4 +2074,81 @@ describe("Fix 2 real plugin hook input", () => {
       })
     }),
   )
+})
+
+// ---------------------------------------------------------------------------
+// W4 — `cancelWithReport` reconstructs the subagent cascade's settlement.
+// The dispatcher discards a descendant's own outcome, so the hub reports which
+// descendants still need the caller's fallback idle. `run-state.ts` consumes it.
+// ---------------------------------------------------------------------------
+
+describe("W4 cancelWithReport", () => {
+  test("a cooperatively settled child needs no fallback idle; the parent's outcome is returned", async () => {
+    const parentID = sid("ses_rep_parent")
+    const childID = sid("ses_rep_child")
+    // Two workers: the parent keeps its foreground slot, the child runs in headroom.
+    const pool = new ControllablePool(2, "resolve", true)
+    const hub = createSessionHub({
+      pool,
+      cancellation: {
+        portFor: (worker) => (worker as ControllableWorker).cancelPort,
+        graceMs: 500,
+        schedule: neverSchedule,
+      },
+    })
+    try {
+      hub.jobs.start({ id: parentID, type: "task" })
+      hub.jobs.start({ id: childID, type: "task", parentID })
+      hub.jobs.linkChild(parentID, childID)
+
+      const parent = settleOf(hub.dispatcher.dispatch({ sessionID: parentID, depth: 0 }))
+      const child = settleOf(hub.dispatcher.dispatch({ sessionID: childID, depth: 1 }))
+      await pollUntil(() => hub.dispatcher.registry.get(childID)?.state === "running", {
+        message: "child never started",
+      })
+
+      const report = await hub.cancelWithReport(parentID)
+
+      expect(report.outcome).toMatchObject({ sessionID: parentID, mode: "cooperative", winner: "cancel" })
+      // The child's worker acked (settled cooperatively), so it published its own
+      // idle: the caller must not write a second one.
+      expect(report.descendants).toEqual([{ sessionID: childID, needsFallbackIdle: false }])
+      expect(await child).toBeInstanceOf(SessionCancelledError)
+      expect(await parent).toBeInstanceOf(SessionCancelledError)
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+
+  test("a linked child that never ran needs the fallback idle", async () => {
+    const parentID = sid("ses_unset_parent")
+    const childID = sid("ses_unset_child")
+    const pool = new ControllablePool(1, "resolve", true)
+    const hub = createSessionHub({
+      pool,
+      cancellation: {
+        portFor: (worker) => (worker as ControllableWorker).cancelPort,
+        graceMs: 500,
+        schedule: neverSchedule,
+      },
+    })
+    try {
+      hub.jobs.start({ id: parentID, type: "task" })
+      hub.jobs.start({ id: childID, type: "task", parentID })
+      hub.jobs.linkChild(parentID, childID)
+
+      const parent = settleOf(hub.dispatcher.dispatch({ sessionID: parentID, depth: 0 }))
+      await pollUntil(() => hub.dispatcher.registry.get(parentID)?.state === "running", {
+        message: "parent never started",
+      })
+
+      const report = await hub.cancelWithReport(parentID)
+
+      // The child was never admitted, so no worker could publish its idle.
+      expect(report.descendants).toEqual([{ sessionID: childID, needsFallbackIdle: true }])
+      expect(await parent).toBeInstanceOf(SessionCancelledError)
+    } finally {
+      await hub.terminateAll()
+    }
+  })
 })

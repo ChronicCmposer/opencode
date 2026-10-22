@@ -1,8 +1,8 @@
 // Phase 11.5 — hub-side mirrored PID/PGID registry (plan decision line 52).
 //
 // The hub mirrors the child PGIDs a worker owns and group-kills them on
-// terminate (terminate() reaps no children — 3.10). Registration must happen
-// BEFORE the spawn returns so a terminate racing the spawn cannot miss a PGID.
+// terminate (terminate() reaps no children — 3.10). A worker reports each
+// detached child over its control port; the hub mirrors the entry.
 // POSIX-only process cases are skipped with the documented reason from
 // `process-tree.posixSupport()`.
 
@@ -12,7 +12,6 @@ import {
   posixReaper,
   reapSupport,
   registerReported,
-  spawnRegistered,
   type ProcessReaper,
 } from "@/session/worker/pid-registry"
 import { isAlive, posixSupport, spawnDetached, waitForDeath } from "../../lib/process-tree"
@@ -51,51 +50,6 @@ describe("11.5 mirrored PGID registry", () => {
     const registry = createPidRegistry()
     expect(() => registry.register({ pid: 0, pgid: 0, workerID: 1, label: "x" })).toThrow()
     expect(() => registry.register({ pid: 5, pgid: 5, workerID: -1, label: "x" })).toThrow()
-  })
-
-  test("registers the PGID synchronously before the spawn result is returned", () => {
-    const registry = createPidRegistry()
-    let spawnCalls = 0
-
-    const child = spawnRegistered(
-      () => {
-        spawnCalls++
-        return { pid: 4242 }
-      },
-      registry,
-      { workerID: 9, label: "mcp" },
-    )
-
-    // No `await` has happened: the registry is already populated.
-    expect(spawnCalls).toBe(1)
-    expect(child).toMatchObject({ pid: 4242, pgid: 4242, workerID: 9, label: "mcp" })
-    expect(registry.has(4242)).toBe(true)
-  })
-
-  test("validates meta before spawning so a bad registration never leaks a process", () => {
-    const registry = createPidRegistry()
-    let spawnCalls = 0
-    const spawn = () => {
-      spawnCalls++
-      return { pid: 500 }
-    }
-
-    expect(() => spawnRegistered(spawn, registry, { workerID: -1, label: "lsp" })).toThrow()
-    expect(() => spawnRegistered(spawn, registry, { workerID: 1, label: "   " })).toThrow()
-    expect(spawnCalls).toBe(0)
-  })
-
-  test("kills the spawned group when mirroring fails, so it is never leaked", () => {
-    const { reaper, calls } = recordingReaper()
-    const registry = createPidRegistry()
-    registry.register({ pid: 700, pgid: 700, workerID: 1, label: "lsp" })
-
-    // The new spawn's PGID collides with a different owner; register throws.
-    expect(() => spawnRegistered(() => ({ pid: 700 }), registry, { workerID: 2, label: "mcp" }, reaper)).toThrow(
-      /owned by worker 1/,
-    )
-    expect(calls).toEqual([{ pgid: 700, signal: "SIGKILL" }])
-    expect(registry.get(700)).toMatchObject({ workerID: 1, label: "lsp" })
   })
 
   test("reap(workerID) group-kills only that worker's PGIDs and unregisters them", () => {
@@ -228,10 +182,11 @@ describe("11.5 worker→hub reported children", () => {
 
 describe("11.5 real detached process-group reaping", () => {
   test.skipIf(!support.supported)(
-    "a detached child registered via spawnRegistered is reaped by a group kill",
+    "a detached child registered in the registry is reaped by a group kill",
     async () => {
       const registry = createPidRegistry({ reaper: posixReaper() })
-      const child = spawnRegistered(() => spawnDetached(["sleep", "30"]), registry, { workerID: 1, label: "lsp" })
+      const spawned = spawnDetached(["sleep", "30"])
+      const child = registry.register({ pid: spawned.pid, pgid: spawned.pgid, workerID: 1, label: "lsp" })
 
       try {
         expect(registry.has(child.pgid)).toBe(true)

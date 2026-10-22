@@ -3,12 +3,10 @@
 // 3.10 proved `terminate()` reaps no children: whatever a worker spawned stays
 // alive as an orphan when the isolate is torn down. The hub therefore mirrors
 // every child PGID a worker owns and group-kills the mirrors on terminate
-// ("hybrid PGID reaping"). Two properties are load-bearing:
-//
-//   • registration happens BEFORE the spawn result is returned, so a terminate
-//     racing a spawn can never miss a freshly-created PGID; and
-//   • reaping is a whole-group kill, which is the only teardown that does not
-//     leak grandchildren (the same semantics `test/lib/process-tree.ts` asserts).
+// ("hybrid PGID reaping"). A worker reports each detached child over its control
+// port and the hub mirrors the entry; reaping is a whole-group kill, the only
+// teardown that does not leak grandchildren (the same semantics
+// `test/lib/process-tree.ts` asserts).
 //
 // PGID semantics are POSIX-only; Windows support is tracked separately
 // (`ProcessReaper` TODO), so `reapSupport()` reports the reason the platform
@@ -230,59 +228,9 @@ export function createPidRegistry(options: PidRegistryOptions = {}): PidRegistry
   }
 }
 
-export interface SpawnLike {
-  readonly pid?: number
-  readonly pgid?: number
-}
-
-export interface SpawnRegisteredMeta {
-  readonly workerID: number
-  readonly label: string
-  readonly generation?: number
-}
-
-/**
- * Run `spawn` synchronously and mirror the resulting PGID before returning, so
- * the PGID is present in the registry the instant the caller can observe it.
- * `spawn` is the synchronous `Bun.spawn(...)` (it exposes `pid` immediately);
- * the returned child is the registered mirror.
- *
- * `meta` is validated before `spawn` runs, so a bad registration never leaks a
- * process. If mirroring still fails (e.g. a PGID already owned by another
- * worker) the freshly spawned group is killed rather than left unregistered.
- */
-export function spawnRegistered(
-  spawn: () => SpawnLike,
-  registry: PidRegistry,
-  meta: SpawnRegisteredMeta,
-  reaper: ProcessReaper = posixReaper(),
-): RegisteredChild {
-  assertWorkerID(meta.workerID)
-  assertLabel(meta.label)
-  const spawned = spawn()
-  if (spawned.pid === undefined) throw new Error(`spawn returned no pid (label ${meta.label})`)
-  const pgid = spawned.pgid ?? spawned.pid
-  try {
-    return registry.register({
-      pid: spawned.pid,
-      pgid,
-      workerID: meta.workerID,
-      label: meta.label,
-      generation: meta.generation,
-    })
-  } catch (error) {
-    try {
-      reaper.killGroup(pgid, "SIGKILL")
-    } catch {
-      // Best effort: the registration failure is the actionable error.
-    }
-    throw error
-  }
-}
-
 /**
  * Mirror a worker's `pid-report` frame into the hub registry. Every entry is
- * keyed by its PGID (via `register`, the same primitive `spawnRegistered` uses).
+ * keyed by its PGID via `register`.
  *
  * `workerID` is the authoritative owner when supplied: the hub knows which pool
  * slot a control port belongs to, while the worker only knows its own thread id.

@@ -318,6 +318,15 @@ export const {
           break
         }
 
+        case "session.cancelled": {
+          // A cancel outcome is the session's terminal signal. The hub publishes
+          // it alongside the worker's terminal idle; clearing the status here
+          // guarantees the running indicator stops even if that idle is missed
+          // or arrives after this event.
+          setStore("session_status", event.properties.sessionID, { type: "idle" })
+          break
+        }
+
         case "message.updated": {
           touchMessage(event.properties.info.sessionID, event.properties.info.id)
           const messages = store.message[event.properties.info.sessionID]

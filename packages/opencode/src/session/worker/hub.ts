@@ -37,6 +37,7 @@ import {
   type BrokerOptions,
 } from "@/session/broker/broker"
 import { createEgressReceiver } from "@/session/egress/receiver"
+import { attachMeshWorker, createEgressMesh, type DurableCommit, type EgressMesh } from "@/session/egress/mesh"
 import type { EventV2Event, EventsAckPayload, EventsResyncPayload } from "./frame"
 import { createLiveEventPublisher, instanceLocation, EventV2Bridge, type LiveEventPublisher } from "@/event-v2-bridge"
 import {
@@ -49,7 +50,13 @@ import {
 import { migrationStatements } from "../writer/migration.statements.gen"
 import type { SessionID } from "@/session/schema"
 import { defined } from "@/util/object"
-import { createDispatcher, type CancellationConfig, type Dispatcher, type SessionWorker } from "./dispatch"
+import {
+  createDispatcher,
+  type CancellationConfig,
+  type CancelledMode,
+  type Dispatcher,
+  type SessionWorker,
+} from "./dispatch"
 import { createJobRegistry, type JobRegistry } from "./job-registry"
 import { createResultRouter, jobPortFromMessagePort, serveJobRegistry, type JobPort } from "./job-client"
 import {
@@ -88,6 +95,30 @@ import { portFromMessagePort } from "./port"
 import type { SessionWorkerInit } from "./session-worker"
 import { Session } from "@/session/session"
 
+/** A descendant cancelled by the subagent cascade, and whether it needs a fallback idle. */
+export interface CancelledDescendant {
+  readonly sessionID: SessionID
+  /**
+   * `true` when the descendant's run did NOT settle its own worker — it was
+   * queued, never admitted, or grace-terminated — so no worker published its
+   * terminal idle and the caller must write the fallback idle. `false` when the
+   * run settled cooperatively or completed, so its worker published the idle.
+   */
+  readonly needsFallbackIdle: boolean
+}
+
+/**
+ * The result of cancelling a session and cascading to its subagent children.
+ * The dispatcher discards a descendant's own outcome, so the hub reconstructs
+ * the terminal modes it observed and reports which sessions still need an idle.
+ */
+export interface CancelReport {
+  /** The requested session's outcome; `undefined` when it was not admitted. */
+  readonly outcome: CancelOutcome | undefined
+  /** Every descendant the cascade reached, plus any linked but unsettled child. */
+  readonly descendants: ReadonlyArray<CancelledDescendant>
+}
+
 /** The hub surface `run-state.ts` consumes when the rollout flag is on. */
 export interface SessionHub {
   readonly dispatcher: Dispatcher
@@ -117,6 +148,14 @@ export interface SessionHub {
   assertNotBusy(sessionID: SessionID): Promise<boolean>
   /** The UI-stop path: cooperative checkpoint, then terminate after the grace window. */
   cancel(sessionID: SessionID): Promise<CancelOutcome | undefined>
+  /**
+   * Cancel a session and its subagent cascade, returning the requested session's
+   * outcome AND every cascaded descendant with whether its worker published the
+   * terminal idle. `run-state.ts` consumes this to write the fallback idle
+   * exactly once per cancelled session (a cooperative settle publishes its own;
+   * a queued or grace-terminated one does not).
+   */
+  cancelWithReport(sessionID: SessionID): Promise<CancelReport>
   cancelAll(): Promise<void>
   terminateAll(): Promise<void>
 }
@@ -236,15 +275,6 @@ export interface SessionHubOptions {
    * `PidRegistry`; absent means pid reports are ignored (a pure hub, no reaper).
    */
   readonly onPidReport?: (workerID: number, report: PidReport) => void
-}
-
-/**
- * The worker currently hosting a session, as the dispatcher knows it. Declared
- * locally so the hub can consume it without importing the dispatcher's registry.
- * `dispatch.ts` must add this method to `Dispatcher` (consolidation request).
- */
-interface WorkerLookup {
-  workerForSession(sessionID: SessionID): number | undefined
 }
 
 /**
@@ -376,12 +406,28 @@ export function createHubEventSink(options: HubEventSinkOptions): HubEventSink {
  * Serve a worker's events port with the shared egress receiver (length-prefixed
  * `WorkerFrameEnvelope` frames, backpressure-aware), routing every decoded frame
  * to `sink`. A malformed frame fails loud: the receiver closes the port.
+ *
+ * A writer-stamped durable event (`generation` + `ordinal`) is additionally
+ * handed to `onDurable` — the hub's cross-isolate mesh commit path, so another
+ * worker's `events.durable()` subscribers wake. The live republish is unchanged:
+ * the mesh is an additive wakeup channel, never a re-commit.
  */
-export function serveEventsPort(port: MessagePort, sink: HubEventSink, onError?: (error: Error) => void): () => void {
+export function serveEventsPort(
+  port: MessagePort,
+  sink: HubEventSink,
+  onError?: (error: Error) => void,
+  onDurable?: (commit: DurableCommit) => void,
+): () => void {
   const receiver = createEgressReceiver({
     port,
     onFrame: (frame) => {
-      if (frame.kind === "event") sink.event(frame.payload.event)
+      if (frame.kind !== "event") return
+      sink.event(frame.payload.event)
+      if (onDurable === undefined) return
+      const { generation, ordinal } = frame.payload
+      if (generation !== undefined && ordinal !== undefined) {
+        onDurable({ meta: { generation, ordinal }, event: frame.payload.event })
+      }
     },
     onEnd: () => sink.end(),
     onResync: (payload) => sink.resync(payload),
@@ -474,12 +520,8 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   // Assigned once the pool exists; read lazily by the routing closures below.
   let dispatcher: Dispatcher
 
-  const workerForSession = (sessionID: string): number | undefined => {
-    const lookup = dispatcher as unknown as Partial<WorkerLookup>
-    return (
-      lookup.workerForSession?.(sessionID as SessionID) ?? dispatcher.registry.get(sessionID as SessionID)?.workerID
-    )
-  }
+  const workerForSession = (sessionID: string): number | undefined =>
+    dispatcher.workerForSession(sessionID as SessionID)
   const portForSession = (sessionID: string): JobPort | undefined => {
     const workerID = workerForSession(sessionID)
     return workerID === undefined ? undefined : jobPorts.get(workerID)
@@ -554,18 +596,28 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   const pool = typeof options.pool === "function" ? options.pool(onJobPort) : options.pool
   const resolvedCancellation =
     typeof options.cancellation === "function" ? options.cancellation(pool) : options.cancellation
+  // Every terminal cancel mode the dispatcher reports, keyed by session id. The
+  // dispatcher cascades children-first but discards a descendant's own outcome,
+  // so the hub records the modes here and reconstructs which descendants still
+  // need a fallback idle (see `cancelWithReport`).
+  const cancelledModes = new Map<string, CancelledMode>()
   // The hub's job registry is the cross-worker parent→child authority (9.4), so
   // an unwired cancellation config still cascades to subagents and still marks a
   // cancelled job. An explicit config always wins.
+  const childrenOf: (sessionID: SessionID) => ReadonlyArray<SessionID> =
+    resolvedCancellation?.childrenOf ?? ((sessionID) => jobs.childrenOf(sessionID).map((child) => child as SessionID))
+  const baseOnCancelled = resolvedCancellation?.onCancelled
   const cancellation: CancellationConfig | undefined =
     resolvedCancellation === undefined
       ? undefined
       : {
           ...resolvedCancellation,
-          childrenOf:
-            resolvedCancellation.childrenOf ??
-            ((sessionID) => jobs.childrenOf(sessionID).map((child) => child as SessionID)),
-          onCancelled: resolvedCancellation.onCancelled ?? ((event) => void jobs.cancel(event.sessionID)),
+          childrenOf,
+          onCancelled: (event) => {
+            cancelledModes.set(event.sessionID, event.mode)
+            if (baseOnCancelled !== undefined) baseOnCancelled(event)
+            else void jobs.cancel(event.sessionID)
+          },
         }
   dispatcher = createDispatcher({
     pool,
@@ -578,8 +630,73 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       onDegraded: options.onDegraded,
     }),
   })
-  const dispatch: SessionDispatch = createSessionDispatch({ dispatcher, pool })
+  // Production depth plumbing: a session's subagent depth lives on the hub job
+  // registry (`subagent.dispatchSubagent` registers the child there), so resolve
+  // it when the caller does not pass one. Without this every production dispatch
+  // resolved `depth: 0` and the on-demand headroom / child-queue paths never ran.
+  const dispatch: SessionDispatch = createSessionDispatch({
+    dispatcher,
+    pool,
+    depthOf: (sessionID) => jobs.get(sessionID)?.depth ?? 0,
+  })
   const onDispatch = options.onDispatch
+
+  /**
+   * Every descendant of `sessionID` (children-first, depth-first), as the
+   * dispatcher's own cascade would visit them. A linked child that was never
+   * admitted is included, so it still receives a fallback idle.
+   */
+  const descendantsOf = (sessionID: SessionID): SessionID[] => {
+    const descendants: SessionID[] = []
+    const visit = (id: SessionID): void => {
+      for (const child of childrenOf(id)) {
+        visit(child)
+        descendants.push(child)
+      }
+    }
+    visit(sessionID)
+    return descendants
+  }
+
+  /** A cancel mode that implies the worker already published its terminal idle. */
+  const workerPublishedIdle = (mode: CancelledMode | undefined): boolean =>
+    mode === "cooperative" || mode === "completed"
+
+  const cancelWithReport = async (sessionID: SessionID): Promise<CancelReport> => {
+    const descendants = descendantsOf(sessionID)
+    // Drop a prior request's recorded modes so its outcome is never reused.
+    cancelledModes.delete(sessionID)
+    for (const descendant of descendants) cancelledModes.delete(descendant)
+
+    // The dispatcher cascades to the descendants itself (children-first); the
+    // recorded modes below reconstruct each descendant's settlement.
+    const outcome = await dispatcher.cancelWithGrace(sessionID)
+
+    // Report the terminal outcome to every SSE client. `SessionV1.Event.Cancelled`
+    // is non-durable, and the live-only publisher refuses a durable definition, so
+    // this can never re-commit the session state already written through the writer.
+    //
+    // Publish only when a cancel actually won. A `completion` outcome means the
+    // run finished on its own during the grace window; telling the client it was
+    // cancelled would be a lie (and would race the run's own idle/completion).
+    // The hub deliberately emits no `session.status: idle` here — `run-state.ts`
+    // owns the canonical cancel-idle transition.
+    if (outcome !== undefined && outcome.winner === "cancel") {
+      options.events?.publishDefinition(SessionV1.Event.Cancelled, {
+        sessionID: outcome.sessionID,
+        mode: outcome.mode,
+        durationMs: outcome.durationMs,
+        acknowledged: outcome.acknowledged,
+      })
+    }
+    return {
+      outcome,
+      descendants: descendants.map((child) => ({
+        sessionID: child,
+        needsFallbackIdle: !workerPublishedIdle(cancelledModes.get(child)),
+      })),
+    }
+  }
 
   return {
     dispatcher,
@@ -596,27 +713,8 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       return dispatch.startShell(sessionID)
     },
     assertNotBusy: (sessionID) => dispatch.assertNotBusy(sessionID),
-    cancel: async (sessionID) => {
-      const outcome = await dispatcher.cancelWithGrace(sessionID)
-      // Report the terminal outcome to every SSE client. `SessionV1.Event.Cancelled`
-      // is non-durable, and the live-only publisher refuses a durable definition, so
-      // this can never re-commit the session state already written through the writer.
-      //
-      // Publish only when a cancel actually won. A `completion` outcome means the
-      // run finished on its own during the grace window; telling the client it was
-      // cancelled would be a lie (and would race the run's own idle/completion).
-      // The hub deliberately emits no `session.status: idle` here — `run-state.ts`
-      // owns the canonical cancel-idle transition.
-      if (outcome !== undefined && outcome.winner === "cancel") {
-        options.events?.publishDefinition(SessionV1.Event.Cancelled, {
-          sessionID: outcome.sessionID,
-          mode: outcome.mode,
-          durationMs: outcome.durationMs,
-          acknowledged: outcome.acknowledged,
-        })
-      }
-      return outcome
-    },
+    cancel: async (sessionID) => (await cancelWithReport(sessionID)).outcome,
+    cancelWithReport,
     cancelAll: () => dispatch.cancelAll(),
     async terminateAll() {
       for (const dispose of jobDisposers.values()) dispose()
@@ -1286,6 +1384,12 @@ export interface ProductionPortBackendsOptions {
    */
   readonly events?: LiveEventPublisher
   /**
+   * Per-worker mesh subscription backlog bound; defaults to the mesh's own
+   * `MESH_SUBSCRIPTION_BOUND`. A small bound makes the overflow/resync path
+   * deterministic in tests.
+   */
+  readonly egressMeshBound?: number
+  /**
    * Handlers for the three hub-proxy authorities served over the worker control
    * port (plan decision 64). Supplied by `productionSessionHubLayer`, which
    * yields the real `SessionStatus` / `Permission` / `Question` services.
@@ -1337,6 +1441,12 @@ export function lazyOpenWriter(writer: WriterClient, filename: string, statement
 export interface ProductionPortBackends extends WorkerPortBackends {
   readonly writer: HubWriter
   readonly broker: BrokerBackend
+  /**
+   * The ONE egress mesh the hub serves every worker's `egressControl` port
+   * against. Exposed so a caller (or test) can observe the cross-isolate
+   * `durable()` wakeups; commits are published on the events-port durable path.
+   */
+  readonly egressMesh: EgressMesh
   readonly dispose: () => Promise<void>
 }
 
@@ -1368,16 +1478,39 @@ export function buildProductionPortBackends(options: ProductionPortBackendsOptio
       migrationStatements,
     )
   const broker: BrokerBackend = options.broker ?? (ownedBroker = createBroker(options.brokerOptions))
+  // ONE mesh per hub: every worker's transferred `egressControl` port attaches
+  // here, and the durable commit path publishes to it (plan task 8.10/8.11).
+  const egressMesh = createEgressMesh(
+    options.egressMeshBound === undefined ? {} : { bound: options.egressMeshBound },
+  )
   return {
     writer,
     broker,
+    egressMesh,
     ...(options.hubProxy === undefined ? {} : { hubProxy: options.hubProxy }),
+    // The default egress backend serves the data port AND attaches the worker's
+    // control plane to the shared mesh; both the receiver and the attachment are
+    // disposed with the port. A durable event reaching the data port is published
+    // to the mesh, waking other workers' `durable()` subscribers.
     egress:
       options.egress ??
-      ((_workerID, port) =>
-        options.events === undefined
-          ? drainEgressPort(port)
-          : serveEventsPort(port, createHubEventSink({ publisher: options.events }))),
+      ((workerID, port, control) => {
+        const attachment =
+          control === undefined ? undefined : attachMeshWorker(egressMesh, String(workerID), control)
+        const disposeReceiver =
+          options.events === undefined
+            ? drainEgressPort(port)
+            : serveEventsPort(
+                port,
+                createHubEventSink({ publisher: options.events }),
+                undefined,
+                (commit) => egressMesh.publish(commit),
+              )
+        return () => {
+          disposeReceiver()
+          attachment?.dispose()
+        }
+      }),
     dispose: async () => {
       if (ownedWriter !== undefined) await ownedWriter.close().catch(() => undefined)
       if (ownedBroker !== undefined) await ownedBroker.teardown().catch(() => undefined)

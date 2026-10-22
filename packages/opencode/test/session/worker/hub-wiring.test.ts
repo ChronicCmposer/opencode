@@ -225,9 +225,9 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
     const cancelled: SessionID[] = []
     const hub: SessionHub = {
       ...base,
-      cancel: async (sessionID) => {
+      cancelWithReport: async (sessionID) => {
         cancelled.push(sessionID)
-        return base.cancel(sessionID)
+        return base.cancelWithReport(sessionID)
       },
     }
     return withTmpdirInstance()(
@@ -245,9 +245,9 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
     const order: string[] = []
     const hub: SessionHub = {
       ...base,
-      cancel: async (sessionID) => {
+      cancelWithReport: async (sessionID) => {
         order.push("hub-cancel")
-        return base.cancel(sessionID)
+        return base.cancelWithReport(sessionID)
       },
     }
     const calls: StatusCall[] = []
@@ -785,6 +785,113 @@ describe("12 — exactly one flag-on cancel idle per case (ON ≡ OFF)", () => {
         expect(on).toBeUndefined()
         expect(idleOf(onCalls)).toEqual([{ sessionID, status: { type: "idle" } }])
         expect(idleOf(offCalls)).toEqual(idleOf(onCalls))
+      }),
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// W4 — parent cancel must settle every subagent child to exactly one idle.
+//
+// The user bug: `SessionRunState.cancel` wrote the fallback idle only for the
+// requested session, so a child the hub cascade could not settle (never
+// admitted, queued, or grace-terminated) never reached `SessionStatus = idle`.
+// The hub now reports its cascade's descendants and whether each worker
+// published its own idle; run-state writes the fallback for exactly the rest.
+// ---------------------------------------------------------------------------
+
+describe("W4 — parent cancel settles every child to exactly one idle", () => {
+  const idleCalls = (calls: StatusCall[]) => calls.filter((call) => call.status.type === "idle")
+  const runningState = (hub: SessionHub, sessionID: SessionID) => (): true | undefined =>
+    hub.dispatcher.registry.get(sessionID)?.state === "running" ? true : undefined
+
+  /** A work/onInterrupt pair a test never inspects; `ensureRunning` needs both. */
+  const work = (sessionID: SessionID) => Effect.succeed(withParts(sessionID))
+
+  it.live("a registry-linked child the hub never dispatched still reaches one idle", () => {
+    const parentID = sid("ses_w4_parent")
+    const childID = sid("ses_w4_child")
+    const calls: StatusCall[] = []
+    const { publisher, published } = recordingPublisher()
+    // Only the parent runs on a worker; the child is a registered but never
+    // dispatched subagent, so no worker can publish its idle.
+    const pool = new BlockingPool(1, withParts(parentID), (id) => {
+      if (id === parentID) calls.push({ sessionID: id, status: { type: "idle" } })
+    })
+    const hub = createSessionHub({
+      pool,
+      events: publisher,
+      cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort, graceMs: 5_000 }),
+    })
+    hub.jobs.start({ id: parentID, type: "task" })
+    hub.jobs.start({ id: childID, type: "task", parentID })
+    hub.jobs.linkChild(parentID, childID)
+
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const running = yield* state
+          .ensureRunning(parentID, work(parentID), work(parentID))
+          .pipe(Effect.exit, Effect.forkChild)
+        yield* pollWithTimeout(Effect.sync(runningState(hub, parentID)), "parent never reached running")
+        yield* state.cancel(parentID)
+        yield* Fiber.join(running)
+      }).pipe(
+        Effect.provide(recordingRunStateLayer(calls)),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+      ),
+    ).pipe(
+      Effect.map(() => {
+        const idles = idleCalls(calls)
+        // The parent's worker published its own idle; no fallback double-emit.
+        expect(idles.filter((call) => call.sessionID === parentID)).toBeArrayOfSize(1)
+        // The child never ran, so run-state's cascade fallback is its only idle.
+        expect(idles.filter((call) => call.sessionID === childID)).toBeArrayOfSize(1)
+        // The parent's cancel is reported once; the child's job is marked too.
+        expect(published.map((event) => event.type)).toEqual(["session.cancelled"])
+        expect(hub.jobs.get(childID)?.status).toBe("cancelled")
+      }),
+    )
+  })
+
+  it.live("a child the hub registry never linked is swept via Session.children", () => {
+    const parentID = sid("ses_w4_sweep_parent")
+    const childID = sid("ses_w4_sweep_child")
+    const calls: StatusCall[] = []
+    // The parent runs; the child is only persisted (no hub registry link).
+    const pool = new BlockingPool(1, withParts(parentID), (id) => {
+      if (id === parentID) calls.push({ sessionID: id, status: { type: "idle" } })
+    })
+    const hub = createSessionHub({
+      pool,
+      cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort, graceMs: 5_000 }),
+    })
+    const sessions = Session.Service.of({
+      children: (id: SessionID) => Effect.succeed(id === parentID ? [{ id: childID } as Session.Info] : []),
+    } as unknown as Session.Interface)
+
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const running = yield* state
+          .ensureRunning(parentID, work(parentID), work(parentID))
+          .pipe(Effect.exit, Effect.forkChild)
+        yield* pollWithTimeout(Effect.sync(runningState(hub, parentID)), "parent never reached running")
+        yield* state.cancel(parentID)
+        yield* Fiber.join(running)
+      }).pipe(
+        Effect.provide(recordingRunStateLayer(calls)),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+        Effect.provideService(Session.Service, sessions),
+      ),
+    ).pipe(
+      Effect.map(() => {
+        const idles = idleCalls(calls)
+        expect(idles.filter((call) => call.sessionID === parentID)).toBeArrayOfSize(1)
+        // The sweep cancelled the persisted child through the hub and wrote its idle.
+        expect(idles.filter((call) => call.sessionID === childID)).toBeArrayOfSize(1)
       }),
     )
   })

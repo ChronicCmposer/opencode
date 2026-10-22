@@ -49,11 +49,17 @@ export interface SessionWorkerNodesOptions<N extends AnyNode = AnyNode> {
 
 /**
  * Whether the session-worker rollout flag is on for `env`. Delegates to the
- * canonical pure predicate `experimentalSessionWorkersFromEnv` (runtime-flags.ts)
- * so the graph decision and `RuntimeFlags.experimentalSessionWorkers` cannot
- * drift: the dedicated `OPENCODE_EXPERIMENTAL_SESSION_WORKERS` var wins when it
- * parses as a boolean, otherwise the `OPENCODE_EXPERIMENTAL` umbrella applies,
- * otherwise `false`.
+ * canonical parser `experimentalSessionWorkersFromEnv` (runtime-flags.ts), the
+ * same parser `RuntimeFlags.experimentalSessionWorkers` resolves through. The
+ * dedicated `OPENCODE_EXPERIMENTAL_SESSION_WORKERS` var wins when it parses as a
+ * boolean, otherwise the `OPENCODE_EXPERIMENTAL` umbrella applies, otherwise
+ * `false`.
+ *
+ * The graph decision is made at module-eval time from `process.env`, while the
+ * runtime gate resolves through the ambient ConfigProvider (whose default reads
+ * `process.env`). Sharing the parser keeps them in lockstep on every value,
+ * including malformed ones; the sources only diverge when a caller overrides the
+ * ConfigProvider away from the environment.
  */
 export function sessionWorkersEnabled(env: Record<string, string | undefined> = process.env): boolean {
   return experimentalSessionWorkersFromEnv(env)

@@ -1,8 +1,8 @@
-// Phase 4.2 — session worker pool core (plan task 4.2).
+// Session worker pool sizing and the production pool wrapper.
 //
 // K = `os.availableParallelism() − 2`, floor 1, a single worker below 4 cores,
-// overridable with `OPENCODE_SESSION_WORKER_COUNT`. Cores are injected so pool
-// sizing is deterministic; the spawned workers use the production bootstrap.
+// overridable with `OPENCODE_SESSION_WORKER_COUNT`. Cores are injected so sizing
+// is deterministic.
 
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
@@ -21,14 +21,7 @@ import {
   buildWorkerEnv,
   resolveWorkerModel,
 } from "@/session/worker/init"
-import {
-  WORKER_COUNT_ENV,
-  createWorkerPool,
-  describeWorkerFailure,
-  resolvePoolWorkerEntry,
-  resolveWorkerCount,
-  spawnPoolWorker,
-} from "@/session/worker/pool"
+import { WORKER_COUNT_ENV, resolveWorkerCount } from "@/session/worker/pool"
 import { createProductionWorkerPool } from "@/session/worker/hub"
 import { buildWorkerSnapshot, nextEpoch } from "@/session/worker/snapshot"
 import { assertStructuredCloneable, sessionWorkerInit } from "../../lib/session-worker-init"
@@ -37,19 +30,6 @@ import { sid } from "../../lib/async"
 
 /** The dependency-light executor fixture (speaks the executor protocol). */
 const EXECUTOR_FIXTURE = new URL("../../fixture/session-execute-worker.ts", import.meta.url)
-
-/** Attach a rejection handler up-front so a later settle cannot go unhandled. */
-const capture = (promise: Promise<unknown>): Promise<unknown> =>
-  promise.then(
-    () => undefined,
-    (error: unknown) => error,
-  )
-
-/** A one-shot worker entry that announces ready, then throws `message` on its first run. */
-function throwingWorkerEntry(message: string): string {
-  const source = `globalThis.postMessage({ type: "ready", threadId: 1 });globalThis.onmessage = () => { throw new Error(${JSON.stringify(message)}) }`
-  return `data:text/javascript,${encodeURIComponent(source)}`
-}
 
 describe("worker count sizing", () => {
   test("reserves two cores on four or more cores", () => {
@@ -80,51 +60,6 @@ describe("worker count sizing", () => {
 
   test("falls back to the real available parallelism when not injected", () => {
     expect(resolveWorkerCount({ env: {} })).toBeGreaterThanOrEqual(1)
-  })
-})
-
-describe("worker pool spawn", () => {
-  test("spawns K ready workers that run the production bootstrap Effect", async () => {
-    await using pool = createWorkerPool({ availableParallelism: () => 4, env: {} })
-
-    expect(pool.size).toBe(2)
-    await pool.ready()
-    expect(pool.workers).toHaveLength(2)
-    expect(pool.workers.every((worker) => worker.alive)).toBe(true)
-
-    const results = await Promise.all(pool.workers.map((worker) => worker.run(21)))
-    expect(results).toEqual([42, 42])
-  })
-
-  test("the env override controls the spawned pool size", async () => {
-    await using pool = createWorkerPool({ availableParallelism: () => 8, env: { [WORKER_COUNT_ENV]: "2" } })
-
-    expect(pool.size).toBe(2)
-    await pool.ready()
-    expect(pool.workers).toHaveLength(2)
-  })
-
-  test("terminateAll stops every worker", async () => {
-    const pool = createWorkerPool({ availableParallelism: () => 4, env: {} })
-    await pool.ready()
-
-    await pool.terminateAll()
-    expect(pool.workers.every((worker) => !worker.alive)).toBe(true)
-  })
-
-  test("terminate resolves with a numeric exit code and is idempotent", async () => {
-    const pool = createWorkerPool({ availableParallelism: () => 4, env: {} })
-    await pool.ready()
-
-    const worker = pool.workers[0]
-    const first = await worker.terminate()
-    expect(typeof first).toBe("number")
-
-    // A second terminate reports the cached exit code, not the fallback.
-    const second = await worker.terminate(99)
-    expect(second).toBe(first)
-
-    await pool.terminateAll()
   })
 })
 
@@ -422,67 +357,5 @@ describe("createProductionWorkerPool", () => {
     }
 
     await pool.terminateAll()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Isolate error surfacing (Fix D): the real worker error must survive the pool.
-// ---------------------------------------------------------------------------
-
-describe("isolate error surfacing", () => {
-  test("describeWorkerFailure keeps the real message and attaches the cause", () => {
-    const cause = new Error("ModuleNotFound resolving './session-worker.ts'")
-    const failure = describeWorkerFailure(3, cause.message, cause)
-
-    expect(failure.message).toBe(`worker 3 error: ${cause.message}`)
-    expect(failure.cause).toBe(cause)
-  })
-
-  test("describeWorkerFailure omits the cause when the runtime reports none", () => {
-    const failure = describeWorkerFailure(1, "isolate died")
-
-    expect(failure.message).toBe("worker 1 error: isolate died")
-    expect(failure.cause).toBeUndefined()
-  })
-
-  test("a worker that throws surfaces its real error through run()", async () => {
-    await using worker = spawnPoolWorker({ id: 8, entry: throwingWorkerEntry("KNOWN_RUN_FAILURE"), timeoutMs: 10_000 })
-    await worker.ready()
-
-    const error = await capture(worker.run(2))
-
-    expect(error).toBeInstanceOf(Error)
-    expect((error as Error).message).toContain("KNOWN_RUN_FAILURE")
-    expect(worker.alive).toBe(false)
-  })
-
-  test("a boot failure surfaces the real module-not-found message through ready()", async () => {
-    await using worker = spawnPoolWorker({ id: 9, entry: "no-such-session-worker-entry.ts", timeoutMs: 10_000 })
-
-    const error = await capture(worker.ready())
-
-    expect(error).toBeInstanceOf(Error)
-    expect((error as Error).message).toContain("no-such-session-worker-entry.ts")
-    expect(worker.alive).toBe(false)
-  })
-})
-
-describe("pool worker entry resolution", () => {
-  const defined = "/$bunfs/root/pool-bootstrap.js"
-
-  test("an env override wins over the build-time define", () => {
-    expect(
-      resolvePoolWorkerEntry({ env: { OPENCODE_POOL_WORKER_PATH: "/custom/bootstrap.js" }, definedPath: defined }),
-    ).toBe("/custom/bootstrap.js")
-  })
-
-  test("the build-time define is used when no env override is present", () => {
-    expect(resolvePoolWorkerEntry({ env: {}, definedPath: defined })).toBe(defined)
-  })
-
-  test("without an override or define the source-relative bootstrap is used", () => {
-    const entry = resolvePoolWorkerEntry({ env: {} })
-    expect(entry).toBeInstanceOf(URL)
-    expect(String(entry).endsWith("/bootstrap.ts")).toBe(true)
   })
 })

@@ -101,6 +101,60 @@ describe("worker egress client adapts the mesh control link", () => {
     attachment.dispose()
   })
 
+  test("acknowledgeDelivery frees the hub backlog slot end-to-end", async () => {
+    const egressChannel = new MessageChannel()
+    const controlChannel = new MessageChannel()
+    const mesh = createEgressMesh({ bound: 1 })
+    const attachment = attachMeshWorker(mesh, "w1", controlChannel.port2)
+    const client = createWorkerEgressClient(egressChannel.port1, { controlPort: controlChannel.port1 })
+
+    const commits: DurableCommit[] = []
+    client.mesh?.onDurable((commit) => commits.push(commit))
+    await client.mesh?.listen("*")
+
+    mesh.publish({ meta: { generation: 1, ordinal: 1 }, event: durable("d1") })
+    await pollUntil(() => commits.length === 1)
+    expect(mesh.outstanding("w1")).toBe(1)
+
+    // The worker acknowledges the processed delivery; the slot frees and the
+    // next commit is no longer treated as overflow.
+    client.mesh?.acknowledgeDelivery()
+    await pollUntil(() => mesh.outstanding("w1") === 0)
+
+    mesh.publish({ meta: { generation: 1, ordinal: 2 }, event: durable("d2") })
+    await pollUntil(() => commits.length === 2)
+    expect(commits.map((commit) => commit.event.id)).toEqual(["d1", "d2"])
+
+    client.dispose()
+    attachment.dispose()
+  })
+
+  test("a mesh overflow resync reaches onResync and acknowledgeResync clears it", async () => {
+    const egressChannel = new MessageChannel()
+    const controlChannel = new MessageChannel()
+    const mesh = createEgressMesh({ bound: 1 })
+    const attachment = attachMeshWorker(mesh, "w1", controlChannel.port2)
+    const client = createWorkerEgressClient(egressChannel.port1, { controlPort: controlChannel.port1 })
+
+    const resyncs: string[] = []
+    client.mesh?.onResync((pattern) => resyncs.push(pattern))
+    await client.mesh?.listen("*")
+
+    // The first delivery occupies the only slot; the second overflows to resync.
+    mesh.publish({ meta: { generation: 1, ordinal: 1 }, event: durable("d1") })
+    mesh.publish({ meta: { generation: 1, ordinal: 2 }, event: durable("d2") })
+
+    await pollUntil(() => resyncs.length === 1)
+    expect(resyncs).toEqual(["*"])
+    expect(mesh.resyncPending).toEqual(["w1"])
+
+    client.mesh?.acknowledgeResync("*")
+    await pollUntil(() => mesh.resyncPending.length === 0)
+
+    client.dispose()
+    attachment.dispose()
+  })
+
   test("no control port means no mesh link", () => {
     const channel = new MessageChannel()
     const client = createWorkerEgressClient(channel.port1)

@@ -15,10 +15,11 @@ import {
 } from "@/session/egress/control"
 import { createEgressHub } from "@/session/egress/hub"
 import { decodeFrame, encodeFrame, type EgressFrame } from "@/session/egress/frame"
+import { attachMeshWorker, createEgressMesh } from "@/session/egress/mesh"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { endFrame } from "@/session/worker/frame"
 import { createWorkerHarness } from "../../lib/worker-harness"
-import { deltasFrame, durableFrame } from "../../lib/egress-fixtures"
+import { deltasFrame, durable, durableFrame } from "../../lib/egress-fixtures"
 
 const WORKER_ENTRY = new URL("../../fixture/egress-worker.ts", import.meta.url)
 
@@ -26,13 +27,33 @@ interface PortsMessage {
   readonly type: "ports"
   readonly egress: MessagePort
   readonly control: MessagePort
+  /** Dedicated EventV2 mesh control port (durable wakeups + ack/resync). */
+  readonly egressControl: MessagePort
 }
 interface FloodMessage {
   readonly type: "flood.done"
   readonly count: number
 }
-type WorkerOut = PortsMessage | FloodMessage
-type WorkerIn = { readonly type: string; readonly id?: string; readonly ordinal?: number; readonly count?: number }
+interface MeshListenOkMessage {
+  readonly type: "mesh.listen.ok"
+  readonly pattern?: string
+}
+interface MeshDurableMessage {
+  readonly type: "mesh.durable"
+  readonly id: string
+}
+interface MeshResyncMessage {
+  readonly type: "mesh.resync"
+  readonly pattern: string
+}
+type WorkerOut = PortsMessage | FloodMessage | MeshListenOkMessage | MeshDurableMessage | MeshResyncMessage
+type WorkerIn = {
+  readonly type: string
+  readonly id?: string
+  readonly ordinal?: number
+  readonly count?: number
+  readonly pattern?: string
+}
 
 async function pollUntil(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -48,17 +69,23 @@ async function pollUntil(predicate: () => boolean, timeoutMs = 3000): Promise<vo
  * handle is `await using`-disposable so every test tears down the hub and the
  * worker isolate in one place instead of a hand-rolled `try/finally`.
  */
-async function spawnEgressWorker() {
+async function spawnEgressWorker(options: { readonly meshBound?: number } = {}) {
   const harness = createWorkerHarness({ cores: 1 })
   try {
     const worker = harness.spawn<WorkerOut, WorkerIn>(WORKER_ENTRY)
     const ports = await worker.waitFor("ports")
     const hub = createEgressHub({ egressPort: ports.egress, controlPort: ports.control })
+    // The hub end of the mesh registry; the worker drives the matching client
+    // over the transferred `egressControl` port.
+    const mesh = createEgressMesh(options.meshBound === undefined ? {} : { bound: options.meshBound })
+    const meshAttachment = attachMeshWorker(mesh, "w1", ports.egressControl)
     return {
       worker,
       hub,
+      mesh,
       ports,
       async [Symbol.asyncDispose]() {
+        meshAttachment.dispose()
         hub.close()
         await harness.dispose()
       },
@@ -134,6 +161,51 @@ describe("egress across a worker isolate", () => {
     worker.post({ type: "end" })
     await consumer
     expect(frames).toEqual([endFrame()])
+  })
+
+  test("the worker transfers a dedicated egressControl port", async () => {
+    await using session = await spawnEgressWorker()
+    const { ports } = session
+    expect(ports.egressControl).toBeInstanceOf(MessagePort)
+    expect(ports.egressControl).not.toBe(ports.egress)
+    expect(ports.egressControl).not.toBe(ports.control)
+  })
+
+  test("mesh listen, durable wake and ack cross the worker boundary", async () => {
+    await using session = await spawnEgressWorker()
+    const { worker, mesh } = session
+
+    worker.post({ type: "mesh.listen", pattern: "message.*" })
+    await worker.waitFor("mesh.listen.ok")
+    expect(mesh.subscriptions()).toEqual([{ workerId: "w1", pattern: "message.*" }])
+
+    mesh.publish({ meta: { generation: 1, ordinal: 1 }, event: durable("m1") })
+    const wake = await worker.waitFor("mesh.durable")
+    expect(wake.id).toBe("m1")
+    expect(mesh.outstanding("w1")).toBe(1)
+
+    worker.post({ type: "mesh.ack", count: 1 })
+    await pollUntil(() => mesh.outstanding("w1") === 0)
+  })
+
+  test("mesh overflow resync crosses the worker boundary and is acknowledged", async () => {
+    await using session = await spawnEgressWorker({ meshBound: 1 })
+    const { worker, mesh } = session
+
+    worker.post({ type: "mesh.listen", pattern: "message.*" })
+    await worker.waitFor("mesh.listen.ok")
+
+    // The first commit occupies the only backlog slot; the second overflows.
+    mesh.publish({ meta: { generation: 1, ordinal: 1 }, event: durable("m1") })
+    await worker.waitFor("mesh.durable")
+    mesh.publish({ meta: { generation: 1, ordinal: 2 }, event: durable("m2") })
+
+    const resync = await worker.waitFor("mesh.resync")
+    expect(resync.pattern).toBe("message.*")
+    expect(mesh.resyncPending).toEqual(["w1"])
+
+    worker.post({ type: "mesh.resync.ack", pattern: "message.*" })
+    await pollUntil(() => mesh.resyncPending.length === 0)
   })
 })
 

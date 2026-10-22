@@ -6,12 +6,44 @@
 // the terminal-result routing seam, and promotion/wait semantics. No threads.
 
 import { describe, expect, test } from "bun:test"
-import {
-  createJobRegistry,
-  type JobInfo,
-  type JobScheduler,
-} from "@/session/worker/job-registry"
+import { Effect } from "effect"
+import { BackgroundJob } from "@/background/job"
+import { createJobRegistry, type JobInfo, type JobRegistry, type JobScheduler } from "@/session/worker/job-registry"
+import { createJobClient, serveJobRegistry, type JobFrame } from "@/session/worker/job-client"
+import { createListenerPair } from "../../lib/port-pair"
 import { createRecordingScheduler } from "../../lib/scheduler"
+
+/**
+ * Drive the worker's *production* `BackgroundJob` (`clientLayer`) against the hub
+ * registry, then resolve once the job settles. This is the exact seam a `task`
+ * subagent traverses in production: the core `StartInput` is reported to the hub
+ * through the thin job client. Testing `registry.start` directly would bypass the
+ * forwarding that makes parent→child linkage live, so it would not prove the fix.
+ */
+function productionWorker(registry: JobRegistry) {
+  const pair = createListenerPair<JobFrame>()
+  serveJobRegistry(registry, pair.hub)
+  const client = createJobClient(pair.worker)
+  const layer = BackgroundJob.clientLayer(client)
+
+  const start = (input: BackgroundJob.StartInput): Promise<BackgroundJob.Info> =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const info = yield* jobs.start(input)
+        yield* jobs.wait({ id: info.id, timeout: 2_000 })
+        return info
+      }).pipe(Effect.provide(layer)),
+    )
+
+  return {
+    start,
+    dispose: () => {
+      client.dispose()
+      pair.close()
+    },
+  }
+}
 
 describe("9.2 registry lifecycle", () => {
   test("start registers a running job with parent linkage and cross-worker metadata", () => {
@@ -170,7 +202,9 @@ describe("9.4 terminal result routing by parentID", () => {
 
   test("an error result is routed too", () => {
     const routed: Array<{ parentID: string; status: string }> = []
-    const registry = createJobRegistry({ routeResult: (parentID, info) => routed.push({ parentID, status: info.status }) })
+    const registry = createJobRegistry({
+      routeResult: (parentID, info) => routed.push({ parentID, status: info.status }),
+    })
     registry.start({ id: "ses_child", type: "task", parentID: "ses_parent" })
     registry.fail("ses_child", "nope")
     expect(routed).toEqual([{ parentID: "ses_parent", status: "error" }])
@@ -241,5 +275,44 @@ describe("bounded retention (9.2)", () => {
     expect(registry.size).toBe(2)
     expect(registry.get("a")).toBeUndefined()
     expect(registry.get("c")?.status).toBe("completed")
+  })
+})
+
+describe("9.6 production start path threads parentID worker → hub", () => {
+  test("(a) a job started without parentID has neither a parent nor children", async () => {
+    const registry = createJobRegistry()
+    const worker = productionWorker(registry)
+
+    const info = await worker.start({ id: "ses_root", type: "task", run: Effect.succeed("done") })
+
+    expect(info.id).toBe("ses_root")
+    expect(registry.parentOf("ses_root")).toBeUndefined()
+    expect(registry.childrenOf("ses_root")).toEqual([])
+    worker.dispose()
+  })
+
+  test("(b) a production-shaped start with parentID links parent → child on the hub", async () => {
+    const registry = createJobRegistry()
+    const worker = productionWorker(registry)
+
+    await worker.start({ id: "ses_parent", type: "task", run: Effect.succeed("parent") })
+    await worker.start({ id: "ses_child", type: "task", parentID: "ses_parent", run: Effect.succeed("child") })
+
+    expect(registry.get("ses_child")?.parentID).toBe("ses_parent")
+    expect(registry.childrenOf("ses_parent")).toEqual(["ses_child"])
+    expect(registry.parentOf("ses_child")).toBe("ses_parent")
+    worker.dispose()
+  })
+
+  test("(c) routeResult fires only for a child that carries a parentID", async () => {
+    const routed: Array<{ parentID: string; id: string }> = []
+    const registry = createJobRegistry({ routeResult: (parentID, info) => routed.push({ parentID, id: info.id }) })
+    const worker = productionWorker(registry)
+
+    await worker.start({ id: "ses_root", type: "task", run: Effect.succeed("root") })
+    await worker.start({ id: "ses_child", type: "task", parentID: "ses_parent", run: Effect.succeed("child") })
+
+    expect(routed).toEqual([{ parentID: "ses_parent", id: "ses_child" }])
+    worker.dispose()
   })
 })

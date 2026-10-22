@@ -4,28 +4,35 @@
 // bounded; on-demand headroom is reserved for depth-1 children; a crash rejects
 // at-most-once and respawns; the key→worker map tracks the reservation
 // lifecycle. The dispatcher is exercised against the `WorkerPool` interface via
-// an in-memory fake, plus a real-Bun smoke test (task 4.9).
+// an in-memory fake; the production Bun pool lives in `hub.ts`.
 
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import type { SessionID } from "@/session/schema"
 import {
-  adaptPoolWorker,
-  createBunWorkerPool,
   createDispatcher,
   deriveHeadroom,
+  HeadroomFullError,
   SessionCancelledError,
   SessionCrashedError,
   WorkerCrashedError,
+  type DispatchRequest,
   type Scheduler,
   type SessionRun,
   type SessionWorker,
   type WorkerKind,
   type WorkerPool,
 } from "@/session/worker/dispatch"
-import type { PoolWorker } from "@/session/worker/pool"
-import { SessionQueueFullError } from "@/session/worker/queue"
+import {
+  createExecutorWorker,
+  createSessionDispatch,
+  type ExecutorTransport,
+  type ExecutorWorkerPool,
+  type SessionExecutorInbound,
+  type SessionScheduler,
+} from "@/session/worker/execute"
 import type { CancelFrame, CancelPort } from "@/session/worker/cancel"
+import { SessionQueueFullError } from "@/session/worker/queue"
 import { createWorkerHarness, type HarnessWorker, type WorkerHarness } from "../../lib/worker-harness"
 import { faultWorkerEntry, withFaults } from "../../lib/faults"
 
@@ -37,12 +44,6 @@ const capture = (promise: Promise<unknown>): Promise<unknown> =>
     () => undefined,
     (error: unknown) => error,
   )
-
-/** A one-shot worker entry that announces ready, then throws `message` on its first run. */
-function throwingWorkerEntry(message: string): string {
-  const source = `globalThis.postMessage({ type: "ready", threadId: 1 });globalThis.onmessage = () => { throw new Error(${JSON.stringify(message)}) }`
-  return `data:text/javascript,${encodeURIComponent(source)}`
-}
 
 interface PendingRun {
   readonly resolve: () => void
@@ -291,7 +292,26 @@ describe("4.6 on-demand headroom (depth-1 children only)", () => {
     await parent
   })
 
-  test("the child queue is bounded then rejects", async () => {
+  test("a depth≥1 dispatch runs on a spawned headroom worker with its run depth", async () => {
+    const pool = new FakePool(1)
+    const dispatcher = createDispatcher({ pool })
+
+    const parent = dispatcher.dispatch({ sessionID: sid("ses_parent") })
+    const child = dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 })
+    await flush()
+
+    // Depth ≥ 1 selects the headroom kind: a child never takes the foreground slot.
+    expect(dispatcher.headroomSlotCount).toBe(1)
+    expect(pool.spawned).toHaveLength(1)
+    expect(pool.spawned[0].runs).toEqual([{ sessionID: sid("ses_child"), depth: 1 }])
+
+    pool.spawned[0].finish(sid("ses_child"))
+    await child
+    pool.workers[0].finish(sid("ses_parent"))
+    await parent
+  })
+
+  test("an exhausted child/headroom queue rejects with HeadroomFullError", async () => {
     const pool = new FakePool(1)
     const dispatcher = createDispatcher({ pool, headroom: 0, childCapacity: 2 })
     const parent = dispatcher.dispatch({ sessionID: sid("ses_parent") })
@@ -299,9 +319,9 @@ describe("4.6 on-demand headroom (depth-1 children only)", () => {
     const childB = dispatcher.dispatch({ sessionID: sid("ses_child_b"), depth: 1 })
 
     expect(dispatcher.queuedCount).toBe(2)
-    await expect(dispatcher.dispatch({ sessionID: sid("ses_child_c"), depth: 1 })).rejects.toThrow(
-      SessionQueueFullError,
-    )
+    // Headroom cannot grow and the child queue is at capacity: the child is refused
+    // loud (decision line 60) rather than admitted past the physical bound.
+    await expect(dispatcher.dispatch({ sessionID: sid("ses_child_c"), depth: 1 })).rejects.toThrow(HeadroomFullError)
 
     await dispatcher.terminateAll()
     await Promise.allSettled([parent, childA, childB])
@@ -613,8 +633,8 @@ describe("4.11 dispatch validation and waiters", () => {
     await parent
     await flush()
 
-    expect(await waiterA).toBeInstanceOf(SessionQueueFullError)
-    expect(await waiterB).toBeInstanceOf(SessionQueueFullError)
+    expect(await waiterA).toBeInstanceOf(HeadroomFullError)
+    expect(await waiterB).toBeInstanceOf(HeadroomFullError)
     await dispatcher.terminateAll()
     await Promise.allSettled([queuedChild])
   })
@@ -631,53 +651,86 @@ describe("4.11 dispatch validation and waiters", () => {
   })
 })
 
-describe("4.12 production pool adapter", () => {
-  test("adaptPoolWorker forwards run.sessionID/depth to the driver", async () => {
-    const forwarded: SessionRun[] = []
-    const worker: PoolWorker = {
-      id: 42,
-      threadId: 0,
-      alive: true,
-      ready: async () => {},
-      run: async () => {
-        throw new Error("the bootstrap placeholder must not run for a forwarded run")
+describe("execution seam forwards depth and the startShell frame", () => {
+  /** A `SessionScheduler` fake that records every dispatch request. */
+  function recordingScheduler(): { scheduler: SessionScheduler; calls: DispatchRequest[] } {
+    const calls: DispatchRequest[] = []
+    const scheduler: SessionScheduler = {
+      dispatch: async (request) => {
+        calls.push(request)
       },
-      terminate: async () => 0,
-      [Symbol.asyncDispose]: () => Promise.resolve(),
+      cancel: async () => {},
+      terminateAll: async () => {},
+      registry: { get: () => undefined },
     }
-    const adapted = adaptPoolWorker(worker, async (_worker, run) => {
-      forwarded.push(run)
-    })
+    return { scheduler, calls }
+  }
 
-    await adapted.execute({ sessionID: sid("ses_real"), depth: 2 })
-    expect(forwarded).toEqual([{ sessionID: sid("ses_real"), depth: 2 }])
-  })
-
-  test("createBunWorkerPool forwards the run through its driver", async () => {
-    const forwarded: SessionRun[] = []
-    await using pool = createBunWorkerPool({
-      k: 1,
-      drive: async (worker, run) => {
-        await worker.ready()
-        forwarded.push(run)
+  /** An `ExecutorWorkerPool` fake whose `resultFor` always resolves a result. */
+  function resultPool(): ExecutorWorkerPool {
+    return {
+      workers: [],
+      spawn: () => {
+        throw new Error("the pool must not be asked to spawn for a recorded dispatch")
       },
-    })
-    await using dispatcher = createDispatcher({ pool })
+      terminateAll: async () => {},
+      byID: () => undefined,
+      resultFor: (sessionID) => ({ sessionID }),
+    }
+  }
 
-    await dispatcher.dispatch({ sessionID: sid("ses_drive"), depth: 0 })
-    expect(forwarded.map((run) => run.sessionID)).toEqual([sid("ses_drive")])
+  test("ensureRunning carries an explicit depth into the dispatch request", async () => {
+    const { scheduler, calls } = recordingScheduler()
+    const dispatch = createSessionDispatch({ dispatcher: scheduler, pool: resultPool() })
+
+    await dispatch.ensureRunning(sid("ses_child"), 1)
+
+    expect(calls).toEqual([{ sessionID: sid("ses_child"), depth: 1, mode: "run" }])
   })
-})
 
-describe("4.9 WorkerPool interface", () => {
-  test("dispatches a session through real Bun workers behind the interface", async () => {
-    await using pool = createBunWorkerPool({ k: 1 })
-    await using dispatcher = createDispatcher({ pool })
+  test("ensureRunning derives depth from depthOf when none is passed", async () => {
+    const { scheduler, calls } = recordingScheduler()
+    const dispatch = createSessionDispatch({
+      dispatcher: scheduler,
+      pool: resultPool(),
+      depthOf: (sessionID) => (sessionID === "ses_child" ? 2 : 0),
+    })
 
-    await dispatcher.dispatch({ sessionID: sid("ses_real") })
+    await dispatch.ensureRunning(sid("ses_child"))
 
-    expect(dispatcher.busySlotCount).toBe(0)
-    expect(dispatcher.registry.size).toBe(0)
+    expect(calls).toEqual([{ sessionID: sid("ses_child"), depth: 2, mode: "run" }])
+  })
+
+  test("startShell dispatches the startShell mode (not a plain run)", async () => {
+    const { scheduler, calls } = recordingScheduler()
+    const dispatch = createSessionDispatch({ dispatcher: scheduler, pool: resultPool() })
+
+    await dispatch.startShell(sid("ses_shell"))
+
+    expect(calls).toEqual([{ sessionID: sid("ses_shell"), depth: 0, mode: "startShell" }])
+  })
+
+  test("createExecutorWorker posts a startShell frame for a startShell-mode run", async () => {
+    const posted: SessionExecutorInbound[] = []
+    const transport: ExecutorTransport = {
+      post: (message) => {
+        posted.push(message)
+      },
+      waitFor: async (match) => {
+        const frame = posted[posted.length - 1] as { readonly id: number; readonly sessionID?: SessionID }
+        const reply = { type: "done" as const, id: frame.id, result: { sessionID: frame.sessionID ?? "ses" } }
+        return match(reply) ? reply : reply
+      },
+      alive: true,
+      terminate: async () => 0,
+    }
+    const worker = createExecutorWorker({ id: 1, transport, workKind: "session" })
+
+    await worker.execute({ sessionID: sid("ses_child"), depth: 1, mode: "startShell" })
+    await worker.execute({ sessionID: sid("ses_root"), depth: 0 })
+
+    expect(posted[0]).toMatchObject({ type: "startShell", sessionID: "ses_child", kind: "session" })
+    expect(posted[1]).toMatchObject({ type: "run", sessionID: "ses_root", kind: "session" })
   })
 })
 
@@ -700,29 +753,6 @@ describe("crash error surfacing", () => {
     expect((error as WorkerCrashedError).cause).toBe(cause)
 
     await dispatcher.terminateAll()
-  })
-
-  test("a real throwing isolate surfaces its error through the dispatcher", async () => {
-    const scheduler = createTestScheduler()
-    await using pool = createBunWorkerPool({ k: 1, entry: throwingWorkerEntry("KNOWN_DISPATCH_FAILURE") })
-    await using dispatcher = createDispatcher({ pool, schedule: scheduler.schedule })
-
-    const error = await capture(dispatcher.dispatch({ sessionID: sid("ses_real_crash") }))
-
-    expect(error).toBeInstanceOf(WorkerCrashedError)
-    expect((error as WorkerCrashedError).message).toContain("KNOWN_DISPATCH_FAILURE")
-    expect((error as WorkerCrashedError).cause).toBeDefined()
-  })
-
-  test("a real boot failure surfaces the module-not-found message through the dispatcher", async () => {
-    const scheduler = createTestScheduler()
-    await using pool = createBunWorkerPool({ k: 1, entry: "no-such-worker-entry.ts" })
-    await using dispatcher = createDispatcher({ pool, schedule: scheduler.schedule })
-
-    const error = await capture(dispatcher.dispatch({ sessionID: sid("ses_boot_fail") }))
-
-    expect(error).toBeInstanceOf(WorkerCrashedError)
-    expect((error as WorkerCrashedError).message).toContain("no-such-worker-entry.ts")
   })
 })
 

@@ -96,6 +96,7 @@ export function clientLayer(client: JobClient): Layer.Layer<CoreBackgroundJob.Se
                 type: input.type,
                 ...(input.title === undefined ? {} : { title: input.title }),
                 ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
+                ...(input.parentID === undefined ? {} : { parentID: input.parentID }),
               }),
             )
             if (input.onPromote !== undefined) onPromoteCallbacks.set(id, input.onPromote)

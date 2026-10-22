@@ -83,25 +83,36 @@ export const layer = Layer.effect(
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
       const hub = yield* hubIfEnabled
       if (hub !== undefined) {
-        const outcome = yield* Effect.promise(() => hub.cancel(sessionID))
-        // Phase 6.1 parity: background subagents/jobs must not outlive the cancel.
-        // The flag-off branch cancels them before it settles; mirror that here
-        // after the hub cancel resolves (so the outcome is known).
-        yield* cancelBackgroundJobs(background, sessionID)
-        // Single-idle authority. The run-state machine lives in the worker
-        // isolate, and its runner's `onIdle` publishes the terminal idle through
-        // the hub-proxy (`session/worker/run-state` table B). That worker emit is
-        // authoritative whenever the run reached its own run-state, which the hub
-        // reports back exactly two ways: the worker acknowledged the cancel
-        // (`acknowledged`, it publishes idle before acking) or the run completed
-        // naturally (`winner` "completion", it publishes idle on `finishRun`).
-        // Only when neither happened — a queued session, an idle no-op, or a
-        // grace-expired terminate that killed the isolate — is no worker
-        // publishing, so this branch emits the fallback idle itself. That keeps
-        // exactly one idle for every cancel, matching the flag-off branch below.
-        const workerPublishedIdle = outcome !== undefined && (outcome.acknowledged || outcome.winner === "completion")
-        if (!workerPublishedIdle) yield* status.set(sessionID, { type: "idle" })
-        return outcome
+        // The hub cancels the session AND cascades to its subagent children,
+        // reporting which descendants need the fallback idle. Phase 6.1 parity:
+        // background subagents/jobs must not outlive the cancel — in flag-on they
+        // live in the hub registry, not the process-local `BackgroundJob`, so the
+        // bridge marks them cancelled too.
+        const report = yield* Effect.promise(() => hub.cancelWithReport(sessionID))
+        yield* cancelBackgroundJobs(background, sessionID, hub.jobs)
+        // Single-idle authority, extended to the subagent cascade. The worker
+        // publishes its own terminal idle only for a cooperative settle or a
+        // natural completion; a queued or grace-terminated child never does, so
+        // run-state writes the fallback for exactly those descendants.
+        const handled = new Set<SessionID>()
+        for (const descendant of report.descendants) {
+          handled.add(descendant.sessionID)
+          if (descendant.needsFallbackIdle) yield* status.set(descendant.sessionID, { type: "idle" })
+        }
+        if (!workerPublishedIdle(report.outcome)) yield* status.set(sessionID, { type: "idle" })
+        // Children the hub registry did not link (a subagent job that never
+        // registered) are still swept: each is cancelled through the hub and its
+        // own outcome decides its single idle.
+        const session = yield* Effect.serviceOption(Session.Service)
+        if (Option.isSome(session)) {
+          const children = yield* session.value.children(sessionID)
+          for (const child of children) {
+            if (handled.has(child.id)) continue
+            const childOutcome = yield* Effect.promise(() => hub.cancel(child.id))
+            if (!workerPublishedIdle(childOutcome)) yield* status.set(child.id, { type: "idle" })
+          }
+        }
+        return report.outcome
       }
       yield* cancelBackgroundJobs(background, sessionID)
       const runners = yield* InstanceState.get(state)
@@ -163,13 +174,39 @@ export const layer = Layer.effect(
   }),
 )
 
+/**
+ * The slice of the hub's cross-worker job registry `cancelBackgroundJobs` needs.
+ * Structural so `run-state.ts` depends on neither the hub nor `job-registry.ts`;
+ * `JobRegistry` satisfies it exactly.
+ */
+interface HubJob {
+  readonly id: string
+  readonly status: string
+  readonly parentID?: string
+  readonly metadata?: Record<string, unknown>
+}
+
+interface HubJobRegistry {
+  list(): ReadonlyArray<HubJob>
+  cancel(id: string): unknown
+}
+
+const metadataString = (metadata: Record<string, unknown> | undefined, key: string): string | undefined => {
+  const value = metadata?.[key]
+  return typeof value === "string" ? value : undefined
+}
+
 const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(function* (
   background: BackgroundJob.Interface,
   sessionID: SessionID,
+  hubJobs?: HubJobRegistry,
 ) {
-  const jobs = yield* background.list()
+  // Bounded, transitive cancel: a matched job joins the pending set, so its own
+  // children (matched by `sessionId`/`parentSessionId`) are cancelled next round.
   const pending = new Set<string>([sessionID])
   const cancelled = new Set<string>()
+
+  const jobs = yield* background.list()
   const matches = (job: BackgroundJob.Info) => {
     if (job.status !== "running") return false
     if (cancelled.has(job.id)) return false
@@ -195,10 +232,48 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
     )
     batch = jobs.filter(matches)
   }
+
+  // Flag-on bridge: a subagent's job lives in the hub registry, not the
+  // process-local `BackgroundJob`, so the dispatcher cascade is the only thing
+  // that reaches it — and it reaches only registry-linked children. Match the
+  // hub jobs by the same `metadata.parentSessionId`/`sessionId` the task tool
+  // writes, so a worker job the cascade missed is still marked cancelled.
+  if (hubJobs === undefined) return
+  const hubMatches = (job: HubJob) => {
+    if (job.status !== "running") return false
+    if (cancelled.has(job.id)) return false
+    if (pending.has(job.id)) return true
+    const hubSessionID = metadataString(job.metadata, "sessionId")
+    if (hubSessionID !== undefined && pending.has(hubSessionID)) return true
+    const parentSessionID = job.parentID ?? metadataString(job.metadata, "parentSessionId")
+    return parentSessionID !== undefined && pending.has(parentSessionID)
+  }
+  let hubBatch = hubJobs.list().filter(hubMatches)
+  while (hubBatch.length > 0) {
+    for (const job of hubBatch) {
+      hubJobs.cancel(job.id)
+      cancelled.add(job.id)
+      pending.add(job.id)
+      const hubSessionID = metadataString(job.metadata, "sessionId")
+      if (hubSessionID !== undefined) pending.add(hubSessionID)
+    }
+    hubBatch = hubJobs.list().filter(hubMatches)
+  }
 })
 
 function busyError(sessionID: SessionID) {
   return new Session.BusyError({ sessionID })
+}
+
+/**
+ * Whether a cancel outcome's worker already published the session's terminal
+ * idle through the hub-proxy (table B): a cooperative settle publishes before it
+ * acks, and a natural completion publishes on `finishRun`. A queued session, an
+ * idle no-op, or a grace-expired terminate never does — the caller must write
+ * the fallback idle exactly once.
+ */
+function workerPublishedIdle(outcome: CancelOutcome | undefined): boolean {
+  return outcome !== undefined && (outcome.acknowledged || outcome.winner === "completion")
 }
 
 /**

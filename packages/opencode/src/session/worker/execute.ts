@@ -10,8 +10,7 @@
 // Transport is the worker's default channel; frames are JSON. Work crosses the
 // isolate as a `kind` string (never a closure): `SessionWorkFactory` resolves a
 // kind to a session work Effect. The default kind is `"session"`; the worker
-// registry (`session-worker.ts`) resolves it to the reduced-`AppLayer` pipeline
-// and aliases the legacy `"noop"`.
+// registry (`session-worker.ts`) resolves it to the reduced-`AppLayer` pipeline.
 
 import { Cause, Effect, Exit, Schema, Scope } from "effect"
 import type { Latch } from "effect"
@@ -46,14 +45,13 @@ export interface SessionRunControl {
 /**
  * Production work kind. The worker registry (`session-worker.ts`
  * `productionWorkRegistry`) resolves `"session"` to the real reduced-layer
- * session work and aliases the legacy `"noop"` to it, so the hub and worker
- * agree.
+ * session work (and aliases this constant as a second key when it differs), so
+ * the hub and worker agree.
  *
  * Typed as `string` (not the `"session"` literal) because the worker registry
- * currently builds its alias table as `{ session, [DEFAULT_WORK_KIND]: session }`;
- * a literal type would make the computed key statically collide with the
- * shorthand (TS1117). Consolidation: `session-worker.ts` (not owned here) should
- * alias the literal `"noop"` instead, after which this can be narrowed.
+ * builds its alias table with a computed key derived from this constant; a
+ * literal type would make that key statically collide with the `session`
+ * shorthand (TS1117).
  */
 export const DEFAULT_WORK_KIND: string = "session"
 
@@ -321,9 +319,14 @@ export function installSessionExecutor(
 
 // --- Hub-side adapter -------------------------------------------------------
 
+/** The executor frame a run takes: a plain session run or the shell-start path. */
+export type SessionRunMode = "run" | "startShell"
+
 export interface ExecutorRun {
   readonly sessionID: SessionID
   readonly depth: number
+  /** Frame to produce; defaults to `"run"` so a plain run stays `{sessionID, depth}`. */
+  readonly mode?: SessionRunMode
 }
 
 /** Structural mirror of dispatch's `SessionWorker` (keeps this module decoupled). */
@@ -413,8 +416,9 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
   }
 
   const execute = async (run: ExecutorRun): Promise<void> => {
+    const type: SessionRunMode = run.mode ?? "run"
     const message = await request(
-      (id) => ({ type: "run", id, sessionID: run.sessionID, kind: workKind }),
+      (id) => ({ type, id, sessionID: run.sessionID, kind: workKind }),
       (reply) => reply.type === "done" || reply.type === "error",
     )
     if (message.type === "error") throw new Error(message.message)
@@ -529,15 +533,21 @@ export function createExecutorWorkerPool(options: ExecutorWorkerPoolOptions): Ex
 
 /** Structural mirror of dispatch's `Dispatcher` (only the hub surface we use). */
 export interface SessionScheduler {
-  dispatch(request: { readonly sessionID: SessionID; readonly depth?: number }): Promise<void>
+  dispatch(request: {
+    readonly sessionID: SessionID
+    readonly depth?: number
+    readonly mode?: SessionRunMode
+  }): Promise<void>
   cancel(sessionID: SessionID): Promise<void>
   terminateAll(): Promise<void>
   readonly registry: { get(sessionID: SessionID): { readonly workerID: number | undefined } | undefined }
 }
 
 export interface SessionDispatch {
-  ensureRunning(sessionID: SessionID): Promise<SessionExecutionResult>
-  startShell(sessionID: SessionID): Promise<SessionExecutionResult>
+  /** Dispatch `sessionID` at `depth` (default 0, or `depthOf(sessionID)`) and resolve its result. */
+  ensureRunning(sessionID: SessionID, depth?: number): Promise<SessionExecutionResult>
+  /** Dispatch `sessionID` on the shell-start path at `depth` and resolve its result. */
+  startShell(sessionID: SessionID, depth?: number): Promise<SessionExecutionResult>
   cancel(sessionID: SessionID): Promise<void>
   assertNotBusy(sessionID: SessionID): Promise<boolean>
   cancelAll(): Promise<void>
@@ -546,6 +556,13 @@ export interface SessionDispatch {
 export interface SessionDispatchOptions {
   readonly dispatcher: SessionScheduler
   readonly pool: ExecutorWorkerPool
+  /**
+   * Resolve a session's subagent depth when the caller does not pass one. The
+   * production hub supplies this from its job registry, so a child session
+   * scheduled through `ensureRunning(sessionID)` still lands on headroom.
+   * Defaults to 0 (a foreground root).
+   */
+  readonly depthOf?: (sessionID: SessionID) => number
 }
 
 /**
@@ -566,8 +583,16 @@ export function createSessionDispatch(options: SessionDispatchOptions): SessionD
     return result
   }
 
-  const ensureRunning = async (sessionID: SessionID): Promise<SessionExecutionResult> => {
-    await options.dispatcher.dispatch({ sessionID, depth: 0 })
+  /** Admit `sessionID` at its resolved depth and frame mode, then await admission. */
+  const admit = (sessionID: SessionID, depth: number | undefined, mode: SessionRunMode): Promise<void> =>
+    options.dispatcher.dispatch({
+      sessionID,
+      depth: depth ?? options.depthOf?.(sessionID) ?? 0,
+      mode,
+    })
+
+  const ensureRunning = async (sessionID: SessionID, depth?: number): Promise<SessionExecutionResult> => {
+    await admit(sessionID, depth, "run")
     return requireResult(sessionID)
   }
 
@@ -576,9 +601,10 @@ export function createSessionDispatch(options: SessionDispatchOptions): SessionD
     return worker === undefined ? false : worker.assertNotBusy(sessionID)
   }
 
-  const startShell = async (sessionID: SessionID): Promise<SessionExecutionResult> => {
+  const startShell = async (sessionID: SessionID, depth?: number): Promise<SessionExecutionResult> => {
     if (await assertNotBusy(sessionID)) throw new SessionBusyError({ sessionID })
-    return ensureRunning(sessionID)
+    await admit(sessionID, depth, "startShell")
+    return requireResult(sessionID)
   }
 
   return {

@@ -7,6 +7,8 @@
 // worker's client only (9.4). No threads.
 
 import { describe, expect, test } from "bun:test"
+import { Effect } from "effect"
+import { BackgroundJob } from "@/background/job"
 import {
   createBackgroundJobClient,
   createJobClient,
@@ -240,5 +242,31 @@ describe("21 the port adapter exposes BackgroundJobClientHandle", () => {
 
     handle.dispose()
     disposeServer()
+  })
+})
+
+describe("9.6 clientLayer ships parentID over the wire to the registry", () => {
+  test("a parentID handed to the worker BackgroundJob reaches the hub registry", async () => {
+    const registry = createJobRegistry()
+    const hub = createHub(registry, 1)
+    const client = hub.clients[0]
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const info = yield* jobs.start({
+          id: "ses_child",
+          type: "task",
+          parentID: "ses_parent",
+          run: Effect.succeed("done"),
+        })
+        yield* jobs.wait({ id: info.id, timeout: 2_000 })
+      }).pipe(Effect.provide(BackgroundJob.clientLayer(client))),
+    )
+
+    expect(registry.get("ses_child")?.parentID).toBe("ses_parent")
+    expect(registry.childrenOf("ses_parent")).toEqual(["ses_child"])
+    expect(registry.parentOf("ses_child")).toBe("ses_parent")
+    hub.dispose()
   })
 })

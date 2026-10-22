@@ -321,7 +321,7 @@ function shellChildLabel(command: string): string {
 /**
  * Report a freshly spawned detached shell child to the hub's PID registry
  * mirror. On POSIX the spawner detaches the child, so it leads its own process
- * group and `pgid === pid` (the same invariant `spawnRegistered` relies on).
+ * group and `pgid === pid` (the invariant the hub's mirror assumes).
  *
  * A missing reporter is a no-op: degraded boots and hub-side (flag-off) runs
  * have no hub registry to fill. Windows has no process-group semantics, so

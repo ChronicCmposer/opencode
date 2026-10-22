@@ -25,9 +25,10 @@ import { InstanceRef } from "@/effect/instance-ref"
 import type { InstanceContext } from "@/project/instance-context"
 import { Provider } from "@/provider/provider"
 import { createWorkerWriterClient, type WorkerWriterClient } from "./writer-client"
-import { createWorkerEgressClient } from "./egress-client"
+import { createWorkerEgressClient, type WorkerEgressClient } from "./egress-client"
 import { createWorkerBrokerClient } from "./broker-client"
 import { createBackgroundJobClient, createJobClient, jobPortFromMessagePort, type JobClient } from "./job-client"
+import type { JobInfo } from "./job-registry"
 import {
   DEFAULT_WORK_KIND,
   UnknownWorkKindError,
@@ -49,7 +50,6 @@ import {
   reducedModelProviderLayer,
   type BackgroundJobClientHandle,
   type BrokerClientHandle,
-  type EventEgressClientHandle,
   type HubProxyClients,
   type PipelineMessage,
   type WorkerEnv,
@@ -195,7 +195,8 @@ function requirePort(port: MessagePort | undefined, field: string): MessagePort 
  */
 export interface WorkerClients {
   readonly writer: WorkerWriterClient
-  readonly egress: EventEgressClientHandle
+  /** The full egress client, so the production control-plane mesh is reachable. */
+  readonly egress: WorkerEgressClient
   readonly broker: BrokerClientHandle
   readonly backgroundJob: BackgroundJobClientHandle
 }
@@ -227,6 +228,30 @@ export function buildWorkerClients(ports: WorkerClientPorts, options: { jobClien
 /** Narrow the full job client to the reduced `BackgroundJobClientHandle` seam. */
 function backgroundJobHandle(client: Pick<JobClient, "wait" | "cancel">): BackgroundJobClientHandle {
   return { wait: (id, timeoutMs) => client.wait(id, timeoutMs), cancel: (id) => client.cancel(id) }
+}
+
+// ---------------------------------------------------------------------------
+// Child-result routing (9.4 handshake).
+// ---------------------------------------------------------------------------
+
+/**
+ * A settled subagent result the hub registry routes to the worker hosting the
+ * child's `parentID`. The worker subscribes once at boot; consumers attach
+ * through {@link SessionWorkerBootstrap.onChildResult}.
+ */
+export type ChildResultSink = (result: JobInfo) => void
+
+/**
+ * The handle {@link bootstrapSessionWorker} returns: the registration handshake
+ * for hub-routed child results plus teardown. The subscription is installed
+ * unconditionally in production, so a routed child result is never silently
+ * dropped; a consumer (or test) attaches a {@link ChildResultSink}.
+ */
+export interface SessionWorkerBootstrap {
+  /** Subscribe to settled child results routed to this worker; returns an unsubscribe. */
+  onChildResult(sink: ChildResultSink): () => void
+  /** Tear down the bootstrapped child-result subscription. */
+  dispose(): void
 }
 
 // ---------------------------------------------------------------------------
@@ -485,7 +510,18 @@ function directClients(backgroundJob: BackgroundJobClientHandle): WorkerClients 
       rollback: unavailable("rollback"),
       dispose: () => {},
     },
-    egress: { emit: () => {} },
+    // Degraded boot: the hub serves no egress port, so events are dropped and
+    // there is no control-plane mesh. Still a full `WorkerEgressClient` so the
+    // aggregate handle type stays honest.
+    egress: {
+      emit: () => {},
+      emitDurable: () => {},
+      end: () => {},
+      buffered: 0,
+      ended: false,
+      mesh: undefined,
+      dispose: () => {},
+    },
     broker: { call: async () => null },
     backgroundJob,
   }
@@ -509,18 +545,29 @@ export function workerGraphReplacements(config: WorkerModelConfig): LayerNode.Re
  * tests can import this module (`buildWorkerClients`, the registry) without a
  * worker context; the module only bootstraps when `workerData` is present.
  *
- * The dedicated job control link is always transferred. The writer / egress /
- * broker ports are transferred only when the hub advertises
- * `capabilities.sessionWorkerPorts`, because a port nobody serves would make a
- * session hang (consolidation: the hub must serve them).
+ * The dedicated job control link is always transferred. The writer / egress
+ * (plus its dedicated control plane) / broker ports are transferred only when
+ * the hub advertises `capabilities.sessionWorkerPorts`, because a port nobody
+ * serves would make a session hang; the production hub serves all four.
+ *
+ * Returns the child-result registration handshake so a caller can subscribe to
+ * settled subagents the hub routes to this worker (and tear the subscription
+ * down); production installs the subscription regardless.
  */
-export function bootstrapSessionWorker(init: SessionWorkerInit, scope: WorkerScope): void {
+export function bootstrapSessionWorker(init: SessionWorkerInit, scope: WorkerScope): SessionWorkerBootstrap {
   const jobChannel = new MessageChannel()
   scope.postMessage({ type: "job-port", port: jobChannel.port2 }, [jobChannel.port2 as unknown as Transferable])
   // One full job client backs both the reduced `BackgroundJobClientHandle` seam
   // and the real `BackgroundJob` node (a second client on the same port would
   // steal replies).
   const jobClient = createJobClient(jobPortFromMessagePort(jobChannel.port1))
+  // The hub registry routes a settled child to the worker hosting its
+  // `parentID`; subscribe at boot so the push reaches consumers. The sink set is
+  // the registration handshake returned to the caller.
+  const childResultSinks = new Set<ChildResultSink>()
+  const unsubscribeChildResults = jobClient.onChildResult((result) => {
+    for (const sink of [...childResultSinks]) sink(result)
+  })
 
   let clients: WorkerClients
   let hubProxies: HubProxyClients | undefined
@@ -532,18 +579,29 @@ export function bootstrapSessionWorker(init: SessionWorkerInit, scope: WorkerSco
   if (usePrompt) {
     const writerChannel = new MessageChannel()
     const egressChannel = new MessageChannel()
+    // A dedicated control plane, so durable wakeups and resync never queue
+    // behind the delta stream; without it the egress mesh is dead in production.
+    const egressControlChannel = new MessageChannel()
     const brokerChannel = new MessageChannel()
     scope.postMessage(
       {
         type: "ports",
         writer: writerChannel.port2,
         egress: egressChannel.port2,
+        egressControl: egressControlChannel.port2,
         broker: brokerChannel.port2,
       },
-      [writerChannel.port2, egressChannel.port2, brokerChannel.port2].map((port) => port as unknown as Transferable),
+      [writerChannel.port2, egressChannel.port2, egressControlChannel.port2, brokerChannel.port2].map(
+        (port) => port as unknown as Transferable,
+      ),
     )
     clients = buildWorkerClients(
-      { writer: writerChannel.port1, egress: egressChannel.port1, broker: brokerChannel.port1 },
+      {
+        writer: writerChannel.port1,
+        egress: egressChannel.port1,
+        egressControl: egressControlChannel.port1,
+        broker: brokerChannel.port1,
+      },
       { jobClient },
     )
     // The hub serves the `SessionStatus` / `Permission` / `Question`
@@ -618,6 +676,17 @@ export function bootstrapSessionWorker(init: SessionWorkerInit, scope: WorkerSco
       busy: (sessionID) => control?.busy(sessionID) ?? Promise.resolve(false),
     },
   })
+
+  return {
+    onChildResult(sink) {
+      childResultSinks.add(sink)
+      return () => childResultSinks.delete(sink)
+    },
+    dispose() {
+      unsubscribeChildResults()
+      childResultSinks.clear()
+    },
+  }
 }
 
 /**
