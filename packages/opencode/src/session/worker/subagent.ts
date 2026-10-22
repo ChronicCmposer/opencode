@@ -13,6 +13,7 @@
 
 import { Schema } from "effect"
 import type { SessionID } from "@/session/schema"
+import { HeadroomFullError } from "./dispatch"
 import type { JobInfo, JobRegistry } from "./job-registry"
 
 /** Raised when a subagent would exceed the resolved `subagent_depth` limit. */
@@ -22,10 +23,12 @@ export class SubagentDepthError extends Schema.TaggedErrorClass<SubagentDepthErr
   limit: Schema.Number,
 }) {}
 
-/** Raised when no headroom worker is available; the child is never queued. */
-export class HeadroomFullError extends Schema.TaggedErrorClass<HeadroomFullError>()("HeadroomFullError", {
-  message: Schema.String,
-}) {}
+/**
+ * Raised when no headroom worker is available; the child is never queued. The
+ * scheduler is the authority for physical headroom, so the error is declared
+ * there and re-exported here for the admission seam's callers.
+ */
+export { HeadroomFullError }
 
 export interface SubagentAdmission {
   /** The child's nesting depth (0 = foreground/root, ≥1 = subagent). */

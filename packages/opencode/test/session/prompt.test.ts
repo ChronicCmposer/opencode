@@ -37,6 +37,14 @@ import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
+import { createSessionHub, SessionHubService } from "@/session/worker/hub"
+import {
+  createExecutorWorkerPool,
+  type ExecutorRun,
+  type ExecutorWorker,
+  type ExecutorWorkerPool,
+  type SessionExecutionResult,
+} from "@/session/worker/execute"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -57,6 +65,14 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+
+// Test isolation: the ambient harness may export a global config
+// (`OPENCODE_CONFIG_CONTENT`), point at a shared config dir, or disable project
+// config loading entirely. These tests own their project `opencode.json`, so
+// drop the ambient overrides before any layer resolves.
+delete process.env.OPENCODE_DISABLE_PROJECT_CONFIG
+delete process.env.OPENCODE_CONFIG_CONTENT
+delete process.env.OPENCODE_CONFIG_DIR
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -166,6 +182,15 @@ const blockingProcessor = Layer.succeed(
 
 const runtimeFlags = RuntimeFlags.layer({ experimentalEventSystem: true })
 
+/**
+ * A flag layer for a test variant. `experimentalEventSystem` is always on (the
+ * harness relies on the v2 event bridge); a variant may add more flags, e.g.
+ * `experimentalBackgroundSubagents` for the background task-tool acceptance
+ * test.
+ */
+const flagsLayer = (overrides: Partial<RuntimeFlags.Info> = {}) =>
+  RuntimeFlags.layer({ experimentalEventSystem: true, ...overrides })
+
 const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })
 
 const promptRoot = LayerNode.group([
@@ -208,12 +233,16 @@ const promptRoot = LayerNode.group([
   RuntimeFlags.node,
 ])
 
-function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makePrompt(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+  flags?: Partial<RuntimeFlags.Info>
+}) {
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
-    [RuntimeFlags.node, runtimeFlags],
+    [RuntimeFlags.node, input?.flags ? flagsLayer(input.flags) : runtimeFlags],
   ] as const
   if (input?.processor === "blocking") {
     return LayerNode.compile(promptRoot, [...replacements, [SessionProcessor.node, blockingProcessor]])
@@ -221,13 +250,17 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
   return LayerNode.compile(promptRoot, replacements)
 }
 
-function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makeHttp(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+  flags?: Partial<RuntimeFlags.Info>
+}) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
-    [RuntimeFlags.node, runtimeFlags],
+    [RuntimeFlags.node, input?.flags ? flagsLayer(input.flags) : runtimeFlags],
   ] as const
   if (input?.processor === "blocking") {
     return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
@@ -235,11 +268,18 @@ function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processo
   return LayerNode.compile(root, replacements)
 }
 
-function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makeHttpNoLLMServer(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+  flags?: Partial<RuntimeFlags.Info>
+}) {
   return makePrompt(input)
 }
 
 const it = testEffect(makeHttp())
+// The background task-tool path is flag-gated (`experimentalBackgroundSubagents`),
+// so the background-subagent acceptance tests need their own flag-enabled variant.
+const backgroundSubagents = testEffect(makeHttp({ flags: { experimentalBackgroundSubagents: true } }))
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const withMcpInstructions = testEffect(
@@ -1367,6 +1407,79 @@ it.instance(
   10_000,
 )
 
+// W9 acceptance (parallel-session-worker): a background `task` subagent must not
+// outlive its parent's cancel. The child runs in its own session (and, flag-on,
+// on a separate worker); cancelling the parent through `prompt.cancel` must idle
+// the child and leave no running background job. This is the end-to-end
+// regression guard for the subagent cancellation cascade — parentID linkage in
+// the job registry plus the background abort teardown in the task tool.
+backgroundSubagents.instance(
+  "cancel propagates from a background task-tool subagent to its child session",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const background = yield* BackgroundJob.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      // The parent's model launches the subagent in the background; a full tool
+      // call is emitted and the stream is then held open, so the tool abort
+      // signal (tied to the LLM stream) does not fire when the step ends. The
+      // background child then hangs on its own LLM request and is running when
+      // the parent is cancelled.
+      yield* llm.push(
+        reply()
+          .tool("task", {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            background: true,
+          })
+          .hang(),
+      )
+      yield* llm.hang
+      yield* user(chat.id, "hello")
+
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+
+      const childID = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const kids = yield* sessions.children(chat.id)
+          const kid = kids[0]
+          if (!kid) return undefined
+          return (yield* status.get(kid.id)).type === "busy" ? kid.id : undefined
+        }),
+        "background subagent child never became busy",
+        "15 seconds",
+      )
+
+      // The child is a registered background job linked to its parent session,
+      // so the hub registry can cascade a cancel to it across workers.
+      const job = (yield* background.list()).find((item) => item.id === childID)
+      expect(job?.status).toBe("running")
+      expect(job?.parentID).toBe(chat.id)
+
+      yield* prompt.cancel(chat.id)
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isSuccess(exit)).toBe(true)
+
+      expect((yield* status.get(chat.id)).type).toBe("idle")
+      expect((yield* status.get(childID)).type).toBe("idle")
+
+      // No subagent is left running behind the cancelled parent.
+      const leftover = (yield* background.list()).filter(
+        (item) => item.status === "running" && item.metadata?.parentSessionId === chat.id,
+      )
+      expect(leftover).toEqual([])
+    }),
+  { config: cfg },
+  30_000,
+)
+
 it.instance(
   "cancel with queued callers resolves all cleanly",
   () =>
@@ -2467,4 +2580,69 @@ noLLMServer.instance(
       }
     }),
   30_000,
+)
+
+// ---------------------------------------------------------------------------
+// W11 — the subagent dispatch seam. `SessionPrompt`'s `ops()` is the production
+// composition site for `TaskPromptOps`; when the hub is in the graph (the
+// flag-on worker graph) it must wire `dispatchSubagent`, so a real nested
+// subagent is admitted through the hub dispatcher at depth ≥ 1.
+// ---------------------------------------------------------------------------
+
+/** An in-memory executor worker that completes instantly (no isolate). */
+class PromptImmediateWorker implements ExecutorWorker {
+  alive = true
+  constructor(readonly id: number) {}
+  async execute(_run: ExecutorRun): Promise<void> {}
+  async cancel(): Promise<void> {}
+  async assertNotBusy(): Promise<boolean> {
+    return false
+  }
+  resultFor(): SessionExecutionResult | undefined {
+    return undefined
+  }
+  async terminate(): Promise<void> {
+    this.alive = false
+  }
+}
+
+/** An in-memory pool so the hub schedules deterministically without isolates. */
+const immediatePool = (k: number): ExecutorWorkerPool =>
+  createExecutorWorkerPool({ k, spawn: (id) => new PromptImmediateWorker(id) })
+
+it.instance(
+  "a nested subagent is admitted through the hub dispatcher at depth >= 1",
+  () => {
+    const hub = createSessionHub({ pool: immediatePool(1) })
+    return Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.hang
+      const msg = yield* user(chat.id, "hello")
+      yield* addSubtask(chat.id, msg.id)
+
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+
+      // The task tool routes the child through `ops().dispatchSubagent`, which
+      // pre-admits it on the hub registry at depth ≥ 1 before running it inline.
+      const job = yield* pollWithTimeout(
+        Effect.sync(() => hub.jobs.list().find((item) => item.type === "task" && item.depth >= 1)),
+        "subagent never registered with the hub at depth >= 1",
+      )
+      expect(job.depth).toBeGreaterThanOrEqual(1)
+      expect(job.parentID).toBe(chat.id)
+      // depth ≥ 1 selects the on-demand headroom kind in the live dispatcher.
+      expect(hub.dispatcher.headroomSlotCount).toBeGreaterThanOrEqual(1)
+
+      yield* prompt.cancel(chat.id)
+      yield* Fiber.await(fiber)
+    }).pipe(Effect.provideService(SessionHubService, hub))
+  },
+  { config: cfg },
+  15_000,
 )

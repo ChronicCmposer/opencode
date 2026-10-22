@@ -26,9 +26,17 @@ function sessionErrorMessage(error: SessionError) {
   return "Session error"
 }
 
+type CancelMode = Extract<Event, { type: "session.cancelled" }>["properties"]["mode"]
+
+function sessionCancelledMessage(mode: CancelMode) {
+  if (mode === "terminated") return "Session terminated"
+  return "Session cancelled"
+}
+
 const tui: TuiPlugin = async (api) => {
   const active = new Set<string>()
   const errored = new Set<string>()
+  const cancelled = new Set<string>()
   const questions = new Set<string>()
   const permissions = new Set<string>()
 
@@ -56,11 +64,27 @@ const tui: TuiPlugin = async (api) => {
     permissions.delete(event.properties.requestID)
   })
 
+  api.event.on("session.cancelled", (event) => {
+    const sessionID = event.properties.sessionID
+    if (cancelled.has(sessionID)) return
+    cancelled.add(sessionID)
+    // A cancel is terminal: drop the run indicators and surface the outcome.
+    // The hub publishes this alongside the terminal idle; whichever order the
+    // two arrive in, this toast is the authoritative cancel signal, and a later
+    // idle must not re-announce the session as a completion.
+    active.delete(sessionID)
+    errored.delete(sessionID)
+    const session = api.state.session.get(sessionID)
+    if (session?.parentID !== undefined) return
+    api.ui.toast({ variant: "warning", message: sessionCancelledMessage(event.properties.mode) })
+  })
+
   api.event.on("session.status", (event) => {
     const sessionID = event.properties.sessionID
     if (event.properties.status.type === "busy" || event.properties.status.type === "retry") {
       active.add(sessionID)
       errored.delete(sessionID)
+      cancelled.delete(sessionID)
       return
     }
 
@@ -72,6 +96,8 @@ const tui: TuiPlugin = async (api) => {
       errored.delete(sessionID)
       return
     }
+
+    if (cancelled.delete(sessionID)) return
 
     const session = api.state.session.get(sessionID)
     notify(api, sessionID, "Session done", session?.parentID ? "subagent_done" : "done")

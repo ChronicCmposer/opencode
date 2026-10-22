@@ -27,7 +27,6 @@ import { LSP } from "@/lsp/lsp"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import { InstanceRef } from "@/effect/instance-ref"
-import { createSessionScopeHost } from "@/session/worker/session-scope"
 import { EffectDrizzleSqlite } from "../../../../effect-drizzle-sqlite/src/index"
 import {
   ModelClient,
@@ -427,30 +426,6 @@ describe("boundary mocks are functional (f-w5)", () => {
         }).pipe(Effect.provide(layer)),
       ),
     ).rejects.toThrow(/MCP/)
-  })
-})
-
-describe("session scope integration (6.7)", () => {
-  test("closes the session scope and runs finalizers after the pipeline", async () => {
-    const finalized: string[] = []
-    const host = createSessionScopeHost()
-    const built = buildSessionWorkerLayer(options())
-
-    const result = await Effect.runPromise(
-      host.run(
-        "s1",
-        Effect.gen(function* () {
-          yield* Effect.addFinalizer(() => Effect.sync(() => finalized.push("s1")))
-          const pipeline = yield* SessionPipeline
-          return yield* pipeline.run({ sessionID: "s1", messages: [{ role: "user", content: "hi" }] })
-        }).pipe(Effect.provide(built.layer)),
-      ),
-    )
-
-    expect(result.text).toBe("hello from the worker")
-    expect(finalized).toEqual(["s1"])
-    expect(host.open).toBe(0)
-    expect(host.closed).toBe(1)
   })
 })
 

@@ -114,3 +114,50 @@ describe("worker fixture contract", () => {
     expect(structuredClone(value)).toEqual(value)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Bootstrap integration seam — the real session-worker entry must transfer its
+// dedicated egress CONTROL port alongside the data port, so the egress mesh
+// (durable ack/resync) is live in production and not silently dead.
+// ---------------------------------------------------------------------------
+
+const SESSION_WORKER_ENTRY = new URL("../../../src/session/worker/session-worker.ts", import.meta.url)
+
+type BootstrapOut =
+  | { type: "ready" }
+  | { type: "job-port"; port: MessagePort }
+  | { type: "ports"; writer: MessagePort; egress: MessagePort; egressControl: MessagePort; broker: MessagePort }
+  | { type: "hub-proxy"; port: MessagePort }
+
+describe("session-worker bootstrap isolate (egress control)", () => {
+  it.live("the entry transfers a dedicated egress control port alongside the data port", () =>
+    Effect.gen(function* () {
+      const harness = createWorkerHarness()
+      try {
+        const worker = harness.spawn<BootstrapOut, never>(SESSION_WORKER_ENTRY, {
+          workerData: {
+            snapshot: workerSnapshot(),
+            env: { values: {} },
+            model: {
+              providerID: "mock",
+              modelID: "m",
+              apiId: "m",
+              baseUrl: "http://127.0.0.1:1/v1",
+              apiKey: "k",
+              capabilities: { temperature: true, reasoning: false },
+              limit: { context: 128_000, output: 4096 },
+            },
+            capabilities: { sessionWorkerPorts: true },
+          },
+        })
+        const ports = yield* Effect.promise(() => worker.waitFor("ports"))
+        expect(ports.egress).toBeInstanceOf(MessagePort)
+        expect(ports.egressControl).toBeInstanceOf(MessagePort)
+        expect(ports.egressControl).not.toBe(ports.egress)
+        yield* Effect.promise(() => worker.waitFor("ready"))
+      } finally {
+        yield* Effect.promise(() => harness.dispose())
+      }
+    }),
+  )
+})

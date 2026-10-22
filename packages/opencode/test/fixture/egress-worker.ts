@@ -1,13 +1,23 @@
 // Phase 8.1 worker entry point (plan task 8.1).
 //
-// Creates a NEW dedicated `MessageChannel` for egress and a SEPARATE one for
-// control, transfers the hub ends to the parent, and drives the production
-// egress sender + control link. The default worker channel stays free for
-// commands ("delta" / "durable" / "flood" / "end").
+// Creates a NEW dedicated `MessageChannel` for egress, a SEPARATE one for the
+// generic control link, and a THIRD for the EventV2 mesh control plane, then
+// transfers the hub ends to the parent. The default worker channel stays free
+// for commands ("delta" / "durable" / "flood" / "end" / "mesh.*").
 //
-// control port in : hub -> worker `{ type: "ping", id }` -> worker replies pong.
+//   * egress        — the production egress sender (data plane).
+//   * control       — the generic control link: hub `{type:"ping",id}` -> pong,
+//                     plus flood bookkeeping.
+//   * egressControl — the production mesh client: `listen` requests, `durable`
+//                     wakeups and overflow `resync` pushes, with `durable.ack` /
+//                     `resync.ack` acknowledgements travelling back to the hub.
+//
+// The mesh client never touches the parent's default channel directly; durable
+// wakes and resync pushes are forwarded there so a test can observe them, and
+// acks are driven by explicit `mesh.ack` / `mesh.resync.ack` commands.
 
 import { createControlLink } from "../../src/session/egress/control"
+import { createMeshWorkerClient } from "../../src/session/egress/mesh"
 import { createEgressSender } from "../../src/session/egress/sender"
 
 interface WorkerScope {
@@ -20,19 +30,29 @@ interface Command {
   readonly id?: string
   readonly ordinal?: number
   readonly count?: number
+  readonly pattern?: string
 }
 
 const scope = globalThis as unknown as WorkerScope
 
 const egressChannel = new MessageChannel()
 const controlChannel = new MessageChannel()
+const egressControlChannel = new MessageChannel()
 const sender = createEgressSender({ port: egressChannel.port1, generation: 1 })
 const control = createControlLink(controlChannel.port1)
+const mesh = createMeshWorkerClient(egressControlChannel.port1)
 
 control.onMessage((frame) => {
   if (frame.type === "ping" && typeof frame.id === "number") {
     control.notify({ type: "pong", id: frame.id })
   }
+})
+
+mesh.onDurable((commit) => {
+  scope.postMessage({ type: "mesh.durable", id: commit.event.id })
+})
+mesh.onResync((pattern) => {
+  scope.postMessage({ type: "mesh.resync", pattern })
 })
 
 const handleCommand = (message: Command): void => {
@@ -55,6 +75,17 @@ const handleCommand = (message: Command): void => {
       control.notify({ type: "flood.done", count })
       return
     }
+    case "mesh.listen": {
+      const pattern = message.pattern ?? "*"
+      void mesh.listen(pattern).then(() => scope.postMessage({ type: "mesh.listen.ok", pattern }))
+      return
+    }
+    case "mesh.ack":
+      mesh.acknowledgeDelivery(message.count)
+      return
+    case "mesh.resync.ack":
+      mesh.acknowledgeResync(message.pattern ?? "*")
+      return
     case "end":
       sender.end()
       return
@@ -63,7 +94,12 @@ const handleCommand = (message: Command): void => {
 
 scope.onmessage = (event) => handleCommand(event.data as Command)
 
-scope.postMessage({ type: "ports", egress: egressChannel.port2, control: controlChannel.port2 }, [
-  egressChannel.port2,
-  controlChannel.port2,
-])
+scope.postMessage(
+  {
+    type: "ports",
+    egress: egressChannel.port2,
+    control: controlChannel.port2,
+    egressControl: egressControlChannel.port2,
+  },
+  [egressChannel.port2, controlChannel.port2, egressControlChannel.port2],
+)

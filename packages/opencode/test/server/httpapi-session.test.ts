@@ -12,6 +12,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
+import { RuntimeFlags } from "@/effect/runtime-flags"
 import { registerAdapter } from "../../src/control-plane/adapters"
 import type { WorkspaceAdapter } from "../../src/control-plane/types"
 import { Workspace } from "../../src/control-plane/workspace"
@@ -38,14 +39,37 @@ import { TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 
+// Test isolation: the ambient harness may export a global config
+// (`OPENCODE_CONFIG_CONTENT`), point at a shared config dir, or disable project
+// config loading entirely. These tests own their project `opencode.json`, so
+// drop the ambient overrides before any layer resolves.
+delete process.env.OPENCODE_DISABLE_PROJECT_CONFIG
+delete process.env.OPENCODE_CONFIG_CONTENT
+delete process.env.OPENCODE_CONFIG_DIR
+
 const originalWorkspaces = Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
 const noopBootstrapLayer = Layer.succeed(
   InstanceBootstrapService.Service,
   InstanceBootstrapService.Service.of({ run: Effect.void }),
 )
+// The background subagent acceptance test drives a `task` tool with
+// `background: true`, gated behind `experimentalBackgroundSubagents`. Derive
+// every other flag from the ambient (env) layer and force just this one on — a
+// per-layer override rather than a `process.env` mutation, so the flag cannot
+// leak into other test files sharing the process.
+const runtimeFlagsWithBackground = Layer.effect(
+  RuntimeFlags.Service,
+  Effect.gen(function* () {
+    const flags = yield* RuntimeFlags.Service
+    return RuntimeFlags.Service.of({ ...flags, experimentalBackgroundSubagents: true })
+  }),
+).pipe(Layer.provide(LayerNode.compile(RuntimeFlags.node)))
 const appLayer = AppNodeBuilder.build(
   LayerNode.group([InstanceStore.node, Project.node, Session.node, Workspace.node, Database.node, Ripgrep.node]),
-  [[InstanceStore.bootstrapNode, noopBootstrapLayer]],
+  [
+    [InstanceStore.bootstrapNode, noopBootstrapLayer],
+    [RuntimeFlags.node, runtimeFlagsWithBackground],
+  ],
 )
 const servedRoutes: Layer.Layer<never, Config.ConfigError, HttpServer.HttpServer> = HttpRouter.serve(
   HttpApiApp.routes,
@@ -431,6 +455,82 @@ describe("session HttpApi", () => {
         root: sessionDirectory,
       })
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  )
+
+  // W9 acceptance (HTTP abort route, end-to-end): a background `task` subagent
+  // must not outlive its parent's abort. Drives the real prompt -> task tool ->
+  // child session through the HTTP routes, aborts the parent, and asserts both
+  // sessions return to idle ("idle" == absent from the status map).
+  it.live(
+    "aborting a parent tears down a background task-tool child",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+
+        // The parent's model launches a background subagent; the child then hangs
+        // on its own LLM request.
+        yield* llm.tool("task", {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          background: true,
+        })
+        yield* llm.hang
+
+        const parent = yield* createSession({
+          title: "parent",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        }).pipe(provideInstanceEffect(directory))
+
+        const accepted = yield* request(
+          `${pathFor(SessionPaths.promptAsync, { sessionID: parent.id })}?directory=${encodeURIComponent(directory)}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "hello" }],
+            }),
+          },
+        )
+        expect(accepted.status).toBe(204)
+
+        const statusFor = () =>
+          requestJson<Record<string, { type: string }>>(
+            `${SessionPaths.status}?directory=${encodeURIComponent(directory)}`,
+          )
+
+        const childID = yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const kids = yield* Session.use.children(parent.id).pipe(provideInstanceEffect(directory))
+            const kid = kids[0]
+            if (!kid) return undefined
+            const statuses = yield* statusFor()
+            return statuses[kid.id]?.type === "busy" ? kid.id : undefined
+          }),
+          "background subagent child never became busy",
+          "40 seconds",
+        )
+
+        const outcome = yield* requestJson<Record<string, unknown>>(
+          `${pathFor(SessionPaths.abort, { sessionID: parent.id })}?directory=${encodeURIComponent(directory)}`,
+          { method: "POST" },
+        )
+        expect(outcome).toMatchObject({ sessionID: parent.id, winner: "cancel" })
+
+        // Both the parent and the child must return to idle (removed from the map).
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const statuses = yield* statusFor()
+            return statuses[parent.id] === undefined && statuses[childID] === undefined ? (true as const) : undefined
+          }),
+          "parent and child never returned to idle after abort",
+          "40 seconds",
+        )
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    90_000,
   )
 
   it.instance(

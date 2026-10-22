@@ -1,12 +1,26 @@
 import { afterEach, describe, expect, mock } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Effect, Layer } from "effect"
+import { Effect, Fiber, Layer, Queue } from "effect"
+import { EventV2 } from "@opencode-ai/core/event"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Session as SessionNs } from "@/session/session"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { pollWithTimeout, testEffect } from "../lib/effect"
+import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
 import { httpApiLayer, requestInDirectory } from "./httpapi-layer"
 
-const it = testEffect(Layer.mergeAll(LayerNode.compile(SessionNs.node), httpApiLayer))
+// Test isolation: the ambient harness may export a global config
+// (`OPENCODE_CONFIG_CONTENT`), point at a shared config dir, or disable project
+// config loading entirely. These tests own their project `opencode.json`, so
+// drop the ambient overrides before any layer resolves.
+delete process.env.OPENCODE_DISABLE_PROJECT_CONFIG
+delete process.env.OPENCODE_CONFIG_CONTENT
+delete process.env.OPENCODE_CONFIG_DIR
+
+// `EventV2.node` is a process-global node, so compiling it here exposes the same
+// pubsub the server publishes on — the event-bridge consumer test observes real
+// events.
+const it = testEffect(Layer.mergeAll(LayerNode.compile(SessionNs.node), LayerNode.compile(EventV2.node), httpApiLayer))
 
 afterEach(async () => {
   mock.restore()
@@ -90,6 +104,133 @@ describe("session action routes", () => {
           winner: "completion",
           acknowledged: false,
           durationMs: 0,
+        })
+      }),
+    { git: true },
+  )
+
+  // W9 acceptance (HTTP abort route): aborting a busy session must cancel the
+  // real run and report the rich cancel outcome (mode/winner/acknowledged/
+  // durationMs), not the idle no-op body. Uses a hanging shell so no provider
+  // model is required. A child session of the aborted parent must end idle.
+  it.instance(
+    "abort route reports a real cancel outcome and idles the session",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "Content-Type": "application/json" }
+        const parent = yield* Effect.acquireRelease(SessionNs.use.create({ title: "parent" }), (created) =>
+          SessionNs.use.remove(created.id).pipe(Effect.ignore),
+        )
+        const child = yield* Effect.acquireRelease(
+          SessionNs.use.create({ title: "child", parentID: parent.id }),
+          (created) => SessionNs.use.remove(created.id).pipe(Effect.ignore),
+        )
+
+        // The shell route is synchronous, so run it in a fiber and cancel it via
+        // the abort route before it finishes.
+        const shellFiber = yield* requestInDirectory(
+          SessionPaths.shell.replace(":sessionID", parent.id),
+          test.directory,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              command: "sleep 30",
+            }),
+          },
+        ).pipe(Effect.forkChild)
+
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const res = yield* requestInDirectory(SessionPaths.status, test.directory)
+            const statuses = (yield* res.json) as Record<string, { type: string }>
+            return statuses[parent.id]?.type === "busy" ? (true as const) : undefined
+          }),
+          "session never became busy",
+          "10 seconds",
+        )
+
+        const abort = yield* requestInDirectory(SessionPaths.abort.replace(":sessionID", parent.id), test.directory, {
+          method: "POST",
+        })
+        expect(abort.status).toBe(200)
+        const outcome = (yield* abort.json) as {
+          sessionID: string
+          mode: string
+          winner: string
+          acknowledged: boolean
+          durationMs: number
+        }
+        expect(outcome).toMatchObject({
+          sessionID: parent.id,
+          mode: "cooperative",
+          winner: "cancel",
+          acknowledged: false,
+        })
+        expect(outcome.durationMs).toBeGreaterThanOrEqual(0)
+
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const res = yield* requestInDirectory(SessionPaths.status, test.directory)
+            const statuses = (yield* res.json) as Record<string, { type: string }>
+            // An idle session is absent from the map: `SessionStatus.set(idle)`
+            // deletes the entry.
+            return statuses[parent.id] === undefined ? (true as const) : undefined
+          }),
+          "parent never returned to idle after abort",
+          "10 seconds",
+        )
+
+        const statuses = (yield* (yield* requestInDirectory(SessionPaths.status, test.directory)).json) as Record<
+          string,
+          { type: string }
+        >
+        expect(statuses[child.id]?.type ?? "idle").toBe("idle")
+
+        // The aborted shell fiber must have settled (not left running).
+        yield* Fiber.interrupt(shellFiber)
+      }),
+    { git: true, config: { formatter: false, lsp: false }, timeout: 20_000 },
+  )
+
+  // W9 (`session.cancelled` consumer): the hub publishes `session.cancelled`
+  // with the resolved cancel outcome, but no client surface consumed it. This
+  // guards that the event bridge is a working consumer channel for the exact
+  // payload the hub emits. A first-class TUI/app handler is requested separately
+  // (see `.parallel-implement/w9-integration.md`).
+  it.instance(
+    "session.cancelled reaches an event-bridge consumer",
+    () =>
+      Effect.gen(function* () {
+        const events = yield* EventV2.Service
+        const received = yield* Queue.unbounded<{ type: string; data: unknown }>()
+        const unsubscribe = yield* events.listen((event) =>
+          Effect.sync(() => Queue.offerUnsafe(received, { type: event.type, data: event.data })),
+        )
+        yield* Effect.addFinalizer(() => unsubscribe)
+
+        // Exactly the payload `hub.ts` publishes on a winning cancel.
+        yield* events.publishLive({
+          id: EventV2.ID.create(),
+          type: SessionV1.Event.Cancelled.type,
+          data: { sessionID: "ses_w9_cancelled", mode: "cooperative", durationMs: 5, acknowledged: true },
+        })
+
+        const event = yield* Queue.take(received).pipe(
+          Effect.timeoutOrElse({
+            duration: "2 seconds",
+            orElse: () =>
+              Effect.fail(new Error("session.cancelled was not delivered to an event-bridge consumer")),
+          }),
+        )
+        expect(event.type).toBe(SessionV1.Event.Cancelled.type)
+        expect(event.data).toMatchObject({
+          sessionID: "ses_w9_cancelled",
+          mode: "cooperative",
+          acknowledged: true,
         })
       }),
     { git: true },

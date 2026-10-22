@@ -8,7 +8,7 @@
 // so the graph decision and the runtime flag cannot drift.
 
 import { describe, expect, test } from "bun:test"
-import { Context, Effect, Layer } from "effect"
+import { ConfigProvider, Context, Effect, Layer } from "effect"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -151,6 +151,48 @@ describe("sessionWorkersEnabled agrees with runtime-flags for the same env", () 
   test("nodes.ts and runtime-flags.ts return the same boolean for every env", () => {
     for (const env of envs) {
       expect(sessionWorkersEnabled(env)).toBe(RuntimeFlags.experimentalSessionWorkersFromEnv(env))
+    }
+  })
+})
+
+// The graph decision reads `process.env` at module-eval time, while the runtime
+// delegation gate resolves `RuntimeFlags.experimentalSessionWorkers` through the
+// ambient ConfigProvider. They must still agree, so both parse through the same
+// canonical predicate. This resolves the real service from a provider built out
+// of the same env (`fromUnknown`, i.e. not `process.env`) and compares.
+describe("sessionWorkersEnabled agrees with the ConfigProvider-resolved runtime flag", () => {
+  /** `"ConfigError"` marks the pre-fix failure mode where the Config path threw. */
+  const resolveRuntimeFlag = (env: Record<string, unknown>): boolean | "ConfigError" => {
+    const layer = AppNodeBuilder.build(RuntimeFlags.node).pipe(
+      Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown(env))),
+    )
+    try {
+      return Effect.runSync(
+        RuntimeFlags.Service.useSync((flags) => flags.experimentalSessionWorkers).pipe(Effect.provide(layer)),
+      )
+    } catch {
+      return "ConfigError"
+    }
+  }
+
+  const driftEnvs: Record<string, unknown>[] = [
+    {},
+    { OPENCODE_EXPERIMENTAL: "true" },
+    { OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "true" },
+    { OPENCODE_EXPERIMENTAL: "false", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "true" },
+    { OPENCODE_EXPERIMENTAL: "true", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "false" },
+    // The drift cases — the provider (not `process.env`) supplies a dedicated
+    // value the pure predicate recovers from but the `Config.boolean` path used
+    // to reject with a fatal `ConfigError`.
+    { OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "nonsense" },
+    { OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "TRUE" },
+    { OPENCODE_EXPERIMENTAL: "true", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "nonsense" },
+    { OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "yes" },
+  ]
+
+  test("both resolvers return the same boolean for every env", () => {
+    for (const env of driftEnvs) {
+      expect(resolveRuntimeFlag(env)).toBe(sessionWorkersEnabled(env as Record<string, string | undefined>))
     }
   })
 })

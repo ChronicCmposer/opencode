@@ -15,7 +15,7 @@ import {
   WorkerCrashedError,
   type CancellationConfig,
 } from "@/session/worker/dispatch"
-import { createExecutorWorker, createExecutorWorkerPool } from "@/session/worker/execute"
+import { createExecutorWorker, createExecutorWorkerPool, createSessionDispatch } from "@/session/worker/execute"
 import { createJobRegistry, type JobInfo, type JobRegistry } from "@/session/worker/job-registry"
 import {
   assertSubagentAdmitted,
@@ -380,6 +380,48 @@ describe("33 real dispatcher: a depth-1 child consumes headroom and routing fire
       expect(routed).toEqual([{ parentID: "ses_parent", id: "ses_child", status: "completed" }])
     } finally {
       await dispatcher.terminateAll()
+    }
+  })
+})
+
+describe("33 production execution seam: depth plumbs through createSessionDispatch", () => {
+  test("ensureRunning(child, 1) runs the child on headroom, not the freed foreground slot", async () => {
+    await using harness = createWorkerHarness({ cores: 4, timeoutMs: 10_000 })
+    const pool = createExecutorWorkerPool({
+      k: 1,
+      spawn: (id) => createExecutorWorker({ id, transport: spawnTransport(harness), workKind: "slow" }),
+    })
+    const dispatcher = createDispatcher({ pool })
+    const dispatch = createSessionDispatch({ dispatcher, pool })
+    try {
+      // The root finishes first, leaving the foreground worker idle.
+      const parent = await dispatch.ensureRunning(sid("ses_parent"))
+      expect(parent.sessionID).toBe("ses_parent")
+      expect(dispatcher.headroomSlotCount).toBe(0)
+
+      // A depth-1 dispatch must still spawn headroom rather than borrow the idle
+      // foreground slot — the exact bug when depth is hardcoded to 0.
+      const child = await dispatch.ensureRunning(sid("ses_child"), 1)
+      expect(child.sessionID).toBe("ses_child")
+      expect(dispatcher.headroomSlotCount).toBe(1)
+    } finally {
+      await dispatcher.terminateAll().catch(() => undefined)
+    }
+  })
+
+  test("startShell runs on a worker through the inbound startShell frame", async () => {
+    await using harness = createWorkerHarness({ cores: 4, timeoutMs: 10_000 })
+    const pool = createExecutorWorkerPool({
+      k: 1,
+      spawn: (id) => createExecutorWorker({ id, transport: spawnTransport(harness), workKind: "slow" }),
+    })
+    const dispatcher = createDispatcher({ pool })
+    const dispatch = createSessionDispatch({ dispatcher, pool })
+    try {
+      const shell = await dispatch.startShell(sid("ses_shell"))
+      expect(shell.sessionID).toBe("ses_shell")
+    } finally {
+      await dispatcher.terminateAll().catch(() => undefined)
     }
   })
 })

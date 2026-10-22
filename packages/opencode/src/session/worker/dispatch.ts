@@ -11,8 +11,9 @@
 //   • idle-reap of headroom workers.
 //
 // The scheduler depends on the `WorkerPool` interface (task 4.9), not on Bun
-// workers directly, so scheduling is deterministic in tests. `createBunWorkerPool`
-// is the production adapter over `pool.ts`.
+// workers directly, so scheduling is deterministic in tests. The production
+// `ExecutorWorkerPool`/`WorkerPool` adapter lives in `hub.ts`
+// (`createProductionWorkerPool`).
 
 import { Schema } from "effect"
 import type { SessionID } from "@/session/schema"
@@ -27,9 +28,14 @@ import {
 } from "./queue"
 import { createSessionRegistry, type SessionRegistry } from "./registry"
 import { createSupervision, type Supervision } from "./supervision"
-import { resolveWorkerCount, spawnPoolWorker, type Env, type PoolWorker } from "./pool"
 import { defaultSchedule } from "./port"
-import type { ExecutorRun, ExecutorSessionWorker, ExecutorWorkerKind, ExecutorWorkerPool } from "./execute"
+import type {
+  ExecutorRun,
+  ExecutorSessionWorker,
+  ExecutorWorkerKind,
+  ExecutorWorkerPool,
+  SessionRunMode,
+} from "./execute"
 import {
   createCancelController,
   createOutcomeGate,
@@ -58,7 +64,17 @@ export function deriveHeadroom(workerCount: number): number {
 /** Scheduling kind: foreground roots or on-demand depth-1 children (execute.ts owns the shape). */
 export type WorkerKind = ExecutorWorkerKind
 
-/** One session run: the key the worker executes and its subagent depth. */
+/**
+ * The scheduling kind a run's depth selects: roots (depth 0) are foreground,
+ * every nested child (depth ≥ 1) needs on-demand headroom. Encoding the rule as
+ * one function keeps the scheduler's capacity checks from drifting from its
+ * admission rule.
+ */
+export function workerKindForDepth(depth: number): WorkerKind {
+  return depth >= 1 ? "headroom" : "foreground"
+}
+
+/** One session run: the key the worker executes, its subagent depth and its frame mode. */
 export type SessionRun = ExecutorRun
 
 /** A worker that executes exactly one session run at a time. */
@@ -116,6 +132,15 @@ export class SessionCancelledError extends Schema.TaggedErrorClass<SessionCancel
   sessionID: Schema.String,
 }) {}
 
+/**
+ * Raised when a depth ≥ 1 child cannot be scheduled: the physical headroom pool
+ * is at its bound and the bounded child queue has no room, so the child is
+ * refused loud rather than admitted past the physical limit (decision line 60).
+ */
+export class HeadroomFullError extends Schema.TaggedErrorClass<HeadroomFullError>()("HeadroomFullError", {
+  message: Schema.String,
+}) {}
+
 /** The terminal mode reported when a session is cancelled (plan 11.10 adds `queued`). */
 export type CancelledMode = CancelMode | "queued"
 
@@ -154,6 +179,8 @@ export interface DispatchRequest {
   readonly sessionID: SessionID
   /** 0 = foreground/root; ≥1 = subagent child. Defaults to 0. */
   readonly depth?: number
+  /** Executor frame to run; defaults to `"run"` (a `"startShell"` takes the shell path). */
+  readonly mode?: SessionRunMode
 }
 
 export interface DispatcherOptions {
@@ -209,6 +236,8 @@ interface Pending {
   readonly sessionID: SessionID
   readonly depth: number
   readonly kind: WorkerKind
+  /** The executor frame this run produces; only `"startShell"` is carried on the run. */
+  readonly mode: SessionRunMode
   readonly promise: Promise<void>
   readonly resolve: () => void
   readonly reject: (error: unknown) => void
@@ -217,14 +246,14 @@ interface Pending {
   slot: Slot | undefined
 }
 
-function createPending(sessionID: SessionID, depth: number, kind: WorkerKind): Pending {
+function createPending(sessionID: SessionID, depth: number, kind: WorkerKind, mode: SessionRunMode): Pending {
   let resolve!: () => void
   let reject!: (error: unknown) => void
   const promise = new Promise<void>((res, rej) => {
     resolve = res
     reject = rej
   })
-  return { sessionID, depth, kind, promise, resolve, reject, gate: createOutcomeGate(), slot: undefined }
+  return { sessionID, depth, kind, mode, promise, resolve, reject, gate: createOutcomeGate(), slot: undefined }
 }
 
 export function createDispatcher(options: DispatcherOptions): Dispatcher {
@@ -352,7 +381,13 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     clearIdleReap(slot)
     registry.reserve(pending.sessionID, slot.worker.id)
     registry.markRunning(pending.sessionID)
-    const run: SessionRun = { sessionID: pending.sessionID, depth: pending.depth }
+    const run: SessionRun = {
+      sessionID: pending.sessionID,
+      depth: pending.depth,
+      // Carry the mode only when it deviates from the default so a plain run
+      // keeps its minimal `{sessionID, depth}` shape.
+      ...(pending.mode === "startShell" ? { mode: pending.mode } : {}),
+    }
     let execution: Promise<void>
     try {
       execution = slot.worker.execute(run)
@@ -493,12 +528,21 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     for (const waiter of waiters.items) waiter.reject(error)
   }
 
+  /** A depth ≥ 1 child refused because the physical headroom is saturated. */
+  const headroomFull = (): HeadroomFullError =>
+    new HeadroomFullError({
+      message: `headroom is full (${countHeadroomSlots()} of ${headroomMax} slots) and the child queue is at capacity (${childCapacity})`,
+    })
+
   const enqueue = (pending: Pending): void => {
     const queue = pending.kind === "foreground" ? admission : children
     try {
       queue.enqueue(pending)
     } catch (error) {
-      failEnqueue(pending, error)
+      // A child-queue overflow is really "headroom is full": the physical pool is
+      // saturated and the bounded child queue has no room, so surface the
+      // semantic error instead of the raw queue-full failure (decision line 60).
+      failEnqueue(pending, pending.kind === "headroom" ? headroomFull() : error)
     }
   }
 
@@ -522,14 +566,15 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       // a function whose contract is a promise.
       return Promise.reject(new Error(`invalid dispatch depth: ${depth} (expected a non-negative integer)`))
     }
-    const kind: WorkerKind = depth >= 1 ? "headroom" : "foreground"
+    const kind: WorkerKind = workerKindForDepth(depth)
+    const mode: SessionRunMode = request.mode ?? "run"
     const sessionID = request.sessionID
 
     const admitted = byKey.get(sessionID)
     if (admitted !== undefined) {
-      if (admitted.kind === kind) return admitted.promise
-      // Different kind: park behind the in-flight run, bounded per key.
-      const pending = createPending(sessionID, depth, kind)
+      if (admitted.kind === kind && admitted.mode === mode) return admitted.promise
+      // Different kind or frame mode: park behind the in-flight run, bounded per key.
+      const pending = createPending(sessionID, depth, kind, mode)
       const waiters = waitersByKey.get(sessionID) ?? createBoundedQueue<Pending>("waiter", waiterCapacity)
       if (!waitersByKey.has(sessionID)) waitersByKey.set(sessionID, waiters)
       try {
@@ -541,7 +586,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       return pending.promise
     }
 
-    const pending = createPending(sessionID, depth, kind)
+    const pending = createPending(sessionID, depth, kind, mode)
     byKey.set(sessionID, pending)
     startOrEnqueue(pending)
     return pending.promise
@@ -623,15 +668,13 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
         ? { ...outcome, mode: "completed", winner: "completion" }
         : outcome
 
-    // Phase 5.1 limit. Before the upstream run-control seam lands, a still-live
-    // run whose *outer* executor machine died is reported `cooperative`: the
-    // executor acks before the real loop unwinds, so this branch may reuse a
-    // worker whose run is still going. No local signal separates that from a
-    // genuine cooperative unwind (the executor promise rejects for a real cancel
-    // too, and `machine.busy` only reflects the already-idle outer machine); the
-    // seam that delegates `cancel`/`busy` to the worker-local run-state makes the
-    // ack mean real settlement. A grace *expiry* is unambiguous and lands below:
-    // the controller has terminated + reaped, and this releases the slot.
+    // A `cooperative` outcome means the worker's run settled at a checkpoint.
+    // The run-control seam (`execute.ts` `SessionRunControl`, registered by the
+    // worker) delegates the executor's `cancel`/`busy` into the worker-local
+    // run-state, so the `cancel-ack` reflects the real loop unwinding — this
+    // branch can trust it and reuse the live worker. A grace *expiry* is
+    // unambiguous and lands below: the controller has terminated + reaped, and
+    // this releases the slot.
     if (resolved.mode === "terminated") {
       // The controller terminated the isolate and reaped its PGIDs; terminate
       // again is idempotent, so only the reservation + slot need releasing.
@@ -697,90 +740,6 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     dispatch,
     cancel,
     cancelWithGrace,
-    terminateAll,
-    dispose: terminateAll,
-    [Symbol.asyncDispose]: terminateAll,
-  }
-}
-
-export interface BunWorkerPoolOptions {
-  readonly k?: number
-  readonly entry?: string | URL
-  readonly env?: Env
-  readonly timeoutMs?: number
-  readonly availableParallelism?: () => number
-  /** Executor-protocol driver; defaults to the Phase-4 bootstrap placeholder. */
-  readonly drive?: PoolWorkerDriver
-}
-
-/**
- * Drive one session run on a pool worker. The production executor transport
- * lives in `hub.ts` (`createBunExecutorWorkerPool`); this is the seam the
- * bootstrap-backed adapter is built on.
- */
-export type PoolWorkerDriver = (worker: PoolWorker, run: SessionRun) => Promise<void>
-
-/**
- * Phase-4 bootstrap placeholder. It boots the trivial Effect, but does NOT yet
- * carry `run.sessionID`/`run.depth` across the isolate — the executor-protocol
- * transport replaces it when the bootstrap pool is unified with the hub pool.
- */
-export const driveBootstrapPlaceholder: PoolWorkerDriver = async (worker) => {
-  await worker.ready()
-  await worker.run(1)
-}
-
-/**
- * Adapt one `PoolWorker` to the scheduling seam. The run is forwarded to
- * `drive` (production: the executor protocol) rather than hard-coded, so the
- * adapter never silently drops `run.sessionID`/`run.depth`.
- */
-export function adaptPoolWorker(
-  worker: PoolWorker,
-  drive: PoolWorkerDriver = driveBootstrapPlaceholder,
-): SessionWorker {
-  return {
-    get id() {
-      return worker.id
-    },
-    get alive() {
-      return worker.alive
-    },
-    execute: (run: SessionRun): Promise<void> => drive(worker, run),
-    terminate: () => worker.terminate().then(() => undefined),
-  }
-}
-
-export interface BunWorkerPool extends WorkerPool, AsyncDisposable {
-  dispose(): Promise<void>
-}
-
-/** Production `WorkerPool`: adapts the Bun worker pool to the scheduling seam. */
-export function createBunWorkerPool(options: BunWorkerPoolOptions = {}): BunWorkerPool {
-  const k = options.k ?? resolveWorkerCount({ availableParallelism: options.availableParallelism, env: options.env })
-  const created: PoolWorker[] = []
-  const drive = options.drive ?? driveBootstrapPlaceholder
-
-  const spawnWorker = (): PoolWorker => {
-    const worker = spawnPoolWorker({
-      id: created.length + 1,
-      entry: options.entry,
-      env: options.env,
-      timeoutMs: options.timeoutMs,
-    })
-    created.push(worker)
-    return worker
-  }
-
-  const foreground = Array.from({ length: k }, () => adaptPoolWorker(spawnWorker(), drive))
-
-  const terminateAll = async (): Promise<void> => {
-    await Promise.all(created.map((worker) => worker.terminate().catch(() => undefined)))
-  }
-
-  return {
-    workers: foreground,
-    spawn: () => adaptPoolWorker(spawnWorker(), drive),
     terminateAll,
     dispose: terminateAll,
     [Symbol.asyncDispose]: terminateAll,

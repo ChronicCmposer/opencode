@@ -178,8 +178,6 @@ for (const item of targets) {
   const writerWorkerPath = "writer-worker.js"
   const brokerWorkerSourcePath = "./src/session/broker/broker-worker.ts"
   const brokerWorkerPath = "broker-worker.js"
-  const poolWorkerSourcePath = "./src/session/worker/bootstrap.ts"
-  const poolWorkerPath = "pool-bootstrap.js"
   const treeSitterWorkerPath = "opentui-tree-sitter-worker.js"
   const bunfsRoot = item.os === "win32" ? "B:/~BUN/root/" : "/$bunfs/root/"
 
@@ -190,7 +188,6 @@ for (const item of targets) {
   const sessionWorkerShim = workerShim(sessionWorkerSourcePath)
   const writerWorkerShim = workerShim(writerWorkerSourcePath)
   const brokerWorkerShim = workerShim(brokerWorkerSourcePath)
-  const poolWorkerShim = workerShim(poolWorkerSourcePath)
 
   await Bun.build({
     conditions: ["bun", "node"],
@@ -215,7 +212,6 @@ for (const item of targets) {
       [sessionWorkerPath]: sessionWorkerShim,
       [writerWorkerPath]: writerWorkerShim,
       [brokerWorkerPath]: brokerWorkerShim,
-      [poolWorkerPath]: poolWorkerShim,
       [treeSitterWorkerPath]: treeSitterWorker,
       ...(embeddedFileMap ? { "opencode-web-ui.gen.ts": embeddedFileMap } : {}),
     },
@@ -228,8 +224,6 @@ for (const item of targets) {
       writerWorkerPath,
       brokerWorkerSourcePath,
       brokerWorkerPath,
-      poolWorkerSourcePath,
-      poolWorkerPath,
       treeSitterWorkerPath,
       ...(embeddedFileMap ? ["opencode-web-ui.gen.ts"] : []),
     ],
@@ -242,7 +236,6 @@ for (const item of targets) {
       OPENCODE_SESSION_WORKER_PATH: bunfsRoot + sessionWorkerPath,
       OPENCODE_WRITER_WORKER_PATH: bunfsRoot + writerWorkerPath,
       OPENCODE_BROKER_WORKER_PATH: bunfsRoot + brokerWorkerPath,
-      OPENCODE_POOL_WORKER_PATH: bunfsRoot + poolWorkerPath,
       OPENCODE_CHANNEL: `'${Script.channel}'`,
       OPENCODE_LIBC: item.os === "linux" ? `'${item.abi ?? "glibc"}'` : "",
       ...(item.os === "linux" ? { "process.env.OPENTUI_LIBC": JSON.stringify(item.abi ?? "glibc") } : {}),

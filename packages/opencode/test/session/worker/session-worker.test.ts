@@ -57,6 +57,7 @@ import {
   type SessionWorkerInit,
   type SessionWorkerModel,
 } from "@/session/worker/session-worker"
+import type { JobInfo } from "@/session/worker/job-registry"
 import {
   createPidRegistry,
   registerReported,
@@ -172,6 +173,104 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
     expect(types).not.toContain("ports")
     expect(types).not.toContain("hub-proxy")
   })
+
+  test("transfers the dedicated egress control (mesh) port for a full hub", () => {
+    const { frames, scope } = fakeScope()
+    bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope)
+    const ports = frames.find((frame) => (frame.data as { type?: string }).type === "ports")
+    expect(ports).toBeDefined()
+    // The control plane rides a SEPARATE port so durable wakeups/resync never
+    // queue behind deltas; without it the egress mesh is dead in production.
+    const control = (ports!.data as { egressControl?: unknown }).egressControl
+    expect(control).toBeInstanceOf(MessagePort)
+    // writer + egress + egressControl + broker are all transferred.
+    expect(ports!.transfer).toHaveLength(4)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Child-result routing (9.4). The hub registry pushes a settled child's info to
+// the worker hosting its `parentID`; production must have the subscriber
+// installed or the push is silently dropped.
+// ---------------------------------------------------------------------------
+
+describe("child-result subscription (9.4)", () => {
+  const fakeScope = () => {
+    const frames: Array<{ data: unknown; transfer: readonly Transferable[] }> = []
+    const scope = {
+      postMessage(data: unknown, transfer?: readonly Transferable[]) {
+        frames.push({ data, transfer: transfer ?? [] })
+      },
+      onmessage: null as ((event: { data: unknown }) => void) | null,
+    }
+    return { frames, scope }
+  }
+
+  const init = () => ({
+    snapshot: workerSnapshot(),
+    env: { values: {} },
+    model: {
+      providerID: "mock",
+      modelID: "m",
+      apiId: "m",
+      baseUrl: "http://127.0.0.1:1/v1",
+      apiKey: "k",
+      capabilities: { temperature: true, reasoning: false },
+      limit: { context: 128_000, output: 4096 },
+    },
+    capabilities: { sessionWorkerPorts: true },
+  })
+
+  test("production installs the subscriber the hub routes settled children to", async () => {
+    const { frames, scope } = fakeScope()
+    const bootstrap = bootstrapSessionWorker(init(), scope)
+    const received = new Promise<JobInfo>((resolve) => bootstrap.onChildResult(resolve))
+
+    // Drive the hub half of the transferred job port: the registry pushes a
+    // settled child keyed by the parent session.
+    const jobFrame = frames.find((frame) => (frame.data as { type?: string }).type === "job-port")
+    expect(jobFrame).toBeDefined()
+    const hubPort = (jobFrame!.data as { port: MessagePort }).port
+    hubPort.start()
+    const result: JobInfo = {
+      id: "ses_child",
+      type: "task",
+      status: "completed",
+      started_at: 1,
+      completed_at: 2,
+      output: "done",
+      parentID: "ses_parent",
+      depth: 1,
+    }
+    hubPort.postMessage({ kind: "push", type: "childResult", parentID: "ses_parent", result })
+
+    expect(await received).toMatchObject({ id: "ses_child", parentID: "ses_parent", status: "completed" })
+    bootstrap.dispose()
+    hubPort.close()
+  })
+
+  test("a disposed bootstrap stops delivering child results", async () => {
+    const { frames, scope } = fakeScope()
+    const bootstrap = bootstrapSessionWorker(init(), scope)
+    let delivered = 0
+    bootstrap.onChildResult(() => void (delivered += 1))
+    bootstrap.dispose()
+
+    const jobFrame = frames.find((frame) => (frame.data as { type?: string }).type === "job-port")!
+    const hubPort = (jobFrame.data as { port: MessagePort }).port
+    hubPort.start()
+    hubPort.postMessage({
+      kind: "push",
+      type: "childResult",
+      parentID: "ses_parent",
+      result: { id: "ses_child", type: "task", status: "completed", started_at: 1, depth: 1 },
+    })
+    // Ordering barrier: the port's message task is queued before this timer, so
+    // by the time it fires the (removed) handler would already have run.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(delivered).toBe(0)
+    hubPort.close()
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -249,6 +348,32 @@ describe("buildWorkerClients (step 22)", () => {
     expect(published).toEqual(["message.assistant"])
 
     expect(await clients.writer.query("all", "SELECT 1")).toEqual([{ value: 1 }])
+  })
+
+  test("wires the egress control port into the mesh client", () => {
+    const channels = emptyChannels()
+    const control = new MessageChannel()
+    const clients = buildWorkerClients({
+      writer: channels.writer.port1,
+      egress: channels.egress.port1,
+      egressControl: control.port1,
+      broker: channels.broker.port1,
+      backgroundJob: channels.backgroundJob.port1,
+    })
+    // The dedicated control port gives the egress client a live mesh (durable
+    // ack/resync); without it `mesh` is `undefined` and the control plane dies.
+    expect(clients.egress.mesh).toBeDefined()
+  })
+
+  test("omits the mesh client when no control port is supplied", () => {
+    const channels = emptyChannels()
+    const clients = buildWorkerClients({
+      writer: channels.writer.port1,
+      egress: channels.egress.port1,
+      broker: channels.broker.port1,
+      backgroundJob: channels.backgroundJob.port1,
+    })
+    expect(clients.egress.mesh).toBeUndefined()
   })
 })
 

@@ -16,6 +16,8 @@ export type Info = {
   output?: string
   error?: string
   metadata?: Record<string, unknown>
+  /** The subagent parent session; absent for a root/foreground job. */
+  parentID?: string
 }
 
 type Active = {
@@ -66,6 +68,8 @@ export type StartInput = {
   type: string
   title?: string
   metadata?: Record<string, unknown>
+  /** The subagent parent session; omitted for a root/foreground job. */
+  parentID?: string
   onPromote?: Effect.Effect<void>
   run: Effect.Effect<string, unknown>
 }
@@ -224,6 +228,7 @@ export const make = Effect.gen(function* () {
                 status: "running" as const,
                 started_at,
                 metadata: input.metadata,
+                ...(input.parentID === undefined ? {} : { parentID: input.parentID }),
               },
               done,
               scope,

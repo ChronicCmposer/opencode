@@ -25,17 +25,49 @@ const parseBoolean = (value: string | undefined): boolean | undefined => {
   return undefined
 }
 
+const SESSION_WORKERS_ENV = "OPENCODE_EXPERIMENTAL_SESSION_WORKERS"
+const UMBRELLA_ENV = "OPENCODE_EXPERIMENTAL"
+
 /**
- * Pure mirror of {@link enabledByExperimental} for a plain environment map.
- * The dedicated flag wins when it parses as a boolean; otherwise it falls back
- * to the umbrella `OPENCODE_EXPERIMENTAL`, which itself defaults to `false`.
+ * The canonical parser for the session-worker rollout flag. The dedicated flag
+ * wins when it parses as a boolean; otherwise it falls back to the umbrella
+ * `OPENCODE_EXPERIMENTAL`, which itself defaults to `false`. Shared by the
+ * graph decision (`SessionWorkerNodes.sessionWorkersEnabled`) and the runtime
+ * gate below, so the two cannot disagree on how a value is interpreted.
  */
 export const experimentalSessionWorkersFromEnv = (
   env: Record<string, string | undefined> = process.env,
 ): boolean =>
-  parseBoolean(env["OPENCODE_EXPERIMENTAL_SESSION_WORKERS"]) ??
-  parseBoolean(env["OPENCODE_EXPERIMENTAL"]) ??
-  false
+  parseBoolean(env[SESSION_WORKERS_ENV]) ?? parseBoolean(env[UMBRELLA_ENV]) ?? false
+
+/**
+ * Read an optional string from the ConfigProvider. A missing *or* unparseable
+ * value yields `None`, so the flag recovers to its fallback instead of dying on
+ * a malformed variable.
+ */
+const optionalString = (name: string): Config.Config<Option.Option<string>> =>
+  Config.string(name).pipe(
+    Config.option,
+    Config.orElse(() => Config.succeed(Option.none<string>())),
+  )
+
+/**
+ * The session-worker rollout flag as a `Config`. It resolves through the ambient
+ * ConfigProvider but parses through {@link experimentalSessionWorkersFromEnv},
+ * so the Config and the graph predicate stay in lockstep — including malformed
+ * values, where both recover rather than the Config path failing.
+ */
+const experimentalSessionWorkersConfig: Config.Config<boolean> = Config.all({
+  dedicated: optionalString(SESSION_WORKERS_ENV),
+  umbrella: optionalString(UMBRELLA_ENV),
+}).pipe(
+  Config.map((values) =>
+    experimentalSessionWorkersFromEnv({
+      [SESSION_WORKERS_ENV]: Option.getOrUndefined(values.dedicated),
+      [UMBRELLA_ENV]: Option.getOrUndefined(values.umbrella),
+    }),
+  ),
+)
 
 export class Service extends ConfigService.Service<Service>()("@opencode/RuntimeFlags", {
   autoShare: bool("OPENCODE_AUTO_SHARE"),
@@ -71,7 +103,7 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
   experimentalPlanMode: enabledByExperimental("OPENCODE_EXPERIMENTAL_PLAN_MODE"),
   experimentalCodeMode: enabledByExperimental("OPENCODE_EXPERIMENTAL_CODE_MODE"),
   experimentalEventSystem: enabledByExperimental("OPENCODE_EXPERIMENTAL_EVENT_SYSTEM"),
-  experimentalSessionWorkers: enabledByExperimental("OPENCODE_EXPERIMENTAL_SESSION_WORKERS"),
+  experimentalSessionWorkers: experimentalSessionWorkersConfig,
   experimentalWorkspaces: enabledByExperimental("OPENCODE_EXPERIMENTAL_WORKSPACES"),
   experimentalIconDiscovery: enabledByExperimental("OPENCODE_EXPERIMENTAL_ICON_DISCOVERY"),
   outputTokenMax: positiveInteger("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"),

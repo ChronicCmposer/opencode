@@ -321,6 +321,12 @@ export function createJobClient(port: JobPort, options: CreateJobClientOptions =
 export interface BackgroundJobClient extends BackgroundJobClientHandle {
   /** Refined for callers that need the settle detail; still assignable to the seam. */
   wait(id: string, timeoutMs?: number): Promise<JobWaitResult>
+  /**
+   * Subscribe to a settled child's result routed to this worker's `parentID`
+   * (9.4). Exposed from the production adapter so a consumer can observe the
+   * result push without holding the wider {@link JobClient} surface.
+   */
+  onChildResult(handler: (result: JobInfo) => void): () => void
   dispose(): void
 }
 
@@ -333,6 +339,7 @@ export function createBackgroundJobClient(
   return {
     wait: (id, timeoutMs) => client.wait(id, timeoutMs),
     cancel: (id) => client.cancel(id),
+    onChildResult: (handler) => client.onChildResult(handler),
     dispose: () => client.dispose(),
   }
 }

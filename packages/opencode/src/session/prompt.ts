@@ -44,8 +44,10 @@ import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
 import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
-import { TaskTool, type TaskPromptOps } from "@/tool/task"
+import { TaskTool, type TaskPromptOps, type TaskSubagentDispatch } from "@/tool/task"
 import { SessionRunState } from "./run-state"
+import { SessionHubService, type SessionHub } from "./worker/hub"
+import { dispatchSubagent as dispatchSubagentToHub } from "./worker/subagent"
 import type { CancelOutcome } from "./worker/cancel"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -142,11 +144,45 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
     const { db } = database
+    // The hub is in the caller's context only in the worker graph; resolve it
+    // once per layer instance (mirrors `run-state.ts`'s flag-on seam). Absent
+    // means the inline/flag-off behaviour: no subagent dispatch seam.
+    const hubIfEnabled: Effect.Effect<SessionHub | undefined> = yield* Effect.cached(
+      Effect.gen(function* () {
+        const hub = yield* Effect.serviceOption(SessionHubService)
+        return Option.isNone(hub) ? undefined : hub.value
+      }),
+    )
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
+      const hub = yield* hubIfEnabled
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID).pipe(Effect.asVoid),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        // Route a subagent child through the hub dispatcher at depth ≥ 1 in
+        // addition to running it inline. `depthLimit` is the resolved
+        // `subagent_depth`; the dispatcher is the physical-headroom authority, so
+        // an over-deep or headroom-full child is refused loud rather than queued.
+        ...(hub === undefined
+          ? {}
+          : {
+              dispatchSubagent: (request: TaskSubagentDispatch) =>
+                Effect.gen(function* () {
+                  const cfg = yield* config.get()
+                  yield* Effect.promise(() =>
+                    dispatchSubagentToHub(
+                      {
+                        registry: hub.jobs,
+                        scheduler: hub.dispatcher,
+                        depthLimit: cfg.subagent_depth ?? 1,
+                        headroomFull: () =>
+                          hub.dispatcher.headroomSlotCount >= hub.dispatcher.headroomCapacity,
+                      },
+                      request,
+                    ),
+                  )
+                }),
+            }),
       } satisfies TaskPromptOps
     })
 

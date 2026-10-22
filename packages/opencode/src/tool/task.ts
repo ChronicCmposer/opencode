@@ -15,10 +15,30 @@ import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
 
+/**
+ * A subagent child routed to the hub dispatcher. The dispatcher owns depth
+ * admission and worker selection, so the task tool only describes the child.
+ */
+export interface TaskSubagentDispatch {
+  readonly parentID: SessionID
+  readonly childID: SessionID
+  readonly type: string
+  /** The child's nesting depth; ≥ 1 for a subagent (0 is a root). */
+  readonly depth: number
+  readonly title?: string
+  readonly metadata?: Record<string, unknown>
+}
+
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
+  /**
+   * Route a child through the subagent dispatcher at depth ≥ 1 instead of
+   * running it inline. Absent in flag-off/inline runs, where the child executes
+   * on the caller (the historical behaviour).
+   */
+  dispatchSubagent?(request: TaskSubagentDispatch): Effect.Effect<void>
 }
 
 const id = "task"
@@ -197,6 +217,17 @@ export const TaskTool = Tool.define(
       const ops = ctx.extra?.promptOps as TaskPromptOps
       if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
 
+      if (ops.dispatchSubagent) {
+        yield* ops.dispatchSubagent({
+          parentID: ctx.sessionID,
+          childID: nextSession.id,
+          type: id,
+          depth: depth + 1,
+          title: params.description,
+          metadata,
+        })
+      }
+
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
         const parts = yield* ops.resolvePromptParts(params.prompt)
         const result = yield* ops.prompt({
@@ -286,6 +317,7 @@ export const TaskTool = Tool.define(
         type: id,
         title: params.description,
         metadata,
+        parentID: ctx.sessionID,
         onPromote: Effect.all([
           ctx.metadata({
             title: params.description,
@@ -315,6 +347,26 @@ export const TaskTool = Tool.define(
 
       if (runInBackground) {
         yield* notify(info.id)
+        // A background child outlives this tool call, so the abort listener must
+        // be installed here — before the early return — or a parent abort would
+        // leave the child running. It is removed once the job settles.
+        const runAbort = yield* EffectBridge.make()
+        const abortChild = Effect.all([ops.cancel(nextSession.id), background.cancel(nextSession.id)], {
+          discard: true,
+        })
+        function onBackgroundAbort() {
+          runAbort.fork(abortChild)
+        }
+        ctx.abort.addEventListener("abort", onBackgroundAbort)
+        if (ctx.abort.aborted) onBackgroundAbort()
+        yield* background.wait({ id: info.id }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              ctx.abort.removeEventListener("abort", onBackgroundAbort)
+            }),
+          ),
+          Effect.forkIn(scope, { startImmediately: true }),
+        )
         return backgroundResult()
       }
 

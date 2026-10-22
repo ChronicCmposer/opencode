@@ -51,13 +51,6 @@ const ENTRIES: readonly WorkerEntry[] = [
     consumer: "src/session/broker/broker.ts",
   },
   {
-    name: "pool-bootstrap",
-    source: "./src/session/worker/bootstrap.ts",
-    shim: "pool-bootstrap.js",
-    define: "OPENCODE_POOL_WORKER_PATH",
-    consumer: "src/session/worker/pool.ts",
-  },
-  {
     name: "tree-sitter",
     shim: "opentui-tree-sitter-worker.js",
     define: "OTUI_TREE_SITTER_WORKER_PATH",
