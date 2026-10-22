@@ -13,7 +13,7 @@
 // pool-spawning layer node (`makeSessionHubNode`) provides it and tears the pool
 // down with the layer scope.
 
-import { Context, Effect, Fiber, Layer } from "effect"
+import { Context, Effect, Fiber, Layer, Option } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Database } from "@opencode-ai/core/database/database"
@@ -67,10 +67,26 @@ import {
 } from "./execute"
 import { resolveCancelGraceMs, type CancelOutcome } from "./cancel"
 import { resolveWorkerCount } from "./pool"
-import { buildSessionWorkerInit, type BuildSessionWorkerInitOptions } from "./init"
+import {
+  buildSessionWorkerInit,
+  resolveWorkerPlugins,
+  type BuildSessionWorkerInitOptions,
+  type WorkerModelSelection,
+  type WorkerPluginSource,
+} from "./init"
+import {
+  createPidRegistry,
+  registerReported,
+  type PidRegistry,
+  type PidReport,
+  type PidReportEntry,
+} from "./pid-registry"
+import { Plugin } from "@/plugin"
+import type { WorkerPluginHooks } from "./plugin-host"
 import type { HubProxyFrame, HubProxyHandlers, HubProxyReply } from "./layer"
 import { portFromMessagePort } from "./port"
 import type { SessionWorkerInit } from "./session-worker"
+import { Session } from "@/session/session"
 
 /** The hub surface `run-state.ts` consumes when the rollout flag is on. */
 export interface SessionHub {
@@ -111,6 +127,28 @@ export interface WorkerTransferredPorts {
   readonly egress?: MessagePort
   readonly egressControl?: MessagePort
   readonly broker?: MessagePort
+}
+
+/**
+ * Whether `frame` is a well-formed {@link PidReport} (fail-closed parse). A pid
+ * report is a plain data frame carried on the worker control (hub-proxy) port,
+ * recognised by its `type` rather than the hub-proxy `kind` discriminator.
+ */
+export function isPidReport(frame: unknown): frame is PidReport {
+  if (typeof frame !== "object" || frame === null) return false
+  const candidate = frame as Partial<PidReport>
+  if (candidate.type !== "pid-report") return false
+  if (typeof candidate.workerID !== "number") return false
+  if (!Array.isArray(candidate.entries)) return false
+  return candidate.entries.every(
+    (entry) =>
+      typeof entry === "object" &&
+      entry !== null &&
+      typeof (entry as PidReportEntry).pid === "number" &&
+      typeof (entry as PidReportEntry).pgid === "number" &&
+      typeof (entry as PidReportEntry).label === "string" &&
+      typeof (entry as PidReportEntry).workerID === "number",
+  )
 }
 
 /**
@@ -169,11 +207,12 @@ export interface SessionHubOptions {
   readonly ports?: WorkerPortBackendsSource
   /**
    * Invoked synchronously at the start of every `ensureRunning`/`startShell`,
-   * before any async work. Used by the production hub to capture the caller's
-   * ambient `InstanceRef` (the `attach` pattern) so the worker init is resolved
-   * under the dispatching session's instance context.
+   * before any async work, with the session being dispatched. Used by the
+   * production hub to capture the caller's ambient `InstanceRef` and runtime
+   * context (the `attach` pattern), and to remember which session's persisted
+   * model the worker init should resolve.
    */
-  readonly onDispatch?: () => void
+  readonly onDispatch?: (sessionID: SessionID) => void
   readonly headroom?: number
   readonly admissionCapacity?: number
   readonly childCapacity?: number
@@ -190,6 +229,13 @@ export interface SessionHubOptions {
    * child's result to the worker hosting its `parentID` (plan 9.4).
    */
   readonly jobs?: JobRegistry
+  /**
+   * Receive a worker's `{type:"pid-report"}` frame (plan 11.5) from its control
+   * port. `workerID` is the authoritative owner (the port association), not the
+   * worker's self-reported id. The production hub mirrors each entry into its
+   * `PidRegistry`; absent means pid reports are ignored (a pure hub, no reaper).
+   */
+  readonly onPidReport?: (workerID: number, report: PidReport) => void
 }
 
 /**
@@ -234,6 +280,19 @@ function serveHubProxyPort(handlers: HubProxyHandlers, port: MessagePort): () =>
             message: error instanceof Error ? error.message : String(error),
           }),
       )
+  })
+}
+
+/**
+ * Serve a worker control port for `{type:"pid-report"}` frames, forwarding each
+ * well-formed frame to `onReport`. `portFromMessagePort` registers an
+ * `addEventListener` listener, so this coexists with the hub-proxy request
+ * server on the same port. Returns a disposer.
+ */
+export function servePidReportPort(onReport: (frame: PidReport) => void, port: MessagePort): () => void {
+  const channel = portFromMessagePort<unknown>(port)
+  return channel.onMessage((frame) => {
+    if (isPidReport(frame)) onReport(frame)
   })
 }
 
@@ -466,12 +525,24 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     return dispose
   }
 
-  // Serve the hub-proxy authorities over a worker's control port.
+  // Serve the hub-proxy authorities over a worker's control port, plus any
+  // `{type:"pid-report"}` frames the worker sends on the same port (plan 11.5).
   const attachHubProxyPort = (workerID: number, port: MessagePort): (() => void) => {
     hubProxyDisposers.get(workerID)?.()
+    const disposers: (() => void)[] = []
     const handlers = portBackends()?.hubProxy
-    if (handlers === undefined) return () => {}
-    const dispose = serveHubProxyPort(handlers, port)
+    if (handlers !== undefined) disposers.push(serveHubProxyPort(handlers, port))
+    const onPidReport = options.onPidReport
+    if (onPidReport !== undefined) {
+      // The port association is the authoritative owner: the worker only knows
+      // its own thread id, not the hub's slot id.
+      disposers.push(servePidReportPort((report) => onPidReport(workerID, report), port))
+    }
+    if (disposers.length === 0) return () => {}
+    const dispose = () => {
+      for (const disposer of disposers) disposer()
+      hubProxyDisposers.delete(workerID)
+    }
     hubProxyDisposers.set(workerID, dispose)
     return dispose
   }
@@ -481,7 +552,21 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     attachJobPort(workerID, jobPortFromMessagePort(port))
   }
   const pool = typeof options.pool === "function" ? options.pool(onJobPort) : options.pool
-  const cancellation = typeof options.cancellation === "function" ? options.cancellation(pool) : options.cancellation
+  const resolvedCancellation =
+    typeof options.cancellation === "function" ? options.cancellation(pool) : options.cancellation
+  // The hub's job registry is the cross-worker parent→child authority (9.4), so
+  // an unwired cancellation config still cascades to subagents and still marks a
+  // cancelled job. An explicit config always wins.
+  const cancellation: CancellationConfig | undefined =
+    resolvedCancellation === undefined
+      ? undefined
+      : {
+          ...resolvedCancellation,
+          childrenOf:
+            resolvedCancellation.childrenOf ??
+            ((sessionID) => jobs.childrenOf(sessionID).map((child) => child as SessionID)),
+          onCancelled: resolvedCancellation.onCancelled ?? ((event) => void jobs.cancel(event.sessionID)),
+        }
   dispatcher = createDispatcher({
     pool,
     ...defined({
@@ -503,11 +588,11 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     attachWorkerPorts,
     attachHubProxyPort,
     ensureRunning: (sessionID) => {
-      onDispatch?.()
+      onDispatch?.(sessionID)
       return dispatch.ensureRunning(sessionID)
     },
     startShell: (sessionID) => {
-      onDispatch?.()
+      onDispatch?.(sessionID)
       return dispatch.startShell(sessionID)
     },
     assertNotBusy: (sessionID) => dispatch.assertNotBusy(sessionID),
@@ -516,7 +601,13 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       // Report the terminal outcome to every SSE client. `SessionV1.Event.Cancelled`
       // is non-durable, and the live-only publisher refuses a durable definition, so
       // this can never re-commit the session state already written through the writer.
-      if (outcome !== undefined) {
+      //
+      // Publish only when a cancel actually won. A `completion` outcome means the
+      // run finished on its own during the grace window; telling the client it was
+      // cancelled would be a lie (and would race the run's own idle/completion).
+      // The hub deliberately emits no `session.status: idle` here — `run-state.ts`
+      // owns the canonical cancel-idle transition.
+      if (outcome !== undefined && outcome.winner === "cancel") {
         options.events?.publishDefinition(SessionV1.Event.Cancelled, {
           sessionID: outcome.sessionID,
           mode: outcome.mode,
@@ -871,8 +962,14 @@ export function resolveSessionWorkerEntry(
 /** The production session-worker entry (the reduced-layer isolate). */
 export const SESSION_WORKER_ENTRY: string | URL = resolveSessionWorkerEntry()
 
-/** A worker `workerData` payload, or a (possibly async) resolver for one. */
-export type SessionWorkerInitSource = SessionWorkerInit | (() => SessionWorkerInit | Promise<SessionWorkerInit>)
+/**
+ * A worker `workerData` payload, or a (possibly async) resolver for one. The
+ * resolver receives the session being dispatched, so the production hub resolves
+ * the session's own model rather than reusing the first session's.
+ */
+export type SessionWorkerInitSource =
+  | SessionWorkerInit
+  | ((sessionID?: SessionID) => SessionWorkerInit | Promise<SessionWorkerInit>)
 
 export interface ProductionWorkerPoolOptions {
   readonly init: SessionWorkerInitSource
@@ -887,33 +984,104 @@ export interface ProductionWorkerPoolOptions {
   readonly onHubProxyPort?: (workerID: number, port: MessagePort) => void
 }
 
+/** Build one isolate for `sessionID` under a fixed worker id. */
+export type SessionBoundSpawner = (id: number, sessionID: SessionID) => Promise<ExecutorWorker>
+
+/**
+ * A worker whose isolate is bound to ONE dispatched session. A worker isolate
+ * owns exactly one serialized model (`reducedModelProviderLayer` rejects any
+ * other with `WorkerModelMismatchError`), so when the dispatcher hands this
+ * worker a *different* session it terminates the old isolate and respawns under
+ * the same id with that session's init. Reuse across turns of the same session
+ * (the common case) keeps the isolate.
+ */
+export function createSessionBoundExecutorWorker(id: number, spawnFor: SessionBoundSpawner): ExecutorWorker {
+  let inner: ExecutorWorker | undefined
+  let boundSession: SessionID | undefined
+  let materializing: Promise<ExecutorWorker> | undefined
+  let terminated = false
+
+  const materialize = (sessionID: SessionID): Promise<ExecutorWorker> => {
+    if (terminated) throw new Error(`executor worker ${id} is terminated`)
+    if (inner !== undefined && boundSession === sessionID) return Promise.resolve(inner)
+    const previous = inner
+    inner = undefined
+    boundSession = sessionID
+    materializing = Promise.resolve()
+      // Retire the old isolate first so two models never share one worker.
+      .then(() => previous?.terminate().catch(() => undefined))
+      .then(() => spawnFor(id, sessionID))
+      .then((worker) => {
+        if (terminated) {
+          void worker.terminate()
+          throw new Error(`executor worker ${id} is terminated`)
+        }
+        inner = worker
+        return worker
+      })
+    return materializing
+  }
+
+  const worker: ExecutorWorker = {
+    id,
+    get alive() {
+      return !terminated && (inner === undefined || inner.alive)
+    },
+    execute: async (run) => (await materialize(run.sessionID)).execute(run),
+    cancel: (sessionID) => (inner === undefined ? Promise.resolve() : inner.cancel(sessionID)),
+    assertNotBusy: (sessionID) => (inner === undefined ? Promise.resolve(false) : inner.assertNotBusy(sessionID)),
+    resultFor: (sessionID) => inner?.resultFor(sessionID),
+    cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID) }),
+    terminate: async () => {
+      terminated = true
+      materializing = undefined
+      const current = inner
+      inner = undefined
+      if (current !== undefined) await current.terminate()
+    },
+  }
+  return worker
+}
+
 /**
  * Production `ExecutorWorkerPool` over the session-worker entry. Lazy: building
- * the pool spawns no isolates. The init source is resolved once, on the first
- * dispatch, then reused as the `workerData` for every worker.
+ * the pool spawns no isolates. Each worker resolves its init for the session it
+ * is asked to run (and rebinds when that session changes), so multiple sessions
+ * with distinct models share a generation without a `WorkerModelMismatchError`.
  */
 export function createProductionWorkerPool(options: ProductionWorkerPoolOptions): ExecutorWorkerPool {
-  const resolveSource = typeof options.init === "function" ? options.init : () => options.init as SessionWorkerInit
-  let cached: Promise<SessionWorkerInit> | undefined
-  const resolveInit = (): Promise<SessionWorkerInit> => (cached ??= Promise.resolve().then(resolveSource))
-  return createLazyExecutorWorkerPool({
+  const resolveSource: (sessionID?: SessionID) => SessionWorkerInit | Promise<SessionWorkerInit> =
+    typeof options.init === "function" ? options.init : () => options.init as SessionWorkerInit
+  // One init per session: a session's model/variants are stable for its lifetime.
+  const initBySession = new Map<string, Promise<SessionWorkerInit>>()
+  const resolveInit = (sessionID: SessionID): Promise<SessionWorkerInit> => {
+    const cached = initBySession.get(sessionID)
+    if (cached !== undefined) return cached
+    const resolved = Promise.resolve().then(() => resolveSource(sessionID))
+    initBySession.set(sessionID, resolved)
+    return resolved
+  }
+  const spawnFor: SessionBoundSpawner = async (id, sessionID) => {
+    const init = await resolveInit(sessionID)
+    return spawnBunExecutorWorker(id, {
+      k: options.count,
+      entry: options.entry ?? SESSION_WORKER_ENTRY,
+      // Ship the pool id so the worker's `pid-report` frames are keyed to this
+      // slot out of the box (the hub still treats its port association as authoritative).
+      workerData: { ...init, workerID: id },
+      ...defined({
+        env: options.env,
+        timeoutMs: options.timeoutMs,
+        workKind: options.workKind,
+        onJobPort: options.onJobPort,
+        onWorkerPorts: options.onWorkerPorts,
+        onHubProxyPort: options.onHubProxyPort,
+      }),
+    })
+  }
+  return createExecutorWorkerPool({
     k: options.count,
-    create: async (id) => {
-      const init = await resolveInit()
-      return spawnBunExecutorWorker(id, {
-        k: options.count,
-        entry: options.entry ?? SESSION_WORKER_ENTRY,
-        workerData: init,
-        ...defined({
-          env: options.env,
-          timeoutMs: options.timeoutMs,
-          workKind: options.workKind,
-          onJobPort: options.onJobPort,
-          onWorkerPorts: options.onWorkerPorts,
-          onHubProxyPort: options.onHubProxyPort,
-        }),
-      })
-    },
+    spawn: (id) => createSessionBoundExecutorWorker(id, spawnFor),
   })
 }
 
@@ -933,7 +1101,7 @@ export interface WorkerPoolSinks {
 
 /** Builds the executor pool from a lazy init resolver and port sinks (test seam). */
 export type ProductionPoolFactory = (
-  resolveInit: () => Promise<SessionWorkerInit>,
+  resolveInit: (sessionID?: SessionID) => Promise<SessionWorkerInit>,
   sinks: WorkerPoolSinks,
 ) => ExecutorWorkerPool
 
@@ -982,10 +1150,98 @@ function captureRuntimeContext(): Context.Context<never> | undefined {
   return Fiber.getCurrent()?.context
 }
 
+/**
+ * Resolve the dispatching session's persisted provider/model pair from the
+ * caller context captured at dispatch. The hub node deliberately does not declare
+ * `Session` as a dependency (the graph stays stable), so it is read optionally:
+ * when the ambient session store is absent (or the session has no model yet) the
+ * worker falls back to the config/default model exactly as before.
+ */
+async function resolveDispatchedSessionModel(
+  context: Context.Context<never> | undefined,
+  sessionID: SessionID | undefined,
+): Promise<WorkerModelSelection | undefined> {
+  if (context === undefined || sessionID === undefined) return undefined
+  const session = Context.getOption(context, Session.Service)
+  if (Option.isNone(session)) return undefined
+  const info = await Effect.runPromise(
+    session.value.get(sessionID).pipe(Effect.match({ onFailure: () => undefined, onSuccess: (value) => value })),
+  )
+  const model = info?.model
+  if (model === undefined) return undefined
+  return { providerID: model.providerID, modelID: model.id }
+}
+
+/** The per-request plugin input the hub can resolve before a worker runs. */
+interface DispatchedSessionRequest {
+  readonly agent?: string
+  readonly message?: unknown
+}
+
+/**
+ * Resolve the dispatching session's per-request plugin input — its agent and the
+ * last user message — from the caller context captured at dispatch, mirroring
+ * {@link resolveDispatchedSessionModel}. `Session` is read optionally (the graph
+ * stays stable), so `undefined` means the ambient session store is absent and the
+ * hooks keep the documented empty fallback.
+ *
+ * This is the latest the hub can resolve: a worker binds to one session at init,
+ * so the last user message at bind time is the message the first turn processes.
+ * A later turn on the SAME worker (no rebind) stays approximate until it rebinds.
+ */
+async function resolveDispatchedSessionRequest(
+  context: Context.Context<never> | undefined,
+  sessionID: SessionID | undefined,
+): Promise<DispatchedSessionRequest | undefined> {
+  if (context === undefined || sessionID === undefined) return undefined
+  const session = Context.getOption(context, Session.Service)
+  if (Option.isNone(session)) return undefined
+  const info = await Effect.runPromise(
+    session.value.get(sessionID).pipe(Effect.match({ onFailure: () => undefined, onSuccess: (value) => value })),
+  )
+  // `findMessage` searches newest-first, so this is the message being processed.
+  const lastUser = await Effect.runPromise(
+    session.value
+      .findMessage(sessionID, (message) => message.info.role === "user")
+      .pipe(Effect.match({ onFailure: () => Option.none(), onSuccess: (value) => value })),
+  )
+  const message = Option.isSome(lastUser) ? lastUser.value.info : undefined
+  // The user message carries the per-request agent; the session's persisted agent
+  // is the fallback when the message is absent.
+  const agent = (message?.role === "user" ? message.agent : undefined) ?? info?.agent
+  if (agent === undefined && message === undefined) return undefined
+  return {
+    ...(agent === undefined ? {} : { agent }),
+    ...(message === undefined ? {} : { message }),
+  }
+}
+
+/**
+ * Resolve the hub's plugin hooks from the dispatch context. The hub node
+ * deliberately does not declare `Plugin` as a dependency (the graph stays
+ * stable), so it is read optionally: absent means the worker ships no plugin
+ * effects and the reduced LLM keeps its no-op pass-through. Hook *functions*
+ * cannot cross the isolate; the init resolver runs their effect first.
+ */
+async function resolveContextPluginSources(
+  context: Context.Context<never> | undefined,
+): Promise<readonly WorkerPluginSource[] | undefined> {
+  if (context === undefined) return undefined
+  const plugin = Context.getOption(context, Plugin.Service)
+  if (Option.isNone(plugin)) return undefined
+  // `Plugin.list` resolves the per-directory `InstanceState`, so run it under the
+  // dispatching instance's captured context.
+  const hooks = await Effect.runPromise(Effect.provide(plugin.value.list(), context))
+  if (hooks.length === 0) return undefined
+  return hooks.map((hook, index) => ({ name: `plugin-${index}`, hooks: hook as WorkerPluginHooks }))
+}
+
 export interface WorkerCancellationOptions {
   readonly graceMs?: number
   readonly schedule?: CancellationConfig["schedule"]
   readonly reap?: (worker: SessionWorker) => void
+  /** Hub shutdown reap; defaults to the production PidRegistry's `reapAll`. */
+  readonly reapAll?: () => void
   readonly childrenOf?: (sessionID: SessionID) => ReadonlyArray<SessionID>
   readonly onCancelled?: CancellationConfig["onCancelled"]
 }
@@ -1005,6 +1261,7 @@ export function createWorkerCancellation(
     ...defined({
       schedule: options.schedule,
       reap: options.reap,
+      reapAll: options.reapAll,
       childrenOf: options.childrenOf,
       onCancelled: options.onCancelled,
     }),
@@ -1150,11 +1407,20 @@ export interface ProductionSessionHubOptions {
    */
   readonly ports?: WorkerPortBackendsSource
   /** Invoked synchronously at the start of each dispatch (see `SessionHubOptions`). */
-  readonly onDispatch?: () => void
+  readonly onDispatch?: (sessionID: SessionID) => void
   /** Live-only event publisher (worker republish + `session.cancelled`). */
   readonly events?: LiveEventPublisher
   /** Test seam: build the pool from the lazy init resolver. Defaults to the production pool. */
   readonly poolFactory?: ProductionPoolFactory
+}
+
+/** Reaping is best-effort teardown: a failed kill must not block cancellation. */
+function ignoreReapFailure(reap: () => void): void {
+  try {
+    reap()
+  } catch {
+    // The isolate is already being torn down; a stale mirror is the only loss.
+  }
 }
 
 /** Compose the production pool + hub, with cooperative cancellation wired. */
@@ -1167,11 +1433,12 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
     onWorkerPorts: (workerID, ports) => hub?.attachWorkerPorts(workerID, ports),
     onHubProxyPort: (workerID, port) => hub?.attachHubProxyPort(workerID, port),
   }
-  const resolveSource = typeof options.init === "function" ? options.init : () => options.init as SessionWorkerInit
-  const resolveInit: () => Promise<SessionWorkerInit> =
-    options.ports === undefined
-      ? async () => resolveSource()
-      : async () => withSessionWorkerPorts(await resolveSource())
+  const resolveSource: (sessionID?: SessionID) => SessionWorkerInit | Promise<SessionWorkerInit> =
+    typeof options.init === "function" ? options.init : () => options.init as SessionWorkerInit
+  const resolveInit = async (sessionID?: SessionID): Promise<SessionWorkerInit> => {
+    const init = await resolveSource(sessionID)
+    return options.ports === undefined ? init : withSessionWorkerPorts(init)
+  }
   const pool =
     options.poolFactory !== undefined
       ? options.poolFactory(resolveInit, sinks)
@@ -1186,10 +1453,29 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
           }),
           ...sinks,
         })
+  // The hub-side mirror of every worker child's process group (plan 11.5): a
+  // terminate reaps the worker's mirrored PGIDs and shutdown reaps the rest.
+  // Filled by the worker's `{type:"pid-report"}` control-port frames below; a
+  // report for an already-mirrored group only advances its generation.
+  const pids = createPidRegistry()
+  const onPidReport = (workerID: number, report: PidReport): void => {
+    try {
+      // `workerID` is the hub's slot association (authoritative); the registry
+      // refuses a PGID reassignment to a different owner.
+      registerReported(pids, report, workerID)
+    } catch {
+      // A bad/conflicting entry must not take the control port down.
+    }
+  }
   hub = createSessionHub({
     pool,
-    ...defined({ ports: options.ports, onDispatch: options.onDispatch, events: options.events }),
-    cancellation: (pool) => createWorkerCancellation(pool, options.cancellation ?? {}),
+    ...defined({ ports: options.ports, onDispatch: options.onDispatch, events: options.events, onPidReport }),
+    cancellation: (pool) =>
+      createWorkerCancellation(pool, {
+        ...options.cancellation,
+        reap: options.cancellation?.reap ?? ((worker) => ignoreReapFailure(() => void pids.reap(worker.id))),
+        reapAll: options.cancellation?.reapAll ?? (() => ignoreReapFailure(() => void pids.reapAll())),
+      }),
     ...defined({
       headroom: options.headroom,
       admissionCapacity: options.admissionCapacity,
@@ -1231,11 +1517,18 @@ export interface ProductionSessionHubNodeOptions {
   readonly poolFactory?: ProductionPoolFactory
   /** Forwarded to `buildSessionWorkerInit` (snapshot/env/model tuning). */
   readonly initOptions?: BuildSessionWorkerInitOptions
+  /**
+   * Resolve the hub plugin hooks the worker should run (`chat.params` /
+   * `chat.headers`). Defaults to reading `Plugin.Service` from the dispatch
+   * context; the returned sources' hook functions never cross the isolate — the
+   * hub resolves their effect and ships the resolved data.
+   */
+  readonly plugins?: () => Promise<readonly WorkerPluginSource[]>
 }
 
 /**
  * Provide `SessionHubService` from the production hub, terminating it on scope
- * close. The `workerData` init is resolved on the FIRST dispatch (never at graph
+ * close. The `workerData` init is resolved per dispatched session (never at graph
  * build): the hub-authoritative services are captured here, and the instance
  * directory comes from the dispatching session's ambient `InstanceRef` (the
  * `attach` pattern). Building the layer spawns no workers.
@@ -1276,6 +1569,10 @@ export function productionSessionHubLayer(
       // Captured synchronously at the start of the first dispatch (below).
       let capturedInstance: InstanceContext | undefined
       let capturedContext: Context.Context<never> | undefined
+      // The session currently being dispatched. Updated on every dispatch; used
+      // only as the fallback when a pool resolves an init without a session id
+      // (the production pool passes the session it is binding a worker to).
+      let dispatchedSession: SessionID | undefined
       // Live-only publisher: stamps the dispatching instance's location so a
       // republished event passes the instance `/event` SSE directory filter.
       const events = createLiveEventPublisher(bridge, {
@@ -1298,14 +1595,39 @@ export function productionSessionHubLayer(
             hubProxy: options.backends?.hubProxy ?? hubProxy,
             events,
           }))
-      const resolveInit = (): Promise<SessionWorkerInit> => {
+      // Per-session: the pool passes the session it is building a worker for, so
+      // this session's model (and plugin effect) is the one shipped, never the
+      // first dispatched session's. `dispatchedSession` is the fallback for a
+      // custom pool that resolves without a session id.
+      const resolveInit = async (sessionID?: SessionID): Promise<SessionWorkerInit> => {
         const instance = capturedInstance ?? captureInstanceRef() ?? fallbackInstanceContext()
-        // A non-serializable provider option is a configuration defect: die loud
-        // rather than widen every graph's error channel with the typed failure.
+        const session = await resolveDispatchedSessionModel(capturedContext, sessionID ?? dispatchedSession)
+        // The real per-request input (agent + last user message) the plugin hooks
+        // resolve against, so a hook keyed on either matches flag-off rather than
+        // seeing an empty stub.
+        const request = await resolveDispatchedSessionRequest(capturedContext, sessionID ?? dispatchedSession)
+        const pluginSources =
+          options.plugins !== undefined ? await options.plugins() : await resolveContextPluginSources(capturedContext)
+        // A non-serializable provider option or plugin hook is a configuration
+        // defect: die loud rather than widen every graph's error channel with the
+        // typed failure.
         return Effect.runPromise(
           buildSessionWorkerInit({
             ...options.initOptions,
+            // The session's persisted model is authoritative; config/default only
+            // applies when the dispatch carried no session model.
+            model: session === undefined ? options.initOptions?.model : { ...options.initOptions?.model, session },
             snapshot: { ...options.initOptions?.snapshot, workerCount: count },
+            plugins:
+              pluginSources === undefined
+                ? options.initOptions?.plugins
+                : (model) =>
+                    resolveWorkerPlugins({
+                      model,
+                      sources: pluginSources,
+                      sessionID: sessionID ?? dispatchedSession,
+                      ...(request ?? {}),
+                    }),
           }).pipe(
             Effect.provideService(Config.Service, config),
             Effect.provideService(Auth.Service, auth),
@@ -1323,9 +1645,13 @@ export function productionSessionHubLayer(
         init: resolveInit,
         ports,
         events,
-        onDispatch: () => {
+        onDispatch: (sessionID) => {
           capturedInstance ??= captureInstanceRef()
           capturedContext ??= captureRuntimeContext()
+          // Overwrite: each dispatch's session is the current one. A worker
+          // rebinds per session, so a stale value cannot leak a first session's
+          // model into a later one.
+          dispatchedSession = sessionID
         },
       })
       yield* Effect.addFinalizer(() => Effect.promise(() => hub.terminateAll().catch(() => undefined)))

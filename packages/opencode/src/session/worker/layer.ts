@@ -104,7 +104,18 @@ import { createWorkerEventBridge } from "./event-bridge"
 import type { EventV2Event } from "./frame"
 import { messageOf, portFromMessagePort } from "./port"
 import type { JobClient } from "./job-client"
+import type {
+  ChatHeadersOutput,
+  ChatParamsOutput,
+  ToolAfterOutput,
+  ToolBeforeOutput,
+  WorkerPluginHost,
+} from "./plugin-host"
 import { writerSqlClientLayer, type WriterSqlHandle } from "./writer-sql-client"
+import { PidReporter, type PidReporterInterface } from "./pid-registry"
+
+export { PidReporter } from "./pid-registry"
+export type { PidReport, PidReportEntry, PidReporterInterface } from "./pid-registry"
 
 // ---------------------------------------------------------------------------
 // Client nodes — the worker-side handles to the writer / egress / hub.
@@ -929,17 +940,61 @@ export function boundaryReplacements(
 // ---------------------------------------------------------------------------
 
 /** The serializable provider/model bootstrap a worker receives (see `init.ts`). */
+export interface WorkerModelModalities {
+  readonly text: boolean
+  readonly audio: boolean
+  readonly image: boolean
+  readonly video: boolean
+  readonly pdf: boolean
+}
+
+/** The real model capabilities the hub serialized into the worker descriptor. */
+export interface WorkerModelCapabilities {
+  readonly temperature: boolean
+  readonly reasoning: boolean
+  readonly attachment?: boolean
+  readonly toolcall?: boolean
+  readonly interleaved?: boolean | { readonly field: string }
+  readonly input?: WorkerModelModalities
+  readonly output?: WorkerModelModalities
+}
+
+/** The real model token limits the hub serialized into the worker descriptor. */
+export interface WorkerModelLimit {
+  readonly context: number
+  readonly output: number
+}
+
+/**
+ * The reduced provider bootstrap a worker consumes. Identity and transport come
+ * from the hub; `capabilities` / `limit` / `options` / `variants` /
+ * `providerOptions` are the REAL serialized model descriptor, so the worker's
+ * outgoing request params equal flag-off (no synthesized temperature capability,
+ * no 4096 output cap, no dropped reasoning/variant/option surface).
+ *
+ * The descriptor fields are optional so a legacy/minimal bootstrap still boots;
+ * an absent field is treated as "not advertised" rather than re-invented.
+ */
 export interface WorkerModelConfig {
   readonly providerID: string
   readonly modelID: string
   readonly apiId: string
-  readonly npm: string
+  readonly npm?: string
   readonly baseUrl: string
   readonly apiKey: string
-  readonly headers: Readonly<Record<string, string>>
+  readonly headers?: Readonly<Record<string, string>>
+  readonly capabilities?: WorkerModelCapabilities
+  readonly limit?: WorkerModelLimit
+  readonly options?: Readonly<Record<string, unknown>>
+  readonly variants?: Readonly<Record<string, Readonly<Record<string, unknown>>>>
+  /** Provider-level options (`provider.options`), spread into the SDK + transforms. */
+  readonly providerOptions?: Readonly<Record<string, unknown>>
 }
 
 const allModalities = { text: true, audio: false, image: false, video: false, pdf: false }
+
+/** The provider npm, defaulting to the OpenAI-compatible client as before. */
+const workerNpm = (config: WorkerModelConfig): string => config.npm ?? "@ai-sdk/openai-compatible"
 
 function reducedProviderInfo(config: WorkerModelConfig, model: Provider.Model): Provider.Info {
   return {
@@ -948,7 +1003,7 @@ function reducedProviderInfo(config: WorkerModelConfig, model: Provider.Model): 
     source: "config",
     env: [],
     key: config.apiKey,
-    options: {},
+    options: { ...(config.providerOptions ?? {}) },
     models: { [config.modelID]: model },
   }
 }
@@ -979,25 +1034,33 @@ export class WorkerModelMismatchError extends Schema.TaggedErrorClass<WorkerMode
 }
 
 function reducedProviderModel(config: WorkerModelConfig): Provider.Model {
+  const capabilities = config.capabilities
   return {
     id: ModelV2.ID.make(config.modelID),
     providerID: ProviderV2.ID.make(config.providerID),
-    api: { id: config.apiId, url: config.baseUrl, npm: config.npm },
+    api: { id: config.apiId, url: config.baseUrl, npm: workerNpm(config) },
     name: config.modelID,
     capabilities: {
-      temperature: true,
-      reasoning: false,
-      attachment: false,
-      toolcall: true,
-      input: allModalities,
-      output: allModalities,
-      interleaved: false,
+      // The descriptor's real capabilities; absent means "not advertised", so we
+      // never synthesize `temperature: true` (which forced `transform.temperature`
+      // to 1.0 for glm/minimax/kimi/gemini) or a dropped reasoning surface.
+      temperature: capabilities?.temperature ?? false,
+      reasoning: capabilities?.reasoning ?? false,
+      attachment: capabilities?.attachment ?? false,
+      toolcall: capabilities?.toolcall ?? true,
+      interleaved: capabilities?.interleaved ?? false,
+      input: capabilities?.input ?? allModalities,
+      output: capabilities?.output ?? allModalities,
     },
     cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-    limit: { context: 128_000, output: 4096 },
+    // The descriptor's real limits. An absent output limit means "unbounded"
+    // (`maxOutputTokens` then falls back to the global max) rather than the
+    // synthesized 4096 cap that truncated worker turns.
+    limit: { context: config.limit?.context ?? 128_000, output: config.limit?.output ?? 0 },
     status: "active",
-    options: {},
-    headers: { ...config.headers },
+    options: { ...(config.options ?? {}) },
+    headers: { ...(config.headers ?? {}) },
+    ...(config.variants === undefined ? {} : { variants: { ...config.variants } }),
     release_date: "",
   }
 }
@@ -1006,21 +1069,126 @@ interface WorkerLanguageSdk {
   languageModel(modelID: string): LanguageModelV3
 }
 
+/** Keep only string-valued header entries from a serialized provider option. */
+function stringHeaders(value: unknown): Record<string, string> {
+  if (value === null || typeof value !== "object") return {}
+  const headers: Record<string, string> = {}
+  for (const [key, header] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof header === "string") headers[key] = header
+  }
+  return headers
+}
+
+/** An abort controller that fires after `ms`, mirroring `provider.ts`'s timeout. */
+function timeoutController(ms: number) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(new Error(`request timed out after ${ms}ms`)), ms)
+  return { signal: controller.signal, clear: () => clearTimeout(timer) }
+}
+
+/** Abort a streaming response when no SSE frame arrives within `ms`. */
+function wrapSseIdle(response: Response, ms: number, controller: AbortController): Response {
+  if (!(ms > 0) || response.body === null || !response.headers.get("content-type")?.includes("text/event-stream")) {
+    return response
+  }
+  const reader = response.body.getReader()
+  const body = new ReadableStream<Uint8Array>({
+    async pull(stream) {
+      const part = await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const error = new Error(`SSE read timed out after ${ms}ms`)
+          controller.abort(error)
+          void reader.cancel(error).catch(() => {})
+          reject(error)
+        }, ms)
+        reader.read().then(
+          (value) => {
+            clearTimeout(timer)
+            resolve(value)
+          },
+          (error) => {
+            clearTimeout(timer)
+            reject(error)
+          },
+        )
+      })
+      if (part.done) {
+        stream.close()
+        return
+      }
+      stream.enqueue(part.value)
+    },
+    cancel(reason) {
+      controller.abort(reason)
+      return reader.cancel(reason)
+    },
+  })
+  return new Response(body, {
+    headers: new Headers(response.headers),
+    status: response.status,
+    statusText: response.statusText,
+  })
+}
+
+/**
+ * The worker transport fetch: applies the serialized `headerTimeout` / `timeout`
+ * / `chunkTimeout` provider options the same way the hub's `resolveSDK` installs
+ * `timeoutFetch` (`provider.ts:1852`), so a worker request is bounded like
+ * flag-off instead of using the unbounded global `fetch`.
+ */
+function workerTimeoutFetch(options: Record<string, any>): typeof fetch {
+  const chunkTimeout = options["chunkTimeout"] ?? 300_000
+  const headerTimeout = options["headerTimeout"] ?? 300_000
+  const timeout = options["timeout"]
+  return (async (input: any, init?: any) => {
+    const opts = init ?? {}
+    const headerTimeoutMs = headerTimeout === false ? undefined : headerTimeout
+    const chunkController = typeof chunkTimeout === "number" && chunkTimeout > 0 ? new AbortController() : undefined
+    const headerController = typeof headerTimeoutMs === "number" ? timeoutController(headerTimeoutMs) : undefined
+    const signals: AbortSignal[] = []
+    if (opts.signal) signals.push(opts.signal)
+    if (chunkController) signals.push(chunkController.signal)
+    if (headerController) signals.push(headerController.signal)
+    if (timeout !== undefined && timeout !== null && timeout !== false) signals.push(AbortSignal.timeout(timeout))
+    const signal = signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals)
+    const response = await fetch(input, {
+      ...opts,
+      ...(signal === undefined ? {} : { signal }),
+      // @ts-ignore Bun-specific: disable Bun's own request timeout.
+      timeout: false,
+    }).finally(() => headerController?.clear())
+    if (chunkController === undefined) return response
+    return wrapSseIdle(response, chunkTimeout, chunkController)
+  }) as typeof fetch
+}
+
 /**
  * Build the reduced provider's SDK from the serialized `npm`, so a worker makes
  * the provider-shaped request the hub resolved instead of always an
  * OpenAI-compatible body. Unknown packages keep the OpenAI-compatible default
  * (the previous behavior), so a provider that is OpenAI-compatible but has no
  * bundled SDK still works.
+ *
+ * The serialized `providerOptions` are spread into the SDK the same way the
+ * hub's `resolveSDK` does (`provider.ts:1791-1865`): the base URL / API key /
+ * headers override them, `includeUsage` is set for OpenAI-compatible providers,
+ * and a timeout-aware `fetch` bounds the request.
  */
 function createWorkerLanguageSdk(config: WorkerModelConfig): WorkerLanguageSdk {
-  const options = {
+  const npm = workerNpm(config)
+  const providerOptions = config.providerOptions ?? {}
+  const options: Record<string, any> = {
+    ...providerOptions,
     name: config.providerID,
     baseURL: config.baseUrl,
     apiKey: config.apiKey,
-    headers: { ...config.headers },
+    headers: { ...stringHeaders(providerOptions["headers"]), ...(config.headers ?? {}) },
+    fetch: workerTimeoutFetch(providerOptions),
+    ...(npm.includes("@ai-sdk/openai-compatible") && providerOptions["includeUsage"] !== false
+      ? { includeUsage: true }
+      : {}),
   }
-  switch (config.npm) {
+  switch (npm) {
     case "@ai-sdk/anthropic":
       return createAnthropic(options) as unknown as WorkerLanguageSdk
     case "@ai-sdk/google":
@@ -1028,14 +1196,17 @@ function createWorkerLanguageSdk(config: WorkerModelConfig): WorkerLanguageSdk {
     case "@ai-sdk/openai":
       return createOpenAI(options) as unknown as WorkerLanguageSdk
     default:
-      return createOpenAICompatible(options) as unknown as WorkerLanguageSdk
+      return createOpenAICompatible(
+        options as Parameters<typeof createOpenAICompatible>[0],
+      ) as unknown as WorkerLanguageSdk
   }
 }
 
 /**
  * The reduced in-worker `Provider`: a client over the serialized
- * `{baseUrl, apiKey, model, npm}` bootstrap. `getLanguage` returns a real AI-SDK
- * language model, so the worker makes the HTTP call itself.
+ * `{providerID, modelID, apiId, npm, baseUrl, apiKey}` bootstrap plus the real
+ * serialized model descriptor. `getLanguage` returns a real AI-SDK language
+ * model, so the worker makes the HTTP call itself.
  */
 export function reducedModelProviderLayer(config: WorkerModelConfig): Layer.Layer<Provider.Service> {
   const sdk = createWorkerLanguageSdk(config)
@@ -1073,13 +1244,47 @@ export function reducedModelProviderLayer(config: WorkerModelConfig): Layer.Laye
 }
 
 /**
- * The boundary `Plugin` for a worker: the hub owns plugin adapters (decision
- * 70). A worker turn needs only the no-op trigger pass-through, so the reduced
- * LLM runs without the hub's plugin registry.
+ * The boundary `Plugin` for a worker: the hub owns plugin *loading* (decision
+ * 70), but the model-facing hooks run in the isolate. Without a host the worker
+ * uses this no-op pass-through; when a worker-hosted {@link WorkerPluginHost} is
+ * supplied, {@link workerPluginLayer} runs its `chat.params` / `chat.headers`
+ * (and tool) hooks so plugin-set sampling/headers match flag-off.
  */
 function noopPluginLayer(): Layer.Layer<Plugin.Service> {
   const plugin = {
     trigger: (_name: string, _input: unknown, output: unknown) => Effect.succeed(output),
+    list: () => Effect.succeed([]),
+    init: () => Effect.void,
+  } as unknown as Plugin.Interface
+  return Layer.succeed(Plugin.Service, plugin)
+}
+
+/** Dispatch one `Plugin.trigger` to the matching worker-hosted hook. */
+function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknown, output: unknown): Promise<unknown> {
+  switch (name) {
+    case "chat.params":
+      return host.chatParams(input, output as ChatParamsOutput)
+    case "chat.headers":
+      return host.chatHeaders(input, output as ChatHeadersOutput)
+    case "tool.execute.before":
+      return host.toolBefore(input, output as ToolBeforeOutput)
+    case "tool.execute.after":
+      return host.toolAfter(input, output as ToolAfterOutput)
+    default:
+      return Promise.resolve(output)
+  }
+}
+
+/**
+ * The worker `Plugin` over a worker-hosted hook host: `chat.params` /
+ * `chat.headers` (and the tool hooks) run in the isolate, so plugin-set
+ * sampling/headers are applied to the worker's outgoing request exactly as
+ * flag-off. Unknown triggers pass through unchanged.
+ */
+function workerPluginLayer(host: WorkerPluginHost): Layer.Layer<Plugin.Service> {
+  const plugin = {
+    trigger: (name: string, input: unknown, output: unknown) =>
+      Effect.promise(() => runWorkerPluginHook(host, name, input, output)),
     list: () => Effect.succeed([]),
     init: () => Effect.void,
   } as unknown as Plugin.Interface
@@ -1133,18 +1338,21 @@ export function llmModelClientLayer(config: WorkerModelConfig): Layer.Layer<Mode
  * `Plugin` / `EventV2Bridge` / `LLMClient` are boundary services on the hub;
  * the worker only needs them at LLM build time (`Layer.mock` provides the
  * service without their hub-side behaviour, which the session-worker does not
- * exercise for a single reduced turn).
+ * exercise for a single reduced turn). A worker-hosted `plugins` host is run
+ * when supplied so plugin-set sampling/headers apply; otherwise a no-op
+ * pass-through is used.
  */
 export function reducedLlmLayer(
   snapshot: WorkerSnapshot,
   config: WorkerModelConfig,
   hubProxies?: HubProxyClients,
+  plugins?: WorkerPluginHost,
 ): Layer.Layer<LLM.Service> {
   const replacements: LayerNode.Replacements = [
     [Auth.node, snapshotAuthLayer(snapshot)],
     [Config.node, snapshotConfigLayer(snapshot)],
     [Provider.node, reducedModelProviderLayer(config)],
-    [Plugin.node, noopPluginLayer()],
+    [Plugin.node, plugins === undefined ? noopPluginLayer() : workerPluginLayer(plugins)],
     [
       Permission.node,
       hubProxies === undefined ? Layer.mock(Permission.Service, {}) : permissionProxyLayer(hubProxies.permission),
@@ -1280,6 +1488,12 @@ export interface SessionLayerOptions {
    * process-local registry.
    */
   readonly backgroundJob?: Layer.Layer<BackgroundJob.Service>
+  /**
+   * Worker→hub PID reporter. Production supplies the control-port-backed
+   * reporter so a detached shell child's process group reaches the hub mirror.
+   * Absent on degraded/hub-only paths, where the shell tool is a no-op.
+   */
+  readonly pidReporter?: PidReporterInterface
   /** Extra replacements, e.g. the real LLM-backed `ModelClient` in production. */
   readonly replacements?: LayerNode.Replacements
 }
@@ -1312,7 +1526,14 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
   ]
 
   assertSessionLayer(root, replacements)
-  const layer = AppNodeBuilderV1.build(root, replacements)
+  const built = AppNodeBuilderV1.build(root, replacements)
+  // `PidReporter` is not a graph node: the shell tool reads it optionally at
+  // execution time, so merging it keeps degraded graphs (no reporter) building
+  // unchanged while the production graph sees the control-port reporter.
+  const layer =
+    options.pidReporter === undefined
+      ? built
+      : Layer.merge(built, Layer.succeed(PidReporter, options.pidReporter))
   return { root, replacements, layer }
 }
 

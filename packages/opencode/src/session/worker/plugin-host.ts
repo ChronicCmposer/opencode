@@ -39,9 +39,43 @@ export interface WorkerPluginHooks {
   readonly "tool.execute.after"?: (input: unknown, output: ToolAfterOutput) => void | Promise<void>
 }
 
+/**
+ * The model-facing params a plugin changed, resolved on the hub into plain data.
+ * A field present here is applied over the worker's own baseline; `null` means
+ * the plugin set the field to `undefined` (e.g. `maxOutputTokens: undefined`).
+ */
+export interface ResolvedChatParams {
+  readonly temperature?: number | null
+  readonly topP?: number | null
+  readonly topK?: number | null
+  readonly maxOutputTokens?: number | null
+  readonly options?: Readonly<Record<string, unknown>>
+}
+
+/** The headers a plugin added/overrode, resolved on the hub into plain data. */
+export interface ResolvedChatHeaders {
+  readonly headers?: Readonly<Record<string, string>>
+}
+
+/**
+ * A plugin's effect, pre-resolved on the hub and shipped as structuredClone-safe
+ * data. The hub owns plugin loading and can run a hook against the worker's
+ * serialized model; the resulting mutation crosses the isolate as data because a
+ * hook *function* can never be structured-cloned.
+ */
+export interface ResolvedWorkerPluginEffect {
+  readonly "chat.params"?: ResolvedChatParams
+  readonly "chat.headers"?: ResolvedChatHeaders
+}
+
 export interface WorkerPlugin {
   readonly name: string
   readonly hooks: WorkerPluginHooks
+  /**
+   * A hub-resolved effect. Applied (in plugin order) after the plugin's own
+   * function hooks; absent for the in-process function-hook path.
+   */
+  readonly resolved?: ResolvedWorkerPluginEffect
 }
 
 export interface WorkerPluginHost {
@@ -78,6 +112,39 @@ async function runHook<TOutput>(
   return output
 }
 
+/**
+ * Apply every plugin's hub-resolved `chat.params` diff over `output`, in plugin
+ * order. A field absent from the resolved effect is left untouched; a `null`
+ * field clears the value (the plugin set it to `undefined`).
+ */
+function applyResolvedParams(plugins: readonly WorkerPlugin[], output: ChatParamsOutput): ChatParamsOutput {
+  const next: Record<string, unknown> = { ...output, options: { ...output.options } }
+  for (const plugin of plugins) {
+    const resolved = plugin.resolved?.["chat.params"]
+    if (resolved === undefined) continue
+    for (const key of ["temperature", "topP", "topK", "maxOutputTokens"] as const) {
+      const value = resolved[key]
+      if (value === undefined) continue
+      next[key] = value ?? undefined
+    }
+    if (resolved.options !== undefined) {
+      next.options = { ...(next.options as Record<string, unknown>), ...resolved.options }
+    }
+  }
+  return next as unknown as ChatParamsOutput
+}
+
+/** Merge every plugin's hub-resolved `chat.headers` over `output`, in plugin order. */
+function applyResolvedHeaders(plugins: readonly WorkerPlugin[], output: ChatHeadersOutput): ChatHeadersOutput {
+  let headers = output.headers
+  for (const plugin of plugins) {
+    const resolved = plugin.resolved?.["chat.headers"]
+    if (resolved?.headers === undefined) continue
+    headers = { ...headers, ...resolved.headers }
+  }
+  return { ...output, headers }
+}
+
 export function createWorkerPluginHost(plugins: readonly WorkerPlugin[]): WorkerPluginHost {
   const names = plugins.map((plugin) => plugin.name)
   const seen = new Set<string>()
@@ -88,8 +155,10 @@ export function createWorkerPluginHost(plugins: readonly WorkerPlugin[]): Worker
 
   return {
     names,
-    chatParams: (input, output) => runHook(plugins, (hooks) => hooks["chat.params"], input, output),
-    chatHeaders: (input, output) => runHook(plugins, (hooks) => hooks["chat.headers"], input, output),
+    chatParams: async (input, output) =>
+      applyResolvedParams(plugins, await runHook(plugins, (hooks) => hooks["chat.params"], input, output)),
+    chatHeaders: async (input, output) =>
+      applyResolvedHeaders(plugins, await runHook(plugins, (hooks) => hooks["chat.headers"], input, output)),
     toolBefore: (input, output) => runHook(plugins, (hooks) => hooks["tool.execute.before"], input, output),
     toolAfter: (input, output) => runHook(plugins, (hooks) => hooks["tool.execute.after"], input, output),
   }

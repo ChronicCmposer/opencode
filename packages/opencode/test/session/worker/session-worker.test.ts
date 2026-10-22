@@ -8,7 +8,10 @@ import { describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { Effect, Latch, Layer, Schema } from "effect"
+import { Effect, Latch, Layer, Option, Schema, Sink, Stream } from "effect"
+import { ChildProcessSpawner } from "effect/unstable/process"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { ShellTool } from "@/tool/shell"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { MessageID, PartID, SessionID } from "@/session/schema"
@@ -32,18 +35,45 @@ import {
   type SessionLayerOptions,
   type WorkerModelConfig,
 } from "@/session/worker/layer"
-import { DEFAULT_WORK_KIND, UnknownWorkKindError, type SessionWork } from "@/session/worker/execute"
+import {
+  DEFAULT_WORK_KIND,
+  UnknownWorkKindError,
+  type SessionRunControl,
+  type SessionWork,
+} from "@/session/worker/execute"
 import {
   MissingWorkerPortError,
   bootstrapSessionWorker,
   buildWorkerClients,
+  createControlPidReporter,
   createSessionWork,
   createWorkRegistry,
+  parseSessionWorkerInit,
   productionWorkRegistry,
+  reportedWorkerID,
   workerGraphReplacements,
   workerInstanceContext,
   writerReadMessages,
+  type SessionWorkerInit,
+  type SessionWorkerModel,
 } from "@/session/worker/session-worker"
+import {
+  createPidRegistry,
+  registerReported,
+  PidReporter,
+  type PidReport,
+  type PidReporterInterface,
+} from "@/session/worker/pid-registry"
+import { reportDetachedShell } from "@/tool/shell"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Truncate } from "@/tool/truncate"
+import { Plugin } from "@/plugin"
+import { Config } from "@/config/config"
+import { Agent } from "@/agent/agent"
+import { RuntimeFlags } from "@/effect/runtime-flags"
+import { provideInstance, testInstanceStoreLayer } from "../../fixture/fixture"
+import type { WorkerPlugin } from "@/session/worker/plugin-host"
 import { Snapshot } from "@/snapshot"
 import { GlobalBus } from "@/bus/global"
 import { createHubEventSink } from "@/session/worker/hub"
@@ -51,6 +81,7 @@ import { workerSnapshot } from "../../lib/snapshot"
 import { withParts } from "../../lib/session-parts"
 import { startMockProvider } from "../../lib/mock-provider"
 import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
+import { assertStructuredCloneable } from "../../lib/session-worker-init"
 
 const sid = (value: string) => SessionID.make(value)
 
@@ -93,7 +124,15 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
   const init = (capabilities?: { sessionWorkerPorts?: boolean }) => ({
     snapshot: workerSnapshot(),
     env: { values: {} },
-    model: { baseUrl: "http://127.0.0.1:1/v1", apiKey: "k", model: "m" },
+    model: {
+      providerID: "mock",
+      modelID: "m",
+      apiId: "m",
+      baseUrl: "http://127.0.0.1:1/v1",
+      apiKey: "k",
+      capabilities: { temperature: true, reasoning: false },
+      limit: { context: 128_000, output: 4096 },
+    },
     ...(capabilities === undefined ? {} : { capabilities }),
   })
 
@@ -211,6 +250,194 @@ describe("buildWorkerClients (step 22)", () => {
 
     expect(await clients.writer.query("all", "SELECT 1")).toEqual([{ value: 1 }])
   })
+})
+
+// ---------------------------------------------------------------------------
+// P5 prerequisite — worker→hub PID reporting.
+//
+// A worker's shell tool spawns a detached child (its own process group). The
+// worker reports `{ pid, pgid, label }` over its control/hub-proxy port so the
+// hub's `PidRegistry` mirrors it and a terminate can group-kill the orphan.
+// ---------------------------------------------------------------------------
+
+/** A fake spawner whose child has a fixed PID (and therefore PGID when detached). */
+function fixedPidSpawnerLayer(pid: number): Layer.Layer<ChildProcessSpawner.ChildProcessSpawner> {
+  const spawner = ChildProcessSpawner.make(() =>
+    Effect.succeed(
+      ChildProcessSpawner.makeHandle({
+        pid: ChildProcessSpawner.ProcessId(pid),
+        exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+        isRunning: Effect.succeed(false),
+        kill: () => Effect.void,
+        stdin: Sink.drain as never,
+        stdout: Stream.empty,
+        stderr: Stream.empty,
+        all: Stream.empty,
+        getInputFd: () => Sink.drain as never,
+        getOutputFd: () => Stream.empty,
+        unref: Effect.succeed(Effect.void),
+      }),
+    ),
+  )
+  return Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner)
+}
+
+/**
+ * A minimal ShellTool graph. The real spawner is replaced by a fixed-PID fake
+ * so the report is deterministic and no process is spawned; the `PidReporter`
+ * is merged at the top so the shell tool sees it at execution time.
+ */
+function shellToolHarness(
+  spawnerLayer: Layer.Layer<ChildProcessSpawner.ChildProcessSpawner>,
+  reporter: PidReporterInterface,
+) {
+  return Layer.mergeAll(
+    LayerNode.compile(
+      LayerNode.group([
+        CrossSpawnSpawner.node,
+        FSUtil.node,
+        Plugin.node,
+        Truncate.node,
+        Config.node,
+        Agent.node,
+        RuntimeFlags.node,
+      ]),
+      [[CrossSpawnSpawner.node, spawnerLayer]],
+    ),
+    Layer.succeed(PidReporter, reporter),
+    testInstanceStoreLayer,
+  )
+}
+
+describe("worker→hub PID reporting (P5 prerequisite)", () => {
+  test("the control reporter posts the frozen pid-report frame over the port", async () => {
+    const channel = new MessageChannel()
+    const received = new Promise<PidReport>((resolve) => {
+      channel.port2.onmessage = (event: MessageEvent) => resolve(event.data as PidReport)
+      channel.port2.start()
+    })
+
+    const reporter = createControlPidReporter(channel.port1, 3)
+    reporter.report({ pid: 101, pgid: 101, label: "shell:echo hi" })
+
+    expect(await received).toEqual({
+      type: "pid-report",
+      workerID: 3,
+      entries: [{ pid: 101, pgid: 101, label: "shell:echo hi", workerID: 3 }],
+    })
+    channel.port1.close()
+    channel.port2.close()
+  })
+
+  test("a worker's pid-report carries the hub-assigned pool id, not threadId", async () => {
+    const channel = new MessageChannel()
+    const received = new Promise<PidReport>((resolve) => {
+      channel.port2.onmessage = (event: MessageEvent) => resolve(event.data as PidReport)
+      channel.port2.start()
+    })
+
+    // The hub ships the pool slot id as `workerData.workerID`; the reporter must
+    // prefer it over the isolate's own thread id (which is not the pool slot).
+    const reporter = createControlPidReporter(channel.port1, reportedWorkerID({ workerID: 7 }, 999))
+    reporter.report({ pid: 101, pgid: 101, label: "shell:echo hi" })
+
+    expect(await received).toEqual({
+      type: "pid-report",
+      workerID: 7,
+      entries: [{ pid: 101, pgid: 101, label: "shell:echo hi", workerID: 7 }],
+    })
+    channel.port1.close()
+    channel.port2.close()
+  })
+
+  test("reportedWorkerID falls back to the isolate threadId only when no pool id was shipped", () => {
+    expect(reportedWorkerID({ workerID: 7 }, 42)).toBe(7)
+    expect(reportedWorkerID({}, 42)).toBe(42)
+  })
+
+  test("a missing reporter (degraded boot) is a no-op; win32 reports nothing", () => {
+    expect(() => reportDetachedShell(undefined, { pid: 7 }, "echo hi", "linux")).not.toThrow()
+
+    const reports: Array<{ pid: number; pgid: number; label: string }> = []
+    reportDetachedShell({ report: (entry) => void reports.push(entry) }, { pid: 7 }, "echo hi", "win32")
+    expect(reports).toEqual([])
+  })
+
+  test("buildSessionWorkerLayer exposes the merged PidReporter at execution time (and none otherwise)", async () => {
+    const withReporter = buildSessionWorkerLayer({
+      snapshot: workerSnapshot(),
+      env: { values: {} },
+      clients: stubClients(),
+      modelClient: modelLayer("worker text"),
+      pidReporter: { report: () => {} },
+    })
+    const without = buildSessionWorkerLayer({
+      snapshot: workerSnapshot(),
+      env: { values: {} },
+      clients: stubClients(),
+      modelClient: modelLayer("worker text"),
+    })
+
+    const has = (layer: Layer.Layer<unknown, unknown>) =>
+      Effect.runPromise(
+        Effect.gen(function* () {
+          return Option.isSome(yield* Effect.serviceOption(PidReporter))
+        }).pipe(Effect.provide(layer)),
+      )
+
+    expect(await has(withReporter.layer)).toBe(true)
+    expect(await has(without.layer)).toBe(false)
+  })
+
+  test.skipIf(process.platform === "win32")(
+    "a spawned shell reports its PGID, which the registry reaps by worker id",
+    async () => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-pid-report-"))
+      const reports: Array<{ pid: number; pgid: number; label: string }> = []
+      const shellLayer = shellToolHarness(fixedPidSpawnerLayer(4321), {
+        report: (entry) => void reports.push(entry),
+      })
+
+      try {
+        await Effect.runPromise(
+          Effect.gen(function* () {
+            const shell = yield* ShellTool
+            const tool = yield* shell.init()
+            yield* tool.execute(
+              { command: "echo hi" },
+              {
+                sessionID: sid("ses_pid"),
+                messageID: MessageID.make("msg_pid"),
+                callID: "",
+                agent: "build",
+                abort: AbortSignal.any([]),
+                messages: [],
+                metadata: () => Effect.void,
+                ask: () => Effect.void,
+              },
+            )
+          }).pipe(provideInstance(directory), Effect.provide(shellLayer)),
+        )
+
+        // The shell tool reported the detached child's PID as its PGID.
+        expect(reports).toEqual([{ pid: 4321, pgid: 4321, label: "echo hi" }])
+
+        // The report fills the hub mirror and `reap(workerID)` group-kills it.
+        const registry = createPidRegistry({ reaper: { killGroup: () => {} } })
+        registerReported(registry, {
+          type: "pid-report",
+          workerID: 1,
+          entries: reports.map((entry) => ({ ...entry, workerID: 1 })),
+        })
+        expect(registry.has(4321)).toBe(true)
+        expect(registry.reap(1, "SIGKILL")).toEqual([4321])
+        expect(registry.size).toBe(0)
+      } finally {
+        fs.rmSync(directory, { recursive: true, force: true })
+      }
+    },
+    30_000,
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -352,7 +579,15 @@ describe("worker event bridge wiring (Q6/Q13/Q15)", () => {
       {
         snapshot: workerSnapshot(),
         env: { values: {} },
-        model: { baseUrl: "http://127.0.0.1:1/v1", apiKey: "k", model: "m" },
+        model: {
+          providerID: "mock",
+          modelID: "m",
+          apiId: "m",
+          baseUrl: "http://127.0.0.1:1/v1",
+          apiKey: "k",
+          capabilities: { temperature: true, reasoning: false },
+          limit: { context: 128_000, output: 4096 },
+        },
         capabilities: { sessionWorkerPorts: true },
       },
       scope,
@@ -870,5 +1105,247 @@ describe("worker event bridge tolerates a project-less instance (Fix B guard)", 
     } finally {
       GlobalBus.off("event", onEvent as never)
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 1 — the worker receives the REAL model descriptor, not a bare identity.
+// ---------------------------------------------------------------------------
+
+describe("worker model descriptor", () => {
+  const descriptorModel: SessionWorkerModel = {
+    providerID: "fixture",
+    modelID: "fixture-model",
+    apiId: "fixture-api-id",
+    npm: "@ai-sdk/anthropic",
+    baseUrl: "https://fixture.example/v1",
+    apiKey: "sk-fixture",
+    headers: { "x-provider": "1" },
+    capabilities: {
+      temperature: false,
+      reasoning: true,
+      interleaved: true,
+      toolcall: true,
+      attachment: false,
+    },
+    limit: { context: 200_000, output: 32_000 },
+    options: { temperature: 0.2, topP: 0.9 },
+    variants: { high: { reasoningEffort: "high" } },
+    providerOptions: { includeUsage: true, useCompletionUrls: true },
+  }
+
+  test("the full descriptor survives a structuredClone round-trip unchanged", () => {
+    expect(assertStructuredCloneable(descriptorModel)).toEqual(descriptorModel)
+  })
+
+  test("parseSessionWorkerInit accepts a descriptor payload", () => {
+    const parsed = parseSessionWorkerInit({
+      snapshot: workerSnapshot(),
+      env: { values: {} },
+      model: descriptorModel,
+    })
+
+    expect(parsed.model).toEqual(descriptorModel)
+    expect(parsed.model.limit.output).toBe(32_000)
+    expect(parsed.model.capabilities.temperature).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 4 + 6.3 — cancelling a worker-local session must STOP the real
+// `SessionPrompt.loop` (the worker-local `SessionRunState` runner, table B), not
+// just the executor's outer machine (table A). The old cancel path interrupted
+// the outer fiber while table B's `runLoop` survived; the run control seam routes
+// cancel/assertNotBusy to table B.
+// ---------------------------------------------------------------------------
+
+/** Poll a predicate until it is true, failing loud on timeout. */
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  message: string,
+  timeoutMs = 5000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  throw new Error(`timed out: ${message}`)
+}
+
+describe("real SessionPrompt.loop cancellation (Phase 4 + 6.3)", () => {
+  /**
+   * An OpenAI-compatible SSE provider that emits a partial assistant turn and
+   * then never closes the response, so the loop stays blocked inside the stream
+   * until it is cancelled.
+   */
+  function startHangingProvider() {
+    const encoder = new TextEncoder()
+    const requests: Array<Record<string, unknown>> = []
+    const frame = (delta: Record<string, unknown>): string =>
+      "data: " + JSON.stringify({ id: "chatcmpl-hang", object: "chat.completion.chunk", choices: [{ delta }] }) + "\n\n"
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(request) {
+        const url = new URL(request.url)
+        if (request.method !== "POST" || !url.pathname.endsWith("/chat/completions")) {
+          return new Response("not found", { status: 404 })
+        }
+        requests.push((await request.json().catch(() => ({}))) as Record<string, unknown>)
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode(frame({ role: "assistant" })))
+            controller.enqueue(encoder.encode(frame({ content: "partial" })))
+            // Intentionally never closes: the run blocks until cancelled.
+          },
+        })
+        return new Response(stream, { headers: { "content-type": "text/event-stream" } })
+      },
+    })
+    return {
+      baseUrl: `http://127.0.0.1:${server.port}/v1`,
+      apiKey: "k",
+      model: "test-model",
+      requests,
+      stop: () => server.stop(true),
+    }
+  }
+
+  test("cancel stops the loop, finalizes the assistant, and run-state goes idle", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-e2e-cancel-"))
+    const provider = startHangingProvider()
+    const ctx = createE2EContext({
+      snapshot: workerSnapshot({ directory }),
+      modelConfig: mkModelConfig(provider),
+    })
+    try {
+      const sessionID = await Effect.runPromise(seedSession(ctx, provider.model, "hi"))
+      let control: SessionRunControl | undefined
+      const work = createSessionWork({
+        layer: ctx.layer,
+        writer: ctx.writer,
+        threadId: 7,
+        prompt: true,
+        instance: ctx.instance,
+        registerControl: (registered) => {
+          control = registered
+        },
+      })
+
+      const running = Effect.runPromise(work(sessionID))
+      await waitUntil(() => control?.busy(sessionID) ?? false, "worker run-state never became busy")
+      await waitUntil(() => provider.requests.length >= 1, "provider never received the request")
+      const requestsBeforeCancel = provider.requests.length
+
+      await control!.cancel(sessionID)
+
+      // 6.3: the run-state reflects the REAL loop after cancel, not a stale table A.
+      expect(await control!.busy(sessionID)).toBe(false)
+
+      // The cancelled run settles; it must not hang.
+      const outcome = await Promise.race([
+        running.then(
+          () => "resolved" as const,
+          () => "rejected" as const,
+        ),
+        new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 3000)),
+      ])
+      expect(outcome).not.toBe("hung")
+
+      // No further provider request after cancel (flag-OFF parity).
+      expect(provider.requests.length).toBe(requestsBeforeCancel)
+
+      // The assistant row is finalized with an AbortedError and a completion time.
+      const json = (value: unknown): Record<string, unknown> =>
+        typeof value === "string" ? (JSON.parse(value) as Record<string, unknown>) : (value as Record<string, unknown>)
+      const assistants = ctx
+        .rows("message")
+        .map((row) => json(row.data))
+        .filter((data) => data.role === "assistant")
+      expect(assistants).toHaveLength(1)
+      const error = assistants[0].error as { name?: string } | undefined
+      expect(error?.name).toBe("MessageAbortedError")
+      expect(assistants[0].time).toBeDefined()
+      expect((assistants[0].time as { completed?: number }).completed).toBeDefined()
+    } finally {
+      await ctx.dispose()
+      provider.stop()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  }, 30_000)
+})
+
+// ---------------------------------------------------------------------------
+// Task 4 (Wave 1 follow-up) — the degraded (no hub-port) `ModelClient` path must
+// run the worker-hosted plugin hooks, not the no-op pass-through, so a plugin's
+// `chat.params` / `chat.headers` mutations reach the reduced LLM.
+// ---------------------------------------------------------------------------
+
+describe("degraded ModelClient worker plugin host (task 4)", () => {
+  /** Run one degraded-boot session turn through the installed executor. */
+  async function runDegradedTurn(init: SessionWorkerInit): Promise<{ readonly type: string }> {
+    const frames: Array<{ type?: string }> = []
+    const scope = {
+      postMessage(data: unknown) {
+        frames.push(data as { type?: string })
+      },
+      onmessage: null as ((event: { data: unknown }) => void) | null,
+    }
+    bootstrapSessionWorker(init, scope)
+    scope.onmessage!({ data: { type: "run", id: 1, sessionID: "ses_plugin", kind: "session" } })
+    await waitUntil(
+      () => frames.some((frame) => frame.type === "done" || frame.type === "error"),
+      "executor never settled",
+    )
+    return frames.find((frame) => frame.type === "done" || frame.type === "error") as { type: string }
+  }
+
+  const degradedInit = (
+    provider: { baseUrl: string; apiKey: string; model: string },
+    plugins?: readonly WorkerPlugin[],
+  ): SessionWorkerInit => ({
+    snapshot: workerSnapshot(),
+    env: { values: {} },
+    model: {
+      providerID: "mock",
+      modelID: provider.model,
+      apiId: provider.model,
+      npm: "@ai-sdk/openai-compatible",
+      baseUrl: provider.baseUrl,
+      apiKey: provider.apiKey,
+      capabilities: { temperature: true, reasoning: false },
+      limit: { context: 128_000, output: 4096 },
+    },
+    ...(plugins === undefined ? {} : { plugins }),
+  })
+
+  test("applies a worker-hosted chat.params hook in the reduced model path", async () => {
+    await using provider = startMockProvider({ text: "ok" })
+    const outcome = await runDegradedTurn(
+      degradedInit(provider, [
+        {
+          name: "sampling",
+          hooks: {
+            "chat.params": (_input, output) => {
+              output.temperature = 0.25
+            },
+          },
+        },
+      ]),
+    )
+
+    expect(outcome.type).toBe("done")
+    expect(provider.requests[0].body.temperature).toBe(0.25)
+  })
+
+  test("uses the no-op Plugin when no hooks are shipped", async () => {
+    await using provider = startMockProvider({ text: "ok" })
+    const outcome = await runDegradedTurn(degradedInit(provider))
+
+    expect(outcome.type).toBe("done")
+    // Without shipped hooks the reduced path uses the no-op Plugin, so the
+    // plugin's mutation is absent.
+    expect(provider.requests[0].body.temperature).not.toBe(0.25)
   })
 })

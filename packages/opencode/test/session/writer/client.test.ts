@@ -39,6 +39,19 @@ const noTx: Pick<HubWriter, "begin" | "txQuery" | "commit" | "rollback"> = {
   },
 }
 
+/** Settle `promise` within `ms` or fail with `message`, turning a hang into a bounded failure. */
+async function settlesWithin<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms)
+  })
+  try {
+    return await Promise.race([promise, deadline])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 describe("writer client: ready handshake (steps 9, 12, 29)", () => {
   test("accepts a matching ready generation and serves requests", async () => {
     await using client = createWriterClient({ entry: fakeEntry, timeoutMs: 1000 })
@@ -402,6 +415,25 @@ describe("writer port server: transactions over the real writer (step 17)", () =
     client.dispose()
     dispose()
     await writer.close()
+  })
+
+  test("a completed run releases the pin so back-to-back transactions and reads settle promptly", async () => {
+    await using tmp = await tmpdir()
+    await using served = await servedWriter(tmp.path)
+
+    const expected: Array<{ aggregate_id: string }> = []
+    for (const aggregate of ["x", "y", "z"]) {
+      const handle = await settlesWithin(served.client.begin(), 1000, "begin blocked on a leftover pin")
+      await served.client.txQuery(handle, "run", INSERT_SEQUENCE, [aggregate, 0, null])
+      await served.client.commit(handle)
+
+      // A read and the next transaction issued immediately after the run must not
+      // block on a pin the completed transaction failed to release.
+      expected.push({ aggregate_id: aggregate })
+      expect(
+        await settlesWithin(served.client.query("all", SELECT_SEQUENCES), 1000, "read blocked after a completed run"),
+      ).toEqual(expected)
+    }
   })
 })
 

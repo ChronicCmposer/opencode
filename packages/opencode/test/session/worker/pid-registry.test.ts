@@ -11,6 +11,7 @@ import {
   createPidRegistry,
   posixReaper,
   reapSupport,
+  registerReported,
   spawnRegistered,
   type ProcessReaper,
 } from "@/session/worker/pid-registry"
@@ -163,6 +164,65 @@ describe("11.5 mirrored PGID registry", () => {
       expect(support.supported).toBe(false)
       expect(support.reason).not.toBe("")
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Worker→hub PID reporting (P5 prerequisite). The worker spawns a detached
+// shell child and reports `{ pid, pgid, label }` over its control port; the hub
+// mirrors each entry into this registry. `registerReported` is the hub-side
+// boundary that turns a report frame into registry entries.
+// ---------------------------------------------------------------------------
+
+describe("11.5 worker→hub reported children", () => {
+  test("registers every reported entry, keyed by its PGID", () => {
+    const registry = createPidRegistry()
+    const registered = registerReported(registry, {
+      type: "pid-report",
+      workerID: 3,
+      entries: [
+        { pid: 101, pgid: 101, label: "shell:echo hi", workerID: 3 },
+        { pid: 202, pgid: 202, label: "shell:sleep 5", workerID: 3 },
+      ],
+    })
+
+    expect(registered.map((child) => child.pgid)).toEqual([101, 202])
+    expect(registry.forWorker(3)).toHaveLength(2)
+    expect(registry.get(101)).toMatchObject({ pid: 101, pgid: 101, label: "shell:echo hi", workerID: 3 })
+    expect(registry.get(202)).toMatchObject({ pid: 202, pgid: 202, label: "shell:sleep 5", workerID: 3 })
+  })
+
+  test("an authoritative workerID overrides the frame's self-reported id", () => {
+    const registry = createPidRegistry()
+    registerReported(
+      registry,
+      { type: "pid-report", workerID: 0, entries: [{ pid: 5, pgid: 5, label: "shell", workerID: 0 }] },
+      9,
+    )
+
+    expect(registry.get(5)?.workerID).toBe(9)
+    expect(registry.forWorker(9)).toHaveLength(1)
+    expect(registry.forWorker(0)).toHaveLength(0)
+  })
+
+  test("reported children are reaped by reap(workerID) and forgotten", () => {
+    const { reaper, calls } = recordingReaper()
+    const registry = createPidRegistry({ reaper })
+    registerReported(registry, {
+      type: "pid-report",
+      workerID: 2,
+      entries: [
+        { pid: 11, pgid: 11, label: "shell:a", workerID: 2 },
+        { pid: 12, pgid: 12, label: "shell:b", workerID: 2 },
+      ],
+    })
+
+    expect(registry.reap(2, "SIGKILL")).toEqual([11, 12])
+    expect(calls).toEqual([
+      { pgid: 11, signal: "SIGKILL" },
+      { pgid: 12, signal: "SIGKILL" },
+    ])
+    expect(registry.size).toBe(0)
   })
 })
 

@@ -29,6 +29,21 @@ export type SessionWork = (sessionID: SessionID) => Effect.Effect<SessionExecuti
 export type SessionWorkFactory = (kind: string) => SessionWork
 
 /**
+ * The run control the worker-local `SessionRunState` exposes to the executor
+ * (Phase 4). The executor's own machine (table A) is only an outer `ensureRunning`
+ * guard; the real `SessionPrompt.loop` runs on the worker-local `SessionRunState`
+ * runner (table B). Routing `cancel`/`assertNotBusy` here makes cancel actually
+ * interrupt the loop — and makes `assertNotBusy` tell the truth after a cancel.
+ *
+ * The methods cross no isolate boundary (the worker resolves table B in-process
+ * and hands the executor a control): the worker `createSessionWork` registers it.
+ */
+export interface SessionRunControl {
+  cancel(sessionID: SessionID): Promise<void>
+  busy(sessionID: SessionID): Promise<boolean>
+}
+
+/**
  * Production work kind. The worker registry (`session-worker.ts`
  * `productionWorkRegistry`) resolves `"session"` to the real reduced-layer
  * session work and aliases the legacy `"noop"` to it, so the hub and worker
@@ -62,7 +77,10 @@ export interface SessionRunMachineOptions {
 /** The worker-local run-state machine: one `Runner` per session key. */
 export interface SessionRunMachine {
   busy(sessionID: SessionID): boolean
-  ensureRunning(sessionID: SessionID, work: Effect.Effect<SessionExecutionResult>): Effect.Effect<SessionExecutionResult>
+  ensureRunning(
+    sessionID: SessionID,
+    work: Effect.Effect<SessionExecutionResult>,
+  ): Effect.Effect<SessionExecutionResult>
   startShell(
     sessionID: SessionID,
     work: Effect.Effect<SessionExecutionResult>,
@@ -85,7 +103,8 @@ export function createSessionRunMachine(options: SessionRunMachineOptions): Sess
     ensureRunning: (sessionID, work) => table.ensureRunning(sessionID, work),
     startShell: (sessionID, work, ready) => table.startShell(sessionID, work, ready),
     cancel: (sessionID) => table.cancel(sessionID),
-    assertNotBusy: (sessionID) => (table.busy(sessionID) ? Effect.fail(new SessionBusyError({ sessionID })) : Effect.void),
+    assertNotBusy: (sessionID) =>
+      table.busy(sessionID) ? Effect.fail(new SessionBusyError({ sessionID })) : Effect.void,
     cancelAll: table.cancelAll,
   }
 }
@@ -141,14 +160,16 @@ export type SessionEffectRunner = <A, E>(effect: Effect.Effect<A, E>) => Promise
 const runEffect: SessionEffectRunner = (effect) => Effect.runPromise(effect)
 
 const tagOf = (error: unknown): string | undefined =>
-  error !== null && typeof error === "object" && "_tag" in error && typeof (error as { _tag: unknown })._tag === "string"
+  error !== null &&
+  typeof error === "object" &&
+  "_tag" in error &&
+  typeof (error as { _tag: unknown })._tag === "string"
     ? (error as { _tag: string })._tag
     : undefined
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error))
 
-const isAddressed = (message: SessionExecutorOutbound, id: number): boolean =>
-  "id" in message && message.id === id
+const isAddressed = (message: SessionExecutorOutbound, id: number): boolean => "id" in message && message.id === id
 
 /** Shape any thrown/rejected value into a failed reply, preserving its `_tag`. */
 const failed = (id: number, error: unknown): SessionExecutorFailed => {
@@ -159,6 +180,12 @@ const failed = (id: number, error: unknown): SessionExecutorFailed => {
 export interface SessionExecutorOptions {
   readonly machine: SessionRunMachine
   readonly work: SessionWorkFactory
+  /**
+   * Worker-local run control (table B). When supplied, `cancel`/`assertNotBusy`
+   * route here so they reach the real `SessionPrompt.loop`; otherwise the
+   * executor's own machine answers.
+   */
+  readonly control?: SessionRunControl
   /** Effect runner seam; defaults to `Effect.runPromise`. */
   readonly run?: SessionEffectRunner
 }
@@ -170,6 +197,14 @@ export interface SessionExecutor {
 /** Route one inbound frame to the worker-local machine and produce one reply. */
 export function createSessionExecutor(options: SessionExecutorOptions): SessionExecutor {
   const run = options.run ?? runEffect
+
+  /** Whether the worker-local run (table B) is busy; the machine answers otherwise. */
+  const busy = (sessionID: SessionID): Promise<boolean> =>
+    options.control === undefined ? Promise.resolve(options.machine.busy(sessionID)) : options.control.busy(sessionID)
+
+  /** Cancel the worker-local run (table B); the machine answers otherwise. */
+  const cancel = (sessionID: SessionID): Promise<void> =>
+    options.control === undefined ? run(options.machine.cancel(sessionID)) : options.control.cancel(sessionID)
 
   const settle = (
     id: number,
@@ -208,9 +243,9 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
       case "ping":
         return { type: "pong", id: message.id }
       case "assertNotBusy":
-        return { type: "busy", id: message.id, busy: options.machine.busy(message.sessionID) }
+        return { type: "busy", id: message.id, busy: await busy(message.sessionID) }
       case "cancel":
-        await run(options.machine.cancel(message.sessionID))
+        await cancel(message.sessionID)
         return { type: "cancelled", id: message.id }
       case "run":
         return runWork(message.id, message.sessionID, message.kind, "run")
@@ -231,6 +266,8 @@ export interface ExecutorWorkerScope {
 
 export interface SessionExecutorInstallOptions {
   readonly work: SessionWorkFactory
+  /** Worker-local run control; forwarded to the installed executor (Phase 4). */
+  readonly control?: SessionRunControl
   readonly onIdle?: (sessionID: SessionID) => Effect.Effect<void>
   readonly onBusy?: (sessionID: SessionID) => Effect.Effect<void>
   readonly threadId?: number
@@ -255,7 +292,7 @@ export function installSessionExecutor(
   const ownsScope = options.scope === undefined
   const workerScope = options.scope ?? Effect.runSync(Scope.make())
   const machine = createSessionRunMachine({ scope: workerScope, onIdle: options.onIdle, onBusy: options.onBusy })
-  const executor = createSessionExecutor({ machine, work: options.work })
+  const executor = createSessionExecutor({ machine, work: options.work, control: options.control })
 
   scope.onmessage = (event) => {
     const message = event.data as SessionExecutorInbound | undefined
@@ -386,11 +423,17 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
   }
 
   const cancel = async (sessionID: SessionID): Promise<void> => {
-    await request((id) => ({ type: "cancel", id, sessionID }), (reply) => reply.type === "cancelled")
+    await request(
+      (id) => ({ type: "cancel", id, sessionID }),
+      (reply) => reply.type === "cancelled",
+    )
   }
 
   const assertNotBusy = async (sessionID: SessionID): Promise<boolean> => {
-    const message = await request((id) => ({ type: "assertNotBusy", id, sessionID }), (reply) => reply.type === "busy")
+    const message = await request(
+      (id) => ({ type: "assertNotBusy", id, sessionID }),
+      (reply) => reply.type === "busy",
+    )
     return message.type === "busy" ? message.busy : false
   }
 
