@@ -15,6 +15,7 @@ import { threadId as mainThreadId } from "node:worker_threads"
 import {
   BrokerRequestError,
   createBroker,
+  resolveBrokerWorkerEntry,
   serveBrokerPort,
   type BrokerBackend,
   type BrokerClient,
@@ -590,5 +591,25 @@ describe("serveBrokerPort — hub-side worker broker proxy (step 19)", () => {
     } finally {
       process.off("unhandledRejection", onRejection)
     }
+  })
+})
+
+describe("broker worker entry resolution", () => {
+  const defined = "/$bunfs/root/broker-worker.js"
+
+  test("an env override wins over the build-time define", () => {
+    expect(
+      resolveBrokerWorkerEntry({ env: { OPENCODE_BROKER_WORKER_PATH: "/custom/broker.js" }, definedPath: defined }),
+    ).toBe("/custom/broker.js")
+  })
+
+  test("the build-time define is used when no env override is present", () => {
+    expect(resolveBrokerWorkerEntry({ env: {}, definedPath: defined })).toBe(defined)
+  })
+
+  test("without an override or define the source-relative isolate is used", () => {
+    const entry = resolveBrokerWorkerEntry({ env: {} })
+    expect(entry).toBeInstanceOf(URL)
+    expect(String(entry).endsWith("/broker-worker.ts")).toBe(true)
   })
 })

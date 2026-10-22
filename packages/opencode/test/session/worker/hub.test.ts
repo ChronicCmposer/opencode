@@ -24,8 +24,11 @@ import {
   createSessionHub,
   createSessionHubLayer,
   createWorkerCancellation,
+  fallbackInstanceContext,
+  lazyOpenWriter,
   makeSessionHubNode,
   productionSessionHubNode,
+  resolveSessionWorkerEntry,
   serveEventsPort,
   SESSION_CANCELLED_TYPE,
   SessionHubService,
@@ -61,7 +64,7 @@ import { createWorkerBrokerClient } from "@/session/worker/broker-client"
 import { createWorkerEgressClient } from "@/session/worker/egress-client"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import type { BrokerBackend } from "@/session/broker/broker"
-import { createWriterClient, serveWriterPort, type HubWriter } from "@/session/writer/client"
+import { serveWriterPort, type HubWriter, type WriterClient } from "@/session/writer/client"
 import { sessionWorkerNodes } from "@/session/worker/nodes"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
@@ -78,7 +81,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Provider } from "@/provider/provider"
 import path from "node:path"
 import { tmpdir } from "../../fixture/fixture"
-import { SCHEMA, healthyEnv } from "../writer/fixtures"
+import { healthyEnv } from "../writer/fixtures"
 
 const it = testEffect(TestLLMServer.layer)
 
@@ -236,7 +239,7 @@ const markerOf = (message: SessionExecutorOutbound): number | undefined =>
 class FakeWorker {
   static last: FakeWorker | undefined
   onmessage: ((event: { data: unknown }) => void) | null = null
-  onerror: ((event: { message: string }) => void) | null = null
+  onerror: ((event: { message: string; error?: unknown }) => void) | null = null
   readonly posted: unknown[] = []
   terminateCount = 0
 
@@ -257,8 +260,8 @@ class FakeWorker {
     this.onmessage?.({ data })
   }
 
-  fail(message: string): void {
-    this.onerror?.({ message })
+  fail(message: string, error?: unknown): void {
+    this.onerror?.(error === undefined ? { message } : { message, error })
   }
 }
 
@@ -856,10 +859,10 @@ describe("36 production port backends", () => {
                 // from the layer's real service deps.
                 backends: {
                   writer: {
-          query: async () => [],
-          publish: async () => ({ seq: null, committed: false }),
-          ...unusedHubWriterTx,
-        },
+                    query: async () => [],
+                    publish: async () => ({ seq: null, committed: false }),
+                    ...unusedHubWriterTx,
+                  },
                   broker: fakeBroker(),
                   databasePath: ":memory:",
                 },
@@ -878,19 +881,11 @@ describe("36 production port backends", () => {
     )
   })
 
-  test("the owned production writer opens the app database so a worker durable publish succeeds", async () => {
+  test("the owned production writer opens + migrates the app database so a worker durable publish succeeds", async () => {
     await using tmp = await tmpdir()
     const filename = path.join(tmp.path, "writer.db")
-    // Seed the event schema the app database ships with (there is no production
-    // raw-SQL migration export; the writer publishes into `event`/`event_sequence`).
-    const seed = createWriterClient({ env: healthyEnv })
-    try {
-      await seed.open(filename)
-      await seed.migrate(SCHEMA)
-    } finally {
-      await seed.close()
-    }
-
+    // No manual seed: `buildProductionPortBackends` ships the production schema
+    // over `writer.migrate(...)`, so the owned isolate creates `event`/`event_sequence`.
     const backends = buildProductionPortBackends({
       databasePath: filename,
       broker: fakeBroker(),
@@ -921,10 +916,10 @@ describe("36 production port backends", () => {
     const broker = fakeBroker()
     const backends = buildProductionPortBackends({
       writer: {
-          query: async () => [],
-          publish: async () => ({ seq: null, committed: false }),
-          ...unusedHubWriterTx,
-        },
+        query: async () => [],
+        publish: async () => ({ seq: null, committed: false }),
+        ...unusedHubWriterTx,
+      },
       broker: { ...broker, teardown: async () => void (torndown += 1) },
     })
 
@@ -1120,10 +1115,10 @@ describe("Q22 hub event sink", () => {
     const { publisher, published } = recordingPublisher()
     const backends = buildProductionPortBackends({
       writer: {
-          query: async () => [],
-          publish: async () => ({ seq: null, committed: false }),
-          ...unusedHubWriterTx,
-        },
+        query: async () => [],
+        publish: async () => ({ seq: null, committed: false }),
+        ...unusedHubWriterTx,
+      },
       broker: fakeBroker(),
       events: publisher,
     })
@@ -1180,4 +1175,109 @@ describe("Q9/Q23 session.cancelled", () => {
       await hub.terminateAll()
     }
   }, 20_000)
+})
+
+// ---------------------------------------------------------------------------
+// Fixes A/C/D — define-aware worker entry, migration after open, error cause.
+// ---------------------------------------------------------------------------
+
+describe("A define-aware session worker entry", () => {
+  test("prefers the runtime env override", () => {
+    expect(resolveSessionWorkerEntry({ env: { OPENCODE_SESSION_WORKER_PATH: "/opt/worker.js" } })).toBe(
+      "/opt/worker.js",
+    )
+  })
+
+  test("falls back to the build-time define", () => {
+    expect(resolveSessionWorkerEntry({ env: {}, definedPath: "/$bunfs/root/session-worker.ts" })).toBe(
+      "/$bunfs/root/session-worker.ts",
+    )
+  })
+
+  test("falls back to the source isolate when neither is set", () => {
+    const entry = resolveSessionWorkerEntry({ env: {} })
+    expect(entry).toBeInstanceOf(URL)
+    expect(String(entry)).toContain("session-worker.ts")
+  })
+
+  test("an empty override is ignored, not treated as a path", () => {
+    const entry = resolveSessionWorkerEntry({ env: { OPENCODE_SESSION_WORKER_PATH: "" } })
+    expect(entry).toBeInstanceOf(URL)
+  })
+})
+
+describe("C writer migration runs after open", () => {
+  /** A `WriterClient` whose admin calls are recorded; tx methods fail loud if reached. */
+  const spyWriter = (calls: string[], onMigrate?: () => void): WriterClient =>
+    ({
+      open: async (filename: string) => {
+        calls.push(`open:${filename}`)
+        return { opened: true, filename }
+      },
+      migrate: async (statements: ReadonlyArray<string>) => {
+        calls.push(`migrate:${statements.join(",")}`)
+        onMigrate?.()
+      },
+      query: async () => [],
+      publish: async () => ({ seq: 0, committed: true }),
+      ...unusedHubWriterTx,
+    }) as unknown as WriterClient
+
+  test("opens then migrates exactly once, before the first request", async () => {
+    const calls: string[] = []
+    const hubWriter = lazyOpenWriter(spyWriter(calls), "app.db", ["CREATE TABLE t(x)"])
+    await hubWriter.query("all", "SELECT 1", [])
+    await hubWriter.publish({ id: "e", type: "t", aggregateID: "a", data: {} }, { durable: true })
+    expect(calls).toEqual(["open:app.db", "migrate:CREATE TABLE t(x)"])
+  })
+
+  test("a failed migrate resets the memo so the next request retries", async () => {
+    const calls: string[] = []
+    let attempts = 0
+    const writer = spyWriter(calls, () => {
+      attempts += 1
+      if (attempts === 1) throw new Error("migrate boom")
+    })
+    const hubWriter = lazyOpenWriter(writer, "app.db", ["S"])
+    await expect(hubWriter.query("all", "SELECT 1", [])).rejects.toThrow("migrate boom")
+    await hubWriter.query("all", "SELECT 1", [])
+    expect(attempts).toBe(2)
+  })
+})
+
+describe("D worker isolate errors surface the underlying message + cause", () => {
+  test("a worker error carries the message and the originating error as cause", async () => {
+    await withFakeWorker(async (fake, transport) => {
+      const pending = transport.waitFor(() => true)
+      const cause = new Error("Cannot find module './session-worker.ts'")
+      fake.fail("boom", cause)
+
+      const error = await pending.then(
+        () => {
+          throw new Error("expected the waiter to reject")
+        },
+        (reason: unknown) => reason as Error,
+      )
+      expect(error.message).toBe("session worker error: boom: Cannot find module './session-worker.ts'")
+      expect(error.cause).toBe(cause)
+      expect(transport.alive).toBe(false)
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Wave-2 consolidation #1: a dispatch with no ambient `InstanceRef` must still
+// ship a REAL project identity to the worker, never the directory string (which
+// would leak into the worker snapshot as a project id).
+// ---------------------------------------------------------------------------
+
+describe("fallbackInstanceContext (Wave-2 consolidation)", () => {
+  test("yields a real project identity, never the directory as a project id", () => {
+    const ctx = fallbackInstanceContext()
+    expect(ctx.project).toBeDefined()
+    expect(typeof ctx.project.id).toBe("string")
+    expect(String(ctx.project.id).length).toBeGreaterThan(0)
+    expect(String(ctx.project.id)).not.toBe(ctx.directory)
+    expect(ctx.worktree).toBe(ctx.directory)
+  })
 })

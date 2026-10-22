@@ -11,6 +11,7 @@ import {
   WriterRemoteError,
   WriterTimeoutError,
   createWriterClient,
+  resolveWriterWorkerEntry,
   serveWriterPort,
   type HubWriter,
 } from "@/session/writer/client"
@@ -401,5 +402,31 @@ describe("writer port server: transactions over the real writer (step 17)", () =
     client.dispose()
     dispose()
     await writer.close()
+  })
+})
+
+describe("writer worker entry resolution", () => {
+  const defined = "/$bunfs/root/writer-worker.js"
+
+  test("an env override wins over the build-time define", () => {
+    expect(
+      resolveWriterWorkerEntry({ env: { OPENCODE_WRITER_WORKER_PATH: "/custom/writer.js" }, definedPath: defined }),
+    ).toBe("/custom/writer.js")
+  })
+
+  test("the build-time define is used when no env override is present", () => {
+    expect(resolveWriterWorkerEntry({ env: {}, definedPath: defined })).toBe(defined)
+  })
+
+  test("an empty override falls through to the source-relative isolate", () => {
+    const entry = resolveWriterWorkerEntry({ env: { OPENCODE_WRITER_WORKER_PATH: "" }, definedPath: "" })
+    expect(entry).toBeInstanceOf(URL)
+    expect(String(entry).endsWith("/worker.ts")).toBe(true)
+  })
+
+  test("without an override or define the source-relative isolate is used", () => {
+    const entry = resolveWriterWorkerEntry({ env: {} })
+    expect(entry).toBeInstanceOf(URL)
+    expect(String(entry).endsWith("/worker.ts")).toBe(true)
   })
 })

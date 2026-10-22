@@ -59,17 +59,19 @@ export interface WorkerModel {
   readonly headers: Readonly<Record<string, string>>
 }
 
-/** Raised when a provider option cannot cross the isolate boundary. */
+/** Raised when provider/model data cannot cross the isolate boundary. */
 export class WorkerModelNotSerializableError extends Schema.TaggedErrorClass<WorkerModelNotSerializableError>()(
   "WorkerModelNotSerializableError",
   {
     providerID: Schema.String,
     modelID: Schema.String,
     field: Schema.String,
+    /** The offending value's kind (`function`, `symbol`, …). */
+    kind: Schema.optional(Schema.String),
   },
 ) {
   override get message() {
-    return `cannot ship ${this.providerID}/${this.modelID} to a session worker: "${this.field}" is a function (not structured-cloneable)`
+    return `cannot ship ${this.providerID}/${this.modelID} to a session worker: "${this.field}" is a ${this.kind ?? "value"} (not structured-cloneable)`
   }
 }
 
@@ -81,21 +83,43 @@ export interface ResolveWorkerModelOptions {
   readonly env?: Record<string, string | undefined>
 }
 
-/** Depth-first search for the first function-valued option, returning its path. */
-function findFunctionPath(value: unknown, path: string, seen: WeakSet<object>): string | undefined {
-  if (typeof value === "function") return path
+type NonCloneableKind = "function" | "symbol"
+
+interface NonCloneablePath {
+  readonly field: string
+  readonly kind: NonCloneableKind
+}
+
+/** The reason a value cannot cross the isolate boundary, if any. */
+function nonCloneableKind(value: unknown): NonCloneableKind | undefined {
+  if (typeof value === "function") return "function"
+  if (typeof value === "symbol") return "symbol"
+  return undefined
+}
+
+/** Iterate a container's children, including `Map` values and `Set` members. */
+function entriesOf(value: object): ReadonlyArray<readonly [string, unknown]> {
+  if (value instanceof Map) return [...value.entries()].map(([key, nested]) => [String(key), nested] as const)
+  if (value instanceof Set) return [...value].map((nested, index) => [String(index), nested] as const)
+  return Object.entries(value as Record<string, unknown>)
+}
+
+/** Depth-first search for the first non-cloneable value, returning its path + kind. */
+function findNonCloneablePath(value: unknown, path: string, seen: WeakSet<object>): NonCloneablePath | undefined {
+  const kind = nonCloneableKind(value)
+  if (kind !== undefined) return { field: path, kind }
   if (value === null || typeof value !== "object") return undefined
   if (seen.has(value)) return undefined
   seen.add(value)
-  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-    const found = findFunctionPath(nested, path === "" ? key : `${path}.${key}`, seen)
+  for (const [key, nested] of entriesOf(value)) {
+    const found = findNonCloneablePath(nested, path === "" ? key : `${path}.${key}`, seen)
     if (found !== undefined) return found
   }
   return undefined
 }
 
-const firstFunctionPath = (options: Readonly<Record<string, unknown>> | undefined): string | undefined =>
-  options === undefined ? undefined : findFunctionPath(options, "", new WeakSet())
+const firstNonCloneablePath = (value: unknown, path = ""): NonCloneablePath | undefined =>
+  findNonCloneablePath(value, path, new WeakSet())
 
 /** Resolve the base URL the same way `provider.ts`'s `resolveSDK` does. */
 function resolveBaseUrl(
@@ -146,12 +170,10 @@ const selectModel = Effect.fnUntraced(function* (
 /**
  * Resolve the serializable model bootstrap for the worker: the provider/model
  * identity, API descriptor, and a plain-data base URL, API key and headers.
- * Rejects function-bearing provider options with
- * {@link WorkerModelNotSerializableError}.
+ * Rejects non-cloneable provider/model options and model headers with
+ * {@link WorkerModelNotSerializableError}, at hub build rather than at spawn.
  */
-export const resolveWorkerModel = Effect.fn("WorkerModel.resolve")(function* (
-  options: ResolveWorkerModelOptions = {},
-) {
+export const resolveWorkerModel = Effect.fn("WorkerModel.resolve")(function* (options: ResolveWorkerModelOptions = {}) {
   const provider = yield* Provider.Service
   const auth = yield* Auth.Service
   const config = yield* Config.Service
@@ -161,12 +183,19 @@ export const resolveWorkerModel = Effect.fn("WorkerModel.resolve")(function* (
   const model = yield* provider.getModel(selection.providerID, selection.modelID)
   const credential = yield* auth.get(selection.providerID)
 
-  const field = firstFunctionPath(info.options) ?? firstFunctionPath(model.options)
-  if (field !== undefined) {
+  // Provider/model options and the model headers are spread into the serialized
+  // bootstrap, so any non-cloneable value there would make `workerData` throw at
+  // spawn. Diagnose it here, at hub build, naming the exact field.
+  const nonCloneable =
+    firstNonCloneablePath(info.options) ??
+    firstNonCloneablePath(model.options) ??
+    firstNonCloneablePath(model.headers, "headers")
+  if (nonCloneable !== undefined) {
     return yield* new WorkerModelNotSerializableError({
       providerID: selection.providerID,
       modelID: selection.modelID,
-      field,
+      field: nonCloneable.field,
+      kind: nonCloneable.kind,
     })
   }
 

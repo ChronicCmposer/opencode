@@ -15,10 +15,15 @@ import { Database } from "@opencode-ai/core/database/database"
 import { DatabaseMigration } from "@opencode-ai/core/database/migration"
 import { EventV2 } from "@opencode-ai/core/event"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
+import { ModelV2 } from "@opencode-ai/core/model"
 import { ProjectV2 } from "@opencode-ai/core/project"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { Config } from "@/config/config"
 import { Auth } from "@/auth"
+import { Provider } from "@/provider/provider"
+import { MCP } from "@/mcp"
+import { LSP } from "@/lsp/lsp"
 import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import { InstanceRef } from "@/effect/instance-ref"
@@ -31,17 +36,21 @@ import {
   SessionPipeline,
   WorkerEnvService,
   WorkerSnapshotService,
+  WorkerModelMismatchError,
   boundaryReplacements,
   buildSessionWorkerLayer,
   databaseBoundaryLayer,
+  reducedModelProviderLayer,
   snapshotAuthLayer,
   snapshotConfigLayer,
   snapshotModelsDevLayer,
   writerDatabaseLayer,
   type SessionLayerOptions,
+  type WorkerModelConfig,
   type WorkerSnapshot,
   type WriterClientHandle,
 } from "@/session/worker/layer"
+import { WorkerModelNotSerializableError, resolveWorkerModel } from "@/session/worker/init"
 import {
   REQUIRED_SESSION_NODE_KEYS,
   SESSION_CLIENT_KEYS,
@@ -346,6 +355,78 @@ describe("boundary layers (6.x)", () => {
         }).pipe(Effect.provide(databaseBoundaryLayer())),
       ),
     ).toThrow(/Database/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// f-w5-boundaries — a worker boundary is FUNCTIONAL, not a throwing mock.
+//
+// `boundaryReplacements` used to install `Layer.mock(Service, {})`, whose every
+// method throws `Unimplemented method "<name>"`. The session path reads neutral
+// catalogs from MCP (`clients`, `instructions`, …) and LSP, so those reads must
+// return the flag-off empty value instead of aborting the loop.
+// ---------------------------------------------------------------------------
+
+/** Resolve a replacement layer by its source node, failing loud when absent. */
+const boundaryLayer = <A>(replacements: LayerNode.Replacements, source: LayerNode.AnyNode): Layer.Layer<A> => {
+  const found = replacements.find(([node]) => node === source)?.[1]
+  if (found === undefined) throw new Error(`no boundary replacement for ${source.name}`)
+  return found as Layer.Layer<A>
+}
+
+describe("boundary mocks are functional (f-w5)", () => {
+  test("the production MCP boundary serves an empty catalog instead of throwing", async () => {
+    const layer = boundaryLayer<MCP.Service>(boundaryReplacements(snapshot()), MCP.node)
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const mcp = yield* MCP.Service
+        return {
+          status: yield* mcp.status(),
+          clients: yield* mcp.clients(),
+          instructions: yield* mcp.instructions(),
+          tools: yield* mcp.tools(),
+          prompts: yield* mcp.prompts(),
+          resources: yield* mcp.resources(),
+          resourceTemplates: yield* mcp.resourceTemplates(),
+        }
+      }).pipe(Effect.provide(layer)),
+    )
+    expect(result).toEqual({
+      status: {},
+      clients: {},
+      instructions: [],
+      tools: {},
+      prompts: {},
+      resources: {},
+      resourceTemplates: {},
+    })
+  })
+
+  test("the production LSP boundary reports no clients instead of throwing", async () => {
+    const layer = boundaryLayer<LSP.Service>(boundaryReplacements(snapshot()), LSP.node)
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const lsp = yield* LSP.Service
+        return {
+          status: yield* lsp.status(),
+          hasClients: yield* lsp.hasClients("/x.ts"),
+          diagnostics: yield* lsp.diagnostics(),
+        }
+      }).pipe(Effect.provide(layer)),
+    )
+    expect(result).toEqual({ status: [], hasClients: false, diagnostics: {} })
+  })
+
+  test("an unsupported MCP mutation still fails loud", async () => {
+    const layer = boundaryLayer<MCP.Service>(boundaryReplacements(snapshot()), MCP.node)
+    await expect(
+      Effect.runPromise(
+        Effect.gen(function* () {
+          const mcp = yield* MCP.Service
+          return yield* mcp.add("server", {} as never)
+        }).pipe(Effect.provide(layer)),
+      ),
+    ).rejects.toThrow(/MCP/)
   })
 })
 
@@ -673,5 +754,151 @@ describe("runnable graph persistence (o1-w2)", () => {
     } finally {
       native.close()
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// f-w2-provider — the worker runs exactly one serialized model.
+//
+// `SessionPrompt` resolves the model from the session/user message, while the
+// reduced provider serves only the model the hub serialized. A mismatch must
+// fail with a typed error naming both models before any provider call, instead
+// of a generic `ProviderModelNotFoundError` defect mid-run.
+// ---------------------------------------------------------------------------
+
+const reducedConfig: WorkerModelConfig = {
+  providerID: "test",
+  modelID: "test-model",
+  apiId: "test-api",
+  npm: "@ai-sdk/openai-compatible",
+  baseUrl: "https://example.test/v1",
+  apiKey: "sk-test",
+  headers: { "x-test": "1" },
+}
+
+const readReducedModel = (providerID: string, modelID: string) =>
+  Effect.gen(function* () {
+    const provider = yield* Provider.Service
+    return yield* provider.getModel(ProviderV2.ID.make(providerID), ModelV2.ID.make(modelID))
+  }).pipe(Effect.provide(reducedModelProviderLayer(reducedConfig)))
+
+describe("reduced worker provider — single serialized model (f-w2)", () => {
+  test("serves the serialized provider/model pair", async () => {
+    const model = await Effect.runPromise(readReducedModel("test", "test-model"))
+    expect(model.api.id).toBe("test-api")
+    expect(model.headers).toEqual({ "x-test": "1" })
+  })
+
+  test("a mismatched model fails with a typed error naming both models", async () => {
+    const result = await Effect.runPromise(Effect.result(readReducedModel("test", "other-model")))
+    expect(result._tag).toBe("Failure")
+    if (result._tag !== "Failure") return
+    expect(result.failure).toBeInstanceOf(WorkerModelMismatchError)
+    const error = result.failure as unknown as WorkerModelMismatchError
+    expect(error.requestedModelID).toBe("other-model")
+    expect(error.serializedModelID).toBe("test-model")
+    expect(error.message).toContain("other-model")
+    expect(error.message).toContain("test-model")
+  })
+
+  test("a mismatched provider fails with the same typed error", async () => {
+    const result = await Effect.runPromise(Effect.result(readReducedModel("other", "test-model")))
+    expect(result._tag).toBe("Failure")
+    if (result._tag !== "Failure") return
+    expect(result.failure).toBeInstanceOf(WorkerModelMismatchError)
+    expect((result.failure as unknown as WorkerModelMismatchError).requestedProviderID).toBe("other")
+  })
+
+  test("honors the serialized npm instead of always using an OpenAI-compatible SDK", async () => {
+    const languageFor = (npm: string) =>
+      Effect.runPromise(
+        Effect.gen(function* () {
+          const provider = yield* Provider.Service
+          return yield* provider.getLanguage({
+            id: ModelV2.ID.make("test-model"),
+            providerID: ProviderV2.ID.make("test"),
+            api: { id: "test-api", url: "https://example.test/v1", npm },
+          } as unknown as Provider.Model)
+        }).pipe(Effect.provide(reducedModelProviderLayer({ ...reducedConfig, npm }))),
+      )
+
+    // The Anthropic SDK names the model `test`; the OpenAI-compatible default
+    // names it `test.chat`. The npm identity therefore changes the SDK.
+    const anthropic = (await languageFor("@ai-sdk/anthropic")) as unknown as { provider: string }
+    const compatible = (await languageFor("@ai-sdk/openai-compatible")) as unknown as { provider: string }
+    expect(anthropic.provider).toBe("test")
+    expect(compatible.provider).toBe("test.chat")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// f-w2-provider — non-serializable provider/model data is diagnosed at hub
+// build (`resolveWorkerModel`, called by `buildSessionWorkerInit`), not carried
+// into `workerData` where `structuredClone` would reject it at spawn.
+// ---------------------------------------------------------------------------
+
+const hubProviderInfo = {
+  id: "test",
+  name: "Test",
+  source: "config",
+  env: [],
+  key: "k",
+  options: {},
+  models: {},
+} as unknown as Provider.Info
+
+const hubProviderModel = {
+  id: "test-model",
+  providerID: "test",
+  api: { id: "test-api", url: "https://example.test/v1", npm: "@ai-sdk/openai-compatible" },
+  name: "Test Model",
+  capabilities: {},
+  cost: {},
+  limit: { context: 1_000, output: 1_000 },
+  status: "active",
+  options: {},
+  headers: { "x-model": "1" },
+  release_date: "",
+} as unknown as Provider.Model
+
+interface HubModelLayerInput {
+  readonly providerOptions?: Record<string, unknown>
+  readonly modelHeaders?: Record<string, string>
+}
+
+const hubModelLayers = (input: HubModelLayerInput = {}) =>
+  Layer.mergeAll(
+    Layer.succeed(Provider.Service, {
+      defaultModel: () =>
+        Effect.succeed({ providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") }),
+      getProvider: () => Effect.succeed({ ...hubProviderInfo, options: input.providerOptions ?? {} }),
+      getModel: () => Effect.succeed({ ...hubProviderModel, headers: input.modelHeaders ?? hubProviderModel.headers }),
+    } as unknown as Provider.Interface),
+    Layer.succeed(Auth.Service, { get: () => Effect.succeed(undefined) } as unknown as Auth.Interface),
+    Layer.succeed(Config.Service, { get: () => Effect.succeed({} as never) } as unknown as Config.Interface),
+  )
+
+const resolveHubModel = (input: HubModelLayerInput = {}) =>
+  Effect.runPromise(Effect.result(resolveWorkerModel().pipe(Effect.provide(hubModelLayers(input)))))
+
+describe("worker model serializability — detected at hub build (f-w2)", () => {
+  test("a function in the selected model's headers is rejected", async () => {
+    const result = await resolveHubModel({ modelHeaders: { authorization: (() => "token") as never } })
+    expect(result._tag).toBe("Failure")
+    if (result._tag !== "Failure") return
+    expect(result.failure).toBeInstanceOf(WorkerModelNotSerializableError)
+    const error = result.failure as WorkerModelNotSerializableError
+    expect(error.field).toBe("headers.authorization")
+    expect(error.kind).toBe("function")
+  })
+
+  test("a symbol nested in provider options is rejected", async () => {
+    const result = await resolveHubModel({ providerOptions: { transport: { token: Symbol("secret") } } })
+    expect(result._tag).toBe("Failure")
+    if (result._tag !== "Failure") return
+    expect(result.failure).toBeInstanceOf(WorkerModelNotSerializableError)
+    const error = result.failure as WorkerModelNotSerializableError
+    expect(error.field).toBe("transport.token")
+    expect(error.kind).toBe("symbol")
   })
 })

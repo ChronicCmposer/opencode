@@ -25,16 +25,14 @@ import {
   ModelClient,
   PIPELINE_SESSION_NODES,
   RUNNABLE_SESSION_NODES,
+  WorkerModelMismatchError,
   buildSessionWorkerLayer,
   createHubProxyClient,
   serveHubProxy,
   type SessionLayerOptions,
+  type WorkerModelConfig,
 } from "@/session/worker/layer"
-import {
-  DEFAULT_WORK_KIND,
-  UnknownWorkKindError,
-  type SessionWork,
-} from "@/session/worker/execute"
+import { DEFAULT_WORK_KIND, UnknownWorkKindError, type SessionWork } from "@/session/worker/execute"
 import {
   MissingWorkerPortError,
   bootstrapSessionWorker,
@@ -42,8 +40,12 @@ import {
   createSessionWork,
   createWorkRegistry,
   productionWorkRegistry,
+  workerGraphReplacements,
+  workerInstanceContext,
   writerReadMessages,
 } from "@/session/worker/session-worker"
+import { Snapshot } from "@/snapshot"
+import { GlobalBus } from "@/bus/global"
 import { createHubEventSink } from "@/session/worker/hub"
 import { workerSnapshot } from "../../lib/snapshot"
 import { withParts } from "../../lib/session-parts"
@@ -450,7 +452,6 @@ describe("worker run-state idle parity (flag-on)", () => {
     expect(store.get("ses_done")).toEqual({ type: "idle" })
   })
 
-
   test("cancelling the worker-local runner also publishes idle through the hub-proxy", async () => {
     const { built, store } = workerWithStatusStore()
 
@@ -585,6 +586,75 @@ describe("real SessionPrompt.loop over the writer-backed worker Database (E2E)",
       fs.rmSync(directory, { recursive: true, force: true })
     }
   }, 60_000)
+
+  test("a git-backed project completes the loop without UnimplementedError", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-e2e-git-"))
+    await using provider = startMockProvider({ chunks: ["hel", "lo"] })
+    const config = mkModelConfig(provider)
+    // A git-backed project: without the worker Snapshot boundary the processor's
+    // `snapshot.track()` reaches `git` through the hub-owned `AppProcess` and the
+    // run dies with `UnimplementedError`.
+    const snapshot = workerSnapshot({ directory, projectId: "prj_git", projectVcs: "git" })
+    const ctx = createE2EContext({
+      snapshot,
+      modelConfig: config,
+      replacements: workerGraphReplacements(config),
+    })
+    try {
+      const sessionID = await Effect.runPromise(seedSession(ctx, provider.model, "hi"))
+      const work = createSessionWork({
+        layer: ctx.layer,
+        writer: ctx.writer,
+        threadId: 7,
+        prompt: true,
+        instance: workerInstanceContext(snapshot),
+      })
+      const result = await Effect.runPromise(work(sessionID))
+      const value = result.value as { parts: ReadonlyArray<{ type: string; text?: string }> }
+      const text = value.parts
+        .filter((part) => part.type === "text")
+        .map((part) => part.text ?? "")
+        .join("")
+      expect(text).toBe("hello")
+    } finally {
+      await ctx.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  }, 60_000)
+
+  test("a session whose model differs from the serialized worker model fails with a typed error before any provider call", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-e2e-mismatch-"))
+    await using provider = startMockProvider({ chunks: ["never"] })
+    const ctx = createE2EContext({
+      snapshot: workerSnapshot({ directory }),
+      modelConfig: mkModelConfig(provider),
+    })
+    try {
+      // The worker was bootstrapped with `provider.model`; the session asks for a
+      // different model, which the single-model reduced provider cannot serve.
+      const sessionID = await Effect.runPromise(seedSession(ctx, "other-model", "hi"))
+      const work = createSessionWork({
+        layer: ctx.layer,
+        writer: ctx.writer,
+        threadId: 7,
+        prompt: true,
+        instance: ctx.instance,
+      })
+      const error = await Effect.runPromise(work(sessionID)).then(
+        () => undefined,
+        (cause: unknown) => cause,
+      )
+
+      // Typed, names both models, and diagnosed before the provider is called.
+      expect(error).toBeInstanceOf(WorkerModelMismatchError)
+      expect((error as Error).message).toContain("other-model")
+      expect((error as Error).message).toContain(provider.model)
+      expect(provider.requests).toHaveLength(0)
+    } finally {
+      await ctx.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  }, 60_000)
 })
 
 // ---------------------------------------------------------------------------
@@ -616,10 +686,7 @@ describe("real SessionPrompt.loop error over the worker (E2E)", () => {
       snapshot: workerSnapshot({ directory }),
       modelConfig: mkModelConfig(provider),
       replacements: [
-        [
-          EventEgressClientNode,
-          Layer.succeed(EventEgressClientService, { emit: (event) => void crossed.push(event) }),
-        ],
+        [EventEgressClientNode, Layer.succeed(EventEgressClientService, { emit: (event) => void crossed.push(event) })],
       ],
     })
     try {
@@ -669,4 +736,139 @@ describe("real SessionPrompt.loop error over the worker (E2E)", () => {
       fs.rmSync(directory, { recursive: true, force: true })
     }
   }, 60_000)
+})
+
+// ---------------------------------------------------------------------------
+// Fix B — the worker's ambient `InstanceRef` must carry a real project.
+//
+// Production used to install `project: undefined as never`, so every
+// `ctx.project.id` reader (`Snapshot.state`, `Session.create`,
+// `event-v2-bridge`) threw `TypeError` as soon as the worker booted. The hub now
+// ships the project identity on the snapshot, and the entry rebuilds a valid
+// `InstanceContext.project` from it.
+// ---------------------------------------------------------------------------
+
+describe("workerInstanceContext (Fix B)", () => {
+  test("rebuilds a valid project from the snapshot identity", () => {
+    const snapshot = workerSnapshot({
+      directory: "/tmp/oc-worker-dir",
+      projectId: "prj_real",
+      projectVcs: "git",
+      worktree: "/tmp/oc-worker-wt",
+    })
+    const ctx = workerInstanceContext(snapshot)
+    expect(ctx.directory).toBe("/tmp/oc-worker-dir")
+    expect(ctx.worktree).toBe("/tmp/oc-worker-wt")
+    expect(String(ctx.project.id)).toBe("prj_real")
+    expect(ctx.project.vcs).toBe("git")
+    expect(ctx.project.worktree).toBe("/tmp/oc-worker-wt")
+  })
+
+  test("a snapshot without a project id falls back to the directory, never undefined", () => {
+    const ctx = workerInstanceContext(workerSnapshot({ directory: "/tmp/oc-worker-bare" }))
+    expect(String(ctx.project.id)).toBe("/tmp/oc-worker-bare")
+    expect(ctx.project.vcs).toBeUndefined()
+    expect(ctx.worktree).toBe("/tmp/oc-worker-bare")
+  })
+})
+
+describe("worker snapshot tracking without vcs (Fix B)", () => {
+  test("Snapshot.track is a safe no-op when the project has no vcs", async () => {
+    // A git project would make `track` shell out to the (worker-mocked)
+    // `AppProcess`; a vcs-less project must short-circuit before any git call.
+    const snapshot = workerSnapshot({ directory: "/tmp/oc-worker-novcs", projectId: "prj_novcs" })
+    const built = buildSessionWorkerLayer({
+      snapshot,
+      env: { values: {} },
+      clients: stubClients(),
+      modelClient: modelLayer("worker text"),
+    })
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const snap = yield* Snapshot.Service
+        return yield* snap.track()
+      }).pipe(Effect.provide(built.layer), Effect.provideService(InstanceRef, workerInstanceContext(snapshot))),
+    )
+    expect(result).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Wave-2 consolidation #2: a git-backed project must not crash the worker.
+//
+// The worker has no OS child-process authority (`AppProcess` is a hub-owned
+// node), so the real `Snapshot` service dies with `UnimplementedError` the
+// moment it shells out to `git`. The worker installs a fail-soft `Snapshot`
+// boundary instead; the session still completes, only snapshot/revert is
+// unavailable in the isolate.
+// ---------------------------------------------------------------------------
+
+describe("worker Snapshot boundary for a git-backed project (Wave-2 consolidation #2)", () => {
+  const gitConfig: WorkerModelConfig = {
+    providerID: "mock",
+    modelID: "mock-model",
+    apiId: "mock-model",
+    npm: "@ai-sdk/openai-compatible",
+    baseUrl: "http://127.0.0.1:1/v1",
+    apiKey: "k",
+    headers: {},
+  }
+
+  test("Snapshot.track is a fail-soft no-op when the project is git-backed", async () => {
+    const snapshot = workerSnapshot({ directory: "/tmp/oc-worker-git", projectId: "prj_git", projectVcs: "git" })
+    const built = buildSessionWorkerLayer({
+      snapshot,
+      env: { values: {} },
+      clients: stubClients(),
+      modelClient: modelLayer("worker text"),
+      replacements: workerGraphReplacements(gitConfig),
+    })
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const snap = yield* Snapshot.Service
+        return yield* snap.track()
+      }).pipe(Effect.provide(built.layer), Effect.provideService(InstanceRef, workerInstanceContext(snapshot))),
+    )
+    expect(result).toBeUndefined()
+  })
+})
+
+describe("worker event bridge tolerates a project-less instance (Fix B guard)", () => {
+  const ProjectlessThing = EventV2.define({
+    type: "test.worker.projectless",
+    schema: { sessionID: Schema.String, text: Schema.String },
+  })
+
+  test("the GlobalBus listener does not throw when the ambient instance has no project", async () => {
+    const received: Array<{ type?: string; project?: string }> = []
+    const onEvent = (event: { payload?: { type?: string }; project?: string }) =>
+      void received.push({ type: event.payload?.type, project: event.project })
+    GlobalBus.on("event", onEvent as never)
+    const built = buildSessionWorkerLayer({
+      snapshot: workerSnapshot(),
+      env: { values: {} },
+      clients: stubClients(),
+      modelClient: modelLayer("worker text"),
+    })
+    try {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const events = yield* EventV2Bridge.Service
+          yield* events.publish(ProjectlessThing, { sessionID: "ses_x", text: "hi" })
+        }).pipe(
+          Effect.provide(built.layer),
+          Effect.provideService(InstanceRef, {
+            directory: workerSnapshot().directory,
+            worktree: workerSnapshot().directory,
+            project: undefined as never,
+          }),
+        ),
+      )
+      const forwarded = received.filter((event) => event.type === "test.worker.projectless")
+      expect(forwarded).toHaveLength(1)
+      expect(forwarded[0].project).toBeUndefined()
+    } finally {
+      GlobalBus.off("event", onEvent as never)
+    }
+  })
 })

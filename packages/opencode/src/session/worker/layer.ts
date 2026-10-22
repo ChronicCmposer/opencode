@@ -19,7 +19,7 @@
 // node table, so a regression that reintroduces an excluded node such as
 // `Database` into the session graph fails at build time, not at run time.
 
-import { Context, Effect, Layer, Stream } from "effect"
+import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
@@ -33,6 +33,9 @@ import { LLMEvent } from "@opencode-ai/llm"
 import { LLMClient } from "@opencode-ai/llm/route"
 import { llmClient } from "@opencode-ai/core/effect/app-node-platform"
 import type { LanguageModelV3 } from "@ai-sdk/provider"
+import { createAnthropic } from "@ai-sdk/anthropic"
+import { createGoogleGenerativeAI } from "@ai-sdk/google"
+import { createOpenAI } from "@ai-sdk/openai"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 
 import type { SessionID } from "@/session/schema"
@@ -376,8 +379,10 @@ export function questionProxyLayer(client: HubProxyClient): Layer.Layer<Question
   const service = {
     ask: (input: { sessionID: SessionID; questions: ReadonlyArray<Question.Info>; tool?: Question.Tool }) =>
       hubProxyCall<ReadonlyArray<Question.Answer>>(client, "ask", [input]),
-    reply: (input: { requestID: Parameters<Question.Interface["reject"]>[0]; answers: ReadonlyArray<Question.Answer> }) =>
-      hubProxyCall<void>(client, "reply", [input]),
+    reply: (input: {
+      requestID: Parameters<Question.Interface["reject"]>[0]
+      answers: ReadonlyArray<Question.Answer>
+    }) => hubProxyCall<void>(client, "reply", [input]),
     reject: (requestID: Parameters<Question.Interface["reject"]>[0]) =>
       hubProxyCall<void>(client, "reject", [requestID]),
     list: () => hubProxyCall<ReadonlyArray<Question.Request>>(client, "list", []),
@@ -411,6 +416,17 @@ export interface WorkerSnapshot {
   /** Monotonic snapshot epoch; a bump invalidates stale-tolerant caches. */
   readonly epoch: number
   readonly directory: string
+  /**
+   * The project id the worker's ambient `InstanceRef` carries. Shipped from the
+   * hub's instance context so the isolate can rebuild a valid `Project.Info` —
+   * `Snapshot.state`, `Session.create` and the event bridge all read `project.id`
+   * and previously crashed on the `project: undefined as never` placeholder.
+   */
+  readonly projectId?: string
+  /** The project VCS (`"git"`) when the hub's project is version-controlled. */
+  readonly projectVcs?: "git"
+  /** The project worktree; defaults to `directory` in the worker. */
+  readonly worktree?: string
   readonly config: ConfigV1.Info
   readonly auth: Readonly<Record<string, unknown>>
   readonly modelsDev: Readonly<Record<string, ModelsDev.Provider>>
@@ -426,9 +442,7 @@ export interface WorkerEnv {
 export class WorkerSnapshotService extends Context.Service<WorkerSnapshotService, WorkerSnapshot>()(
   "@opencode/session-worker/Snapshot",
 ) {}
-export class WorkerEnvService extends Context.Service<WorkerEnvService, WorkerEnv>()(
-  "@opencode/session-worker/Env",
-) {}
+export class WorkerEnvService extends Context.Service<WorkerEnvService, WorkerEnv>()("@opencode/session-worker/Env") {}
 
 export const WorkerSnapshotNode = LayerNode.unbound(WorkerSnapshotService, workerTags.values.worker)
 export const WorkerEnvNode = LayerNode.unbound(WorkerEnvService, workerTags.values.worker)
@@ -590,10 +604,207 @@ export function databaseBoundaryLayer(): Layer.Layer<Database.Service> {
   return Layer.succeed(Database.Service, database)
 }
 
+// ---------------------------------------------------------------------------
+// Functional boundary layers for the hub / broker-owned authorities.
+//
+// A worker legitimately owns no MCP/LSP servers, no OS process, no git checkout
+// and no storage. Each layer below therefore serves the flag-off EMPTY value for
+// the reads the session path performs (an MCP catalog with no servers, an LSP
+// with no clients) and fails loud with a {@link SessionLayerBoundaryError} for a
+// mutation a worker may not perform. The previous `Layer.mock(Service, {})`
+// provided neither: an unlisted read died with `Unimplemented method "<name>"`,
+// aborting the prompt loop the moment it read the MCP catalog.
+// ---------------------------------------------------------------------------
+
+/** The MCP boundary: a worker owns no servers, so every catalog read is empty. */
+export function mcpBoundaryLayer(): Layer.Layer<MCP.Service> {
+  const mcp: MCP.Interface = {
+    status: () => Effect.succeed({}),
+    clients: () => Effect.succeed({}),
+    instructions: () => Effect.succeed([]),
+    tools: () => Effect.succeed({}),
+    prompts: () => Effect.succeed({}),
+    resources: () => Effect.succeed({}),
+    resourceTemplates: () => Effect.succeed({}),
+    getPrompt: () => Effect.succeed(undefined),
+    readResource: () => Effect.succeed(undefined),
+    hasStoredTokens: () => Effect.succeed(false),
+    getAuthStatus: () => Effect.succeed("not_authenticated"),
+    supportsOAuth: () => Effect.succeed(false),
+    add: () => boundaryViolation("MCP", "add"),
+    connect: () => boundaryViolation("MCP", "connect"),
+    disconnect: () => boundaryViolation("MCP", "disconnect"),
+    startAuth: () => boundaryViolation("MCP", "startAuth"),
+    authenticate: () => boundaryViolation("MCP", "authenticate"),
+    finishAuth: () => boundaryViolation("MCP", "finishAuth"),
+    removeAuth: () => boundaryViolation("MCP", "removeAuth"),
+  }
+  return Layer.succeed(MCP.Service, mcp)
+}
+
+/** The LSP boundary: a worker owns no language servers, so every read is empty. */
+export function lspBoundaryLayer(): Layer.Layer<LSP.Service> {
+  const lsp: LSP.Interface = {
+    init: () => Effect.void,
+    status: () => Effect.succeed([]),
+    hasClients: () => Effect.succeed(false),
+    touchFile: () => Effect.void,
+    diagnostics: () => Effect.succeed({}),
+    hover: () => Effect.succeed(undefined),
+    definition: () => Effect.succeed([]),
+    references: () => Effect.succeed([]),
+    implementation: () => Effect.succeed([]),
+    documentSymbol: () => Effect.succeed([]),
+    workspaceSymbol: () => Effect.succeed([]),
+    prepareCallHierarchy: () => Effect.succeed([]),
+    incomingCalls: () => Effect.succeed([]),
+    outgoingCalls: () => Effect.succeed([]),
+  }
+  return Layer.succeed(LSP.Service, lsp)
+}
+
+/** The MCP auth boundary: no stored tokens; persistence is hub-owned. */
+export function mcpAuthBoundaryLayer(): Layer.Layer<McpAuth.Service> {
+  const auth: McpAuth.Interface = {
+    all: () => Effect.succeed({}),
+    get: () => Effect.succeed(undefined),
+    getForUrl: () => Effect.succeed(undefined),
+    getOAuthState: () => Effect.succeed(undefined),
+    set: () => boundaryViolation("McpAuth", "set"),
+    remove: () => boundaryViolation("McpAuth", "remove"),
+    updateTokens: () => boundaryViolation("McpAuth", "updateTokens"),
+    updateClientInfo: () => boundaryViolation("McpAuth", "updateClientInfo"),
+    updateCodeVerifier: () => boundaryViolation("McpAuth", "updateCodeVerifier"),
+    clearCodeVerifier: () => boundaryViolation("McpAuth", "clearCodeVerifier"),
+    updateOAuthState: () => boundaryViolation("McpAuth", "updateOAuthState"),
+    clearOAuthState: () => boundaryViolation("McpAuth", "clearOAuthState"),
+  }
+  return Layer.succeed(McpAuth.Service, auth)
+}
+
+/** The Npm boundary: a worker never installs packages; resolution is hub-only. */
+export function npmBoundaryLayer(): Layer.Layer<Npm.Service> {
+  const npm: Npm.Interface = {
+    which: () => Effect.succeed(undefined),
+    add: () => boundaryViolation("Npm", "add"),
+    install: () => boundaryViolation("Npm", "install"),
+  }
+  return Layer.succeed(Npm.Service, npm)
+}
+
+/** The Account boundary: read-only; a worker has no account authority. */
+export function accountBoundaryLayer(): Layer.Layer<Account.Service> {
+  const account: Account.Interface = {
+    active: () => Effect.succeed(Option.none()),
+    activeOrg: () => Effect.succeed(Option.none()),
+    list: () => Effect.succeed([]),
+    orgsByAccount: () => Effect.succeed([]),
+    orgs: () => Effect.succeed([]),
+    config: () => Effect.succeed(Option.none()),
+    token: () => Effect.succeed(Option.none()),
+    remove: () => boundaryViolation("Account", "remove"),
+    use: () => boundaryViolation("Account", "use"),
+    login: () => boundaryViolation("Account", "login"),
+    poll: () => boundaryViolation("Account", "poll"),
+  }
+  return Layer.succeed(Account.Service, account)
+}
+
+/** The AccountRepo boundary: read-only; persistence is hub-owned. */
+export function accountRepoBoundaryLayer(): Layer.Layer<AccountRepo.Service> {
+  const repo: AccountRepo.Interface = {
+    active: () => Effect.succeed(Option.none()),
+    list: () => Effect.succeed([]),
+    getRow: () => Effect.succeed(Option.none()),
+    remove: () => boundaryViolation("AccountRepo", "remove"),
+    use: () => boundaryViolation("AccountRepo", "use"),
+    persistToken: () => boundaryViolation("AccountRepo", "persistToken"),
+    persistAccount: () => boundaryViolation("AccountRepo", "persistAccount"),
+  }
+  return Layer.succeed(AccountRepo.Service, repo)
+}
+
+/** The Storage boundary: a worker owns no durable store; only `list` is empty. */
+export function storageBoundaryLayer(): Layer.Layer<Storage.Service> {
+  const storage: Storage.Interface = {
+    list: () => Effect.succeed([]),
+    read: () => boundaryViolation("Storage", "read"),
+    update: () => boundaryViolation("Storage", "update"),
+    write: () => boundaryViolation("Storage", "write"),
+    remove: () => boundaryViolation("Storage", "remove"),
+  }
+  return Layer.succeed(Storage.Service, storage)
+}
+
+/** The Git boundary: a worker owns no checkout; every operation is process-backed. */
+export function gitBoundaryLayer(): Layer.Layer<Git.Service> {
+  const git: Git.Interface = {
+    run: () => boundaryViolation("Git", "run"),
+    branch: () => boundaryViolation("Git", "branch"),
+    prefix: () => boundaryViolation("Git", "prefix"),
+    defaultBranch: () => boundaryViolation("Git", "defaultBranch"),
+    hasHead: () => boundaryViolation("Git", "hasHead"),
+    mergeBase: () => boundaryViolation("Git", "mergeBase"),
+    show: () => boundaryViolation("Git", "show"),
+    status: () => boundaryViolation("Git", "status"),
+    diff: () => boundaryViolation("Git", "diff"),
+    stats: () => boundaryViolation("Git", "stats"),
+    patch: () => boundaryViolation("Git", "patch"),
+    patchAll: () => boundaryViolation("Git", "patchAll"),
+    patchUntracked: () => boundaryViolation("Git", "patchUntracked"),
+    statUntracked: () => boundaryViolation("Git", "statUntracked"),
+    applyPatch: () => boundaryViolation("Git", "applyPatch"),
+  }
+  return Layer.succeed(Git.Service, git)
+}
+
+/**
+ * The AppProcess boundary: a worker owns no OS child-process authority, so
+ * every operation fails loud. `spawn`/`run` are Effects; the two stream forms
+ * use `Stream.die` to fail in their own stream channel.
+ */
+export function appProcessBoundaryLayer(): Layer.Layer<AppProcess.Service> {
+  const unsupportedStream = (member: string): Stream.Stream<never, never> =>
+    Stream.die(new SessionLayerBoundaryError("AppProcess", member))
+  const appProcess: AppProcess.Interface = {
+    spawn: () => boundaryViolation("AppProcess", "spawn"),
+    exitCode: () => boundaryViolation("AppProcess", "exitCode"),
+    streamString: () => unsupportedStream("streamString"),
+    streamLines: () => unsupportedStream("streamLines"),
+    lines: () => boundaryViolation("AppProcess", "lines"),
+    string: () => boundaryViolation("AppProcess", "string"),
+    run: () => boundaryViolation("AppProcess", "run"),
+    runStream: () => unsupportedStream("runStream"),
+  }
+  return Layer.succeed(AppProcess.Service, appProcess)
+}
+
+/** The ripgrep binary boundary: a worker never downloads or locates the binary. */
+export function ripgrepBinaryBoundaryLayer(): Layer.Layer<RipgrepBinary.Service> {
+  return Layer.succeed(RipgrepBinary.Service, {
+    filepath: boundaryViolation("RipgrepBinary", "filepath"),
+  })
+}
+
+/** The ripgrep boundary: a worker owns no search process; every search fails loud. */
+export function ripgrepBoundaryLayer(): Layer.Layer<Ripgrep.Service> {
+  return Layer.succeed(Ripgrep.Service, {
+    find: () => boundaryViolation("Ripgrep", "find"),
+    glob: () => boundaryViolation("Ripgrep", "glob"),
+    grep: () => boundaryViolation("Ripgrep", "grep"),
+  })
+}
+
+/** The MCP browser boundary: a worker never opens a browser. */
+export function mcpBrowserBoundaryLayer(): Layer.Layer<McpBrowser.Service> {
+  return Layer.succeed(McpBrowser.Service, {
+    open: () => boundaryViolation("McpBrowser", "open"),
+  })
+}
+
 /** A writer primitive the reduced/degraded handle did not implement. */
-const missingWriterPrimitive =
-  (method: keyof WriterTransactionHandle) => (): Promise<never> =>
-    Promise.reject(new SessionLayerBoundaryError("WriterClient", method))
+const missingWriterPrimitive = (method: keyof WriterTransactionHandle) => (): Promise<never> =>
+  Promise.reject(new SessionLayerBoundaryError("WriterClient", method))
 
 /**
  * Parse the worker writer handle into the statement surface the writer-backed
@@ -680,27 +891,30 @@ export function boundaryReplacements(
     // `db.transaction`, which the writer-backed Database routes through the writer
     // tx primitives — so projection is atomic with the event insert, exactly as
     // flag-off. (The node-table classifies it `worker-local`.)
-    // Hub-owned / broker-owned authorities the reduced graph yields. A mock
-    // provides the service shape so the graph BOOTS (an `Layer.empty` provides
-    // nothing, so `SessionPrompt`'s `yield* MCP.Service`/`LSP.Service` would
-    // fail at build); a worker that reaches one fails loud at call time.
-    [MCP.node, Layer.mock(MCP.Service, {})],
-    [LSP.node, Layer.mock(LSP.Service, {})],
-    [McpAuth.node, Layer.mock(McpAuth.Service, {})],
-    [Npm.node, Layer.mock(Npm.Service, {})],
-    [Account.node, Layer.mock(Account.Service, {})],
-    [AccountRepo.node, Layer.mock(AccountRepo.Service, {})],
+    // Hub-owned / broker-owned authorities the reduced graph yields. Each is a
+    // FUNCTIONAL boundary: the graph BOOTS (an `Layer.empty` provides nothing, so
+    // `SessionPrompt`'s `yield* MCP.Service`/`LSP.Service` would fail at build)
+    // AND a session that reads a neutral catalog (MCP `clients`/`instructions`,
+    // LSP `diagnostics`) gets the flag-off empty value instead of aborting. A
+    // genuinely unsupported mutation (an MCP `add`, a git `run`) still fails loud
+    // with a `SessionLayerBoundaryError`.
+    [MCP.node, mcpBoundaryLayer()],
+    [LSP.node, lspBoundaryLayer()],
+    [McpAuth.node, mcpAuthBoundaryLayer()],
+    [Npm.node, npmBoundaryLayer()],
+    [Account.node, accountBoundaryLayer()],
+    [AccountRepo.node, accountRepoBoundaryLayer()],
     // Residual hub/writer/broker/infra boundaries (see `SESSION_EXCLUDED`).
-    [Storage.node, Layer.mock(Storage.Service, {})],
-    [Git.node, Layer.mock(Git.Service, {})],
+    [Storage.node, storageBoundaryLayer()],
+    [Git.node, gitBoundaryLayer()],
     [BackgroundJob.node, backgroundJob ?? localBackgroundJobLayer()],
     // `Global` is a plain record of paths (no I/O); the real value is safe and
     // lets any read of `Global.Path`/`Service` work rather than return undefined.
     [Global.node, Layer.succeed(Global.Service, Global.make())],
-    [AppProcess.node, Layer.mock(AppProcess.Service, {})],
-    [RipgrepBinary.node, Layer.mock(RipgrepBinary.Service, {})],
-    [Ripgrep.node, Layer.mock(Ripgrep.Service, {})],
-    [McpBrowser.node, Layer.mock(McpBrowser.Service, {})],
+    [AppProcess.node, appProcessBoundaryLayer()],
+    [RipgrepBinary.node, ripgrepBinaryBoundaryLayer()],
+    [Ripgrep.node, ripgrepBoundaryLayer()],
+    [McpBrowser.node, mcpBrowserBoundaryLayer()],
     // The hub composes the location service map; the worker never resolves a
     // location for a V1 session, so a lazily-built empty map satisfies the graph
     // without pulling the V2 location graph into the isolate.
@@ -739,6 +953,31 @@ function reducedProviderInfo(config: WorkerModelConfig, model: Provider.Model): 
   }
 }
 
+/**
+ * Raised when a session asks the worker for a provider/model other than the one
+ * the hub serialized into its bootstrap. A worker owns exactly one model, so the
+ * mismatch is diagnosed at the provider boundary — naming both models — before
+ * any request is made, instead of surfacing as a generic
+ * `ProviderModelNotFoundError` die mid-run.
+ */
+export class WorkerModelMismatchError extends Schema.TaggedErrorClass<WorkerModelMismatchError>()(
+  "WorkerModelMismatchError",
+  {
+    requestedProviderID: Schema.String,
+    requestedModelID: Schema.String,
+    serializedProviderID: Schema.String,
+    serializedModelID: Schema.String,
+  },
+) {
+  override get message() {
+    return `Model not found: session worker was bootstrapped for ${this.serializedProviderID}/${this.serializedModelID}, but the session requested ${this.requestedProviderID}/${this.requestedModelID}. A worker can only run its serialized model.`
+  }
+
+  static isInstance(input: unknown): input is WorkerModelMismatchError {
+    return input instanceof WorkerModelMismatchError
+  }
+}
+
 function reducedProviderModel(config: WorkerModelConfig): Provider.Model {
   return {
     id: ModelV2.ID.make(config.modelID),
@@ -763,41 +1002,74 @@ function reducedProviderModel(config: WorkerModelConfig): Provider.Model {
   }
 }
 
+interface WorkerLanguageSdk {
+  languageModel(modelID: string): LanguageModelV3
+}
+
 /**
- * The reduced in-worker `Provider`: an OpenAI-compatible client over the
- * serialized `{baseUrl, apiKey, model}` bootstrap. `getLanguage` returns a real
- * AI-SDK language model, so the worker makes the HTTP call itself.
+ * Build the reduced provider's SDK from the serialized `npm`, so a worker makes
+ * the provider-shaped request the hub resolved instead of always an
+ * OpenAI-compatible body. Unknown packages keep the OpenAI-compatible default
+ * (the previous behavior), so a provider that is OpenAI-compatible but has no
+ * bundled SDK still works.
  */
-export function reducedModelProviderLayer(config: WorkerModelConfig): Layer.Layer<Provider.Service> {
-  const sdk = createOpenAICompatible({
+function createWorkerLanguageSdk(config: WorkerModelConfig): WorkerLanguageSdk {
+  const options = {
     name: config.providerID,
     baseURL: config.baseUrl,
     apiKey: config.apiKey,
     headers: { ...config.headers },
-  })
+  }
+  switch (config.npm) {
+    case "@ai-sdk/anthropic":
+      return createAnthropic(options) as unknown as WorkerLanguageSdk
+    case "@ai-sdk/google":
+      return createGoogleGenerativeAI(options) as unknown as WorkerLanguageSdk
+    case "@ai-sdk/openai":
+      return createOpenAI(options) as unknown as WorkerLanguageSdk
+    default:
+      return createOpenAICompatible(options) as unknown as WorkerLanguageSdk
+  }
+}
+
+/**
+ * The reduced in-worker `Provider`: a client over the serialized
+ * `{baseUrl, apiKey, model, npm}` bootstrap. `getLanguage` returns a real AI-SDK
+ * language model, so the worker makes the HTTP call itself.
+ */
+export function reducedModelProviderLayer(config: WorkerModelConfig): Layer.Layer<Provider.Service> {
+  const sdk = createWorkerLanguageSdk(config)
   const model = reducedProviderModel(config)
   const info = reducedProviderInfo(config, model)
-  const providerID = ProviderV2.ID.make(config.providerID)
-  const modelID = ModelV2.ID.make(config.modelID)
   // The reduced provider serves exactly one model; any other request is a
   // programming error surfaced loudly rather than silently mis-served.
-  const notFound = (requestedID: ModelV2.ID) => new Provider.ModelNotFoundError({ providerID, modelID: requestedID })
-  const service: Provider.Interface = {
+  const mismatch = (requestedProvider: ProviderV2.ID, requestedModel: ModelV2.ID) =>
+    new WorkerModelMismatchError({
+      requestedProviderID: requestedProvider,
+      requestedModelID: requestedModel,
+      serializedProviderID: config.providerID,
+      serializedModelID: config.modelID,
+    })
+  const service = {
     list: () => Effect.succeed({ [info.id]: info }),
     getProvider: () => Effect.succeed(info),
-    getModel: (requestedProvider, requestedModel) =>
+    getModel: (requestedProvider: ProviderV2.ID, requestedModel: ModelV2.ID) =>
       requestedProvider === config.providerID && requestedModel === config.modelID
         ? Effect.succeed(model)
-        : Effect.fail(notFound(requestedModel)),
-    getLanguage: (requested) =>
+        : Effect.fail(mismatch(requestedProvider, requestedModel)),
+    getLanguage: (requested: Provider.Model) =>
       requested.providerID === config.providerID && requested.api.id === config.apiId
-        ? Effect.succeed(sdk.chatModel(config.apiId) as unknown as LanguageModelV3)
-        : Effect.fail(notFound(requested.id)),
+        ? Effect.succeed(sdk.languageModel(config.apiId))
+        : Effect.fail(mismatch(requested.providerID, requested.id)),
     closest: () => Effect.succeed(undefined),
     getSmallModel: () => Effect.succeed(undefined),
     defaultModel: () => Effect.succeed({ providerID: info.id, modelID: model.id }),
   }
-  return Layer.succeed(Provider.Service, service)
+  // The reduced provider is structurally a `Provider.Interface`, but its
+  // single-model mismatch is a more specific typed error than the interface's
+  // `ModelNotFoundError`. The cast keeps that diagnosis intact; the worker's
+  // prompt path surfaces it verbatim instead of a generic not-found die.
+  return Layer.succeed(Provider.Service, service as unknown as Provider.Interface)
 }
 
 /**
@@ -873,7 +1145,10 @@ export function reducedLlmLayer(
     [Config.node, snapshotConfigLayer(snapshot)],
     [Provider.node, reducedModelProviderLayer(config)],
     [Plugin.node, noopPluginLayer()],
-    [Permission.node, hubProxies === undefined ? Layer.mock(Permission.Service, {}) : permissionProxyLayer(hubProxies.permission)],
+    [
+      Permission.node,
+      hubProxies === undefined ? Layer.mock(Permission.Service, {}) : permissionProxyLayer(hubProxies.permission),
+    ],
     [EventV2Bridge.node, Layer.mock(EventV2Bridge.Service, {})],
     [llmClient, Layer.mock(LLMClient.Service, {})],
     [RuntimeFlags.node, Layer.succeed(RuntimeFlags.Service, snapshot.flags)],

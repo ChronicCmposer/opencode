@@ -281,8 +281,6 @@ class WriteThroughCache {
 
 interface Job {
   readonly txHandle?: string
-  /** Control jobs (e.g. `begin`) run even while a transaction is pinned so they can reject. */
-  readonly control?: boolean
   readonly reject: (error: unknown) => void
   readonly run: () => void
 }
@@ -372,7 +370,7 @@ export class WriterCore {
 
   // -- queue ----------------------------------------------------------------
 
-  private enqueue<T>(task: () => Promise<T> | T, options: { readonly txHandle?: string; readonly control?: boolean } = {}): Promise<T> {
+  private enqueue<T>(task: () => Promise<T> | T, options: { readonly txHandle?: string } = {}): Promise<T> {
     if (this.closed) return Promise.reject(new WriterClosedError())
     return new Promise<T>((resolve, reject) => {
       const admit = () => {
@@ -382,7 +380,6 @@ export class WriterCore {
         }
         this.jobs.push({
           txHandle: options.txHandle,
-          control: options.control,
           reject,
           run: () => {
             this.draining = true
@@ -410,18 +407,19 @@ export class WriterCore {
   }
 
   /**
-   * A job may run when nothing is pinned, when it is a control job (it must be
-   * able to reject while a transaction is pinned), or when it belongs to the
-   * pinned transaction handle.
+   * A job may run when nothing is pinned or when it belongs to the pinned
+   * transaction handle. Everything else — including another `begin` — waits for
+   * the pin to clear, so concurrent top-level transactions serialize instead of
+   * rejecting.
    */
   private isRunnable(job: Job): boolean {
-    return this.pinned === undefined || job.control === true || job.txHandle === this.pinned.handle
+    return this.pinned === undefined || job.txHandle === this.pinned.handle
   }
 
   private pump(): void {
     if (this.draining || this.closed) return
     // Unpinned: every job is runnable, so take the FIFO head in O(1). Pinned: only
-    // control jobs and the pinned handle may run; scan for the first such job.
+    // the pinned handle's own jobs may run; scan for the first such job.
     let index = 0
     if (this.pinned !== undefined) {
       index = this.jobs.findIndex((job) => this.isRunnable(job))
@@ -516,16 +514,16 @@ export class WriterCore {
   // -- reserved-handle transactions ----------------------------------------
 
   beginTransaction(): Promise<string> {
-    return this.enqueue(
-      () => {
-        if (this.pinned !== undefined) throw new TransactionError("a transaction is already pinned")
-        this.connection.run("BEGIN IMMEDIATE", [])
-        const handle = `tx-${++this.txCounter}`
-        this.pinned = { handle, timer: this.armIdleTimer(handle) }
-        return handle
-      },
-      { control: true },
-    )
+    // A `begin` is an ordinary queued job: when another transaction is pinned it
+    // waits head-of-line instead of rejecting, so the worker's Drizzle database
+    // can open concurrent top-level transactions safely.
+    return this.enqueue(() => {
+      if (this.pinned !== undefined) throw new TransactionError("a transaction is already pinned")
+      this.connection.run("BEGIN IMMEDIATE", [])
+      const handle = `tx-${++this.txCounter}`
+      this.pinned = { handle, timer: this.armIdleTimer(handle) }
+      return handle
+    })
   }
 
   txQuery(

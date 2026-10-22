@@ -7,7 +7,7 @@
 
 import { Database } from "bun:sqlite"
 import { describe, expect, test } from "bun:test"
-import { Effect, Exit, Stream } from "effect"
+import { Deferred, Effect, Exit, Fiber, Stream } from "effect"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type { Connection } from "effect/unstable/sql/SqlConnection"
@@ -17,6 +17,8 @@ import { sql } from "drizzle-orm"
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core"
 import { Database as CoreDatabase } from "@opencode-ai/core/database/database"
 import { EffectDrizzleSqlite } from "../../../../effect-drizzle-sqlite/src/index"
+import { createBunSqliteConnection } from "@/session/writer/connection"
+import { createWriterCore, type WriterCore } from "@/session/writer/core"
 import { writerSqlClient, type WriterSqlHandle } from "@/session/worker/writer-sql-client"
 
 const widget = sqliteTable("widget", {
@@ -85,6 +87,26 @@ function writerOver(reference: SqlClient.SqlClient): WriterSqlHandle {
     },
     rollback: async () => {
       await Effect.runPromise(reference.unsafe("ROLLBACK").withoutTransform)
+    },
+  }
+}
+
+/**
+ * A writer handle backed by the real `WriterCore` over an in-memory SQLite
+ * connection. Unlike `writerOver`, this preserves the writer's single-pin
+ * transaction semantics, which is what the packaged worker actually talks to.
+ */
+function writerOverCore(): { writer: WriterSqlHandle; core: WriterCore } {
+  const connection = createBunSqliteConnection({ filename: ":memory:" })
+  const core = createWriterCore({ connection, sleep: async () => {} })
+  return {
+    core,
+    writer: {
+      query: (method, sql, params) => core.query(method, sql, params),
+      begin: () => core.beginTransaction(),
+      txQuery: (handle, method, sql, params) => core.txQuery(handle, method, sql, params),
+      commit: (handle) => core.commitTransaction(handle),
+      rollback: (handle) => core.rollbackTransaction(handle),
     },
   }
 }
@@ -262,6 +284,68 @@ describe("writerSqlClient", () => {
       ])
     } finally {
       native.close()
+    }
+  })
+
+  test("concurrent top-level transactions queue instead of failing with a pinned transaction", async () => {
+    const { writer, core } = writerOverCore()
+    try {
+      const result = await run(
+        Effect.gen(function* () {
+          let begins = 0
+          let signalSecondBegin: () => void = () => {}
+          const secondBeginAttempted = new Promise<void>((resolve) => {
+            signalSecondBegin = resolve
+          })
+          const tracking: WriterSqlHandle = {
+            ...writer,
+            begin: async () => {
+              begins += 1
+              if (begins === 2) signalSecondBegin()
+              return writer.begin()
+            },
+          }
+          const client = yield* writerSqlClient(tracking)
+          const db = yield* drizzleOver(client)
+
+          yield* db.run(sql`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`)
+          const firstStarted = yield* Deferred.make<void>()
+          const releaseFirst = yield* Deferred.make<void>()
+
+          const first = yield* db
+            .transaction((tx) =>
+              Effect.gen(function* () {
+                yield* tx.insert(widget).values({ id: 1, name: "first" }).run()
+                yield* Deferred.succeed(firstStarted, undefined)
+                yield* Deferred.await(releaseFirst)
+              }),
+            )
+            .pipe(Effect.forkChild)
+          yield* Deferred.await(firstStarted)
+
+          const second = yield* db
+            .transaction((tx) => tx.insert(widget).values({ id: 2, name: "second" }).run())
+            .pipe(Effect.forkChild)
+
+          // The second transaction must reach its `begin` before the first
+          // releases the pin; otherwise this test cannot prove queueing.
+          yield* Effect.promise(() => secondBeginAttempted).pipe(Effect.timeout("2 seconds"))
+          yield* Deferred.succeed(releaseFirst, undefined)
+
+          const [firstExit, secondExit] = yield* Effect.all([Fiber.await(first), Fiber.await(second)])
+          const rows = yield* db.select().from(widget).orderBy(widget.id).all()
+          return { firstExit, secondExit, rows }
+        }),
+      )
+
+      expect(result.firstExit._tag).toBe("Success")
+      expect(result.secondExit._tag).toBe("Success")
+      expect(result.rows).toEqual([
+        { id: 1, name: "first" },
+        { id: 2, name: "second" },
+      ])
+    } finally {
+      await core.close()
     }
   })
 

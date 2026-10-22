@@ -88,12 +88,50 @@ export interface WorkerPoolOptions {
   readonly timeoutMs?: number
 }
 
-const DEFAULT_ENTRY = new URL("./bootstrap.ts", import.meta.url)
+declare global {
+  /**
+   * Compile-time path to the bundled pool bootstrap isolate, injected by
+   * `script/build.ts` (mirrors `OPENCODE_SESSION_WORKER_PATH`). Absent in dev/test.
+   */
+  const OPENCODE_POOL_WORKER_PATH: string | undefined
+}
+
+/**
+ * Resolve the pool bootstrap entry: the runtime env override, else the build-time
+ * define, else the source-relative isolate. The packaged binary cannot resolve
+ * the source path (`new URL("./bootstrap.ts", import.meta.url)` becomes
+ * `/$bunfs/root/bootstrap.ts`), so this mirrors `resolveSessionWorkerEntry` to
+ * load the bundled worker. Pure so the resolution is testable without
+ * re-importing.
+ */
+export function resolvePoolWorkerEntry(
+  options: { readonly env?: Record<string, string | undefined>; readonly definedPath?: string } = {},
+): string | URL {
+  const defined =
+    options.definedPath ?? (typeof OPENCODE_POOL_WORKER_PATH !== "undefined" ? OPENCODE_POOL_WORKER_PATH : undefined)
+  const fromEnv = (options.env ?? process.env).OPENCODE_POOL_WORKER_PATH
+  const resolved = fromEnv ?? defined
+  if (resolved === undefined || resolved === "") return new URL("./bootstrap.ts", import.meta.url)
+  return resolved
+}
+
+const DEFAULT_ENTRY = resolvePoolWorkerEntry()
 
 interface PendingRun {
   readonly resolve: (value: number) => void
   readonly reject: (error: Error) => void
   readonly timer: ReturnType<typeof setTimeout>
+}
+
+/**
+ * Build the error a broken isolate rejects its callers with. The runtime's real
+ * `message` is always preserved; a runtime-provided `cause` (an `ErrorEvent`'s
+ * `error`, carrying the original stack) is attached so the failure stays
+ * actionable instead of collapsing into a bare "worker N error".
+ */
+export function describeWorkerFailure(id: number, message: string, cause?: unknown): Error {
+  const text = `worker ${id} error: ${message}`
+  return cause === undefined ? new Error(text) : new Error(text, { cause })
 }
 
 function createPoolWorker(id: number, entry: string | URL, env: Record<string, string>, timeoutMs: number): PoolWorker {
@@ -175,7 +213,7 @@ function createPoolWorker(id: number, entry: string | URL, env: Record<string, s
     }
   }
 
-  worker.onerror = (event: ErrorEvent) => shutdown(new Error(`worker ${id} error: ${event.message}`))
+  worker.onerror = (event: ErrorEvent) => shutdown(describeWorkerFailure(id, event.message, event.error))
 
   const run = async (value: number): Promise<number> => {
     await readyPromise

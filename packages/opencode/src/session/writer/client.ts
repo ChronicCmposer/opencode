@@ -101,8 +101,37 @@ interface Pending {
   readonly timer: ReturnType<typeof setTimeout>
 }
 
-const DEFAULT_ENTRY = new URL("./worker.ts", import.meta.url)
 const DEFAULT_TIMEOUT_MS = 10_000
+
+declare global {
+  /**
+   * Compile-time path to the bundled writer isolate, injected by `script/build.ts`
+   * (mirrors `OPENCODE_SESSION_WORKER_PATH`). Absent in dev/test, where the
+   * source-relative isolate is used instead.
+   */
+  const OPENCODE_WRITER_WORKER_PATH: string | undefined
+}
+
+/**
+ * Resolve the writer isolate entry: the runtime env override, else the build-time
+ * define, else the source-relative isolate. The packaged binary cannot resolve the
+ * source path (`new URL("./worker.ts", import.meta.url)` becomes
+ * `/$bunfs/root/worker.ts`), so this mirrors `resolveSessionWorkerEntry` to load
+ * the bundled worker. Pure so the resolution is testable without re-importing.
+ */
+export function resolveWriterWorkerEntry(
+  options: { readonly env?: Record<string, string | undefined>; readonly definedPath?: string } = {},
+): string | URL {
+  const defined =
+    options.definedPath ??
+    (typeof OPENCODE_WRITER_WORKER_PATH !== "undefined" ? OPENCODE_WRITER_WORKER_PATH : undefined)
+  const fromEnv = (options.env ?? process.env).OPENCODE_WRITER_WORKER_PATH
+  const resolved = fromEnv ?? defined
+  if (resolved === undefined || resolved === "") return new URL("./worker.ts", import.meta.url)
+  return resolved
+}
+
+const DEFAULT_ENTRY = resolveWriterWorkerEntry()
 
 /** `Omit` over a union collapses to common keys; distribute so each frame keeps its fields. */
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never

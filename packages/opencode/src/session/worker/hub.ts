@@ -28,6 +28,7 @@ import { Question } from "@/question"
 import type { InstanceContext } from "@/project/instance-context"
 import { mergeEnv } from "@/session/broker/env"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { Project } from "@opencode-ai/schema/project"
 import {
   createBroker,
   serveBrokerPort,
@@ -45,6 +46,7 @@ import {
   type WriterClient,
   type WriterClientOptions,
 } from "@/session/writer/client"
+import { migrationStatements } from "../writer/migration.statements.gen"
 import type { SessionID } from "@/session/schema"
 import { defined } from "@/util/object"
 import { createDispatcher, type CancellationConfig, type Dispatcher, type SessionWorker } from "./dispatch"
@@ -679,7 +681,15 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     // every waiter and tear the isolate down.
     worker.onmessage = null
     worker.onerror = null
-    failWaiters(new Error(`session worker error: ${event.message}`))
+    // A boot/import failure often reports an empty `message`; keep the
+    // originating error's text and chain it as `cause` so the caller is not
+    // left with a generic "worker crashed".
+    const cause = event.error
+    const detail =
+      cause instanceof Error && cause.message !== "" && cause.message !== event.message ? `: ${cause.message}` : ""
+    failWaiters(
+      new Error(`session worker error: ${event.message}${detail}`, cause === undefined ? undefined : { cause }),
+    )
     void worker.terminate()
   }
 
@@ -833,8 +843,33 @@ export function createLazyExecutorWorkerPool(options: LazyExecutorWorkerPoolOpti
 // Production pool + hub factories (steps 10 + 13 + 14).
 // ---------------------------------------------------------------------------
 
+declare global {
+  /**
+   * Compile-time path to the bundled session-worker isolate, injected by
+   * `script/build.ts` (mirrors `OPENCODE_WORKER_PATH`). Absent in dev/test.
+   */
+  const OPENCODE_SESSION_WORKER_PATH: string | undefined
+}
+
+/**
+ * Resolve the production session-worker entry: the runtime env override, else
+ * the build-time define, else the source-relative isolate. Pure so the
+ * resolution is testable without re-importing the module.
+ */
+export function resolveSessionWorkerEntry(
+  options: { readonly env?: Record<string, string | undefined>; readonly definedPath?: string } = {},
+): string | URL {
+  const defined =
+    options.definedPath ??
+    (typeof OPENCODE_SESSION_WORKER_PATH !== "undefined" ? OPENCODE_SESSION_WORKER_PATH : undefined)
+  const fromEnv = (options.env ?? process.env).OPENCODE_SESSION_WORKER_PATH
+  const resolved = fromEnv ?? defined
+  if (resolved === undefined || resolved === "") return new URL("./session-worker.ts", import.meta.url)
+  return resolved
+}
+
 /** The production session-worker entry (the reduced-layer isolate). */
-export const SESSION_WORKER_ENTRY = new URL("./session-worker.ts", import.meta.url)
+export const SESSION_WORKER_ENTRY: string | URL = resolveSessionWorkerEntry()
 
 /** A worker `workerData` payload, or a (possibly async) resolver for one. */
 export type SessionWorkerInitSource = SessionWorkerInit | (() => SessionWorkerInit | Promise<SessionWorkerInit>)
@@ -909,11 +944,26 @@ function withSessionWorkerPorts(init: SessionWorkerInit): SessionWorkerInit {
 
 /**
  * Fallback instance context for a dispatch with no ambient `InstanceRef`.
- * `buildWorkerSnapshot` only reads `directory`; `worktree`/`project` are unused.
+ *
+ * A dispatch that reaches the hub without an ambient instance is a hub-side gap,
+ * but the worker still needs a real project identity: `buildWorkerSnapshot` ships
+ * `ctx.project.id`/`ctx.project.vcs`, and `workerInstanceContext` rebuilds the
+ * worker's `InstanceRef` from them. The global project is the canonical identity
+ * for "no resolved project", so the worker never falls back to the directory
+ * string as a project id.
  */
-function fallbackInstanceContext(): InstanceContext {
+export function fallbackInstanceContext(): InstanceContext {
   const directory = process.cwd()
-  return { directory, worktree: directory, project: undefined as never }
+  return {
+    directory,
+    worktree: directory,
+    project: {
+      id: Project.ID.global,
+      worktree: directory,
+      time: { created: 0, updated: 0 },
+      sandboxes: [],
+    },
+  }
 }
 
 /** The ambient instance context for the current fiber, if any (the `attach` pattern). */
@@ -996,20 +1046,24 @@ export interface ProductionPortBackendsOptions {
 
 /**
  * Wrap an owned hub writer so its isolate opens `filename` exactly once, on the
- * first request. The writer isolate spawns with NO connection — every
+ * first request, then applies `statements` (the schema migrations) before any
+ * request is served. The writer isolate spawns with NO connection — every
  * `publish`/`query` before `admin.open` throws `"writer connection is not open"`
  * — so the port server would reject without this. Opening lazily keeps graph
- * build free of I/O; a failed open resets the memo so a later call can retry
- * (the isolate's own respawn replays the open once it has succeeded).
+ * build free of I/O; a failed open/migrate resets the memo so a later call can
+ * retry (the isolate's own respawn replays the open once it has succeeded).
  */
-function lazyOpenWriter(writer: WriterClient, filename: string): HubWriter {
+export function lazyOpenWriter(writer: WriterClient, filename: string, statements: ReadonlyArray<string>): HubWriter {
   let opened: Promise<unknown> | undefined
   const ensureOpen = (): Promise<unknown> => {
     if (opened !== undefined) return opened
-    opened = writer.open(filename).catch((error) => {
-      opened = undefined
-      throw error
-    })
+    opened = writer
+      .open(filename)
+      .then(() => writer.migrate(statements))
+      .catch((error) => {
+        opened = undefined
+        throw error
+      })
     return opened
   }
   return {
@@ -1051,7 +1105,11 @@ export function buildProductionPortBackends(options: ProductionPortBackendsOptio
   // writer opens the app database lazily, on the first request.
   const writer: HubWriter =
     options.writer ??
-    lazyOpenWriter((ownedWriter = createWriterClient(options.writerOptions)), options.databasePath ?? Database.path())
+    lazyOpenWriter(
+      (ownedWriter = createWriterClient(options.writerOptions)),
+      options.databasePath ?? Database.path(),
+      migrationStatements,
+    )
   const broker: BrokerBackend = options.broker ?? (ownedBroker = createBroker(options.brokerOptions))
   return {
     writer,
