@@ -58,6 +58,49 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/LL
 
 export const use = serviceUse(Service)
 
+// A completed LLMEvent stream is only meaningful once a terminal event has
+// arrived: `step-finish` closes a step, `finish` closes the response. A stream
+// that ends without either is truncated (dropped connection, cancelled
+// provider, missing sentinel) — surface it as a typed failure so the run loop
+// stops instead of looping forever on an unfinished turn.
+//
+// `provider-error` is the native runtime's terminal failure signal: the
+// provider reported a concrete failure (e.g. OpenAI Responses `response.failed`)
+// and no `finish` follows. That stream already carries a specific error, so the
+// guard yields to it rather than layering a generic `IncompleteStreamError` on
+// top and masking the provider's message. The processor reacts to the
+// `provider-error` event itself; the guard only fails a *normal* completion
+// that lacks a terminal.
+const isTerminalEvent = (event: LLMEvent): boolean => event.type === "step-finish" || event.type === "finish"
+const isProviderFailure = (event: LLMEvent): boolean => event.type === "provider-error"
+
+/**
+ * Enforce the stream boundary contract: fail with
+ * `SessionV1.IncompleteStreamError` when the source completes normally without
+ * emitting a terminal event. `Stream.onEnd` runs only on normal completion, so a
+ * source that already failed (as an Effect error, or by emitting a
+ * `provider-error`) passes its own error through untouched.
+ */
+export const requireTerminalEvent = (events: Stream.Stream<LLMEvent, unknown>): Stream.Stream<LLMEvent, unknown> => {
+  let sawTerminal = false
+  let sawProviderFailure = false
+  return events.pipe(
+    Stream.tap((event) =>
+      Effect.sync(() => {
+        if (isTerminalEvent(event)) sawTerminal = true
+        else if (isProviderFailure(event)) sawProviderFailure = true
+      }),
+    ),
+    Stream.onEnd(
+      Effect.suspend(() =>
+        sawTerminal || sawProviderFailure
+          ? Effect.void
+          : Effect.fail(new SessionV1.IncompleteStreamError({ message: "LLM stream ended without a terminal event" })),
+      ),
+    ),
+  )
+}
+
 const live: Layer.Layer<
   Service,
   never,
@@ -364,16 +407,18 @@ const live: Layer.Layer<
 
             const result = yield* run({ ...input, abort: ctrl.signal })
 
-            if (result.type === "native") return result.stream
+            if (result.type === "native") return requireTerminalEvent(result.stream)
 
             // Adapter seam: both runtimes expose the same LLMEvent stream. Native
             // already returns one; AI SDK streams are converted here.
             const state = LLMAISDK.adapterState()
-            return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
-              e instanceof Error ? e : new Error(String(e)),
-            ).pipe(
-              Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
-              Stream.flatMap((events) => Stream.fromIterable(events)),
+            return requireTerminalEvent(
+              Stream.fromAsyncIterable(result.result.fullStream, (e) =>
+                e instanceof Error ? e : new Error(String(e)),
+              ).pipe(
+                Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
+                Stream.flatMap((events) => Stream.fromIterable(events)),
+              ),
             )
           }),
         ),

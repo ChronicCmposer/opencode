@@ -66,3 +66,8 @@ export const ContextOverflowError = NamedError.create("ContextOverflowError", {
   responseBody: Schema.optional(Schema.String),
 })
 export const ContentFilterError = NamedError.create("ContentFilterError", { message: Schema.String })
+export const IncompleteStreamError = NamedError.create("IncompleteStreamError", { message: Schema.String })
+export const MaxStepsExceededError = NamedError.create("MaxStepsExceededError", {
+  message: Schema.String,
+  steps: Schema.Number,
+})

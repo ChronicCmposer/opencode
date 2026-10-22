@@ -61,6 +61,13 @@ export const ContextOverflowError = namedError("ContextOverflowError", {
 export const ContentFilterError = namedError("ContentFilterError", {
   message: Schema.String,
 })
+export const IncompleteStreamError = namedError("IncompleteStreamError", {
+  message: Schema.String,
+})
+export const MaxStepsExceededError = namedError("MaxStepsExceededError", {
+  message: Schema.String,
+  steps: Schema.Number,
+})
 
 export class OutputFormatText extends Schema.Class<OutputFormatText>("OutputFormatText")({
   type: Schema.Literal("text"),
@@ -390,6 +397,8 @@ const AssistantErrorSchema = Schema.Union([
   StructuredOutputError.EffectSchema,
   ContextOverflowError.EffectSchema,
   ContentFilterError.EffectSchema,
+  IncompleteStreamError.EffectSchema,
+  MaxStepsExceededError.EffectSchema,
   APIError.EffectSchema,
 ]).annotate({ discriminator: "name" })
 type AssistantError = Schema.Schema.Type<typeof AssistantErrorSchema>

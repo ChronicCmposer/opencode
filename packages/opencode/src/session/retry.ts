@@ -83,6 +83,10 @@ function exponential(attempt: number, random: number) {
 }
 
 export function retryable(error: Err, provider: string) {
+  // a truncated stream and a step-cap violation are terminal: retrying either
+  // would replay a run that already failed for a non-transient reason.
+  if (SessionV1.IncompleteStreamError.isInstance(error)) return undefined
+  if (SessionV1.MaxStepsExceededError.isInstance(error)) return undefined
   // context overflow errors should not be retried
   if (SessionV1.ContextOverflowError.isInstance(error)) return undefined
   if (SessionV1.APIError.isInstance(error)) {

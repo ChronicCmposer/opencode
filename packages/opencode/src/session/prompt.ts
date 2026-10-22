@@ -16,7 +16,7 @@ import { SessionCompaction } from "./compaction"
 import { SystemPrompt } from "./system"
 import { Instruction } from "./instruction"
 import { Plugin } from "../plugin"
-import { MAX_STEPS_PROMPT } from "@opencode-ai/core/session/runner/max-steps"
+import { MAX_STEPS_DEFAULT, MAX_STEPS_PROMPT } from "@opencode-ai/core/session/runner/max-steps"
 import { ToolRegistry } from "@/tool/registry"
 import { MCP } from "../mcp"
 import { LSP } from "@/lsp/lsp"
@@ -100,6 +100,17 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   // cleanup() marks abandoned tool_use blocks this way after retries/aborts.
   // They are not pending work and must not trigger an assistant-prefill request.
   return part.state.status === "error" && part.state.metadata?.interrupted === true
+}
+
+// A step is a legitimate continuation when it produced at least one runnable
+// tool call. Provider-executed calls are handled by the provider, and orphaned
+// interrupted calls were abandoned by cleanup, so neither represents pending
+// work. Shared by the top-of-loop break and the fail-closed stream guard so both
+// agree on what "the loop has work to do" means.
+function hasActiveToolCalls(parts: readonly SessionV1.Part[]) {
+  return parts.some(
+    (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
+  )
 }
 
 export interface Interface {
@@ -1140,10 +1151,7 @@ const layer = Layer.effect(
           // Some providers return "stop" even when the assistant message contains
           // tool calls. Keep the loop running so tool results can be sent back to
           // the model, but ignore cleanup-marked interrupted orphans.
-          const hasToolCalls =
-            lastAssistantMsg?.parts.some(
-              (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
-            ) ?? false
+          const hasToolCalls = lastAssistantMsg ? hasActiveToolCalls(lastAssistantMsg.parts) : false
 
           if (
             lastAssistant?.finish &&
@@ -1212,7 +1220,7 @@ const layer = Layer.effect(
             yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
             throw error
           }
-          const maxSteps = agent.steps ?? Infinity
+          const maxSteps = agent.steps ?? MAX_STEPS_DEFAULT
           const isLastStep = step >= maxSteps
           msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
             Effect.provideService(RuntimeFlags.Service, flags),
@@ -1362,7 +1370,57 @@ const layer = Layer.effect(
                 auto: true,
                 overflow: !handle.message.finish,
               })
+              return "continue" as const
             }
+
+            // The processor asked to continue. That is only legitimate when the
+            // turn reached a terminal finish or a deliberate tool continuation
+            // (tool-calls keeps `finished` false but leaves `finish` set). Enforce
+            // the absolute step cap first, then fail closed on a turn that never
+            // reached a terminal finish, so neither case re-requests forever.
+            if (step >= maxSteps && !finished) {
+              handle.message.error = new SessionV1.MaxStepsExceededError({
+                message: `The agent reached its maximum of ${maxSteps} steps`,
+                steps: maxSteps,
+              }).toObject()
+              yield* sessions.updateMessage(handle.message)
+              yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+              yield* Effect.logWarning("max steps exceeded", {
+                "session.id": sessionID,
+                messageID: handle.message.id,
+                step,
+                maxSteps,
+              })
+              return "break" as const
+            }
+
+            if (!finished && handle.message.finish !== "tool-calls" && !handle.message.error) {
+              // The producer asked to continue, so the step must have made
+              // progress. Tool-call parts are the progress signal the
+              // top-of-loop break already trusts (see `hasToolCalls`); a
+              // provider that omits or misspells its finish reason while still
+              // emitting tool calls is a legitimate continuation and must run
+              // those tools. Only a step with no active tool calls is a
+              // genuinely stalled stream, so fail closed on that alone.
+              const producedToolCalls = hasActiveToolCalls(
+                yield* MessageV2.parts(handle.message.id).pipe(Effect.provideService(Database.Service, database)),
+              )
+              if (!producedToolCalls) {
+                handle.message.error = new SessionV1.IncompleteStreamError({
+                  message: "The provider stream ended before the response completed",
+                }).toObject()
+                yield* sessions.updateMessage(handle.message)
+                yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+                yield* Effect.logWarning("provider stream ended without a terminal finish", {
+                  "session.id": sessionID,
+                  messageID: handle.message.id,
+                  step,
+                  finish: handle.message.finish,
+                })
+                return "break" as const
+              }
+            }
+
             return "continue" as const
           }).pipe(
             Effect.ensuring(instruction.clear(handle.message.id)),

@@ -60,7 +60,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { reply, TestLLMServer } from "../lib/llm-server"
+import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -282,6 +282,9 @@ const it = testEffect(makeHttp())
 const backgroundSubagents = testEffect(makeHttp({ flags: { experimentalBackgroundSubagents: true } }))
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
+// The session-worker path is flag-gated (`experimentalSessionWorkers`); the
+// stream-termination regression must behave identically with the flag on/off.
+const workersOn = testEffect(makeHttp({ flags: { experimentalSessionWorkers: true } }))
 const withMcpInstructions = testEffect(
   makeHttp({
     mcpInstructions: [
@@ -340,6 +343,49 @@ function providerCfg(url: string) {
         },
       },
     },
+  }
+}
+
+/**
+ * A minimal OpenAI-compatible SSE provider that streams a single content delta
+ * and then closes the response body WITHOUT a `finish_reason` or `[DONE]`
+ * sentinel. That truncated shape is what previously made the run loop re-request
+ * the model forever. `calls()` counts chat-completions requests so a test can
+ * prove the loop terminated after exactly one.
+ */
+function makeTruncatedProvider(text: string) {
+  const encoder = new TextEncoder()
+  let calls = 0
+  const frame = (delta: Record<string, unknown>) =>
+    `data: ${JSON.stringify({
+      id: "chatcmpl-trunc",
+      object: "chat.completion.chunk",
+      choices: [{ delta }],
+    })}\n\n`
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    async fetch(request) {
+      const url = new URL(request.url)
+      if (request.method !== "POST" || !url.pathname.endsWith("/chat/completions")) {
+        return new Response("not found", { status: 404 })
+      }
+      await request.json().catch(() => ({}))
+      calls++
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(frame({ role: "assistant" })))
+          controller.enqueue(encoder.encode(frame({ content: text })))
+          controller.close()
+        },
+      })
+      return new Response(body, { headers: { "content-type": "text/event-stream" } })
+    },
+  })
+  return {
+    url: `http://127.0.0.1:${server.port}/v1`,
+    calls: () => calls,
+    stop: () => server.stop(true),
   }
 }
 
@@ -890,7 +936,7 @@ it.instance("loop continues when finish is tool-calls", () =>
   }),
 )
 
-it.instance("loop continues when finish is unknown", () =>
+it.instance("loop fails closed when finish is unknown", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const prompt = yield* SessionPrompt.Service
@@ -909,11 +955,64 @@ it.instance("loop continues when finish is unknown", () =>
     yield* llm.text("second")
 
     const result = yield* prompt.loop({ sessionID: session.id })
+    expect(yield* llm.calls).toBe(1)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.error?.name).toBe("IncompleteStreamError")
+    }
+  }),
+)
+
+// A step that produced tool-call parts is a legitimate continuation even when
+// the provider reported no terminal finish reason (absent finish_reason maps to
+// `"unknown"`). The top-of-loop continuation predicate keys off the presence of
+// tool parts, not the reported finish, so the fail-closed guard must excuse the
+// same shape — otherwise a tool-calling turn with an unrecognized finish would
+// error out instead of executing its tools.
+it.instance("loop continues when tool calls arrive without a terminal finish", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+
+    // Tool-call deltas followed by stream end with no `finish_reason`: the
+    // provider reported neither `tool-calls` nor any terminal reason.
+    const frame = (delta: Record<string, unknown>) => ({
+      id: "chatcmpl-unknown-tools",
+      object: "chat.completion.chunk",
+      choices: [{ delta }],
+    })
+    yield* llm.push(
+      raw({
+        head: [
+          frame({ role: "assistant" }),
+          frame({
+            tool_calls: [
+              { index: 0, id: "call_unknown", type: "function", function: { name: "glob", arguments: "" } },
+            ],
+          }),
+          frame({ tool_calls: [{ index: 0, function: { arguments: JSON.stringify({ pattern: "**/*.txt" }) } }] }),
+        ],
+      }),
+    )
+    yield* llm.text("second")
+
+    const result = yield* prompt.loop({ sessionID: session.id })
     expect(yield* llm.calls).toBe(2)
     expect(result.info.role).toBe("assistant")
     if (result.info.role === "assistant") {
+      expect(result.info.error?.name).not.toBe("IncompleteStreamError")
       expect(result.parts.some((part) => part.type === "text" && part.text === "second")).toBe(true)
-      expect(result.info.finish).toBe("stop")
     }
   }),
 )
@@ -982,6 +1081,94 @@ it.instance("loop continues when finish is stop but assistant has tool parts", (
       expect(result.parts.some((part) => part.type === "text" && part.text === "second")).toBe(true)
       expect(result.info.finish).toBe("stop")
     }
+  }),
+)
+
+// Regression: a provider stream that ends without a terminal finish must fail
+// closed after a single request instead of re-requesting the model forever.
+const collectSessionErrors = (sessionID: SessionID) =>
+  Effect.gen(function* () {
+    const events = yield* EventV2Bridge.Service
+    const errors: NonNullable<SessionV1.Assistant["error"]>[] = []
+    const off = yield* events.listen((event) => {
+      if (event.type !== Session.Event.Error.type) return Effect.void
+      const data = event.data as typeof Session.Event.Error.data.Type
+      if (data.sessionID === sessionID && data.error) errors.push(data.error)
+      return Effect.void
+    })
+    return { errors, off }
+  })
+
+const truncatedStreamRegression = (suite: typeof it, label: string) =>
+  suite.instance(`truncated stream fails closed without a request storm (${label})`, () =>
+    Effect.gen(function* () {
+      const provider = yield* Effect.acquireRelease(
+        Effect.sync(() => makeTruncatedProvider("partial response")),
+        (value) => Effect.promise(() => value.stop()),
+      )
+      const { directory } = yield* TestInstance
+      yield* writeConfig(directory, providerCfg(provider.url))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Truncated stream" })
+      const { errors, off } = yield* collectSessionErrors(chat.id)
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "hello" }],
+      })
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      yield* off
+
+      expect(provider.calls()).toBe(1)
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") expect(result.info.error).toBeDefined()
+      expect(errors).toHaveLength(1)
+    }),
+  )
+
+truncatedStreamRegression(it, "flag off")
+truncatedStreamRegression(workersOn, "flag on")
+
+it.instance("enforces the absolute step cap for runaway tool loops", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      agent: { build: { steps: 2 } },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "Step cap",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const { errors, off } = yield* collectSessionErrors(chat.id)
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.tool("first", { value: "one" })
+    yield* llm.tool("first", { value: "two" })
+    yield* llm.tool("first", { value: "three" })
+    yield* llm.tool("first", { value: "four" })
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    yield* off
+
+    expect(yield* llm.calls).toBe(2)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.error).toEqual({
+        name: "MaxStepsExceededError",
+        data: { message: "The agent reached its maximum of 2 steps", steps: 2 },
+      })
+    }
+    expect(errors.map((error) => error.name)).toContain("MaxStepsExceededError")
   }),
 )
 
