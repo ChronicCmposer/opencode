@@ -630,6 +630,10 @@ export function fromError(
       ).toObject()
     case OutputLengthError.isInstance(e):
       return e
+    case SessionV1.IncompleteStreamError.isInstance(e):
+      return e
+    case SessionV1.MaxStepsExceededError.isInstance(e):
+      return e
     case LoadAPIKeyError.isInstance(e):
       return new AuthError(
         {

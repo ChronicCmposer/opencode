@@ -9,10 +9,13 @@ import { InstanceRef } from "../../src/effect/instance-ref"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import z from "zod"
 import { LLM } from "../../src/session/llm"
-import { LLMClient, RequestExecutor } from "@opencode-ai/llm/route"
+import { LLMClient, RequestExecutor, type LLMClientShape } from "@opencode-ai/llm/route"
+import { LLMEvent } from "@opencode-ai/llm"
 import { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
+import { MockLanguageModelV3, convertArrayToReadableStream } from "ai/test"
+import { type LanguageModelV3 } from "@ai-sdk/provider"
 
 import { testEffect } from "../lib/effect"
 import type { Agent } from "../../src/agent/agent"
@@ -751,6 +754,239 @@ function createEventResponse(chunks: unknown[], includeDone = false) {
     headers: { "Content-Type": "text/event-stream" },
   })
 }
+
+describe("session.llm terminal event contract", () => {
+  const textDelta = LLMEvent.textDelta({ id: "text-1", text: "partial" })
+  const stepFinish = (reason: "stop" | "unknown") => LLMEvent.stepFinish({ index: 0, reason })
+  const finish = LLMEvent.finish({ reason: "stop" })
+
+  const drainGuarded = (events: ReadonlyArray<LLMEvent>) =>
+    Stream.runDrain(LLM.requireTerminalEvent(Stream.fromIterable(events)))
+
+  test("fails with IncompleteStreamError when the stream ends without a terminal event", async () => {
+    const error = await Effect.runPromise(drainGuarded([textDelta]).pipe(Effect.flip))
+    expect(SessionV1.IncompleteStreamError.isInstance(error)).toBe(true)
+  })
+
+  test("completes when a step-finish closes the stream", async () => {
+    await Effect.runPromise(drainGuarded([textDelta, stepFinish("stop")]))
+  })
+
+  test("completes when only a finish closes the stream", async () => {
+    await Effect.runPromise(drainGuarded([textDelta, finish]))
+  })
+
+  test("treats a step-finish with reason unknown as terminal", async () => {
+    await Effect.runPromise(drainGuarded([textDelta, stepFinish("unknown")]))
+  })
+
+  test("passes an existing stream failure through without masking it", async () => {
+    const boom = new Error("provider exploded")
+    const error = await Effect.runPromise(
+      Stream.runDrain(
+        LLM.requireTerminalEvent(Stream.make(textDelta).pipe(Stream.concat(Stream.fail(boom)))),
+      ).pipe(Effect.flip),
+    )
+    expect(error).toBe(boom)
+  })
+
+  // Native runtime asymmetry: OpenAI Responses `response.failed` (and the other
+  // native protocols' mid-stream errors) surface as a `provider-error` data
+  // event with no following `finish`. That stream already carries a specific
+  // error, so the guard must yield to it rather than replace it with a generic
+  // IncompleteStreamError. The processor throws on the event itself.
+  test("yields to a provider-error completion instead of layering IncompleteStreamError", async () => {
+    await Effect.runPromise(
+      drainGuarded([textDelta, LLMEvent.providerError({ message: "Overloaded" })]),
+    )
+  })
+})
+
+// Integration coverage for the stream-boundary guard. The full `it.instance`
+// Provider harness cannot resolve models in this environment (see artifact
+// `.parallel-implement/w8-native-guard.md`: untouched processor-effect.test.ts is
+// 0/17 and provider.test.ts is 65 failing). To keep real `LLM.Service.stream`
+// coverage anyway, this block replaces Provider with a mock and LLMClient with a
+// scripted source: the guard still runs through the real service wiring, the real
+// request prep, and the real native adapter.
+describe("session.llm.stream guard wiring", () => {
+  const guardModel: Provider.Model = {
+    id: ModelV2.ID.make("gpt-5-mini"),
+    providerID: ProviderV2.ID.make("openai"),
+    api: { id: "gpt-5-mini", url: "https://api.openai.com/v1", npm: "@ai-sdk/openai" },
+    name: "GPT-5 Mini",
+    capabilities: {
+      temperature: true,
+      reasoning: true,
+      attachment: true,
+      toolcall: true,
+      input: { text: true, audio: false, image: true, video: false, pdf: false },
+      output: { text: true, audio: false, image: false, video: false, pdf: false },
+      interleaved: false,
+    },
+    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    limit: { context: 128_000, input: 128_000, output: 32_000 },
+    status: "active",
+    options: {},
+    headers: {},
+    release_date: "2026-01-01",
+  }
+
+  const guardProvider: Provider.Info = {
+    id: ProviderV2.ID.make("openai"),
+    name: "OpenAI",
+    source: "config",
+    env: ["OPENAI_API_KEY"],
+    options: { apiKey: "test-openai-key" },
+    models: {},
+  }
+
+  const unusedClient: LLMClientShape = {
+    prepare: () => Effect.die("unused"),
+    generate: () => Effect.die("unused"),
+    stream: () => Stream.die("unused"),
+  }
+
+  const scriptedClient = (events: ReadonlyArray<LLMEvent>): LLMClientShape => ({
+    prepare: () => Effect.die("unused"),
+    generate: () => Effect.die("unused"),
+    stream: () => Stream.fromIterable(events),
+  })
+
+  const guardLayer = (options: { native: boolean; llmClient: LLMClientShape; language?: LanguageModelV3 }) =>
+    AppNodeBuilder.build(LLM.node, [
+      [
+        Provider.node,
+        Layer.mock(Provider.Service, {
+          getProvider: () => Effect.succeed(guardProvider),
+          getLanguage: () => Effect.succeed(options.language ?? new MockLanguageModelV3()),
+        }),
+      ],
+      [RuntimeFlags.node, RuntimeFlags.layer({ experimentalNativeLlm: options.native })],
+      [
+        LayerNodePlatform.llmClient,
+        Layer.succeed(LLMClient.Service, LLMClient.Service.of(options.llmClient)),
+      ],
+    ])
+
+  const drainExit = (layer: Layer.Layer<LLM.Service>, input: LLM.StreamInput) =>
+    Effect.gen(function* () {
+      const ctx = yield* InstanceRef
+      if (!ctx) return yield* Effect.die("InstanceRef not provided")
+      return yield* Effect.promise(() =>
+        Effect.runPromiseExit(
+          LLM.Service.use((svc) => svc.stream(input).pipe(Stream.runDrain)).pipe(
+            Effect.provide(layer),
+            Effect.provideService(InstanceRef, ctx),
+          ),
+        ),
+      )
+    })
+
+  const guardInput = (session: string): LLM.StreamInput => {
+    const sessionID = SessionID.make(`ses_${session}`)
+    const agent = {
+      name: "test",
+      mode: "primary",
+      options: {},
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    } satisfies Agent.Info
+    return {
+      user: {
+        id: MessageID.make(`msg_${session}`),
+        sessionID,
+        role: "user",
+        time: { created: Date.now() },
+        agent: agent.name,
+        model: { providerID: guardModel.providerID, modelID: guardModel.id },
+      } satisfies SessionV1.User,
+      sessionID,
+      model: guardModel,
+      agent,
+      system: ["You are a helpful assistant."],
+      messages: [{ role: "user", content: "Hello" }],
+      tools: {},
+    }
+  }
+
+  it.instance("native branch fails a delta-only source with IncompleteStreamError", () =>
+    Effect.gen(function* () {
+      const exit = yield* drainExit(
+        guardLayer({
+          native: true,
+          llmClient: scriptedClient([LLMEvent.textDelta({ id: "text-1", text: "partial" })]),
+        }),
+        guardInput("guard-native-truncated"),
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(SessionV1.IncompleteStreamError.isInstance(Cause.squash(exit.cause))).toBe(true)
+      }
+    }),
+  )
+
+  it.instance("native branch completes when a step-finish closes the source", () =>
+    Effect.gen(function* () {
+      const exit = yield* drainExit(
+        guardLayer({
+          native: true,
+          llmClient: scriptedClient([
+            LLMEvent.textDelta({ id: "text-1", text: "done" }),
+            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+          ]),
+        }),
+        guardInput("guard-native-step-finish"),
+      )
+      expect(Exit.isSuccess(exit)).toBe(true)
+    }),
+  )
+
+  it.instance("native branch yields to a provider-error source", () =>
+    Effect.gen(function* () {
+      // Response.failed path: a specific provider failure is already on the
+      // stream, so the guard must not replace it with IncompleteStreamError.
+      const exit = yield* drainExit(
+        guardLayer({
+          native: true,
+          llmClient: scriptedClient([
+            LLMEvent.textDelta({ id: "text-1", text: "partial" }),
+            LLMEvent.providerError({ message: "Overloaded" }),
+          ]),
+        }),
+        guardInput("guard-native-provider-error"),
+      )
+      expect(Exit.isSuccess(exit)).toBe(true)
+    }),
+  )
+
+  it.instance("ai-sdk branch completes a well-formed model stream through the guard", () =>
+    Effect.gen(function* () {
+      const language = new MockLanguageModelV3({
+        doStream: async () => ({
+          stream: convertArrayToReadableStream([
+            { type: "stream-start", warnings: [] },
+            { type: "text-start", id: "text-1" },
+            { type: "text-delta", id: "text-1", delta: "hello" },
+            { type: "text-end", id: "text-1" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: {
+                inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                outputTokens: { total: 1, text: 1, reasoning: 0 },
+              },
+            },
+          ]),
+        }),
+      })
+      const exit = yield* drainExit(
+        guardLayer({ native: false, language, llmClient: unusedClient }),
+        guardInput("guard-ai-sdk-complete"),
+      )
+      expect(Exit.isSuccess(exit)).toBe(true)
+    }),
+  )
+})
 
 describe("session.llm.stream", () => {
   const vivgridFixture = { providerID: "vivgrid", modelID: "gemini-3.1-pro-preview" }

@@ -272,6 +272,45 @@ describe("session.retry.retryable", () => {
     expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
   })
 
+  test("does not retry incomplete stream errors", () => {
+    const error = new SessionV1.IncompleteStreamError({
+      message: "provider stream ended before completion",
+    }).toObject()
+
+    expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+  })
+
+  test("does not retry max steps exceeded errors", () => {
+    const error = new SessionV1.MaxStepsExceededError({
+      message: "Maximum steps exceeded",
+      steps: 100,
+    }).toObject()
+
+    expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+  })
+
+  test("incomplete stream message does not match generic retryable patterns", () => {
+    // The explicit type guard, not the text, is what makes this terminal.
+    expect(SessionRetry.retryable(wrap("provider stream ended before completion"), retryProvider)).toBeUndefined()
+  })
+
+  test("incomplete stream errors stay terminal even when the message matches a retryable pattern", () => {
+    const error = new SessionV1.IncompleteStreamError({
+      message: "provider stream ended before completion: request timed out",
+    }).toObject()
+
+    expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+  })
+
+  test("max steps exceeded errors stay terminal even when the message matches a retryable pattern", () => {
+    const error = new SessionV1.MaxStepsExceededError({
+      message: "Maximum steps exceeded after internal server error",
+      steps: 100,
+    }).toObject()
+
+    expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+  })
+
   test("retries 500 errors even when isRetryable is false", () => {
     const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
       new SessionV1.APIError({
@@ -517,5 +556,30 @@ describe("session.message-v2.fromError", () => {
     expect(SessionRetry.retryable(result, retryProvider)).toEqual({
       message: "An error occurred while processing your request.",
     })
+  })
+
+  test("maps incomplete stream errors to a non-retryable message error", () => {
+    const result = MessageV2.fromError(
+      new SessionV1.IncompleteStreamError({ message: "provider stream ended before completion" }),
+      { providerID },
+    )
+
+    expect(SessionV1.IncompleteStreamError.isInstance(result)).toBe(true)
+    if (!SessionV1.IncompleteStreamError.isInstance(result)) throw new Error("expected IncompleteStreamError")
+    expect(result.data.message).toBe("provider stream ended before completion")
+    expect(SessionRetry.retryable(result, retryProvider)).toBeUndefined()
+  })
+
+  test("maps max steps exceeded errors to a non-retryable message error", () => {
+    const result = MessageV2.fromError(
+      new SessionV1.MaxStepsExceededError({ message: "Maximum steps exceeded", steps: 42 }),
+      { providerID },
+    )
+
+    expect(SessionV1.MaxStepsExceededError.isInstance(result)).toBe(true)
+    if (!SessionV1.MaxStepsExceededError.isInstance(result)) throw new Error("expected MaxStepsExceededError")
+    expect(result.data.message).toBe("Maximum steps exceeded")
+    expect(result.data.steps).toBe(42)
+    expect(SessionRetry.retryable(result, retryProvider)).toBeUndefined()
   })
 })

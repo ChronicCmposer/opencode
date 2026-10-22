@@ -546,6 +546,11 @@ const layer = Layer.effect(
             return
 
           case "finish":
+            // Terminal stream event: some providers only emit a top-level finish
+            // (no step-finish). Record the reason without clobbering one already
+            // set by step-finish.
+            ctx.assistantMessage.finish = ctx.assistantMessage.finish ?? value.reason
+            yield* session.updateMessage(ctx.assistantMessage)
             return
         }
       })
