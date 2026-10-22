@@ -832,6 +832,65 @@ describe("reduced worker provider — single serialized model (f-w2)", () => {
 })
 
 // ---------------------------------------------------------------------------
+// Phases 2-3 — the reduced provider consumes the REAL serialized descriptor.
+//
+// The worker used to synthesize a stub model (`capabilities.temperature:true`,
+// `reasoning:false`, `interleaved:false`, `limit.output:4096`, `options:{}`),
+// which made the worker's outgoing request params diverge from flag-off and
+// forced `temperature: 1.0` on glm/minimax/kimi/gemini. The descriptor now
+// carries the real capabilities/limit/options/variants/providerOptions.
+// ---------------------------------------------------------------------------
+
+const descriptorConfig: WorkerModelConfig = {
+  ...reducedConfig,
+  capabilities: {
+    temperature: false,
+    reasoning: true,
+    interleaved: { field: "reasoning_content" },
+    toolcall: true,
+    attachment: false,
+  },
+  limit: { context: 200_000, output: 32_000 },
+  options: { reasoningEffort: "high" },
+  variants: { high: { reasoningEffort: "high" } },
+  providerOptions: { includeUsage: true, setCacheKey: true },
+}
+
+const readReducedDescriptor = (config: WorkerModelConfig) =>
+  Effect.gen(function* () {
+    const provider = yield* Provider.Service
+    return {
+      model: yield* provider.getModel(ProviderV2.ID.make(config.providerID), ModelV2.ID.make(config.modelID)),
+      info: yield* provider.getProvider(ProviderV2.ID.make(config.providerID)),
+    }
+  }).pipe(Effect.provide(reducedModelProviderLayer(config)))
+
+describe("reduced worker provider — consumes the real descriptor", () => {
+  test("carries capabilities, limit, options, variants and provider options", async () => {
+    const { model, info } = await Effect.runPromise(readReducedDescriptor(descriptorConfig))
+
+    expect(model.capabilities.temperature).toBe(false)
+    expect(model.capabilities.reasoning).toBe(true)
+    expect(model.capabilities.interleaved).toEqual({ field: "reasoning_content" })
+    expect(model.limit).toMatchObject({ context: 200_000, output: 32_000 })
+    expect(model.options).toEqual({ reasoningEffort: "high" })
+    expect(model.variants).toEqual({ high: { reasoningEffort: "high" } })
+    expect(info.options).toEqual({ includeUsage: true, setCacheKey: true })
+  })
+
+  test("never invents a 4096 output cap or a temperature capability when the descriptor omits them", async () => {
+    const { model, info } = await Effect.runPromise(readReducedDescriptor(reducedConfig))
+
+    // No capabilities in the descriptor: do NOT synthesize `temperature: true`,
+    // which is what forced `ProviderTransform.temperature` to 1.0.
+    expect(model.capabilities.temperature).toBe(false)
+    expect(model.limit.output).not.toBe(4096)
+    expect(model.options).toEqual({})
+    expect(info.options).toEqual({})
+  })
+})
+
+// ---------------------------------------------------------------------------
 // f-w2-provider — non-serializable provider/model data is diagnosed at hub
 // build (`resolveWorkerModel`, called by `buildSessionWorkerInit`), not carried
 // into `workerData` where `structuredClone` would reject it at spawn.

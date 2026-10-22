@@ -20,6 +20,7 @@ import {
   type ExecutorTransport,
   type ExecutorWorkerScope,
   type SessionExecutionResult,
+  type SessionRunControl,
   type SessionWorkFactory,
 } from "@/session/worker/execute"
 import type { CancelFrame } from "@/session/worker/cancel"
@@ -280,6 +281,59 @@ describe("5.1 executor protocol", () => {
 
   test("DEFAULT_WORK_KIND is the production session work kind", () => {
     expect(DEFAULT_WORK_KIND).toBe("session")
+  })
+})
+
+describe("5.4 SessionRunControl seam (Phase 4 + 6.3)", () => {
+  test("cancel routes to the provided run control, not the executor machine", () =>
+    withScope(async (scope) => {
+      const machine = createSessionRunMachine({ scope })
+      const cancelled: SessionID[] = []
+      const control: SessionRunControl = {
+        cancel: async (sessionID) => {
+          cancelled.push(sessionID)
+        },
+        busy: async () => false,
+      }
+      const executor = createSessionExecutor({ machine, work: echoWork, control })
+
+      expect(await executor.handle({ type: "cancel", id: 9, sessionID: sid("ses_1") })).toEqual({
+        type: "cancelled",
+        id: 9,
+      })
+      expect(cancelled).toEqual([sid("ses_1")])
+    }))
+
+  test("assertNotBusy answers from the provided run control", () =>
+    withScope(async (scope) => {
+      const machine = createSessionRunMachine({ scope })
+      const executor = createSessionExecutor({
+        machine,
+        work: echoWork,
+        control: { cancel: async () => {}, busy: async () => true },
+      })
+
+      expect(await executor.handle({ type: "assertNotBusy", id: 1, sessionID: sid("ses_1") })).toEqual({
+        type: "busy",
+        id: 1,
+        busy: true,
+      })
+    }))
+
+  test("installSessionExecutor forwards the run control to the executor", async () => {
+    const posted: unknown[] = []
+    const workerScope: ExecutorWorkerScope = { onmessage: null, postMessage: (message) => posted.push(message) }
+    const installed = installSessionExecutor(workerScope, {
+      work: echoWork,
+      control: { cancel: async () => {}, busy: async () => true },
+    })
+
+    expect(await installed.handle({ type: "assertNotBusy", id: 1, sessionID: sid("ses_1") })).toEqual({
+      type: "busy",
+      id: 1,
+      busy: true,
+    })
+    await installed.dispose()
   })
 })
 

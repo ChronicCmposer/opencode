@@ -16,6 +16,8 @@
 //   * Reserved-handle transactions. One transaction may be pinned at a time; other
 //     operations queue behind it (documented head-of-line blocking). A pinned
 //     transaction is rolled back after `txIdleMs` of inactivity and on close (7.4).
+//     A commit/rollback always releases the pin, even when its final statement
+//     fails, so a completed run never leaves the writer pinned.
 //   * Sequence allocation at commit. The writer, never the caller, assigns
 //     `event_sequence.seq = latest + 1` inside the commit transaction; an aborted or
 //     failed commit consumes no sequence (7.10, 7.11).
@@ -456,7 +458,7 @@ export class WriterCore {
     }
   }
 
-  private async runBusyRetried<T>(point: string, body: () => Promise<T>): Promise<T> {
+  private async runBusyRetried<T>(point: string, body: () => Promise<T> | T): Promise<T> {
     let delay = this.busyBaseDelayMs
     for (let attempt = 0; ; attempt++) {
       try {
@@ -517,13 +519,15 @@ export class WriterCore {
     // A `begin` is an ordinary queued job: when another transaction is pinned it
     // waits head-of-line instead of rejecting, so the worker's Drizzle database
     // can open concurrent top-level transactions safely.
-    return this.enqueue(() => {
-      if (this.pinned !== undefined) throw new TransactionError("a transaction is already pinned")
-      this.connection.run("BEGIN IMMEDIATE", [])
-      const handle = `tx-${++this.txCounter}`
-      this.pinned = { handle, timer: this.armIdleTimer(handle) }
-      return handle
-    })
+    return this.enqueue(() =>
+      this.runBusyRetried("writer:tx-begin", () => {
+        if (this.pinned !== undefined) throw new TransactionError("a transaction is already pinned")
+        this.connection.run("BEGIN IMMEDIATE", [])
+        const handle = `tx-${++this.txCounter}`
+        this.pinned = { handle, timer: this.armIdleTimer(handle) }
+        return handle
+      }),
+    )
   }
 
   txQuery(
@@ -537,9 +541,11 @@ export class WriterCore {
       this.resetIdleTimer(handle)
       if (Faults.abortTxAfter("writer:tx")) {
         // The requester died mid-write: abandon the pinned transaction and release it.
-        this.clearIdleTimer()
-        this.connection.run("ROLLBACK", [])
-        this.pinned = undefined
+        try {
+          this.finishTransaction("ROLLBACK")
+        } catch {
+          // Release is the point; a failing ROLLBACK must not mask the abort.
+        }
         throw new AbortedWriteError("requester died mid-write")
       }
       return this.execute(method, sql, params)
@@ -549,25 +555,46 @@ export class WriterCore {
   commitTransaction(handle: string): Promise<void> {
     return this.enqueue(() => {
       this.assertPinned(handle)
-      this.clearIdleTimer()
       // A mid-commit crash (only armed in a real isolate) fires before COMMIT, so
       // the open transaction is never committed; the isolate dying rolls it back
       // and nothing partial survives — the reserved-handle analogue of the
       // publish path's mid-commit crash.
       Faults.crashWorker("writer:tx-commit")
-      this.connection.run("COMMIT", [])
-      this.pinned = undefined
-      this.cache.clear()
+      this.finishTransaction("COMMIT")
     }, { txHandle: handle })
   }
 
   rollbackTransaction(handle: string): Promise<void> {
     return this.enqueue(() => {
       this.assertPinned(handle)
-      this.clearIdleTimer()
-      this.connection.run("ROLLBACK", [])
-      this.pinned = undefined
+      this.finishTransaction("ROLLBACK")
     }, { txHandle: handle })
+  }
+
+  /**
+   * End the pinned transaction with `statement` and release the pin no matter
+   * what. A failed `COMMIT` leaves SQLite's transaction open, so it is rolled back
+   * before the pin clears; a failed `ROLLBACK` cannot be undone at the SQL level,
+   * but the handle is still spent, so a queued `begin` can proceed instead of
+   * starving behind a transaction that has logically finished.
+   */
+  private finishTransaction(statement: "COMMIT" | "ROLLBACK"): void {
+    try {
+      this.connection.run(statement, [])
+      if (statement === "COMMIT") this.cache.clear()
+    } catch (error) {
+      if (statement === "COMMIT") {
+        try {
+          this.connection.run("ROLLBACK", [])
+        } catch {
+          // SQLite already unwound the transaction; nothing left to discard.
+        }
+      }
+      throw error
+    } finally {
+      this.clearIdleTimer()
+      this.pinned = undefined
+    }
   }
 
   private assertPinned(handle: string): void {

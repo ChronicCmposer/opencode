@@ -25,6 +25,7 @@ import {
 } from "@/session/worker/dispatch"
 import type { PoolWorker } from "@/session/worker/pool"
 import { SessionQueueFullError } from "@/session/worker/queue"
+import type { CancelFrame, CancelPort } from "@/session/worker/cancel"
 import { createWorkerHarness, type HarnessWorker, type WorkerHarness } from "../../lib/worker-harness"
 import { faultWorkerEntry, withFaults } from "../../lib/faults"
 
@@ -267,9 +268,7 @@ describe("4.6 on-demand headroom (depth-1 children only)", () => {
     const dispatcher = createDispatcher({ pool })
     const parent = dispatcher.dispatch({ sessionID: sid("ses_parent") })
 
-    const children = [0, 1, 2].map((index) =>
-      dispatcher.dispatch({ sessionID: sid(`ses_child_${index}`), depth: 1 }),
-    )
+    const children = [0, 1, 2].map((index) => dispatcher.dispatch({ sessionID: sid(`ses_child_${index}`), depth: 1 }))
     await flush()
 
     // headroom = 2 for K=1: two children run, the third queues.
@@ -626,9 +625,7 @@ describe("4.11 dispatch validation and waiters", () => {
     const root = capture(dispatcher.dispatch({ sessionID: sid("ses_1") }))
     const one = capture(dispatcher.dispatch({ sessionID: sid("ses_1"), depth: 1 }))
     const two = capture(dispatcher.dispatch({ sessionID: sid("ses_1"), depth: 2 }))
-    await expect(dispatcher.dispatch({ sessionID: sid("ses_1"), depth: 3 })).rejects.toThrow(
-      SessionQueueFullError,
-    )
+    await expect(dispatcher.dispatch({ sessionID: sid("ses_1"), depth: 3 })).rejects.toThrow(SessionQueueFullError)
     await dispatcher.terminateAll()
     await Promise.allSettled([root, one, two])
   })
@@ -726,5 +723,184 @@ describe("crash error surfacing", () => {
 
     expect(error).toBeInstanceOf(WorkerCrashedError)
     expect((error as WorkerCrashedError).message).toContain("no-such-worker-entry.ts")
+  })
+})
+
+/**
+ * A worker with a cancel port whose run unwinds (resolves), dies with the
+ * executor machine (rejects), or ignores the cancel entirely (`ignore`).
+ * `acknowledge` controls whether the worker reports a `cancel-ack`.
+ */
+class PortedWorker implements SessionWorker {
+  alive = true
+  readonly runs: SessionRun[] = []
+  readonly hub: CancelPort
+  private readonly pending = new Map<SessionID, PendingRun>()
+  private readonly ackHandlers = new Set<(frame: CancelFrame) => void>()
+
+  constructor(
+    readonly id: number,
+    private readonly onCancel: "resolve" | "reject" | "ignore",
+    private readonly acknowledge = true,
+  ) {
+    this.hub = {
+      notify: (frame) => {
+        if (frame.type !== "cancel") return
+        if (this.acknowledge) {
+          for (const handler of [...this.ackHandlers]) {
+            handler({ type: "cancel-ack", sessionID: frame.sessionID, accepted: true })
+          }
+        }
+        if (this.onCancel === "ignore") return
+        const sessionID = frame.sessionID as SessionID
+        const pending = this.pending.get(sessionID)
+        if (pending === undefined) return
+        this.pending.delete(sessionID)
+        if (this.onCancel === "resolve") pending.resolve()
+        else pending.reject(new Error("executor machine interrupted"))
+      },
+      onMessage: (handler) => {
+        this.ackHandlers.add(handler)
+        return () => void this.ackHandlers.delete(handler)
+      },
+    }
+  }
+
+  execute(run: SessionRun): Promise<void> {
+    this.runs.push(run)
+    return new Promise<void>((resolve, reject) => {
+      this.pending.set(run.sessionID, { resolve, reject })
+    })
+  }
+
+  async terminate(): Promise<void> {
+    this.alive = false
+    const pending = [...this.pending.values()]
+    this.pending.clear()
+    for (const run of pending) run.reject(new SessionCancelledError({ message: "terminated", sessionID: "" }))
+  }
+}
+
+class PortedPool implements WorkerPool {
+  readonly workers: PortedWorker[]
+  readonly spawned: PortedWorker[] = []
+
+  constructor(
+    k: number,
+    private readonly onCancel: "resolve" | "reject" | "ignore",
+  ) {
+    this.workers = Array.from({ length: k }, (_, index) => new PortedWorker(index + 1, onCancel))
+  }
+
+  spawn(): SessionWorker {
+    const worker = new PortedWorker(100 + this.spawned.length, this.onCancel)
+    this.spawned.push(worker)
+    return worker
+  }
+
+  async terminateAll(): Promise<void> {
+    await Promise.all(this.workers.map((worker) => worker.terminate()))
+  }
+}
+
+describe("11.5 reaping seams + still-live terminate hardening", () => {
+  test("the terminate path invokes the reap seam with the worker", async () => {
+    const pool = new FakePool(1)
+    const reaped: number[] = []
+    const dispatcher = createDispatcher({
+      pool,
+      cancellation: { reap: (worker) => reaped.push(worker.id) },
+    })
+
+    const running = capture(dispatcher.dispatch({ sessionID: sid("ses_reap") }))
+    await flush()
+    await dispatcher.cancelWithGrace(sid("ses_reap"))
+
+    expect(await running).toBeInstanceOf(SessionCancelledError)
+    expect(reaped).toEqual([1])
+
+    await dispatcher.terminateAll()
+  })
+
+  test("terminateAll invokes the reapAll seam exactly once", async () => {
+    const pool = new FakePool(1)
+    let reapAllCalls = 0
+    const dispatcher = createDispatcher({
+      pool,
+      cancellation: {
+        reapAll: () => {
+          reapAllCalls += 1
+        },
+      },
+    })
+
+    const running = capture(dispatcher.dispatch({ sessionID: sid("ses_reap_all") }))
+    await flush()
+    await dispatcher.terminateAll()
+    await running
+    await dispatcher.terminateAll()
+
+    expect(reapAllCalls).toBe(1)
+  })
+
+  test("a cooperative ack whose run actually unwound reuses the worker and does not reap", async () => {
+    const pool = new PortedPool(1, "resolve")
+    const reaped: number[] = []
+    const dispatcher = createDispatcher({
+      pool,
+      cancellation: {
+        portFor: (worker) => (worker as PortedWorker).hub,
+        graceMs: 500,
+        schedule: createTestScheduler().schedule,
+        reap: (worker) => reaped.push(worker.id),
+      },
+    })
+
+    const running = capture(dispatcher.dispatch({ sessionID: sid("ses_unwound") }))
+    await flush()
+    const outcome = await dispatcher.cancelWithGrace(sid("ses_unwound"))
+
+    expect(outcome).toMatchObject({ mode: "cooperative", winner: "cancel", acknowledged: true })
+    expect(pool.workers[0].alive).toBe(true)
+    expect(reaped).toEqual([])
+    expect(await running).toBeInstanceOf(SessionCancelledError)
+
+    await dispatcher.terminateAll()
+  })
+
+  test("grace expiry terminates a still-running worker and reaps it exactly once", async () => {
+    const pool = new PortedPool(1, "ignore")
+    const scheduler = createTestScheduler()
+    const reaped: number[] = []
+    const dispatcher = createDispatcher({
+      pool,
+      cancellation: {
+        portFor: (worker) => (worker as PortedWorker).hub,
+        graceMs: 500,
+        schedule: scheduler.schedule,
+        reap: (worker) => reaped.push(worker.id),
+      },
+    })
+
+    const running = capture(dispatcher.dispatch({ sessionID: sid("ses_grace") }))
+    await flush()
+    const pending = dispatcher.cancelWithGrace(sid("ses_grace"))
+    await flush()
+
+    // The run ignored the cancel: at grace expiry the dispatcher terminates the
+    // isolate (reaping mirrored PGIDs once — the controller reaps, the idempotent
+    // dispatcher terminate does not reap again).
+    scheduler
+      .pending()
+      .find((timer) => timer.delayMs === 500)
+      ?.run()
+    const outcome = await pending
+
+    expect(outcome).toMatchObject({ mode: "terminated", winner: "cancel", acknowledged: true })
+    expect(pool.workers[0].alive).toBe(false)
+    expect(reaped).toEqual([1])
+    expect(await running).toBeInstanceOf(SessionCancelledError)
+
+    await dispatcher.terminateAll()
   })
 })

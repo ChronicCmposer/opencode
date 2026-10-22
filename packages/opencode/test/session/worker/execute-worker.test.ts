@@ -19,7 +19,11 @@ import { spawnTransport } from "../../lib/transport"
 
 const sid = (value: string) => value as SessionID
 
-async function waitUntil(predicate: () => boolean | Promise<boolean>, message: string, timeoutMs = 5000): Promise<void> {
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  message: string,
+  timeoutMs = 5000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (await predicate()) return
@@ -130,5 +134,20 @@ describe("5.4 hub forwards cancellation", () => {
 
     await rig.dispatch.cancel(sid("ses_a"))
     await expect(running).rejects.toBeInstanceOf(SessionCancelledError)
+  })
+
+  test("a cancelled worker session leaves the worker run-state clean and reusable", async () => {
+    await using rig = makeRig(1)
+    const running = rig.dispatch.ensureRunning(sid("ses_a"))
+    await waitUntil(() => rig.dispatch.assertNotBusy(sid("ses_a")), "worker never became busy")
+
+    await rig.dispatch.cancel(sid("ses_a"))
+    await expect(running).rejects.toBeInstanceOf(SessionCancelledError)
+
+    // The worker's per-key run-state is idle after the cancel, so a fresh
+    // session runs to completion on the same worker.
+    expect(await rig.dispatch.assertNotBusy(sid("ses_a"))).toBe(false)
+    const next = await rig.dispatch.ensureRunning(sid("ses_b"))
+    expect(next.sessionID).toBe("ses_b")
   })
 })

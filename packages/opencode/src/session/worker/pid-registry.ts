@@ -14,6 +14,8 @@
 // (`ProcessReaper` TODO), so `reapSupport()` reports the reason the platform
 // cannot be verified. The registry itself is platform-neutral bookkeeping.
 
+import { Context } from "effect"
+
 /** Kills a whole process group. Injecting one makes reaping deterministic in tests. */
 export interface ProcessReaper {
   killGroup(pgid: number, signal?: NodeJS.Signals): void
@@ -90,6 +92,45 @@ export interface RegisterChildInput {
   readonly label: string
   readonly generation?: number
 }
+
+// ---------------------------------------------------------------------------
+// Worker→hub PID reporting.
+//
+// A session worker owns the detached shell children it spawns, but the hub owns
+// reaping. The worker therefore reports each child's process group over its
+// control port; the hub mirrors the entries into the `PidRegistry` above. The
+// report shape is frozen because a sibling consumes it in `hub.ts`.
+// ---------------------------------------------------------------------------
+
+/** One reported child process group. `workerID` is the owner's hub id. */
+export interface PidReportEntry {
+  readonly pid: number
+  readonly pgid: number
+  readonly label: string
+  readonly workerID: number
+}
+
+/** The worker→hub `pid-report` frame. */
+export interface PidReport {
+  readonly type: "pid-report"
+  readonly workerID: number
+  readonly entries: ReadonlyArray<PidReportEntry>
+}
+
+/**
+ * The worker-side report seam. The shell tool calls it after a detached spawn;
+ * the production implementation posts a {@link PidReport} over the worker's
+ * control port. The worker does not know its own hub id, so the reporter injects
+ * it (and the hub may override it with the authoritative port association).
+ */
+export interface PidReporterInterface {
+  report(entry: Omit<PidReportEntry, "workerID">): void
+}
+
+/** The worker `PidReporter` service; absent on degraded/hub-only paths. */
+export class PidReporter extends Context.Service<PidReporter, PidReporterInterface>()(
+  "@opencode/session-worker/PidReporter",
+) {}
 
 export interface PidRegistry {
   readonly size: number
@@ -237,6 +278,22 @@ export function spawnRegistered(
     }
     throw error
   }
+}
+
+/**
+ * Mirror a worker's `pid-report` frame into the hub registry. Every entry is
+ * keyed by its PGID (via `register`, the same primitive `spawnRegistered` uses).
+ *
+ * `workerID` is the authoritative owner when supplied: the hub knows which pool
+ * slot a control port belongs to, while the worker only knows its own thread id.
+ * It therefore overrides the frame's self-reported id.
+ */
+export function registerReported(
+  registry: PidRegistry,
+  report: PidReport,
+  workerID: number = report.workerID,
+): ReadonlyArray<RegisteredChild> {
+  return report.entries.map((entry) => registry.register({ ...entry, workerID }))
 }
 
 function assertWorkerID(workerID: number): void {

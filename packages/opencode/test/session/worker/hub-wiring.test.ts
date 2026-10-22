@@ -96,7 +96,9 @@ class FakePool implements ExecutorWorkerPool {
 const runStateLayer = SessionRunState.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
-      Layer.mock(BackgroundJob.Service, {}),
+      // The flag-on cancel branch now cancels background jobs too, so `list`
+      // must be callable even when no jobs are running.
+      Layer.mock(BackgroundJob.Service, { list: () => Effect.succeed([]) }),
       Layer.mock(SessionStatus.Service, { set: () => Effect.void }),
     ),
   ),
@@ -125,6 +127,40 @@ const recordingRunStateLayer = (calls: StatusCall[]) =>
       ),
     ),
   )
+
+/**
+ * `SessionRunState.layer` with a recording `SessionStatus` AND a `BackgroundJob`
+ * stub that reports a fixed set of running jobs and records every `cancel`. Used
+ * to pin the Phase 6.1 contract: cancel must cancel background subagents/jobs
+ * (flag on and flag off) as well as reach the single terminal idle.
+ */
+const recordingBackgroundRunStateLayer = (calls: StatusCall[], jobs: BackgroundJob.Info[], cancelled: string[]) =>
+  SessionRunState.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(BackgroundJob.Service, {
+          list: () => Effect.succeed(jobs),
+          cancel: (id) =>
+            Effect.sync(() => {
+              cancelled.push(id)
+              return undefined
+            }),
+        }),
+        Layer.mock(SessionStatus.Service, {
+          set: (sessionID, status) => Effect.sync(() => void calls.push({ sessionID, status })),
+        }),
+      ),
+    ),
+  )
+
+/** A running background job owned by `parentSessionID` (a background subagent). */
+const backgroundJobOf = (id: string, parentSessionID: SessionID): BackgroundJob.Info => ({
+  id,
+  type: "task",
+  status: "running",
+  started_at: 0,
+  metadata: { parentSessionId: parentSessionID },
+})
 
 const flagsOn = RuntimeFlags.layer({ experimentalSessionWorkers: true })
 
@@ -155,11 +191,7 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
         // The hub cannot carry the caller's latch, so run-state must open it:
         // awaiting would suspend forever (and time the test out) otherwise.
         yield* ready.await
-      }).pipe(
-        Effect.provide(runStateLayer),
-        Effect.provideService(SessionHubService, hub),
-        Effect.provide(flagsOn),
-      ),
+      }).pipe(Effect.provide(runStateLayer), Effect.provideService(SessionHubService, hub), Effect.provide(flagsOn)),
     )
   })
 
@@ -183,11 +215,7 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
           )
           .pipe(Effect.flip)
         expect(error).toBeInstanceOf(Session.BusyError)
-      }).pipe(
-        Effect.provide(runStateLayer),
-        Effect.provideService(SessionHubService, hub),
-        Effect.provide(flagsOn),
-      ),
+      }).pipe(Effect.provide(runStateLayer), Effect.provideService(SessionHubService, hub), Effect.provide(flagsOn)),
     )
   })
 
@@ -207,11 +235,7 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
         const state = yield* SessionRunState.Service
         yield* state.cancel(sid("ses_none"))
         expect(cancelled).toEqual([sid("ses_none")])
-      }).pipe(
-        Effect.provide(runStateLayer),
-        Effect.provideService(SessionHubService, hub),
-        Effect.provide(flagsOn),
-      ),
+      }).pipe(Effect.provide(runStateLayer), Effect.provideService(SessionHubService, hub), Effect.provide(flagsOn)),
     )
   })
 
@@ -240,6 +264,48 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
         Effect.provideService(SessionHubService, hub),
         Effect.provide(flagsOn),
       ),
+    )
+  })
+
+  it.live("flag-on cancel cancels background jobs and emits exactly one idle, matching flag-off", () => {
+    const sessionID = sid("ses_bg")
+    const job = backgroundJobOf("job_bg_1", sessionID)
+
+    const flagOnCalls: StatusCall[] = []
+    const flagOffCalls: StatusCall[] = []
+    const flagOnCancelled: string[] = []
+    const flagOffCancelled: string[] = []
+
+    const flagOnPool = new FakePool(1, undefined)
+    const flagOnHub = createSessionHub({ pool: flagOnPool })
+    const flagOn = withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        yield* state.cancel(sessionID)
+      }).pipe(
+        Effect.provide(recordingBackgroundRunStateLayer(flagOnCalls, [job], flagOnCancelled)),
+        Effect.provideService(SessionHubService, flagOnHub),
+        Effect.provide(flagsOn),
+      ),
+    )
+
+    const flagOff = withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        yield* state.cancel(sessionID)
+      }).pipe(Effect.provide(recordingBackgroundRunStateLayer(flagOffCalls, [job], flagOffCancelled))),
+    )
+
+    return Effect.all([flagOn, flagOff]).pipe(
+      Effect.map(() => {
+        // Phase 6.1: the background subagent is cancelled on both paths — the
+        // flag-on branch must not let it outlive the cancel.
+        expect(flagOnCancelled).toEqual([job.id])
+        expect(flagOffCancelled).toEqual([job.id])
+        // Exactly one terminal idle, and the same idle sequence as flag off.
+        expect(idleOf(flagOnCalls)).toEqual([{ sessionID, status: { type: "idle" } }])
+        expect(idleOf(flagOnCalls)).toEqual(idleOf(flagOffCalls))
+      }),
     )
   })
 
@@ -300,12 +366,22 @@ class BlockingWorker implements ExecutorWorker {
   constructor(
     readonly id: number,
     private readonly value: unknown,
+    /**
+     * Simulates the worker-local run-state (table B) publishing the terminal
+     * `session.status: idle` through the hub-proxy before it acknowledges the
+     * cancel. Phase 4 routes the executor cancel into that inner runner, so a
+     * dispatched run emits its own idle; the hub-side `SessionRunState.cancel`
+     * must not emit a second one.
+     */
+    private readonly onCancelIdle?: (sessionID: SessionID) => void,
   ) {
     this.cancelPort = {
       notify: (frame) => {
         if (frame.type !== "cancel") return
-        // Acknowledge FIRST: `cancelWithGrace` reclassifies a settle with no ack
-        // to a natural completion, so the ack must land before the run settles.
+        // table B publishes idle on unwind, BEFORE the ack. Then acknowledge:
+        // `cancelWithGrace` reclassifies a settle with no ack to a natural
+        // completion, so the ack must land before the run settles.
+        this.onCancelIdle?.(frame.sessionID as SessionID)
         for (const handler of this.ackHandlers) {
           handler({ type: "cancel-ack", sessionID: frame.sessionID, accepted: true })
         }
@@ -354,12 +430,13 @@ class BlockingPool implements ExecutorWorkerPool {
   constructor(
     k: number,
     private readonly value: unknown,
+    private readonly onCancelIdle?: (sessionID: SessionID) => void,
   ) {
-    this.workers = Array.from({ length: k }, (_, index) => new BlockingWorker(index + 1, this.value))
+    this.workers = Array.from({ length: k }, (_, index) => new BlockingWorker(index + 1, this.value, onCancelIdle))
   }
 
   spawn(): ExecutorSessionWorker {
-    const worker = new BlockingWorker(this.nextSpawnId++, this.value)
+    const worker = new BlockingWorker(this.nextSpawnId++, this.value, this.onCancelIdle)
     this.spawned.push(worker)
     return worker
   }
@@ -394,16 +471,21 @@ const idleOf = (calls: StatusCall[]) => calls.filter((call) => call.status.type 
 describe("12 — integrated flag-on cancel (outcome + idle + session.cancelled)", () => {
   it.live("one flag-on cancel observes the hub outcome, exactly one idle, and session.cancelled", () => {
     const sessionID = sid("ses_integrated")
-    const pool = new BlockingPool(1, withParts(sessionID))
+    const flagOnCalls: StatusCall[] = []
+    const flagOffCalls: StatusCall[] = []
+    // Phase 4: the executor cancel reaches the worker-local run-state (table B),
+    // whose `onIdle` publishes the terminal idle through the hub-proxy. The pool
+    // simulates that emit; the hub-side `SessionRunState.cancel` must not add a
+    // second one.
+    const pool = new BlockingPool(1, withParts(sessionID), (id) =>
+      flagOnCalls.push({ sessionID: id, status: { type: "idle" } }),
+    )
     const { publisher, published } = recordingPublisher()
     const hub = createSessionHub({
       pool,
       events: publisher,
       cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort, graceMs: 5_000 }),
     })
-
-    const flagOnCalls: StatusCall[] = []
-    const flagOffCalls: StatusCall[] = []
 
     // Flag on: a worker session that stays busy until `state.cancel` reaches it.
     const flagOn = withTmpdirInstance()(
@@ -528,5 +610,182 @@ describe("12 — integrated flag-on cancel (outcome + idle + session.cancelled)"
       // Both arms emit the same single terminal idle: the no-op is safe.
       expect(idleOf(flagOffCalls)).toEqual(idleOf(flagOnCalls))
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 4 consolidation — exactly ONE idle per flag-ON cancel, in every case.
+//
+// The executor cancel now routes into the worker-local run-state (table B),
+// whose `onIdle` publishes `session.status: idle` through the hub-proxy. The
+// hub-side `SessionRunState.cancel` therefore emits the fallback idle ONLY when
+// no worker could have published it: a queued session, an idle no-op, or a
+// grace-expired terminate. These three cases pin that contract, each against
+// flag-off.
+// ---------------------------------------------------------------------------
+
+describe("12 — exactly one flag-on cancel idle per case (ON ≡ OFF)", () => {
+  /** Whether the hub currently hosts `sessionID` on a running worker. */
+  const runningState = (hub: SessionHub, sessionID: SessionID) => (): true | undefined =>
+    hub.dispatcher.registry.get(sessionID)?.state === "running" ? true : undefined
+
+  it.live("busy/dispatched: the worker publishes the idle, the hub does not double-emit", () => {
+    const sessionID = sid("ses_busy_one")
+    const onCalls: StatusCall[] = []
+    const offCalls: StatusCall[] = []
+    // The pool simulates table B publishing idle through the hub-proxy on cancel.
+    const pool = new BlockingPool(1, withParts(sessionID), (id) =>
+      onCalls.push({ sessionID: id, status: { type: "idle" } }),
+    )
+    const hub = createSessionHub({
+      pool,
+      cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort, graceMs: 5_000 }),
+    })
+
+    const flagOn = withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const running = yield* state
+          .ensureRunning(sessionID, Effect.succeed(withParts(sessionID)), Effect.succeed(withParts(sessionID)))
+          .pipe(Effect.exit, Effect.forkChild)
+        yield* pollWithTimeout(Effect.sync(runningState(hub, sessionID)), "flag-on session never reached running")
+        yield* state.cancel(sessionID)
+        yield* Fiber.join(running)
+      }).pipe(
+        Effect.provide(recordingRunStateLayer(onCalls)),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+      ),
+    )
+
+    const flagOff = withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const started = yield* Deferred.make<void>()
+        const work = Effect.gen(function* () {
+          yield* Deferred.succeed(started, undefined)
+          return yield* Effect.never
+        })
+        const running = yield* state
+          .ensureRunning(sessionID, Effect.succeed(withParts(sessionID)), work)
+          .pipe(Effect.exit, Effect.forkChild)
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            return (yield* Deferred.isDone(started)) ? true : undefined
+          }),
+          "flag-off session never started",
+        )
+        yield* state.cancel(sessionID)
+        yield* Fiber.join(running)
+      }).pipe(Effect.provide(recordingRunStateLayer(offCalls))),
+    )
+
+    return Effect.all([flagOn, flagOff]).pipe(
+      Effect.map(() => {
+        // One idle, from the worker's hub-proxy emit — not two.
+        expect(idleOf(onCalls)).toEqual([{ sessionID, status: { type: "idle" } }])
+        expect(idleOf(offCalls)).toEqual([{ sessionID, status: { type: "idle" } }])
+        expect(idleOf(onCalls)).toEqual(idleOf(offCalls))
+      }),
+    )
+  })
+
+  it.live("queued-but-not-dispatched: the hub publishes the single idle, matching flag-off", () => {
+    const holderID = sid("ses_holder")
+    const queuedID = sid("ses_queued")
+    const onCalls: StatusCall[] = []
+    const offCalls: StatusCall[] = []
+    // One live worker holds `holderID`; `queuedID` is admitted with no worker.
+    const pool = new BlockingPool(1, withParts(holderID))
+    const hub = createSessionHub({
+      pool,
+      cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort, graceMs: 5_000 }),
+    })
+
+    const flagOn = withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const holder = yield* state
+          .ensureRunning(holderID, Effect.succeed(withParts(holderID)), Effect.succeed(withParts(holderID)))
+          .pipe(Effect.exit, Effect.forkChild)
+        yield* pollWithTimeout(Effect.sync(runningState(hub, holderID)), "holder session never reached running")
+        const queued = yield* state
+          .ensureRunning(queuedID, Effect.succeed(withParts(queuedID)), Effect.succeed(withParts(queuedID)))
+          .pipe(Effect.exit, Effect.forkChild)
+        yield* pollWithTimeout(
+          Effect.sync(() => (hub.dispatcher.queuedCount === 1 ? true : undefined)),
+          "session was never queued",
+        )
+        const outcome = yield* state.cancel(queuedID)
+        yield* Fiber.join(queued)
+        // Release the holder so the scope can close.
+        yield* state.cancel(holderID)
+        yield* Fiber.join(holder)
+        return outcome
+      }).pipe(
+        Effect.provide(recordingRunStateLayer(onCalls)),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+      ),
+    )
+
+    const flagOff = withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        yield* state.cancel(queuedID)
+      }).pipe(Effect.provide(recordingRunStateLayer(offCalls))),
+    )
+
+    return Effect.all([flagOn, flagOff]).pipe(
+      Effect.map(([outcome]) => {
+        // No worker ran the queued session, so the hub-side is the only emitter.
+        expect(outcome).toMatchObject({
+          sessionID: queuedID,
+          mode: "terminated",
+          winner: "cancel",
+          acknowledged: false,
+        })
+        expect(idleOf(onCalls)).toEqual([{ sessionID: queuedID, status: { type: "idle" } }])
+        expect(idleOf(offCalls)).toEqual(idleOf(onCalls))
+      }),
+    )
+  })
+
+  it.live("idle/no-op: the hub publishes the single idle, matching flag-off", () => {
+    const sessionID = sid("ses_idle_one")
+    const onCalls: StatusCall[] = []
+    const offCalls: StatusCall[] = []
+    const pool = new BlockingPool(1, withParts(sessionID))
+    const hub = createSessionHub({
+      pool,
+      cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort, graceMs: 5_000 }),
+    })
+
+    const flagOn = withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        return yield* state.cancel(sessionID)
+      }).pipe(
+        Effect.provide(recordingRunStateLayer(onCalls)),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+      ),
+    )
+
+    const flagOff = withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        return yield* state.cancel(sessionID)
+      }).pipe(Effect.provide(recordingRunStateLayer(offCalls))),
+    )
+
+    return Effect.all([flagOn, flagOff]).pipe(
+      Effect.map(([on]) => {
+        // Nothing was admitted and nothing ran: the hub-side emits the idle.
+        expect(on).toBeUndefined()
+        expect(idleOf(onCalls)).toEqual([{ sessionID, status: { type: "idle" } }])
+        expect(idleOf(offCalls)).toEqual(idleOf(onCalls))
+      }),
+    )
   })
 })

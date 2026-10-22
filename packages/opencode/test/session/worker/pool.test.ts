@@ -267,8 +267,10 @@ const modelLayers = (input: ModelLayerInput = {}) =>
     RuntimeFlags.layer({ experimentalSessionWorkers: true }),
   )
 
-const runResolve = (input: ModelLayerInput, options: { providerID?: string; modelID?: string; env?: Record<string, string | undefined> } = {}) =>
-  Effect.runPromise(resolveWorkerModel(options).pipe(Effect.provide(modelLayers(input))))
+const runResolve = (
+  input: ModelLayerInput,
+  options: { providerID?: string; modelID?: string; env?: Record<string, string | undefined> } = {},
+) => Effect.runPromise(resolveWorkerModel(options).pipe(Effect.provide(modelLayers(input))))
 
 describe("resolveWorkerModel", () => {
   test("resolves the serializable subset from provider + auth", async () => {
@@ -282,6 +284,10 @@ describe("resolveWorkerModel", () => {
       baseUrl: "https://api.example.com/v1",
       apiKey: "sk-auth",
       headers: { "x-provider": "1", "x-model": "1" },
+      capabilities: { temperature: false, reasoning: false, interleaved: undefined },
+      limit: { context: 1_000, output: 1_000 },
+      options: {},
+      providerOptions: { baseURL: "https://api.example.com/v1", headers: { "x-provider": "1" } },
     })
   })
 
@@ -292,7 +298,10 @@ describe("resolveWorkerModel", () => {
   })
 
   test("substitutes ${VAR} from the injected env", async () => {
-    const model = await runResolve({ providerOptions: { baseURL: "https://${HOST}/v1" } }, { env: { HOST: "example.test" } })
+    const model = await runResolve(
+      { providerOptions: { baseURL: "https://${HOST}/v1" } },
+      { env: { HOST: "example.test" } },
+    )
 
     expect(model.baseUrl).toBe("https://example.test/v1")
   })
@@ -354,13 +363,17 @@ describe("buildSessionWorkerInit", () => {
 
     expect(init.env).toEqual({ values: { A: "1" } })
     expect(init.model).toEqual({
-      baseUrl: "https://api.example.com/v1",
-      apiKey: "sk-auth",
-      model: "claude",
       providerID: "anthropic",
+      modelID: "claude",
       apiId: "claude-api-id",
       npm: "@ai-sdk/anthropic",
+      baseUrl: "https://api.example.com/v1",
+      apiKey: "sk-auth",
       headers: { "x-provider": "1", "x-model": "1" },
+      capabilities: { temperature: false, reasoning: false, interleaved: undefined },
+      limit: { context: 1_000, output: 1_000 },
+      options: {},
+      providerOptions: { baseURL: "https://api.example.com/v1", headers: { "x-provider": "1" } },
     })
     expect(init.snapshot.directory).toBe("/tmp/opencode-proj")
     expect(init.snapshot.workerCount).toBe(2)
@@ -368,7 +381,10 @@ describe("buildSessionWorkerInit", () => {
   })
 
   test("carries the requested worker capabilities", async () => {
-    const init = await runInit({ snapshot: { workerCount: 1, clock: () => 300 }, capabilities: { sessionWorkerPorts: true } })
+    const init = await runInit({
+      snapshot: { workerCount: 1, clock: () => 300 },
+      capabilities: { sessionWorkerPorts: true },
+    })
 
     expect(init.capabilities).toEqual({ sessionWorkerPorts: true })
     expect(assertStructuredCloneable(init)).toEqual(init)
@@ -398,9 +414,7 @@ describe("createProductionWorkerPool", () => {
 
     expect(pool.workers).toHaveLength(3)
 
-    await Promise.all(
-      pool.workers.map((worker, index) => worker.execute({ sessionID: sid(`ses_${index}`), depth: 0 })),
-    )
+    await Promise.all(pool.workers.map((worker, index) => worker.execute({ sessionID: sid(`ses_${index}`), depth: 0 })))
 
     expect(pool.workers.every((worker) => worker.alive)).toBe(true)
     for (const index of pool.workers.keys()) {

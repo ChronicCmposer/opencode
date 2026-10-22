@@ -187,4 +187,28 @@ describe("9.6 parent CRASH implicitly cancels its children (children-first)", ()
 
     await dispatcher.terminateAll()
   })
+
+  test("a crash cascade reaps each cancelled child's worker", async () => {
+    const pool = new FakePool(1)
+    const reaped: number[] = []
+    const config: CancellationConfig = {
+      childrenOf: (parent) => (parent === sid("ses_parent") ? [sid("ses_child")] : []),
+      reap: (worker) => reaped.push(worker.id),
+    }
+    const dispatcher = createDispatcher({ pool, cancellation: config })
+
+    const parent = capture(dispatcher.dispatch({ sessionID: sid("ses_parent") }))
+    const child = capture(dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 }))
+    await flush()
+    expect(dispatcher.headroomSlotCount).toBe(1)
+
+    pool.workers[0].crash(sid("ses_parent"))
+
+    expect(await parent).toBeInstanceOf(WorkerCrashedError)
+    expect(await child).toBeInstanceOf(SessionCancelledError)
+    // The child ran on the spawned headroom worker; the terminate path reaped it.
+    expect(reaped).toEqual([pool.spawned[0].id])
+
+    await dispatcher.terminateAll()
+  })
 })

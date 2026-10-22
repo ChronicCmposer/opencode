@@ -19,6 +19,7 @@ import { Effect, Layer, Option } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Project } from "@opencode-ai/schema/project"
 import { SessionPrompt } from "@/session/prompt"
+import { SessionRunState } from "@/session/run-state"
 import { Snapshot } from "@/snapshot"
 import { InstanceRef } from "@/effect/instance-ref"
 import type { InstanceContext } from "@/project/instance-context"
@@ -32,9 +33,11 @@ import {
   UnknownWorkKindError,
   installSessionExecutor,
   type SessionExecutionResult,
+  type SessionRunControl,
   type SessionWork,
   type SessionWorkFactory,
 } from "./execute"
+import { createWorkerPluginHost, type WorkerPlugin } from "./plugin-host"
 import {
   SessionPipeline,
   PIPELINE_SESSION_NODES,
@@ -55,18 +58,43 @@ import {
   type WriterClientHandle,
 } from "./layer"
 import { workerSnapshotBoundaryLayer } from "./snapshot"
+import { PidReporter, type PidReport, type PidReporterInterface } from "./pid-registry"
 
+/** The real model capabilities, serialized for the isolate boundary. */
+export interface SerializedModelCapabilities {
+  readonly temperature: boolean
+  readonly reasoning: boolean
+  readonly interleaved?: boolean
+  readonly toolcall?: boolean
+  readonly attachment?: boolean
+  readonly [k: string]: unknown
+}
+
+/** The real context/output window, serialized for the isolate boundary. */
+export interface SerializedModelLimit {
+  readonly context: number
+  readonly output: number
+}
+
+/**
+ * The plain-data model bootstrap the hub ships to a worker. It carries the
+ * REAL descriptor — capabilities, limits, options, variants and provider
+ * options — so the reduced provider reproduces flag-OFF sampling instead of
+ * inventing defaults. Every field is structured-clone safe.
+ */
 export interface SessionWorkerModel {
+  readonly providerID: string
+  readonly modelID: string
+  readonly apiId: string
+  readonly npm?: string
   readonly baseUrl: string
   readonly apiKey: string
-  readonly model: string
-  /** Provider identity; defaults to `model` for the reduced bootstrap. */
-  readonly providerID?: string
-  /** Provider API model id; defaults to `model`. */
-  readonly apiId?: string
-  /** Provider npm package; defaults to the OpenAI-compatible client. */
-  readonly npm?: string
   readonly headers?: Readonly<Record<string, string>>
+  readonly capabilities: SerializedModelCapabilities
+  readonly limit: SerializedModelLimit
+  readonly options?: Readonly<Record<string, unknown>>
+  readonly variants?: Readonly<Record<string, unknown>>
+  readonly providerOptions?: Readonly<Record<string, unknown>>
 }
 
 /**
@@ -84,6 +112,20 @@ export interface SessionWorkerInit {
   readonly env: WorkerEnv
   readonly model: SessionWorkerModel
   readonly capabilities?: SessionWorkerCapabilities
+  /**
+   * The worker's hub pool id, when the hub ships it. `pid-report` frames carry
+   * an owner id; the hub may override it with the authoritative port
+   * association, but a matching id keeps the mirror keyed correctly out of the
+   * box. Defaults to the isolate's `threadId` when absent.
+   */
+  readonly workerID?: number
+  /**
+   * Worker-hosted plugin hooks (Phase 6.3, plan decision 70): the hub owns plugin
+   * loading but the model-facing `chat.params`/`chat.headers` hooks run in the
+   * isolate. Supplied when the hub can hand the loaded hooks across (in-process
+   * tests today); absent means the reduced LLM uses its no-op pass-through.
+   */
+  readonly plugins?: readonly WorkerPlugin[]
 }
 
 interface WorkerScope {
@@ -109,6 +151,12 @@ export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
   }
   if (candidate.model === undefined || typeof candidate.model.baseUrl !== "string") {
     throw new Error("session worker workerData.model.baseUrl is required")
+  }
+  if (
+    candidate.workerID !== undefined &&
+    (typeof candidate.workerID !== "number" || !Number.isInteger(candidate.workerID) || candidate.workerID < 0)
+  ) {
+    throw new Error(`session worker workerData.workerID must be a non-negative integer, received ${candidate.workerID}`)
   }
   return candidate as SessionWorkerInit
 }
@@ -182,18 +230,82 @@ function backgroundJobHandle(client: Pick<JobClient, "wait" | "cancel">): Backgr
 }
 
 // ---------------------------------------------------------------------------
+// Worker→hub PID reporting (P5 prerequisite).
+// ---------------------------------------------------------------------------
+
+/**
+ * The owner id a worker reports: the hub-assigned pool slot id when the hub
+ * shipped one, else the isolate's own `threadId`. The hub still treats its
+ * port association as authoritative; this only keeps the frame's mirror keyed
+ * correctly out of the box. Falling back to `threadId` is a genuine-last resort
+ * (a pool that resolves an init without a slot id), never a silent default.
+ */
+export function reportedWorkerID(init: Pick<SessionWorkerInit, "workerID">, threadId: number): number {
+  return init.workerID ?? threadId
+}
+
+/**
+ * The production {@link PidReporterInterface}: posts a frozen `pid-report`
+ * frame over the worker's control/hub-proxy port. `workerID` is the worker's
+ * owner id (the hub may override it with the authoritative port association).
+ *
+ * A closed port makes `postMessage` throw, so a report is never silently
+ * dropped; the shell run fails loud instead.
+ */
+export function createControlPidReporter(port: MessagePort, workerID: number): PidReporterInterface {
+  return {
+    report(entry) {
+      const frame: PidReport = {
+        type: "pid-report",
+        workerID,
+        entries: [{ pid: entry.pid, pgid: entry.pgid, label: entry.label, workerID }],
+      }
+      port.postMessage(frame)
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Model bootstrap.
 // ---------------------------------------------------------------------------
 
+/**
+ * The reduced-provider defaults for a legacy bootstrap that predates the
+ * descriptor fields (only the non-owned test helper still emits one). A real
+ * bootstrap always carries its own capabilities/limit.
+ */
+const DEFAULT_WORKER_CAPABILITIES: SerializedModelCapabilities = {
+  temperature: true,
+  reasoning: false,
+  attachment: false,
+  toolcall: true,
+  interleaved: false,
+}
+const DEFAULT_WORKER_LIMIT: SerializedModelLimit = { context: 128_000, output: 4096 }
+
+/** The descriptor fields the reduced provider consumes (see `layer.ts`). */
 function modelConfig(model: SessionWorkerModel): WorkerModelConfig {
+  // The frozen wire shape names the model `modelID`; a legacy bootstrap still
+  // names it `model`. Accept both at this one boundary so an old payload cannot
+  // reach the reduced provider as `undefined`.
+  const legacy = model as SessionWorkerModel & { readonly model?: string }
+  const modelID = model.modelID ?? legacy.model ?? ""
   return {
-    providerID: model.providerID ?? model.model,
-    modelID: model.model,
-    apiId: model.apiId ?? model.model,
+    providerID: model.providerID ?? modelID,
+    modelID,
+    apiId: model.apiId ?? modelID,
     npm: model.npm ?? "@ai-sdk/openai-compatible",
     baseUrl: model.baseUrl,
     apiKey: model.apiKey,
     headers: model.headers ?? {},
+    // The wire shapes (`SerializedModelCapabilities` / a loose variants record)
+    // are the frozen isolate contract; `WorkerModelConfig` is the reduced
+    // provider's stricter projection. Narrowing here is the single boundary.
+    capabilities: (model.capabilities ?? DEFAULT_WORKER_CAPABILITIES) as WorkerModelConfig["capabilities"],
+    limit: model.limit ?? DEFAULT_WORKER_LIMIT,
+    ...(model.options === undefined ? {} : { options: model.options }),
+    ...(model.variants === undefined ? {} : { variants: model.variants as WorkerModelConfig["variants"] }),
+    ...(model.providerOptions === undefined ? {} : { providerOptions: model.providerOptions }),
   }
 }
 
@@ -266,6 +378,14 @@ export interface SessionWorkOptions {
    * in-process tests that supply their own context.
    */
   readonly instance?: InstanceContext
+  /**
+   * Register the worker-local run control (Phase 4). When the graph provides
+   * `SessionRunState`, `run` resolves it and hands over a `SessionRunControl`
+   * whose `cancel`/`busy` reach the real `SessionPrompt.loop` runner (table B),
+   * so an executor cancel actually stops the loop (and `assertNotBusy` stops
+   * lying). Pipeline-only graphs have no `SessionRunState`, so nothing registers.
+   */
+  readonly registerControl?: (control: SessionRunControl) => void
 }
 
 /**
@@ -279,6 +399,25 @@ export interface SessionWorkOptions {
 export function createSessionWork(options: SessionWorkOptions): SessionWork {
   return (sessionID) => {
     const run = Effect.gen(function* () {
+      if (options.registerControl !== undefined) {
+        const runState = yield* Effect.serviceOption(SessionRunState.Service)
+        if (Option.isSome(runState)) {
+          // `SessionRunState` methods resolve their per-directory state through
+          // `InstanceRef`; a control call is made outside the run's ambient
+          // context, so re-provide the worker instance the run was built with.
+          const withInstance = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+            options.instance === undefined ? effect : Effect.provideService(effect, InstanceRef, options.instance)
+          options.registerControl({
+            cancel: (id) => Effect.runPromise(withInstance(runState.value.cancel(id)).pipe(Effect.asVoid)),
+            busy: (id) =>
+              Effect.runPromise(
+                withInstance(runState.value.assertNotBusy(id)).pipe(
+                  Effect.match({ onFailure: () => true, onSuccess: () => false }),
+                ),
+              ),
+          })
+        }
+      }
       if (options.prompt !== false) {
         const prompt = yield* Effect.serviceOption(SessionPrompt.Service)
         if (Option.isSome(prompt)) {
@@ -385,6 +524,7 @@ export function bootstrapSessionWorker(init: SessionWorkerInit, scope: WorkerSco
 
   let clients: WorkerClients
   let hubProxies: HubProxyClients | undefined
+  let pidReporter: PidReporterInterface | undefined
   // The real `SessionPrompt` loop needs the writer-backed Database and an
   // ambient `InstanceRef`; only the full hub-port wiring provides them. The
   // degraded (no-port) boot runs the reduced pipeline.
@@ -415,12 +555,22 @@ export function bootstrapSessionWorker(init: SessionWorkerInit, scope: WorkerSco
     ])
     const hubProxyClient = createHubProxyClient(hubProxyChannel.port1)
     hubProxies = { sessionStatus: hubProxyClient, permission: hubProxyClient, question: hubProxyClient }
+    // The shell tool's detached children are reaped by the hub, so the same
+    // control port carries their `pid-report` frames (the hub distinguishes the
+    // two frame shapes). Only the full-port boot owns children.
+    pidReporter = createControlPidReporter(hubProxyChannel.port1, reportedWorkerID(init, threadId))
   } else {
     clients = directClients(backgroundJobHandle(jobClient))
   }
 
   const config = modelConfig(init.model)
-  const modelClient = llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(init.snapshot, config)))
+  // The worker runs the model-facing plugin hooks in its own isolate; build the
+  // host from the shipped hooks so their `chat.params`/`chat.headers` mutations
+  // reach the reduced LLM exactly as flag-off. Absent hooks keep the no-op.
+  const plugins = init.plugins === undefined ? undefined : createWorkerPluginHost(init.plugins)
+  const modelClient = llmModelClientLayer(config).pipe(
+    Layer.provide(reducedLlmLayer(init.snapshot, config, undefined, plugins)),
+  )
 
   const runtime = buildSessionWorkerLayer({
     // The full runnable graph needs the writer-backed Database and the serialized
@@ -439,8 +589,12 @@ export function bootstrapSessionWorker(init: SessionWorkerInit, scope: WorkerSco
     // snapshot tracking is a fail-soft no-op (the isolate cannot run `git`).
     replacements: workerGraphReplacements(config),
     ...(hubProxies === undefined ? {} : { hubProxies }),
+    ...(pidReporter === undefined ? {} : { pidReporter }),
   })
 
+  // The worker-local run control is registered once the first `run` resolves the
+  // worker's `SessionRunState`; the executor proxy reads it live.
+  let control: SessionRunControl | undefined
   const work = productionWorkRegistry(
     createSessionWork({
       layer: runtime.layer,
@@ -448,9 +602,22 @@ export function bootstrapSessionWorker(init: SessionWorkerInit, scope: WorkerSco
       threadId,
       prompt: usePrompt,
       instance: workerInstanceContext(init.snapshot),
+      registerControl: (registered) => {
+        control = registered
+      },
     }),
   )
-  installSessionExecutor(scope, { work, threadId })
+  installSessionExecutor(scope, {
+    work,
+    threadId,
+    // The control is registered when the first `run` resolves the worker's
+    // `SessionRunState`; the proxy reads it live so a cancel after registration
+    // reaches the real loop (table B). Before that there is nothing to cancel.
+    control: {
+      cancel: (sessionID) => control?.cancel(sessionID) ?? Promise.resolve(),
+      busy: (sessionID) => control?.busy(sessionID) ?? Promise.resolve(false),
+    },
+  })
 }
 
 /**

@@ -6,11 +6,7 @@
 // isolate boundary, so the same trusted shape is used everywhere.
 
 import { describe, expect, test } from "bun:test"
-import {
-  TEST_WORKER_MODEL,
-  assertStructuredCloneable,
-  sessionWorkerInit,
-} from "./session-worker-init"
+import { TEST_WORKER_MODEL, assertStructuredCloneable, sessionWorkerInit } from "./session-worker-init"
 import { workerSnapshot } from "./snapshot"
 
 describe("sessionWorkerInit builder", () => {
@@ -22,17 +18,28 @@ describe("sessionWorkerInit builder", () => {
     expect(init.model).toEqual(TEST_WORKER_MODEL)
   })
 
-  test("overrides are layered over the defaults", () => {
+  test("overrides are layered over the default descriptor", () => {
     const snapshot = workerSnapshot({ epoch: 7, directory: "/tmp/worker-override" })
     const init = sessionWorkerInit({
       snapshot,
       env: { values: { OPENCODE_TEST_WORKER_KEY: "worker-local" } },
-      model: { model: "other-model" },
+      model: { modelID: "other-model", limit: { context: 4_096, output: 512 } },
     })
 
     expect(init.snapshot).toBe(snapshot)
     expect(init.env).toEqual({ values: { OPENCODE_TEST_WORKER_KEY: "worker-local" } })
-    expect(init.model).toEqual({ ...TEST_WORKER_MODEL, model: "other-model" })
+    expect(init.model).toEqual({
+      ...TEST_WORKER_MODEL,
+      modelID: "other-model",
+      limit: { context: 4_096, output: 512 },
+    })
+  })
+
+  test("a legacy `model` override is normalized to `modelID`", () => {
+    const init = sessionWorkerInit({ model: { model: "other-model" } })
+
+    expect(init.model).toEqual({ ...TEST_WORKER_MODEL, modelID: "other-model" })
+    expect(assertStructuredCloneable(init)).toEqual(init)
   })
 
   test("a built init survives a structuredClone round-trip unchanged", () => {

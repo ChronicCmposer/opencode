@@ -5,7 +5,7 @@
 // transaction and sequence semantics are exercised for real, without a Worker.
 
 import { afterEach, describe, expect, test } from "bun:test"
-import { createBunSqliteConnection } from "@/session/writer/connection"
+import { createBunSqliteConnection, type WriterConnection } from "@/session/writer/connection"
 import {
   AbortedWriteError,
   OwnerMismatchError,
@@ -37,6 +37,40 @@ function harness(options: Omit<WriterCoreOptions, "connection"> = {}): Harness {
   const connection = createBunSqliteConnection({ filename: ":memory:" })
   connection.exec(SCHEMA_SQL)
   const core = createWriterCore({ connection, sleep: async () => {}, ...options })
+  return { core, rows: (sql, params = []) => connection.all(sql, params) }
+}
+
+/**
+ * Settle `promise` within `ms` or fail with `message`. A pinned transaction that
+ * never releases surfaces as a bounded, descriptive failure instead of a hang.
+ */
+async function settlesWithin<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms)
+  })
+  try {
+    return await Promise.race([promise, deadline])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+/**
+ * A harness whose connection can fail the COMMIT statement on demand, so the
+ * writer's release path is exercised when the transaction's finalization throws.
+ */
+function guardedHarness(failCommit: () => boolean): Harness {
+  const connection = createBunSqliteConnection({ filename: ":memory:" })
+  connection.exec(SCHEMA_SQL)
+  const guarded: WriterConnection = {
+    ...connection,
+    run: (sql, params = []) => {
+      if (/^\s*commit\b/i.test(sql) && failCommit()) throw new Error("injected COMMIT failure")
+      return connection.run(sql, params)
+    },
+  }
+  const core = createWriterCore({ connection: guarded, sleep: async () => {} })
   return { core, rows: (sql, params = []) => connection.all(sql, params) }
 }
 
@@ -322,6 +356,91 @@ describe("writer core: reserved-handle transactions (7.4)", () => {
     const next = await core.beginTransaction()
     expect(next).not.toBe(handle)
     await core.rollbackTransaction(next)
+  })
+})
+
+describe("writer core: transaction release is unconditional (7.4)", () => {
+  const INSERT = "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)"
+  const insertRow = (core: WriterCore, handle: string, id: string) => core.txQuery(handle, "run", INSERT, [id, "a", 0, "t", "{}"])
+
+  test("a committed transaction leaves no pin: the next read and begin settle promptly", async () => {
+    const { core } = harness()
+    const handle = await core.beginTransaction()
+    await insertRow(core, handle, "x")
+    await core.commitTransaction(handle)
+
+    expect(await settlesWithin(core.query("all", "SELECT id FROM event"), 1000, "read blocked on a leftover pin")).toEqual([
+      { id: "x" },
+    ])
+    const next = await settlesWithin(core.beginTransaction(), 1000, "begin blocked on a leftover pin")
+    await core.rollbackTransaction(next)
+  })
+
+  test("a failed COMMIT still unpins so the next operation settles promptly", async () => {
+    let armed = true
+    const { core, rows } = guardedHarness(() => {
+      const fail = armed
+      armed = false
+      return fail
+    })
+    const handle = await core.beginTransaction()
+    await insertRow(core, handle, "x")
+
+    await expect(core.commitTransaction(handle)).rejects.toThrow("injected COMMIT failure")
+
+    // The failed commit is rolled back and released: no orphaned write, no pin.
+    expect(rows("SELECT id FROM event")).toEqual([])
+    expect(await settlesWithin(core.query("all", "SELECT 1 AS one"), 1000, "read starved behind a failed commit")).toEqual([
+      { one: 1 },
+    ])
+    const next = await settlesWithin(core.beginTransaction(), 1000, "begin starved behind a failed commit")
+    await core.rollbackTransaction(next)
+  })
+
+  test("a queued begin is not starved when the pinned transaction's COMMIT fails", async () => {
+    let armed = true
+    const { core } = guardedHarness(() => {
+      const fail = armed
+      armed = false
+      return fail
+    })
+    const first = await core.beginTransaction()
+    const second = core.beginTransaction()
+
+    await expect(core.commitTransaction(first)).rejects.toThrow("injected COMMIT failure")
+    const secondHandle = await settlesWithin(second, 1000, "queued begin starved behind a failed commit")
+    expect(secondHandle).not.toBe(first)
+    await core.rollbackTransaction(secondHandle)
+  })
+
+  test("a statement failure inside a transaction is rolled back and releases the pin", async () => {
+    const { core, rows } = harness()
+    const handle = await core.beginTransaction()
+    await insertRow(core, handle, "x")
+
+    await expect(core.txQuery(handle, "run", "INSERT INTO missing_table VALUES (1)")).rejects.toThrow()
+
+    // The caller rolls back after the failure; the pin must clear for the next run.
+    await core.rollbackTransaction(handle)
+    expect(rows("SELECT id FROM event")).toEqual([])
+    const next = await settlesWithin(core.beginTransaction(), 1000, "begin starved after a failed statement")
+    await core.rollbackTransaction(next)
+  })
+
+  test("a read queued behind a pinned transaction settles promptly once the transaction commits", async () => {
+    const { core } = harness()
+    const handle = await core.beginTransaction()
+
+    let observed: unknown = "pending"
+    const read = core.query("all", "SELECT 1 AS one").then((value) => {
+      observed = value
+      return value
+    })
+    await flush()
+    expect(observed).toBe("pending")
+
+    await core.commitTransaction(handle)
+    expect(await settlesWithin(read, 1000, "read never settled after commit")).toEqual([{ one: 1 }])
   })
 })
 

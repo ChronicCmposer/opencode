@@ -29,12 +29,7 @@ import { createSessionRegistry, type SessionRegistry } from "./registry"
 import { createSupervision, type Supervision } from "./supervision"
 import { resolveWorkerCount, spawnPoolWorker, type Env, type PoolWorker } from "./pool"
 import { defaultSchedule } from "./port"
-import type {
-  ExecutorRun,
-  ExecutorSessionWorker,
-  ExecutorWorkerKind,
-  ExecutorWorkerPool,
-} from "./execute"
+import type { ExecutorRun, ExecutorSessionWorker, ExecutorWorkerKind, ExecutorWorkerPool } from "./execute"
 import {
   createCancelController,
   createOutcomeGate,
@@ -146,6 +141,8 @@ export interface CancellationConfig {
   readonly schedule?: CancelScheduler
   /** Hub reaps the worker's mirrored PGIDs after a terminate (plan 11.5). */
   readonly reap?: (worker: SessionWorker) => void
+  /** Hub reaps every mirrored PGID on shutdown, after the workers are gone (plan 11.5). */
+  readonly reapAll?: () => void
   /** Subagent children of a session, cancelled children-first (plan 11.8). */
   readonly childrenOf?: (sessionID: SessionID) => ReadonlyArray<SessionID>
   readonly onCancelled?: (event: CancelledEvent) => void
@@ -626,9 +623,18 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
         ? { ...outcome, mode: "completed", winner: "completion" }
         : outcome
 
+    // Phase 5.1 limit. Before the upstream run-control seam lands, a still-live
+    // run whose *outer* executor machine died is reported `cooperative`: the
+    // executor acks before the real loop unwinds, so this branch may reuse a
+    // worker whose run is still going. No local signal separates that from a
+    // genuine cooperative unwind (the executor promise rejects for a real cancel
+    // too, and `machine.busy` only reflects the already-idle outer machine); the
+    // seam that delegates `cancel`/`busy` to the worker-local run-state makes the
+    // ack mean real settlement. A grace *expiry* is unambiguous and lands below:
+    // the controller has terminated + reaped, and this releases the slot.
     if (resolved.mode === "terminated") {
-      // The controller already terminated the isolate and reaped its PGIDs;
-      // terminate again is idempotent, only release the reservation + slot.
+      // The controller terminated the isolate and reaped its PGIDs; terminate
+      // again is idempotent, so only the reservation + slot need releasing.
       await terminateSlot(sessionID, admitted, slot, { reap: false })
       pump()
       nextWaiter(sessionID)
@@ -665,6 +671,9 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     slots.length = 0
     await Promise.all(workers.map((worker) => worker.terminate().catch(() => undefined)))
     await pool.terminateAll().catch(() => undefined)
+    // Phase 11.5: once every worker isolate is gone, reap any mirrored PGIDs the
+    // per-worker terminate did not cover (e.g. a worker that never got a slot).
+    cancellation?.reapAll?.()
   }
 
   return {
@@ -748,8 +757,7 @@ export interface BunWorkerPool extends WorkerPool, AsyncDisposable {
 
 /** Production `WorkerPool`: adapts the Bun worker pool to the scheduling seam. */
 export function createBunWorkerPool(options: BunWorkerPoolOptions = {}): BunWorkerPool {
-  const k =
-    options.k ?? resolveWorkerCount({ availableParallelism: options.availableParallelism, env: options.env })
+  const k = options.k ?? resolveWorkerCount({ availableParallelism: options.availableParallelism, env: options.env })
   const created: PoolWorker[] = []
   const drive = options.drive ?? driveBootstrapPlaceholder
 

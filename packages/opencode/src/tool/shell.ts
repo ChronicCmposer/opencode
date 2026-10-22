@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Effect, Option, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -21,6 +21,7 @@ import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
+import { PidReporter, type PidReporterInterface } from "@/session/worker/pid-registry"
 
 export { Parameters } from "./shell/prompt"
 
@@ -308,6 +309,35 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
     detached: process.platform !== "win32",
   })
 }
+
+const MAX_SHELL_LABEL = 120
+
+/** A stable, non-empty label for the hub's PGID mirror of a shell child. */
+function shellChildLabel(command: string): string {
+  const first = command.trim().split("\n")[0]?.trim() ?? ""
+  return first === "" ? "shell" : first.slice(0, MAX_SHELL_LABEL)
+}
+
+/**
+ * Report a freshly spawned detached shell child to the hub's PID registry
+ * mirror. On POSIX the spawner detaches the child, so it leads its own process
+ * group and `pgid === pid` (the same invariant `spawnRegistered` relies on).
+ *
+ * A missing reporter is a no-op: degraded boots and hub-side (flag-off) runs
+ * have no hub registry to fill. Windows has no process-group semantics, so
+ * nothing is reported there. A present reporter never drops silently — a failed
+ * `postMessage` throws through the shell run.
+ */
+export function reportDetachedShell(
+  reporter: PidReporterInterface | undefined,
+  spawned: { readonly pid: number },
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  if (reporter === undefined || platform === "win32") return
+  const pid = Number(spawned.pid)
+  reporter.report({ pid, pgid: pid, label: shellChildLabel(command) })
+}
 const parser = lazy(async () => {
   const { Parser } = await import("web-tree-sitter")
   const { default: treeWasm } = await import("web-tree-sitter/tree-sitter.wasm" as string, {
@@ -436,6 +466,8 @@ export const ShellTool = Tool.define(
       ctx: Tool.Context,
     ) {
       const limits = yield* trunc.limits()
+      // Optional seam: absent on the hub/degraded paths (no hub mirror to fill).
+      const pidReporter = Option.getOrUndefined(yield* Effect.serviceOption(PidReporter))
       const keep = limits.maxBytes * 2
       let full = ""
       let last = ""
@@ -482,6 +514,9 @@ export const ShellTool = Tool.define(
         Effect.gen(function* () {
           yield* Effect.addFinalizer(closeSink)
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
+          // Mirror the detached child's process group on the hub before the run
+          // can be cancelled, so a terminate reaps it instead of orphaning it.
+          reportDetachedShell(pidReporter, handle, input.command)
 
           yield* Effect.forkScoped(
             Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {

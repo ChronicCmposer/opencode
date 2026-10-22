@@ -12,7 +12,7 @@
 //   12.4 HTTP ingress + SSE stay functional while K sessions run.
 
 import { describe, expect, test } from "bun:test"
-import { Context, Effect, Exit, Layer, ManagedRuntime } from "effect"
+import { Context, Effect, Exit, Layer, ManagedRuntime, Option } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import type { SessionID } from "@/session/schema"
 import {
@@ -21,12 +21,15 @@ import {
   createBunExecutorWorkerPool,
   createHubEventSink,
   createLazyExecutorWorkerPool,
+  createProductionWorkerPool,
+  createSessionBoundExecutorWorker,
   createSessionHub,
   createSessionHubLayer,
   createWorkerCancellation,
   fallbackInstanceContext,
   lazyOpenWriter,
   makeSessionHubNode,
+  productionSessionHubLayer,
   productionSessionHubNode,
   resolveSessionWorkerEntry,
   serveEventsPort,
@@ -47,12 +50,20 @@ import { SessionCancelledError, WorkerCrashedError } from "@/session/worker/disp
 import { createJobClient, jobPortFromMessagePort, type JobPort } from "@/session/worker/job-client"
 import type {
   ExecutorRun,
+  ExecutorSessionWorker,
   ExecutorTransport,
   ExecutorWorker,
+  ExecutorWorkerPool,
   SessionExecutionResult,
   SessionExecutorInbound,
   SessionExecutorOutbound,
 } from "@/session/worker/execute"
+import type { CancelFrame, CancelPort, CancelScheduler } from "@/session/worker/cancel"
+import type { SessionWorkerInit } from "@/session/worker/session-worker"
+import { createPidRegistry, registerReported } from "@/session/worker/pid-registry"
+import { createWorkerPluginHost } from "@/session/worker/plugin-host"
+import { sessionWorkerInit, assertStructuredCloneable } from "../../lib/session-worker-init"
+import { Session } from "@/session/session"
 import { testEffect } from "../../lib/effect"
 import { TestLLMServer } from "../../lib/llm-server"
 import { sid } from "../../lib/async"
@@ -238,13 +249,20 @@ const markerOf = (message: SessionExecutorOutbound): number | undefined =>
 
 class FakeWorker {
   static last: FakeWorker | undefined
+  /** Every constructed fake, so a test can inspect the `workerData` the pool shipped. */
+  static readonly instances: FakeWorker[] = []
   onmessage: ((event: { data: unknown }) => void) | null = null
   onerror: ((event: { message: string; error?: unknown }) => void) | null = null
   readonly posted: unknown[] = []
+  readonly entry: unknown
+  readonly options: { readonly workerData?: unknown } | undefined
   terminateCount = 0
 
-  constructor() {
+  constructor(entry?: unknown, options?: { readonly workerData?: unknown }) {
+    this.entry = entry
+    this.options = options
     FakeWorker.last = this
+    FakeWorker.instances.push(this)
   }
 
   postMessage(message: unknown): void {
@@ -377,6 +395,127 @@ const trackedLazyPool = (k: number, created: ImmediateWorker[]) =>
       return worker
     },
   })
+
+/**
+ * An executor worker with a cancel port whose run either unwinds (resolves) or
+ * dies with the executor machine (rejects) when cancelled. `acknowledge`
+ * controls whether it reports a `cancel-ack`.
+ */
+class ControllableWorker implements ExecutorWorker {
+  alive = true
+  readonly cancelPort: CancelPort
+  private readonly pending = new Map<SessionID, { resolve: () => void; reject: (error: unknown) => void }>()
+  private readonly results = new Map<SessionID, SessionExecutionResult>()
+  private readonly ackHandlers = new Set<(frame: CancelFrame) => void>()
+
+  constructor(
+    readonly id: number,
+    private readonly onCancel: "resolve" | "reject" | "ignore",
+    private readonly acknowledge = false,
+  ) {
+    this.cancelPort = {
+      notify: (frame) => {
+        if (frame.type !== "cancel") return
+        if (this.acknowledge) {
+          for (const handler of [...this.ackHandlers]) {
+            handler({ type: "cancel-ack", sessionID: frame.sessionID, accepted: true })
+          }
+        }
+        if (this.onCancel === "ignore") return
+        const sessionID = frame.sessionID as SessionID
+        const pending = this.pending.get(sessionID)
+        if (pending === undefined) return
+        this.pending.delete(sessionID)
+        if (this.onCancel === "resolve") {
+          this.results.set(sessionID, { sessionID, value: null })
+          pending.resolve()
+        } else {
+          pending.reject(new Error("executor machine interrupted"))
+        }
+      },
+      onMessage: (handler) => {
+        this.ackHandlers.add(handler)
+        return () => void this.ackHandlers.delete(handler)
+      },
+    }
+  }
+
+  execute(run: ExecutorRun): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.pending.set(run.sessionID, { resolve, reject })
+    })
+  }
+
+  async cancel(sessionID: SessionID): Promise<void> {
+    this.cancelPort.notify({ type: "cancel", sessionID })
+  }
+
+  async assertNotBusy(sessionID: SessionID): Promise<boolean> {
+    return this.pending.has(sessionID)
+  }
+
+  resultFor(sessionID: SessionID): SessionExecutionResult | undefined {
+    return this.results.get(sessionID)
+  }
+
+  async terminate(): Promise<void> {
+    this.alive = false
+    const pending = [...this.pending.values()]
+    this.pending.clear()
+    for (const run of pending) run.reject(new Error("terminated"))
+  }
+}
+
+class ControllablePool implements ExecutorWorkerPool {
+  readonly workers: ControllableWorker[]
+  readonly spawned: ControllableWorker[] = []
+
+  constructor(
+    k: number,
+    private readonly onCancel: "resolve" | "reject" | "ignore",
+    private readonly acknowledge = false,
+  ) {
+    this.workers = Array.from({ length: k }, (_, index) => new ControllableWorker(index + 1, onCancel, acknowledge))
+  }
+
+  spawn(): ExecutorSessionWorker {
+    const worker = new ControllableWorker(100 + this.spawned.length, this.onCancel, this.acknowledge)
+    this.spawned.push(worker)
+    return worker
+  }
+
+  async terminateAll(): Promise<void> {
+    await Promise.all([...this.workers, ...this.spawned].map((worker) => worker.terminate()))
+  }
+
+  byID(id: number): ControllableWorker | undefined {
+    return [...this.workers, ...this.spawned].find((worker) => worker.id === id)
+  }
+
+  resultFor(sessionID: SessionID): SessionExecutionResult | undefined {
+    for (const worker of [...this.workers, ...this.spawned]) {
+      const result = worker.resultFor(sessionID)
+      if (result !== undefined) return result
+    }
+    return undefined
+  }
+}
+
+/** A scheduler that records nothing and never fires (the run must settle first). */
+const neverSchedule: CancelScheduler = () => () => {}
+
+/** A scheduler that records timers so a test can fire the grace window. */
+const recordingSchedule = () => {
+  const timers: { delayMs: number; run: () => void; cancelled: boolean }[] = []
+  const schedule: CancelScheduler = (delayMs, run) => {
+    const timer = { delayMs, run, cancelled: false }
+    timers.push(timer)
+    return () => {
+      timer.cancelled = true
+    }
+  }
+  return { schedule, pending: () => timers.filter((timer) => !timer.cancelled) }
+}
 
 describe("11 pool job-port hookup", () => {
   test("the hub hands its job-port sink to a pool factory and a job round-trips", async () => {
@@ -1171,10 +1310,356 @@ describe("Q9/Q23 session.cancelled", () => {
         durationMs: outcome!.durationMs,
         acknowledged: outcome!.acknowledged,
       })
+      // The hub publishes ONLY the cancel outcome; the canonical cancel-idle
+      // emitter is `run-state.ts`, so the hub must never emit a second idle.
+      expect(published.map((event) => event.type)).toEqual([SESSION_CANCELLED_TYPE])
     } finally {
       await hub.terminateAll()
     }
   }, 20_000)
+
+  test("a completion that wins the cancel race publishes no session.cancelled", async () => {
+    const { publisher, published } = recordingPublisher()
+    // The run resolves on cancel without acking: completion wins the race.
+    const pool = new ControllablePool(1, "resolve")
+    const hub = createSessionHub({
+      pool,
+      events: publisher,
+      cancellation: {
+        portFor: (worker) => (worker as ControllableWorker).cancelPort,
+        graceMs: 500,
+        schedule: neverSchedule,
+      },
+    })
+    try {
+      const running = hub.dispatcher.dispatch({ sessionID: sid("ses_completed"), depth: 0 })
+      const settled = running.then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      await pollUntil(() => hub.dispatcher.registry.get(sid("ses_completed"))?.state === "running", {
+        message: "session never started",
+      })
+
+      const outcome = await hub.cancel(sid("ses_completed"))
+      expect(outcome).toMatchObject({ mode: "completed", winner: "completion" })
+      expect(published.filter((event) => event.type === SESSION_CANCELLED_TYPE)).toHaveLength(0)
+      expect(await settled).toBeInstanceOf(SessionCancelledError)
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+
+  test("a grace-expiry terminate publishes the terminated outcome", async () => {
+    const { publisher, published } = recordingPublisher()
+    const scheduler = recordingSchedule()
+    // The run ignores the cancel: the grace window expires and the hub terminates.
+    const pool = new ControllablePool(1, "ignore", true)
+    const hub = createSessionHub({
+      pool,
+      events: publisher,
+      cancellation: {
+        portFor: (worker) => (worker as ControllableWorker).cancelPort,
+        graceMs: 500,
+        schedule: scheduler.schedule,
+      },
+    })
+    try {
+      const running = hub.dispatcher.dispatch({ sessionID: sid("ses_terminated"), depth: 0 })
+      const settled = running.then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      await pollUntil(() => hub.dispatcher.registry.get(sid("ses_terminated"))?.state === "running", {
+        message: "session never started",
+      })
+
+      const cancelling = hub.cancel(sid("ses_terminated"))
+      await pollUntil(() => scheduler.pending().some((timer) => timer.delayMs === 500), {
+        message: "grace timer never scheduled",
+      })
+      scheduler
+        .pending()
+        .find((timer) => timer.delayMs === 500)
+        ?.run()
+      const outcome = await cancelling
+
+      expect(outcome).toMatchObject({ mode: "terminated", winner: "cancel", acknowledged: true })
+      const cancelled = published.find((event) => event.type === SESSION_CANCELLED_TYPE)
+      expect(cancelled?.data).toEqual({
+        sessionID: outcome!.sessionID,
+        mode: "terminated",
+        durationMs: outcome!.durationMs,
+        acknowledged: true,
+      })
+      expect(await settled).toBeInstanceOf(SessionCancelledError)
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// W2 — production cancellation authorities (Phase 5.3/6.2/6.4).
+// ---------------------------------------------------------------------------
+
+const settleOf = (promise: Promise<unknown>): Promise<unknown> =>
+  promise.then(
+    () => undefined,
+    (error: unknown) => error,
+  )
+
+describe("W2 cancellation authorities", () => {
+  test("childrenOf defaults to the job registry and onCancelled marks jobs cancelled", async () => {
+    const pool = new ControllablePool(1, "resolve")
+    // No explicit childrenOf/onCancelled: the hub must default to its job registry.
+    const hub = createSessionHub({ pool, cancellation: {} })
+    try {
+      hub.jobs.start({ id: "ses_parent", type: "task" })
+      hub.jobs.start({ id: "ses_child", type: "task", parentID: "ses_parent" })
+      hub.jobs.linkChild("ses_parent", "ses_child")
+
+      const parent = settleOf(hub.dispatcher.dispatch({ sessionID: sid("ses_parent"), depth: 0 }))
+      const child = settleOf(hub.dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 }))
+      await pollUntil(() => hub.dispatcher.registry.get(sid("ses_child"))?.state === "running", {
+        message: "child never started",
+      })
+
+      await hub.cancel(sid("ses_parent"))
+
+      // Children-first cascade reached the child, and both jobs are terminal.
+      expect(await child).toBeInstanceOf(SessionCancelledError)
+      expect(await parent).toBeInstanceOf(SessionCancelledError)
+      expect(hub.jobs.get("ses_child")?.status).toBe("cancelled")
+      expect(hub.jobs.get("ses_parent")?.status).toBe("cancelled")
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// W2 — the dispatching session's model is threaded into the worker init.
+// ---------------------------------------------------------------------------
+
+describe("W2 session model threading", () => {
+  it.live("buildSessionWorkerInit receives the dispatching session's model", () =>
+    Effect.gen(function* () {
+      const captured: SessionWorkerInit[] = []
+      const poolFactory: ProductionPoolFactory = (resolveInit) =>
+        createLazyExecutorWorkerPool({
+          k: 1,
+          create: async (id) => {
+            captured.push(await resolveInit())
+            return new ImmediateWorker(id)
+          },
+        })
+
+      const deps = Layer.mergeAll(
+        Layer.mock(Config.Service, {
+          get: () => Effect.succeed({ model: "config/default" } as ConfigV1.Info),
+        }),
+        Layer.mock(Auth.Service, {
+          all: () => Effect.succeed({}),
+          get: () => Effect.succeed(new Auth.Api({ type: "api", key: "sk-test" })),
+        }),
+        Layer.mock(ModelsDev.Service, { get: () => Effect.succeed({}) }),
+        Layer.mock(Provider.Service, {
+          defaultModel: () =>
+            Effect.succeed({ providerID: ProviderV2.ID.make("default"), modelID: ModelV2.ID.make("default") }),
+          getProvider: () => Effect.succeed(providerInfo),
+          getModel: () => Effect.succeed(providerModel),
+        }),
+        RuntimeFlags.layer({ experimentalSessionWorkers: true }),
+        Layer.mock(SessionStatus.Service, {
+          get: () => Effect.succeed({ type: "idle" } as SessionStatus.Info),
+          list: () => Effect.succeed(new Map()),
+          set: () => Effect.void,
+        }),
+        Layer.mock(Permission.Service, {}),
+        Layer.mock(Question.Service, {}),
+        Layer.mock(EventV2Bridge.Service, { publishLive: () => Effect.void }),
+      )
+
+      const layer = productionSessionHubLayer({ count: 1, poolFactory }).pipe(Layer.provide(deps))
+      const sessionID = sid("ses_model")
+
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const context = yield* Layer.build(layer)
+          const hub = Context.get(context, SessionHubService)
+          const sessionLayer = Layer.succeed(
+            Session.Service,
+            Session.Service.of({
+              get: () =>
+                Effect.succeed({
+                  model: { id: "session-model", providerID: "session-provider" },
+                } as unknown as Session.Info),
+              // The hub reads the last user message for the real plugin input;
+              // this model-only test has none.
+              findMessage: () => Effect.succeed(Option.none()),
+            } as unknown as Session.Interface),
+          )
+          yield* Effect.promise(() => hub.ensureRunning(sessionID)).pipe(
+            Effect.provide(sessionLayer),
+            Effect.provideService(InstanceRef, productionInstanceCtx),
+          )
+        }),
+      )
+
+      expect(captured).toHaveLength(1)
+      // The session's model wins over the config default ("config/default").
+      expect(String(captured[0].model.providerID)).toBe("session-provider")
+      expect(String(captured[0].model.modelID)).toBe("session-model")
+    }),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// W4 (P1/P2) — per-session worker model: a worker rebinds when a different
+// session (which may carry a different model) is dispatched to it.
+// ---------------------------------------------------------------------------
+
+describe("W4 per-session worker model", () => {
+  test("one worker rebinds for a second session and resolves that session's model", async () => {
+    const resolvedSessions: string[] = []
+    const pool = createProductionWorkerPool({
+      init: (sessionID) => {
+        resolvedSessions.push(String(sessionID))
+        return sessionWorkerInit({ model: { modelID: `model-${sessionID}` } })
+      },
+      count: 1,
+      entry: new URL("../../fixture/session-execute-worker.ts", import.meta.url),
+      workKind: "instant",
+      timeoutMs: 15_000,
+    })
+    try {
+      const [worker] = pool.workers
+      await worker.execute({ sessionID: sid("ses_first"), depth: 0 })
+      expect(pool.resultFor(sid("ses_first"))?.sessionID).toBe(sid("ses_first"))
+
+      // A second session on the same worker slot rebinds: the isolate is rebuilt
+      // with THIS session's init, so the model no longer mismatches.
+      await worker.execute({ sessionID: sid("ses_second"), depth: 0 })
+      expect(resolvedSessions).toEqual(["ses_first", "ses_second"])
+      expect(pool.resultFor(sid("ses_second"))?.sessionID).toBe(sid("ses_second"))
+    } finally {
+      await pool.terminateAll()
+    }
+  }, 30_000)
+})
+
+// ---------------------------------------------------------------------------
+// W4 (P3) — the hub ships the resolved plugin effect into the worker init.
+// ---------------------------------------------------------------------------
+
+describe("W4 plugin effect shipping", () => {
+  it.live("ships the resolved plugin effect in the worker init", () =>
+    Effect.gen(function* () {
+      const captured: SessionWorkerInit[] = []
+      const poolFactory: ProductionPoolFactory = (resolveInit) =>
+        createLazyExecutorWorkerPool({
+          k: 1,
+          create: async (id) => {
+            captured.push(await resolveInit())
+            return new ImmediateWorker(id)
+          },
+        })
+
+      const deps = Layer.mergeAll(
+        Layer.mock(Config.Service, {
+          get: () => Effect.succeed({ model: "config/default" } as ConfigV1.Info),
+        }),
+        Layer.mock(Auth.Service, {
+          all: () => Effect.succeed({}),
+          get: () => Effect.succeed(new Auth.Api({ type: "api", key: "sk-test" })),
+        }),
+        Layer.mock(ModelsDev.Service, { get: () => Effect.succeed({}) }),
+        Layer.mock(Provider.Service, {
+          defaultModel: () =>
+            Effect.succeed({ providerID: ProviderV2.ID.make("default"), modelID: ModelV2.ID.make("default") }),
+          getProvider: () => Effect.succeed(providerInfo),
+          getModel: () => Effect.succeed(providerModel),
+        }),
+        RuntimeFlags.layer({ experimentalSessionWorkers: true }),
+        Layer.mock(SessionStatus.Service, {
+          get: () => Effect.succeed({ type: "idle" } as SessionStatus.Info),
+          list: () => Effect.succeed(new Map()),
+          set: () => Effect.void,
+        }),
+        Layer.mock(Permission.Service, {}),
+        Layer.mock(Question.Service, {}),
+        Layer.mock(EventV2Bridge.Service, { publishLive: () => Effect.void }),
+      )
+
+      const layer = productionSessionHubLayer({
+        count: 1,
+        poolFactory,
+        plugins: async () => [
+          {
+            name: "sampling",
+            hooks: {
+              "chat.params": (_input, output) => {
+                output.temperature = 0.25
+              },
+            },
+          },
+        ],
+      }).pipe(Layer.provide(deps))
+
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const context = yield* Layer.build(layer)
+          const hub = Context.get(context, SessionHubService)
+          yield* Effect.promise(() => hub.ensureRunning(sid("ses_plugin"))).pipe(
+            Effect.provideService(InstanceRef, productionInstanceCtx),
+          )
+        }),
+      )
+
+      expect(captured).toHaveLength(1)
+      const shipped = captured[0].plugins
+      expect(shipped).toHaveLength(1)
+      // The effect must survive the isolate boundary, then apply on the worker.
+      expect(assertStructuredCloneable(shipped)).toEqual(shipped)
+      const host = createWorkerPluginHost(shipped!)
+      const params = yield* Effect.promise(() =>
+        host.chatParams({}, { temperature: 1, topP: 1, topK: 1, maxOutputTokens: 100, options: {} }),
+      )
+      expect(params.temperature).toBe(0.25)
+    }),
+  )
+})
+
+// ---------------------------------------------------------------------------
+// W4 (P5 prerequisite) — a worker pid-report on the control port fills the
+// hub mirror so reap actually has targets.
+// ---------------------------------------------------------------------------
+
+describe("W4 pid-report receive", () => {
+  test("a pid-report frame populates the registry and reap uses it", async () => {
+    const killed: number[] = []
+    const registry = createPidRegistry({ reaper: { killGroup: (pgid) => killed.push(pgid) } })
+    const hub = createSessionHub({
+      pool: new ControllablePool(1, "resolve"),
+      onPidReport: (workerID, report) => registerReported(registry, report, workerID),
+    })
+    try {
+      const channel = new MessageChannel()
+      hub.attachHubProxyPort(7, channel.port1)
+      channel.port2.postMessage({
+        type: "pid-report",
+        workerID: 7,
+        entries: [{ pid: 4242, pgid: 4242, label: "shell", workerID: 7 }],
+      })
+
+      await pollUntil(() => registry.has(4242), { message: "pid report never registered" })
+      expect(registry.reap(7)).toEqual([4242])
+      expect(killed).toEqual([4242])
+    } finally {
+      await hub.terminateAll()
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1280,4 +1765,162 @@ describe("fallbackInstanceContext (Wave-2 consolidation)", () => {
     expect(String(ctx.project.id)).not.toBe(ctx.directory)
     expect(ctx.worktree).toBe(ctx.directory)
   })
+})
+
+// ---------------------------------------------------------------------------
+// Fix 1 — the worker reports the REAL pool slot id: the production pool stamps
+// `workerData.workerID` on every spawn (initial and per-session rebind), and it
+// is the same slot id across a rebind.
+// ---------------------------------------------------------------------------
+
+describe("Fix 1 workerID threading", () => {
+  test("the production pool ships the pool slot id as workerData.workerID", async () => {
+    const original = (globalThis as { Worker?: unknown }).Worker
+    ;(globalThis as { Worker?: unknown }).Worker = FakeWorker
+    const started = FakeWorker.instances.length
+    const pool = createProductionWorkerPool({
+      init: () => sessionWorkerInit(),
+      count: 2,
+      entry: "fake://workerid",
+      workKind: "instant",
+      timeoutMs: 5_000,
+    })
+    try {
+      // Fire both runs but never await: the fake isolate never replies, and the
+      // only thing under test is the `workerData` the pool hands to `new Worker`.
+      // Terminating the pool below rejects these pending runs (all caught).
+      for (const [index, worker] of pool.workers.entries()) {
+        void worker.execute({ sessionID: sid(`ses_wid_${index}`), depth: 0 }).catch(() => undefined)
+      }
+      await pollUntil(() => FakeWorker.instances.length - started === 2, { message: "workers never spawned" })
+
+      const workerIDs = FakeWorker.instances
+        .slice(started)
+        .map((worker) => (worker.options?.workerData as { workerID?: number } | undefined)?.workerID)
+      // Slot ids 1 and 2 — never the isolate threadId.
+      expect(workerIDs).toEqual([1, 2])
+    } finally {
+      ;(globalThis as { Worker?: unknown }).Worker = original
+      await pool.terminateAll()
+    }
+  })
+
+  test("a worker rebinds to a second session under the SAME pool slot id", async () => {
+    const spawned: Array<{ readonly id: number; readonly session: string }> = []
+    const worker = createSessionBoundExecutorWorker(3, async (id, sessionID) => {
+      spawned.push({ id, session: String(sessionID) })
+      return new ImmediateWorker(id)
+    })
+
+    await worker.execute({ sessionID: sid("ses_a"), depth: 0 })
+    await worker.execute({ sessionID: sid("ses_b"), depth: 0 })
+
+    expect(spawned).toEqual([
+      { id: 3, session: "ses_a" },
+      { id: 3, session: "ses_b" },
+    ])
+    await worker.terminate()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fix 2 — the hub resolves a plugin effect against the REAL per-request input
+// (the session's agent + the last user message), not an empty stub.
+// ---------------------------------------------------------------------------
+
+describe("Fix 2 real plugin hook input", () => {
+  it.live("ships a plugin effect resolved against the session's real agent + last user message", () =>
+    Effect.gen(function* () {
+      const captured: SessionWorkerInit[] = []
+      const poolFactory: ProductionPoolFactory = (resolveInit) =>
+        createLazyExecutorWorkerPool({
+          k: 1,
+          create: async (id) => {
+            captured.push(await resolveInit())
+            return new ImmediateWorker(id)
+          },
+        })
+
+      const deps = Layer.mergeAll(
+        Layer.mock(Config.Service, {
+          get: () => Effect.succeed({ model: "config/default" } as ConfigV1.Info),
+        }),
+        Layer.mock(Auth.Service, {
+          all: () => Effect.succeed({}),
+          get: () => Effect.succeed(new Auth.Api({ type: "api", key: "sk-test" })),
+        }),
+        Layer.mock(ModelsDev.Service, { get: () => Effect.succeed({}) }),
+        Layer.mock(Provider.Service, {
+          defaultModel: () =>
+            Effect.succeed({ providerID: ProviderV2.ID.make("default"), modelID: ModelV2.ID.make("default") }),
+          getProvider: () => Effect.succeed(providerInfo),
+          getModel: () => Effect.succeed(providerModel),
+        }),
+        RuntimeFlags.layer({ experimentalSessionWorkers: true }),
+        Layer.mock(SessionStatus.Service, {
+          get: () => Effect.succeed({ type: "idle" } as SessionStatus.Info),
+          list: () => Effect.succeed(new Map()),
+          set: () => Effect.void,
+        }),
+        Layer.mock(Permission.Service, {}),
+        Layer.mock(Question.Service, {}),
+        Layer.mock(EventV2Bridge.Service, { publishLive: () => Effect.void }),
+      )
+
+      const layer = productionSessionHubLayer({
+        count: 1,
+        poolFactory,
+        plugins: async () => [
+          {
+            name: "request",
+            hooks: {
+              "chat.headers": (input, output) => {
+                const real = input as { agent: string; message: { id: string } }
+                output.headers["x-agent"] = real.agent
+                output.headers["x-message"] = real.message.id
+              },
+            },
+          },
+        ],
+      }).pipe(Layer.provide(deps))
+
+      const sessionID = sid("ses_plugin_input")
+      const lastUserMessage = {
+        id: "msg_real",
+        sessionID,
+        role: "user",
+        time: { created: 0 },
+        agent: "title",
+        model: { providerID: "p", modelID: "m" },
+      }
+
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const context = yield* Layer.build(layer)
+          const hub = Context.get(context, SessionHubService)
+          const sessionLayer = Layer.succeed(
+            Session.Service,
+            Session.Service.of({
+              get: () =>
+                Effect.succeed({
+                  agent: "build",
+                  model: { id: "m", providerID: "p" },
+                } as unknown as Session.Info),
+              findMessage: () => Effect.succeed(Option.some({ info: lastUserMessage, parts: [] } as never)),
+            } as unknown as Session.Interface),
+          )
+          yield* Effect.promise(() => hub.ensureRunning(sessionID)).pipe(
+            Effect.provide(sessionLayer),
+            Effect.provideService(InstanceRef, productionInstanceCtx),
+          )
+        }),
+      )
+
+      expect(captured).toHaveLength(1)
+      // The hook saw the last user message's agent + id, exactly as flag-off.
+      expect(captured[0].plugins?.[0].resolved?.["chat.headers"]).toEqual({
+        headers: { "x-agent": "title", "x-message": "msg_real" },
+      })
+    }),
+  )
 })

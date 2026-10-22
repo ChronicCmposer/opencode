@@ -84,15 +84,23 @@ export const layer = Layer.effect(
       const hub = yield* hubIfEnabled
       if (hub !== undefined) {
         const outcome = yield* Effect.promise(() => hub.cancel(sessionID))
-        // Flag-ON parity with the flag-off branch below. Flag off, `Runner.cancel`
-        // emits the terminal `idle` through the runner's `onIdle` (runner.ts:180,
-        // wired at run-state.ts:65). Flag on, the run-state machine lives in the
-        // worker isolate and its executor runner has no `onIdle` seam
-        // (session-worker.ts:417); the cancel frame interrupts that outer fiber
-        // without ever reaching the worker-local run-state runner, so nothing else
-        // publishes `idle` and the UI stop button stays busy. Emit the same
-        // `session.status` idle the flag-off path emits, once, after the hub cancel.
-        yield* status.set(sessionID, { type: "idle" })
+        // Phase 6.1 parity: background subagents/jobs must not outlive the cancel.
+        // The flag-off branch cancels them before it settles; mirror that here
+        // after the hub cancel resolves (so the outcome is known).
+        yield* cancelBackgroundJobs(background, sessionID)
+        // Single-idle authority. The run-state machine lives in the worker
+        // isolate, and its runner's `onIdle` publishes the terminal idle through
+        // the hub-proxy (`session/worker/run-state` table B). That worker emit is
+        // authoritative whenever the run reached its own run-state, which the hub
+        // reports back exactly two ways: the worker acknowledged the cancel
+        // (`acknowledged`, it publishes idle before acking) or the run completed
+        // naturally (`winner` "completion", it publishes idle on `finishRun`).
+        // Only when neither happened — a queued session, an idle no-op, or a
+        // grace-expired terminate that killed the isolate — is no worker
+        // publishing, so this branch emits the fallback idle itself. That keeps
+        // exactly one idle for every cancel, matching the flag-off branch below.
+        const workerPublishedIdle = outcome !== undefined && (outcome.acknowledged || outcome.winner === "completion")
+        if (!workerPublishedIdle) yield* status.set(sessionID, { type: "idle" })
         return outcome
       }
       yield* cancelBackgroundJobs(background, sessionID)

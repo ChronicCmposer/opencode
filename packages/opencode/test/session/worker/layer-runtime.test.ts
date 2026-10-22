@@ -36,7 +36,8 @@ import {
 } from "@/session/worker/layer"
 import { Provider } from "@/provider/provider"
 import { LLM } from "@/session/llm"
-import { startMockProvider } from "../../lib/mock-provider"
+import { createWorkerPluginHost } from "@/session/worker/plugin-host"
+import { startMockProvider, type MockProviderHandle } from "../../lib/mock-provider"
 import { workerSnapshot } from "../../lib/snapshot"
 
 const sid = (value: string) => SessionID.make(value)
@@ -322,5 +323,77 @@ describe("llmModelClientLayer (step 26)", () => {
     )
 
     expect(completion.text).toBe("hub-zero")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phases 2-3 — the worker's outgoing request params match flag-off.
+//
+// A descriptor with `capabilities.temperature:false` must OMIT temperature even
+// for a model family `ProviderTransform.temperature` would force to 1.0
+// (`transform.ts:530-547`), and must use the descriptor's `limit.output`
+// instead of the old synthesized 4096 cap. A worker-hosted plugin's
+// `chat.params` transform must apply.
+// ---------------------------------------------------------------------------
+
+const descriptorConfig = (provider: MockProviderHandle, overrides: Partial<WorkerModelConfig> = {}): WorkerModelConfig => ({
+  ...modelConfig(provider),
+  capabilities: { temperature: false, reasoning: true },
+  limit: { context: 200_000, output: 1_234 },
+  ...overrides,
+})
+
+const completeWith = (config: WorkerModelConfig, plugins?: Parameters<typeof reducedLlmLayer>[3]) =>
+  Effect.runPromise(
+    Effect.gen(function* () {
+      const model = yield* ModelClient
+      return yield* model.complete({ sessionID: "s", messages: [{ role: "user", content: "hi" }] })
+    }).pipe(
+      Effect.provide(
+        llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(workerSnapshot(), config, undefined, plugins))),
+      ),
+    ),
+  )
+
+describe("reduced worker request parity (phases 2-3)", () => {
+  test("omits temperature for a temperature-less descriptor (glm-4.6 would otherwise be 1.0)", async () => {
+    await using provider = startMockProvider({ text: "ok" })
+    await completeWith(descriptorConfig(provider, { apiId: "glm-4.6" }))
+
+    expect(provider.requests[0].body.temperature).toBeUndefined()
+  })
+
+  test("sends the transform temperature when the descriptor declares temperature support", async () => {
+    await using provider = startMockProvider({ text: "ok" })
+    await completeWith(
+      descriptorConfig(provider, { apiId: "glm-4.6", capabilities: { temperature: true, reasoning: true } }),
+    )
+
+    expect(provider.requests[0].body.temperature).toBe(1)
+  })
+
+  test("uses the descriptor limit.output, not the synthesized 4096 cap", async () => {
+    await using provider = startMockProvider({ text: "ok" })
+    await completeWith(descriptorConfig(provider))
+
+    const body = provider.requests[0].body
+    expect(body.max_tokens ?? body.max_completion_tokens).toBe(1_234)
+  })
+
+  test("applies a worker-hosted plugin's chat.params transform", async () => {
+    await using provider = startMockProvider({ text: "ok" })
+    const plugins = createWorkerPluginHost([
+      {
+        name: "sampling",
+        hooks: {
+          "chat.params": (_input, output) => {
+            output.temperature = 0.25
+          },
+        },
+      },
+    ])
+    await completeWith(descriptorConfig(provider, { capabilities: { temperature: true, reasoning: false } }), plugins)
+
+    expect(provider.requests[0].body.temperature).toBe(0.25)
   })
 })
