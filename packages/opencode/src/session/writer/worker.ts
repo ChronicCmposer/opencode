@@ -11,14 +11,12 @@
 // The connection is created by the `admin.open` frame (no service opens its own
 // connection). Every other frame is answered by the serialized `WriterCore`.
 
+import { resolveWalConfig } from "@opencode-ai/core/database/pragmas"
 import { workerData } from "node:worker_threads"
-import { createBunSqliteConnection, type WriterConnection } from "./connection"
+import { openWriterConnection, type WriterConnection } from "./connection"
 import { createWriterCore, writerErrorInfo, type WriterCore } from "./core"
 import { createFileStorage } from "./storage"
 import { parseWriterRequest, type WriterRequest, type WriterResponse } from "./protocol"
-
-/** Busy timeout is deliberately short: a sync driver with a long timeout stalls the writer thread. */
-const BUSY_TIMEOUT_MS = 250
 
 interface WorkerScope {
   postMessage(message: WriterResponse): void
@@ -52,13 +50,12 @@ async function openConnection(filename: string): Promise<void> {
   if (connection !== undefined) throw new Error("writer connection is already open")
   // Build the whole graph before publishing any of it, so a failure partway leaves
   // the isolate unopened (and the native handle closed) rather than half-open.
-  const nextConnection = createBunSqliteConnection({
-    filename,
-    pragmas: ["PRAGMA journal_mode = WAL", `PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`],
-  })
+  // The shared WAL pragmas (including `journal_size_limit`) are applied here.
+  const wal = resolveWalConfig()
+  const nextConnection = openWriterConnection(filename, wal)
   let nextCore: WriterCore
   try {
-    nextCore = createWriterCore({ connection: nextConnection })
+    nextCore = createWriterCore({ connection: nextConnection, checkpointIntervalMs: wal.checkpointIntervalMs })
   } catch (error) {
     nextConnection.close()
     throw error

@@ -30,9 +30,19 @@
 //   * Replay is idempotent: a sequence at or below the latest is never republished,
 //     and a diverged replay fails loud (7.19).
 
+import { DEFAULT_CHECKPOINT_INTERVAL_MS } from "@opencode-ai/core/database/pragmas"
 import { isDeepStrictEqual } from "node:util"
 import { Faults } from "@/testing/faults"
 import { isSqliteBusy, type WriterConnection } from "./connection"
+
+/** Arms `task` to run every `intervalMs`; the returned function cancels it. */
+export type CheckpointScheduler = (task: () => void, intervalMs: number) => () => void
+
+const defaultCheckpointScheduler: CheckpointScheduler = (task, intervalMs) => {
+  const timer = setInterval(task, intervalMs)
+  if (typeof (timer as { unref?: () => void }).unref === "function") (timer as { unref: () => void }).unref()
+  return () => clearInterval(timer)
+}
 
 export interface CommittedEvent {
   readonly id: string
@@ -121,6 +131,10 @@ export interface WriterCoreOptions {
   readonly txIdleMs?: number
   readonly cache?: boolean
   readonly sleep?: (ms: number) => Promise<void>
+  /** Idle truncating-checkpoint cadence in ms; `0` disables it. */
+  readonly checkpointIntervalMs?: number
+  /** Timer seam for the periodic checkpoint; defaults to an unref'd `setInterval`. */
+  readonly schedule?: CheckpointScheduler
   /** File-KV backend; storage frames reject until one is set (plan task 7.13). */
   readonly storage?: WriterStorage
 }
@@ -309,6 +323,9 @@ export class WriterCore {
   private readonly txIdleMs: number
   private readonly cacheEnabled: boolean
   private readonly sleep: (ms: number) => Promise<void>
+  private readonly checkpointIntervalMs: number
+  private readonly scheduleCheckpoint: CheckpointScheduler
+  private stopCheckpoint: (() => void) | undefined
   private storage: WriterStorage | undefined
 
   private readonly jobs: Job[] = []
@@ -334,7 +351,14 @@ export class WriterCore {
     this.txIdleMs = options.txIdleMs ?? DEFAULT_TX_IDLE_MS
     this.cacheEnabled = options.cache ?? true
     this.sleep = options.sleep ?? defaultSleep
+    this.checkpointIntervalMs = options.checkpointIntervalMs ?? DEFAULT_CHECKPOINT_INTERVAL_MS
+    this.scheduleCheckpoint = options.schedule ?? defaultCheckpointScheduler
     this.storage = options.storage
+    if (this.checkpointIntervalMs > 0) {
+      this.stopCheckpoint = this.scheduleCheckpoint(() => {
+        void this.checkpointWhenIdle().catch(() => undefined)
+      }, this.checkpointIntervalMs)
+    }
   }
 
   /** Install the file-KV backend (opened by the writer-internal `admin.openStorage`). */
@@ -857,11 +881,23 @@ export class WriterCore {
     })
   }
 
+  /**
+   * Periodic checkpoint guard. A truncating checkpoint only helps (and only runs
+   * promptly) while the writer is idle: a busy writer is never interrupted, and
+   * the checkpoint never queues behind unbounded work. Returns whether it ran.
+   */
+  checkpointWhenIdle(): Promise<boolean> {
+    if (this.closed || this.pinned !== undefined || this.depth() > 0) return Promise.resolve(false)
+    return this.checkpoint().then(() => true)
+  }
+
   // -- lifecycle ------------------------------------------------------------
 
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
+    this.stopCheckpoint?.()
+    this.stopCheckpoint = undefined
     if (this.pinned !== undefined) {
       this.clearIdleTimer()
       try {

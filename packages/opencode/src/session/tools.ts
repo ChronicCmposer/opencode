@@ -193,17 +193,22 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 ),
               )
             const content = JSON.stringify({ resources: filtered.map(formatMcpResource) }, null, 2)
-            const truncated = yield* truncate.output(content, {}, input.agent)
+            const bounded = yield* Truncate.boundResult(
+              truncate,
+              {
+                output: content,
+                metadata: {
+                  count: filtered.length,
+                  servers: resourceServers,
+                  ...(parsed.server ? { server: parsed.server } : {}),
+                },
+              },
+              input.agent,
+            )
             const output = {
               title: parsed.server ? `MCP resources: ${parsed.server}` : "MCP resources",
-              metadata: {
-                count: filtered.length,
-                servers: resourceServers,
-                ...(parsed.server ? { server: parsed.server } : {}),
-                truncated: truncated.truncated,
-                ...(truncated.truncated && { outputPath: truncated.outputPath }),
-              },
-              output: truncated.content,
+              metadata: bounded.metadata,
+              output: bounded.output,
             }
             yield* plugin.trigger(
               "tool.execute.after",
@@ -276,17 +281,22 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 ),
               )
             const content = JSON.stringify({ resourceTemplates: filtered.map(formatMcpResourceTemplate) }, null, 2)
-            const truncated = yield* truncate.output(content, {}, input.agent)
+            const bounded = yield* Truncate.boundResult(
+              truncate,
+              {
+                output: content,
+                metadata: {
+                  count: filtered.length,
+                  servers: resourceServers,
+                  ...(parsed.server ? { server: parsed.server } : {}),
+                },
+              },
+              input.agent,
+            )
             const output = {
               title: parsed.server ? `MCP resource templates: ${parsed.server}` : "MCP resource templates",
-              metadata: {
-                count: filtered.length,
-                servers: resourceServers,
-                ...(parsed.server ? { server: parsed.server } : {}),
-                truncated: truncated.truncated,
-                ...(truncated.truncated && { outputPath: truncated.outputPath }),
-              },
-              output: truncated.content,
+              metadata: bounded.metadata,
+              output: bounded.output,
             }
             yield* plugin.trigger(
               "tool.execute.after",
@@ -351,18 +361,23 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             if (!content) throw new Error(`Failed to read MCP resource: ${parsed.server}/${parsed.uri}`)
 
             const formatted = formatMcpResourceContent(parsed.server, parsed.uri, content)
-            const truncated = yield* truncate.output(formatted.text, {}, input.agent)
+            const bounded = yield* Truncate.boundResult(
+              truncate,
+              {
+                output: formatted.text,
+                metadata: {
+                  server: parsed.server,
+                  uri: parsed.uri,
+                  contents: formatted.contents,
+                  attachments: formatted.attachments.length,
+                },
+              },
+              input.agent,
+            )
             const output = {
               title: `MCP resource: ${parsed.uri}`,
-              metadata: {
-                server: parsed.server,
-                uri: parsed.uri,
-                contents: formatted.contents,
-                attachments: formatted.attachments.length,
-                truncated: truncated.truncated,
-                ...(truncated.truncated && { outputPath: truncated.outputPath }),
-              },
-              output: truncated.content,
+              metadata: bounded.metadata,
+              output: bounded.output,
               attachments: formatted.attachments.map((attachment) => ({
                 ...attachment,
                 id: PartID.ascending(),
@@ -461,17 +476,16 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
           }
 
-          const truncated = yield* truncate.output(textParts.join("\n\n"), {}, input.agent)
-          const metadata = {
-            ...result.metadata,
-            truncated: truncated.truncated,
-            ...(truncated.truncated && { outputPath: truncated.outputPath }),
-          }
+          const bounded = yield* Truncate.boundResult(
+            truncate,
+            { output: textParts.join("\n\n"), metadata: result.metadata },
+            input.agent,
+          )
 
           const output = {
             title: "",
-            metadata,
-            output: truncated.content,
+            metadata: bounded.metadata,
+            output: bounded.output,
             attachments: attachments.map((attachment) => ({
               ...attachment,
               id: PartID.ascending(),

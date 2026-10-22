@@ -6,7 +6,14 @@
 // wires the `bun:sqlite` adapter; tests wire the same adapter over an in-memory
 // database so transaction and sequence semantics are exercised for real.
 
+import { resolveWalConfig, walPragmas, type WalConfig } from "@opencode-ai/core/database/pragmas"
 import { Database } from "bun:sqlite"
+
+/**
+ * A synchronous driver must never stall the writer isolate on a lock, so the
+ * writer keeps a much shorter busy timeout than the read connection.
+ */
+export const WRITER_BUSY_TIMEOUT_MS = 250
 
 export interface WriteOutcome {
   readonly changes: number
@@ -83,6 +90,20 @@ export function createBunSqliteConnection(options: BunSqliteConnectionOptions): 
     exec: (sql) => native.exec(sql),
     close: () => native.close(),
   }
+}
+
+/** Writer-side pragmas: the shared WAL tuning plus the isolate's short timeout. */
+export function writerPragmas(config: WalConfig): ReadonlyArray<string> {
+  return walPragmas({ journalSizeLimitBytes: config.journalSizeLimitBytes, busyTimeoutMs: WRITER_BUSY_TIMEOUT_MS })
+}
+
+/**
+ * Open the production writer connection. The shared WAL pragmas (including
+ * `journal_size_limit`) are applied before the first statement, so the WAL is
+ * capped from the moment the isolate starts writing.
+ */
+export function openWriterConnection(filename: string, config: WalConfig = resolveWalConfig()): WriterConnection {
+  return createBunSqliteConnection({ filename, pragmas: writerPragmas(config) })
 }
 
 export * as WriterConnection from "./connection"

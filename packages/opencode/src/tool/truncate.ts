@@ -13,10 +13,23 @@ const RETENTION = Duration.days(7)
 
 export const MAX_LINES = 2000
 export const MAX_BYTES = 50 * 1024
+/**
+ * Maximum serialized size of a persisted tool result (`output` + `metadata`).
+ * Results above this bound are externalized to the truncation directory and
+ * referenced by path so `edit`/`write`/`read` cannot store multi-MB payloads in
+ * `part`. Kept above the worst-case bounded read (~114 KB JSON) so ordinary
+ * results pass through unchanged.
+ */
+export const MAX_TOOL_OUTPUT_BYTES = 128 * 1024
 export const DIR = TRUNCATION_DIR
 export const GLOB = path.join(TRUNCATION_DIR, "*")
 
 export type Result = { content: string; truncated: false } | { content: string; truncated: true; outputPath: string }
+
+export interface ResultInput {
+  output: string
+  metadata: Record<string, any>
+}
 
 export interface Options {
   maxLines?: number
@@ -27,6 +40,18 @@ export interface Options {
 function hasTaskTool(agent?: Agent.Info) {
   if (!agent?.permission) return false
   return evaluate("task", "*", agent.permission).action !== "deny"
+}
+
+const takePrefix = (input: string, maximumBytes: number) => {
+  let bytes = 0
+  let content = ""
+  for (const char of input) {
+    const size = Buffer.byteLength(char, "utf-8")
+    if (bytes + size > maximumBytes) break
+    content += char
+    bytes += size
+  }
+  return content
 }
 
 export interface Interface {
@@ -150,6 +175,39 @@ const layer = Layer.effect(
     return Service.of({ cleanup, write, output, limits })
   }),
 )
+
+/**
+ * Bounds a complete tool result before persistence, reusing `service.output`
+ * for text truncation and `service.write` for externalization. Results at or
+ * below `MAX_TOOL_OUTPUT_BYTES` keep the existing text truncation behavior;
+ * larger results are written to the truncation directory and replaced by a
+ * bounded preview plus an `outputPath` reference. Keeping this a standalone
+ * helper means every tool-result construction site shares one policy without
+ * widening the `Truncate` service contract.
+ */
+export const boundResult = Effect.fn("Truncate.boundResult")(function* (
+  service: Pick<Interface, "output" | "write">,
+  input: ResultInput,
+  agent?: Agent.Info,
+) {
+  const payload = JSON.stringify({ output: input.output, metadata: input.metadata })
+  const bytes = Buffer.byteLength(payload, "utf-8")
+  if (bytes <= MAX_TOOL_OUTPUT_BYTES) {
+    const text = yield* service.output(input.output, {}, agent)
+    const metadata: Record<string, any> = {
+      ...input.metadata,
+      truncated: text.truncated || input.metadata.truncated === true,
+      ...(text.truncated ? { outputPath: text.outputPath } : {}),
+    }
+    return { output: text.content, metadata }
+  }
+
+  const file = yield* service.write(payload)
+  const marker = `... tool result truncated; full result saved to ${file} ...`
+  const prefix = takePrefix(input.output, Math.max(0, MAX_BYTES - Buffer.byteLength(marker, "utf-8") - 2))
+  const metadata: Record<string, any> = { truncated: true, outputPath: file, originalBytes: bytes }
+  return { output: prefix ? `${prefix}\n\n${marker}` : marker, metadata }
+})
 
 export const node = LayerNode.make({ service: Service, layer: layer, deps: [FSUtil.node] })
 
