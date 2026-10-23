@@ -119,6 +119,24 @@ import { schemaErrorLayer } from "./middleware/schema-error"
 
 export const context = Context.makeUnsafe<unknown>(new Map())
 
+// Test-only build counter. The server app graph is materialized exactly when the
+// `webHandler` lazy below is forced (`Server.Default().app.fetch` → `webHandler()`).
+// A worker isolate must never reach this point: its session graph replaces the
+// real `Plugin.node`, so the plugin `effect-layer` (and, through it, the server
+// graph) is never imported. Production behavior is unchanged; the counter is a
+// plain integer on the lazy path, never touched per request.
+let serverAppGraphBuilds = 0
+
+/** How many times the server app graph has been built (`webHandler` forced). */
+export function serverAppGraphBuildCount(): number {
+  return serverAppGraphBuilds
+}
+
+/** Reset the build counter so a caller can measure one build. */
+export function resetServerAppGraphBuildCount(): void {
+  serverAppGraphBuilds = 0
+}
+
 const cors = (corsOptions?: CorsOptions) =>
   HttpRouter.middleware(
     HttpMiddleware.cors({
@@ -317,12 +335,13 @@ export function createRoutes(
 
 export const routes = createRoutes()
 
-export const webHandler = lazy(() =>
-  HttpRouter.toWebHandler(routes, {
+export const webHandler = lazy(() => {
+  serverAppGraphBuilds += 1
+  return HttpRouter.toWebHandler(routes, {
     disableLogger: true,
     memoMap,
     middleware: disposeMiddleware,
-  }),
-)
+  })
+})
 
 export * as HttpApiApp from "./server"

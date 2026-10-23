@@ -13,6 +13,17 @@
 // dependency on the production pool factory. Nothing here acquires resources or
 // spawns workers — it only decides graph membership.
 //
+// The hub must never enter a worker-hosted graph. A session worker's reduced
+// LAYER graph already excludes the hub, but its MODULE graph can dynamically pull
+// in the app runtime (`effect/app-runtime.ts`) and server (`server/server.ts`) via
+// `session/prompt.ts → plugin/index.ts`. When plugins are configured that
+// materialises a second `Server`/`AppRuntime` inside the worker, whose app graph
+// spreads this helper — building a nested hub (and a nested worker pool) in the
+// worker. `sessionWorkerNodes` therefore also gates on the process role: only the
+// `hub` role contributes the node, so a worker-hosted graph (`session`) always
+// gets `[]`. The role is explicit per-isolate state (`@/effect/process-role`),
+// replacing the ambient `isMainThread` check.
+//
 // Applied wiring (Wave 3):
 //
 // ```ts
@@ -33,7 +44,9 @@
 // `SessionRunState.node`.
 
 import type { AnyNode } from "@opencode-ai/core/effect/layer-node"
+import { processRole } from "@/effect/process-role"
 import { experimentalSessionWorkersFromEnv } from "@/effect/runtime-flags"
+import type { Role } from "./node-table"
 
 export interface SessionWorkerNodesOptions<N extends AnyNode = AnyNode> {
   /** The hub node to contribute when session workers are enabled. */
@@ -45,6 +58,12 @@ export interface SessionWorkerNodesOptions<N extends AnyNode = AnyNode> {
   readonly enabled?: boolean
   /** Environment source for the default gate. Defaults to `process.env`. */
   readonly env?: Record<string, string | undefined>
+  /**
+   * The process role to gate on. Defaults to {@link processRole}: only the
+   * `hub` role contributes the hub node, so a worker-hosted graph (e.g. the app
+   * runtime pulled in by a session worker's module graph) always gets `[]`.
+   */
+  readonly role?: Role
 }
 
 /**
@@ -67,13 +86,14 @@ export function sessionWorkersEnabled(env: Record<string, string | undefined> = 
 
 /**
  * The session-hub node as a spreadable list: `[hubNode]` when session workers are
- * enabled, `[]` otherwise. Pure and side-effect free.
+ * enabled for the `hub` process role, `[]` otherwise. Pure and side-effect free.
  */
 export function sessionWorkerNodes<const N extends AnyNode>(
   options: SessionWorkerNodesOptions<N>,
 ): readonly N[] {
   const enabled = options.enabled ?? sessionWorkersEnabled(options.env)
-  return enabled ? [options.hubNode] : []
+  const role = options.role ?? processRole()
+  return enabled && role === "hub" ? [options.hubNode] : []
 }
 
 export * as SessionWorkerNodes from "./nodes"

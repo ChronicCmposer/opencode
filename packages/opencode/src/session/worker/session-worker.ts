@@ -24,6 +24,7 @@
 import { threadId, workerData } from "node:worker_threads"
 import { Effect, Layer, Option } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { isRole, setProcessRole } from "@/effect/process-role"
 import { Project } from "@opencode-ai/schema/project"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRunState } from "@/session/run-state"
@@ -71,6 +72,7 @@ import {
 } from "./layer"
 import { workerSnapshotBoundaryLayer } from "./snapshot"
 import { PidReporter, type PidReport, type PidReporterInterface } from "./pid-registry"
+import type { Role } from "./node-table"
 
 /** The real model capabilities, serialized for the isolate boundary. */
 export interface SerializedModelCapabilities {
@@ -123,6 +125,13 @@ export interface SessionWorkerInit {
   readonly snapshot: WorkerSnapshot
   readonly env: WorkerEnv
   readonly model: SessionWorkerModel
+  /**
+   * The process role this isolate adopts at boot (`setProcessRole(role)`). The
+   * hub ships `"session"`; the role gates graph membership so a worker-hosted
+   * graph never contributes the hub node. Required — a payload without a valid
+   * role fails loud at the isolate boundary.
+   */
+  readonly role: Role
   readonly capabilities?: SessionWorkerCapabilities
   /**
    * The worker's hub pool id, when the hub ships it. `pid-report` frames carry
@@ -163,6 +172,9 @@ export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
   }
   if (candidate.model === undefined || typeof candidate.model.baseUrl !== "string") {
     throw new Error("session worker workerData.model.baseUrl is required")
+  }
+  if (!isRole(candidate.role)) {
+    throw new Error(`session worker workerData.role must be a valid process role, received ${JSON.stringify(candidate.role)}`)
   }
   if (
     candidate.workerID !== undefined &&
@@ -746,6 +758,10 @@ export function bootstrapSessionWorker(
     // the graph's provider (the real loop's `LLM` and `SessionPrompt` use it), and
     // snapshot tracking is a fail-soft no-op (the isolate cannot run `git`).
     replacements: workerGraphReplacements(config),
+    // The worker-hosted plugin host reaches the graph's `LLM`/`Plugin` node too,
+    // not just the `ModelClient` sealed below, so plugin-set sampling/headers
+    // apply identically in both. Absent keeps the graph's no-op pass-through.
+    ...(plugins === undefined ? {} : { plugins }),
     ...(hubProxies === undefined ? {} : { hubProxies }),
     ...(pidReporter === undefined ? {} : { pidReporter }),
   })
@@ -832,6 +848,9 @@ export function workerInstanceContext(snapshot: WorkerSnapshot): InstanceContext
 
 if (workerData !== null && workerData !== undefined) {
   const init = parseSessionWorkerInit(workerData)
+  // Adopt the shipped role BEFORE any heavy bootstrap, so a dynamic app-runtime
+  // import during bootstrap sees `session` and never contributes a nested hub.
+  setProcessRole(init.role)
   // Name the OS thread for its slot before any heavy bootstrap. Fail-soft and
   // Linux-only (see `@/util/thread-name`); skipped when the hub shipped no slot.
   if (init.workerID !== undefined) setThreadName(sessionThreadName(init.workerID))

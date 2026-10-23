@@ -243,6 +243,32 @@ describe("sessionWorkerNodes", () => {
     expect(sessionWorkerNodes(options)).toEqual([hubNode])
     expect(SessionWorkerNodes.sessionWorkerNodes).toBe(sessionWorkerNodes)
   })
+
+  // The hub must never enter a worker-hosted graph. A session worker's reduced
+  // layer graph excludes it, but the module graph dynamically pulls in the app
+  // runtime; when plugins are configured that builds a second Server whose graph
+  // would spread this helper. Gating on the process role keeps the hub out of any
+  // worker-hosted graph (role `session`) while the process main graph (`hub`)
+  // stays unchanged. This is the marker for the deleted worker-hosted-hub fixture:
+  // a worker graph contributes no hub, so no nested hub can clobber its thread name.
+  test("returns an empty list for a non-hub process role even when enabled", () => {
+    expect(sessionWorkerNodes({ hubNode, enabled: true, role: "session" })).toEqual([])
+    expect(sessionWorkerNodes({ hubNode, enabled: true, role: "writer" })).toEqual([])
+    expect(sessionWorkerNodes({ hubNode, enabled: true, role: "broker" })).toEqual([])
+  })
+
+  test("returns the hub node for the hub role when enabled", () => {
+    expect(sessionWorkerNodes({ hubNode, enabled: true, role: "hub" })).toEqual([hubNode])
+  })
+
+  test("a disabled gate stays empty regardless of role", () => {
+    expect(sessionWorkerNodes({ hubNode, enabled: false, role: "session" })).toEqual([])
+    expect(sessionWorkerNodes({ hubNode, enabled: false, role: "hub" })).toEqual([])
+  })
+
+  test("defaults to the process role (hub in the main test process)", () => {
+    expect(sessionWorkerNodes({ hubNode, enabled: true })).toEqual([hubNode])
+  })
 })
 
 // ---------------------------------------------------------------------------

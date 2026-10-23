@@ -13,6 +13,7 @@
 import { isDeepStrictEqual } from "node:util"
 import type { SessionWorkerInit, SessionWorkerModel } from "@/session/worker/session-worker"
 import type { WorkerEnv, WorkerSnapshot } from "@/session/worker/layer"
+import type { Role } from "@/session/worker/node-table"
 import { workerSnapshot } from "./snapshot"
 
 /**
@@ -42,6 +43,8 @@ export interface SessionWorkerInitOverrides {
    * `modelID`; an explicit `modelID` always wins.
    */
   readonly model?: Partial<SessionWorkerModel> & { readonly model?: string }
+  /** Process role the worker adopts; defaults to `"session"`. */
+  readonly role?: Role
 }
 
 /**
@@ -54,6 +57,7 @@ export function sessionWorkerInit(overrides: SessionWorkerInitOverrides = {}): S
   return {
     snapshot: overrides.snapshot ?? workerSnapshot(),
     env: overrides.env ?? { values: {} },
+    role: overrides.role ?? "session",
     // Normalize the legacy `model` name at this boundary so the emitted payload
     // always carries the entry's `modelID` (which the entry's `modelConfig` reads
     // as `modelID ?? model`), keeping a legacy override effective rather than inert.

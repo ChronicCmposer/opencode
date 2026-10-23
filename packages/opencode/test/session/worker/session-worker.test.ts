@@ -126,6 +126,7 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
   const init = (capabilities?: { sessionWorkerPorts?: boolean }) => ({
     snapshot: workerSnapshot(),
     env: { values: {} },
+    role: "session" as const,
     model: {
       providerID: "mock",
       modelID: "m",
@@ -224,6 +225,7 @@ describe("child-result subscription (9.4)", () => {
   const init = () => ({
     snapshot: workerSnapshot(),
     env: { values: {} },
+    role: "session" as const,
     model: {
       providerID: "mock",
       modelID: "m",
@@ -550,6 +552,7 @@ describe("worker→hub PID reporting (P5 prerequisite)", () => {
     const init: SessionWorkerInit = {
       snapshot: workerSnapshot(),
       env: { values: {} },
+      role: "session",
       model: {
         providerID: "mock",
         modelID: "m",
@@ -818,6 +821,7 @@ describe("worker event bridge wiring (Q6/Q13/Q15)", () => {
       {
         snapshot: workerSnapshot(),
         env: { values: {} },
+        role: "session",
         model: {
           providerID: "mock",
           modelID: "m",
@@ -1381,6 +1385,7 @@ describe("worker model descriptor", () => {
     const parsed = parseSessionWorkerInit({
       snapshot: workerSnapshot(),
       env: { values: {} },
+      role: "session",
       model: descriptorModel,
     })
 
@@ -1546,6 +1551,7 @@ describe("degraded ModelClient worker plugin host (task 4)", () => {
   ): SessionWorkerInit => ({
     snapshot: workerSnapshot(),
     env: { values: {} },
+    role: "session",
     model: {
       providerID: "mock",
       modelID: provider.model,

@@ -187,6 +187,9 @@ export class WriterClient {
     const worker = new Worker(this.entry, {
       env: this.env,
       workerData: { ...this.baseWorkerData, generation },
+      // Born named `ocw` so the isolate is observable from creation, not only
+      // once its own entry self-names.
+      name: "ocw",
     } as ConstructorParameters<typeof Worker>[1])
     this.worker = worker
     this.alive = false
