@@ -13,6 +13,13 @@
 // Protocol: the `execute.ts` frame protocol over the default worker channel.
 // The worker additionally transfers its writer / egress / broker ports and its
 // dedicated job control link to the hub.
+//
+// Thread naming (Linux-only, fail-soft): the isolate names its OS thread so
+// `ps -T`/`top -H`/htop label the slot instead of the process (htop needs
+// "Show custom thread names" enabled). Because the hub's main thread is `och`,
+// the process `comm` no longer matches `pgrep opencode`/`ps -C opencode`; use
+// `pgrep -f 'oc serve'` instead. Names are clipped to the kernel's 15-byte
+// `comm` limit (see `@/util/thread-name`).
 
 import { threadId, workerData } from "node:worker_threads"
 import { Effect, Layer, Option } from "effect"
@@ -23,6 +30,7 @@ import { SessionRunState } from "@/session/run-state"
 import { Snapshot } from "@/snapshot"
 import { InstanceRef } from "@/effect/instance-ref"
 import { EffectBridge } from "@/effect/bridge"
+import { setThreadName } from "@/util/thread-name"
 import type { InstanceContext } from "@/project/instance-context"
 import { Provider } from "@/provider/provider"
 import { createWorkerWriterClient, type WorkerWriterClient } from "./writer-client"
@@ -31,6 +39,7 @@ import { createWorkerBrokerClient } from "./broker-client"
 import { createBackgroundJobClient, createJobClient, jobPortFromMessagePort, type JobClient } from "./job-client"
 import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
 import { messageOf } from "./port"
+import { sessionThreadName } from "./thread-name"
 import type { JobInfo } from "./job-registry"
 import {
   DEFAULT_WORK_KIND,
@@ -756,6 +765,7 @@ export function bootstrapSessionWorker(
       },
     }),
   )
+  const slot = init.workerID
   installSessionExecutor(scope, {
     work,
     threadId,
@@ -766,6 +776,17 @@ export function bootstrapSessionWorker(
       cancel: (sessionID) => control?.cancel(sessionID) ?? Promise.resolve(),
       busy: (sessionID) => control?.busy(sessionID) ?? Promise.resolve(false),
     },
+    // Dynamic OS thread name (Linux-only, fail-soft): `ocs<slot>` at rest and
+    // `ocs<slot>:<last6>` while a run is live. `onIdle` fires on every terminal
+    // (settle, cooperative cancel, interrupt), so the name always resets. Both
+    // callbacks are fail-soft in `execute.ts`, so naming never unwinds a run.
+    // Skipped when the hub shipped no slot id.
+    ...(slot === undefined
+      ? {}
+      : {
+          onRunStart: (sessionID) => setThreadName(sessionThreadName(slot, sessionID)),
+          onIdle: () => Effect.sync(() => setThreadName(sessionThreadName(slot))),
+        }),
   })
 
   return {
@@ -810,5 +831,9 @@ export function workerInstanceContext(snapshot: WorkerSnapshot): InstanceContext
 }
 
 if (workerData !== null && workerData !== undefined) {
-  bootstrapSessionWorker(parseSessionWorkerInit(workerData), globalThis as unknown as WorkerScope)
+  const init = parseSessionWorkerInit(workerData)
+  // Name the OS thread for its slot before any heavy bootstrap. Fail-soft and
+  // Linux-only (see `@/util/thread-name`); skipped when the hub shipped no slot.
+  if (init.workerID !== undefined) setThreadName(sessionThreadName(init.workerID))
+  bootstrapSessionWorker(init, globalThis as unknown as WorkerScope)
 }

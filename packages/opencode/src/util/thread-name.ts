@@ -16,15 +16,27 @@ import { writeFileSync } from "node:fs"
 
 const THREAD_COMM_PATH = "/proc/thread-self/comm"
 
+/** The kernel's `comm` field holds at most 15 bytes. */
+const THREAD_COMM_MAX = 15
+
+/**
+ * Clip `name` to the kernel's 15-byte `comm` limit. Pure and total, so callers
+ * can compose names freely (see `sessionThreadName`) without re-checking the
+ * limit at every call site.
+ */
+export function threadNameWithinLimit(name: string): string {
+  return name.slice(0, THREAD_COMM_MAX)
+}
+
 /**
  * Name the current OS thread `name` on Linux. No-op (never throws) elsewhere or
  * when the kernel rejects the write, since thread naming is best-effort
- * observability. Names longer than the kernel's 15-byte `comm` limit are
- * truncated by the kernel, not by us.
+ * observability. The name is clipped to the kernel's 15-byte `comm` limit
+ * before writing.
  */
 export function setThreadName(name: string): void {
   try {
-    writeFileSync(THREAD_COMM_PATH, name)
+    writeFileSync(THREAD_COMM_PATH, threadNameWithinLimit(name))
   } catch {
     // Non-Linux host or unwritable /proc: leave the default name in place.
   }
