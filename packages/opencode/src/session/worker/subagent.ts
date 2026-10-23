@@ -11,10 +11,13 @@
 // (`job-registry.ts`) and the scheduler is the hub's `Dispatcher`
 // (`dispatch.ts`), so `task` never needs to know about isolates.
 
-import { Schema } from "effect"
+import { Context, Effect, Schema } from "effect"
 import type { SessionID } from "@/session/schema"
+import type { PromptInput } from "@/session/prompt"
 import { HeadroomFullError } from "./dispatch"
+import type { SessionExecutionResult } from "./execute"
 import type { JobInfo, JobRegistry } from "./job-registry"
+import { messageOf } from "./port"
 
 /** Raised when a subagent would exceed the resolved `subagent_depth` limit. */
 export class SubagentDepthError extends Schema.TaggedErrorClass<SubagentDepthError>()("SubagentDepthError", {
@@ -71,7 +74,12 @@ export function assertSubagentAdmitted(admission: SubagentAdmission): void {
 
 /** The scheduling slice of the hub `Dispatcher` this seam needs. */
 export interface SubagentScheduler {
-  dispatch(request: { readonly sessionID: SessionID; readonly depth?: number }): Promise<void>
+  dispatch(request: {
+    readonly sessionID: SessionID
+    readonly depth?: number
+    /** The sub-agent prompt the worker persists before looping (Solution 1). */
+    readonly prompt?: PromptInput
+  }): Promise<void>
 }
 
 export interface SubagentDispatchOptions {
@@ -81,6 +89,13 @@ export interface SubagentDispatchOptions {
   readonly depthLimit: number
   /** Whether the headroom pool is full (e.g. `dispatcher.headroomSlotCount >= dispatcher.headroomCapacity`). */
   readonly headroomFull: () => boolean
+  /**
+   * Bridge a settled child's worker result back to the registry so
+   * `JobInfo.output` carries the child's last assistant text. Absent in
+   * schedulers whose job client already reports the output (e.g. a fake, or the
+   * child's own job port).
+   */
+  readonly resultFor?: (sessionID: SessionID) => SessionExecutionResult | undefined
 }
 
 export interface SubagentDispatchRequest {
@@ -92,7 +107,25 @@ export interface SubagentDispatchRequest {
   readonly workerID?: number
   /** Explicit depth; derived from the parent job when omitted. */
   readonly depth?: number
+  /** The sub-agent prompt the worker persists before looping (Solution 1). */
+  readonly prompt?: PromptInput
 }
+
+/**
+ * The narrow hub-proxy surface a worker's `SessionPrompt.ops.dispatchSubagent`
+ * calls. It exists so the worker graph can expose the RPC without depending on
+ * the (absent) `SessionHubService`; a transport failure is the only rejection,
+ * a domain outcome returns as a status-bearing {@link JobInfo}.
+ */
+export interface SubagentDispatchProxy {
+  readonly dispatchSubagent: (request: SubagentDispatchRequest) => Effect.Effect<JobInfo, Error>
+}
+
+/** Worker-side service key for the hub-proxy subagent-dispatch RPC. */
+export class SubagentDispatchProxyService extends Context.Service<
+  SubagentDispatchProxyService,
+  SubagentDispatchProxy
+>()("@opencode/session-worker/SubagentDispatch") {}
 
 /**
  * A dispatch rejection is a cancellation (not a failure) when it carries the
@@ -108,21 +141,90 @@ function isSessionCancellation(error: unknown): boolean {
   )
 }
 
+/** A text part carries the assistant prose the parent renders as output. */
+function isTextPart(value: unknown): value is { readonly text: string } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as { readonly type?: unknown }).type === "text" &&
+    typeof (value as { readonly text?: unknown }).text === "string"
+  )
+}
+
+/**
+ * Extract the last assistant text from a settled worker result. The session
+ * result's `value` is a `SessionV1.WithParts` (`{ parts }`) in the real path or a
+ * pipeline result (`{ text }`) in the reduced path; both are parsed at this
+ * boundary so the registry `output` is a plain string.
+ */
+function finalTextFromResult(result: SessionExecutionResult | undefined): string | undefined {
+  const value = result?.value
+  if (value === null || typeof value !== "object") return undefined
+  const parts = (value as { readonly parts?: unknown }).parts
+  if (Array.isArray(parts)) {
+    for (let index = parts.length - 1; index >= 0; index--) {
+      const part = parts[index]
+      if (isTextPart(part)) return part.text
+    }
+  }
+  const text = (value as { readonly text?: unknown }).text
+  return typeof text === "string" ? text : undefined
+}
+
+/**
+ * A status-bearing failed `JobInfo` for a child rejected BEFORE registration.
+ * The admission seam never queues an over-deep or headroom-full child, so no
+ * registry entry exists; the caller still receives a settled outcome.
+ */
+function rejectedSubagentJob(request: SubagentDispatchRequest, depth: number, error: unknown): JobInfo {
+  const now = Date.now()
+  return {
+    id: request.childID,
+    type: request.type,
+    ...(request.title === undefined ? {} : { title: request.title }),
+    ...(request.metadata === undefined ? {} : { metadata: request.metadata }),
+    parentID: request.parentID,
+    status: "error",
+    started_at: now,
+    completed_at: now,
+    error: messageOf(error),
+    depth,
+  }
+}
+
+/**
+ * Settle a registered child once its run resolves: the worker's own result is
+ * the only place the last assistant text lives, so complete the registry job
+ * with it. A child already settled (by its job port or the scheduler) is left
+ * untouched.
+ */
+function settleChildFromResult(options: SubagentDispatchOptions, childID: SessionID): JobInfo | undefined {
+  const current = options.registry.get(childID)
+  if (current === undefined || current.status !== "running") return current
+  const text = finalTextFromResult(options.resultFor?.(childID))
+  return options.registry.complete(childID, text ?? "")
+}
+
 /**
  * Admit, register and dispatch one subagent child. Resolves with the child's
- * settled registry info once `scheduler.dispatch` resolves; a dispatch failure
- * settles the job and rethrows — `cancelled` for a cancellation, `error`
- * otherwise — so the parent's routed result matches the child's terminal state.
+ * settled registry info once `scheduler.dispatch` resolves. Domain outcomes are
+ * status-bearing and NEVER thrown (only a transport fault rejects): an over-deep
+ * or headroom-full child returns a failed job without being registered, a
+ * cancellation settles `cancelled`, any other dispatch failure settles `error`.
  */
 export async function dispatchSubagent(
   options: SubagentDispatchOptions,
   request: SubagentDispatchRequest,
-): Promise<JobInfo | undefined> {
+): Promise<JobInfo> {
   const parent = options.registry.get(request.parentID)
   const depth = request.depth ?? (parent?.depth ?? 0) + 1
-  assertSubagentAdmitted({ depth, limit: options.depthLimit, headroomFull: options.headroomFull() })
+  try {
+    assertSubagentAdmitted({ depth, limit: options.depthLimit, headroomFull: options.headroomFull() })
+  } catch (error) {
+    return rejectedSubagentJob(request, depth, error)
+  }
 
-  options.registry.start({
+  const started = options.registry.start({
     id: request.childID,
     type: request.type,
     ...(request.title === undefined ? {} : { title: request.title }),
@@ -133,13 +235,18 @@ export async function dispatchSubagent(
   })
 
   try {
-    await options.scheduler.dispatch({ sessionID: request.childID, depth })
+    await options.scheduler.dispatch({
+      sessionID: request.childID,
+      depth,
+      ...(request.prompt === undefined ? {} : { prompt: request.prompt }),
+    })
   } catch (error) {
-    if (isSessionCancellation(error)) options.registry.cancel(request.childID)
-    else options.registry.fail(request.childID, error)
-    throw error
+    const settled = isSessionCancellation(error)
+      ? options.registry.cancel(request.childID)
+      : options.registry.fail(request.childID, error)
+    return settled ?? started
   }
-  return options.registry.get(request.childID)
+  return settleChildFromResult(options, request.childID) ?? options.registry.get(request.childID) ?? started
 }
 
 export * as Subagent from "./subagent"

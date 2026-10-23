@@ -113,6 +113,8 @@ import type {
 } from "./plugin-host"
 import { writerSqlClientLayer, type WriterSqlHandle } from "./writer-sql-client"
 import { PidReporter, type PidReporterInterface } from "./pid-registry"
+import type { JobInfo } from "./job-registry"
+import { SubagentDispatchProxyService, type SubagentDispatchRequest } from "./subagent"
 
 export { PidReporter } from "./pid-registry"
 export type { PidReport, PidReportEntry, PidReporterInterface } from "./pid-registry"
@@ -264,6 +266,12 @@ export class HubProxyRemoteError extends Error {
 
 export interface HubProxyClient {
   readonly call: (method: string, args: readonly unknown[]) => Promise<unknown>
+  /**
+   * The typed subagent-dispatch RPC (Solution 1). Optional so lightweight test
+   * doubles (`{ call, dispose }`) remain assignable; the multiplexed client
+   * always installs it.
+   */
+  readonly dispatchSubagent?: (request: SubagentDispatchRequest) => Promise<JobInfo>
   dispose(): void
 }
 
@@ -291,23 +299,26 @@ export function createHubProxyClient(port: MessagePort): HubProxyClient {
     waiter.resolve(frame)
   })
 
-  return {
-    call(method, args) {
-      if (disposed) return Promise.reject(new HubProxyRemoteError("hub proxy client disposed"))
-      const id = nextId++
-      return new Promise<unknown>((resolve, reject) => {
-        pending.set(id, {
-          resolve: (frame) => (frame.ok ? resolve(frame.value) : reject(new HubProxyRemoteError(frame.message))),
-          reject,
-        })
-        try {
-          channel.post({ kind: "request", id, method, args })
-        } catch (error) {
-          pending.delete(id)
-          reject(error)
-        }
+  const call = (method: string, args: readonly unknown[]): Promise<unknown> => {
+    if (disposed) return Promise.reject(new HubProxyRemoteError("hub proxy client disposed"))
+    const id = nextId++
+    return new Promise<unknown>((resolve, reject) => {
+      pending.set(id, {
+        resolve: (frame) => (frame.ok ? resolve(frame.value) : reject(new HubProxyRemoteError(frame.message))),
+        reject,
       })
-    },
+      try {
+        channel.post({ kind: "request", id, method, args })
+      } catch (error) {
+        pending.delete(id)
+        reject(error)
+      }
+    })
+  }
+
+  return {
+    call,
+    dispatchSubagent: (request) => call("dispatchSubagent", [request]) as Promise<JobInfo>,
     dispose() {
       if (disposed) return
       disposed = true
@@ -405,6 +416,28 @@ export interface HubProxyClients {
   readonly sessionStatus: HubProxyClient
   readonly permission: HubProxyClient
   readonly question: HubProxyClient
+  /**
+   * Optional dedicated subagent-dispatch client. Production multiplexes all
+   * four over one port, so an absent value falls back to `sessionStatus`
+   * (identical client). Present so a test can route dispatch independently.
+   */
+  readonly subagent?: HubProxyClient
+}
+
+/**
+ * Worker-side `SubagentDispatchProxy` over the hub-proxy control port. The
+ * `SessionPrompt` layer reads it optionally, so `ops.dispatchSubagent` is wired
+ * exactly when a worker reaches a hub control plane.
+ */
+export function subagentDispatchProxyLayer(client: HubProxyClient): Layer.Layer<SubagentDispatchProxyService> {
+  return Layer.succeed(SubagentDispatchProxyService, {
+    dispatchSubagent: (request) => hubProxyCall<JobInfo>(client, "dispatchSubagent", [request]),
+  })
+}
+
+/** The client the subagent-dispatch proxy multiplexes over. */
+export function subagentDispatchClient(clients: HubProxyClients): HubProxyClient {
+  return clients.subagent ?? clients.sessionStatus
 }
 
 /** Replacement layers for the three hub-resident authorities. */
@@ -1553,10 +1586,17 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
   // `PidReporter` is not a graph node: the shell tool reads it optionally at
   // execution time, so merging it keeps degraded graphs (no reporter) building
   // unchanged while the production graph sees the control-port reporter.
-  const layer =
+  const withPid =
     options.pidReporter === undefined
       ? built
       : Layer.merge(built, Layer.succeed(PidReporter, options.pidReporter))
+  // `SubagentDispatchProxy` is likewise not a graph node: `SessionPrompt.ops`
+  // reads it optionally, so a hub-reaching worker gets `dispatchSubagent` while
+  // a degraded/hub-less graph builds unchanged (and runs sub-agents inline).
+  const layer =
+    options.hubProxies === undefined
+      ? withPid
+      : Layer.merge(withPid, subagentDispatchProxyLayer(subagentDispatchClient(options.hubProxies)))
   return { root, replacements, layer }
 }
 

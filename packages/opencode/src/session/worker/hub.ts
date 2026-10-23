@@ -61,7 +61,8 @@ import {
   type Dispatcher,
   type SessionWorker,
 } from "./dispatch"
-import { createJobRegistry, type JobRegistry } from "./job-registry"
+import { createJobRegistry, type JobInfo, type JobRegistry } from "./job-registry"
+import { dispatchSubagent as dispatchSubagentToHub, type SubagentDispatchRequest } from "./subagent"
 import { createResultRouter, jobPortFromMessagePort, serveJobRegistry, type JobPort } from "./job-client"
 import {
   createExecutorCancelPort,
@@ -290,6 +291,12 @@ export interface SessionHubOptions {
    * `PidRegistry`; absent means pid reports are ignored (a pure hub, no reaper).
    */
   readonly onPidReport?: (workerID: number, report: PidReport) => void
+  /**
+   * Resolved `subagent_depth` for the `dispatchSubagent` hub-proxy RPC; defaults
+   * to `1`. The hub owns admission, so it is the authority for the nesting limit
+   * a worker's `task` tool reaches it with.
+   */
+  readonly subagentDepth?: number
   /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
   readonly log?: WorkerLogger
 }
@@ -469,6 +476,12 @@ export interface HubProxyAuthorities {
   readonly sessionStatus: SessionStatus.Interface
   readonly permission: Permission.Interface
   readonly question: Question.Interface
+  /**
+   * Optional subagent-dispatch authority (Solution 1). Present only when a
+   * caller wires the hub registry itself; `createSessionHub` installs its own
+   * pool-aware authority on attach, so production leaves this absent.
+   */
+  readonly dispatchSubagent?: (request: SubagentDispatchRequest) => Promise<JobInfo>
 }
 
 /**
@@ -508,6 +521,11 @@ export function buildHubProxyHandlers(authorities: HubProxyAuthorities, run: Hub
         ? run(authorities.question.reply(input as Parameters<Question.Interface["reply"]>[0]))
         : run(authorities.permission.reply(input as Parameters<Permission.Interface["reply"]>[0])),
     reject: (requestID) => run(authorities.question.reject(requestID as Parameters<Question.Interface["reject"]>[0])),
+    ...(authorities.dispatchSubagent === undefined
+      ? {}
+      : {
+          dispatchSubagent: (request) => authorities.dispatchSubagent!(request as SubagentDispatchRequest),
+        }),
   }
 }
 
@@ -593,7 +611,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     log(workerLogMessage("ports connected"), { level: "INFO", workerID, ports: ["hub-proxy"] })
     hubProxyDisposers.get(workerID)?.()
     const disposers: (() => void)[] = []
-    const handlers = portBackends()?.hubProxy
+    const handlers = hubProxyHandlers()
     if (handlers !== undefined) disposers.push(serveHubProxyPort(handlers, port))
     const onPidReport = options.onPidReport
     if (onPidReport !== undefined) {
@@ -608,6 +626,29 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     }
     hubProxyDisposers.set(workerID, dispose)
     return dispose
+  }
+
+  /**
+   * The served hub-proxy handler map: the caller's three authorities plus the
+   * pool-aware `dispatchSubagent` RPC. The handler closes over the registry and
+   * dispatcher, both materialised by attach time, so it is built lazily. A
+   * caller-supplied `dispatchSubagent` authority (a test) wins.
+   */
+  function hubProxyHandlers(): HubProxyHandlers | undefined {
+    const base = portBackends()?.hubProxy
+    if (base === undefined) return undefined
+    const dispatchSubagent = (...args: readonly unknown[]): Promise<JobInfo> =>
+      dispatchSubagentToHub(
+        {
+          registry: jobs,
+          scheduler: dispatcher,
+          depthLimit: options.subagentDepth ?? 1,
+          headroomFull: () => dispatcher.headroomSlotCount >= dispatcher.headroomCapacity,
+          resultFor: (sessionID) => pool.resultFor(sessionID),
+        },
+        args[0] as SubagentDispatchRequest,
+      )
+    return { ...base, dispatchSubagent: base.dispatchSubagent ?? dispatchSubagent }
   }
 
   // Materialise the pool, wiring its transferred job ports into `attachJobPort`.
@@ -1676,6 +1717,8 @@ export interface ProductionSessionHubOptions {
   /** Cancellation tuning; cooperative cancel is always wired (step 13). */
   readonly cancellation?: WorkerCancellationOptions
   readonly onDegraded?: (workerID: number) => void
+  /** Resolved `subagent_depth` for the hub-proxy `dispatchSubagent` RPC. */
+  readonly subagentDepth?: number
   /**
    * Worker-port backends (plan tasks 8/17/19/24), ready or lazily built. When
    * present the resolved init advertises `capabilities.sessionWorkerPorts` and the
@@ -1798,6 +1841,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
       headroom: options.headroom,
       admissionCapacity: options.admissionCapacity,
       childCapacity: options.childCapacity,
+      subagentDepth: options.subagentDepth,
       onDegraded: options.onDegraded,
     }),
   })
@@ -1876,6 +1920,17 @@ export function productionSessionHubLayer(
       const modelsDev = yield* ModelsDev.Service
       const provider = yield* Provider.Service
       const flags = yield* RuntimeFlags.Service
+      // The resolved nesting limit the hub enforces for a worker's
+      // `dispatchSubagent` RPC; the hub is the admission authority, so it reads
+      // the config once at layer build rather than trusting the worker. A
+      // missing or throwing Config must not fail layer construction (the hub
+      // falls back to the documented `1`), so the read is tolerant: `catchCause`
+      // also absorbs the sync-throw / `UnimplementedError` defect a mock Config
+      // raises, which `orElseSucceed` would not.
+      const subagentDepth = yield* config.get().pipe(
+        Effect.map((info) => info.subagent_depth ?? 1),
+        Effect.catchCause(() => Effect.succeed(1)),
+      )
       // The hub-proxy authorities (plan decision 64) a worker reaches over its
       // control port. The handlers run on the HUB, under the dispatching
       // instance's context (the hub runtime is global).
@@ -1974,6 +2029,7 @@ export function productionSessionHubLayer(
         ports,
         events,
         log,
+        subagentDepth,
         onDispatch: (sessionID) => {
           capturedInstance ??= captureInstanceRef()
           capturedContext ??= captureRuntimeContext()

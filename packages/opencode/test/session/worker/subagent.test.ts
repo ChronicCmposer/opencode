@@ -29,8 +29,6 @@ import { spawnTransport } from "../../lib/transport"
 import { capture, flush, sid } from "../../lib/async"
 import { createFakeWorkerPool } from "../../lib/fake-worker-pool"
 
-const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error))
-
 interface Recorded {
   readonly sessionID: string
   readonly depth: number | undefined
@@ -72,33 +70,31 @@ describe("9.5 nesting is bounded by subagent_depth and headroom", () => {
     expect(() => assertSubagentAdmitted({ depth: 1, limit: 2, headroomFull: true })).toThrow(HeadroomFullError)
   })
 
-  test("depth>limit rejects before the scheduler is touched (never queues)", async () => {
+  test("depth>limit returns a failed job before the scheduler is touched (never queues)", async () => {
     const registry = createJobRegistry()
     registry.start({ id: "ses_parent", type: "task", depth: 1 })
     const { scheduler, calls } = recordingScheduler()
 
-    const error = await capture(
-      dispatchSubagent(
-        { registry, scheduler, depthLimit: 1, headroomFull: () => false },
-        { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
-      ),
+    const info = await dispatchSubagent(
+      { registry, scheduler, depthLimit: 1, headroomFull: () => false },
+      { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
     )
-    expect(error).toEqual({ ok: false, error: expect.any(SubagentDepthError) })
+    expect(info).toMatchObject({ id: "ses_child", status: "error", depth: 2 })
+    expect(info.error).toContain("exceeds the limit")
     expect(calls).toHaveLength(0)
     expect(registry.get("ses_child")).toBeUndefined()
   })
 
-  test("headroom-full rejects before the scheduler is touched (never queues)", async () => {
+  test("headroom-full returns a failed job before the scheduler is touched (never queues)", async () => {
     const registry = createJobRegistry()
     const { scheduler, calls } = recordingScheduler()
 
-    const error = await capture(
-      dispatchSubagent(
-        { registry, scheduler, depthLimit: 2, headroomFull: () => true },
-        { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
-      ),
+    const info = await dispatchSubagent(
+      { registry, scheduler, depthLimit: 2, headroomFull: () => true },
+      { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
     )
-    expect(error).toEqual({ ok: false, error: expect.any(HeadroomFullError) })
+    expect(info).toMatchObject({ id: "ses_child", status: "error", depth: 1 })
+    expect(info.error).toContain("headroom is full")
     expect(calls).toHaveLength(0)
     expect(registry.get("ses_child")).toBeUndefined()
   })
@@ -116,7 +112,9 @@ describe("9.1 a task child session is dispatched to a worker", () => {
 
     expect(calls).toEqual([{ sessionID: "ses_child", depth: 1 }])
     expect(registry.parentOf("ses_child")).toBe("ses_parent")
-    expect(registry.get("ses_child")).toMatchObject({ depth: 1, parentID: "ses_parent", status: "running" })
+    // The dispatch resolved, so the bridge settled the child (output is empty
+    // because this scheduler reports no worker result).
+    expect(registry.get("ses_child")).toMatchObject({ depth: 1, parentID: "ses_parent", status: "completed" })
   })
 
   test("a nested child derives depth from the parent job", async () => {
@@ -150,18 +148,42 @@ describe("9.1 a task child session is dispatched to a worker", () => {
     expect(info).toMatchObject({ id: "ses_child", status: "completed", output: "child-output" })
   })
 
-  test("a scheduler failure marks the job failed", async () => {
+  test("a scheduler failure returns a failed job (not a throw)", async () => {
     const registry = createJobRegistry()
     const scheduler: SubagentScheduler = { dispatch: () => Promise.reject(new Error("no slot")) }
-    const settled = await capture(
-      dispatchSubagent(
-        { registry, scheduler, depthLimit: 1, headroomFull: () => false },
-        { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
-      ),
+    const info = await dispatchSubagent(
+      { registry, scheduler, depthLimit: 1, headroomFull: () => false },
+      { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
     )
-    expect(settled.ok).toBe(false)
-    if (!settled.ok) expect(messageOf(settled.error)).toBe("no slot")
+    expect(info.status).toBe("error")
+    expect(info.error).toBe("no slot")
     expect(registry.get("ses_child")?.status).toBe("error")
+  })
+
+  test("the child's final assistant text lands in JobInfo.output", async () => {
+    const registry = createJobRegistry()
+    const scheduler: SubagentScheduler = { dispatch: () => Promise.resolve() }
+    const info = await dispatchSubagent(
+      {
+        registry,
+        scheduler,
+        depthLimit: 1,
+        headroomFull: () => false,
+        resultFor: (sessionID) => ({
+          sessionID,
+          value: {
+            info: { role: "assistant" },
+            parts: [
+              { type: "text", text: "first" },
+              { type: "text", text: "final answer" },
+            ],
+          },
+        }),
+      },
+      { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
+    )
+    expect(info).toMatchObject({ id: "ses_child", status: "completed", output: "final answer" })
+    expect(registry.get("ses_child")?.output).toBe("final answer")
   })
 })
 
@@ -296,14 +318,12 @@ describe("33 subagent path end-to-end: a depth-1 child routes its settled result
       dispatch: () => Promise.reject(new SessionCancelledError({ message: "cancelled", sessionID: sid("ses_child") })),
     }
 
-    const settled = await capture(
-      dispatchSubagent(
-        { registry, scheduler, depthLimit: 1, headroomFull: () => false },
-        { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
-      ),
+    const info = await dispatchSubagent(
+      { registry, scheduler, depthLimit: 1, headroomFull: () => false },
+      { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
     )
 
-    expect(settled).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
+    expect(info.status).toBe("cancelled")
     expect(registry.get("ses_child")?.status).toBe("cancelled")
     expect(routed).toEqual([{ parentID: "ses_parent", id: "ses_child", status: "cancelled", output: undefined }])
   })
@@ -314,14 +334,12 @@ describe("33 subagent path end-to-end: a depth-1 child routes its settled result
       dispatch: () => Promise.reject(new WorkerCrashedError({ message: "worker 7 crashed", workerID: 7 })),
     }
 
-    const settled = await capture(
-      dispatchSubagent(
-        { registry, scheduler, depthLimit: 1, headroomFull: () => false },
-        { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
-      ),
+    const info = await dispatchSubagent(
+      { registry, scheduler, depthLimit: 1, headroomFull: () => false },
+      { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
     )
 
-    expect(settled.ok).toBe(false)
+    expect(info.status).toBe("error")
     expect(registry.get("ses_child")?.status).toBe("error")
     expect(routed).toEqual([{ parentID: "ses_parent", id: "ses_child", status: "error", output: undefined }])
   })
@@ -330,14 +348,12 @@ describe("33 subagent path end-to-end: a depth-1 child routes its settled result
     const { registry, routed } = routingRegistry()
     const { scheduler, dispatched } = headroomWorker(registry, "unreachable")
 
-    const settled = await capture(
-      dispatchSubagent(
-        { registry, scheduler, depthLimit: 0, headroomFull: () => false },
-        { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
-      ),
+    const info = await dispatchSubagent(
+      { registry, scheduler, depthLimit: 0, headroomFull: () => false },
+      { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task" },
     )
 
-    expect(settled).toEqual({ ok: false, error: expect.any(SubagentDepthError) })
+    expect(info).toMatchObject({ id: "ses_child", status: "error" })
     expect(dispatched).toHaveLength(0)
     expect(registry.get("ses_child")).toBeUndefined()
     expect(routed).toHaveLength(0)

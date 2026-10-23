@@ -1327,3 +1327,39 @@ describe("reply timeout terminates and retires the worker", () => {
     await dispatcher.terminateAll()
   })
 })
+
+// ---------------------------------------------------------------------------
+// Solution 1 (B1) — the sub-agent prompt rides `DispatchRequest` through to the
+// executor run (`ExecutorRun.prompt`, B2), so the dispatched worker can persist
+// the parent's prompt instead of reading a message that does not exist yet.
+// ---------------------------------------------------------------------------
+
+describe("B1 dispatch prompt plumbing", () => {
+  test("a dispatch carrying a prompt forwards it on the executor run", async () => {
+    const pool = new FakePool(1)
+    const dispatcher = createDispatcher({ pool })
+    const prompt = { sessionID: sid("ses_child"), agent: "build", parts: [{ type: "text" as const, text: "go" }] }
+
+    const run = capture(dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 0, prompt }))
+    await flush()
+
+    expect(pool.workers[0].runs).toEqual([{ sessionID: sid("ses_child"), depth: 0, prompt }])
+    pool.workers[0].finish(sid("ses_child"))
+    await run
+    await dispatcher.terminateAll()
+  })
+
+  test("a prompt-less dispatch keeps the minimal run shape", async () => {
+    const pool = new FakePool(1)
+    const dispatcher = createDispatcher({ pool })
+
+    const run = capture(dispatcher.dispatch({ sessionID: sid("ses_bare"), depth: 0 }))
+    await flush()
+
+    expect(pool.workers[0].runs).toEqual([{ sessionID: sid("ses_bare"), depth: 0 }])
+    expect("prompt" in pool.workers[0].runs[0]).toBe(false)
+    pool.workers[0].finish(sid("ses_bare"))
+    await run
+    await dispatcher.terminateAll()
+  })
+})

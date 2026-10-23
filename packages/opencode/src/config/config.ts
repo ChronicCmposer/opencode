@@ -11,7 +11,7 @@ import { Flag } from "@opencode-ai/core/flag/flag"
 import { Auth } from "../auth"
 import { Env } from "../env"
 import { applyEdits, modify } from "jsonc-parser"
-import { InstallationLocal, InstallationVersion } from "@opencode-ai/core/installation/version"
+import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { existsSync } from "fs"
 import { Account } from "@/account/account"
 import { isRecord } from "@/util/record"
@@ -32,6 +32,7 @@ import { ConfigManaged } from "./managed"
 import { ConfigParse } from "./parse"
 import { ConfigPaths } from "./paths"
 import { ConfigPlugin } from "./plugin"
+import { pluginInstallVersion, verifyPluginDeps } from "./plugin-install"
 import { ConfigVariable } from "./variable"
 import { ConfigV2Compat } from "./v2-compat"
 import { Npm } from "@opencode-ai/core/npm"
@@ -434,6 +435,7 @@ const layer = Layer.effect(
         }
 
         const deps: Fiber.Fiber<void>[] = []
+        const pluginVersion = pluginInstallVersion(InstallationVersion)
 
         for (const dir of directories) {
           if (dir.endsWith(".opencode") || dir === Flag.OPENCODE_CONFIG_DIR) {
@@ -454,15 +456,23 @@ const layer = Layer.effect(
               add: [
                 {
                   name: "@opencode-ai/plugin",
-                  version: InstallationLocal ? undefined : InstallationVersion,
+                  // `@latest` is the floating sentinel: omit the version so npm resolves the
+                  // dist-tag, since `name@version` cannot carry a leading `@`.
+                  version: pluginVersion === "@latest" ? undefined : pluginVersion,
                 },
               ],
             })
             .pipe(
+              Effect.flatMap(() => Effect.sync(() => verifyPluginDeps(dir))),
+              Effect.tap((result) =>
+                result.ok
+                  ? Effect.void
+                  : Effect.logError("plugin dependencies were not installed", { dir, reason: result.reason }),
+              ),
               Effect.exit,
               Effect.tap((exit) =>
                 Exit.isFailure(exit)
-                  ? Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) })
+                  ? Effect.logError("background dependency install failed", { dir, error: String(exit.cause) })
                   : Effect.void,
               ),
               Effect.asVoid,
