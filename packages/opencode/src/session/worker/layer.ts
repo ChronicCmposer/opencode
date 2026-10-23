@@ -107,6 +107,8 @@ import type { JobClient } from "./job-client"
 import type {
   ChatHeadersOutput,
   ChatParamsOutput,
+  SystemTransformInput,
+  SystemTransformOutput,
   ToolAfterOutput,
   ToolBeforeOutput,
   WorkerPluginHost,
@@ -1309,6 +1311,8 @@ function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknow
       return host.toolBefore(input, output as ToolBeforeOutput)
     case "tool.execute.after":
       return host.toolAfter(input, output as ToolAfterOutput)
+    case "experimental.chat.system.transform":
+      return host.systemTransform(input as SystemTransformInput, output as SystemTransformOutput)
     default:
       return Promise.resolve(output)
   }

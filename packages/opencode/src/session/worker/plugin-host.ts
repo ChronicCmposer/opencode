@@ -32,11 +32,25 @@ export interface ToolAfterOutput {
   metadata: unknown
 }
 
+export interface SystemTransformInput {
+  readonly sessionID?: string
+  readonly model?: unknown
+}
+
+/** Mutable `string[]` the `experimental.chat.system.transform` hook rewrites. */
+export interface SystemTransformOutput {
+  system: string[]
+}
+
 export interface WorkerPluginHooks {
   readonly "chat.params"?: (input: unknown, output: ChatParamsOutput) => void | Promise<void>
   readonly "chat.headers"?: (input: unknown, output: ChatHeadersOutput) => void | Promise<void>
   readonly "tool.execute.before"?: (input: unknown, output: ToolBeforeOutput) => void | Promise<void>
   readonly "tool.execute.after"?: (input: unknown, output: ToolAfterOutput) => void | Promise<void>
+  readonly "experimental.chat.system.transform"?: (
+    input: SystemTransformInput,
+    output: SystemTransformOutput,
+  ) => void | Promise<void>
 }
 
 /**
@@ -84,6 +98,7 @@ export interface WorkerPluginHost {
   chatHeaders(input: unknown, output: ChatHeadersOutput): Promise<ChatHeadersOutput>
   toolBefore(input: unknown, output: ToolBeforeOutput): Promise<ToolBeforeOutput>
   toolAfter(input: unknown, output: ToolAfterOutput): Promise<ToolAfterOutput>
+  systemTransform(input: SystemTransformInput, output: SystemTransformOutput): Promise<SystemTransformOutput>
 }
 
 /** Raised when two plugins share a name (fail loud). */
@@ -98,10 +113,10 @@ export class DuplicatePluginError extends Error {
  * Run one hook across every plugin. The caller selects the hook, so the
  * function's input/output types are pinned by the selector with no cast.
  */
-async function runHook<TOutput>(
+async function runHook<TInput, TOutput>(
   plugins: readonly WorkerPlugin[],
-  select: (hooks: WorkerPluginHooks) => ((input: unknown, output: TOutput) => void | Promise<void>) | undefined,
-  input: unknown,
+  select: (hooks: WorkerPluginHooks) => ((input: TInput, output: TOutput) => void | Promise<void>) | undefined,
+  input: TInput,
   output: TOutput,
 ): Promise<TOutput> {
   for (const plugin of plugins) {
@@ -145,7 +160,15 @@ function applyResolvedHeaders(plugins: readonly WorkerPlugin[], output: ChatHead
   return { ...output, headers }
 }
 
-export function createWorkerPluginHost(plugins: readonly WorkerPlugin[]): WorkerPluginHost {
+export function createWorkerPluginHost(
+  plugins: readonly WorkerPlugin[],
+  options?: {
+    readonly systemTransform?: (
+      input: SystemTransformInput,
+      output: SystemTransformOutput,
+    ) => Promise<SystemTransformOutput>
+  },
+): WorkerPluginHost {
   const names = plugins.map((plugin) => plugin.name)
   const seen = new Set<string>()
   for (const name of names) {
@@ -161,6 +184,18 @@ export function createWorkerPluginHost(plugins: readonly WorkerPlugin[]): Worker
       applyResolvedHeaders(plugins, await runHook(plugins, (hooks) => hooks["chat.headers"], input, output)),
     toolBefore: (input, output) => runHook(plugins, (hooks) => hooks["tool.execute.before"], input, output),
     toolAfter: (input, output) => runHook(plugins, (hooks) => hooks["tool.execute.after"], input, output),
+    // Plugin function hooks run first (registration order), then the injected
+    // hub-resolved transform; absent both, the output passes through unchanged.
+    systemTransform: async (input, output) => {
+      const transformed = await runHook(
+        plugins,
+        (hooks) => hooks["experimental.chat.system.transform"],
+        input,
+        output,
+      )
+      if (options?.systemTransform === undefined) return transformed
+      return options.systemTransform(input, transformed)
+    },
   }
 }
 
