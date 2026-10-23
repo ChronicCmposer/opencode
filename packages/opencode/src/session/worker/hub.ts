@@ -288,6 +288,14 @@ export interface SessionHubOptions {
    * model the worker init should resolve.
    */
   readonly onDispatch?: (sessionID: SessionID) => void
+  /**
+   * Invoked synchronously when a worker's `dispatchSubagent` RPC admits a child,
+   * BEFORE the child is scheduled. Unlike {@link onDispatch}, this fires for the
+   * raw-scheduler subagent path (`ensureRunning`/`startShell` never run for a
+   * child), so the production layer uses it to copy the parent's captured
+   * per-session instance/context onto the child.
+   */
+  readonly onSubagentDispatch?: (childSessionID: SessionID, parentSessionID: SessionID) => void
   readonly headroom?: number
   readonly admissionCapacity?: number
   readonly childCapacity?: number
@@ -788,6 +796,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
           depthLimit: options.subagentDepth ?? 1,
           headroomFull: () => dispatcher.headroomSlotCount >= dispatcher.headroomCapacity,
           resultFor: (sessionID) => pool.resultFor(sessionID),
+          ...defined({ onSubagentDispatch: options.onSubagentDispatch }),
         },
         args[0] as SubagentDispatchRequest,
       )
@@ -1863,6 +1872,12 @@ export interface ProductionSessionHubOptions {
   readonly ports?: WorkerPortBackendsSource
   /** Invoked synchronously at the start of each dispatch (see `SessionHubOptions`). */
   readonly onDispatch?: (sessionID: SessionID) => void
+  /**
+   * Invoked when a worker's `dispatchSubagent` RPC admits a child (see
+   * `SessionHubOptions`). The production layer copies the parent's captured
+   * per-session instance/context onto the child here.
+   */
+  readonly onSubagentDispatch?: (childSessionID: SessionID, parentSessionID: SessionID) => void
   /** Live-only event publisher (worker republish + `session.cancelled`). */
   readonly events?: LiveEventPublisher
   /** Per-session live publisher, so a cancel carries the cancelled session's location. */
@@ -1977,6 +1992,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
     ...defined({
       ports: options.ports,
       onDispatch: options.onDispatch,
+      onSubagentDispatch: options.onSubagentDispatch,
       events: options.events,
       eventPublisherFor: options.eventPublisherFor,
       onPidReport,
@@ -2102,6 +2118,18 @@ export function productionSessionHubLayer(
       // hub-proxy calls never run — under the first project's directory/instance.
       const instanceBySession = new Map<SessionID, InstanceContext>()
       const contextBySession = new Map<SessionID, Context.Context<never>>()
+      // Release one session's per-session state; the finalizer clears the rest.
+      // Called on every rebind and at teardown, so the maps stay bounded by the
+      // set of live sessions. A session's own entry is dropped once its worker
+      // rebinds away (the isolate is retired) or the hub tears down; there is no
+      // race-free job-settle hook to release it earlier (the registry routes a
+      // settled child's result but surfaces no settle callback here), and
+      // releasing on settle would race a later turn that re-resolves its init.
+      // An ancestor's entry is still reachable through the parent chain below.
+      const releaseSession = (sessionID: SessionID): void => {
+        instanceBySession.delete(sessionID)
+        contextBySession.delete(sessionID)
+      }
       // The session currently being dispatched. Updated on every dispatch; used
       // only as the fallback when a pool resolves an init without a session id
       // (the production pool passes the session it is binding a worker to).
@@ -2117,17 +2145,39 @@ export function productionSessionHubLayer(
       // lazily on the first port attach (post-assignment), so the reference is safe.
       let hubRef: SessionHub | undefined
       const sessionOfWorker = (workerID: number): SessionID | undefined => hubRef?.sessionOfWorker(workerID)
-      const instanceOfSession = (sessionID: SessionID | undefined): InstanceContext | undefined =>
-        sessionID === undefined ? undefined : instanceBySession.get(sessionID)
-      const contextOfSession = (sessionID: SessionID | undefined): Context.Context<never> | undefined =>
-        sessionID === undefined ? undefined : contextBySession.get(sessionID)
+      // A session's per-session entry may be absent: a subagent child admitted by
+      // the raw scheduler (whose parent's `onSubagentDispatch` copy was skipped),
+      // or a session whose worker already rebound and released it. Resolve it
+      // through the job registry's parent chain so the SAME project's ancestor
+      // supplies the instance/context — never a last-writer-wins latch, which
+      // under concurrent multi-project dispatch can hold ANOTHER project's
+      // instance. Subagents share the parent's directory, so an ancestor entry is
+      // always the same project. `seen` guards a corrupt/cyclic parent edge.
+      const findUp = <T>(
+        sessionID: SessionID | undefined,
+        get: (id: SessionID) => T | undefined,
+      ): T | undefined => {
+        let id = sessionID
+        const seen = new Set<string>()
+        while (id !== undefined && !seen.has(id)) {
+          seen.add(id)
+          const value = get(id)
+          if (value !== undefined) return value
+          id = hubRef?.jobs.get(id)?.parentID as SessionID | undefined
+        }
+        return undefined
+      }
+      const instanceOfSessionDeep = (sessionID: SessionID | undefined): InstanceContext | undefined =>
+        findUp(sessionID, (id) => instanceBySession.get(id))
+      const contextOfSessionDeep = (sessionID: SessionID | undefined): Context.Context<never> | undefined =>
+        findUp(sessionID, (id) => contextBySession.get(id))
       const contextOfWorker = (workerID: number): Context.Context<never> | undefined =>
-        contextOfSession(sessionOfWorker(workerID))
+        contextOfSessionDeep(sessionOfWorker(workerID))
       // Live-only publisher, stamped with the emitting session's own location so a
       // republished worker event passes THAT session's `/event` SSE directory
       // filter — never a first-dispatch directory.
       const eventsForSession = (sessionID: SessionID): LiveEventPublisher =>
-        createLiveEventPublisher(bridge, { location: () => instanceLocation(instanceBySession.get(sessionID)) })
+        createLiveEventPublisher(bridge, { location: () => instanceLocation(instanceOfSessionDeep(sessionID)) })
       const eventsForWorker = (workerID: number): LiveEventPublisher | undefined => {
         const sessionID = sessionOfWorker(workerID)
         return sessionID === undefined ? undefined : eventsForSession(sessionID)
@@ -2178,16 +2228,20 @@ export function productionSessionHubLayer(
       // for a custom pool that resolves without a session id.
       const resolveInit = async (sessionID?: SessionID): Promise<SessionWorkerInit> => {
         const session = sessionID ?? dispatchedSession
-        const context = contextOfSession(session)
+        // The ancestor-chain context keeps `loadDispatchedSession` reachable for a
+        // child whose own entry is missing, so its PERSISTED directory/project
+        // still resolves instead of the hub cwd.
+        const context = contextOfSessionDeep(session)
         // One `Session.get` yields the persisted model, directory/project and the
         // per-request plugin input (agent + last user message) the hooks resolve
         // against, so a hook keyed on either matches flag-off rather than an empty stub.
         const dispatched = await loadDispatchedSession(context, session)
-        // Provider order: this session's captured instance, else its PERSISTED
-        // directory, else the resolving fiber's ambient instance, else the
-        // documented global fallback (warned: it is a hub-side gap).
+        // Provider order: this session's captured instance (or an ancestor's,
+        // found through the parent chain), else its PERSISTED directory, else the
+        // resolving fiber's ambient instance, else the documented global fallback
+        // (warned: it is a hub-side gap).
         const instance =
-          instanceOfSession(session) ??
+          instanceOfSessionDeep(session) ??
           (dispatched === undefined ? undefined : instanceFromSession(dispatched)) ??
           captureInstanceRef() ??
           (() => {
@@ -2246,8 +2300,7 @@ export function productionSessionHubLayer(
         onSessionRebound: (sessionID) => {
           // The rebinding worker's old session is done with its isolate; release
           // its state so the maps cannot grow without bound.
-          instanceBySession.delete(sessionID)
-          contextBySession.delete(sessionID)
+          releaseSession(sessionID)
           options.onSessionRebound?.(sessionID)
         },
         onDispatch: (sessionID) => {
@@ -2258,6 +2311,19 @@ export function productionSessionHubLayer(
           const context = captureRuntimeContext()
           if (context !== undefined) contextBySession.set(sessionID, context)
           dispatchedSession = sessionID
+        },
+        onSubagentDispatch: (childID, parentID) => {
+          // PRIMARY FIX: a subagent child is dispatched by the raw scheduler, so
+          // `onDispatch` never runs for it. Copy the parent's captured per-session
+          // instance/context onto the child BEFORE its worker materialises, so
+          // `resolveInit(child)` binds the parent's directory (not the hub cwd)
+          // and the child's per-worker hub-proxy handlers run under a live
+          // `InstanceRef`. Nested subagents inherit recursively: a child's own
+          // entry is copied here when IT dispatches a grandchild.
+          const instance = instanceBySession.get(parentID)
+          if (instance !== undefined) instanceBySession.set(childID, instance)
+          const context = contextBySession.get(parentID)
+          if (context !== undefined) contextBySession.set(childID, context)
         },
       })
       hubRef = hub

@@ -96,6 +96,15 @@ export interface SubagentDispatchOptions {
    * child's own job port).
    */
   readonly resultFor?: (sessionID: SessionID) => SessionExecutionResult | undefined
+  /**
+   * Propagate the parent's per-session instance/context to the child BEFORE the
+   * child worker materialises. A subagent child is dispatched by the raw
+   * scheduler, so the hub's own `onDispatch` capture never runs for it; without
+   * this the child boots under the hub's cwd (`Project.ID.global`) and its
+   * per-worker hub-proxy handlers run with no `InstanceRef`. Invoked once per
+   * admitted child, after registration and before `scheduler.dispatch`.
+   */
+  readonly onSubagentDispatch?: (childSessionID: SessionID, parentSessionID: SessionID) => void
 }
 
 export interface SubagentDispatchRequest {
@@ -233,6 +242,11 @@ export async function dispatchSubagent(
     ...(request.workerID === undefined ? {} : { workerID: request.workerID }),
     depth,
   })
+
+  // Inherit the parent's per-session instance/context before the child worker is
+  // materialised by the scheduler, so `resolveInit(child)` and the child's
+  // per-worker hub-proxy handlers see the parent's instance (never the hub cwd).
+  options.onSubagentDispatch?.(request.childID, request.parentID)
 
   try {
     await options.scheduler.dispatch({
