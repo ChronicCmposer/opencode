@@ -22,7 +22,7 @@
 // `comm` limit (see `@/util/thread-name`).
 
 import { threadId, workerData } from "node:worker_threads"
-import { Effect, Layer, Option } from "effect"
+import { Cause, Effect, Fiber, Layer, Option } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { isRole, setProcessRole } from "@/effect/process-role"
 import { Project } from "@opencode-ai/schema/project"
@@ -39,6 +39,7 @@ import { createWorkerEgressClient, type WorkerEgressClient } from "./egress-clie
 import { createWorkerBrokerClient } from "./broker-client"
 import { createBackgroundJobClient, createJobClient, jobPortFromMessagePort, type JobClient } from "./job-client"
 import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
+import { workerLoggingLayer } from "./worker-logging"
 import { messageOf } from "./port"
 import { sessionThreadName } from "./thread-name"
 import type { JobInfo } from "./job-registry"
@@ -537,7 +538,17 @@ export function createSessionWork(options: SessionWorkOptions): SessionWork {
       const pipeline = yield* SessionPipeline
       const result = yield* pipeline.run({ sessionID, messages })
       return { sessionID, value: { ...result, threadId: options.threadId } } satisfies SessionExecutionResult
-    }).pipe(Effect.provide(options.layer), Effect.orDie)
+    }).pipe(
+      // A failed run is logged once, through the worker logger (the layer is
+      // provided below, so the sink captures it), before the cause is re-raised.
+      // Interrupts (a cooperative cancel) are not failures and are not logged.
+      Effect.tapCauseIf(
+        (cause) => Cause.hasFails(cause) || Cause.hasDies(cause),
+        (cause) => Effect.logError("session worker run failed", { sessionID, cause: Cause.pretty(cause) }),
+      ),
+      Effect.provide(options.layer),
+      Effect.orDie,
+    )
     // The layer build (and any fiber it forks) must see the worker's ambient
     // instance context, so `InstanceState`-backed services resolve a directory.
     return options.instance === undefined ? run : Effect.provideService(run, InstanceRef, options.instance)
@@ -629,10 +640,19 @@ export function workerGraphReplacements(config: WorkerModelConfig): LayerNode.Re
  * on the default Effect runtime, so the E2 peer lifecycle lines reach the worker's
  * output instead of being dropped by the no-op default.
  */
-export function workerBridgeLogger(snapshot: WorkerSnapshot): WorkerLogger {
-  return workerLoggerFromBridge(
-    Effect.runSync(EffectBridge.make().pipe(Effect.provideService(InstanceRef, workerInstanceContext(snapshot)))),
+export function workerBridgeLogger(snapshot: WorkerSnapshot, logging?: Layer.Layer<never>): WorkerLogger {
+  const bridge = Effect.runSync(
+    EffectBridge.make().pipe(Effect.provideService(InstanceRef, workerInstanceContext(snapshot))),
   )
+  if (logging === undefined) return workerLoggerFromBridge(bridge)
+  // The file sink opens asynchronously, so `Effect.runSync` cannot build it into
+  // the bridge context. Provide the logging layer per emitted line instead — the
+  // bridge logger only emits a handful of E2 lifecycle lines.
+  return workerLoggerFromBridge({
+    ...bridge,
+    fork: <A, E, R>(effect: Effect.Effect<A, E, R>): Fiber.Fiber<A, E> =>
+      Effect.runFork(effect.pipe(Effect.provide(logging)) as Effect.Effect<A, E, never>),
+  })
 }
 
 /** Options for {@link bootstrapSessionWorker}; every field is additive. */
@@ -643,6 +663,12 @@ export interface BootstrapSessionWorkerOptions {
    * lines the client construction emits.
    */
   readonly log?: WorkerLogger
+  /**
+   * Worker logging layer (see `worker-logging.ts`). Production omits it: the
+   * worker derives a file-sink layer scoped to its slot id so its `Effect.log*`
+   * lines reach the main `opencode.log`. A test may inject a recorder.
+   */
+  readonly logging?: Layer.Layer<never>
   /**
    * Test seam: build the control-port PID reporter. Defaults to
    * `createControlPidReporter(port, workerID, { log })`, so the worker's forwarded
@@ -670,7 +696,8 @@ export function bootstrapSessionWorker(
   scope: WorkerScope,
   options: BootstrapSessionWorkerOptions = {},
 ): SessionWorkerBootstrap {
-  const log = options.log ?? workerBridgeLogger(init.snapshot)
+  const logging = options.logging ?? workerLoggingLayer({ id: `worker-${init.workerID ?? threadId}` })
+  const log = options.log ?? workerBridgeLogger(init.snapshot, logging)
   // The control-port PID reporter's log is the worker's forwarded `log` (the same
   // seam the client lifecycles use). A test may swap the factory to observe E4.
   const createPidReporter =
@@ -774,6 +801,9 @@ export function bootstrapSessionWorker(
     ...(plugins === undefined ? {} : { plugins }),
     ...(hubProxies === undefined ? {} : { hubProxies }),
     ...(pidReporter === undefined ? {} : { pidReporter }),
+    // The worker's Effect logs reach the main `opencode.log` sink. Merged as a
+    // non-graph seam, so the node table and its assertion are untouched.
+    logging,
   })
 
   // The worker-local run control is registered once the first `run` resolves the

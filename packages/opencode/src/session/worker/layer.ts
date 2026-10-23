@@ -1546,6 +1546,12 @@ export interface SessionLayerOptions {
    * `Plugin` layer is never built in the worker.
    */
   readonly plugins?: WorkerPluginHost
+  /**
+   * Non-graph worker logging layer (see `worker-logging.ts`). Merged beside the
+   * non-graph seams so the worker's `Effect.log*` reaches the main sink; absent
+   * keeps the graph byte-for-byte unchanged.
+   */
+  readonly logging?: Layer.Layer<never>
   /** Extra replacements, e.g. the real LLM-backed `ModelClient` in production. */
   readonly replacements?: LayerNode.Replacements
 }
@@ -1597,7 +1603,11 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
     options.hubProxies === undefined
       ? withPid
       : Layer.merge(withPid, subagentDispatchProxyLayer(subagentDispatchClient(options.hubProxies)))
-  return { root, replacements, layer }
+  // `logging` is not a graph node either: it contributes only context references
+  // (the file sink + minimum level), so merging it leaves the graph and its
+  // node-table assertion untouched. Absent keeps the layer unchanged.
+  const withLogging = options.logging === undefined ? layer : Layer.merge(layer, options.logging)
+  return { root, replacements, layer: withLogging }
 }
 
 /** Build a `ManagedRuntime`-style runner for the reduced layer. */
