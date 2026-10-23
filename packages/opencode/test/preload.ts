@@ -142,3 +142,14 @@ process.env["OPENCODE_DB"] = hostIsolationDisabled ? path.join(dir, "opencode-te
 const { initProjectors } = await import("../src/server/projectors")
 
 initProjectors()
+
+// Fail-fast tripwire. Last in the file so every src module has already captured
+// its flags: if the resolved database path is not isolated to the temp dir,
+// abort the entire run before a single test body executes. This guards the
+// 2026-10-23 capture-before-isolation failure, where a module pinned the host's
+// real database path into the flag module and the env isolation above came too
+// late — the suite then opened (and deleted) the real database. Do not swallow
+// the error: an aborted run is the point.
+const { Database } = await import("@opencode-ai/core/database/database")
+const { assertIsolatedDatabasePath } = await import("./fixture/isolation")
+await assertIsolatedDatabasePath(Database.path())

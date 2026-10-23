@@ -1,6 +1,7 @@
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Effect } from "effect"
 import path from "path"
+import { assertIsolatedDatabasePath } from "../../fixture/isolation"
 
 const preserveExerciseGlobalRoot = !!process.env.OPENCODE_HTTPAPI_EXERCISE_GLOBAL
 export const exerciseGlobalRoot =
@@ -18,6 +19,11 @@ const preserveExerciseDatabase = !!process.env.OPENCODE_HTTPAPI_EXERCISE_DB
 export const exerciseDatabasePath =
   process.env.OPENCODE_HTTPAPI_EXERCISE_DB ??
   path.join(process.env.TMPDIR ?? "/tmp", `opencode-httpapi-exercise-${process.pid}.db`)
+// Refuse to load if the exercise database is not isolated to the temp dir. This
+// runs before OPENCODE_DB/Flag.OPENCODE_DB are set and before any importer can
+// reach resetDatabase(), which deletes the file. The harness runs via `bun run`
+// and does NOT load test/preload.ts, so this module owns the guard.
+await assertIsolatedDatabasePath(exerciseDatabasePath)
 process.env.OPENCODE_DB = exerciseDatabasePath
 Flag.OPENCODE_DB = exerciseDatabasePath
 
