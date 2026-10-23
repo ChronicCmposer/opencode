@@ -118,6 +118,7 @@ const modelLayers = (input: ModelLayerInput = {}) =>
     }),
     Layer.mock(Config.Service, {
       get: () => Effect.succeed((input.config ?? {}) as ConfigV1.Info),
+      directories: () => Effect.succeed(["/cfg/opencode"]),
     }),
   )
 

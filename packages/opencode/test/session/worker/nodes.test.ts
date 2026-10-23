@@ -309,7 +309,13 @@ const providerModel = {
 
 /** Replace the node's declared service deps with dependency-free mocks. */
 const productionReplacements: LayerNode.Replacements = [
-  [Config.node, Layer.mock(Config.Service, { get: () => Effect.succeed({ model: "test/model" } as ConfigV1.Info) })],
+  [
+    Config.node,
+    Layer.mock(Config.Service, {
+      get: () => Effect.succeed({ model: "test/model" } as ConfigV1.Info),
+      directories: () => Effect.succeed(["/cfg/opencode"]),
+    }),
+  ],
   [
     Auth.node,
     Layer.mock(Auth.Service, {

@@ -471,6 +471,12 @@ export interface WorkerSnapshot {
   readonly projectVcs?: "git"
   /** The project worktree; defaults to `directory` in the worker. */
   readonly worktree?: string
+  /**
+   * The hub's `config.directories()`, shipped verbatim so worker-side discovery
+   * (skills/agents/commands) scans the same roots; absent ⇒ fall back to
+   * `[directory]`.
+   */
+  readonly directories?: readonly string[]
   readonly config: ConfigV1.Info
   readonly auth: Readonly<Record<string, unknown>>
   readonly modelsDev: Readonly<Record<string, ModelsDev.Provider>>
@@ -612,7 +618,7 @@ export function snapshotConfigLayer(snapshot: WorkerSnapshot): Layer.Layer<Confi
     update: () => boundaryViolation("Config", "update"),
     updateGlobal: () => boundaryViolation("Config", "updateGlobal"),
     invalidate: () => boundaryViolation("Config", "invalidate"),
-    directories: () => Effect.succeed([snapshot.directory]),
+    directories: () => Effect.succeed([...(snapshot.directories ?? [snapshot.directory])]),
     waitForDependencies: () => Effect.void,
   }
   return Layer.succeed(Config.Service, config)
