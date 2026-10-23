@@ -138,6 +138,7 @@ describe("12.1 the hub executes zero sessions", () => {
         workerData: {
           snapshot: workerSnapshot(),
           env: { values: {} },
+          role: "session",
           model: { baseUrl: llm.url, apiKey: "test-key", model: "test-model" },
         },
       })

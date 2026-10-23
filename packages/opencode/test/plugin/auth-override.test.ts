@@ -85,7 +85,9 @@ describe("plugin.auth-override", () => {
   )
 })
 
-const file = path.join(import.meta.dir, "../../src/plugin/index.ts")
+// The plugin layer factory now lives in the heavy effect-layer module; the light
+// entry only defers to it, so this source-level assertion follows the code.
+const file = path.join(import.meta.dir, "../../src/plugin/effect-layer.ts")
 
 describe("plugin.config-hook-error-isolation", () => {
   test("config hooks are individually error-isolated in the layer factory", async () => {

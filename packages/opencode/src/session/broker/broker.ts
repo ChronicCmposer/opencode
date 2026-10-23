@@ -345,7 +345,9 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
     const myId = ++currentWorkerId
     // Each generation gets its own handshake trace; reset before it re-runs.
     handshake.length = 0
-    const handle = new Worker(entry, { env }) as unknown as BrokerWorkerHandle
+    // Born named `ocb` so the isolate is observable from creation, not only once
+    // its own entry self-names.
+    const handle = new Worker(entry, { env, name: "ocb" }) as unknown as BrokerWorkerHandle
     worker = handle
 
     handle.onmessage = (event) => {

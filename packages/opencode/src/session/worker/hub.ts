@@ -15,7 +15,6 @@
 
 import { Context, Effect, Fiber, Layer, Option } from "effect"
 import os from "node:os"
-import { isMainThread } from "node:worker_threads"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Database } from "@opencode-ai/core/database/database"
@@ -102,6 +101,7 @@ import type { HubProxyFrame, HubProxyHandlers, HubProxyReply } from "./layer"
 import { portFromMessagePort } from "./port"
 import type { SessionWorkerInit } from "./session-worker"
 import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
+import { sessionThreadName } from "@/session/worker/thread-name"
 import { Session } from "@/session/session"
 
 /** A descendant cancelled by the subagent cascade, and whether it needs a fallback idle. */
@@ -763,6 +763,12 @@ export interface BunExecutorTransportOptions {
   readonly entry: string | URL
   readonly env?: Record<string, string | undefined>
   readonly workerData?: unknown
+  /**
+   * OS thread name (`WorkerOptions.name`) applied at spawn, so the isolate is
+   * born with the right Linux `comm` before it self-names. Absent leaves Bun's
+   * default (`Worker`). Fail-soft: a name never affects spawning.
+   */
+  readonly name?: string
   readonly timeoutMs?: number
   /** Maximum buffered outbound frames kept for late `waitFor` matches. */
   readonly bufferCapacity?: number
@@ -850,7 +856,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
   const bufferCapacity = options.bufferCapacity ?? DEFAULT_TRANSPORT_BUFFER_CAPACITY
   const worker = new Worker(options.entry, {
     env: mergeEnv(options.env),
-    ...defined({ workerData: options.workerData }),
+    ...defined({ workerData: options.workerData, name: options.name }),
   })
   const messages: SessionExecutorOutbound[] = []
   const waiters = new Set<PendingWaiter>()
@@ -990,6 +996,9 @@ export function spawnBunExecutorWorker(id: number, options: BunExecutorWorkerPoo
     ...defined({
       env: options.env,
       workerData: options.workerData,
+      // Born named `ocs<slot>` so the isolate is observable from creation, not
+      // only once it self-names at boot.
+      name: sessionThreadName(id),
       timeoutMs: options.timeoutMs,
       log: options.log,
       workerID: id,
@@ -1288,7 +1297,8 @@ export function createProductionWorkerPool(options: ProductionWorkerPoolOptions)
       entry: options.entry ?? SESSION_WORKER_ENTRY,
       // Ship the pool id so the worker's `pid-report` frames are keyed to this
       // slot out of the box (the hub still treats its port association as authoritative).
-      workerData: { ...init, workerID: id },
+      // The pool only spawns session workers, so the role is pinned `session`.
+      workerData: { ...init, workerID: id, role: "session" },
       ...defined({
         env: options.env,
         timeoutMs: options.timeoutMs,
@@ -1700,10 +1710,10 @@ function isWorkerCountOverride(env: Record<string, string | undefined> | undefin
 /** Compose the production pool + hub, with cooperative cancellation wired. */
 export function createProductionSessionHub(options: ProductionSessionHubOptions): SessionHub {
   // Name the hub's main OS thread for human observability (Linux-only, fail-soft).
-  // Only the process main thread may claim `och`: a session-worker isolate builds a
-  // nested hub on its OWN thread, which already named itself `ocs<slot>` at boot —
-  // naming it `och` here would collapse worker identity into the main process name.
-  if (isMainThread) setThreadName("och")
+  // Role-gating keeps a session-worker isolate from ever building a nested hub (its
+  // graph contributes no hub node — see `sessionWorkerNodes`), so this only names
+  // the real hub process; no worker's `ocs<slot>` name can be clobbered.
+  setThreadName("och")
   const log = options.log ?? noopWorkerLogger
   const workerCount = options.count ?? resolveWorkerCount()
   // Resolve the run-reply liveness budget once, at the hub boundary: an explicit

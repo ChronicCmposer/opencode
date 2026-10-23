@@ -1291,6 +1291,17 @@ function workerPluginLayer(host: WorkerPluginHost): Layer.Layer<Plugin.Service> 
   return Layer.succeed(Plugin.Service, plugin)
 }
 
+/**
+ * The worker-safe `Plugin.node` replacement: the worker-hosted hooks when a
+ * {@link WorkerPluginHost} is supplied, otherwise a no-op pass-through. This is
+ * the single source for the replacement, used by both the full worker graph
+ * ({@link buildSessionWorkerLayer}) and the reduced `LLM` sub-graph
+ * ({@link reducedLlmLayer}), so neither ever builds the global `Plugin` layer.
+ */
+function workerPluginReplacement(plugins?: WorkerPluginHost): LayerNode.Replacement {
+  return [Plugin.node, plugins === undefined ? noopPluginLayer() : workerPluginLayer(plugins)]
+}
+
 /** Build the minimal `LLM.StreamInput` for a worker pipeline call. */
 function streamInputFor(model: Provider.Model, input: PipelineInput): LLM.StreamInput {
   return {
@@ -1335,12 +1346,13 @@ export function llmModelClientLayer(config: WorkerModelConfig): Layer.Layer<Mode
  * provider, the snapshot Config/Auth/ModelsDev and the hub-proxy authorities.
  * This keeps the provider stream inside the isolate (design decision 20).
  *
- * `Plugin` / `EventV2Bridge` / `LLMClient` are boundary services on the hub;
- * the worker only needs them at LLM build time (`Layer.mock` provides the
- * service without their hub-side behaviour, which the session-worker does not
- * exercise for a single reduced turn). A worker-hosted `plugins` host is run
- * when supplied so plugin-set sampling/headers apply; otherwise a no-op
- * pass-through is used.
+ * `EventV2Bridge` / `LLMClient` are boundary services on the hub; the worker only
+ * needs them at LLM build time (`Layer.mock` provides the service without their
+ * hub-side behaviour, which the session-worker does not exercise for a single
+ * reduced turn). `Plugin` is a worker-safe replacement here (host when supplied,
+ * no-op otherwise) because this sub-graph is compiled standalone by callers such
+ * as the reduced pipeline; the full worker graph additionally replaces
+ * `Plugin.node` at the top level ({@link buildSessionWorkerLayer}).
  */
 export function reducedLlmLayer(
   snapshot: WorkerSnapshot,
@@ -1352,7 +1364,7 @@ export function reducedLlmLayer(
     [Auth.node, snapshotAuthLayer(snapshot)],
     [Config.node, snapshotConfigLayer(snapshot)],
     [Provider.node, reducedModelProviderLayer(config)],
-    [Plugin.node, plugins === undefined ? noopPluginLayer() : workerPluginLayer(plugins)],
+    workerPluginReplacement(plugins),
     [
       Permission.node,
       hubProxies === undefined ? Layer.mock(Permission.Service, {}) : permissionProxyLayer(hubProxies.permission),
@@ -1494,6 +1506,13 @@ export interface SessionLayerOptions {
    * Absent on degraded/hub-only paths, where the shell tool is a no-op.
    */
   readonly pidReporter?: PidReporterInterface
+  /**
+   * The worker-hosted plugin hooks. The session layer owns the `Plugin.node`
+   * replacement (the hub loads plugins, decision 70), so the model-facing hooks
+   * run in this isolate. Absent, the graph uses a no-op pass-through; the global
+   * `Plugin` layer is never built in the worker.
+   */
+  readonly plugins?: WorkerPluginHost
   /** Extra replacements, e.g. the real LLM-backed `ModelClient` in production. */
   readonly replacements?: LayerNode.Replacements
 }
@@ -1520,6 +1539,10 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
     [WorkerSnapshotNode, Layer.succeed(WorkerSnapshotService, options.snapshot)],
     [WorkerEnvNode, Layer.succeed(WorkerEnvService, options.env)],
     [ModelClientNode, options.modelClient],
+    // The worker graph owns `Plugin`: the hub loads plugins (decision 70), but
+    // the model-facing hooks run here. Replace the real node for the whole graph
+    // so it is never built in the isolate.
+    workerPluginReplacement(options.plugins),
     ...boundaryReplacements(options.snapshot, options.clients.writer, options.backgroundJob),
     ...(options.hubProxies === undefined ? [] : hubProxyReplacements(options.hubProxies)),
     ...(options.replacements ?? []),

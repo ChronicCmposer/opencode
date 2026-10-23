@@ -138,6 +138,7 @@ describe("session-worker bootstrap isolate (egress control)", () => {
           workerData: {
             snapshot: workerSnapshot(),
             env: { values: {} },
+            role: "session",
             model: {
               providerID: "mock",
               modelID: "m",

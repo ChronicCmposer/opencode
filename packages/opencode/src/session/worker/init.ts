@@ -28,6 +28,7 @@ import type {
   SessionWorkerModel,
 } from "./session-worker"
 import type { WorkerEnv } from "./layer"
+import type { Role } from "./node-table"
 import type {
   ChatHeadersOutput,
   ChatParamsOutput,
@@ -473,6 +474,12 @@ export interface BuildSessionWorkerInitOptions {
   readonly env?: BuildWorkerEnvOptions
   readonly model?: ResolveWorkerModelOptions
   /**
+   * The process role the worker adopts at boot. Defaults to `"session"`: this
+   * builder assembles a session-worker init. The role is required on the wire so
+   * the entry can `setProcessRole` it and gate graph membership.
+   */
+  readonly role?: Role
+  /**
    * The worker's pool slot id, when the caller knows it. The production pool
    * stamps the real id per spawn (it is the only layer that owns the slot), so
    * this is for callers that build an init for a specific worker.
@@ -516,6 +523,7 @@ export const buildSessionWorkerInit = Effect.fn("SessionWorkerInit.build")(funct
     // The full descriptor crosses verbatim, so the reduced provider reproduces
     // flag-OFF sampling (capabilities/limits/options/variants/provider options).
     model,
+    role: options.role ?? "session",
     ...(options.workerID === undefined ? {} : { workerID: options.workerID }),
     ...(options.capabilities === undefined ? {} : { capabilities: options.capabilities }),
     ...(plugins === undefined ? {} : { plugins }),

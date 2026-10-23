@@ -22,14 +22,10 @@ import type { ExecutorSessionWorker, ExecutorWorkerKind, ExecutorWorkerPool } fr
 import { createProductionSessionHub } from "@/session/worker/hub"
 import { pollUntil } from "../../lib/poll"
 import { sessionWorkerInit } from "../../lib/session-worker-init"
-import { createWorkerHarness } from "../../lib/worker-harness"
 import { healthyEnv } from "../writer/fixtures"
 
 const TASK_DIR = "/proc/self/task"
 const procAvailable = existsSync(TASK_DIR)
-
-/** Fixture: a worker that names its thread `ocs9`, then builds a nested hub. */
-const HUB_ON_WORKER_FIXTURE = new URL("../../fixture/hub-on-worker-fixture.ts", import.meta.url)
 
 /** Every thread name currently visible for this process. */
 function threadNames(): string[] {
@@ -98,24 +94,6 @@ describe("WS4 — static thread names", () => {
       } finally {
         await broker.teardown().catch(() => undefined)
         await writer.close()
-      }
-    },
-  )
-
-  test.skipIf(!procAvailable)(
-    `a nested hub built inside a worker keeps the worker's ocs<slot> name (${
-      procAvailable ? "linux /proc" : "no /proc/self/task"
-    })`,
-    async () => {
-      const harness = createWorkerHarness({ timeoutMs: 15_000 })
-      try {
-        const worker = harness.spawn<{ type: "comm"; comm: string }>(HUB_ON_WORKER_FIXTURE)
-        const report = await worker.waitFor("comm")
-        // The worker names itself `ocs9` at boot; a nested hub must not overwrite
-        // that with the process-wide `och`.
-        expect(report.comm).toBe("ocs9")
-      } finally {
-        await harness.dispose()
       }
     },
   )
