@@ -1182,6 +1182,14 @@ describe("tool.task", () => {
       expect(dispatched[0]?.type).toBe("task")
       expect(dispatched[0]?.depth).toBeGreaterThanOrEqual(1)
 
+      // The child must carry its first user prompt, or the hub-dispatched
+      // session runs a bare loop and fails with "No user message found".
+      expect(dispatched[0]?.prompt?.sessionID).toBe(result.metadata.sessionId)
+      expect(dispatched[0]?.prompt?.agent).toBe("general")
+      expect(dispatched[0]?.prompt?.parts).toEqual([{ type: "text", text: "look into the cache key path" }])
+      expect(dispatched[0]?.prompt?.model).toEqual({ modelID: ref.modelID, providerID: ref.providerID })
+      expect(dispatched[0]?.prompt?.variant).toBe("xhigh")
+
       // The dispatcher owns the child; the tool must not also run it inline.
       expect(prompts).toHaveLength(0)
       expect(prompts.some((input) => input.sessionID === result.metadata.sessionId)).toBe(false)
@@ -1227,6 +1235,38 @@ describe("tool.task", () => {
       expect(result.output).toContain(`<task id="${result.metadata.sessionId}" state="error">`)
       expect(result.output).toContain("<task_error>")
       expect(result.output).toContain("child exploded")
+    }),
+  )
+
+  it.instance("dispatch-first foreground: renders a non-terminal JobInfo as running", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const promptOps = dispatchOps({
+        settle: (request) => jobInfo({ id: request.childID, status: "running" }),
+      })
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.output).toContain(`<task id="${result.metadata.sessionId}" state="running">`)
+      expect(result.output).not.toContain(`state="completed"`)
     }),
   )
 
@@ -1302,6 +1342,9 @@ describe("tool.task", () => {
       )
 
       expect(dispatched).toHaveLength(1)
+      expect(dispatched[0]?.prompt?.sessionID).toBe(result.metadata.sessionId)
+      expect(dispatched[0]?.prompt?.agent).toBe("general")
+      expect(dispatched[0]?.prompt?.parts).toEqual([{ type: "text", text: "look into the cache key path" }])
       expect(result.metadata.background).toBe(true)
       expect(result.output).toContain(`state="running"`)
       expect(prompts.some((input) => input.sessionID === result.metadata.sessionId)).toBe(false)

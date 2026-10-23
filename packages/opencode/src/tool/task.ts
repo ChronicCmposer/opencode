@@ -28,6 +28,12 @@ export interface TaskSubagentDispatch {
   readonly depth: number
   readonly title?: string
   readonly metadata?: Record<string, unknown>
+  /**
+   * The first user prompt the hub-dispatched child must run. Without it the
+   * child session has no user message and `SessionPrompt.loop` fails
+   * immediately, so the producer must always populate it.
+   */
+  readonly prompt?: SessionPrompt.PromptInput
 }
 
 export interface TaskPromptOps {
@@ -359,6 +365,15 @@ export const TaskTool = Tool.define(
 
       const dispatchSubagent = ops.dispatchSubagent
       if (dispatchSubagent) {
+        const parts = yield* ops.resolvePromptParts(params.prompt)
+        const prompt: SessionPrompt.PromptInput = {
+          messageID: MessageID.ascending(),
+          sessionID: nextSession.id,
+          model: { modelID: model.modelID, providerID: model.providerID },
+          variant: next.model ? undefined : variant,
+          agent: next.name,
+          parts,
+        }
         const request: TaskSubagentDispatch = {
           parentID: ctx.sessionID,
           childID: nextSession.id,
@@ -366,6 +381,7 @@ export const TaskTool = Tool.define(
           depth: depth + 1,
           title: params.description,
           metadata,
+          prompt,
         }
 
         // Background joins/registers a local job whose run awaits the child, so
@@ -388,12 +404,13 @@ export const TaskTool = Tool.define(
 
         const settled = yield* dispatchSubagent(request)
         if (settled.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
+        const state = settled.status === "error" ? "error" : settled.status === "completed" ? "completed" : "running"
         return {
           title: params.description,
           metadata,
           output: renderOutput({
             sessionID: nextSession.id,
-            state: settled.status === "error" ? "error" : "completed",
+            state,
             text: settled.output ?? settled.error ?? "",
           }),
         }
