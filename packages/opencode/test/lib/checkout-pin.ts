@@ -61,7 +61,7 @@ export function readRevision(ref: string, cwd?: string, options: RevisionReadOpt
   if (proc.exitCode !== 0) {
     const detail = revisionFailureDetail({
       exitCode: proc.exitCode,
-      signalCode: proc.signalCode ?? null,
+      signalCode: proc.signalCode === null ? null : String(proc.signalCode),
       stderr: proc.stderr.toString(),
       timeoutMs,
     })
