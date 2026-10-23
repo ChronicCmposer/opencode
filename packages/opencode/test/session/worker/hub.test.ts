@@ -73,6 +73,7 @@ import { workerLoggerFromBridge, workerLogMessage, type WorkerLogger } from "@/s
 import { createWorkerPluginHost } from "@/session/worker/plugin-host"
 import { sessionWorkerInit, assertStructuredCloneable } from "../../lib/session-worker-init"
 import { Session } from "@/session/session"
+import type { ShellInput } from "@/session/prompt"
 import { testEffect } from "../../lib/effect"
 import { TestLLMServer } from "../../lib/llm-server"
 import { sid } from "../../lib/async"
@@ -610,6 +611,71 @@ describe("12 lazy pool", () => {
     expect(created.length).toBeGreaterThan(0)
 
     await hub.terminateAll()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// startShell payload forwarding (FROZEN CONTRACT). The hub must carry the
+// serialized `ShellInput` through `dispatch.startShell` to the worker's
+// `ExecutorRun`, and keep the plain startShell path when the shell is absent.
+// The executor run is the observable boundary: `dispatch.startShell` builds it
+// from the payload, so asserting on it pins the forwarding end-to-end.
+// ---------------------------------------------------------------------------
+
+/** An in-memory executor pool that records every `ExecutorRun` a worker receives. */
+const recordingExecutorPool = (runs: ExecutorRun[]): ExecutorWorkerPool => {
+  const results = new Map<SessionID, SessionExecutionResult>()
+  const worker: ExecutorWorker = {
+    id: 1,
+    alive: true,
+    async execute(run) {
+      runs.push(run)
+      results.set(run.sessionID, { sessionID: run.sessionID, value: null })
+    },
+    async cancel() {},
+    async assertNotBusy() {
+      return false
+    },
+    resultFor: (sessionID) => results.get(sessionID),
+    async terminate() {},
+  }
+  return {
+    workers: [worker],
+    spawn: () => worker,
+    async terminateAll() {},
+    byID: (id) => (id === worker.id ? worker : undefined),
+    resultFor: (sessionID) => results.get(sessionID),
+  }
+}
+
+describe("hub startShell payload forwarding", () => {
+  test("forwards the ShellInput payload and the startShell mode to the worker", async () => {
+    const runs: ExecutorRun[] = []
+    const hub = createSessionHub({ pool: recordingExecutorPool(runs) })
+    const sessionID = sid("ses_shell_fwd")
+    const shell: ShellInput = { sessionID, agent: "build", command: "echo hi" }
+    try {
+      const result = await hub.startShell(sessionID, shell)
+      expect(result.sessionID).toBe(sessionID)
+      expect(runs).toHaveLength(1)
+      // Exact shape: the payload rides the run, no extra field leaks.
+      expect(runs[0]).toEqual({ sessionID, depth: 0, mode: "startShell", shell })
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+
+  test("an absent shell keeps the plain startShell path (no shell on the run)", async () => {
+    const runs: ExecutorRun[] = []
+    const hub = createSessionHub({ pool: recordingExecutorPool(runs) })
+    const sessionID = sid("ses_shell_plain")
+    try {
+      await hub.startShell(sessionID)
+      expect(runs).toHaveLength(1)
+      expect(runs[0]).toEqual({ sessionID, depth: 0, mode: "startShell" })
+    } finally {
+      await hub.terminateAll()
+    }
   })
 })
 
@@ -1760,6 +1826,152 @@ describe("W4 per-session worker model", () => {
       await pool.terminateAll()
     }
   }, 30_000)
+})
+
+// ---------------------------------------------------------------------------
+// Fix 1 (per-session working directory) — the hub must resolve each session's
+// worker init under that session's OWN instance, never the first dispatch's.
+// The bug latched `capturedInstance ??= captureInstanceRef()` once per process,
+// so a second project inherited the first project's directory. `snapshot.directory`
+// is the observable seam (`buildWorkerSnapshot` reads the ambient `InstanceRef`).
+// ---------------------------------------------------------------------------
+
+describe("Fix 1 per-session working directory", () => {
+  /** An ambient InstanceRef whose only meaningful field for the snapshot is `directory`. */
+  const ambient = (directory: string) => ({ directory, worktree: directory, project: {} as never })
+
+  /**
+   * A pool whose single worker records the init resolved for the session it is
+   * asked to run. `resolveInit(run.sessionID)` is the production seam the real
+   * pool drives, so the recording pins the per-session resolution end-to-end.
+   */
+  const recordingInitPool =
+    (captured: Array<{ sessionID: SessionID; init: SessionWorkerInit }>): ProductionPoolFactory =>
+    (resolveInit) => {
+      const results = new Map<SessionID, SessionExecutionResult>()
+      return createLazyExecutorWorkerPool({
+        k: 1,
+        create: (id) => ({
+          id,
+          alive: true,
+          execute: async (run) => {
+            captured.push({ sessionID: run.sessionID, init: await resolveInit(run.sessionID) })
+            results.set(run.sessionID, { sessionID: run.sessionID, value: null })
+          },
+          cancel: async () => {},
+          assertNotBusy: async () => false,
+          resultFor: (sessionID) => results.get(sessionID),
+          terminate: async () => {},
+        }),
+      })
+    }
+
+  const deps = Layer.mergeAll(
+    Layer.mock(Config.Service, {
+      get: () => Effect.succeed({ model: "config/default" } as ConfigV1.Info),
+      directories: () => Effect.succeed(["/cfg/opencode"]),
+    }),
+    Layer.mock(Auth.Service, {
+      all: () => Effect.succeed({}),
+      get: () => Effect.succeed(new Auth.Api({ type: "api", key: "sk-test" })),
+    }),
+    Layer.mock(ModelsDev.Service, { get: () => Effect.succeed({}) }),
+    Layer.mock(Provider.Service, {
+      defaultModel: () =>
+        Effect.succeed({ providerID: ProviderV2.ID.make("default"), modelID: ModelV2.ID.make("default") }),
+      getProvider: () => Effect.succeed(providerInfo),
+      getModel: () => Effect.succeed(providerModel),
+    }),
+    RuntimeFlags.layer({ experimentalSessionWorkers: true }),
+    Layer.mock(SessionStatus.Service, {
+      get: () => Effect.succeed({ type: "idle" } as SessionStatus.Info),
+      list: () => Effect.succeed(new Map()),
+      set: () => Effect.void,
+    }),
+    Layer.mock(Permission.Service, {}),
+    Layer.mock(Question.Service, {}),
+    Layer.mock(EventV2Bridge.Service, { publishLive: () => Effect.void }),
+  )
+
+  /** A `Session` stub whose `get` returns a per-session persisted directory. */
+  const sessionLayer = (directoryBySession: Map<SessionID, string>) =>
+    Layer.succeed(
+      Session.Service,
+      Session.Service.of({
+        get: (sessionID: SessionID) =>
+          Effect.succeed({
+            id: sessionID,
+            directory: directoryBySession.get(sessionID) ?? "/persisted/unknown",
+            projectID: "proj-test",
+            model: { id: "m", providerID: "p" },
+          } as unknown as Session.Info),
+        findMessage: () => Effect.succeed(Option.none()),
+      } as unknown as Session.Interface),
+    )
+
+  it.live("resolves each session under its own ambient InstanceRef, never the first", () =>
+    Effect.gen(function* () {
+      const captured: Array<{ sessionID: SessionID; init: SessionWorkerInit }> = []
+      const layer = productionSessionHubLayer({ count: 1, poolFactory: recordingInitPool(captured) }).pipe(
+        Layer.provide(deps),
+      )
+      const sessionA = sid("ses_fixdir_a")
+      const sessionB = sid("ses_fixdir_b")
+      const sessions = sessionLayer(
+        new Map([
+          [sessionA, "/persisted/a"],
+          [sessionB, "/persisted/b"],
+        ]),
+      )
+
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const context = yield* Layer.build(layer)
+          const hub = Context.get(context, SessionHubService)
+          yield* Effect.promise(() => hub.ensureRunning(sessionA)).pipe(
+            Effect.provide(sessions),
+            Effect.provideService(InstanceRef, ambient("/ambient/a")),
+          )
+          yield* Effect.promise(() => hub.ensureRunning(sessionB)).pipe(
+            Effect.provide(sessions),
+            Effect.provideService(InstanceRef, ambient("/ambient/b")),
+          )
+        }),
+      )
+
+      // The second session must NOT inherit the first dispatch's directory.
+      expect(captured.map((entry) => entry.init.snapshot.directory)).toEqual(["/ambient/a", "/ambient/b"])
+    }),
+  )
+
+  it.live("falls back to the session's own persisted directory when no ambient InstanceRef exists", () =>
+    Effect.gen(function* () {
+      const captured: Array<{ sessionID: SessionID; init: SessionWorkerInit }> = []
+      const layer = productionSessionHubLayer({ count: 1, poolFactory: recordingInitPool(captured) }).pipe(
+        Layer.provide(deps),
+      )
+      const sessionA = sid("ses_fixdir_c")
+      const sessionB = sid("ses_fixdir_d")
+      const sessions = sessionLayer(
+        new Map([
+          [sessionA, "/persisted/c"],
+          [sessionB, "/persisted/d"],
+        ]),
+      )
+
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const context = yield* Layer.build(layer)
+          const hub = Context.get(context, SessionHubService)
+          yield* Effect.promise(() => hub.ensureRunning(sessionA)).pipe(Effect.provide(sessions))
+          yield* Effect.promise(() => hub.ensureRunning(sessionB)).pipe(Effect.provide(sessions))
+        }),
+      )
+
+      // No ambient instance: each session resolves from its OWN persisted directory.
+      expect(captured.map((entry) => entry.init.snapshot.directory)).toEqual(["/persisted/c", "/persisted/d"])
+    }),
+  )
 })
 
 // ---------------------------------------------------------------------------

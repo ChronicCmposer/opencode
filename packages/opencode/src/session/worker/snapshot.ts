@@ -10,8 +10,9 @@
 // never regress, otherwise a worker could adopt an "older" generation and keep
 // stale-tolerant cache entries alive.
 
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Option } from "effect"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
+import { RipgrepBinary } from "@opencode-ai/core/ripgrep/binary"
 
 import { Auth } from "@/auth"
 import { Config } from "@/config/config"
@@ -70,6 +71,15 @@ export const buildWorkerSnapshot = Effect.fn("WorkerSnapshot.build")(function* (
   // Keep the derived sequence monotonic even after an explicit epoch is used.
   lastEpoch = Math.max(lastEpoch, epoch)
 
+  // Freeze the hub's resolved ripgrep path so the worker runs the same binary
+  // instead of locating/downloading its own. Resolution is best-effort: a hub
+  // without a resolvable binary still ships a snapshot, and the worker falls
+  // back to a PATH-resolved `rg`. `serviceOption` keeps the build independent of
+  // the hub graph, so a snapshot can be built from hub-authoritative services
+  // alone.
+  const binary = yield* Effect.serviceOption(RipgrepBinary.Service)
+  const ripgrepPath = Option.isSome(binary) ? yield* binary.value.filepath.pipe(Effect.option) : Option.none<string>()
+
   return {
     epoch,
     directory: ctx.directory,
@@ -84,6 +94,7 @@ export const buildWorkerSnapshot = Effect.fn("WorkerSnapshot.build")(function* (
     ...(ctx.project?.id === undefined ? {} : { projectId: ctx.project.id }),
     ...(ctx.project?.vcs === undefined ? {} : { projectVcs: ctx.project.vcs }),
     worktree: ctx.worktree,
+    ...(Option.isNone(ripgrepPath) ? {} : { ripgrepPath: ripgrepPath.value }),
     config: configInfo,
     auth: authInfo,
     modelsDev: models,

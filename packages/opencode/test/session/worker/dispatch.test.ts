@@ -9,6 +9,7 @@
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import type { SessionID } from "@/session/schema"
+import type { ShellInput } from "@/session/prompt"
 import {
   createDispatcher,
   deriveHeadroom,
@@ -1207,6 +1208,61 @@ describe("Part 1 shell dispatch plumbing", () => {
     expect("shell" in pool.workers[0].runs[0]).toBe(false)
     pool.workers[0].finish(sid("ses_shell"))
     await run
+    await dispatcher.terminateAll()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Part 1 shell dedup: the run identity carries the shell payload by reference,
+// so two different shell commands never coalesce while an identical one does.
+// ---------------------------------------------------------------------------
+
+describe("Part 1 shell dispatch dedup key", () => {
+  test("DispatchRequest accepts a readonly shell?: ShellInput", () => {
+    const shell: ShellInput = { sessionID: sid("ses_shell"), agent: "build", command: "echo hi" }
+    const request: DispatchRequest = { sessionID: sid("ses_shell"), mode: "startShell", shell }
+    expect(request.shell).toBe(shell)
+  })
+
+  test("an identical shell reference coalesces onto the in-flight run", async () => {
+    const pool = createFakeWorkerPool(1)
+    const dispatcher = createDispatcher({ pool })
+    const shell: ShellInput = { sessionID: sid("ses_shell"), agent: "build", command: "echo hi" }
+
+    const first = dispatcher.dispatch({ sessionID: sid("ses_shell"), mode: "startShell", shell })
+    const second = dispatcher.dispatch({ sessionID: sid("ses_shell"), mode: "startShell", shell })
+    await flush()
+
+    // The identical dispatch joins the admitted run: same promise, one run only.
+    expect(second).toBe(first)
+    expect(pool.workers[0].runs.map((run) => run.shell)).toEqual([shell])
+
+    pool.workers[0].finish(sid("ses_shell"))
+    await first
+    await dispatcher.terminateAll()
+  })
+
+  test("two different shell commands park instead of coalescing", async () => {
+    const pool = createFakeWorkerPool(1)
+    const dispatcher = createDispatcher({ pool })
+    const firstShell: ShellInput = { sessionID: sid("ses_shell"), agent: "build", command: "echo one" }
+    const secondShell: ShellInput = { sessionID: sid("ses_shell"), agent: "build", command: "echo two" }
+
+    const first = capture(dispatcher.dispatch({ sessionID: sid("ses_shell"), mode: "startShell", shell: firstShell }))
+    const second = capture(dispatcher.dispatch({ sessionID: sid("ses_shell"), mode: "startShell", shell: secondShell }))
+    await flush()
+
+    // Only the first shell run started; the second parks as a different-run waiter.
+    expect(pool.workers[0].runs.map((run) => run.shell)).toEqual([firstShell])
+
+    pool.workers[0].finish(sid("ses_shell"))
+    await first
+    await flush()
+    // The freed slot runs the second shell command, not the first.
+    expect(pool.workers[0].runs.map((run) => run.shell)).toEqual([firstShell, secondShell])
+
+    pool.workers[0].finish(sid("ses_shell"))
+    await second
     await dispatcher.terminateAll()
   })
 })

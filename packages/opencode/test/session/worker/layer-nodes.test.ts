@@ -25,21 +25,28 @@ import { boundaryReplacements } from "@/session/worker/layer"
 import { workerSnapshot } from "../../lib/snapshot"
 
 /**
- * The 9 residual hub/writer/broker/infra-owned nodes the reduced worker must
+ * The 7 residual hub/writer/broker/infra-owned nodes the reduced worker must
  * never own. They are reachable from the real `SessionPrompt` graph, so they
  * must be classified `excluded` (and replaced) rather than left `unknown`.
+ *
+ * `AppProcess` and `v2/Ripgrep` are deliberately NOT here: a Bun worker is a
+ * separate isolate in the same OS process and already spawns real detached
+ * children in-worker, so ripgrep is worker-local (see the allowlist tests).
+ * `RipgrepBinary` stays excluded — its resolved binary path comes from the hub
+ * snapshot rather than a worker-side download.
  */
 const RESIDUAL_EXCLUDED_KEYS = [
   "@opencode/Storage",
   "@opencode/Git",
   "@opencode/BackgroundJob",
   "@opencode/Global",
-  "@opencode/AppProcess",
   "@opencode/RipgrepBinary",
-  "@opencode/v2/Ripgrep",
   "@opencode/McpBrowser",
   "@opencode/example/LocationServiceMap",
 ] as const
+
+/** Worker-local ripgrep nodes: safe to instantiate inside a session worker. */
+const WORKER_LOCAL_RIPGREP_KEYS = ["@opencode/AppProcess", "@opencode/v2/Ripgrep"] as const
 
 const clientNode = (name: string) =>
   LayerNode.make({ name, layer: Layer.empty as Layer.Layer<never>, deps: [] as const })
@@ -76,9 +83,7 @@ describe("session node table", () => {
         "Git",
         "BackgroundJob",
         "Global",
-        "AppProcess",
         "RipgrepBinary",
-        "v2/Ripgrep",
         "McpBrowser",
         "LocationServiceMap",
       ]),
@@ -94,11 +99,29 @@ describe("session node table", () => {
     expect(REQUIRED_SESSION_NODE_KEYS).toContain("session-projector")
   })
 
-  test("the 9 residual hub/writer/broker/infra nodes are classified excluded", () => {
+  test("the 7 residual hub/writer/broker/infra nodes are classified excluded", () => {
     for (const key of RESIDUAL_EXCLUDED_KEYS) {
       const entry = lookupNode(key)
       expect(entry?.boundary).toBe("excluded")
     }
+  })
+
+  test("AppProcess and v2/Ripgrep are allowlisted worker-local, never excluded", () => {
+    // A Bun worker is a separate isolate in the same OS process and spawns real
+    // detached children in-worker (`ToolRegistry.node` provides the real
+    // `CrossSpawnSpawner`), so ripgrep — over `AppProcess` + `RipgrepBinary` — is
+    // worker-local rather than a hub/broker fail-loud boundary.
+    const excludedKeys = SESSION_EXCLUDED.map((item) => item.key)
+    for (const key of WORKER_LOCAL_RIPGREP_KEYS) {
+      expect(lookupNode(key)?.boundary).toBe("worker-local")
+      expect(excludedKeys).not.toContain(key)
+    }
+  })
+
+  test("RipgrepBinary stays excluded with a snapshot-backed note", () => {
+    const entry = lookupNode("@opencode/RipgrepBinary")
+    expect(entry?.boundary).toBe("excluded")
+    expect(entry?.note).toBe("snapshot-backed binary path")
   })
 
   test("lookupNode resolves by key and by label", () => {
@@ -241,6 +264,16 @@ describe("required session node set (step 29)", () => {
     expect(report.ok).toBe(false)
   })
 
+  test("worker-local ripgrep is never reported excluded by validateSessionLayer", () => {
+    // Even in the bare graph (no replacements) the worker-local ripgrep nodes are
+    // allowlisted, so they are neither `excluded` nor `unknown`.
+    const report = validateSessionLayer(LayerNode.group([SessionPrompt.node, clientGroup()]))
+    for (const key of WORKER_LOCAL_RIPGREP_KEYS) {
+      expect(report.excluded).not.toContain(key)
+      expect(report.unknown).not.toContain(key)
+    }
+  })
+
   test("boundary replacements make the real SessionPrompt graph fully classified", () => {
     const report = validateSessionLayer(
       LayerNode.group([SessionPrompt.node, clientGroup()]),
@@ -250,5 +283,6 @@ describe("required session node set (step 29)", () => {
     expect(report.missingClients).toEqual([])
     expect(report.unknown).toEqual([])
     expect(report.ok).toBe(true)
+    for (const key of WORKER_LOCAL_RIPGREP_KEYS) expect(report.excluded).not.toContain(key)
   })
 })

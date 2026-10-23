@@ -320,6 +320,20 @@ function shellChildLabel(command: string): string {
 }
 
 /**
+ * Parse the tool boundary's `command` into a trusted, non-empty command. The
+ * parameter schema only enforces "a string is present", so an empty or
+ * whitespace-only command would otherwise reach the spawner and run a shell
+ * that exits silently with no output. That is an illegal state, so it halts
+ * here with a descriptive error instead of masquerading as a successful run.
+ */
+function requireCommand(command: string): string {
+  if (command.trim() === "") {
+    throw new Error("shell command must not be empty: provide a command to execute")
+  }
+  return command
+}
+
+/**
  * Report a freshly spawned detached shell child to the hub's PID registry
  * mirror. On POSIX the spawner detaches the child, so it leads its own process
  * group and `pgid === pid` (the invariant the hub's mirror assumes).
@@ -644,6 +658,7 @@ export const ShellTool = Tool.define(
           parameters: prompt.parameters,
           execute: (params: Parameters, ctx: Tool.Context) =>
             Effect.gen(function* () {
+              const command = requireCommand(params.command)
               const instanceCtx = yield* InstanceState.context
               const cwd = params.workdir
                 ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
@@ -655,19 +670,19 @@ export const ShellTool = Tool.define(
               const ps = Shell.ps(shell)
               yield* Effect.scoped(
                 Effect.gen(function* () {
-                  const tree = yield* Effect.acquireRelease(parse(params.command, ps), (tree) =>
+                  const tree = yield* Effect.acquireRelease(parse(command, ps), (tree) =>
                     Effect.sync(() => tree.delete()),
                   )
                   const scan = yield* collect(tree.rootNode, cwd, ps, shell, instanceCtx)
                   if (!containsPath(cwd, instanceCtx)) scan.dirs.add(cwd)
-                  yield* ask(ctx, scan, params)
+                  yield* ask(ctx, scan, { command })
                 }),
               )
 
               return yield* run(
                 {
                   shell,
-                  command: params.command,
+                  command,
                   cwd,
                   env: yield* shellEnv(ctx, cwd),
                   timeout,

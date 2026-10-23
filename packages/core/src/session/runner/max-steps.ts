@@ -1,4 +1,4 @@
-export const MAX_STEPS_DEFAULT = 128
+export const MAX_STEPS_DEFAULT = 256
 
 export const MAX_STEPS_PROMPT = `CRITICAL - MAXIMUM STEPS REACHED
 

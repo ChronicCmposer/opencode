@@ -1,5 +1,8 @@
 // Phase 6.1 / 6.2 / 6.5 / 6.7 — reduced session layer tests (in-process).
 
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import { Database as BunDatabase } from "bun:sqlite"
 import { describe, expect, test } from "bun:test"
 import { Effect, Exit, Layer, Schema, Stream } from "effect"
@@ -18,6 +21,8 @@ import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { Ripgrep } from "@opencode-ai/core/ripgrep"
+import { RipgrepBinary } from "@opencode-ai/core/ripgrep/binary"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { Config } from "@/config/config"
 import { Auth } from "@/auth"
@@ -43,6 +48,7 @@ import {
   snapshotAuthLayer,
   snapshotConfigLayer,
   snapshotModelsDevLayer,
+  snapshotRipgrepBinaryLayer,
   writerDatabaseLayer,
   type SessionLayerOptions,
   type WorkerModelConfig,
@@ -426,6 +432,61 @@ describe("boundary mocks are functional (f-w5)", () => {
         }).pipe(Effect.provide(layer)),
       ),
     ).rejects.toThrow(/MCP/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// fix-2 — ripgrep runs worker-local over the hub's frozen binary path.
+//
+// A worker owns a real `CrossSpawnSpawner` (via `ToolRegistry`), so `Ripgrep`
+// and `AppProcess` run for real in-isolate instead of as fail-loud boundaries.
+// Only the binary path is frozen into the snapshot, so the worker never locates
+// or downloads `rg` itself.
+// ---------------------------------------------------------------------------
+
+describe("worker-local ripgrep (fix 2)", () => {
+  test("the built worker layer serves a functional Ripgrep over the snapshot's binary path", async () => {
+    const snap = snapshot()
+    // `Ripgrep` / `RipgrepBinary` are transitive deps of `ToolRegistry`, so
+    // surface them as roots to resolve the services the worker actually runs.
+    const built = buildSessionWorkerLayer(
+      options({
+        snapshot: snap,
+        nodes: LayerNode.group([RUNNABLE_SESSION_NODES, Ripgrep.node, RipgrepBinary.node]),
+      }),
+    )
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-rg-"))
+    try {
+      fs.writeFileSync(path.join(dir, "needle.txt"), "hello worker\n")
+
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          const binary = yield* RipgrepBinary.Service
+          const filepath = yield* binary.filepath
+          const ripgrep = yield* Ripgrep.Service
+          const entries = yield* ripgrep.find({ cwd: dir, pattern: "*", limit: 100 })
+          return { filepath, entries }
+        }).pipe(Effect.provide(built.layer)),
+      )
+
+      // The binary path is the snapshot's frozen path, not a worker-located one.
+      expect(result.filepath).toBe(snap.ripgrepPath ?? "rg")
+      // `find` actually executed `rg`: the real search path is functional, not
+      // the old fail-loud `SessionLayerBoundaryError` boundary.
+      expect(result.entries.map((entry) => String(entry.path))).toContain("needle.txt")
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("snapshotRipgrepBinaryLayer falls back to a PATH-resolved rg when the snapshot omits the path", async () => {
+    const filepath = await Effect.runPromise(
+      Effect.gen(function* () {
+        const binary = yield* RipgrepBinary.Service
+        return yield* binary.filepath
+      }).pipe(Effect.provide(snapshotRipgrepBinaryLayer(snapshot({ ripgrepPath: undefined })))),
+    )
+    expect(filepath).toBe("rg")
   })
 })
 

@@ -86,6 +86,24 @@ export const SESSION_ALLOWLIST: readonly NodeEntry[] = [
   entry("RequestExecutor", "@opencode/LLM/RequestExecutor", ["session"], "worker-local"),
   entry("Env", "@opencode/Env", ["session"], "worker-local", "worker-isolate environment"),
   entry("FileSystem", "@opencode/FileSystem", ["session"], "worker-local", "worker-isolate filesystem"),
+  // A Bun worker is a separate isolate in the SAME OS process, and the shell tool
+  // already spawns real detached children in-worker (the real `CrossSpawnSpawner`
+  // is provided transitively by `ToolRegistry.node`). Ripgrep therefore runs
+  // worker-local over `AppProcess` + `RipgrepBinary` rather than failing loud.
+  entry(
+    "AppProcess",
+    "@opencode/AppProcess",
+    ["session"],
+    "worker-local",
+    "worker-isolate OS children via the real CrossSpawnSpawner",
+  ),
+  entry(
+    "v2/Ripgrep",
+    "@opencode/v2/Ripgrep",
+    ["session"],
+    "worker-local",
+    "worker-local ripgrep over AppProcess + RipgrepBinary",
+  ),
   entry("EventEgressClient", "@opencode/session-worker/EventEgressClient", ["session"], "worker-local"),
   entry(
     "WorkerEventBridge",
@@ -123,9 +141,10 @@ export const SESSION_EXCLUDED: readonly NodeEntry[] = [
   entry("Git", "@opencode/Git", ["hub"], "excluded", "hub-owned VCS"),
   entry("BackgroundJob", "@opencode/BackgroundJob", ["hub"], "excluded", "hub-resident job registry"),
   entry("Global", "@opencode/Global", ["hub"], "excluded", "process-global state"),
-  entry("AppProcess", "@opencode/AppProcess", ["hub"], "excluded", "OS child processes stay on the hub"),
-  entry("RipgrepBinary", "@opencode/RipgrepBinary", ["broker"], "excluded", "broker-owned binary"),
-  entry("v2/Ripgrep", "@opencode/v2/Ripgrep", ["broker"], "excluded", "broker-proxy only"),
+  // `AppProcess` / `v2/Ripgrep` are worker-local (allowlist above). The binary
+  // itself stays excluded: its resolved path ships in the hub snapshot, so the
+  // layer replaces it with a snapshot-backed layer rather than a fail-loud one.
+  entry("RipgrepBinary", "@opencode/RipgrepBinary", ["broker"], "excluded", "snapshot-backed binary path"),
   entry("McpBrowser", "@opencode/McpBrowser", ["broker"], "excluded", "broker-proxy only"),
   entry("LocationServiceMap", "@opencode/example/LocationServiceMap", ["hub"], "excluded", "hub-composed location map"),
 ]
