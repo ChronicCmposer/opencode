@@ -8,6 +8,7 @@
 
 import { describe, expect, test } from "bun:test"
 import { WorkerWriterError, createWorkerWriterClient, type WorkerWriterFrame } from "@/session/worker/writer-client"
+import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
 import { flush } from "../../lib/async"
 
 /** Serve raw frames on `port` with a hand-rolled responder (no client/server dep). */
@@ -223,5 +224,75 @@ describe("worker writer client: transaction relay (step 16)", () => {
 
     expect(error).toBeInstanceOf(WorkerWriterError)
     expect((error as WorkerWriterError).tag).toBe("DISPOSED")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// E2 — peer lifecycle logging. Mirrors the broker client: INFO connect at
+// construction, INFO close at dispose, WARN connect-failed (with `reason`) when
+// the port cannot be started.
+// ---------------------------------------------------------------------------
+
+interface RecordedLog {
+  readonly message: string
+  readonly fields: Record<string, unknown>
+}
+
+function recordingLogger(records: RecordedLog[]): WorkerLogger {
+  return (message, fields) => void records.push({ message, fields })
+}
+
+describe("worker writer client lifecycle logging (E2)", () => {
+  test("emits an INFO connect line with the peer and workerID", () => {
+    const channel = new MessageChannel()
+    const records: RecordedLog[] = []
+    const client = createWorkerWriterClient(channel.port2, { log: recordingLogger(records), workerID: 11 })
+
+    expect(records).toEqual([
+      { message: workerLogMessage("writer connected"), fields: { peer: "writer", level: "info", workerID: 11 } },
+    ])
+    client.dispose()
+  })
+
+  test("emits an INFO close line on dispose", () => {
+    const channel = new MessageChannel()
+    const records: RecordedLog[] = []
+    const client = createWorkerWriterClient(channel.port2, { log: recordingLogger(records), workerID: 11 })
+    client.dispose()
+
+    expect(records.at(-1)).toEqual({
+      message: workerLogMessage("writer closed"),
+      fields: { peer: "writer", level: "info", workerID: 11 },
+    })
+  })
+
+  test("omits workerID when the caller did not supply one", () => {
+    const channel = new MessageChannel()
+    const records: RecordedLog[] = []
+    const client = createWorkerWriterClient(channel.port2, { log: recordingLogger(records) })
+
+    expect(records[0]?.fields).toEqual({ peer: "writer", level: "info" })
+    client.dispose()
+  })
+
+  test("a failed connect emits a WARN line with the reason and rethrows", () => {
+    const records: RecordedLog[] = []
+    const brokenPort = {
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      start: () => {
+        throw new Error("port closed")
+      },
+    } as unknown as MessagePort
+
+    expect(() => createWorkerWriterClient(brokenPort, { log: recordingLogger(records), workerID: 4 })).toThrow(
+      "port closed",
+    )
+    expect(records).toEqual([
+      {
+        message: workerLogMessage("writer connect failed"),
+        fields: { peer: "writer", level: "warn", reason: "port closed", workerID: 4 },
+      },
+    ])
   })
 })

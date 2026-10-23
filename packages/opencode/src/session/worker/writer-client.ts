@@ -13,6 +13,7 @@
 import { defined } from "@/util/object"
 import type { WriterClientHandle } from "./layer"
 import { messageOf, portFromMessagePort } from "./port"
+import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
 
 /** A durable event as it crosses the port; `data` is validated at the server boundary. */
 export interface WorkerWriterEvent {
@@ -104,6 +105,14 @@ export interface CreateWorkerWriterClientOptions {
    * a promise.
    */
   readonly timeoutMs?: number
+  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
+  readonly log?: WorkerLogger
+  /**
+   * The worker's owner id, when the caller knows it. Included on the lifecycle
+   * log lines so a hub-side reader can correlate the writer peer with its pool
+   * slot. Omitted (never fabricated) when not supplied.
+   */
+  readonly workerID?: number
 }
 
 interface PendingRequest {
@@ -130,13 +139,45 @@ function expectReply<K extends WorkerWriterReply["ok"]>(
   return reply as Extract<WorkerWriterReply, { readonly ok: K }>
 }
 
-/** Worker side: a thin `WriterClientHandle` over `port`. */
+/** The lifecycle log fields shared by the connect/close lines for this peer. */
+const writerLifecycleFields = (workerID: number | undefined, level: "info" | "warn"): Record<string, unknown> => ({
+  peer: "writer",
+  level,
+  ...(workerID === undefined ? {} : { workerID }),
+})
+
+/**
+ * Worker side: a thin `WriterClientHandle` over `port`.
+ *
+ * Emits the E2 peer lifecycle lines: an INFO `writer connected` at construction,
+ * a WARN `writer connect failed` (with `reason`) if `port.start()` throws, and an
+ * INFO `writer closed` at dispose.
+ */
 export function createWorkerWriterClient(
   port: MessagePort,
   options: CreateWorkerWriterClientOptions = {},
 ): WorkerWriterClient {
+  const log = options.log ?? noopWorkerLogger
+  const workerID = options.workerID
+  try {
+    const client = buildWriterClient(port, options)
+    log(workerLogMessage("writer connected"), writerLifecycleFields(workerID, "info"))
+    return client
+  } catch (error) {
+    log(workerLogMessage("writer connect failed"), {
+      ...writerLifecycleFields(workerID, "warn"),
+      reason: messageOf(error),
+    })
+    throw error
+  }
+}
+
+/** The connect seam: build the client over a started port; a start failure throws. */
+function buildWriterClient(port: MessagePort, options: CreateWorkerWriterClientOptions): WorkerWriterClient {
   const channel = portFromMessagePort<WorkerWriterFrame>(port)
   const defaultTimeoutMs = options.timeoutMs
+  const log = options.log ?? noopWorkerLogger
+  const workerID = options.workerID
   let nextId = 1
   let disposed = false
   const pending = new Map<number, PendingRequest>()
@@ -226,6 +267,7 @@ export function createWorkerWriterClient(
         waiter.reject(new WorkerWriterError("DISPOSED", DISPOSED_MESSAGE))
       }
       pending.clear()
+      log(workerLogMessage("writer closed"), writerLifecycleFields(workerID, "info"))
     },
   }
 }

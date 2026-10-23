@@ -12,6 +12,7 @@ import type { SessionID } from "@/session/schema"
 import {
   createDispatcher,
   deriveHeadroom,
+  HEADROOM_MIN,
   HeadroomFullError,
   SessionCancelledError,
   SessionCrashedError,
@@ -26,6 +27,7 @@ import {
 import {
   createExecutorWorker,
   createSessionDispatch,
+  SessionWorkerReplyTimeoutError,
   type ExecutorTransport,
   type ExecutorWorkerPool,
   type SessionExecutorInbound,
@@ -33,6 +35,7 @@ import {
 } from "@/session/worker/execute"
 import type { CancelFrame, CancelPort } from "@/session/worker/cancel"
 import { SessionQueueFullError } from "@/session/worker/queue"
+import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
 import { createWorkerHarness, type HarnessWorker, type WorkerHarness } from "../../lib/worker-harness"
 import { faultWorkerEntry, withFaults } from "../../lib/faults"
 
@@ -223,6 +226,42 @@ describe("4.6 on-demand headroom (depth-1 children only)", () => {
     expect(deriveHeadroom(4)).toBe(2)
     expect(deriveHeadroom(6)).toBe(3)
     expect(deriveHeadroom(8)).toBe(4)
+  })
+
+  test("scales additively for oversubscribed K = nproc × F", () => {
+    // Option B oversubscription: the foreground pool K is now `nproc × F`
+    // (F = 2), so K commonly lands at 8/16/32. Headroom tracks it at
+    // `max(HEADROOM_MIN, ceil(K/2))` — 8 → 4, 16 → 8, 32 → 16 — and is
+    // ADDITIVE and TRANSIENT: it is spawned on demand for depth ≥ 1 children
+    // and idle-reaped, never folded into the foreground pool.
+    expect(deriveHeadroom(8)).toBe(4)
+    expect(deriveHeadroom(16)).toBe(8)
+    expect(deriveHeadroom(32)).toBe(16)
+
+    // Small K still floors at HEADROOM_MIN rather than dropping to 1.
+    expect(deriveHeadroom(1)).toBe(HEADROOM_MIN)
+    expect(deriveHeadroom(2)).toBe(HEADROOM_MIN)
+    expect(deriveHeadroom(3)).toBe(HEADROOM_MIN)
+  })
+
+  test("headroom is additive: K foreground workers are not pre-provisioned with headroom", async () => {
+    const pool = new FakePool(8)
+    const dispatcher = createDispatcher({ pool })
+
+    // K = 8 foreground workers, headroom bound = max(2, ceil(8/2)) = 4.
+    expect(dispatcher.headroomCapacity).toBe(4)
+    expect(dispatcher.headroomSlotCount).toBe(0)
+
+    const parent = capture(dispatcher.dispatch({ sessionID: sid("ses_parent") }))
+    const child = capture(dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 }))
+    await flush()
+
+    // The depth≥1 child spawns headroom on demand; it is not part of K.
+    expect(dispatcher.headroomSlotCount).toBe(1)
+    expect(pool.spawned).toHaveLength(1)
+
+    await dispatcher.terminateAll()
+    await Promise.allSettled([parent, child])
   })
 
   test("foreground dispatch never borrows headroom; children spawn it on demand", async () => {
@@ -930,6 +969,360 @@ describe("11.5 reaping seams + still-live terminate hardening", () => {
     expect(pool.workers[0].alive).toBe(false)
     expect(reaped).toEqual([1])
     expect(await running).toBeInstanceOf(SessionCancelledError)
+
+    await dispatcher.terminateAll()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// dbwal-12-02 DISPATCH stream — session-worker observability logging.
+//
+// The dispatcher's lifecycle transitions emit one structured line each through
+// the shared `WorkerLogger` seam. A recording logger captures `(message, fields)`
+// so each event's message and payload can be pinned. `level` rides in the fields
+// payload (the fixed seam has no level parameter — see the stream artifact).
+// ---------------------------------------------------------------------------
+
+interface RecordedLog {
+  readonly message: string
+  readonly fields: Record<string, unknown>
+}
+
+/** A `WorkerLogger` that records every line the dispatcher emits. */
+function recordingLogger(): { log: WorkerLogger; lines: RecordedLog[] } {
+  const lines: RecordedLog[] = []
+  return {
+    log: (message, fields) => {
+      lines.push({ message, fields })
+    },
+    lines,
+  }
+}
+
+describe("dbwal-12-02 dispatch observability logging", () => {
+  test("C1 session admitted (INFO) carries worker, kind, depth and queue depth", async () => {
+    const pool = new FakePool(1)
+    const { log, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, log })
+
+    const run = dispatcher.dispatch({ sessionID: sid("ses_1") })
+    await flush()
+
+    const admitted = lines.find((line) => line.message === workerLogMessage("session admitted"))
+    expect(admitted).toBeDefined()
+    expect(admitted!.fields).toMatchObject({
+      level: "INFO",
+      sessionID: "ses_1",
+      workerID: pool.workers[0].id,
+      kind: "foreground",
+      depth: 0,
+    })
+    expect(typeof admitted!.fields.queueDepth).toBe("number")
+
+    pool.workers[0].finish(sid("ses_1"))
+    await run
+  })
+
+  test("C2 session queued (INFO) carries the queue name, depth, capacity and size", async () => {
+    const pool = new FakePool(1)
+    const { log, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, log, admissionCapacity: 3 })
+
+    const first = dispatcher.dispatch({ sessionID: sid("ses_1") })
+    const second = dispatcher.dispatch({ sessionID: sid("ses_2") })
+    await flush()
+
+    const queued = lines.filter((line) => line.message === workerLogMessage("session queued"))
+    expect(queued).toHaveLength(1)
+    expect(queued[0].fields).toMatchObject({
+      level: "INFO",
+      sessionID: "ses_2",
+      queue: "admission",
+      depth: 0,
+      capacity: 3,
+      size: 1,
+    })
+
+    pool.workers[0].finish(sid("ses_1"))
+    await first
+    await flush()
+    pool.workers[0].finish(sid("ses_2"))
+    await second
+  })
+
+  test("C3 queue full (WARN) is emitted where the admission queue rejects", async () => {
+    const pool = new FakePool(1)
+    const { log, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, log, admissionCapacity: 1 })
+
+    const first = dispatcher.dispatch({ sessionID: sid("ses_1") })
+    const second = dispatcher.dispatch({ sessionID: sid("ses_2") })
+    await flush()
+
+    await expect(dispatcher.dispatch({ sessionID: sid("ses_3") })).rejects.toThrow(SessionQueueFullError)
+
+    const full = lines.find((line) => line.message === workerLogMessage("queue full"))
+    expect(full).toBeDefined()
+    expect(full!.fields).toMatchObject({ level: "WARN", sessionID: "ses_3", queue: "admission", capacity: 1 })
+
+    pool.workers[0].finish(sid("ses_1"))
+    await first
+    await flush()
+    pool.workers[0].finish(sid("ses_2"))
+    await second
+  })
+
+  test("C4 session completed (INFO) carries the worker and a non-negative duration", async () => {
+    const pool = new FakePool(1)
+    const { log, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, log })
+
+    const run = dispatcher.dispatch({ sessionID: sid("ses_1") })
+    await flush()
+    pool.workers[0].finish(sid("ses_1"))
+    await run
+
+    const done = lines.find((line) => line.message === workerLogMessage("session completed"))
+    expect(done).toBeDefined()
+    expect(done!.fields).toMatchObject({ level: "INFO", sessionID: "ses_1", workerID: pool.workers[0].id })
+    expect(typeof done!.fields.durationMs).toBe("number")
+    expect(done!.fields.durationMs as number).toBeGreaterThanOrEqual(0)
+  })
+
+  test("C5 waiter promoted (INFO) carries the remaining waiter depth", async () => {
+    const pool = new FakePool(1)
+    const { log, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, log })
+
+    const root = capture(dispatcher.dispatch({ sessionID: sid("ses_1") }))
+    const waiter = capture(dispatcher.dispatch({ sessionID: sid("ses_1"), depth: 1 }))
+    await flush()
+
+    pool.workers[0].finish(sid("ses_1"))
+    await root
+    await flush()
+
+    const promoted = lines.find((line) => line.message === workerLogMessage("waiter promoted"))
+    expect(promoted).toBeDefined()
+    expect(promoted!.fields).toMatchObject({ level: "INFO", sessionID: "ses_1" })
+    expect(typeof promoted!.fields.waiterQueueDepth).toBe("number")
+
+    await dispatcher.terminateAll()
+    await Promise.allSettled([waiter])
+  })
+
+  test("B4 worker crashed (WARN) carries the crash decision", async () => {
+    const pool = new FakePool(1)
+    const scheduler = createTestScheduler()
+    const { log, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, log, schedule: scheduler.schedule })
+
+    const crashed = capture(dispatcher.dispatch({ sessionID: sid("ses_1") }))
+    await flush()
+    pool.workers[0].crash(sid("ses_1"))
+    await crashed
+
+    const line = lines.find((entry) => entry.message === workerLogMessage("worker crashed"))
+    expect(line).toBeDefined()
+    expect(line!.fields).toMatchObject({
+      level: "WARN",
+      sessionID: "ses_1",
+      attempts: 1,
+      backoffMs: 1_000,
+      degraded: false,
+    })
+    expect(typeof line!.fields.workerID).toBe("number")
+
+    await dispatcher.terminateAll()
+  })
+
+  test("B5 slot degraded (ERROR) carries the degraded count", async () => {
+    const pool = new FakePool(1)
+    const scheduler = createTestScheduler()
+    const { log, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, log, schedule: scheduler.schedule })
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const run = capture(dispatcher.dispatch({ sessionID: sid(`ses_${attempt}`) }))
+      await flush()
+      const worker = attempt === 0 ? pool.workers[0] : pool.spawned[attempt - 1]
+      worker.crash(sid(`ses_${attempt}`))
+      await run
+      const pending = scheduler.pending()
+      if (pending.length > 0) {
+        pending[pending.length - 1].run()
+        await flush()
+      }
+    }
+
+    const line = lines.find((entry) => entry.message === workerLogMessage("slot degraded"))
+    expect(line).toBeDefined()
+    expect(line!.fields).toMatchObject({ level: "ERROR", degradedCount: 1 })
+    expect(typeof line!.fields.workerID).toBe("number")
+
+    await dispatcher.terminateAll()
+  })
+
+  test("B6 headroom reaped (INFO) carries the idle window", async () => {
+    const pool = new FakePool(1)
+    const scheduler = createTestScheduler()
+    const { log, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, log, schedule: scheduler.schedule, headroomIdleReapMs: 60_000 })
+
+    const parent = dispatcher.dispatch({ sessionID: sid("ses_parent") })
+    const child = dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 })
+    await flush()
+
+    pool.spawned[0].finish(sid("ses_child"))
+    await child
+    await flush()
+
+    scheduler
+      .pending()
+      .find((timer) => timer.delayMs === 60_000)
+      ?.run()
+    await flush()
+
+    const line = lines.find((entry) => entry.message === workerLogMessage("headroom reaped"))
+    expect(line).toBeDefined()
+    expect(line!.fields).toMatchObject({ level: "INFO", idleMs: 60_000 })
+    expect(typeof line!.fields.workerID).toBe("number")
+
+    pool.workers[0].finish(sid("ses_parent"))
+    await parent
+  })
+})
+
+// ---------------------------------------------------------------------------
+// dbwal-12-07 WIRING — the cancel controller is built at the production call
+// site, so its D1 `cancel requested` line must carry the dispatcher's `log` and
+// the owning worker id. Before the wiring, `controllerFor` built the controller
+// without `log`/`workerID`, so the line never fired in production.
+// ---------------------------------------------------------------------------
+
+describe("dbwal-12-07 dispatch wiring — cancel controller emits D1", () => {
+  test("cancelWithGrace emits 'cancel requested' with sessionID, workerID and graceMs", async () => {
+    const pool = new PortedPool(1, "ignore")
+    const scheduler = createTestScheduler()
+    const { log, lines } = recordingLogger()
+    const dispatcher = createDispatcher({
+      pool,
+      log,
+      cancellation: {
+        portFor: (worker) => (worker as PortedWorker).hub,
+        graceMs: 750,
+        schedule: scheduler.schedule,
+      },
+    })
+
+    const running = capture(dispatcher.dispatch({ sessionID: sid("ses_d1") }))
+    await flush()
+    const pending = dispatcher.cancelWithGrace(sid("ses_d1"))
+    await flush()
+
+    const line = lines.find((entry) => entry.message === workerLogMessage("cancel requested"))
+    expect(line).toBeDefined()
+    expect(line!.fields).toEqual({ sessionID: "ses_d1", workerID: 1, graceMs: 750 })
+
+    // The run ignores the cancel, so settle it via the grace window.
+    scheduler
+      .pending()
+      .find((timer) => timer.delayMs === 750)
+      ?.run()
+    await pending
+    expect(await running).toBeInstanceOf(SessionCancelledError)
+
+    await dispatcher.terminateAll()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Reply-timeout hardening. A worker reply timeout must TERMINATE the isolate (so
+// a wedged run stops issuing writer transactions) and retire/replace the slot
+// under the same supervised backoff as a crash — instead of rejecting the caller
+// while leaving the worker running.
+// ---------------------------------------------------------------------------
+
+describe("reply timeout terminates and retires the worker", () => {
+  test("a reply timeout rejects with the timeout error, terminates and replaces the slot", async () => {
+    const pool = new FakePool(1)
+    const scheduler = createTestScheduler()
+    const dispatcher = createDispatcher({ pool, schedule: scheduler.schedule })
+
+    const run = capture(dispatcher.dispatch({ sessionID: sid("ses_timeout") }))
+    await flush()
+
+    const wedged = pool.workers[0]
+    const timedOut = new SessionWorkerReplyTimeoutError(30_000)
+    // The isolate wedges: its reply never arrives, so `execute` rejects with the timeout.
+    wedged.fail(sid("ses_timeout"), timedOut)
+
+    // (a) the caller rejects with the timeout error itself (not a cancellation).
+    expect(await run).toBe(timedOut)
+    // (b) the wedged isolate was terminated.
+    expect(wedged.alive).toBe(false)
+    // (c) a supervised replacement is scheduled with the initial backoff, not spawned yet.
+    expect(scheduler.pending().map((timer) => timer.delayMs)).toEqual([1_000])
+    expect(pool.spawned).toHaveLength(0)
+    scheduler.pending()[0].run()
+    await flush()
+    expect(pool.spawned).toHaveLength(1)
+
+    // (d) the reservation cleared and a later dispatch runs on the NEW worker.
+    expect(dispatcher.workerForSession(sid("ses_timeout"))).toBeUndefined()
+    const next = capture(dispatcher.dispatch({ sessionID: sid("ses_next") }))
+    await flush()
+    expect(pool.spawned[0].runs.map((record) => record.sessionID)).toEqual([sid("ses_next")])
+    pool.spawned[0].finish(sid("ses_next"))
+    await next
+  })
+
+  test("a timeout loop degrades the slot (K−1) instead of hot-looping", async () => {
+    const pool = new FakePool(1)
+    const scheduler = createTestScheduler()
+    const degraded: number[] = []
+    const dispatcher = createDispatcher({ pool, schedule: scheduler.schedule, onDegraded: (id) => degraded.push(id) })
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const run = capture(dispatcher.dispatch({ sessionID: sid(`ses_timeout_${attempt}`) }))
+      await flush()
+      const worker = attempt === 0 ? pool.workers[0] : pool.spawned[attempt - 1]
+      worker.fail(sid(`ses_timeout_${attempt}`), new SessionWorkerReplyTimeoutError(1_000))
+      expect(await run).toBeInstanceOf(SessionWorkerReplyTimeoutError)
+      const pending = scheduler.pending()
+      if (pending.length > 0) {
+        pending[pending.length - 1].run()
+        await flush()
+      }
+    }
+
+    expect(degraded).toHaveLength(1)
+    expect(dispatcher.degradedCount).toBe(1)
+    // capacity is reduced: no free headroom slot remains.
+    expect(dispatcher.headroomSlotCount).toBe(0)
+    await dispatcher.terminateAll()
+  })
+
+  test("a timeout that races a cancel settles once and does not double-spawn", async () => {
+    const pool = new FakePool(1)
+    const scheduler = createTestScheduler()
+    const dispatcher = createDispatcher({ pool, schedule: scheduler.schedule })
+
+    const run = capture(dispatcher.dispatch({ sessionID: sid("ses_race") }))
+    await flush()
+
+    const worker = pool.workers[0]
+    // Deliver both in the same tick: the isolate rejects with a timeout while the
+    // cancel is already retiring the slot. Exactly one retirement may happen.
+    worker.fail(sid("ses_race"), new SessionWorkerReplyTimeoutError(30_000))
+    const cancelled = dispatcher.cancel(sid("ses_race"))
+    await cancelled
+    await flush()
+
+    expect(await run).toBeInstanceOf(SessionCancelledError)
+    // only the cancel's single replacement is spawned; the timeout adds no second.
+    expect(pool.spawned).toHaveLength(1)
+    expect(scheduler.pending()).toHaveLength(0)
 
     await dispatcher.terminateAll()
   })

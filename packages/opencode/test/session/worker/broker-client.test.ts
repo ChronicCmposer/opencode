@@ -11,6 +11,7 @@
 
 import { describe, expect, test } from "bun:test"
 import { createWorkerBrokerClient } from "@/session/worker/broker-client"
+import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
 import type { BrokerClientHandle } from "@/session/worker/layer"
 import {
   BrokerFailure,
@@ -188,5 +189,76 @@ describe("createWorkerBrokerClient (step 18)", () => {
 
     client.dispose()
     stop()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// E2 — peer lifecycle logging. The client emits a structured connect line at
+// construction and a close line at dispose, so a hub-side reader can correlate
+// the worker's broker peer with its pool slot. A construction failure emits a
+// WARN connect-failed line (with the error `reason`) before rethrowing.
+// ---------------------------------------------------------------------------
+
+interface RecordedLog {
+  readonly message: string
+  readonly fields: Record<string, unknown>
+}
+
+function recordingLogger(records: RecordedLog[]): WorkerLogger {
+  return (message, fields) => void records.push({ message, fields })
+}
+
+describe("worker broker client lifecycle logging (E2)", () => {
+  test("emits an INFO connect line with the peer and workerID", () => {
+    const { port2 } = channel()
+    const records: RecordedLog[] = []
+    const client = createWorkerBrokerClient(port2, { log: recordingLogger(records), workerID: 7 })
+
+    expect(records).toEqual([
+      { message: workerLogMessage("broker connected"), fields: { peer: "broker", level: "info", workerID: 7 } },
+    ])
+    client.dispose()
+  })
+
+  test("emits an INFO close line on dispose", () => {
+    const { port2 } = channel()
+    const records: RecordedLog[] = []
+    const client = createWorkerBrokerClient(port2, { log: recordingLogger(records), workerID: 7 })
+    client.dispose()
+
+    expect(records.at(-1)).toEqual({
+      message: workerLogMessage("broker closed"),
+      fields: { peer: "broker", level: "info", workerID: 7 },
+    })
+  })
+
+  test("omits workerID when the caller did not supply one", () => {
+    const { port2 } = channel()
+    const records: RecordedLog[] = []
+    const client = createWorkerBrokerClient(port2, { log: recordingLogger(records) })
+
+    expect(records[0]?.fields).toEqual({ peer: "broker", level: "info" })
+    client.dispose()
+  })
+
+  test("a failed connect emits a WARN line with the reason and rethrows", () => {
+    const records: RecordedLog[] = []
+    const brokenPort = {
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      start: () => {
+        throw new Error("port closed")
+      },
+    } as unknown as MessagePort
+
+    expect(() => createWorkerBrokerClient(brokenPort, { log: recordingLogger(records), workerID: 3 })).toThrow(
+      "port closed",
+    )
+    expect(records).toEqual([
+      {
+        message: workerLogMessage("broker connect failed"),
+        fields: { peer: "broker", level: "warn", reason: "port closed", workerID: 3 },
+      },
+    ])
   })
 })

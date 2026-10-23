@@ -1,10 +1,12 @@
 // Phase 13.2 — opt-in session-parallelism benchmark.
 //
-// Runs the mock-SSE session workload serially (pool of 1) and then across a
-// K-worker pool, and RECORDS the throughput ratio, busy-thread count, hub
-// loop-gap and RSS. Per repo convention there is NO machine-dependent CI
-// threshold: the ≥1.5× target is reported informationally and the script always
-// exits 0. Below 4 cores it SKIPS (a single-core host cannot show wall speedup).
+// Runs the mock-SSE session workload serially (pool of 1) and then across the
+// oversubscribed K-worker pool (`K = resolveWorkerCount()`, i.e. `floor(cores × F)`
+// with the default factor F = `DEFAULT_OVERSUBSCRIPTION_FACTOR` = 2), and RECORDS
+// the throughput ratio, busy-thread count, hub loop-gap and RSS. Per repo
+// convention there is NO machine-dependent CI threshold: the ≥1.5× target is
+// reported informationally and the script always exits 0. Below 4 cores it SKIPS
+// (a single-core host cannot show wall speedup).
 //
 // Usage (from `packages/opencode`):
 //   bun run script/bench-session-parallelism.ts
@@ -14,6 +16,7 @@
 
 import os from "node:os"
 import { parsePositiveInt } from "@/util/parse"
+import { DEFAULT_OVERSUBSCRIPTION_FACTOR, OVERSUBSCRIPTION_ENV, resolveWorkerCount } from "@/session/worker/pool"
 import { DEFAULT_BURN_ITERATIONS, startMockSseServer, runParallelSessions } from "../test/lib/mock-sse-harness"
 import type { Leak } from "../test/lib/leak-detector"
 
@@ -104,7 +107,8 @@ async function main(): Promise<void> {
     return
   }
 
-  const k = cores - 2
+  // K is the canonical oversubscribed pool target: `floor(cores × F)`, default F = 2.
+  const k = resolveWorkerCount()
   const sessions = readPositiveInt("OPENCODE_BENCH_SESSIONS", Math.max(4, k * 2))
   const burn = readPositiveInt("OPENCODE_BENCH_BURN", DEFAULT_BURN_ITERATIONS * 2)
   const repeats = readPositiveInt("OPENCODE_BENCH_REPEATS", DEFAULT_REPEATS)
@@ -119,6 +123,8 @@ async function main(): Promise<void> {
     const report = {
       cores,
       k,
+      oversubscriptionFactor: DEFAULT_OVERSUBSCRIPTION_FACTOR,
+      oversubscriptionEnv: OVERSUBSCRIPTION_ENV,
       sessions,
       burnIterations: burn,
       repeats,

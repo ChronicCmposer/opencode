@@ -34,6 +34,10 @@ import {
 } from "./protocol"
 import { BrokerFailure, parseBrokerRequest, resolveRequestTimeout } from "./protocol"
 import { mergeEnv } from "./env"
+import { setThreadName } from "@/util/thread-name"
+
+// Name this isolate's OS thread for human observability (Linux-only, fail-soft).
+setThreadName("ocb")
 
 // ---------------------------------------------------------------------------
 // Framing

@@ -40,6 +40,30 @@ export function resolveWalConfig(env: Environment = process.env): WalConfig {
   }
 }
 
+/** Bounded busy-retry budget for the main connection's SQL choke point. */
+export const DEFAULT_BUSY_RETRIES = 5
+export const DEFAULT_BUSY_BASE_DELAY_MS = 50
+export const DEFAULT_BUSY_MAX_DELAY_MS = 1000
+
+export interface BusyRetryConfig {
+  readonly retries: number
+  readonly baseDelayMs: number
+  readonly maxDelayMs: number
+}
+
+/**
+ * Resolve the busy-retry knobs at the process boundary. These are additive to
+ * the fixed `busy_timeout`; a lock that outlasts `busy_timeout` is retried with
+ * exponential backoff rather than surfacing immediately.
+ */
+export function resolveBusyRetryConfig(env: Environment = process.env): BusyRetryConfig {
+  return {
+    retries: parseInteger(env.OPENCODE_DB_BUSY_RETRIES, DEFAULT_BUSY_RETRIES, 0),
+    baseDelayMs: parseInteger(env.OPENCODE_DB_BUSY_BASE_DELAY_MS, DEFAULT_BUSY_BASE_DELAY_MS, 0),
+    maxDelayMs: parseInteger(env.OPENCODE_DB_BUSY_MAX_DELAY_MS, DEFAULT_BUSY_MAX_DELAY_MS, 0),
+  }
+}
+
 export interface WalPragmaOptions {
   readonly journalSizeLimitBytes?: number
   readonly busyTimeoutMs?: number

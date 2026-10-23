@@ -10,6 +10,7 @@ import { type EgressFrame } from "@/session/egress/frame"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { attachMeshWorker, createEgressMesh, type DurableCommit } from "@/session/egress/mesh"
 import { createWorkerEgressClient } from "@/session/worker/egress-client"
+import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
 import { type EventV2Event, eventFrame } from "@/session/worker/frame"
 
 async function pollUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
@@ -160,5 +161,84 @@ describe("worker egress client adapts the mesh control link", () => {
     const client = createWorkerEgressClient(channel.port1)
     expect(client.mesh).toBeUndefined()
     client.dispose()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// E2 — peer lifecycle logging. The data plane is "connected" once the sender is
+// adapted; the optional mesh control link is part of the same connect seam, so a
+// failed control-port start emits a WARN connect-failed line before rethrowing.
+// ---------------------------------------------------------------------------
+
+interface RecordedLog {
+  readonly message: string
+  readonly fields: Record<string, unknown>
+}
+
+function recordingLogger(records: RecordedLog[]): WorkerLogger {
+  return (message, fields) => void records.push({ message, fields })
+}
+
+describe("worker egress client lifecycle logging (E2)", () => {
+  test("emits an INFO connect line with the peer and workerID", () => {
+    const channel = new MessageChannel()
+    const records: RecordedLog[] = []
+    const client = createWorkerEgressClient(channel.port1, {
+      maxBatch: 1,
+      log: recordingLogger(records),
+      workerID: 9,
+    })
+
+    expect(records).toEqual([
+      { message: workerLogMessage("egress connected"), fields: { peer: "egress", level: "info", workerID: 9 } },
+    ])
+    client.dispose()
+  })
+
+  test("emits an INFO close line on dispose", () => {
+    const channel = new MessageChannel()
+    const records: RecordedLog[] = []
+    const client = createWorkerEgressClient(channel.port1, { log: recordingLogger(records), workerID: 9 })
+    client.dispose()
+
+    expect(records.at(-1)).toEqual({
+      message: workerLogMessage("egress closed"),
+      fields: { peer: "egress", level: "info", workerID: 9 },
+    })
+  })
+
+  test("omits workerID when the caller did not supply one", () => {
+    const channel = new MessageChannel()
+    const records: RecordedLog[] = []
+    const client = createWorkerEgressClient(channel.port1, { log: recordingLogger(records) })
+
+    expect(records[0]?.fields).toEqual({ peer: "egress", level: "info" })
+    client.dispose()
+  })
+
+  test("a failed mesh-control connect emits a WARN line with the reason and rethrows", () => {
+    const channel = new MessageChannel()
+    const records: RecordedLog[] = []
+    const brokenControl = {
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      start: () => {
+        throw new Error("control closed")
+      },
+    } as unknown as MessagePort
+
+    expect(() =>
+      createWorkerEgressClient(channel.port1, {
+        controlPort: brokenControl,
+        log: recordingLogger(records),
+        workerID: 9,
+      }),
+    ).toThrow("control closed")
+    expect(records).toEqual([
+      {
+        message: workerLogMessage("egress connect failed"),
+        fields: { peer: "egress", level: "warn", reason: "control closed", workerID: 9 },
+      },
+    ])
   })
 })

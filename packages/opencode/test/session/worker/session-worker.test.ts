@@ -58,6 +58,7 @@ import {
   type SessionWorkerModel,
 } from "@/session/worker/session-worker"
 import type { JobInfo } from "@/session/worker/job-registry"
+import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
 import {
   createPidRegistry,
   registerReported,
@@ -185,6 +186,20 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
     expect(control).toBeInstanceOf(MessagePort)
     // writer + egress + egressControl + broker are all transferred.
     expect(ports!.transfer).toHaveLength(4)
+  })
+
+  test("wires a real logger into the E2 client lifecycles (not the noop default)", () => {
+    const { scope } = fakeScope()
+    const lines: Array<{ message: string; fields: Record<string, unknown> }> = []
+    bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope, {
+      log: (message, fields) => void lines.push({ message, fields }),
+    })
+    const messages = lines.map((entry) => entry.message)
+    // Each port-backed peer emits its E2 connected line at construction; without
+    // a real logger these were dormant in production.
+    expect(messages).toContain(workerLogMessage("writer connected"))
+    expect(messages).toContain(workerLogMessage("egress connected"))
+    expect(messages).toContain(workerLogMessage("broker connected"))
   })
 })
 
@@ -375,6 +390,29 @@ describe("buildWorkerClients (step 22)", () => {
     })
     expect(clients.egress.mesh).toBeUndefined()
   })
+
+  test("forwards a supplied log into every peer's E2 lifecycle", () => {
+    const channels = emptyChannels()
+    const lines: Array<{ message: string; fields: Record<string, unknown> }> = []
+    const log: WorkerLogger = (message, fields) => void lines.push({ message, fields })
+    const clients = buildWorkerClients(
+      {
+        writer: channels.writer.port1,
+        egress: channels.egress.port1,
+        broker: channels.broker.port1,
+        backgroundJob: channels.backgroundJob.port1,
+      },
+      { workerID: 4, log },
+    )
+    expect(typeof clients.writer.publish).toBe("function")
+    const connected = lines.filter((entry) => entry.message.endsWith("connected"))
+    expect(connected.map((entry) => entry.message)).toEqual([
+      workerLogMessage("writer connected"),
+      workerLogMessage("egress connected"),
+      workerLogMessage("broker connected"),
+    ])
+    for (const entry of connected) expect(entry.fields.workerID).toBe(4)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -478,6 +516,82 @@ describe("worker→hub PID reporting (P5 prerequisite)", () => {
   test("reportedWorkerID falls back to the isolate threadId only when no pool id was shipped", () => {
     expect(reportedWorkerID({ workerID: 7 }, 42)).toBe(7)
     expect(reportedWorkerID({}, 42)).toBe(42)
+  })
+
+  test("a throwing port emits a WARN pid report failed line with the reason and rethrows", () => {
+    const records: Array<{ message: string; fields: Record<string, unknown> }> = []
+    const log: WorkerLogger = (message, fields) => void records.push({ message, fields })
+    const brokenPort = {
+      postMessage: () => {
+        throw new Error("port closed")
+      },
+    } as unknown as MessagePort
+
+    const reporter = createControlPidReporter(brokenPort, 5, { log })
+    expect(() => reporter.report({ pid: 101, pgid: 101, label: "shell:echo hi" })).toThrow("port closed")
+    expect(records).toEqual([
+      {
+        message: workerLogMessage("pid report failed"),
+        fields: { level: "warn", workerID: 5, reason: "port closed" },
+      },
+    ])
+  })
+
+  test("bootstrap forwards its log into the control pid reporter so E4 fires on a closed port", () => {
+    // `bootstrapSessionWorker` builds the reporter over an open MessageChannel and
+    // does not expose it, so the forwarding cannot be observed from outside. The
+    // `pidReporterFactory` seam hands the test the reporter bootstrap built — and
+    // the exact `log` it forwarded — so a throwing port can exercise E4 without a
+    // real closed port (Bun silently accepts a post to a peer-closed port).
+    const scope = {
+      postMessage(_data: unknown, _transfer?: readonly Transferable[]) {},
+      onmessage: null as ((event: { data: unknown }) => void) | null,
+    }
+    const init: SessionWorkerInit = {
+      snapshot: workerSnapshot(),
+      env: { values: {} },
+      model: {
+        providerID: "mock",
+        modelID: "m",
+        apiId: "m",
+        baseUrl: "http://127.0.0.1:1/v1",
+        apiKey: "k",
+        capabilities: { temperature: true, reasoning: false },
+        limit: { context: 128_000, output: 4096 },
+      },
+      capabilities: { sessionWorkerPorts: true },
+    }
+    const records: Array<{ message: string; fields: Record<string, unknown> }> = []
+    const log: WorkerLogger = (message, fields) => void records.push({ message, fields })
+    const brokenPort = {
+      postMessage: () => {
+        throw new Error("port closed")
+      },
+    } as unknown as MessagePort
+
+    let reporter: PidReporterInterface | undefined
+    let reportedID: number | undefined
+    bootstrapSessionWorker(init, scope, {
+      log,
+      pidReporterFactory: (_port, workerID, forwarded) => {
+        reportedID = workerID
+        reporter = createControlPidReporter(brokenPort, workerID, { log: forwarded })
+        return reporter
+      },
+    })
+
+    // The reporter exists and carries the forwarded log: reporting on the broken
+    // port logs E4 (WARN) through it before rethrowing. The same `log` also carries
+    // the E2 client connect lines, so assert on the E4 line specifically.
+    expect(reporter).toBeDefined()
+    expect(() => reporter!.report({ pid: 101, pgid: 101, label: "shell:echo hi" })).toThrow("port closed")
+    const failed = records.filter((entry) => entry.message === workerLogMessage("pid report failed"))
+    expect(failed).toEqual([
+      {
+        message: workerLogMessage("pid report failed"),
+        fields: { level: "warn", workerID: reportedID, reason: "port closed" },
+      },
+    ])
   })
 
   test("a missing reporter (degraded boot) is a no-op; win32 reports nothing", () => {

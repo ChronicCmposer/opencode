@@ -22,12 +22,15 @@ import { SessionPrompt } from "@/session/prompt"
 import { SessionRunState } from "@/session/run-state"
 import { Snapshot } from "@/snapshot"
 import { InstanceRef } from "@/effect/instance-ref"
+import { EffectBridge } from "@/effect/bridge"
 import type { InstanceContext } from "@/project/instance-context"
 import { Provider } from "@/provider/provider"
 import { createWorkerWriterClient, type WorkerWriterClient } from "./writer-client"
 import { createWorkerEgressClient, type WorkerEgressClient } from "./egress-client"
 import { createWorkerBrokerClient } from "./broker-client"
 import { createBackgroundJobClient, createJobClient, jobPortFromMessagePort, type JobClient } from "./job-client"
+import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
+import { messageOf } from "./port"
 import type { JobInfo } from "./job-registry"
 import {
   DEFAULT_WORK_KIND,
@@ -208,19 +211,39 @@ export interface WorkerClients {
  * A pre-built `jobClient` may be supplied so the same `MessagePort` backs both
  * the reduced `BackgroundJobClientHandle` seam and the real `BackgroundJob`
  * node; two clients on one port would steal each other's replies.
+ *
+ * `workerID`, when supplied, is threaded onto every client so their E2 lifecycle
+ * log lines carry the worker's owner id. It is omitted (never fabricated) when
+ * the caller does not know it.
+ *
+ * `log`, when supplied, is threaded into every port-backed client so the E2
+ * peer lifecycle lines (`writer connected`/`egress connected`/`broker connected`
+ * and their closes) actually fire in the isolate. Absent keeps the no-op default.
  */
-export function buildWorkerClients(ports: WorkerClientPorts, options: { jobClient?: JobClient } = {}): WorkerClients {
+export function buildWorkerClients(
+  ports: WorkerClientPorts,
+  options: { jobClient?: JobClient; workerID?: number; log?: WorkerLogger } = {},
+): WorkerClients {
   const writer = requirePort(ports.writer, "writer")
   const egress = requirePort(ports.egress, "egress")
   const broker = requirePort(ports.broker, "broker")
   const job = options.jobClient ?? createBackgroundJobClient(requirePort(ports.backgroundJob, "backgroundJob"))
+  const workerID = options.workerID
+  const withLog = options.log === undefined ? {} : { log: options.log }
   return {
-    writer: createWorkerWriterClient(writer),
-    egress: createWorkerEgressClient(
-      egress,
-      ports.egressControl === undefined ? {} : { controlPort: ports.egressControl },
-    ),
-    broker: createWorkerBrokerClient(broker),
+    writer: createWorkerWriterClient(writer, {
+      ...(workerID === undefined ? {} : { workerID }),
+      ...withLog,
+    }),
+    egress: createWorkerEgressClient(egress, {
+      ...(ports.egressControl === undefined ? {} : { controlPort: ports.egressControl }),
+      ...(workerID === undefined ? {} : { workerID }),
+      ...withLog,
+    }),
+    broker: createWorkerBrokerClient(broker, {
+      ...(workerID === undefined ? {} : { workerID }),
+      ...withLog,
+    }),
     backgroundJob: backgroundJobHandle(job),
   }
 }
@@ -275,9 +298,30 @@ export function reportedWorkerID(init: Pick<SessionWorkerInit, "workerID">, thre
  * owner id (the hub may override it with the authoritative port association).
  *
  * A closed port makes `postMessage` throw, so a report is never silently
- * dropped; the shell run fails loud instead.
+ * dropped; the shell run fails loud instead. Before rethrowing, a WARN
+ * `pid report failed` line (with `workerID` and `reason`) is emitted so the
+ * dropped report is observable.
  */
-export function createControlPidReporter(port: MessagePort, workerID: number): PidReporterInterface {
+export interface ControlPidReporterOptions {
+  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
+  readonly log?: WorkerLogger
+}
+
+/**
+ * Builds the worker's control-port PID reporter. Production uses
+ * {@link createControlPidReporter} with the worker's forwarded `log`; the factory
+ * seam lets a test hand the reporter a throwing port so the E4
+ * `pid report failed` path (and the forwarded `log`) is observable without a
+ * real closed port.
+ */
+export type ControlPidReporterFactory = (port: MessagePort, workerID: number, log: WorkerLogger) => PidReporterInterface
+
+export function createControlPidReporter(
+  port: MessagePort,
+  workerID: number,
+  options: ControlPidReporterOptions = {},
+): PidReporterInterface {
+  const log = options.log ?? noopWorkerLogger
   return {
     report(entry) {
       const frame: PidReport = {
@@ -285,7 +329,14 @@ export function createControlPidReporter(port: MessagePort, workerID: number): P
         workerID,
         entries: [{ pid: entry.pid, pgid: entry.pgid, label: entry.label, workerID }],
       }
-      port.postMessage(frame)
+      try {
+        port.postMessage(frame)
+      } catch (error) {
+        // E4 — the port is closed. Emit the WARN before rethrowing so the report
+        // is never silently dropped AND the reason is observable.
+        log(workerLogMessage("pid report failed"), { level: "warn", workerID, reason: messageOf(error) })
+        throw error
+      }
     },
   }
 }
@@ -541,6 +592,35 @@ export function workerGraphReplacements(config: WorkerModelConfig): LayerNode.Re
 }
 
 /**
+ * The worker-side logger. The isolate runs no long-lived Effect fiber (each frame
+ * is executed with `Effect.runPromise`), so a bridge is created synchronously from
+ * the worker's own instance context. `bridge.fork` then runs each `Effect.logInfo`
+ * on the default Effect runtime, so the E2 peer lifecycle lines reach the worker's
+ * output instead of being dropped by the no-op default.
+ */
+export function workerBridgeLogger(snapshot: WorkerSnapshot): WorkerLogger {
+  return workerLoggerFromBridge(
+    Effect.runSync(EffectBridge.make().pipe(Effect.provideService(InstanceRef, workerInstanceContext(snapshot)))),
+  )
+}
+
+/** Options for {@link bootstrapSessionWorker}; every field is additive. */
+export interface BootstrapSessionWorkerOptions {
+  /**
+   * Override the worker-side logger. Production omits it (a bridge logger is
+   * derived from the snapshot); a test may inject a recorder to observe the E2
+   * lines the client construction emits.
+   */
+  readonly log?: WorkerLogger
+  /**
+   * Test seam: build the control-port PID reporter. Defaults to
+   * `createControlPidReporter(port, workerID, { log })`, so the worker's forwarded
+   * `log` reaches the reporter's E4 `pid report failed` line.
+   */
+  readonly pidReporterFactory?: ControlPidReporterFactory
+}
+
+/**
  * Build the reduced layer and install the executor. Split from module scope so
  * tests can import this module (`buildWorkerClients`, the registry) without a
  * worker context; the module only bootstraps when `workerData` is present.
@@ -554,7 +634,18 @@ export function workerGraphReplacements(config: WorkerModelConfig): LayerNode.Re
  * settled subagents the hub routes to this worker (and tear the subscription
  * down); production installs the subscription regardless.
  */
-export function bootstrapSessionWorker(init: SessionWorkerInit, scope: WorkerScope): SessionWorkerBootstrap {
+export function bootstrapSessionWorker(
+  init: SessionWorkerInit,
+  scope: WorkerScope,
+  options: BootstrapSessionWorkerOptions = {},
+): SessionWorkerBootstrap {
+  const log = options.log ?? workerBridgeLogger(init.snapshot)
+  // The control-port PID reporter's log is the worker's forwarded `log` (the same
+  // seam the client lifecycles use). A test may swap the factory to observe E4.
+  const createPidReporter =
+    options.pidReporterFactory ??
+    ((port: MessagePort, workerID: number, forwarded: WorkerLogger) =>
+      createControlPidReporter(port, workerID, { log: forwarded }))
   const jobChannel = new MessageChannel()
   scope.postMessage({ type: "job-port", port: jobChannel.port2 }, [jobChannel.port2 as unknown as Transferable])
   // One full job client backs both the reduced `BackgroundJobClientHandle` seam
@@ -602,7 +693,7 @@ export function bootstrapSessionWorker(init: SessionWorkerInit, scope: WorkerSco
         egressControl: egressControlChannel.port1,
         broker: brokerChannel.port1,
       },
-      { jobClient },
+      { jobClient, workerID: reportedWorkerID(init, threadId), log },
     )
     // The hub serves the `SessionStatus` / `Permission` / `Question`
     // authorities over one control port; a single multiplexing client backs all
@@ -616,7 +707,7 @@ export function bootstrapSessionWorker(init: SessionWorkerInit, scope: WorkerSco
     // The shell tool's detached children are reaped by the hub, so the same
     // control port carries their `pid-report` frames (the hub distinguishes the
     // two frame shapes). Only the full-port boot owns children.
-    pidReporter = createControlPidReporter(hubProxyChannel.port1, reportedWorkerID(init, threadId))
+    pidReporter = createPidReporter(hubProxyChannel.port1, reportedWorkerID(init, threadId), log)
   } else {
     clients = directClients(backgroundJobHandle(jobClient))
   }

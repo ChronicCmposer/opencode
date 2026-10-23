@@ -23,12 +23,15 @@ import {
   ADMISSION_QUEUE_CAPACITY,
   CHILD_QUEUE_CAPACITY,
   WAITER_QUEUE_CAPACITY,
+  SessionQueueFullError,
   createBoundedQueue,
   type BoundedQueue,
 } from "./queue"
 import { createSessionRegistry, type SessionRegistry } from "./registry"
 import { createSupervision, type Supervision } from "./supervision"
 import { defaultSchedule } from "./port"
+import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
+import { SessionWorkerReplyTimeoutError } from "./execute"
 import type {
   ExecutorRun,
   ExecutorSessionWorker,
@@ -55,7 +58,16 @@ export const HEADROOM_MIN = 2
 /** Approved headroom idle-reap window (plan decision line 71). */
 export const DEFAULT_HEADROOM_IDLE_REAP_MS = 60_000
 
-/** Headroom size: `max(2, ceil(K/2))`. */
+/**
+ * Headroom size for the foreground pool: `max(HEADROOM_MIN, ceil(K/2))`, where
+ * K = nproc × F (F = 2) is the spec's "total worker threads" target for the
+ * FOREGROUND pool.
+ *
+ * Headroom is ADDITIVE and TRANSIENT: it is spawned on demand for depth ≥ 1
+ * children and idle-reaped, so it is never part of K. Read "total worker
+ * threads" as the foreground target, not as a hard cap that includes headroom —
+ * the process may briefly hold K plus this many workers while children run.
+ */
 export function deriveHeadroom(workerCount: number): number {
   parsePositiveInt(workerCount, "worker count")
   return Math.max(HEADROOM_MIN, Math.ceil(workerCount / 2))
@@ -198,6 +210,8 @@ export interface DispatcherOptions {
   readonly onDegraded?: (workerID: number) => void
   /** Phase 11 additive cancellation wiring; absent keeps the Phase-4 terminate path. */
   readonly cancellation?: CancellationConfig
+  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
+  readonly log?: WorkerLogger
 }
 
 export interface Dispatcher extends AsyncDisposable {
@@ -227,6 +241,13 @@ interface Slot {
   readonly kind: WorkerKind
   worker: SessionWorker
   busy: SessionID | null
+  /**
+   * True while the slot's isolate is being retired (a crash or a reply timeout):
+   * the slot must never be handed another run until its replacement is spawned.
+   * Guarding on this closes the window before `terminate()` resolves, when the
+   * wedged isolate could otherwise still read as `alive`.
+   */
+  retiring: boolean
   /** Cancels the idle-reap timer (it holds a timer's canceller, not a cancel controller). */
   cancelIdleReap: (() => void) | undefined
   respawnCancel: (() => void) | undefined
@@ -244,6 +265,10 @@ interface Pending {
   /** First-writer-wins between a cancel and a natural completion (plan 11.9). */
   readonly gate: OutcomeGate
   slot: Slot | undefined
+  /** Wall-clock start, stamped when the run begins, for the completion duration line. */
+  startedAt: number | undefined
+  /** The worker id hosting the run, captured at admission so it survives slot detach. */
+  workerID: number | undefined
 }
 
 function createPending(sessionID: SessionID, depth: number, kind: WorkerKind, mode: SessionRunMode): Pending {
@@ -253,7 +278,19 @@ function createPending(sessionID: SessionID, depth: number, kind: WorkerKind, mo
     resolve = res
     reject = rej
   })
-  return { sessionID, depth, kind, mode, promise, resolve, reject, gate: createOutcomeGate(), slot: undefined }
+  return {
+    sessionID,
+    depth,
+    kind,
+    mode,
+    promise,
+    resolve,
+    reject,
+    gate: createOutcomeGate(),
+    slot: undefined,
+    startedAt: undefined,
+    workerID: undefined,
+  }
 }
 
 export function createDispatcher(options: DispatcherOptions): Dispatcher {
@@ -268,6 +305,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const headroomIdleReapMs = options.headroomIdleReapMs ?? DEFAULT_HEADROOM_IDLE_REAP_MS
   const onDegraded = options.onDegraded
   const cancellation = options.cancellation
+  const log = options.log ?? noopWorkerLogger
 
   const admission: BoundedQueue<Pending> = createBoundedQueue("admission", admissionCapacity)
   const children: BoundedQueue<Pending> = createBoundedQueue("child", childCapacity)
@@ -283,6 +321,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     kind,
     worker,
     busy: null,
+    retiring: false,
     cancelIdleReap: undefined,
     respawnCancel: undefined,
   })
@@ -292,10 +331,28 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   }
 
   const freeSlot = (kind: WorkerKind): Slot | undefined =>
-    slots.find((slot) => slot.kind === kind && slot.busy === null && slot.worker.alive)
+    slots.find((slot) => slot.kind === kind && slot.busy === null && !slot.retiring && slot.worker.alive)
 
   const countHeadroomSlots = (): number => slots.filter((slot) => slot.kind === "headroom").length
   const countBusySlots = (): number => slots.filter((slot) => slot.busy !== null).length
+
+  /** The queue a run of `kind` waits in; its size is the depth reported at admission. */
+  const queueFor = (kind: WorkerKind): BoundedQueue<Pending> => (kind === "foreground" ? admission : children)
+
+  /**
+   * A bounded-queue rejection is reported once, at the dispatcher's catch site:
+   * the queue is a generic FIFO and cannot know the session it refused, but the
+   * typed `SessionQueueFullError` carries the queue name and capacity.
+   */
+  const logQueueFull = (sessionID: SessionID, error: unknown): void => {
+    if (!(error instanceof SessionQueueFullError)) return
+    log(workerLogMessage("queue full"), {
+      level: "WARN",
+      sessionID,
+      queue: error.queue,
+      capacity: error.capacity,
+    })
+  }
 
   const addSlot = (kind: WorkerKind, worker: SessionWorker): Slot => {
     const slot = emptySlot(kind, worker)
@@ -343,6 +400,11 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       terminate: () => slot.worker.terminate().then(() => undefined),
       ...defined({ graceMs: config.graceMs, schedule: config.schedule }),
       reap: () => config.reap?.(slot.worker),
+      // Thread the dispatcher's logger and the owning worker id into the
+      // controller so its D1 `cancel requested` line fires in production, where
+      // the controller is built at this call site.
+      log,
+      workerID: slot.worker.id,
     })
     controllers.set(slot.key, controller)
     return controller
@@ -378,9 +440,19 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const start = (pending: Pending, slot: Slot): void => {
     slot.busy = pending.sessionID
     pending.slot = slot
+    pending.startedAt = Date.now()
+    pending.workerID = slot.worker.id
     clearIdleReap(slot)
     registry.reserve(pending.sessionID, slot.worker.id)
     registry.markRunning(pending.sessionID)
+    log(workerLogMessage("session admitted"), {
+      level: "INFO",
+      sessionID: pending.sessionID,
+      workerID: slot.worker.id,
+      kind: pending.kind,
+      depth: pending.depth,
+      queueDepth: queueFor(pending.kind).size,
+    })
     const run: SessionRun = {
       sessionID: pending.sessionID,
       depth: pending.depth,
@@ -407,6 +479,11 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       slot.cancelIdleReap = undefined
       if (terminated || slot.busy !== null) return
       removeSlot(slot)
+      log(workerLogMessage("headroom reaped"), {
+        level: "INFO",
+        workerID: slot.worker.id,
+        idleMs: headroomIdleReapMs,
+      })
       void slot.worker.terminate().catch(() => undefined)
     })
   }
@@ -420,6 +497,12 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       supervision.recordHealthy(slot.key)
       maybeReap(slot)
     }
+    log(workerLogMessage("session completed"), {
+      level: "INFO",
+      sessionID: pending.sessionID,
+      workerID: pending.workerID,
+      durationMs: pending.startedAt === undefined ? 0 : Date.now() - pending.startedAt,
+    })
     // First-writer-wins: a cancel claimed before this completion rejects instead.
     if (pending.gate.claim("completion")) pending.resolve()
     else pending.reject(cancelled(pending.sessionID))
@@ -432,7 +515,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     registry.release(pending.sessionID)
     byKey.delete(pending.sessionID)
     if (slot !== undefined) slot.busy = null
-    // A cancelled run's rejection is a cancellation, not a crash (no respawn).
+    // (a) A cancelled run's rejection is a cancellation, not a crash (no respawn).
     if (pending.gate.winner === "cancel") {
       pending.reject(cancelled(pending.sessionID))
       if (slot !== undefined) maybeReap(slot)
@@ -440,8 +523,18 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       nextWaiter(pending.sessionID)
       return
     }
+    const timedOut = error instanceof SessionWorkerReplyTimeoutError
     const crashed = error instanceof WorkerCrashedError || (slot !== undefined && !slot.worker.alive)
-    if (crashed && slot !== undefined) {
+    if (timedOut && slot !== undefined) {
+      // (b) A reply timeout is a wedged isolate: reject with the timeout itself
+      // (not a cancellation), cascade to the subagents it would otherwise orphan,
+      // then terminate + retire under the same supervised backoff as a crash.
+      pending.reject(error)
+      void cancelWithGrace(pending.sessionID).catch(() => undefined)
+      retire(slot, pending.sessionID, "timeout")
+    } else if (crashed && slot !== undefined) {
+      // (c) A crashed isolate: reject with a crash error, cascade, then terminate
+      // (idempotent — a crash that already killed it is fine) + retire.
       pending.reject(
         error instanceof WorkerCrashedError
           ? error
@@ -455,8 +548,9 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       // The parent's own reservation is already released above, so cascading
       // through `cancelWithGrace` only reaches descendants — children-first.
       void cancelWithGrace(pending.sessionID).catch(() => undefined)
-      crash(slot)
+      retire(slot, pending.sessionID, "crash")
     } else {
+      // (d) A plain session failure with a live worker: release it.
       pending.reject(error)
       if (slot !== undefined) maybeReap(slot)
       pump()
@@ -464,14 +558,40 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     nextWaiter(pending.sessionID)
   }
 
-  const crash = (slot: Slot): void => {
+  /**
+   * Retire a slot whose run failed (`reason: "crash"`) or wedged
+   * (`reason: "timeout"`), then replace it under the same supervised backoff.
+   *
+   * The old isolate is terminated FIRST: `terminate` is idempotent, so a crash
+   * that already killed it is harmless, while a timed-out isolate that is still
+   * running is stopped before it can issue more writer transactions. The slot is
+   * marked `retiring` for the whole window so `freeSlot` never hands it a run.
+   * After a crash loop the slot is removed and reported degraded (`K−1`) rather
+   * than respawned forever.
+   */
+  const retire = (slot: Slot, sessionID: SessionID, reason: "crash" | "timeout"): void => {
     if (terminated) return
+    slot.retiring = true
+    void slot.worker.terminate().catch(() => undefined)
     const decision = supervision.recordCrash(slot.key)
+    log(workerLogMessage("worker crashed"), {
+      level: "WARN",
+      workerID: decision.workerID,
+      sessionID,
+      reason,
+      attempts: decision.attempts,
+      backoffMs: decision.delayMs,
+      degraded: decision.degraded,
+    })
     if (decision.degraded) {
       // Keep the supervision entry so `degradedCount` records the K−1 pool.
       removeSlot(slot, { forget: false })
       onDegraded?.(slot.key)
-      void slot.worker.terminate().catch(() => undefined)
+      log(workerLogMessage("slot degraded"), {
+        level: "ERROR",
+        workerID: slot.key,
+        degradedCount: supervision.degradedCount,
+      })
       pump()
       return
     }
@@ -480,6 +600,8 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       slot.respawnCancel = undefined
       if (terminated) return
       slot.worker = pool.spawn(slot.kind)
+      // The fresh isolate can take runs again.
+      slot.retiring = false
       pump()
     })
   }
@@ -509,6 +631,11 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const waiters = waitersByKey.get(sessionID)
     if (waiters === undefined || waiters.size === 0) return
     const next = waiters.dequeue()!
+    log(workerLogMessage("waiter promoted"), {
+      level: "INFO",
+      sessionID,
+      waiterQueueDepth: waiters.size,
+    })
     if (waiters.size === 0) waitersByKey.delete(sessionID)
     byKey.set(sessionID, next)
     startOrEnqueue(next)
@@ -539,11 +666,21 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     try {
       queue.enqueue(pending)
     } catch (error) {
+      logQueueFull(pending.sessionID, error)
       // A child-queue overflow is really "headroom is full": the physical pool is
       // saturated and the bounded child queue has no room, so surface the
       // semantic error instead of the raw queue-full failure (decision line 60).
       failEnqueue(pending, pending.kind === "headroom" ? headroomFull() : error)
+      return
     }
+    log(workerLogMessage("session queued"), {
+      level: "INFO",
+      sessionID: pending.sessionID,
+      queue: queue.name,
+      depth: pending.depth,
+      capacity: queue.capacity,
+      size: queue.size,
+    })
   }
 
   const startOrEnqueue = (pending: Pending): void => {
@@ -580,6 +717,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       try {
         waiters.enqueue(pending)
       } catch (error) {
+        logQueueFull(sessionID, error)
         if (waiters.size === 0) waitersByKey.delete(sessionID)
         pending.reject(error)
       }

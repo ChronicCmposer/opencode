@@ -17,6 +17,10 @@ import { openWriterConnection, type WriterConnection } from "./connection"
 import { createWriterCore, writerErrorInfo, type WriterCore } from "./core"
 import { createFileStorage } from "./storage"
 import { parseWriterRequest, type WriterRequest, type WriterResponse } from "./protocol"
+import { setThreadName } from "@/util/thread-name"
+
+// Name this isolate's OS thread for human observability (Linux-only, fail-soft).
+setThreadName("ocw")
 
 interface WorkerScope {
   postMessage(message: WriterResponse): void

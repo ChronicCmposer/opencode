@@ -9,6 +9,7 @@
 // `reportedRssBytes` is an observed in-worker sample, `rssBytes` is the hub reading.
 
 import path from "node:path"
+import { deriveWorkerCount } from "@/session/worker/pool"
 import { bootMany, summarizeBootLevel } from "./worker-boot"
 import { createWorkerHarness } from "./worker-harness"
 
@@ -60,14 +61,9 @@ interface BootMessage {
   readonly rssBytes: number
 }
 
-/** K = availableParallelism − 2, floor 1, single worker below 4 cores. */
-export function deriveWorkerCount(cores: number): number {
-  if (!Number.isInteger(cores) || cores < 1) {
-    throw new Error(`invalid core count: ${cores} (expected a positive integer)`)
-  }
-  if (cores < 4) return 1
-  return cores - 2
-}
+// Pool sizing is owned by the production pool module; the harness re-exports the
+// canonical helper so it can never drift from what the hub actually spawns.
+export { deriveWorkerCount }
 
 export function readRssBytes(): number {
   const rss = process.memoryUsage().rss
