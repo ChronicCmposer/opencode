@@ -15,6 +15,7 @@
 
 import { Context, Effect, Fiber, Layer, Option } from "effect"
 import os from "node:os"
+import { isMainThread } from "node:worker_threads"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Database } from "@opencode-ai/core/database/database"
@@ -1699,7 +1700,10 @@ function isWorkerCountOverride(env: Record<string, string | undefined> | undefin
 /** Compose the production pool + hub, with cooperative cancellation wired. */
 export function createProductionSessionHub(options: ProductionSessionHubOptions): SessionHub {
   // Name the hub's main OS thread for human observability (Linux-only, fail-soft).
-  setThreadName("och")
+  // Only the process main thread may claim `och`: a session-worker isolate builds a
+  // nested hub on its OWN thread, which already named itself `ocs<slot>` at boot —
+  // naming it `och` here would collapse worker identity into the main process name.
+  if (isMainThread) setThreadName("och")
   const log = options.log ?? noopWorkerLogger
   const workerCount = options.count ?? resolveWorkerCount()
   // Resolve the run-reply liveness budget once, at the hub boundary: an explicit
