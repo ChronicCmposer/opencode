@@ -1191,6 +1191,32 @@ describe("dbwal-12-02 dispatch observability logging", () => {
     pool.workers[0].finish(sid("ses_parent"))
     await parent
   })
+
+  test("B7 a plain session failure (live worker) logs an ERROR 'worker run failed' line", async () => {
+    const pool = new FakePool(1)
+    const { log, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, log })
+
+    const failing = capture(dispatcher.dispatch({ sessionID: sid("ses_1") }))
+    await flush()
+
+    // The worker stays alive but the run itself fails (the "plain session
+    // failure with a live worker" path): the caller rejects and the slot is
+    // released, but the failure must still surface in the log.
+    pool.workers[0].fail(sid("ses_1"), new Error("No user message found in stream"))
+    await failing
+
+    const line = lines.find((entry) => entry.message === workerLogMessage("worker run failed"))
+    expect(line).toBeDefined()
+    expect(line!.fields).toMatchObject({
+      level: "ERROR",
+      sessionID: "ses_1",
+      workerID: pool.workers[0].id,
+    })
+    expect(String(line!.fields.error)).toContain("No user message found in stream")
+
+    await dispatcher.terminateAll()
+  })
 })
 
 // ---------------------------------------------------------------------------

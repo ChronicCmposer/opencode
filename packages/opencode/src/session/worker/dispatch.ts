@@ -568,7 +568,17 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       void cancelWithGrace(pending.sessionID).catch(() => undefined)
       retire(slot, pending.sessionID, "crash")
     } else {
-      // (d) A plain session failure with a live worker: release it.
+      // (d) A plain session failure with a live worker: release it, but surface
+      // the run's own error first so a defect (e.g. "No user message found in
+      // stream") is never silent. `pending.workerID` is captured at admission,
+      // so it survives a detach; the error text keeps the cause visible.
+      log(workerLogMessage("worker run failed"), {
+        level: "ERROR",
+        sessionID: pending.sessionID,
+        workerID: pending.workerID,
+        error: describeFailure(error),
+        cause: error,
+      })
       pending.reject(error)
       if (slot !== undefined) maybeReap(slot)
       pump()
