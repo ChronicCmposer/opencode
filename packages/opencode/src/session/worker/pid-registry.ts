@@ -13,6 +13,7 @@
 // cannot be verified. The registry itself is platform-neutral bookkeeping.
 
 import { Context } from "effect"
+import { parsePositiveInt } from "@/util/parse"
 
 /** Kills a whole process group. Injecting one makes reaping deterministic in tests. */
 export interface ProcessReaper {
@@ -64,7 +65,7 @@ export function reapSupport(platform: NodeJS.Platform = process.platform): ReapS
 export function posixReaper(): ProcessReaper {
   return {
     killGroup(pgid, signal = "SIGTERM") {
-      assertPositiveInteger(pgid, "pgid")
+      parsePositiveInt(pgid, "pgid")
       try {
         process.kill(-pgid, signal)
       } catch (error) {
@@ -190,9 +191,9 @@ export function createPidRegistry(options: PidRegistryOptions = {}): PidRegistry
       return children.size
     },
     register(input) {
-      assertPositiveInteger(input.pid, "pid")
+      parsePositiveInt(input.pid, "pid")
       const pgid = input.pgid ?? input.pid
-      assertPositiveInteger(pgid, "pgid")
+      parsePositiveInt(pgid, "pgid")
       assertWorkerID(input.workerID)
       assertLabel(input.label)
       const existing = children.get(pgid)
@@ -260,10 +261,4 @@ function assertSameOwner(existing: RegisteredChild, input: RegisterChildInput): 
     `pgid ${existing.pgid} is owned by worker ${existing.workerID} (${existing.label}); ` +
       `refusing to reassign it to worker ${input.workerID} (${input.label})`,
   )
-}
-
-function assertPositiveInteger(value: number, label: string): void {
-  if (!Number.isInteger(value) || value < 1) {
-    throw new Error(`invalid ${label}: ${value} (expected a positive integer)`)
-  }
 }

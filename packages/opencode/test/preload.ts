@@ -6,6 +6,45 @@ import fs from "fs/promises"
 import { setTimeout as sleep } from "node:timers/promises"
 import { afterAll } from "bun:test"
 
+// Host config isolation: the ambient shell/harness exports OPENCODE_* config
+// inputs (global config content, a config dir, project-config disabling, the
+// host's real database, worker sizing/logging, ...). Left in place they leak into
+// every suite and make the result depend on the machine running the tests. Clear
+// them before any src/ import so the suite starts from a known-clean baseline.
+// Tests that need a knob set it themselves at runtime, after this runs.
+const HOST_CONFIG_VARS = [
+  "OPENCODE",
+  "OPENCODE_BIN",
+  "OPENCODE_CONFIG",
+  "OPENCODE_CONFIG_CONTENT",
+  "OPENCODE_CONFIG_DIR",
+  "OPENCODE_DB",
+  "OPENCODE_DISABLE_AUTOUPDATE",
+  "OPENCODE_DISABLE_PROJECT_CONFIG",
+  "OPENCODE_EXPERIMENTAL_SESSION_WORKERS",
+  "OPENCODE_LOG_LEVEL",
+  "OPENCODE_PID",
+  "OPENCODE_PRINT_LOGS",
+  "OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION",
+  "OPENCODE_BASH_IONICE",
+  "OPENCODE_BASH_NICE",
+  "OPENCODE_BASH_SCHED",
+] as const
+
+// Verification escape hatch for the isolation above. A caller forcing the
+// session-worker rollout flag on for a one-off verification run sets
+// `W6D_DISABLE_HOST_ISOLATION=1`; that preserves ONLY
+// `OPENCODE_EXPERIMENTAL_SESSION_WORKERS` so `...=on` survives into the suite,
+// while every other host input — including the host's real `OPENCODE_DB` — is
+// still cleared. The isolation therefore never weakens beyond forcing that flag.
+const hostIsolationDisabled = process.env["W6D_DISABLE_HOST_ISOLATION"] === "1"
+const isPreservedForVerification = (key: string): boolean =>
+  hostIsolationDisabled && key === "OPENCODE_EXPERIMENTAL_SESSION_WORKERS"
+for (const key of HOST_CONFIG_VARS) {
+  if (isPreservedForVerification(key)) continue
+  delete process.env[key]
+}
+
 // Set XDG env vars FIRST, before any src/ imports
 const dir = path.join(os.tmpdir(), "opencode-test-data-" + process.pid)
 await fs.mkdir(dir, { recursive: true })
@@ -83,8 +122,21 @@ delete process.env["OTEL_EXPORTER_OTLP_ENDPOINT"]
 delete process.env["OTEL_EXPORTER_OTLP_HEADERS"]
 delete process.env["OTEL_RESOURCE_ATTRIBUTES"]
 
-// Use in-memory sqlite
-process.env["OPENCODE_DB"] = ":memory:"
+// One shared database for the hub and the session worker's writer isolate.
+//
+// The session worker's `Database.Service` is writer-backed: every statement is
+// forwarded over the writer port to the hub-owned writer isolate, which opens
+// `Database.path()` as its OWN SQLite connection. SQLite `:memory:` is
+// per-connection, so the hub's in-process connection and the writer isolate's
+// connection would be two DIFFERENT databases — a worker `Session.get` then sees
+// zero rows (NotFoundError -> HTTP 500). Two connections can only share state
+// through a file, so when a session-worker path may run (the verification
+// override above) we point `OPENCODE_DB` at an isolated per-run temp file,
+// removed with `dir` below. The default suite never runs a worker path, so it
+// keeps the cheap in-memory database. A harness that needs a specific database
+// sets `OPENCODE_DB` after this preload (as `test/server/httpapi-exercise`
+// does); preload only chooses the default.
+process.env["OPENCODE_DB"] = hostIsolationDisabled ? path.join(dir, "opencode-test.db") : ":memory:"
 
 // Now safe to import from src/
 const { initProjectors } = await import("../src/server/projectors")

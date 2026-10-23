@@ -285,16 +285,16 @@ export interface SessionLayerReport {
  * excluded node back in unnoticed.
  */
 export function validateSessionLayer(
-  root: LayerNode.Node<unknown, unknown, any>,
+  root: AnyNode,
   replacements: LayerNode.Replacements = [],
 ): SessionLayerReport {
   const map = replacementMap(replacements)
-  const seen = new Set<LayerNode.Node<unknown, unknown, any>>()
+  const seen = new Set<AnyNode>()
   const excluded: string[] = []
   const clients = new Set<string>()
   const unknown = new Set<string>()
 
-  const visit = (node: LayerNode.Node<unknown, unknown, any>): void => {
+  const visit = (node: AnyNode): void => {
     if (seen.has(node)) return
     seen.add(node)
 
@@ -346,20 +346,9 @@ export class SessionLayerViolationError extends Error {
 }
 
 /** Assert a session layer graph satisfies the table; throw descriptively otherwise. */
-export function assertSessionLayer(
-  root: LayerNode.Node<unknown, unknown, any>,
-  replacements: LayerNode.Replacements = [],
-): void {
+export function assertSessionLayer(root: AnyNode, replacements: LayerNode.Replacements = []): void {
   const report = validateSessionLayer(root, replacements)
   if (!report.ok) throw new SessionLayerViolationError(report)
-}
-
-/** Render the table for progress reports. */
-export function describeNodeTable(): string {
-  const rows = ALL_ENTRIES.map(
-    (item) => `${item.label.padEnd(20)} ${item.boundary.padEnd(12)} ${item.roles.join(",")}`,
-  )
-  return rows.join("\n")
 }
 
 export * as WorkerNodeTable from "./node-table"

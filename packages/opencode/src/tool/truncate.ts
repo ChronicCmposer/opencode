@@ -21,6 +21,14 @@ export const MAX_BYTES = 50 * 1024
  * results pass through unchanged.
  */
 export const MAX_TOOL_OUTPUT_BYTES = 128 * 1024
+
+/**
+ * Inline preview byte budget for an externalized result. Kept at `MAX_BYTES` (not
+ * `MAX_TOOL_OUTPUT_BYTES`) so the preview reads like an ordinary bounded tool
+ * result; the marker and its separator are carved out of this same budget below.
+ */
+const EXTERNALIZED_PREVIEW_BYTES = MAX_BYTES
+const PREVIEW_SEPARATOR = "\n\n"
 export const DIR = TRUNCATION_DIR
 export const GLOB = path.join(TRUNCATION_DIR, "*")
 
@@ -28,7 +36,7 @@ export type Result = { content: string; truncated: false } | { content: string; 
 
 export interface ResultInput {
   output: string
-  metadata: Record<string, any>
+  metadata: Record<string, unknown>
 }
 
 export interface Options {
@@ -194,7 +202,7 @@ export const boundResult = Effect.fn("Truncate.boundResult")(function* (
   const bytes = Buffer.byteLength(payload, "utf-8")
   if (bytes <= MAX_TOOL_OUTPUT_BYTES) {
     const text = yield* service.output(input.output, {}, agent)
-    const metadata: Record<string, any> = {
+    const metadata: Record<string, unknown> = {
       ...input.metadata,
       truncated: text.truncated || input.metadata.truncated === true,
       ...(text.truncated ? { outputPath: text.outputPath } : {}),
@@ -204,9 +212,17 @@ export const boundResult = Effect.fn("Truncate.boundResult")(function* (
 
   const file = yield* service.write(payload)
   const marker = `... tool result truncated; full result saved to ${file} ...`
-  const prefix = takePrefix(input.output, Math.max(0, MAX_BYTES - Buffer.byteLength(marker, "utf-8") - 2))
-  const metadata: Record<string, any> = { truncated: true, outputPath: file, originalBytes: bytes }
-  return { output: prefix ? `${prefix}\n\n${marker}` : marker, metadata }
+  const prefix = takePrefix(
+    input.output,
+    Math.max(0, EXTERNALIZED_PREVIEW_BYTES - Buffer.byteLength(marker, "utf-8") - PREVIEW_SEPARATOR.length),
+  )
+  const metadata: Record<string, unknown> = {
+    ...input.metadata,
+    truncated: true,
+    outputPath: file,
+    originalBytes: bytes,
+  }
+  return { output: prefix ? `${prefix}${PREVIEW_SEPARATOR}${marker}` : marker, metadata }
 })
 
 export const node = LayerNode.make({ service: Service, layer: layer, deps: [FSUtil.node] })

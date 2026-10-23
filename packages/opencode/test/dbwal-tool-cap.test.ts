@@ -54,8 +54,9 @@ describe("dbwal tool output cap", () => {
       const execute = tool.execute as unknown as (args: unknown, ctx: Tool.Context) => ReturnType<typeof tool.execute>
       const result = yield* execute({}, makeCtx())
 
-      // Persisted result is bounded and carries a reference to the full payload.
-      expect(result.metadata.diff).toBeUndefined()
+      // Externalization preserves tool metadata alongside the truncation fields
+      // and carries a reference to the full payload on disk.
+      expect(result.metadata.diff).toBe(oversized)
       expect(result.metadata.truncated).toBe(true)
       const outputPath = result.metadata.outputPath
       expect(typeof outputPath).toBe("string")

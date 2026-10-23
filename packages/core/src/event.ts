@@ -136,6 +136,14 @@ export interface Interface {
    * in the worker isolate and must never be repeated.
    */
   readonly publishLive: (event: Payload) => Effect.Effect<void>
+  /**
+   * Wake the `durable({ aggregateID })` subscribers for an aggregate WITHOUT
+   * committing or persisting: a writer in another isolate owns the durable
+   * commit, and the local durable stream re-reads the aggregate to observe it.
+   * Optional only so reduced `EventV2` stubs stay structurally assignable; the
+   * production layer always provides it.
+   */
+  readonly wakeDurable?: (aggregateID: string) => Effect.Effect<void>
   readonly subscribe: <D extends Definition>(definition: D) => Stream.Stream<Payload<D>>
   readonly all: () => Stream.Stream<Payload>
   readonly durable: (input: { readonly aggregateID: string; readonly after?: number }) => Stream.Stream<Payload>
@@ -412,6 +420,10 @@ export const layerWith = (options?: LayerOptions) =>
 
       function notify(event: Payload, isolateListeners: boolean) {
         return Effect.gen(function* () {
+          // When `isolateListeners` is set, one failing observer is caught and
+          // logged by `observe` instead of aborting the publish for the others (or
+          // the caller). Live-only republishes take this path so a listener defect
+          // never crosses a synchronous port boundary.
           yield* Effect.forEach(
             listeners,
             (listener) => (isolateListeners ? observe(event, listener) : listener(event)),
@@ -589,6 +601,18 @@ export const layerWith = (options?: LayerOptions) =>
           return subscription
         })
 
+      /**
+       * Publish the per-aggregate durable wake exactly as `commitDurableEvent`
+       * does after a commit — without re-committing or touching the database.
+       * Named for the caller's intent: wake the aggregate's `durable()` streams
+       * so they re-read and observe an event committed in another isolate.
+       */
+      function wakeDurable(aggregateID: string): Effect.Effect<void> {
+        return Effect.forEach(pubsub.durable.get(aggregateID) ?? [], (wake) => PubSub.publish(wake, undefined), {
+          discard: true,
+        })
+      }
+
       const durable = (input: { readonly aggregateID: string; readonly after?: number }): Stream.Stream<Payload> =>
         Stream.unwrap(
           Effect.gen(function* () {
@@ -628,7 +652,8 @@ export const layerWith = (options?: LayerOptions) =>
 
       return Service.of({
         publish,
-        publishLive: (event) => notify(event, false),
+        publishLive: (event) => notify(event, true),
+        wakeDurable,
         subscribe,
         all: streamAll,
         durable,

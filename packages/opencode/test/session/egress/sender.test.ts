@@ -8,7 +8,7 @@
 import { describe, expect, test } from "bun:test"
 import { decodeFrames } from "@/session/egress/frame"
 import { createEgressSender } from "@/session/egress/sender"
-import { type EventV2Event, endFrame, eventFrame } from "@/session/worker/frame"
+import { type EventV2Event, ackFrame, endFrame, eventFrame } from "@/session/worker/frame"
 
 async function pollUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -55,7 +55,7 @@ describe("egress sender", () => {
     ])
   })
 
-  test("durable frames bypass the window and are stamped with monotonic ordinals", async () => {
+  test("durable frames bypass the window, are stamped with monotonic ordinals, and are acked", async () => {
     const channel = new MessageChannel()
     const chunks = captureRaw(channel)
     const sender = createEgressSender({ port: channel.port1 })
@@ -65,11 +65,13 @@ describe("egress sender", () => {
     sender.pushDurable(first)
     sender.pushDurable(second)
 
-    await pollUntil(() => chunks.length === 2)
-    const decoded = chunks.map((chunk) => decodeFrames(chunk).frames[0])
-    expect(decoded).toEqual([
-      eventFrame({ event: first, generation: 1, ordinal: 1 }),
-      eventFrame({ event: second, generation: 1, ordinal: 2 }),
+    await pollUntil(() => chunks.length === 4)
+    // Each durable hand-off is followed by an ack frame carrying the durable count.
+    expect(chunks.map((chunk) => decodeFrames(chunk).frames)).toEqual([
+      [eventFrame({ event: first, generation: 1, ordinal: 1 })],
+      [ackFrame({ count: 1 })],
+      [eventFrame({ event: second, generation: 1, ordinal: 2 })],
+      [ackFrame({ count: 1 })],
     ])
   })
 
@@ -81,8 +83,25 @@ describe("egress sender", () => {
     const event = { id: "d", type: "message.updated", properties: {} }
     sender.pushDurable(event, { generation: 4, ordinal: 9 })
 
-    await pollUntil(() => chunks.length === 1)
+    await pollUntil(() => chunks.length === 2)
     expect(decodeFrames(chunks[0]).frames[0]).toEqual(eventFrame({ event, generation: 4, ordinal: 9 }))
+    expect(decodeFrames(chunks[1]).frames[0]).toEqual(ackFrame({ count: 1 }))
+  })
+
+  test("a delta-only batch is not acked", async () => {
+    const channel = new MessageChannel()
+    const chunks = captureRaw(channel)
+    const sender = createEgressSender({ port: channel.port1 })
+
+    sender.pushDelta(deltaEvent("a"))
+    sender.end()
+
+    await pollUntil(() => chunks.length === 2)
+    // Only the delta batch and the end frame — no ack for non-durable deltas.
+    expect(chunks.flatMap((chunk) => decodeFrames(chunk).frames)).toEqual([
+      eventFrame({ event: deltaEvent("a") }),
+      endFrame(),
+    ])
   })
 
   test("end flushes buffered deltas then posts the end frame", async () => {

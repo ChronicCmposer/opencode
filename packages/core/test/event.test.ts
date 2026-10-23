@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Schema, Stream } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Event } from "@opencode-ai/schema/event"
 import { Session } from "@opencode-ai/schema/session"
@@ -515,6 +515,32 @@ describe("EventV2", () => {
       yield* events.publish(DurableMessage, durableData(aggregateID, "durable"))
 
       expect(Array.from(yield* Fiber.join(fiber)).map((event) => event.type)).toEqual([DurableMessage.type])
+    }),
+  )
+
+  it.effect("wakeDurable wakes a durable() subscriber to re-read its aggregate", () =>
+    Effect.gen(function* () {
+      const reads = yield* Queue.unbounded<string>()
+      const eventLayer = EventV2.layerWith({
+        beforeAggregateRead: (aggregateID) => Queue.offer(reads, aggregateID),
+      }).pipe(Layer.provide(LayerNode.compile(Database.node)))
+
+      yield* Effect.gen(function* () {
+        const events = yield* EventV2.Service
+        const aggregateID = Session.ID.create()
+        const fiber = yield* events.durable({ aggregateID }).pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped)
+
+        // The historical replay reads the aggregate once when the stream starts.
+        expect(yield* Queue.take(reads)).toBe(aggregateID)
+
+        // A wake — with no new commit — makes the subscriber re-read the aggregate.
+        const wakeDurable = events.wakeDurable
+        if (wakeDurable === undefined) throw new Error("EventV2 layer must provide wakeDurable")
+        yield* wakeDurable(aggregateID)
+
+        expect(yield* Queue.take(reads)).toBe(aggregateID)
+        yield* Fiber.interrupt(fiber)
+      }).pipe(Effect.provide(Layer.merge(LayerNode.compile(Database.node), eventLayer)))
     }),
   )
 

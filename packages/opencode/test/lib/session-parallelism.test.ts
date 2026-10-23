@@ -1,7 +1,14 @@
 import { describe, expect, test } from "bun:test"
-import { MOCK_SSE_API_KEY_ENV, MOCK_SSE_BURN_ENV, MOCK_SSE_MODEL_ENV, MOCK_SSE_URL_ENV, mockSseEnv, throughputPerSec } from "./mock-sse-harness"
+import {
+  MOCK_SSE_API_KEY_ENV,
+  MOCK_SSE_BURN_ENV,
+  MOCK_SSE_MODEL_ENV,
+  MOCK_SSE_URL_ENV,
+  mockSseEnv,
+} from "./mock-sse-worker"
+import { throughputPerSec } from "./session-parallelism"
 
-describe("mock-sse-harness helpers", () => {
+describe("session-parallelism helpers", () => {
   test("throughputPerSec records a finite value for an instantaneous run", () => {
     expect(throughputPerSec(4, 1000)).toBe(4)
     expect(throughputPerSec(4, 0)).toBe(0)

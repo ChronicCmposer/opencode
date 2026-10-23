@@ -25,6 +25,7 @@ import { threadId, workerData } from "node:worker_threads"
 import { Cause, Effect, Fiber, Layer, Option } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { isRole, setProcessRole } from "@/effect/process-role"
+import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Project } from "@opencode-ai/schema/project"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRunState } from "@/session/run-state"
@@ -120,13 +121,15 @@ export interface SessionWorkerModel {
 
 /**
  * Capabilities the hub advertises for a worker generation. `sessionWorkerPorts`
- * is set once the hub serves the worker's writer / egress / broker ports (see
- * `serveWriterPort` and the egress/broker servers); until then the entry uses an
- * in-worker fallback so a session cannot hang on an unserved port.
+ * is `true` once the hub serves the worker's writer / egress / broker ports (see
+ * `serveWriterPort` and the egress/broker servers); the `false`/absent member
+ * means the entry uses an in-worker fallback so a session cannot hang on an
+ * unserved port. Modelled as a union so the served state is an explicit `true`,
+ * never a truthy accident.
  */
-export interface SessionWorkerCapabilities {
-  readonly sessionWorkerPorts?: boolean
-}
+export type SessionWorkerCapabilities =
+  | { readonly sessionWorkerPorts: true }
+  | { readonly sessionWorkerPorts?: false }
 
 export interface SessionWorkerInit {
   readonly snapshot: WorkerSnapshot
@@ -174,6 +177,9 @@ export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
   if (typeof candidate.snapshot !== "object" || candidate.snapshot === null) {
     throw new Error("session worker workerData.snapshot is required")
   }
+  if (typeof candidate.snapshot.flags !== "object" || candidate.snapshot.flags === null) {
+    throw new Error("session worker workerData.snapshot.flags is required")
+  }
   if (typeof candidate.env !== "object" || candidate.env === null) {
     throw new Error("session worker workerData.env is required")
   }
@@ -189,7 +195,14 @@ export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
   ) {
     throw new Error(`session worker workerData.workerID must be a non-negative integer, received ${candidate.workerID}`)
   }
-  return candidate as SessionWorkerInit
+  // Parse the hub-resolved flags into a trusted `RuntimeFlags.Info` at the isolate
+  // boundary. The worker never re-reads its own `process.env` for flags; the
+  // snapshot is the single source of truth, so a hub-only override reaches the
+  // session loop.
+  return {
+    ...candidate,
+    snapshot: { ...candidate.snapshot, flags: RuntimeFlags.parseInfo(candidate.snapshot.flags) },
+  } as SessionWorkerInit
 }
 
 // ---------------------------------------------------------------------------
@@ -373,31 +386,12 @@ export function createControlPidReporter(
 // Model bootstrap.
 // ---------------------------------------------------------------------------
 
-/**
- * The reduced-provider defaults for a legacy bootstrap that predates the
- * descriptor fields (only the non-owned test helper still emits one). A real
- * bootstrap always carries its own capabilities/limit.
- */
-const DEFAULT_WORKER_CAPABILITIES: SerializedModelCapabilities = {
-  temperature: true,
-  reasoning: false,
-  attachment: false,
-  toolcall: true,
-  interleaved: false,
-}
-const DEFAULT_WORKER_LIMIT: SerializedModelLimit = { context: 128_000, output: 4096 }
-
 /** The descriptor fields the reduced provider consumes (see `layer.ts`). */
 function modelConfig(model: SessionWorkerModel): WorkerModelConfig {
-  // The frozen wire shape names the model `modelID`; a legacy bootstrap still
-  // names it `model`. Accept both at this one boundary so an old payload cannot
-  // reach the reduced provider as `undefined`.
-  const legacy = model as SessionWorkerModel & { readonly model?: string }
-  const modelID = model.modelID ?? legacy.model ?? ""
   return {
-    providerID: model.providerID ?? modelID,
-    modelID,
-    apiId: model.apiId ?? modelID,
+    providerID: model.providerID,
+    modelID: model.modelID,
+    apiId: model.apiId,
     npm: model.npm ?? "@ai-sdk/openai-compatible",
     baseUrl: model.baseUrl,
     apiKey: model.apiKey,
@@ -405,8 +399,8 @@ function modelConfig(model: SessionWorkerModel): WorkerModelConfig {
     // The wire shapes (`SerializedModelCapabilities` / a loose variants record)
     // are the frozen isolate contract; `WorkerModelConfig` is the reduced
     // provider's stricter projection. Narrowing here is the single boundary.
-    capabilities: (model.capabilities ?? DEFAULT_WORKER_CAPABILITIES) as WorkerModelConfig["capabilities"],
-    limit: model.limit ?? DEFAULT_WORKER_LIMIT,
+    capabilities: model.capabilities as WorkerModelConfig["capabilities"],
+    limit: model.limit,
     ...(model.options === undefined ? {} : { options: model.options }),
     ...(model.variants === undefined ? {} : { variants: model.variants as WorkerModelConfig["variants"] }),
     ...(model.providerOptions === undefined ? {} : { providerOptions: model.providerOptions }),
@@ -505,7 +499,7 @@ export interface SessionWorkOptions {
  * loop — instead of the bare `loop` that expects the row to already exist.
  */
 export function createSessionWork(options: SessionWorkOptions): SessionWork {
-  return (sessionID, carriedPrompt) => {
+  return (sessionID, carriedPrompt, carriedShell) => {
     const run = Effect.gen(function* () {
       if (options.registerControl !== undefined) {
         const runState = yield* Effect.serviceOption(SessionRunState.Service)
@@ -529,13 +523,17 @@ export function createSessionWork(options: SessionWorkOptions): SessionWork {
       if (options.prompt !== false) {
         const prompt = yield* Effect.serviceOption(SessionPrompt.Service)
         if (Option.isSome(prompt)) {
-          // A carried prompt persists its user message (`createUserMessage`)
-          // before looping; the run's `sessionID` is authoritative so the row
-          // always lands on the session this run was admitted for.
+          // A carried shell replays the caller's full `SessionPrompt.shell`
+          // path (persist + shell + settle) in-worker; a carried prompt persists
+          // its user message (`createUserMessage`) before looping. The run's
+          // `sessionID` is authoritative either way, so the row always lands on
+          // the session this run was admitted for.
           const result =
-            carriedPrompt === undefined
-              ? yield* prompt.value.loop(new SessionPrompt.LoopInput({ sessionID }))
-              : yield* prompt.value.prompt({ ...carriedPrompt, sessionID })
+            carriedShell !== undefined
+              ? yield* prompt.value.shell({ ...carriedShell, sessionID })
+              : carriedPrompt === undefined
+                ? yield* prompt.value.loop(new SessionPrompt.LoopInput({ sessionID }))
+                : yield* prompt.value.prompt({ ...carriedPrompt, sessionID })
           return { sessionID, value: result } satisfies SessionExecutionResult
         }
       }
@@ -700,6 +698,21 @@ export interface BootstrapSessionWorkerOptions {
 }
 
 /**
+ * Whether the hub serves this worker's writer / egress / broker ports, i.e.
+ * whether the full prompt path boots. A discriminated switch over the
+ * capabilities union keeps the two boot modes explicit at the decision site.
+ */
+function servesWorkerPorts(capabilities: SessionWorkerCapabilities | undefined): boolean {
+  switch (capabilities?.sessionWorkerPorts) {
+    case true:
+      return true
+    case false:
+    case undefined:
+      return false
+  }
+}
+
+/**
  * Build the reduced layer and install the executor. Split from module scope so
  * tests can import this module (`buildWorkerClients`, the registry) without a
  * worker context; the module only bootstraps when `workerData` is present.
@@ -746,7 +759,7 @@ export function bootstrapSessionWorker(
   // The real `SessionPrompt` loop needs the writer-backed Database and an
   // ambient `InstanceRef`; only the full hub-port wiring provides them. The
   // degraded (no-port) boot runs the reduced pipeline.
-  const usePrompt = init.capabilities?.sessionWorkerPorts === true
+  const usePrompt = servesWorkerPorts(init.capabilities)
   if (usePrompt) {
     const writerChannel = new MessageChannel()
     const egressChannel = new MessageChannel()
@@ -803,8 +816,11 @@ export function bootstrapSessionWorker(
     init.plugins === undefined
       ? undefined
       : createWorkerPluginHost(init.plugins, systemTransform === undefined ? undefined : { systemTransform })
+  // Pass the real hub-proxy clients so the reduced LLM sub-graph routes
+  // `Permission` over the hub control port (never a silent mock); absent
+  // (degraded boot) the sub-graph uses a fail-loud boundary.
   const modelClient = llmModelClientLayer(config).pipe(
-    Layer.provide(reducedLlmLayer(init.snapshot, config, undefined, plugins)),
+    Layer.provide(reducedLlmLayer(init.snapshot, config, hubProxies, plugins)),
   )
 
   const runtime = buildSessionWorkerLayer({

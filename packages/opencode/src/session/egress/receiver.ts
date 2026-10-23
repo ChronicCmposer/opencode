@@ -4,8 +4,8 @@
 // are reassembled with the length-prefixed codec (a frame may be split across
 // deliveries and a delivery may carry several frames). Event frames are handed to
 // `onFrame` in arrival order — which is commit order for a single worker — and
-// durable `(generation, ordinal)` pairs are checked for generation-scoped
-// monotonicity, so an out-of-order or stale-generation durable frame fails loud
+// durable `(generation, ordinal)` pairs are checked for generation-scoped order,
+// so an out-of-order, stale-generation, or gapped durable frame fails loud
 // instead of silently corrupting commit order. The `end`/`resync`/`ack` control
 // frames are surfaced distinctly rather than swallowed.
 //
@@ -14,9 +14,29 @@
 // blocks the worker. Durable events are never dropped.
 
 import { type EventsAckPayload, type EventsFrame, type EventsResyncPayload, decodeFrameChunks } from "./frame"
+// The single durability test lives on the shared envelope; the codec re-exports
+// it, but the receiver depends on the canonical module so there is one source.
+import { durableMetaOf } from "@/session/worker/frame"
 import { compareOrdinals, type WriterOrdinal } from "./ordinal"
 
 type EventFrame = Extract<EventsFrame, { readonly kind: "event" }>
+
+/**
+ * Raised when a durable event violates generation-scoped order: a regression
+ * (stale generation or repeated/lower ordinal) or a gap in the ordinal sequence
+ * within one generation. Named so callers can distinguish it from a framing
+ * error and decide to fail loud or resync.
+ */
+export class DurableOrderError extends Error {
+  constructor(
+    readonly reason: "out-of-order" | "gap",
+    got: WriterOrdinal,
+    last: WriterOrdinal,
+  ) {
+    super(`${reason} durable egress: got ${got.generation}/${got.ordinal}, last ${last.generation}/${last.ordinal}`)
+    this.name = "DurableOrderError"
+  }
+}
 
 export interface EgressReceiverOptions {
   readonly port: MessagePort
@@ -71,11 +91,18 @@ function concat(left: Uint8Array, right: Uint8Array): Uint8Array {
   return joined
 }
 
-/** A durable event carries BOTH a generation and an ordinal; a delta carries neither. */
-function durableOrdinal(frame: EventFrame): WriterOrdinal | undefined {
-  const { generation, ordinal } = frame.payload
-  if (generation === undefined || ordinal === undefined) return undefined
-  return { generation, ordinal }
+/**
+ * Validate a durable's `(generation, ordinal)` against the last accepted one.
+ * A lower generation, or a repeated/lower ordinal within the same generation, is
+ * out-of-order; an ordinal that skips ahead within the same generation is a gap.
+ * A generation bump resets the sequence, so it is accepted with any ordinal.
+ */
+function assertDurableOrder(meta: WriterOrdinal, last: WriterOrdinal | undefined): void {
+  if (last === undefined) return
+  if (meta.generation < last.generation) throw new DurableOrderError("out-of-order", meta, last)
+  if (meta.generation !== last.generation) return
+  if (compareOrdinals(meta, last) <= 0) throw new DurableOrderError("out-of-order", meta, last)
+  if (meta.ordinal !== last.ordinal + 1) throw new DurableOrderError("gap", meta, last)
 }
 
 export function createEgressReceiver(options: EgressReceiverOptions): EgressReceiver {
@@ -96,13 +123,9 @@ export function createEgressReceiver(options: EgressReceiverOptions): EgressRece
   }
 
   const handleEvent = (frame: EventFrame, bytes: Uint8Array): void => {
-    const meta = durableOrdinal(frame)
+    const meta = durableMetaOf(frame)
     if (meta) {
-      if (last && compareOrdinals(meta, last) <= 0) {
-        throw new Error(
-          `out-of-order durable egress: got ${meta.generation}/${meta.ordinal}, last ${last.generation}/${last.ordinal}`,
-        )
-      }
+      assertDurableOrder(meta, last)
       last = meta
       received++
       options.onFrame(frame, bytes)

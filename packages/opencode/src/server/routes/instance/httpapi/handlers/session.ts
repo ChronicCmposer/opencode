@@ -15,6 +15,7 @@ import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
 import { Todo } from "@/session/todo"
 import { MessageID, PartID, SessionID } from "@/session/schema"
+import type { CancelOutcome } from "@/session/worker/cancel"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Effect, Option, Schema, Scope } from "effect"
 import * as Stream from "effect/Stream"
@@ -57,8 +58,42 @@ const idleAbortOutcome = (sessionID: SessionID): typeof AbortOutcome.Type => ({
   durationMs: 0,
 })
 
-const resolveAbortOutcome = (sessionID: SessionID, outcome: unknown): typeof AbortOutcome.Type =>
-  (outcome as typeof AbortOutcome.Type | undefined) ?? idleAbortOutcome(sessionID)
+/**
+ * Parse a resolved cancel outcome into the wire shape. The `mode` → `winner`
+ * correlation is an invariant of the cancel controller (`worker/cancel.ts`), so
+ * the exhaustive switch restates it per mode rather than trusting a widened pair.
+ */
+const toAbortOutcome = (outcome: CancelOutcome): typeof AbortOutcome.Type => {
+  switch (outcome.mode) {
+    case "cooperative":
+      return {
+        sessionID: outcome.sessionID,
+        mode: "cooperative",
+        winner: "cancel",
+        acknowledged: outcome.acknowledged,
+        durationMs: outcome.durationMs,
+      }
+    case "terminated":
+      return {
+        sessionID: outcome.sessionID,
+        mode: "terminated",
+        winner: "cancel",
+        acknowledged: outcome.acknowledged,
+        durationMs: outcome.durationMs,
+      }
+    case "completed":
+      return {
+        sessionID: outcome.sessionID,
+        mode: "completed",
+        winner: "completion",
+        acknowledged: outcome.acknowledged,
+        durationMs: outcome.durationMs,
+      }
+  }
+}
+
+const resolveAbortOutcome = (sessionID: SessionID, outcome: CancelOutcome | undefined): typeof AbortOutcome.Type =>
+  outcome === undefined ? idleAbortOutcome(sessionID) : toAbortOutcome(outcome)
 
 export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", (handlers) =>
   Effect.gen(function* () {

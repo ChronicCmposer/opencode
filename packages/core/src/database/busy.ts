@@ -13,33 +13,57 @@ import * as Schema from "effect/Schema"
 import { isSqlError } from "effect/unstable/sql/SqlError"
 import { resolveBusyRetryConfig, type BusyRetryConfig } from "./pragmas"
 
-/** Native SQLite codes that mean "the database is locked by someone else". */
-const BUSY_SQLITE_CODES: ReadonlySet<string> = new Set(["SQLITE_BUSY", "SQLITE_LOCKED"])
+/**
+ * Native SQLite code families that mean "the database is locked by someone else".
+ * SQLite extends the base code with a suffix (`SQLITE_BUSY_SNAPSHOT`,
+ * `SQLITE_LOCKED_SHAREDCACHE`, …), so membership is a prefix match on the
+ * underscore boundary rather than an exact-code set.
+ */
+const BUSY_SQLITE_CODES: ReadonlyArray<string> = ["SQLITE_BUSY", "SQLITE_LOCKED"]
 
 const LOCKED_MESSAGE = "database is locked"
 
+/** True when `code` is a busy/locked code or an extended form of one. */
+function isBusyCode(code: string): boolean {
+  return BUSY_SQLITE_CODES.some((base) => code === base || code.startsWith(`${base}_`))
+}
+
 function hasBusyCode(error: object): boolean {
   const code = (error as { code?: unknown }).code
-  if (typeof code === "string" && BUSY_SQLITE_CODES.has(code)) return true
+  if (typeof code === "string" && isBusyCode(code)) return true
   // The writer-side classifier reads `sqliteCode`; mirror that for parity.
   const sqliteCode = (error as { sqliteCode?: unknown }).sqliteCode
-  return typeof sqliteCode === "string" && BUSY_SQLITE_CODES.has(sqliteCode)
+  return typeof sqliteCode === "string" && isBusyCode(sqliteCode)
+}
+
+/**
+ * True when `error` carries a recognizable native-driver shape. The "database is
+ * locked" message fallback is only trustworthy for these: an arbitrary error
+ * whose message happens to contain that text must not trigger a retry.
+ */
+function isNativeSqliteError(error: object): boolean {
+  const name = (error as { name?: unknown }).name
+  if (name === "SQLiteError") return true
+  if (typeof (error as { errno?: unknown }).errno === "number") return true
+  if (typeof (error as { sqliteCode?: unknown }).sqliteCode === "string") return true
+  const code = (error as { code?: unknown }).code
+  return (typeof code === "string" && code.startsWith("SQLITE_")) || typeof code === "number"
 }
 
 function hasBusyMessage(error: object): boolean {
+  if (!isNativeSqliteError(error)) return false
   const message = (error as { message?: unknown }).message
   if (typeof message !== "string") return false
-  return (
-    message.includes("SQLITE_BUSY") || message.includes("SQLITE_LOCKED") || message.includes(LOCKED_MESSAGE)
-  )
+  return message.includes("SQLITE_BUSY") || message.includes("SQLITE_LOCKED") || message.includes(LOCKED_MESSAGE)
 }
 
 /**
  * True when `error` is a lock/busy failure a retry can recover from. Recognizes
  * the `LockTimeoutError` reason produced by `classifySqliteError`, the native
- * `SQLITE_BUSY`/`SQLITE_LOCKED` codes, and the native "database is locked"
- * message. Mirrors the writer isolate's `isSqliteBusy` without importing across
- * packages (core stays self-contained).
+ * `SQLITE_BUSY`/`SQLITE_LOCKED` code families (including extended forms), and a
+ * native-driver error whose message says the database is locked. Mirrors the
+ * writer isolate's `isSqliteBusy` without importing across packages (core stays
+ * self-contained).
  */
 export function isBusySqlError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false
@@ -54,7 +78,7 @@ export interface BusyRetryOptions {
   readonly sleep?: (ms: number) => Effect.Effect<void>
 }
 
-/** Raised (as a defect, not a typed failure) once the retry budget is spent. */
+/** Raised as a typed failure once the retry budget is spent. */
 export class BusyRetriesExhaustedError extends Schema.TaggedErrorClass<BusyRetriesExhaustedError>()(
   "Busy.BusyRetriesExhaustedError",
   {
@@ -82,23 +106,25 @@ function resolveRetryConfig(options: BusyRetryOptions): BusyRetryConfig {
 
 /**
  * Retry `effect` with bounded exponential backoff whenever it fails with a busy
- * SQL error. Non-busy failures and successes pass through unchanged, so the
- * error type is preserved. Once `retries` additional attempts are exhausted the
- * effect dies with `BusyRetriesExhaustedError` carrying the attempt count and
- * the last cause — the caller cannot silently continue on a stuck lock.
+ * SQL error. Non-busy failures and successes pass through unchanged. Once
+ * `retries` additional attempts are exhausted the effect fails with the typed
+ * `BusyRetriesExhaustedError` carrying the attempt count and the last cause, so
+ * a caller can recover deliberately instead of observing an uncatchable defect.
+ * The SQLite `Connection` adapters fold this reason back into their `SqlError`
+ * channel at the driver boundary, where the interface requires it.
  */
 export function withBusyRetry<A, E, R>(
   effect: Effect.Effect<A, E, R>,
   options: BusyRetryOptions = {},
-): Effect.Effect<A, E, R> {
+): Effect.Effect<A, E | BusyRetriesExhaustedError, R> {
   const { retries, baseDelayMs, maxDelayMs } = resolveRetryConfig(options)
   const sleep = options.sleep ?? Effect.sleep
 
-  const attempt = (retriesRemaining: number, attemptsMade: number): Effect.Effect<A, E, R> =>
+  const attempt = (retriesRemaining: number, attemptsMade: number): Effect.Effect<A, E | BusyRetriesExhaustedError, R> =>
     Effect.catch(effect, (error) => {
       if (!isBusySqlError(error)) return Effect.fail(error)
       if (retriesRemaining <= 0) {
-        return Effect.die(new BusyRetriesExhaustedError({ attempts: attemptsMade, lastCause: error }))
+        return Effect.fail(new BusyRetriesExhaustedError({ attempts: attemptsMade, lastCause: error }))
       }
       const delay = Math.min(baseDelayMs * 2 ** (attemptsMade - 1), maxDelayMs)
       return Effect.andThen(sleep(delay), attempt(retriesRemaining - 1, attemptsMade + 1))

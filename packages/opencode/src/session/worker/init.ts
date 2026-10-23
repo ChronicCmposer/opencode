@@ -38,6 +38,7 @@ import type {
   WorkerPluginHooks,
 } from "./plugin-host"
 import { buildWorkerSnapshot, type BuildWorkerSnapshotOptions } from "./snapshot"
+import { stringHeaders } from "./headers"
 
 // ---------------------------------------------------------------------------
 // Environment overlay (step 7)
@@ -153,15 +154,6 @@ function resolveBaseUrl(
   const configured = options["baseURL"]
   const url = typeof configured === "string" && configured !== "" ? configured : fallback
   return url.replace(/\$\{([^}]+)\}/g, (match, key) => env[String(key)] ?? match)
-}
-
-function stringHeaders(value: unknown): Record<string, string> {
-  if (value === null || typeof value !== "object") return {}
-  const headers: Record<string, string> = {}
-  for (const [key, header] of Object.entries(value as Record<string, unknown>)) {
-    if (typeof header === "string") headers[key] = header
-  }
-  return headers
 }
 
 /**
@@ -359,35 +351,29 @@ function pluginHookInput(
   }
 }
 
-/**
- * Sentinel baseline value for `maxOutputTokens`. The hub only ships the fields a
- * plugin changed; a plugin that *clears* the cap (`output.maxOutputTokens =
- * undefined`) must still be detected, so the baseline uses an impossible value
- * (never a real token cap) and `undefined` after the hook ships as `null`.
- */
-const MAX_OUTPUT_TOKENS_SENTINEL = -1
+/** The sampling fields a `chat.params` hook may set or clear. */
+const CHAT_PARAM_KEYS = ["temperature", "topP", "topK", "maxOutputTokens"] as const
 
-/** The baseline `chat.params` output the hub resolves a hook against. */
+/**
+ * The baseline `chat.params` output the hub resolves a hook against. The worker
+ * recomputes the sampling fields from its own model/agent at request time; the
+ * hub only ships the *diff* the plugin introduces, so the baseline omits them
+ * entirely (the plugin's absolute values still win).
+ */
 function pluginParamsBaseline(model: WorkerModel): ChatParamsOutput {
-  return {
-    // The worker recomputes these from its own model/agent at request time; the
-    // hub only ships the *diff* the plugin introduces, so the baseline is
-    // deliberately unset (the plugin's absolute values still win).
-    temperature: undefined as unknown as number,
-    topP: undefined as unknown as number,
-    topK: undefined as unknown as number,
-    maxOutputTokens: MAX_OUTPUT_TOKENS_SENTINEL,
-    options: { ...(model.options ?? {}) },
-  }
+  return { options: { ...(model.options ?? {}) } }
 }
 
 /** The fields a `chat.params` hook changed, as cloneable data (`null` = cleared). */
 function diffResolvedParams(before: ChatParamsOutput, after: ChatParamsOutput): ResolvedChatParams {
   const diff: Record<string, unknown> = {}
-  for (const key of ["temperature", "topP", "topK", "maxOutputTokens"] as const) {
-    const next = (after as unknown as Record<string, unknown>)[key]
-    const previous = (before as unknown as Record<string, unknown>)[key]
-    if (next !== previous) diff[key] = next ?? null
+  for (const key of CHAT_PARAM_KEYS) {
+    // A field the hook left untouched is unchanged; a field it *added* (even as
+    // `undefined`, clearing the worker's cap) or changed ships as a diff.
+    const presentBefore = key in before
+    const presentAfter = key in after
+    if (presentBefore === presentAfter && before[key] === after[key]) continue
+    diff[key] = after[key] ?? null
   }
   const options: Record<string, unknown> = {}
   for (const [key, value] of Object.entries(after.options)) {

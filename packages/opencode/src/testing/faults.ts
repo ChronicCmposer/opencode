@@ -160,10 +160,28 @@ export function resetFaultsCache(): void {
 }
 
 /**
+ * Build-time gate for the whole seam. `script/build.ts` inlines
+ * `OPENCODE_TEST_FAULTS_ENABLED: false` into the production bundle, so every hook
+ * short-circuits before it ever touches the environment. In dev/test the symbol is
+ * absent, so the `OPENCODE_TEST_FAULTS` env gate is honoured exactly as before.
+ */
+declare const OPENCODE_TEST_FAULTS_ENABLED: boolean | undefined
+
+/**
+ * True when the build compiled the seam out. `typeof` guards the bare identifier
+ * so an absent define (dev/test) is `undefined` rather than a `ReferenceError`.
+ */
+function compiledOut(): boolean {
+  return typeof OPENCODE_TEST_FAULTS_ENABLED !== "undefined" && OPENCODE_TEST_FAULTS_ENABLED === false
+}
+
+/**
  * The active plan, read from the environment at call time (cached per value so
- * tests may change the gate between cases without a stale plan lingering).
+ * tests may change the gate between cases without a stale plan lingering). Once
+ * the build compiles the seam out this is unconditionally the disabled plan.
  */
 export function activeFaults(): FaultPlan {
+  if (compiledOut()) return DISABLED_PLAN
   return planCache.read(process.env[FAULTS_ENV])
 }
 
@@ -172,9 +190,47 @@ export interface CrashOptions {
   readonly onCrash?: (directive: FaultDirective) => never
 }
 
+/**
+ * The three fault hooks behind one indirection, so the production build can swap
+ * in a no-op port (or an Effect `Layer.empty`) without each call site changing.
+ */
+export interface FaultPort {
+  crashWorker(point: string, options?: CrashOptions): void
+  failCommitAt(point: string): CommitFault | undefined
+  abortTxAfter(point: string): boolean
+}
+
 function exitIsolate(): never {
   process.exit(WORKER_CRASH_EXIT_CODE)
 }
+
+/** The real hooks: env-gated, inert unless armed. */
+const liveFaultPort: FaultPort = {
+  crashWorker(point, options = {}) {
+    const faults = activeFaults()
+    if (!faults.enabled || !faults.has("crashWorker", point)) return
+    ;(options.onCrash ?? exitIsolate)({ kind: "crashWorker", point })
+  },
+  failCommitAt(point) {
+    const faults = activeFaults()
+    if (!faults.enabled || !faults.has("failCommitAt", point)) return undefined
+    return new CommitFault({ point, sqliteCode: "SQLITE_BUSY", message: `forced SQLITE_BUSY at ${point}` })
+  },
+  abortTxAfter(point) {
+    const faults = activeFaults()
+    return faults.enabled && faults.has("abortTxAfter", point)
+  },
+}
+
+/** The production port: every hook is a no-op, with no environment read. */
+const emptyFaultPort: FaultPort = {
+  crashWorker: () => {},
+  failCommitAt: () => undefined,
+  abortTxAfter: () => false,
+}
+
+/** The selected port: the no-op one once the build compiles the seam out. */
+const faultPort: FaultPort = compiledOut() ? emptyFaultPort : liveFaultPort
 
 /**
  * Hard-crash the current isolate when `crashWorker@point` is armed. No-op else.
@@ -182,9 +238,7 @@ function exitIsolate(): never {
  * killing the test runner.
  */
 export function crashWorker(point: string, options: CrashOptions = {}): void {
-  const faults = activeFaults()
-  if (!faults.enabled || !faults.has("crashWorker", point)) return
-  ;(options.onCrash ?? exitIsolate)({ kind: "crashWorker", point })
+  faultPort.crashWorker(point, options)
 }
 
 /**
@@ -192,9 +246,7 @@ export function crashWorker(point: string, options: CrashOptions = {}): void {
  * `undefined`. The caller turns the fault into its own typed failure channel.
  */
 export function failCommitAt(point: string): CommitFault | undefined {
-  const faults = activeFaults()
-  if (!faults.enabled || !faults.has("failCommitAt", point)) return undefined
-  return new CommitFault({ point, sqliteCode: "SQLITE_BUSY", message: `forced SQLITE_BUSY at ${point}` })
+  return faultPort.failCommitAt(point)
 }
 
 /**
@@ -202,8 +254,7 @@ export function failCommitAt(point: string): CommitFault | undefined {
  * transaction mid-write (requester death), as if the requester's port closed.
  */
 export function abortTxAfter(point: string): boolean {
-  const faults = activeFaults()
-  return faults.enabled && faults.has("abortTxAfter", point)
+  return faultPort.abortTxAfter(point)
 }
 
 export * as Faults from "./faults"

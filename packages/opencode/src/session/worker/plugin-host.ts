@@ -10,11 +10,17 @@
 // and a mutable `output`; hooks run in registration order and each observes the
 // previous hook's mutations. A throwing hook aborts the chain (fail loud).
 
+/**
+ * The mutable `chat.params` output a hook rewrites. The sampling fields are
+ * optional: an absent field means "the worker's own baseline", so a plugin need
+ * only set what it changes and a worker that does not advertise a field cannot
+ * claim one. `options` is always present (the merged provider options).
+ */
 export interface ChatParamsOutput {
-  temperature: number
-  topP: number
-  topK: number
-  maxOutputTokens: number | undefined
+  temperature?: number
+  topP?: number
+  topK?: number
+  maxOutputTokens?: number
   options: Record<string, unknown>
 }
 
@@ -127,26 +133,30 @@ async function runHook<TInput, TOutput>(
   return output
 }
 
+/** The mutable sampling fields a `chat.params` plugin may set. */
+const CHAT_PARAM_KEYS = ["temperature", "topP", "topK", "maxOutputTokens"] as const
+type ChatParamKey = (typeof CHAT_PARAM_KEYS)[number]
+
 /**
  * Apply every plugin's hub-resolved `chat.params` diff over `output`, in plugin
  * order. A field absent from the resolved effect is left untouched; a `null`
  * field clears the value (the plugin set it to `undefined`).
  */
 function applyResolvedParams(plugins: readonly WorkerPlugin[], output: ChatParamsOutput): ChatParamsOutput {
-  const next: Record<string, unknown> = { ...output, options: { ...output.options } }
+  const next: ChatParamsOutput = { ...output, options: { ...output.options } }
   for (const plugin of plugins) {
     const resolved = plugin.resolved?.["chat.params"]
     if (resolved === undefined) continue
-    for (const key of ["temperature", "topP", "topK", "maxOutputTokens"] as const) {
+    for (const key of CHAT_PARAM_KEYS) {
       const value = resolved[key]
       if (value === undefined) continue
       next[key] = value ?? undefined
     }
     if (resolved.options !== undefined) {
-      next.options = { ...(next.options as Record<string, unknown>), ...resolved.options }
+      next.options = { ...next.options, ...resolved.options }
     }
   }
-  return next as unknown as ChatParamsOutput
+  return next
 }
 
 /** Merge every plugin's hub-resolved `chat.headers` over `output`, in plugin order. */

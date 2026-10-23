@@ -6,6 +6,7 @@
 
 import { describe, expect, test } from "bun:test"
 import path from "node:path"
+import { classifySqliteError } from "effect/unstable/sql/SqlError"
 import {
   WriterCrashedError,
   WriterRemoteError,
@@ -19,7 +20,7 @@ import { WorkerWriterError, createWorkerWriterClient } from "@/session/worker/wr
 import { FAULTS_ENV } from "@/testing/faults"
 import { flush } from "../../lib/async"
 import { tmpdir } from "../../fixture/fixture"
-import { SCHEMA, healthyEnv } from "./fixtures"
+import { SCHEMA, ev, healthyEnv } from "./fixtures"
 
 const fakeEntry = new URL("./fake-worker.ts", import.meta.url)
 
@@ -128,6 +129,118 @@ describe("writer client: failure surfacing (steps 11, 14, 15, 16)", () => {
 
     await expect(client.open("x.db")).rejects.toBeInstanceOf(WriterCrashedError)
     expect(client.isAlive).toBe(false)
+  })
+})
+
+describe("writer client: crash reporting and timeouts (B5, A22, B6)", () => {
+  test("reports onCrash for a startup crash that never became ready (B5)", async () => {
+    const crashes: string[] = []
+    await using client = createWriterClient({
+      entry: fakeEntry,
+      workerData: { mode: "exit-once" },
+      timeoutMs: 1000,
+      onCrash: (error) => crashes.push(error.message),
+    })
+
+    await expect(client.open("x.db")).rejects.toBeInstanceOf(WriterCrashedError)
+    expect(crashes).toHaveLength(1)
+  })
+
+  test("a timed-out mutating frame is fatal for the generation (A22)", async () => {
+    const crashes: string[] = []
+    await using client = createWriterClient({
+      entry: fakeEntry,
+      workerData: { mode: "stall", stall: "publish" },
+      timeoutMs: 80,
+      onCrash: (error) => crashes.push(error.message),
+    })
+    await client.open("x.db")
+
+    const error = await client.publish(ev("t", "a"), { durable: true }).then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+    expect(error).toBeInstanceOf(WriterTimeoutError)
+    // The generation was dropped, and the crash was reported.
+    expect(client.isAlive).toBe(false)
+    expect(crashes).toHaveLength(1)
+
+    // The next call respawns with a bumped generation.
+    await client.open("x.db")
+    expect(client.generation).toBe(2)
+    expect(client.isAlive).toBe(true)
+  })
+
+  test("a timed-out read only rejects the caller and keeps the generation (A22)", async () => {
+    await using client = createWriterClient({
+      entry: fakeEntry,
+      workerData: { mode: "stall", stall: "query" },
+      timeoutMs: 80,
+    })
+    await client.open("x.db")
+
+    await expect(client.query("all", "select 1")).rejects.toBeInstanceOf(WriterTimeoutError)
+    expect(client.isAlive).toBe(true)
+    expect(client.generation).toBe(1)
+  })
+
+  test("replays the open recorded before a mid-open crash (B6)", async () => {
+    await using client = createWriterClient({
+      entry: fakeEntry,
+      workerData: { mode: "crash-first-open" },
+      timeoutMs: 1000,
+    })
+
+    await expect(client.open("x.db")).rejects.toBeInstanceOf(WriterCrashedError)
+
+    // The respawn replays the open recorded before the crash, so the isolate is
+    // usable (the fake worker refuses any request before an open).
+    expect(await client.query("all", "select 1")).toBeNull()
+    expect(client.isAlive).toBe(true)
+    expect(client.generation).toBe(2)
+  })
+
+  test("replays the storage dir recorded before a mid-open crash (B6)", async () => {
+    await using client = createWriterClient({
+      entry: fakeEntry,
+      workerData: { mode: "crash-first-open" },
+      timeoutMs: 1000,
+    })
+
+    await expect(client.openStorage("/tmp/storage")).rejects.toBeInstanceOf(WriterCrashedError)
+
+    expect(await client.query("all", "select 1")).toBeNull()
+    expect(client.isAlive).toBe(true)
+    expect(client.generation).toBe(2)
+  })
+})
+
+describe("writer client: failure code classification (R1#2)", () => {
+  test("carries the native code and classifies a writer lock as LockTimeoutError, not UnknownError", async () => {
+    await using client = createWriterClient({
+      entry: fakeEntry,
+      workerData: { mode: "coded-failure" },
+      timeoutMs: 1000,
+    })
+    await client.open("x.db")
+
+    const error = await client.query("all", "select 1").then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+    expect(error).toBeInstanceOf(WriterRemoteError)
+    const remote = error as WriterRemoteError
+    expect(remote.tag).toBe("SQLITE_BUSY_EXHAUSTED")
+    expect(remote.code).toBe("SQLITE_BUSY")
+    // The code the port carried is what lets the receiver classify the lock.
+    expect(classifySqliteError(remote, { message: "writer statement failed", operation: "execute" })._tag).toBe(
+      "LockTimeoutError",
+    )
+  })
+
+  test("classifies a remote error with no code as UnknownError", () => {
+    const remote = new WriterRemoteError("SQLITE_BUSY_EXHAUSTED", "busy")
+    expect(classifySqliteError(remote, { operation: "execute" })._tag).toBe("UnknownError")
   })
 })
 

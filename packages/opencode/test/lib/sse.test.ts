@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { applySsePayload, createSseAccumulator, readSseStream } from "./sse"
+import { applySsePayload, createSseAccumulator, parseSseFrame, readSsePayloads, readSseStream } from "./sse"
 
 function streamOf(text: string): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder()
@@ -37,5 +37,16 @@ describe("shared SSE parsing", () => {
     const body = ': note\n\ndata: not-json\n\ndata: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
     const acc = await readSseStream(streamOf(body))
     expect(acc.text).toBe("ok")
+  })
+
+  test("parseSseFrame decodes every data line and skips terminators", () => {
+    const frame = ': keep-alive\ndata: {"a":1}\ndata: [DONE]\ndata: {"b":2}\ndata: not-json'
+    expect(parseSseFrame(frame)).toEqual([{ a: 1 }, { b: 2 }])
+  })
+
+  test("readSsePayloads streams each decoded payload to the callback", async () => {
+    const seen: unknown[] = []
+    await readSsePayloads(streamOf('data: {"n":1}\n\ndata: {"n":2}\n\ndata: [DONE]\n\n'), (payload) => seen.push(payload))
+    expect(seen).toEqual([{ n: 1 }, { n: 2 }])
   })
 })

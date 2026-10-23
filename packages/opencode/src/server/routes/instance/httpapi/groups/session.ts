@@ -75,16 +75,36 @@ export const PermissionResponsePayload = Schema.Struct({
   response: PermissionV1.Reply,
 })
 
-// Cancellation outcome reported by `POST /session/:sessionID/abort`. Fields are
-// optional so an idle session with no active run (no outcome to report) still
-// serializes a 200 body rather than failing the declared success schema.
-export const AbortOutcome = Schema.Struct({
-  sessionID: Schema.optional(SessionID),
-  mode: Schema.optional(Schema.Literals(["cooperative", "terminated", "completed"])),
-  winner: Schema.optional(Schema.Literals(["cancel", "completion"])),
-  acknowledged: Schema.optional(Schema.Boolean),
-  durationMs: Schema.optional(Schema.Number),
+// Cancellation outcome reported by `POST /session/:sessionID/abort`, discriminated
+// on `mode`. `sessionID`, `mode` and `winner` are always present, so an idle body
+// with no outcome (`{}`) is not a valid response; the handler supplies the idle
+// "completed" outcome explicitly.
+const AbortOutcomeCooperative = Schema.Struct({
+  sessionID: SessionID,
+  mode: Schema.Literal("cooperative"),
+  winner: Schema.Literal("cancel"),
+  acknowledged: Schema.Boolean,
+  durationMs: Schema.Number,
 })
+const AbortOutcomeTerminated = Schema.Struct({
+  sessionID: SessionID,
+  mode: Schema.Literal("terminated"),
+  winner: Schema.Literal("cancel"),
+  acknowledged: Schema.Boolean,
+  durationMs: Schema.Number,
+})
+const AbortOutcomeCompleted = Schema.Struct({
+  sessionID: SessionID,
+  mode: Schema.Literal("completed"),
+  winner: Schema.Literal("completion"),
+  acknowledged: Schema.Boolean,
+  durationMs: Schema.Number,
+})
+export const AbortOutcome = Schema.Union([
+  AbortOutcomeCooperative,
+  AbortOutcomeTerminated,
+  AbortOutcomeCompleted,
+]).pipe(Schema.toTaggedUnion("mode"))
 
 export const SessionPaths = {
   list: root,

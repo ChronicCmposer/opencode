@@ -1,11 +1,15 @@
-// Phase 8.1 + 8.7 + 8.12 — hub-side egress session (plan tasks 8.1, 8.7, 8.12).
+// Test-only hub-side egress session (relocated from `src/session/egress/hub.ts`,
+// plan finding B1). Production serves the worker events port through
+// `session/worker/hub.ts`; this hub+SSE stream abstraction was never wired to a
+// production route, so it lives under `test/` and backs the hub/worker-egress
+// stream tests only.
 //
 // Ties a worker's dedicated egress port to a byte fan-out and exposes one async
 // byte stream per SSE client. The hub — not the worker — owns termination: on
 // `close` it drops buffered non-durable frames, emits a terminal `end`, and
-// closes the egress + control ports (plan decision line 83). Durable frames are
-// delivered as they arrive (immediate flush worker-side), so termination never
-// reorders or loses a committed boundary.
+// closes the egress + control ports. Durable frames are delivered as they arrive
+// (immediate flush worker-side), so termination never reorders or loses a
+// committed boundary.
 //
 // Termination is tracked with a `terminated` flag rather than re-decoding each
 // drained chunk to look for the `end` marker, and a durable-saturated subscriber
@@ -14,14 +18,15 @@
 
 import { endFrame } from "@/session/worker/frame"
 
-import type { ControlLink } from "./control"
-import { createControlLink } from "./control"
+import type { ControlLink } from "@/session/egress/control"
+import { createControlLink } from "@/session/egress/control"
+import { encodeFrame } from "@/session/egress/frame"
+import { createEgressReceiver, type EgressReceiver } from "@/session/egress/receiver"
 import { createFanout, type Fanout } from "./fanout"
-import { createEgressReceiver, type EgressReceiver } from "./receiver"
 
 export interface EgressHubOptions {
   readonly egressPort: MessagePort
-  /** Dedicated control port, distinct from egress (task 8.13). */
+  /** Dedicated control port, distinct from egress. */
   readonly controlPort?: MessagePort
   /** Per-client backpressure bound; defaults to 256. */
   readonly bound?: number
@@ -49,6 +54,8 @@ export interface EgressHub {
 }
 
 const END_FRAME = endFrame()
+/** The terminal frame's wire bytes, handed to subscribers that arrive after termination. */
+const END_BYTES = encodeFrame(END_FRAME)
 
 function createNotifier() {
   let waiters: (() => void)[] = []
@@ -114,6 +121,13 @@ export function createEgressHub(options: EgressHubOptions): EgressHub {
     async *stream(subscriberId) {
       const subscriber = fanout.subscribe(subscriberId)
       try {
+        // A subscriber that arrives AFTER termination never had `finalize`'s end
+        // frame queued for it, so hand it the terminal frame before returning;
+        // otherwise a late SSE client would see an empty, silently-truncated stream.
+        if (terminated) {
+          yield END_BYTES
+          return
+        }
         while (true) {
           // A durable-saturated overflow means a committed boundary was lost:
           // fail loud rather than emit a silently truncated stream.
@@ -134,5 +148,3 @@ export function createEgressHub(options: EgressHubOptions): EgressHub {
     close: finish,
   }
 }
-
-export * as EgressHubModule from "./hub"

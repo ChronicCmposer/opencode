@@ -8,7 +8,7 @@
 
 import { describe, expect, test } from "bun:test"
 import { encodeFrame, type EgressFrame } from "@/session/egress/frame"
-import { createEgressReceiver } from "@/session/egress/receiver"
+import { createEgressReceiver, DurableOrderError } from "@/session/egress/receiver"
 import { type EventsFrame, ackFrame, endFrame, eventFrame, resyncFrame } from "@/session/worker/frame"
 
 async function pollUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
@@ -110,8 +110,30 @@ describe("egress receiver over event frames", () => {
     harness.port1.postMessage(encodeFrame(eventFrame({ event: durableEvent("d2"), generation: 1, ordinal: 2 })))
     harness.port1.postMessage(encodeFrame(eventFrame({ event: durableEvent("d1"), generation: 1, ordinal: 1 })))
     await pollUntil(() => harness.errors.length === 1)
+    expect(harness.errors[0]).toBeInstanceOf(DurableOrderError)
     expect(harness.errors[0]?.message).toMatch(/out-of-order durable/)
     expect(harness.receiver.lastOrdinal()).toEqual({ generation: 1, ordinal: 2 })
+    harness.close()
+  })
+
+  test("detects an ordinal gap within a generation and fails loud", async () => {
+    const harness = setup()
+    harness.port1.postMessage(encodeFrame(eventFrame({ event: durableEvent("a"), generation: 1, ordinal: 1 })))
+    harness.port1.postMessage(encodeFrame(eventFrame({ event: durableEvent("c"), generation: 1, ordinal: 3 })))
+    await pollUntil(() => harness.errors.length === 1)
+    expect(harness.errors[0]).toBeInstanceOf(DurableOrderError)
+    expect(harness.errors[0]?.message).toMatch(/gap durable/)
+    // The gap is not accepted as the new last ordinal.
+    expect(harness.receiver.lastOrdinal()).toEqual({ generation: 1, ordinal: 1 })
+    harness.close()
+  })
+
+  test("a generation bump resets the sequence, so no gap is reported across generations", async () => {
+    const harness = setup()
+    harness.port1.postMessage(encodeFrame(eventFrame({ event: durableEvent("a"), generation: 1, ordinal: 9 })))
+    harness.port1.postMessage(encodeFrame(eventFrame({ event: durableEvent("b"), generation: 2, ordinal: 5 })))
+    await pollUntil(() => harness.frames.length === 2)
+    expect(harness.errors).toEqual([])
     harness.close()
   })
 

@@ -456,9 +456,9 @@ const layer = Layer.effect(
               add: [
                 {
                   name: "@opencode-ai/plugin",
-                  // `@latest` is the floating sentinel: omit the version so npm resolves the
-                  // dist-tag, since `name@version` cannot carry a leading `@`.
-                  version: pluginVersion === "@latest" ? undefined : pluginVersion,
+                  // `undefined` floats to the `latest` dist-tag: `name@version` cannot
+                  // carry a leading `@`, so dev/local channels omit the specifier.
+                  version: pluginVersion,
                 },
               ],
             })

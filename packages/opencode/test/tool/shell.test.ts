@@ -1041,6 +1041,19 @@ describe("tool.shell abort", () => {
   )
 
   it.live(
+    "rejects a non-positive timeout",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const err = yield* fail({ command: "echo hi", timeout: 0 })
+          expect(err.message).toMatch(/invalid arguments|positive integer/i)
+        }),
+      ),
+    15_000,
+  )
+
+  it.live(
     "terminates command on timeout",
     () =>
       runIn(

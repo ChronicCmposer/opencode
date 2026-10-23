@@ -55,9 +55,39 @@ describe("plugin.install.verify", () => {
     expect(verifyPluginDeps(tmp.path)).toEqual({ ok: false, reason: expect.any(String) })
   })
 
-  test("reports ok when @opencode-ai/plugin is installed", async () => {
+  test("reports not ok when the plugin directory is empty", async () => {
     await using tmp = await tmpdir()
     await fs.mkdir(path.join(tmp.path, "node_modules", "@opencode-ai", "plugin"), { recursive: true })
+    expect(verifyPluginDeps(tmp.path)).toEqual({ ok: false, reason: expect.any(String) })
+  })
+
+  test("reports not ok when the plugin manifest has no version", async () => {
+    await using tmp = await tmpdir()
+    const pluginDir = path.join(tmp.path, "node_modules", "@opencode-ai", "plugin")
+    await fs.mkdir(pluginDir, { recursive: true })
+    await fs.writeFile(path.join(pluginDir, "package.json"), JSON.stringify({ name: "@opencode-ai/plugin" }))
+    expect(verifyPluginDeps(tmp.path)).toEqual({ ok: false, reason: expect.any(String) })
+  })
+
+  test("reports not ok when the plugin manifest names another package", async () => {
+    await using tmp = await tmpdir()
+    const pluginDir = path.join(tmp.path, "node_modules", "@opencode-ai", "plugin")
+    await fs.mkdir(pluginDir, { recursive: true })
+    await fs.writeFile(
+      path.join(pluginDir, "package.json"),
+      JSON.stringify({ name: "@opencode-ai/something-else", version: "1.19.4" }),
+    )
+    expect(verifyPluginDeps(tmp.path)).toEqual({ ok: false, reason: expect.any(String) })
+  })
+
+  test("reports ok when @opencode-ai/plugin is installed with a resolvable manifest", async () => {
+    await using tmp = await tmpdir()
+    const pluginDir = path.join(tmp.path, "node_modules", "@opencode-ai", "plugin")
+    await fs.mkdir(pluginDir, { recursive: true })
+    await fs.writeFile(
+      path.join(pluginDir, "package.json"),
+      JSON.stringify({ name: "@opencode-ai/plugin", version: "1.19.4" }),
+    )
     expect(verifyPluginDeps(tmp.path)).toEqual({ ok: true })
   })
 

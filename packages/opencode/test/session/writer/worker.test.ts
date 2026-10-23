@@ -9,7 +9,6 @@ import { describe, expect, test } from "bun:test"
 import path from "node:path"
 import { createBunSqliteConnection } from "@/session/writer/connection"
 import { WriterCrashedError, createWriterClient } from "@/session/writer/client"
-import { createRemoteConnection } from "@/session/writer/sql-proxy"
 import { FAULTS_ENV } from "@/testing/faults"
 import { tmpdir } from "../../fixture/fixture"
 import { SCHEMA, ev, healthyEnv } from "./fixtures"
@@ -39,25 +38,6 @@ describe("writer worker: admin RPC and remote-query proxy (7.2, 7.3, 7.13)", () 
     ])
 
     await client.checkpoint()
-  })
-
-  test("a remote connection proxy forwards {method, sql, params} and returns typed rows", async () => {
-    await using tmp = await tmpdir()
-    await using client = createWriterClient({ env: healthyEnv })
-    await client.open(path.join(tmp.path, "writer.db"))
-    await client.migrate(SCHEMA)
-
-    const connection = createRemoteConnection(client)
-    const outcome = await connection.run("INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (?, ?, ?)", [
-      "a",
-      0,
-      null,
-    ])
-    expect(outcome.changes).toBe(1)
-    expect(await connection.all("SELECT seq FROM event_sequence WHERE aggregate_id = ?", ["a"])).toEqual([{ seq: 0 }])
-    expect(await connection.values("SELECT seq FROM event_sequence WHERE aggregate_id = ?", ["a"])).toEqual([[0]])
-    await connection.exec("DELETE FROM event_sequence")
-    expect(await connection.all("SELECT seq FROM event_sequence")).toEqual([])
   })
 })
 

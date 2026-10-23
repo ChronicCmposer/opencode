@@ -62,17 +62,23 @@ export function createLiveEventPublisher(
   options: LiveEventPublisherOptions = {},
 ): LiveEventPublisher {
   const location = () => options.location?.()
+  const toPayload = (event: LiveEvent): EventV2.Payload => {
+    const resolved = event.location ?? location()
+    return {
+      id: event.id === undefined ? EventV2.ID.create() : EventV2.ID.make(event.id),
+      type: event.type,
+      data: event.data,
+      ...(resolved === undefined ? {} : { location: resolved }),
+    }
+  }
+  // `publishLive` is the live-only seam: no Definition lookup and no durable
+  // commit, so it is synchronous by construction and safe to drive from this
+  // synchronous port boundary. The possibly-async `publish` (which commits
+  // durably) is never run here — a durable definition is refused outright.
+  const publishLive = (payload: EventV2.Payload) => Effect.runSync(events.publishLive(payload))
   return {
     publish(event) {
-      const resolved = event.location ?? location()
-      Effect.runSync(
-        events.publishLive({
-          id: event.id === undefined ? EventV2.ID.create() : EventV2.ID.make(event.id),
-          type: event.type,
-          data: event.data,
-          ...(resolved === undefined ? {} : { location: resolved }),
-        }),
-      )
+      publishLive(toPayload(event))
     },
     publishDefinition(definition, data) {
       // A durable definition would commit to SQLite; that write belongs to the
@@ -80,8 +86,7 @@ export function createLiveEventPublisher(
       if (definition.durable !== undefined) {
         throw new Error(`live-only publish refuses durable event "${definition.type}"`)
       }
-      const resolved = location()
-      Effect.runSync(events.publish(definition, data, resolved === undefined ? undefined : { location: resolved }))
+      publishLive(toPayload({ id: EventV2.ID.create(), type: definition.type, data }))
     },
   }
 }

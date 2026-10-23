@@ -22,6 +22,7 @@ import {
   type PipelineMessage,
   type WorkerSnapshot,
 } from "@/session/worker/layer"
+import { readSseStream } from "../lib/sse"
 
 interface MockModelBootstrap {
   readonly baseUrl: string
@@ -70,40 +71,8 @@ async function consumeChat(bootstrap: MockModelBootstrap, messages: readonly Pip
   if (!response.ok) throw new Error(`mock provider responded ${response.status}`)
   if (!response.body) throw new Error("mock provider returned an empty body")
 
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ""
-  let text = ""
-  const apply = (frame: string): void => {
-    for (const rawLine of frame.split("\n")) {
-      const line = rawLine.trim()
-      if (!line.startsWith("data:")) continue
-      const data = line.slice("data:".length).trim()
-      if (!data || data === "[DONE]") continue
-      try {
-        const payload = JSON.parse(data) as { choices?: Array<{ delta?: { content?: unknown } }> }
-        const content = payload.choices?.[0]?.delta?.content
-        if (typeof content === "string") text += content
-      } catch {
-        // Ignore malformed frames; the mock server only emits JSON.
-      }
-    }
-  }
-
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    let boundary = buffer.indexOf("\n\n")
-    while (boundary !== -1) {
-      apply(buffer.slice(0, boundary))
-      buffer = buffer.slice(boundary + 2)
-      boundary = buffer.indexOf("\n\n")
-    }
-  }
-  buffer += decoder.decode()
-  if (buffer.trim()) apply(buffer)
-  return text
+  const accumulator = await readSseStream(response.body)
+  return accumulator.text
 }
 
 function modelLayer(bootstrap: MockModelBootstrap): Layer.Layer<ModelClient> {

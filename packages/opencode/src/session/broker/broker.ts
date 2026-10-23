@@ -304,6 +304,10 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
         )
       }, requestTimeoutMs)
       const send = () => {
+        // The timeout may have already settled this request while it waited for
+        // the transport; posting now would register a waiter that is never
+        // settled and leak a frame.
+        if (settled) return
         if (!alive || !port) {
           finish(() => reject(new BrokerRequestError("crashed", "broker is not available")))
           return

@@ -4,7 +4,7 @@ import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { Cause, Config, Effect, Exit, Layer } from "effect"
+import { Cause, Config, ConfigProvider, Effect, Exit, Layer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -12,7 +12,6 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
-import { RuntimeFlags } from "@/effect/runtime-flags"
 import { registerAdapter } from "../../src/control-plane/adapters"
 import type { WorkspaceAdapter } from "../../src/control-plane/types"
 import { Workspace } from "../../src/control-plane/workspace"
@@ -52,24 +51,23 @@ const noopBootstrapLayer = Layer.succeed(
   InstanceBootstrapService.Service,
   InstanceBootstrapService.Service.of({ run: Effect.void }),
 )
-// The background subagent acceptance test drives a `task` tool with
-// `background: true`, gated behind `experimentalBackgroundSubagents`. Derive
-// every other flag from the ambient (env) layer and force just this one on — a
-// per-layer override rather than a `process.env` mutation, so the flag cannot
-// leak into other test files sharing the process.
-const runtimeFlagsWithBackground = Layer.effect(
-  RuntimeFlags.Service,
-  Effect.gen(function* () {
-    const flags = yield* RuntimeFlags.Service
-    return RuntimeFlags.Service.of({ ...flags, experimentalBackgroundSubagents: true })
-  }),
-).pipe(Layer.provide(LayerNode.compile(RuntimeFlags.node)))
 const appLayer = AppNodeBuilder.build(
   LayerNode.group([InstanceStore.node, Project.node, Session.node, Workspace.node, Database.node, Ripgrep.node]),
-  [
-    [InstanceStore.bootstrapNode, noopBootstrapLayer],
-    [RuntimeFlags.node, runtimeFlagsWithBackground],
-  ],
+  [[InstanceStore.bootstrapNode, noopBootstrapLayer]],
+)
+// The background subagent acceptance test drives a `task` tool with
+// `background: true`, gated behind `experimentalBackgroundSubagents`. Force the
+// flag through the server layer's ConfigProvider rather than `process.env`: the
+// session-worker isolate inherits `process.env`, so an env-based flag would be
+// visible to the worker even if the snapshot never carried it. A ConfigProvider
+// override is scoped to the hub graph and invisible to the isolate, so the test
+// only passes when the hub's resolved flags actually cross the worker snapshot
+// boundary (the production code path this file guards).
+const serverConfig = ConfigProvider.layer(
+  ConfigProvider.fromUnknown({
+    ...Object.fromEntries(Object.entries(process.env).filter(([, value]) => value !== undefined)),
+    OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS: "true",
+  } as Record<string, string>),
 )
 const servedRoutes: Layer.Layer<never, Config.ConfigError, HttpServer.HttpServer> = HttpRouter.serve(
   HttpApiApp.routes,
@@ -83,7 +81,14 @@ const httpApiLayer = servedRoutes.pipe(
   Layer.provideMerge(NodeHttpServer.layerTest),
   Layer.provideMerge(NodeServices.layer),
 )
-const it = testEffect(Layer.mergeAll(appLayer, httpApiLayer))
+// `RuntimeFlags.node` is one process-wide layer instance shared by `appLayer`
+// and the server graph, so the layer memoMap builds it exactly once — with
+// whichever `ConfigProvider` is in scope for that first build. Providing the
+// scoped config at the merge boundary is what makes the hub's resolved flags
+// (and therefore the worker snapshot) observe the override; providing it only
+// on `servedRoutes` is too late because `appLayer` already built the shared
+// RuntimeFlags layer from the default env provider.
+const it = testEffect(Layer.mergeAll(appLayer, httpApiLayer).pipe(Layer.provide(serverConfig)))
 
 function pathFor(path: string, params: Record<string, string>) {
   return Object.entries(params).reduce((result, [key, value]) => result.replace(`:${key}`, value), path)

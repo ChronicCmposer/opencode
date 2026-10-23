@@ -8,6 +8,7 @@
 // the commit and is told to `resync` (task 8.11).
 
 import { describe, expect, test } from "bun:test"
+import { createControlLink, type ControlFrame } from "@/session/egress/control"
 import {
   MESH_SUBSCRIPTION_BOUND,
   attachMeshWorker,
@@ -209,6 +210,69 @@ describe("event mesh transport over a control port", () => {
     expect(woken).toEqual(["e1", "e2", "e3"])
 
     client.dispose()
+    attachment.dispose()
+  })
+
+  test("the worker client can be driven end to end (listen -> wake -> ack)", async () => {
+    const mesh = createEgressMesh()
+    const channel = new MessageChannel()
+    const attachment = attachMeshWorker(mesh, "w1", channel.port2)
+    const client = createMeshWorkerClient(channel.port1)
+
+    const woken: string[] = []
+    client.onDurable((c) => woken.push(c.event.id))
+    await client.listen("session.*")
+    expect(mesh.subscriptions()).toEqual([{ workerId: "w1", pattern: "session.*" }])
+
+    mesh.publish(commit("e1", "session.message", 1))
+    await pollUntil(() => woken.length === 1)
+    expect(mesh.outstanding("w1")).toBe(1)
+
+    client.acknowledgeDelivery()
+    await pollUntil(() => mesh.outstanding("w1") === 0)
+
+    client.dispose()
+    attachment.dispose()
+  })
+})
+
+describe("mesh durable.ack count validation", () => {
+  test("acknowledgeDelivery rejects a non-negative-integer count", () => {
+    const channel = new MessageChannel()
+    const client = createMeshWorkerClient(channel.port1)
+    expect(() => client.acknowledgeDelivery(-1)).toThrow(/count/)
+    expect(() => client.acknowledgeDelivery(1.5)).toThrow(/count/)
+    client.dispose()
+    channel.port2.close()
+  })
+
+  test("the control boundary drops a malformed durable.ack and records an error", async () => {
+    const channel = new MessageChannel()
+    const link = createControlLink(channel.port1)
+    const seen: ControlFrame[] = []
+    link.onMessage((frame) => seen.push(frame))
+    channel.port2.postMessage({ type: "durable.ack", count: -1 })
+    channel.port2.postMessage({ type: "durable.ack", count: 2 })
+    await pollUntil(() => seen.length === 1)
+    expect(seen).toEqual([{ type: "durable.ack", count: 2 }])
+    expect(link.lastError?.message).toMatch(/invalid control frame/)
+    link.dispose()
+    channel.port2.close()
+  })
+
+  test("a malformed durable.ack cannot inflate the hub backlog", async () => {
+    const mesh = createEgressMesh()
+    const channel = new MessageChannel()
+    const attachment = attachMeshWorker(mesh, "w1", channel.port2)
+    mesh.listen("w1", "*")
+    mesh.publish(commit("e1", "session.message", 1))
+    expect(mesh.outstanding("w1")).toBe(1)
+
+    // A negative count would otherwise INCREASE the backlog (1 - (-5) = 6).
+    channel.port1.postMessage({ type: "durable.ack", count: -5 })
+    channel.port1.postMessage({ type: "durable.ack", count: 1 })
+    await pollUntil(() => mesh.outstanding("w1") === 0)
+
     attachment.dispose()
   })
 })

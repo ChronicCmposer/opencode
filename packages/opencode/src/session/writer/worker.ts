@@ -43,6 +43,7 @@ function readGeneration(): number {
 const generation = readGeneration()
 
 let connection: WriterConnection | undefined
+let connectionFilename: string | undefined
 let core: WriterCore | undefined
 
 function requireCore(): WriterCore {
@@ -51,7 +52,13 @@ function requireCore(): WriterCore {
 }
 
 async function openConnection(filename: string): Promise<void> {
-  if (connection !== undefined) throw new Error("writer connection is already open")
+  // Opening the same database is idempotent: a client replays `admin.open` on
+  // every respawn (to survive a mid-open crash), and may also retry the open
+  // itself, so the isolate must treat the duplicate as a no-op rather than fail.
+  if (connection !== undefined) {
+    if (connectionFilename === filename) return
+    throw new Error(`writer connection is already open for ${connectionFilename}`)
+  }
   // Build the whole graph before publishing any of it, so a failure partway leaves
   // the isolate unopened (and the native handle closed) rather than half-open.
   // The shared WAL pragmas (including `journal_size_limit`) are applied here.
@@ -65,6 +72,7 @@ async function openConnection(filename: string): Promise<void> {
     throw error
   }
   connection = nextConnection
+  connectionFilename = filename
   core = nextCore
 }
 

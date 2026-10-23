@@ -6,93 +6,19 @@
 // landed `CancellationConfig.childrenOf` seam (wired to the Phase 9 job
 // registry), so no new index is introduced here.
 //
-// These tests drive the dispatcher against an in-memory `WorkerPool` fake, so
-// the crash/cascade ordering is deterministic and no isolates are spawned.
+// These tests drive the dispatcher against the shared in-memory `WorkerPool`
+// fake, so the crash/cascade ordering is deterministic and no isolates are
+// spawned.
 
 import { describe, expect, test } from "bun:test"
-import type { SessionID } from "@/session/schema"
 import {
   createDispatcher,
   SessionCancelledError,
   WorkerCrashedError,
   type CancellationConfig,
-  type SessionRun,
-  type SessionWorker,
-  type WorkerKind,
-  type WorkerPool,
 } from "@/session/worker/dispatch"
-
-const sid = (value: string) => value as SessionID
-const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
-/** Attach a rejection handler up-front so a later settle cannot go unhandled. */
-const capture = (promise: Promise<unknown>): Promise<unknown> =>
-  promise.then(
-    () => undefined,
-    (error: unknown) => error,
-  )
-
-interface PendingRun {
-  readonly resolve: () => void
-  readonly reject: (error: unknown) => void
-}
-
-/** A worker whose runs the test completes/crashes explicitly (no real threads). */
-class FakeWorker implements SessionWorker {
-  alive = true
-  readonly runs: SessionRun[] = []
-  private readonly pending = new Map<SessionID, PendingRun>()
-
-  constructor(readonly id: number) {}
-
-  execute(run: SessionRun): Promise<void> {
-    this.runs.push(run)
-    return new Promise<void>((resolve, reject) => {
-      this.pending.set(run.sessionID, { resolve, reject })
-    })
-  }
-
-  crash(sessionID: SessionID): void {
-    this.alive = false
-    const pending = this.pending.get(sessionID)
-    this.pending.delete(sessionID)
-    pending?.reject(new WorkerCrashedError({ message: `worker ${this.id} crashed`, workerID: this.id }))
-  }
-
-  /** Kill the worker with an arbitrary isolate error (a dead isolate, not a typed crash). */
-  crashWith(sessionID: SessionID, error: unknown): void {
-    this.alive = false
-    const pending = this.pending.get(sessionID)
-    this.pending.delete(sessionID)
-    pending?.reject(error)
-  }
-
-  async terminate(): Promise<void> {
-    this.alive = false
-    const pending = [...this.pending.values()]
-    this.pending.clear()
-    for (const run of pending) run.reject(new SessionCancelledError({ message: "terminated", sessionID: "" }))
-  }
-}
-
-class FakePool implements WorkerPool {
-  readonly workers: FakeWorker[]
-  readonly spawned: FakeWorker[] = []
-  private nextSpawnId = 100
-
-  constructor(k: number) {
-    this.workers = Array.from({ length: k }, (_, index) => new FakeWorker(index + 1))
-  }
-
-  spawn(_kind: WorkerKind): SessionWorker {
-    const worker = new FakeWorker(this.nextSpawnId++)
-    this.spawned.push(worker)
-    return worker
-  }
-
-  async terminateAll(): Promise<void> {
-    await Promise.all(this.workers.map((worker) => worker.terminate()))
-  }
-}
+import { capture, flush, sid } from "../../lib/async"
+import { createFakeWorkerPool } from "../../lib/fake-worker-pool"
 
 /** A `childrenOf` index backed by a plain map, plus the cancelled-session log. */
 function cancellation(children: Record<string, string[]>): {
@@ -109,7 +35,7 @@ function cancellation(children: Record<string, string[]>): {
 
 describe("9.6 parent CRASH implicitly cancels its children (children-first)", () => {
   test("a crashed parent cancels its running subagent child", async () => {
-    const pool = new FakePool(1)
+    const pool = createFakeWorkerPool(1)
     const { config, cancelled } = cancellation({ ses_parent: ["ses_child"] })
     const dispatcher = createDispatcher({ pool, cancellation: config })
 
@@ -120,8 +46,8 @@ describe("9.6 parent CRASH implicitly cancels its children (children-first)", ()
 
     pool.workers[0].crash(sid("ses_parent"))
 
-    expect(await parent).toBeInstanceOf(WorkerCrashedError)
-    expect(await child).toBeInstanceOf(SessionCancelledError)
+    expect(await parent).toEqual({ ok: false, error: expect.any(WorkerCrashedError) })
+    expect(await child).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
     expect(dispatcher.registry.has(sid("ses_child"))).toBe(false)
     expect(cancelled).toContain(sid("ses_child"))
 
@@ -129,7 +55,7 @@ describe("9.6 parent CRASH implicitly cancels its children (children-first)", ()
   })
 
   test("the cascade reaches grandchildren (children-first recursion)", async () => {
-    const pool = new FakePool(1)
+    const pool = createFakeWorkerPool(1)
     const { config, cancelled } = cancellation({
       ses_parent: ["ses_child"],
       ses_child: ["ses_grandchild"],
@@ -144,9 +70,9 @@ describe("9.6 parent CRASH implicitly cancels its children (children-first)", ()
 
     pool.workers[0].crash(sid("ses_parent"))
 
-    expect(await parent).toBeInstanceOf(WorkerCrashedError)
-    expect(await child).toBeInstanceOf(SessionCancelledError)
-    expect(await grandchild).toBeInstanceOf(SessionCancelledError)
+    expect(await parent).toEqual({ ok: false, error: expect.any(WorkerCrashedError) })
+    expect(await child).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
+    expect(await grandchild).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
     expect(cancelled).toContain(sid("ses_child"))
     expect(cancelled).toContain(sid("ses_grandchild"))
 
@@ -154,20 +80,20 @@ describe("9.6 parent CRASH implicitly cancels its children (children-first)", ()
   })
 
   test("no cancellation config means a crash never cascades (flag-off behavior)", async () => {
-    const pool = new FakePool(1)
+    const pool = createFakeWorkerPool(1)
     const dispatcher = createDispatcher({ pool })
 
     const parent = capture(dispatcher.dispatch({ sessionID: sid("ses_parent") }))
     await flush()
 
     pool.workers[0].crash(sid("ses_parent"))
-    expect(await parent).toBeInstanceOf(WorkerCrashedError)
+    expect(await parent).toEqual({ ok: false, error: expect.any(WorkerCrashedError) })
 
     await dispatcher.terminateAll()
   })
 
   test("a parent crash preserves the underlying isolate error", async () => {
-    const pool = new FakePool(1)
+    const pool = createFakeWorkerPool(1)
     const { config, cancelled } = cancellation({ ses_parent: ["ses_child"] })
     const dispatcher = createDispatcher({ pool, cancellation: config })
 
@@ -178,18 +104,20 @@ describe("9.6 parent CRASH implicitly cancels its children (children-first)", ()
     const cause = new Error("worker isolate died: TypeError: db.select is not a function")
     pool.workers[0].crashWith(sid("ses_parent"), cause)
 
-    const error = await parent
-    expect(error).toBeInstanceOf(WorkerCrashedError)
-    expect((error as WorkerCrashedError).message).toContain("db.select is not a function")
-    expect((error as WorkerCrashedError).cause).toBe(cause)
-    expect(await child).toBeInstanceOf(SessionCancelledError)
+    const settled = await parent
+    if (settled.ok) throw new Error("expected the parent dispatch to crash")
+    expect(settled.error).toBeInstanceOf(WorkerCrashedError)
+    const error = settled.error as WorkerCrashedError
+    expect(error.message).toContain("db.select is not a function")
+    expect(error.cause).toBe(cause)
+    expect(await child).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
     expect(cancelled).toContain(sid("ses_child"))
 
     await dispatcher.terminateAll()
   })
 
   test("a crash cascade reaps each cancelled child's worker", async () => {
-    const pool = new FakePool(1)
+    const pool = createFakeWorkerPool(1)
     const reaped: number[] = []
     const config: CancellationConfig = {
       childrenOf: (parent) => (parent === sid("ses_parent") ? [sid("ses_child")] : []),
@@ -204,8 +132,8 @@ describe("9.6 parent CRASH implicitly cancels its children (children-first)", ()
 
     pool.workers[0].crash(sid("ses_parent"))
 
-    expect(await parent).toBeInstanceOf(WorkerCrashedError)
-    expect(await child).toBeInstanceOf(SessionCancelledError)
+    expect(await parent).toEqual({ ok: false, error: expect.any(WorkerCrashedError) })
+    expect(await child).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
     // The child ran on the spawned headroom worker; the terminate path reaped it.
     expect(reaped).toEqual([pool.spawned[0].id])
 

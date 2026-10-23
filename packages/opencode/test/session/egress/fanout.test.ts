@@ -7,7 +7,7 @@
 // never blocks — it returns synchronously with the ids that overflowed.
 
 import { describe, expect, test } from "bun:test"
-import { SUBSCRIBER_BOUND, SubscriberOverflowError, createFanout } from "@/session/egress/fanout"
+import { SUBSCRIBER_BOUND, SubscriberOverflowError, createFanout } from "./fanout"
 import { encodeFrame } from "@/session/egress/frame"
 import { deltasFrame, durableFrame } from "../../lib/egress-fixtures"
 
@@ -90,11 +90,27 @@ describe("egress fan-out", () => {
     fanout.publish(durableFrame("d2", 2))
     fast.drain() // the fast client kept up and drained its durable queue
 
-    const result = fanout.publish(deltasFrame("3"))
+    const result = fanout.publish(durableFrame("d3", 3))
     expect(result.overflowed).toEqual(["slow"])
+    expect(result.droppedDeltas).toEqual([])
     expect(slow.overflowed).toBe(true)
     // The other subscriber still received the frame.
-    expect(fast.drain()).toEqual([deltasFrame("3")])
+    expect(fast.drain()).toEqual([durableFrame("d3", 3)])
+  })
+
+  test("a durable-saturated queue drops an incoming delta without flagging overflow", () => {
+    const fanout = createFanout({ bound: 2 })
+    const sub = fanout.subscribe("s")
+    fanout.publish(durableFrame("d1", 1))
+    fanout.publish(durableFrame("d2", 2))
+
+    const result = fanout.publish(deltasFrame("x"))
+    // A dropped non-durable delta is expected backpressure, not a lost commit.
+    expect(result.overflowed).toEqual([])
+    expect(result.droppedDeltas).toEqual(["s"])
+    expect(result.delivered).toBe(0)
+    expect(sub.overflowed).toBe(false)
+    expect(sub.drain()).toEqual([durableFrame("d1", 1), durableFrame("d2", 2)])
   })
 
   test("publish never throws; it marks the subscriber overflowed", () => {
@@ -111,7 +127,7 @@ describe("egress fan-out", () => {
     const fast = fanout.subscribe("fast")
     fanout.publish(durableFrame("d1", 1))
     fast.drain()
-    const result = fanout.publish(deltasFrame("2"))
+    const result = fanout.publish(durableFrame("d2", 2))
     expect(result.overflowed).toEqual(["slow"])
     expect(result.delivered).toBe(1)
   })

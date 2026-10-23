@@ -7,13 +7,18 @@
 // worker's session actually produced. The egress transport owns framing: it wraps
 // the event in an `eventFrame` (`session/worker/frame.ts`) and posts it.
 //
-// Two filters keep the wire focused (Q13/Q15):
+// Three filters keep the wire focused (Q13/Q15):
 //
 //   * only SESSION-SCOPED events are forwarded — those whose payload carries a
 //     `sessionID`, i.e. what the UI renders. Worker-local telemetry (thread ids,
 //     metrics, …) never crosses;
 //   * the hub-proxied `session.status` is dropped, because the hub already owns
-//     that authority and must not receive an echo.
+//     that authority and must not receive an echo;
+//   * a durable-wakeup republish is dropped, because the hub's mesh delivers every
+//     matching durable commit back to the subscribing worker — including the
+//     worker's own (pattern `"*"`) — and that payload already crossed to the hub
+//     when it was first published. Re-forwarding it would make the hub publish the
+//     same event twice.
 //
 // The forwarded event keeps the EventV2 `{ id, type, properties }` shape exactly
 // (`properties` is the EventV2 `data` reference, never a writer-style `data`
@@ -41,6 +46,21 @@ export interface WorkerEventBridge {
 
 /** Event types the hub already proxies; the worker must never echo them back. */
 export const HUB_PROXIED_EVENT_TYPES: ReadonlySet<string> = new Set(["session.status"])
+
+/**
+ * Metadata key marking a payload the durable-wakeup path republished into this
+ * isolate (see `republishDurableCommit`). The hub's mesh delivers every matching
+ * durable commit back to the subscribing worker — including the worker's own
+ * commit (pattern `"*"`) — so the republished payload must not be re-forwarded: it
+ * already crossed to the hub when it was first published, and re-forwarding it
+ * would make the hub publish the same event twice.
+ */
+export const DURABLE_WAKEUP_METADATA_KEY = "opencode.worker.durable-wakeup"
+
+/** Is this payload a durable-wakeup republish that must never be re-forwarded? */
+export function isDurableWakeup(event: Pick<EventV2.Payload, "metadata">): boolean {
+  return event.metadata?.[DURABLE_WAKEUP_METADATA_KEY] === true
+}
 
 /** The slice of `EventV2.Interface` the bridge depends on. */
 export type EventSubscriber = Pick<EventV2.Interface, "listen">
@@ -86,8 +106,9 @@ export function createWorkerEventBridge(
   })
 }
 
-/** Forward session-scoped events only, and never a hub-proxied type. */
+/** Forward session-scoped events only, never a hub-proxied type, never a wakeup republish. */
 function isForwardable(event: EventV2.Payload): boolean {
+  if (isDurableWakeup(event)) return false
   if (HUB_PROXIED_EVENT_TYPES.has(event.type)) return false
   return isSessionScopedEvent(event)
 }

@@ -296,84 +296,98 @@ const layer = Layer.effect(
         }),
       )
 
-    const remove: Interface["remove"] = Effect.fn("Storage.remove")(function* (key: string[]) {
-      if (Option.isSome(writer)) {
-        yield* writer.value.remove(key)
-        return
-      }
-      yield* withResolved(key, (target, rw) =>
-        TxReentrantLock.withWriteLock(rw, fs.remove(target).pipe(Effect.catchIf(missing, () => Effect.void))),
-      )
+    /**
+     * The direct-filesystem backend: reads and writes the files itself, guarded by
+     * the per-file reentrant lock. This is the default when no writer port is
+     * present (flag off), byte-identical to before the single-writer boundary.
+     */
+    const direct = (): Interface => ({
+      remove: Effect.fn("Storage.remove")(function* (key: string[]) {
+        yield* withResolved(key, (target, rw) =>
+          TxReentrantLock.withWriteLock(rw, fs.remove(target).pipe(Effect.catchIf(missing, () => Effect.void))),
+        )
+      }),
+
+      read: <T>(key: string[]) =>
+        Effect.gen(function* () {
+          const value = yield* withResolved(key, (target, rw) =>
+            TxReentrantLock.withReadLock(rw, wrap(target, fs.readJson(target))),
+          )
+          return value as T
+        }),
+
+      update: <T>(key: string[], fn: (draft: T) => void) =>
+        Effect.gen(function* () {
+          const value = yield* withResolved(key, (target, rw) =>
+            TxReentrantLock.withWriteLock(
+              rw,
+              Effect.gen(function* () {
+                const content = yield* wrap(target, fs.readJson(target))
+                fn(narrow<T>(content))
+                yield* writeJson(target, content)
+                return content
+              }),
+            ),
+          )
+          return narrow<T>(value)
+        }),
+
+      write: (key: string[], content: unknown) =>
+        Effect.gen(function* () {
+          yield* withResolved(key, (target, rw) => TxReentrantLock.withWriteLock(rw, writeJson(target, content)))
+        }),
+
+      list: Effect.fn("Storage.list")(function* (prefix: string[]) {
+        const dir = (yield* state).dir
+        const cwd = path.join(dir, ...prefix)
+        const result = yield* fs
+          .glob("**/*", {
+            cwd,
+            include: "file",
+          })
+          .pipe(Effect.catch(() => Effect.succeed<string[]>([])))
+        return result
+          .map((x) => [...prefix, ...x.slice(0, -5).split(path.sep)])
+          .toSorted((a, b) => a.join("/").localeCompare(b.join("/")))
+      }),
     })
 
-    const read: Interface["read"] = <T>(key: string[]) =>
-      Effect.gen(function* () {
-        if (Option.isSome(writer)) {
-          const result = yield* writer.value.read(key)
+    /**
+     * The writer-proxied backend: every read and mutation crosses the writer port,
+     * so file-KV serializes on the writer's one queue and never bypasses it. A
+     * missing key surfaces the same `NotFoundError` as the direct path.
+     */
+    const proxied = (port: WriterPort): Interface => ({
+      remove: Effect.fn("Storage.remove")(function* (key: string[]) {
+        yield* port.remove(key)
+      }),
+
+      read: <T>(key: string[]) =>
+        Effect.gen(function* () {
+          const result = yield* port.read(key)
           if (!result.found) return yield* fail(file((yield* state).dir, key))
           return narrow<T>(result.content)
-        }
-        const value = yield* withResolved(key, (target, rw) =>
-          TxReentrantLock.withReadLock(rw, wrap(target, fs.readJson(target))),
-        )
-        return value as T
-      })
+        }),
 
-    const update: Interface["update"] = <T>(key: string[], fn: (draft: T) => void) =>
-      Effect.gen(function* () {
-        if (Option.isSome(writer)) {
-          const result = yield* writer.value.update<T>(key, fn)
+      update: <T>(key: string[], fn: (draft: T) => void) =>
+        Effect.gen(function* () {
+          const result = yield* port.update<T>(key, fn)
           if (!result.found) return yield* fail(file((yield* state).dir, key))
           return narrow<T>(result.content)
-        }
-        const value = yield* withResolved(key, (target, rw) =>
-          TxReentrantLock.withWriteLock(
-            rw,
-            Effect.gen(function* () {
-              const content = yield* wrap(target, fs.readJson(target))
-              fn(narrow<T>(content))
-              yield* writeJson(target, content)
-              return content
-            }),
-          ),
-        )
-        return narrow<T>(value)
-      })
+        }),
 
-    const write: Interface["write"] = (key: string[], content: unknown) =>
-      Effect.gen(function* () {
-        if (Option.isSome(writer)) {
-          yield* writer.value.write(key, content)
-          return
-        }
-        yield* withResolved(key, (target, rw) => TxReentrantLock.withWriteLock(rw, writeJson(target, content)))
-      })
+      write: (key: string[], content: unknown) => port.write(key, content),
 
-    const list: Interface["list"] = Effect.fn("Storage.list")(function* (prefix: string[]) {
-      if (Option.isSome(writer)) {
-        const keys = yield* writer.value.list(prefix)
+      list: Effect.fn("Storage.list")(function* (prefix: string[]) {
+        const keys = yield* port.list(prefix)
         return keys.map((key) => [...key])
-      }
-      const dir = (yield* state).dir
-      const cwd = path.join(dir, ...prefix)
-      const result = yield* fs
-        .glob("**/*", {
-          cwd,
-          include: "file",
-        })
-        .pipe(Effect.catch(() => Effect.succeed<string[]>([])))
-      return result
-        .map((x) => [...prefix, ...x.slice(0, -5).split(path.sep)])
-        .toSorted((a, b) => a.join("/").localeCompare(b.join("/")))
+      }),
     })
 
-    return Service.of({
-      remove,
-      read,
-      update,
-      write,
-      list,
-    })
+    // Port selection happens ONCE, here at layer construction: whichever backend
+    // is chosen, no method re-inspects a `serviceOption` or branches per call.
+    if (Option.isNone(writer)) return Service.of(direct())
+    return Service.of(proxied(writer.value))
   }),
 )
 

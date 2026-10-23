@@ -5,11 +5,16 @@
 // a single byte buffer; the buffer is transferred so the send is zero-copy.
 // Durable frames are stamped with the writer ordinal here via the `meta`
 // argument (or an internal monotonic fallback until Phase 7 lands).
+//
+// Events-port ack handshake (spec Q16): after a batch that carried durable
+// frames, the sender posts an `ack` frame whose `count` is the number of durable
+// hand-offs in that batch. The hub receiver surfaces it via `onAck`, so durable
+// progress is observable across the port rather than only implied by the events.
 
-import { type EventsFrame, type EventV2Event } from "@/session/worker/frame"
+import { ackFrame, type EventsFrame, type EventV2Event } from "@/session/worker/frame"
 
 import { createCoalescer, type Coalescer, type CoalescerScheduler } from "./coalesce"
-import { encodeFrames, type DurableMeta } from "./frame"
+import { durableMetaOf, encodeFrame, encodeFrames, type DurableMeta } from "./frame"
 import { createMonotonicOrdinalSource } from "./ordinal"
 
 export interface EgressSenderOptions {
@@ -41,6 +46,10 @@ export function createEgressSender(options: EgressSenderOptions): EgressSender {
     onBatch: (frames: readonly EventsFrame[]) => {
       const bytes = encodeFrames(frames)
       options.port.postMessage(bytes, [bytes.buffer])
+      const durables = frames.filter((frame) => durableMetaOf(frame) !== undefined).length
+      if (durables === 0) return
+      const ack = encodeFrame(ackFrame({ count: durables }))
+      options.port.postMessage(ack, [ack.buffer])
     },
   })
 

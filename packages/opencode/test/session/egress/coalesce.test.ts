@@ -207,4 +207,20 @@ describe("delta coalescer over event frames", () => {
     expect(() => coalescer.pushDelta(deltaEvent("a"))).toThrow(CoalescerEndedError)
     expect(() => coalescer.pushDurable(deltaEvent("d"), durableMeta)).toThrow(CoalescerEndedError)
   })
+
+  test("rejects a negative, fractional, or non-numeric window", () => {
+    for (const windowMs of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => createCoalescer({ windowMs, onBatch: () => {} })).toThrow(/window/)
+    }
+  })
+
+  test("rejects a non-positive or fractional batch threshold", () => {
+    for (const maxBatch of [0, -1, 2.5, Number.NaN]) {
+      expect(() => createCoalescer({ maxBatch, onBatch: () => {} })).toThrow(/batch/)
+    }
+  })
+
+  test("accepts a zero window (immediate flush) and a positive threshold", () => {
+    expect(() => createCoalescer({ windowMs: 0, maxBatch: 1, onBatch: () => {} })).not.toThrow()
+  })
 })

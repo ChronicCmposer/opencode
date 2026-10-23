@@ -7,6 +7,8 @@
 // the SSE stream with `fetch`, parses the frames in-isolate, and posts back
 // plain JSON. No Effect, no model SDK, no shared memory.
 
+import { readSseStream } from "./sse"
+
 /** Everything the worker needs to reach the hub's mock provider. */
 export interface MockLlmBootstrap {
   readonly baseUrl: string
@@ -71,12 +73,6 @@ export interface MockLlmWorkerScope {
   postMessage(message: unknown): void
 }
 
-interface ChatAccumulator {
-  text: string
-  usage?: MockLlmUsage
-  toolCalls: MockLlmToolCall[]
-}
-
 class MockProviderError extends Error {
   readonly status: number
 
@@ -87,84 +83,10 @@ class MockProviderError extends Error {
   }
 }
 
-function emptyAccumulator(): ChatAccumulator {
-  return { text: "", toolCalls: [] }
-}
-
-/** Apply one decoded SSE `data:` payload to the running chat accumulator. */
-function applyChunk(accumulator: ChatAccumulator, payload: unknown): void {
-  if (!payload || typeof payload !== "object") return
-
-  if ("usage" in payload && payload.usage && typeof payload.usage === "object") {
-    const usage = payload.usage as Record<string, unknown>
-    if (typeof usage.prompt_tokens === "number" && typeof usage.completion_tokens === "number") {
-      accumulator.usage = { input: usage.prompt_tokens, output: usage.completion_tokens }
-    }
-  }
-
-  if (!("choices" in payload) || !Array.isArray(payload.choices)) return
-  const choice = payload.choices[0]
-  if (!choice || typeof choice !== "object" || !("delta" in choice)) return
-  const delta = choice.delta
-  if (!delta || typeof delta !== "object") return
-
-  if ("content" in delta && typeof delta.content === "string") {
-    accumulator.text += delta.content
-  }
-
-  if (!("tool_calls" in delta) || !Array.isArray(delta.tool_calls)) return
-  for (const tool of delta.tool_calls) {
-    if (!tool || typeof tool !== "object") continue
-    const call = tool as Record<string, unknown>
-    const fn = call.function && typeof call.function === "object" ? (call.function as Record<string, unknown>) : undefined
-    if (typeof call.id === "string" && fn && typeof fn.name === "string") {
-      accumulator.toolCalls.push({ id: call.id, name: fn.name, arguments: "" })
-    }
-    const current = accumulator.toolCalls[accumulator.toolCalls.length - 1]
-    if (current && fn && typeof fn.arguments === "string" && fn.arguments) {
-      accumulator.toolCalls[accumulator.toolCalls.length - 1] = {
-        ...current,
-        arguments: current.arguments + fn.arguments,
-      }
-    }
-  }
-}
-
-/** Consume one SSE frame (which may hold several `data:` lines). */
-function applyFrame(accumulator: ChatAccumulator, frame: string): void {
-  for (const rawLine of frame.split("\n")) {
-    const line = rawLine.trim()
-    if (!line.startsWith("data:")) continue
-    const data = line.slice("data:".length).trim()
-    if (!data || data === "[DONE]") continue
-    try {
-      applyChunk(accumulator, JSON.parse(data))
-    } catch {
-      // Ignore malformed frames; the mock server only emits JSON.
-    }
-  }
-}
-
+/** Read the mock provider's SSE body into a `MockLlmChatResult` via the shared accumulator. */
 async function readChatStream(response: Response, id: string): Promise<MockLlmChatResult> {
   if (!response.body) throw new Error("mock provider returned an empty body")
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  const accumulator = emptyAccumulator()
-  let buffer = ""
-
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    let boundary = buffer.indexOf("\n\n")
-    while (boundary !== -1) {
-      applyFrame(accumulator, buffer.slice(0, boundary))
-      buffer = buffer.slice(boundary + 2)
-      boundary = buffer.indexOf("\n\n")
-    }
-  }
-  buffer += decoder.decode()
-  if (buffer.trim()) applyFrame(accumulator, buffer)
+  const accumulator = await readSseStream(response.body)
 
   const result: MockLlmChatResult = { type: "chat-result", id, text: accumulator.text }
   if (accumulator.usage) result.usage = accumulator.usage

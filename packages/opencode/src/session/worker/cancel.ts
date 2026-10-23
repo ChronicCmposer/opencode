@@ -125,12 +125,21 @@ export interface CancelController {
   dispose(): void
 }
 
+/** An in-flight cancel plus the reject handle `dispose` uses to settle it. */
+interface InFlightRequest {
+  /** The promise a caller receives; the `.finally` chain that clears the entry. */
+  promise: Promise<CancelOutcome>
+  readonly reject: (error: unknown) => void
+}
+
 export function createCancelController(options: CancelControllerOptions): CancelController {
   const graceMs = options.graceMs ?? resolveCancelGraceMs()
   const schedule = options.schedule ?? defaultSchedule
   const now = options.now ?? (() => Date.now())
   const log = options.log ?? noopWorkerLogger
-  const inFlight = new Map<SessionID, Promise<CancelOutcome>>()
+  // Each in-flight request keeps its settle handle so `dispose` can fail it
+  // loud instead of leaving a caller waiting on a promise that will never settle.
+  const inFlight = new Map<SessionID, InFlightRequest>()
   // Per-run ack waiters, keyed by the raw session id string (no brand cast). The
   // waiter is registered before the cancel frame is sent and pruned in `run`'s
   // finally, so a late ack from a previous request can never satisfy a later one.
@@ -219,15 +228,28 @@ export function createCancelController(options: CancelControllerOptions): Cancel
 
   return {
     cancel(sessionID, request) {
-      if (disposed) throw new Error("cancel controller has been disposed")
+      // A disposed controller is a caller error, surfaced as a rejected promise
+      // (never a synchronous throw) so the async contract is uniform.
+      if (disposed) return Promise.reject(new Error("cancel controller has been disposed"))
       const existing = inFlight.get(sessionID)
-      if (existing !== undefined) return existing
+      if (existing !== undefined) return existing.promise
       // A new (non-joining) request is the one that emits; the idempotent join
       // above never re-logs.
       log(workerLogMessage("cancel requested"), { sessionID, workerID: options.workerID, graceMs })
-      const promise = run(sessionID, request).finally(() => inFlight.delete(sessionID))
-      inFlight.set(sessionID, promise)
-      return promise
+      let rejectRequest!: (error: unknown) => void
+      const inner = new Promise<CancelOutcome>((resolve, reject) => {
+        rejectRequest = reject
+        run(sessionID, request).then(resolve, reject)
+      })
+      const entry: InFlightRequest = { promise: inner, reject: rejectRequest }
+      // The caller receives the `.finally` chain, so the entry is cleared BEFORE
+      // the caller's `await` resumes — a request that arrives right after a settle
+      // starts fresh instead of joining the already-settled entry.
+      entry.promise = inner.finally(() => {
+        if (inFlight.get(sessionID) === entry) inFlight.delete(sessionID)
+      })
+      inFlight.set(sessionID, entry)
+      return entry.promise
     },
     get pending() {
       return inFlight.size
@@ -235,8 +257,11 @@ export function createCancelController(options: CancelControllerOptions): Cancel
     dispose() {
       disposed = true
       unsubscribe()
+      const pending = [...inFlight.values()]
       inFlight.clear()
       ackWaiters.clear()
+      // Settle every in-flight request loud: its caller must not hang forever.
+      for (const entry of pending) entry.reject(new Error("cancel controller has been disposed"))
     },
   }
 }

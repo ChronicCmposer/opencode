@@ -10,7 +10,7 @@
 // mesh (task 8.11); acknowledging a delivery frees its slot, so a draining
 // worker keeps receiving.
 
-import { createControlLink, type ControlInbound, type ControlOutbound } from "./control"
+import { createControlLink, isNonNegativeInteger, type ControlInbound, type ControlOutbound } from "./control"
 import type { EgressEvent } from "./frame"
 import type { WriterOrdinal } from "./ordinal"
 
@@ -87,7 +87,7 @@ export function createEgressMesh(options: EgressMeshOptions = {}): EgressMesh {
   const resync = new Map<string, Set<string>>()
 
   /** Pure read: does NOT create a subscription entry for `workerId`. */
-  const matchingPattern = (workerId: string, type: string): string | undefined => {
+  const firstMatchingPattern = (workerId: string, type: string): string | undefined => {
     const patterns = subscriptions.get(workerId)
     if (!patterns) return undefined
     for (const pattern of patterns) {
@@ -131,7 +131,7 @@ export function createEgressMesh(options: EgressMeshOptions = {}): EgressMesh {
       const delivered: string[] = []
       const dropped: string[] = []
       for (const workerId of subscriptions.keys()) {
-        const pattern = matchingPattern(workerId, commit.event.type)
+        const pattern = firstMatchingPattern(workerId, commit.event.type)
         if (pattern === undefined) continue
         const pending = outstanding.get(workerId) ?? 0
         if (pending >= bound) {
@@ -196,6 +196,19 @@ export interface MeshWorkerAttachment {
   dispose(): void
 }
 
+/**
+ * Parse a `durable.ack` count: absent means a single delivery; anything other
+ * than a non-negative integer fails loud, so a corrupt ack can never inflate or
+ * corrupt the outstanding-delivery counter.
+ */
+function requireAckCount(value: unknown): number {
+  if (value === undefined) return 1
+  if (!isNonNegativeInteger(value)) {
+    throw new Error(`invalid durable.ack count: ${JSON.stringify(value)} (expected a non-negative integer)`)
+  }
+  return value
+}
+
 /** Hub end of a worker's mesh control link: routes `listen`/`unlisten`/acks, pushes wakes. */
 export function attachMeshWorker(mesh: EgressMesh, workerId: string, port: MessagePort): MeshWorkerAttachment {
   const link = createControlLink(port)
@@ -221,7 +234,7 @@ export function attachMeshWorker(mesh: EgressMesh, workerId: string, port: Messa
       return
     }
     if (frame.type === "durable.ack") {
-      mesh.ack(workerId, typeof frame.count === "number" ? frame.count : 1)
+      mesh.ack(workerId, requireAckCount(frame.count))
       return
     }
     if (frame.type === "resync.ack") {
@@ -279,7 +292,8 @@ export function createMeshWorkerClient(port: MessagePort): MeshWorkerClient {
     onResync: (handler) => {
       resyncHandler = handler
     },
-    acknowledgeDelivery: (count = 1) => link.notify({ type: "durable.ack", count } satisfies ControlInbound),
+    acknowledgeDelivery: (count = 1) =>
+      link.notify({ type: "durable.ack", count: requireAckCount(count) } satisfies ControlInbound),
     acknowledgeResync: (pattern) => link.notify({ type: "resync.ack", pattern } satisfies ControlInbound),
     dispose: () => link.dispose(),
   }

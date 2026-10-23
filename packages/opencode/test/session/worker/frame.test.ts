@@ -12,12 +12,19 @@ import {
   WORKER_FRAME_VERSION,
   UnsupportedFrameVersionError,
   ackFrame,
+  createFramePrimitives,
   decodeWorkerFrame,
+  durableMetaOf,
   encodeWorkerFrame,
   endFrame,
   eventFrame,
+  isRecord,
+  optionalBoolean,
+  optionalString,
   parseEventsFrame,
   parseWorkerFrame,
+  requireInteger,
+  requireString,
   resyncFrame,
   type EventsFrame,
 } from "@/session/worker/frame"
@@ -175,5 +182,68 @@ describe("parseEventsFrame", () => {
 
   test("rejects a payload on an end frame", () => {
     expect(() => parseEventsFrame({ v: 1, port: "events", kind: "end", payload: {} })).toThrow(ProtocolError)
+  })
+})
+
+describe("durableMetaOf", () => {
+  test("returns { generation, ordinal } only when both are present", () => {
+    expect(
+      durableMetaOf(eventFrame({ event: { id: "e", type: "t", properties: {} }, generation: 2, ordinal: 7 })),
+    ).toEqual({ generation: 2, ordinal: 7 })
+  })
+
+  test("a non-durable delta (neither field) has no durable meta", () => {
+    expect(durableMetaOf(eventFrame({ event: { id: "e", type: "t", properties: {} } }))).toBeUndefined()
+  })
+
+  test("a half-stamped frame is not durable", () => {
+    expect(
+      durableMetaOf(eventFrame({ event: { id: "e", type: "t", properties: {} }, ordinal: 7 })),
+    ).toBeUndefined()
+    expect(
+      durableMetaOf(eventFrame({ event: { id: "e", type: "t", properties: {} }, generation: 2 })),
+    ).toBeUndefined()
+  })
+
+  test("control frames are never durable", () => {
+    expect(durableMetaOf(endFrame())).toBeUndefined()
+    expect(durableMetaOf(ackFrame({ count: 1 }))).toBeUndefined()
+    expect(durableMetaOf(resyncFrame({ pattern: "p" }))).toBeUndefined()
+  })
+})
+
+describe("shared primitive parsers", () => {
+  test("isRecord excludes null and arrays", () => {
+    expect(isRecord({ a: 1 })).toBe(true)
+    expect(isRecord(null)).toBe(false)
+    expect(isRecord([1, 2])).toBe(false)
+    expect(isRecord("x")).toBe(false)
+  })
+
+  test("requireString/requireInteger fail loud on the wrong shape", () => {
+    expect(requireString({ s: "ok" }, "s")).toBe("ok")
+    expect(() => requireString({ s: 1 }, "s")).toThrow(ProtocolError)
+    expect(requireInteger({ n: 3 }, "n")).toBe(3)
+    expect(() => requireInteger({ n: 3.5 }, "n")).toThrow(ProtocolError)
+    expect(() => requireInteger({ n: "3" }, "n")).toThrow(ProtocolError)
+  })
+
+  test("optionalString/optionalBoolean keep absence as undefined", () => {
+    expect(optionalString({}, "s")).toBeUndefined()
+    expect(optionalString({ s: "v" }, "s")).toBe("v")
+    expect(() => optionalString({ s: 1 }, "s")).toThrow(ProtocolError)
+    expect(optionalBoolean({}, "b")).toBeUndefined()
+    expect(optionalBoolean({ b: false }, "b")).toBe(false)
+    expect(() => optionalBoolean({ b: "true" }, "b")).toThrow(ProtocolError)
+  })
+
+  test("createFramePrimitives binds failures to the caller's own error taxonomy", () => {
+    class CustomError extends Error {}
+    const fail = (message: string): never => {
+      throw new CustomError(message)
+    }
+    const primitives = createFramePrimitives(fail)
+    expect(() => primitives.requireString({ s: 1 }, "s")).toThrow(CustomError)
+    expect(() => primitives.requireInteger({ n: 1.5 }, "n")).toThrow(CustomError)
   })
 })

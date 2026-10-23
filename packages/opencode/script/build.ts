@@ -237,6 +237,11 @@ for (const item of targets) {
       OPENCODE_WRITER_WORKER_PATH: bunfsRoot + writerWorkerPath,
       OPENCODE_BROKER_WORKER_PATH: bunfsRoot + brokerWorkerPath,
       OPENCODE_CHANNEL: `'${Script.channel}'`,
+      // Compile the fault-injection seam out of production binaries. `define`
+      // values are raw code, so `"false"` inlines the boolean literal `false`
+      // that `src/testing/faults.ts` checks in `compiledOut()`. Dev/test never
+      // define it, so the `OPENCODE_TEST_FAULTS` env gate stays honoured there.
+      OPENCODE_TEST_FAULTS_ENABLED: "false",
       OPENCODE_LIBC: item.os === "linux" ? `'${item.abi ?? "glibc"}'` : "",
       ...(item.os === "linux" ? { "process.env.OPENTUI_LIBC": JSON.stringify(item.abi ?? "glibc") } : {}),
     },

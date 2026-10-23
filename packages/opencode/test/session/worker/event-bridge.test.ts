@@ -12,6 +12,7 @@ import { Effect, Layer, Schema } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Database } from "@opencode-ai/core/database/database"
 import {
+  DURABLE_WAKEUP_METADATA_KEY,
   HUB_PROXIED_EVENT_TYPES,
   createWorkerEventBridge,
   isSessionScopedEvent,
@@ -158,6 +159,46 @@ describe("createWorkerEventBridge", () => {
 
       expect(HUB_PROXIED_EVENT_TYPES.has("session.status")).toBe(true)
       expect(forwarded).toEqual([])
+      yield* bridge.dispose
+    }),
+  )
+
+  // Regression: the hub mesh delivers a worker its OWN durable commit back
+  // (pattern `"*"`). `republishDurableCommit` marks that live-only republish with
+  // `DURABLE_WAKEUP_METADATA_KEY`; the bridge must not re-forward it, or the hub
+  // would publish the same assistant part/text update twice.
+  it.effect("does not re-forward a durable-wakeup republish", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { events: forwarded, sink } = capture()
+      const bridge = yield* createWorkerEventBridge(events, sink)
+
+      yield* events.publishLive({
+        id: EventV2.ID.create(),
+        type: SessionThing.type,
+        data: { sessionID: "ses_1", text: "woken" },
+        metadata: { [DURABLE_WAKEUP_METADATA_KEY]: true },
+      })
+
+      expect(forwarded).toEqual([])
+      yield* bridge.dispose
+    }),
+  )
+
+  it.effect("still forwards a live publish that is not a wakeup republish", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { events: forwarded, sink } = capture()
+      const bridge = yield* createWorkerEventBridge(events, sink)
+
+      yield* events.publishLive({
+        id: EventV2.ID.create(),
+        type: SessionThing.type,
+        data: { sessionID: "ses_1", text: "live" },
+      })
+
+      expect(forwarded).toHaveLength(1)
+      expect(forwarded[0].properties).toEqual({ sessionID: "ses_1", text: "live" })
       yield* bridge.dispose
     }),
   )

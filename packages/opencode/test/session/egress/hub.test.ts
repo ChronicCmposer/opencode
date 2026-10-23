@@ -6,7 +6,7 @@
 // and hub-owned termination.
 
 import { describe, expect, test } from "bun:test"
-import { EgressStreamOverflowError, createEgressHub } from "@/session/egress/hub"
+import { EgressStreamOverflowError, createEgressHub } from "./hub"
 import { decodeFrame, encodeFrame, type EgressFrame } from "@/session/egress/frame"
 import { createEgressSender } from "@/session/egress/sender"
 import { endFrame } from "@/session/worker/frame"
@@ -108,6 +108,27 @@ describe("egress hub over MessagePort", () => {
     hub.close()
     hub.close()
     expect(hub.closed).toBe(true)
+  })
+
+  test("a subscriber that arrives after termination still receives the end frame", async () => {
+    const { hub } = setup()
+    hub.close()
+
+    const frames: EgressFrame[] = []
+    for await (const bytes of hub.stream("late")) frames.push(decodeFrame(bytes))
+
+    // The late SSE client must observe the terminal marker, not an empty stream.
+    expect(frames).toEqual([endFrame()])
+  })
+
+  test("a subscriber that arrives after the worker's end frame still receives it", async () => {
+    const { hub, sender } = setup()
+    sender.end()
+    await pollUntil(() => hub.closed)
+
+    const frames: EgressFrame[] = []
+    for await (const bytes of hub.stream("late")) frames.push(decodeFrame(bytes))
+    expect(frames).toEqual([endFrame()])
   })
 
   test("surfaces a typed error when a subscriber's durable queue overflows", async () => {

@@ -28,10 +28,11 @@ import {
   type BrokerRequest,
   type OAuthResult,
   type PingResult,
+  type ResponseFrame,
   type ServerSpec,
 } from "../broker/protocol"
 import type { BrokerClientHandle } from "./layer"
-import { messageOf, portFromMessagePort } from "./port"
+import { connectPeer, createRequestChannel, messageOf, peerLifecycle, portFromMessagePort } from "./port"
 import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
 
 /** Every frame either end may post: requests outbound, response/push frames inbound. */
@@ -72,20 +73,7 @@ export interface WorkerBrokerClientOptions {
   readonly workerID?: number
 }
 
-interface PendingRequest {
-  readonly resolve: (value: unknown) => void
-  readonly reject: (error: unknown) => void
-  readonly timer: ReturnType<typeof setTimeout> | undefined
-}
-
 const DISPOSED_MESSAGE = "worker broker client disposed"
-
-/** The lifecycle log fields shared by the connect/close lines for this peer. */
-const brokerLifecycleFields = (workerID: number | undefined, level: "info" | "warn"): Record<string, unknown> => ({
-  peer: "broker",
-  level,
-  ...(workerID === undefined ? {} : { workerID }),
-})
 
 /**
  * Adapt a transferred `MessagePort` into a worker broker client. The client
@@ -100,88 +88,39 @@ export function createWorkerBrokerClient(
   port: MessagePort,
   options: WorkerBrokerClientOptions = {},
 ): WorkerBrokerClient {
-  const log = options.log ?? noopWorkerLogger
-  const workerID = options.workerID
-  try {
-    const client = buildBrokerClient(port, options)
-    log(workerLogMessage("broker connected"), brokerLifecycleFields(workerID, "info"))
-    return client
-  } catch (error) {
-    log(workerLogMessage("broker connect failed"), {
-      ...brokerLifecycleFields(workerID, "warn"),
-      reason: messageOf(error),
-    })
-    throw error
-  }
+  return connectPeer(options.log ?? noopWorkerLogger, "broker", options.workerID, () =>
+    buildBrokerClient(port, options),
+  )
 }
 
 /** The connect seam: build the client over a started port; a start failure throws. */
 function buildBrokerClient(port: MessagePort, options: WorkerBrokerClientOptions): WorkerBrokerClient {
   const channel = portFromMessagePort<BrokerWireFrame>(port)
-  const defaultTimeoutMs = options.timeoutMs
   const log = options.log ?? noopWorkerLogger
   const workerID = options.workerID
 
   let nextRequestId = 0
   let disposed = false
-  const pending = new Map<string, PendingRequest>()
 
-  const unsubscribe = channel.onMessage((frame) => {
-    switch (frame.kind) {
-      case "response": {
-        const waiter = pending.get(frame.requestId)
-        if (waiter === undefined) return
-        pending.delete(frame.requestId)
-        if (waiter.timer !== undefined) clearTimeout(waiter.timer)
-        if (frame.ok) waiter.resolve(frame.value)
-        else waiter.reject(new BrokerFailure(frame.error.code, frame.error.message))
-        return
-      }
-      // Hub→worker pushes and (never-sent) requests are explicitly ignored.
-      case "notification":
-      case "child":
-      case "child-exit":
-      case "acquire":
-      case "call":
-      case "cancel":
-      case "release":
-      case "oauth":
-      case "ping":
-      case "teardown":
-        return
-      default: {
-        // Exhaustiveness guard: a new frame kind must be handled here.
-        const unknown: never = frame
-        void unknown
-        return
-      }
-    }
+  // Hub→worker pushes and (never-sent) requests are not replies, so the shared
+  // channel ignores them; only a correlated `response` settles a request. Timers
+  // are unref'd by the shared scheduler.
+  const requests = createRequestChannel<BrokerWireFrame, ResponseFrame, string>(channel, {
+    timeoutMs: options.timeoutMs,
+    isReply: (frame): frame is ResponseFrame => frame.kind === "response",
+    idOf: (reply) => reply.requestId,
+    nextId: () => `w${++nextRequestId}`,
+    disposedError: () => new BrokerFailure("crashed", DISPOSED_MESSAGE),
+    timeoutError: (id, timeoutMs) =>
+      new BrokerFailure("timeout", `broker request ${id} timed out after ${timeoutMs}ms`),
+    mapPostError: (error) => new BrokerFailure("crashed", messageOf(error)),
   })
 
-  const request = (
-    build: (requestId: string) => BrokerRequest,
-    timeoutMs = defaultTimeoutMs,
-  ): Promise<unknown> => {
-    if (disposed) return Promise.reject(new BrokerFailure("crashed", DISPOSED_MESSAGE))
-    const requestId = `w${++nextRequestId}`
-    return new Promise<unknown>((resolve, reject) => {
-      const timer =
-        timeoutMs === undefined
-          ? undefined
-          : setTimeout(() => {
-              pending.delete(requestId)
-              reject(new BrokerFailure("timeout", `broker request ${requestId} timed out after ${timeoutMs}ms`))
-            }, timeoutMs)
-      pending.set(requestId, { resolve, reject, timer })
-      try {
-        channel.post(build(requestId))
-      } catch (error) {
-        pending.delete(requestId)
-        if (timer !== undefined) clearTimeout(timer)
-        reject(new BrokerFailure("crashed", messageOf(error)))
-      }
+  const request = (build: (requestId: string) => BrokerRequest, timeoutMs?: number): Promise<unknown> =>
+    requests.request(build, timeoutMs).then((frame) => {
+      if (!frame.ok) throw new BrokerFailure(frame.error.code, frame.error.message)
+      return frame.value
     })
-  }
 
   const requestAs = async <T>(build: (requestId: string) => BrokerRequest, parse: (value: unknown) => T): Promise<T> =>
     parse(await request(build))
@@ -209,13 +148,8 @@ function buildBrokerClient(port: MessagePort, options: WorkerBrokerClientOptions
     dispose() {
       if (disposed) return
       disposed = true
-      unsubscribe()
-      for (const waiter of pending.values()) {
-        if (waiter.timer !== undefined) clearTimeout(waiter.timer)
-        waiter.reject(new BrokerFailure("crashed", DISPOSED_MESSAGE))
-      }
-      pending.clear()
-      log(workerLogMessage("broker closed"), brokerLifecycleFields(workerID, "info"))
+      requests.dispose()
+      log(workerLogMessage("broker closed"), peerLifecycle("broker", workerID)("info"))
     },
   }
 }

@@ -28,6 +28,8 @@
 // translation. `generation` / `ordinal` are frame metadata (payload siblings of
 // `event`), never fields on the event itself.
 
+import type { WriterOrdinal } from "@/session/egress/ordinal"
+
 /** The only envelope version understood by this build. */
 export const WORKER_FRAME_VERSION = 1
 export type WorkerFrameVersion = typeof WORKER_FRAME_VERSION
@@ -166,6 +168,120 @@ export class UnsupportedFrameVersionError extends ProtocolError {
 }
 
 // ---------------------------------------------------------------------------
+// Shared primitive parsers
+// ---------------------------------------------------------------------------
+
+/**
+ * A protocol's failure factory: build and throw that module's own protocol error.
+ * Binding the shared parsers to it lets every framed protocol (writer, broker,
+ * events) keep its own error taxonomy while sharing one implementation.
+ */
+export type ParseFail = (message: string) => never
+
+/** The failure factory used by the default parser exports: this module's `ProtocolError`. */
+const frameFail: ParseFail = (message) => {
+  throw new ProtocolError(message)
+}
+
+/** True for a plain object; `null` and arrays are excluded. */
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+/** Parse a required string field; fails loud through `fail` (frame `ProtocolError` by default). */
+export function requireString(
+  record: Record<string, unknown>,
+  field: string,
+  fail: ParseFail = frameFail,
+): string {
+  const value = record[field]
+  if (typeof value !== "string") fail(`field "${field}" must be a string (got ${JSON.stringify(value)})`)
+  return value
+}
+
+/** Parse a required finite-number field. */
+export function requireNumber(
+  record: Record<string, unknown>,
+  field: string,
+  fail: ParseFail = frameFail,
+): number {
+  const value = record[field]
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    fail(`field "${field}" must be a finite number (got ${JSON.stringify(value)})`)
+  }
+  return value
+}
+
+/** Parse a required integer field. */
+export function requireInteger(
+  record: Record<string, unknown>,
+  field: string,
+  fail: ParseFail = frameFail,
+): number {
+  const value = record[field]
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    fail(`field "${field}" must be an integer (got ${JSON.stringify(value)})`)
+  }
+  return value
+}
+
+/** Parse an optional string field; `undefined` stays absent. */
+export function optionalString(
+  record: Record<string, unknown>,
+  field: string,
+  fail: ParseFail = frameFail,
+): string | undefined {
+  const value = record[field]
+  if (value === undefined) return undefined
+  if (typeof value !== "string") fail(`field "${field}" must be a string (got ${JSON.stringify(value)})`)
+  return value
+}
+
+/** Parse an optional boolean field; `undefined` stays absent. */
+export function optionalBoolean(
+  record: Record<string, unknown>,
+  field: string,
+  fail: ParseFail = frameFail,
+): boolean | undefined {
+  const value = record[field]
+  if (value === undefined) return undefined
+  if (typeof value !== "boolean") fail(`field "${field}" must be a boolean (got ${JSON.stringify(value)})`)
+  return value
+}
+
+/** The total primitive parsers shared by every framed protocol. */
+export interface FramePrimitives {
+  /** True for a plain object; `null` and arrays are excluded. */
+  isRecord(value: unknown): value is Record<string, unknown>
+  requireString(record: Record<string, unknown>, field: string): string
+  requireNumber(record: Record<string, unknown>, field: string): number
+  requireInteger(record: Record<string, unknown>, field: string): number
+  optionalString(record: Record<string, unknown>, field: string): string | undefined
+  optionalBoolean(record: Record<string, unknown>, field: string): boolean | undefined
+}
+
+/**
+ * Bind the shared primitive parsers to a protocol's own failure type, so a
+ * module (e.g. the broker) can parse with its own error while reusing the
+ * implementation. Once bound, each parser takes only `(record, field)`.
+ */
+export function createFramePrimitives(fail: ParseFail): FramePrimitives {
+  return {
+    isRecord,
+    requireString: (record, field) => requireString(record, field, fail),
+    requireNumber: (record, field) => requireNumber(record, field, fail),
+    requireInteger: (record, field) => requireInteger(record, field, fail),
+    optionalString: (record, field) => optionalString(record, field, fail),
+    optionalBoolean: (record, field) => optionalBoolean(record, field, fail),
+  }
+}
+
+/** Coerce a thrown JSON-parse error to a message for a protocol error. */
+export function jsonErrorOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+// ---------------------------------------------------------------------------
 // Codec + parsing
 // ---------------------------------------------------------------------------
 
@@ -258,6 +374,19 @@ export function parseEventsFrame(input: unknown): EventsFrame {
   }
 }
 
+/**
+ * The writer-stamped durable metadata on an events `event` frame: present only
+ * when BOTH `generation` and `ordinal` are set. A non-durable delta carries
+ * neither, so this is the single durability test shared by the sender, the
+ * fan-out backpressure policy, and the receiver's commit-ordering check.
+ */
+export function durableMetaOf(frame: EventsFrame): WriterOrdinal | undefined {
+  if (frame.kind !== "event") return undefined
+  const { generation, ordinal } = frame.payload
+  if (generation === undefined || ordinal === undefined) return undefined
+  return { generation, ordinal }
+}
+
 /** Spread `{ id }` only when present, so absent correlation stays absent. */
 function correlation(id: number | undefined): { id?: number } {
   return id === undefined ? {} : { id }
@@ -341,13 +470,8 @@ function parseJson(text: string): unknown {
   try {
     return JSON.parse(text)
   } catch (error) {
-    throw new ProtocolError(`frame is not valid JSON: ${error instanceof Error ? error.message : String(error)}`)
+    throw new ProtocolError(`frame is not valid JSON: ${jsonErrorOf(error)}`)
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  // Arrays are objects but never valid records here, so exclude them explicitly.
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 export * as WorkerFrame from "./frame"

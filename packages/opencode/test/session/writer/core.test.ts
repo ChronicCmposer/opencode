@@ -8,12 +8,14 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { createBunSqliteConnection, type WriterConnection } from "@/session/writer/connection"
 import {
   AbortedWriteError,
+  ConnectionPoisonedError,
   OwnerMismatchError,
   SequenceError,
   TransactionError,
   WriterBusyExhaustedError,
   WriterClosedError,
   createWriterCore,
+  writerErrorInfo,
   type WriterCore,
   type WriterCoreOptions,
 } from "@/session/writer/core"
@@ -67,6 +69,29 @@ function guardedHarness(failCommit: () => boolean): Harness {
     ...connection,
     run: (sql, params = []) => {
       if (/^\s*commit\b/i.test(sql) && failCommit()) throw new Error("injected COMMIT failure")
+      return connection.run(sql, params)
+    },
+  }
+  const core = createWriterCore({ connection: guarded, sleep: async () => {} })
+  return { core, rows: (sql, params = []) => connection.all(sql, params) }
+}
+
+/**
+ * A harness whose connection fails the FIRST `COMMIT` with a native `SQLITE_BUSY`
+ * (carrying a `code`), so a busy retry of the commit boundary is exercised while
+ * the transaction is still open on the native handle.
+ */
+function busyCommitHarness(): Harness {
+  const connection = createBunSqliteConnection({ filename: ":memory:" })
+  connection.exec(SCHEMA_SQL)
+  let busy = true
+  const guarded: WriterConnection = {
+    ...connection,
+    run: (sql, params = []) => {
+      if (/^\s*commit\b/i.test(sql) && busy) {
+        busy = false
+        throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY", errno: 5 })
+      }
       return connection.run(sql, params)
     },
   }
@@ -236,6 +261,102 @@ describe("writer core: SQLITE_BUSY retry (7.8)", () => {
     const result = await core.publish({ event: ev("t", "a"), durable: true })
     expect(attempts).toBe(1)
     expect(result).toMatchObject({ seq: 0, committed: true })
+  })
+})
+
+describe("writer core: error info carries the native code (R1#2)", () => {
+  test("writerErrorInfo carries the code from a native driver error and the busy-exhausted error", () => {
+    expect(writerErrorInfo(Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" }))).toEqual({
+      tag: "UNKNOWN",
+      message: "database is locked",
+      code: "SQLITE_BUSY",
+    })
+    expect(writerErrorInfo(new WriterBusyExhaustedError("writer:commit", 3))).toMatchObject({
+      tag: "SQLITE_BUSY_EXHAUSTED",
+      code: "SQLITE_BUSY",
+    })
+    // A writer error with no native code stays a plain {tag, message}.
+    expect(writerErrorInfo(new OwnerMismatchError("nope"))).toEqual({ tag: "OWNER_MISMATCH", message: "nope" })
+  })
+})
+
+describe("writer core: busy COMMIT retry (R1#1, R5#4)", () => {
+  const INSERT = "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)"
+
+  test("a reserved-handle COMMIT is retried on the still-open transaction and the pin survives", async () => {
+    const { core, rows } = busyCommitHarness()
+    const handle = await core.beginTransaction()
+    await core.txQuery(handle, "run", INSERT, ["x", "a", 0, "t", "{}"])
+
+    await core.commitTransaction(handle)
+
+    // The first COMMIT failed busy; the retry re-issued it on the open
+    // transaction, so the write persisted rather than being rolled back.
+    expect(rows("SELECT id FROM event")).toEqual([{ id: "x" }])
+    const next = await core.beginTransaction()
+    await core.rollbackTransaction(next)
+  })
+
+  test("a busy COMMIT retry does not double-fire an in-process projector", async () => {
+    const { core } = busyCommitHarness()
+    let fires = 0
+    const result = await core.publish({
+      event: ev("t", "a"),
+      durable: true,
+      commit: () => {
+        fires += 1
+      },
+    })
+
+    expect(result).toMatchObject({ committed: true, seq: 0 })
+    expect(fires).toBe(1)
+  })
+
+  test("a busy COMMIT retry re-applies the transactional SQL projector exactly once", async () => {
+    const { core, rows } = busyCommitHarness()
+    await core.registerProjector(
+      "log",
+      "t",
+      "INSERT INTO projector_log (aggregate_id, seq, type) VALUES ($aggregate_id, $seq, $type)",
+    )
+    await core.publish({ event: ev("t", "a"), durable: true, commitId: "log" })
+
+    expect(rows("SELECT aggregate_id FROM projector_log")).toEqual([{ aggregate_id: "a" }])
+  })
+})
+
+describe("writer core: failed rollback poisons the connection (R1#3)", () => {
+  function uninvertibleHarness(): Harness {
+    const connection = createBunSqliteConnection({ filename: ":memory:" })
+    connection.exec(SCHEMA_SQL)
+    const guarded: WriterConnection = {
+      ...connection,
+      run: (sql, params = []) => {
+        if (/^\s*rollback\b/i.test(sql)) throw new Error("injected ROLLBACK failure")
+        return connection.run(sql, params)
+      },
+    }
+    const core = createWriterCore({ connection: guarded, sleep: async () => {} })
+    return { core, rows: (sql, params = []) => connection.all(sql, params) }
+  }
+
+  test("an untracked rollback that fails poisons the writer and later ops fail loud", async () => {
+    const { core } = uninvertibleHarness()
+
+    await expect(
+      core.publish({
+        event: ev("t", "a"),
+        durable: true,
+        commit: () => {
+          throw new Error("projector exploded")
+        },
+      }),
+    ).rejects.toBeInstanceOf(ConnectionPoisonedError)
+
+    // No wedge on "cannot start a transaction within a transaction": the writer
+    // refuses every queued and future operation with the same loud failure.
+    await expect(core.query("all", "SELECT 1 AS one")).rejects.toBeInstanceOf(ConnectionPoisonedError)
+    await expect(core.publish({ event: ev("t", "b"), durable: true })).rejects.toBeInstanceOf(ConnectionPoisonedError)
   })
 })
 

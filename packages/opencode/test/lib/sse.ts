@@ -1,8 +1,13 @@
 // Shared SSE stream parsing (plan consolidation).
 //
-// Both the mock-SSE session worker and the worker-side mock-LLM consumer parse
-// an OpenAI-compatible SSE stream into the same shape, so the reader and the
-// accumulator live here. Additive: existing consumers are migrated in wave 2.
+// The single reader/accumulator for OpenAI-compatible SSE streams. Every test
+// consumer — the worker-side mock-LLM chat parser, the mock-SSE session worker,
+// the session-layer worker fixture and the packaged-binary smoke gate — decodes
+// frames through here, so producer and consumer cannot drift.
+//
+// `parseSseFrame` decodes one frame's `data:` payloads; `readSsePayloads` streams
+// a body to a per-payload callback; `readSseStream` accumulates into the shared
+// `SseAccumulator`.
 
 export interface SseUsage {
   readonly input: number
@@ -75,19 +80,63 @@ export function applySsePayload(accumulator: SseAccumulator, payload: unknown): 
   applyToolCalls(accumulator, fields)
 }
 
-/** Apply one raw SSE frame (which may hold several `data:` lines). */
-export function applySseFrame(accumulator: SseAccumulator, frame: string): void {
+/** SSE stream terminators that carry no JSON payload. */
+const DONE_MARKERS: ReadonlySet<string> = new Set(["DONE", "[DONE]"])
+
+/**
+ * Decode the JSON payloads carried by one raw SSE frame (which may hold several
+ * `data:` lines). Non-`data:` lines, terminators and malformed JSON are skipped,
+ * so a consumer can treat the result as trusted payloads.
+ */
+export function parseSseFrame(frame: string): unknown[] {
+  const payloads: unknown[] = []
   for (const rawLine of frame.split("\n")) {
     const line = rawLine.trim()
     if (!line.startsWith("data:")) continue
-    const data = line.slice(5).trim()
-    if (data.length === 0 || data === "DONE") continue
+    const data = line.slice("data:".length).trim()
+    if (data.length === 0 || DONE_MARKERS.has(data)) continue
     try {
-      applySsePayload(accumulator, JSON.parse(data))
+      payloads.push(JSON.parse(data))
     } catch {
-      continue
+      // Ignore malformed frames; SSE payloads are expected to be JSON.
     }
   }
+  return payloads
+}
+
+/** Apply one raw SSE frame (which may hold several `data:` lines). */
+export function applySseFrame(accumulator: SseAccumulator, frame: string): void {
+  for (const payload of parseSseFrame(frame)) applySsePayload(accumulator, payload)
+}
+
+/**
+ * Read an SSE body, invoking `onPayload` for every decoded `data:` payload as it
+ * arrives. This is the streaming primitive both the accumulator and consumers
+ * that react to each event (rather than collect them) build on.
+ */
+export async function readSsePayloads(
+  body: ReadableStream<Uint8Array>,
+  onPayload: (payload: unknown) => void,
+): Promise<void> {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  const drain = (frame: string): void => {
+    for (const payload of parseSseFrame(frame)) onPayload(payload)
+  }
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let boundary = buffer.indexOf("\n\n")
+    while (boundary !== -1) {
+      drain(buffer.slice(0, boundary))
+      buffer = buffer.slice(boundary + 2)
+      boundary = buffer.indexOf("\n\n")
+    }
+  }
+  buffer += decoder.decode()
+  if (buffer.trim() !== "") drain(buffer)
 }
 
 /** Read an SSE body, applying every `data:` payload to `accumulator`. */
@@ -95,21 +144,6 @@ export async function readSseStream(
   body: ReadableStream<Uint8Array>,
   accumulator: SseAccumulator = createSseAccumulator(),
 ): Promise<SseAccumulator> {
-  const reader = body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ""
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    let boundary = buffer.indexOf("\n\n")
-    while (boundary !== -1) {
-      applySseFrame(accumulator, buffer.slice(0, boundary))
-      buffer = buffer.slice(boundary + 2)
-      boundary = buffer.indexOf("\n\n")
-    }
-  }
-  buffer += decoder.decode()
-  if (buffer.trim() !== "") applySseFrame(accumulator, buffer)
+  await readSsePayloads(body, (payload) => applySsePayload(accumulator, payload))
   return accumulator
 }

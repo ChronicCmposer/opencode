@@ -189,11 +189,11 @@ describe("hub-proxy control wire (production node wiring)", () => {
     const store = new Map<string, SessionStatus.Info>()
     serveHubProxy(
       {
-        get: (sessionID) => store.get(sessionID as string) ?? { type: "idle" },
-        set: (sessionID, status) => {
+        "sessionStatus.get": (sessionID) => store.get(sessionID as string) ?? { type: "idle" },
+        "sessionStatus.set": (sessionID, status) => {
           store.set(sessionID as string, status as SessionStatus.Info)
         },
-        list: () => [...store.entries()],
+        "sessionStatus.list": () => [...store.entries()],
       },
       channel.port2,
     )
@@ -223,7 +223,8 @@ describe("hub-proxy control wire (production node wiring)", () => {
   test("the production handler map routes the multiplexed wire to the right authority", async () => {
     // One worker control port multiplexes SessionStatus / Permission / Question,
     // so `ask`/`reply` (Permission+Question) and `list` (all three) collide. The
-    // production map disambiguates `ask`/`reply` by request shape.
+    // production map disambiguates them by NAMESPACING every method
+    // (`permission.ask` vs `question.ask`), so no request-shape guessing exists.
     const calls: string[] = []
     const authorities: HubProxyAuthorities = {
       sessionStatus: {
@@ -281,12 +282,12 @@ describe("hub-proxy control wire (production node wiring)", () => {
     const run: HubProxyRunner = (effect) => Effect.runPromise(effect)
     const handlers = buildHubProxyHandlers(authorities, run)
 
-    expect(await handlers.get(sid("ses_a"))).toEqual({ type: "idle" })
-    await handlers.ask({ permission: "bash", patterns: ["*"] })
-    await handlers.ask({ sessionID: sid("ses_q"), questions: [] })
-    await handlers.reply({ requestID: "req_p", reply: "once" })
-    await handlers.reply({ requestID: "req_q", answers: [["yes"]] })
-    await handlers.reject("req_q")
+    expect(await handlers["sessionStatus.get"]!(sid("ses_a"))).toEqual({ type: "idle" })
+    await handlers["permission.ask"]!({ permission: "bash", patterns: ["*"] })
+    await handlers["question.ask"]!({ sessionID: sid("ses_q"), questions: [] })
+    await handlers["permission.reply"]!({ requestID: "req_p", reply: "once" })
+    await handlers["question.reply"]!({ requestID: "req_q", answers: [["yes"]] })
+    await handlers["question.reject"]!("req_q")
 
     expect(calls).toEqual([
       "sessionStatus.get:ses_a",

@@ -12,7 +12,7 @@
 
 import { defined } from "@/util/object"
 import type { WriterClientHandle } from "./layer"
-import { messageOf, portFromMessagePort } from "./port"
+import { connectPeer, createRequestChannel, peerLifecycle, portFromMessagePort } from "./port"
 import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
 
 /** A durable event as it crosses the port; `data` is validated at the server boundary. */
@@ -61,17 +61,36 @@ export type WorkerWriterReply =
   | { readonly kind: "reply"; readonly id: number; readonly ok: "tx.query"; readonly value: unknown }
   | { readonly kind: "reply"; readonly id: number; readonly ok: "tx.commit" }
   | { readonly kind: "reply"; readonly id: number; readonly ok: "tx.rollback" }
-  | { readonly kind: "reply"; readonly id: number; readonly ok: "error"; readonly tag: string; readonly message: string }
+  | {
+      readonly kind: "reply"
+      readonly id: number
+      readonly ok: "error"
+      readonly tag: string
+      readonly message: string
+      /**
+       * The native SQLite code the hub forwarded, when the failure carried one
+       * (`SQLITE_BUSY`, `SQLITE_BUSY_SNAPSHOT`, …). Kept on the reply so the
+       * receiving side can classify a writer lock as a `LockTimeoutError`.
+       */
+      readonly code?: string | number
+    }
 
 export type WorkerWriterFrame = WorkerWriterRequest | WorkerWriterReply
 
 /** A typed failure returned across the port (mirrors `WriterRemoteError`). */
 export class WorkerWriterError extends Error {
   readonly tag: string
-  constructor(tag: string, message: string) {
+  /**
+   * The native SQLite code carried across the port, when the writer sent one.
+   * `classifySqliteError` reads `cause.code`, so preserving it here lets a
+   * writer lock map onto `LockTimeoutError` instead of `UnknownError`.
+   */
+  readonly code?: string | number
+  constructor(tag: string, message: string, code?: string | number) {
     super(message)
     this.name = tag
     this.tag = tag
+    if (code !== undefined) this.code = code
   }
 }
 
@@ -115,12 +134,6 @@ export interface CreateWorkerWriterClientOptions {
   readonly workerID?: number
 }
 
-interface PendingRequest {
-  readonly resolve: (reply: WorkerWriterReply) => void
-  readonly reject: (error: unknown) => void
-  readonly timer: ReturnType<typeof setTimeout> | undefined
-}
-
 const DISPOSED_MESSAGE = "worker writer client disposed"
 
 /**
@@ -132,19 +145,12 @@ function expectReply<K extends WorkerWriterReply["ok"]>(
   reply: WorkerWriterReply,
   expected: K,
 ): Extract<WorkerWriterReply, { readonly ok: K }> {
-  if (reply.ok === "error") throw new WorkerWriterError(reply.tag, reply.message)
+  if (reply.ok === "error") throw new WorkerWriterError(reply.tag, reply.message, reply.code)
   if (reply.ok !== expected) {
     throw new WorkerWriterError("PROTOCOL", `expected a "${expected}" reply, received "${reply.ok}"`)
   }
   return reply as Extract<WorkerWriterReply, { readonly ok: K }>
 }
-
-/** The lifecycle log fields shared by the connect/close lines for this peer. */
-const writerLifecycleFields = (workerID: number | undefined, level: "info" | "warn"): Record<string, unknown> => ({
-  peer: "writer",
-  level,
-  ...(workerID === undefined ? {} : { workerID }),
-})
 
 /**
  * Worker side: a thin `WriterClientHandle` over `port`.
@@ -157,63 +163,34 @@ export function createWorkerWriterClient(
   port: MessagePort,
   options: CreateWorkerWriterClientOptions = {},
 ): WorkerWriterClient {
-  const log = options.log ?? noopWorkerLogger
-  const workerID = options.workerID
-  try {
-    const client = buildWriterClient(port, options)
-    log(workerLogMessage("writer connected"), writerLifecycleFields(workerID, "info"))
-    return client
-  } catch (error) {
-    log(workerLogMessage("writer connect failed"), {
-      ...writerLifecycleFields(workerID, "warn"),
-      reason: messageOf(error),
-    })
-    throw error
-  }
+  return connectPeer(options.log ?? noopWorkerLogger, "writer", options.workerID, () =>
+    buildWriterClient(port, options),
+  )
 }
 
 /** The connect seam: build the client over a started port; a start failure throws. */
 function buildWriterClient(port: MessagePort, options: CreateWorkerWriterClientOptions): WorkerWriterClient {
   const channel = portFromMessagePort<WorkerWriterFrame>(port)
-  const defaultTimeoutMs = options.timeoutMs
   const log = options.log ?? noopWorkerLogger
   const workerID = options.workerID
   let nextId = 1
   let disposed = false
-  const pending = new Map<number, PendingRequest>()
 
-  const unsubscribe = channel.onMessage((frame) => {
-    // Only replies are addressed to the client; a request frame is a protocol
-    // violation we ignore rather than serve (the worker never owns the writer).
-    if (frame.kind !== "reply") return
-    const waiter = pending.get(frame.id)
-    if (waiter === undefined) return
-    pending.delete(frame.id)
-    if (waiter.timer !== undefined) clearTimeout(waiter.timer)
-    waiter.resolve(frame)
+  // Only replies are addressed to the client; a request frame is a protocol
+  // violation the channel ignores rather than serves (the worker never owns the
+  // writer). Timers are unref'd by the shared scheduler, so a pending request
+  // never keeps the worker alive.
+  const requests = createRequestChannel<WorkerWriterFrame, WorkerWriterReply, number>(channel, {
+    timeoutMs: options.timeoutMs,
+    isReply: (frame): frame is WorkerWriterReply => frame.kind === "reply",
+    idOf: (reply) => reply.id,
+    nextId: () => nextId++,
+    disposedError: () => new WorkerWriterError("DISPOSED", DISPOSED_MESSAGE),
+    timeoutError: (_id, timeoutMs) =>
+      new WorkerWriterError("TIMEOUT", `worker writer request timed out after ${timeoutMs}ms`),
   })
 
-  const request = (build: (id: number) => WorkerWriterRequest): Promise<WorkerWriterReply> => {
-    if (disposed) return Promise.reject(new WorkerWriterError("DISPOSED", DISPOSED_MESSAGE))
-    const id = nextId++
-    return new Promise<WorkerWriterReply>((resolve, reject) => {
-      const timer =
-        defaultTimeoutMs === undefined
-          ? undefined
-          : setTimeout(() => {
-              pending.delete(id)
-              reject(new WorkerWriterError("TIMEOUT", `worker writer request timed out after ${defaultTimeoutMs}ms`))
-            }, defaultTimeoutMs)
-      pending.set(id, { resolve, reject, timer })
-      try {
-        channel.post(build(id))
-      } catch (error) {
-        pending.delete(id)
-        if (timer !== undefined) clearTimeout(timer)
-        reject(error)
-      }
-    })
-  }
+  const request = (build: (id: number) => WorkerWriterRequest): Promise<WorkerWriterReply> => requests.request(build)
 
   return {
     async query(method, sql, params) {
@@ -261,13 +238,8 @@ function buildWriterClient(port: MessagePort, options: CreateWorkerWriterClientO
     dispose() {
       if (disposed) return
       disposed = true
-      unsubscribe()
-      for (const waiter of pending.values()) {
-        if (waiter.timer !== undefined) clearTimeout(waiter.timer)
-        waiter.reject(new WorkerWriterError("DISPOSED", DISPOSED_MESSAGE))
-      }
-      pending.clear()
-      log(workerLogMessage("writer closed"), writerLifecycleFields(workerID, "info"))
+      requests.dispose()
+      log(workerLogMessage("writer closed"), peerLifecycle("writer", workerID)("info"))
     },
   }
 }

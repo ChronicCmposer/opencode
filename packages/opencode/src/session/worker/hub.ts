@@ -40,7 +40,7 @@ import {
 } from "@/session/broker/broker"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { attachMeshWorker, createEgressMesh, type DurableCommit, type EgressMesh } from "@/session/egress/mesh"
-import type { EventV2Event, EventsAckPayload, EventsResyncPayload } from "./frame"
+import { durableMetaOf, type EventV2Event, type EventsAckPayload, type EventsResyncPayload } from "./frame"
 import { createLiveEventPublisher, instanceLocation, EventV2Bridge, type LiveEventPublisher } from "@/event-v2-bridge"
 import {
   createWriterClient,
@@ -98,12 +98,14 @@ import {
 } from "./pid-registry"
 import { Plugin } from "@/plugin"
 import type { SystemTransformInput, SystemTransformOutput, WorkerPluginHooks } from "./plugin-host"
-import type { HubProxyFrame, HubProxyHandlers, HubProxyReply } from "./layer"
+import type { HubProxyHandlers } from "./hub-proxy-wire"
+import { serveHubProxy } from "./hub-proxy-wire"
 import { portFromMessagePort } from "./port"
 import type { SessionWorkerInit } from "./session-worker"
 import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
 import { sessionThreadName } from "@/session/worker/thread-name"
 import { Session } from "@/session/session"
+import type { ShellInput } from "@/session/prompt"
 
 /** A descendant cancelled by the subagent cascade, and whether it needs a fallback idle. */
 export interface CancelledDescendant {
@@ -154,7 +156,11 @@ export interface SessionHub {
   attachHubProxyPort(workerID: number, port: MessagePort): () => void
   /** Dispatch `sessionID` to a worker and resolve with its result (admission-aware). */
   ensureRunning(sessionID: SessionID): Promise<SessionExecutionResult>
-  startShell(sessionID: SessionID): Promise<SessionExecutionResult>
+  /**
+   * Dispatch a shell turn. `shell` is the serialized `ShellInput` the worker
+   * replays through `SessionPrompt.shell`; absent keeps the plain startShell path.
+   */
+  startShell(sessionID: SessionID, shell?: ShellInput): Promise<SessionExecutionResult>
   assertNotBusy(sessionID: SessionID): Promise<boolean>
   /** The UI-stop path: cooperative checkpoint, then terminate after the grace window. */
   cancel(sessionID: SessionID): Promise<CancelOutcome | undefined>
@@ -302,42 +308,6 @@ export interface SessionHubOptions {
 }
 
 /**
- * Hub side: serve hub-proxy requests against `handlers`; returns a disposer.
- * Mirrors `layer.ts`'s `serveHubProxy` (imported type-only to avoid the
- * `hub → layer → run-state → hub` import cycle).
- */
-function serveHubProxyPort(handlers: HubProxyHandlers, port: MessagePort): () => void {
-  const channel = portFromMessagePort<HubProxyFrame>(port)
-  return channel.onMessage((frame) => {
-    if (frame.kind !== "request") return
-    const reply = (payload: HubProxyReply): void => {
-      try {
-        channel.post(payload)
-      } catch {
-        // Drop the reply: the worker is gone.
-      }
-    }
-    const handler = handlers[frame.method]
-    if (handler === undefined) {
-      reply({ kind: "reply", id: frame.id, ok: false, message: `unknown hub-proxy method "${frame.method}"` })
-      return
-    }
-    Promise.resolve()
-      .then(() => handler(...frame.args))
-      .then(
-        (value) => reply({ kind: "reply", id: frame.id, ok: true, value: value ?? null }),
-        (error) =>
-          reply({
-            kind: "reply",
-            id: frame.id,
-            ok: false,
-            message: error instanceof Error ? error.message : String(error),
-          }),
-      )
-  })
-}
-
-/**
  * Serve a worker control port for `{type:"pid-report"}` frames, forwarding each
  * well-formed frame to `onReport`. `portFromMessagePort` registers an
  * `addEventListener` listener, so this coexists with the hub-proxy request
@@ -448,10 +418,11 @@ export function serveEventsPort(
       if (frame.kind !== "event") return
       sink.event(frame.payload.event)
       if (onDurable === undefined) return
-      const { generation, ordinal } = frame.payload
-      if (generation !== undefined && ordinal !== undefined) {
-        onDurable({ meta: { generation, ordinal }, event: frame.payload.event })
-      }
+      // The canonical durability test (present only when BOTH `generation` and
+      // `ordinal` are set), shared with the receiver and fan-out so the three
+      // never drift on exactly which frames are durable.
+      const meta = durableMetaOf(frame)
+      if (meta !== undefined) onDurable({ meta, event: frame.payload.event })
     },
     onEnd: () => sink.end(),
     onResync: (payload) => sink.resync(payload),
@@ -498,36 +469,26 @@ export interface HubProxyAuthorities {
  */
 export type HubProxyRunner = <A, E>(effect: Effect.Effect<A, E>) => Promise<A>
 
-/** Whether a hub-proxy request payload carries an array field (Question vs Permission). */
-function hasArrayField(input: unknown, field: string): boolean {
-  if (typeof input !== "object" || input === null) return false
-  return Array.isArray((input as Record<string, unknown>)[field])
-}
-
 /**
- * Build the hub-side handler map for the worker hub-proxy wire. `SessionStatus`
- * owns `get`/`set`; `Question` owns `reject`; `ask`/`reply` are shared with
- * `Permission` and disambiguated by request shape (a Question request carries
- * `questions`/`answers`). `list` is shared by all three, which the single
- * multiplexed port cannot discriminate — the worker session loop never lists
- * (the UI lists on the hub), so it routes to `SessionStatus` so a worker call
- * resolves rather than hangs.
+ * Build the hub-side handler map for the worker hub-proxy wire. Every method is
+ * namespaced by its authority (`question.ask` vs `permission.ask`), so a single
+ * multiplexed control port can never misroute a call — no request-shape guessing.
  */
 export function buildHubProxyHandlers(authorities: HubProxyAuthorities, run: HubProxyRunner): HubProxyHandlers {
   return {
-    get: (sessionID) => run(authorities.sessionStatus.get(sessionID as SessionID)),
-    set: (sessionID, status) =>
+    "sessionStatus.get": (sessionID) => run(authorities.sessionStatus.get(sessionID as SessionID)),
+    "sessionStatus.set": (sessionID, status) =>
       run(authorities.sessionStatus.set(sessionID as SessionID, status as SessionStatus.Info)),
-    list: () => run(authorities.sessionStatus.list()).then((entries) => [...entries]),
-    ask: (input) =>
-      hasArrayField(input, "questions")
-        ? run(authorities.question.ask(input as Parameters<Question.Interface["ask"]>[0]))
-        : run(authorities.permission.ask(input as Parameters<Permission.Interface["ask"]>[0])),
-    reply: (input) =>
-      hasArrayField(input, "answers")
-        ? run(authorities.question.reply(input as Parameters<Question.Interface["reply"]>[0]))
-        : run(authorities.permission.reply(input as Parameters<Permission.Interface["reply"]>[0])),
-    reject: (requestID) => run(authorities.question.reject(requestID as Parameters<Question.Interface["reject"]>[0])),
+    "sessionStatus.list": () => run(authorities.sessionStatus.list()).then((entries) => [...entries]),
+    "permission.ask": (input) => run(authorities.permission.ask(input as Parameters<Permission.Interface["ask"]>[0])),
+    "permission.reply": (input) =>
+      run(authorities.permission.reply(input as Parameters<Permission.Interface["reply"]>[0])),
+    "permission.list": () => run(authorities.permission.list()),
+    "question.ask": (input) => run(authorities.question.ask(input as Parameters<Question.Interface["ask"]>[0])),
+    "question.reply": (input) => run(authorities.question.reply(input as Parameters<Question.Interface["reply"]>[0])),
+    "question.reject": (requestID) =>
+      run(authorities.question.reject(requestID as Parameters<Question.Interface["reject"]>[0])),
+    "question.list": () => run(authorities.question.list()),
     // Always served: a worker's `experimental.chat.system.transform` reaches the
     // hub, which runs the plugin hook and returns the mutated `{system}`. Absent
     // an authority the output passes through unchanged (never an unknown method).
@@ -543,46 +504,41 @@ export function buildHubProxyHandlers(authorities: HubProxyAuthorities, run: Hub
   }
 }
 
-/** Compose the dispatcher + executor pool + cooperative cancel into one hub. */
-export function createSessionHub(options: SessionHubOptions): SessionHub {
-  const log = options.log ?? noopWorkerLogger
-  // One registry for the whole hub. A settled child is routed to the worker
-  // currently hosting its `parentID` (the dispatcher's key→worker map).
+/**
+ * The per-worker port servers: the job link plus the transferred writer / egress
+ * / broker and hub-proxy control ports. Each attach is idempotent per worker (a
+ * re-attach disposes the previous server first), and `disposeAll` tears every
+ * server down. The backend source and handler map are thunks because both
+ * materialise lazily, after the pool and dispatcher exist.
+ */
+interface WorkerPortRegistryOptions {
+  readonly log: WorkerLogger
+  readonly jobs: JobRegistry
+  readonly backends: () => WorkerPortBackends | undefined
+  readonly hubProxyHandlers: () => HubProxyHandlers | undefined
+  readonly onPidReport?: (workerID: number, report: PidReport) => void
+}
+
+interface WorkerPortRegistry {
+  readonly jobPortFor: (workerID: number) => JobPort | undefined
+  readonly attachJobPort: (workerID: number, port: JobPort) => () => void
+  readonly attachWorkerPorts: (workerID: number, ports: WorkerTransferredPorts) => () => void
+  readonly attachHubProxyPort: (workerID: number, port: MessagePort) => () => void
+  readonly disposeAll: () => void
+}
+
+function createWorkerPortRegistry(options: WorkerPortRegistryOptions): WorkerPortRegistry {
+  const { log } = options
   const jobPorts = new Map<number, JobPort>()
   const jobDisposers = new Map<number, () => void>()
-  // Worker writer/egress/broker and hub-proxy port servers, keyed by worker id.
   const workerPortDisposers = new Map<number, () => void>()
   const hubProxyDisposers = new Map<number, () => void>()
-  // The port authorities are built on the first attach (never at construction):
-  // a value is used as-is; a source function is invoked once and memoised.
-  const portSource = options.ports
-  let resolvedBackends: WorkerPortBackends | undefined
-  let backendsResolved = false
-  const portBackends = (): WorkerPortBackends | undefined => {
-    if (portSource === undefined) return undefined
-    if (typeof portSource !== "function") return portSource
-    if (!backendsResolved) {
-      resolvedBackends = portSource()
-      backendsResolved = true
-    }
-    return resolvedBackends
-  }
-  // Assigned once the pool exists; read lazily by the routing closures below.
-  let dispatcher: Dispatcher
-
-  const workerForSession = (sessionID: string): number | undefined =>
-    dispatcher.workerForSession(sessionID as SessionID)
-  const portForSession = (sessionID: string): JobPort | undefined => {
-    const workerID = workerForSession(sessionID)
-    return workerID === undefined ? undefined : jobPorts.get(workerID)
-  }
-  const jobs = options.jobs ?? createJobRegistry({ routeResult: createResultRouter(portForSession) })
 
   const attachJobPort = (workerID: number, port: JobPort): (() => void) => {
     log(workerLogMessage("ports connected"), { level: "INFO", workerID, ports: ["job"] })
     jobDisposers.get(workerID)?.()
     jobPorts.set(workerID, port)
-    const disposeServer = serveJobRegistry(jobs, port)
+    const disposeServer = serveJobRegistry(options.jobs, port)
     const dispose = () => {
       disposeServer()
       jobPorts.delete(workerID)
@@ -599,7 +555,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     log(workerLogMessage("ports connected"), { level: "INFO", workerID, ports: transferredPortNames(ports) })
     workerPortDisposers.get(workerID)?.()
     const disposers: (() => void)[] = []
-    const backends = portBackends()
+    const backends = options.backends()
     if (backends !== undefined) {
       if (ports.writer !== undefined) disposers.push(serveWriterPort(backends.writer, ports.writer))
       if (ports.broker !== undefined) disposers.push(serveBrokerPort(backends.broker, ports.broker))
@@ -625,8 +581,8 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     log(workerLogMessage("ports connected"), { level: "INFO", workerID, ports: ["hub-proxy"] })
     hubProxyDisposers.get(workerID)?.()
     const disposers: (() => void)[] = []
-    const handlers = hubProxyHandlers()
-    if (handlers !== undefined) disposers.push(serveHubProxyPort(handlers, port))
+    const handlers = options.hubProxyHandlers()
+    if (handlers !== undefined) disposers.push(serveHubProxy(handlers, port))
     const onPidReport = options.onPidReport
     if (onPidReport !== undefined) {
       // The port association is the authoritative owner: the worker only knows
@@ -641,6 +597,152 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     hubProxyDisposers.set(workerID, dispose)
     return dispose
   }
+
+  return {
+    jobPortFor: (workerID) => jobPorts.get(workerID),
+    attachJobPort,
+    attachWorkerPorts,
+    attachHubProxyPort,
+    disposeAll: () => {
+      for (const dispose of jobDisposers.values()) dispose()
+      for (const dispose of workerPortDisposers.values()) dispose()
+      for (const dispose of hubProxyDisposers.values()) dispose()
+    },
+  }
+}
+
+/** The cancel reporter's collaborators: the dispatcher (lazy) and the child graph. */
+interface CancelReporterOptions {
+  readonly dispatcher: () => Dispatcher
+  readonly childrenOf: (sessionID: SessionID) => ReadonlyArray<SessionID>
+  readonly events?: LiveEventPublisher
+  readonly log: WorkerLogger
+}
+
+interface CancelReporter {
+  /** Record a dispatcher-reported terminal mode so the report can reconstruct it. */
+  readonly recordCancelled: (sessionID: string, mode: CancelledMode) => void
+  readonly cancelWithReport: (sessionID: SessionID) => Promise<CancelReport>
+}
+
+/**
+ * Reconstruct the terminal settlement of a cancelled session and its subagent
+ * cascade. The dispatcher cascades children-first but discards a descendant's own
+ * outcome, so this records each mode it reports and derives which descendants
+ * still need a fallback idle (a cooperative settle publishes its own; a queued or
+ * grace-terminated one does not).
+ */
+function createCancelReporter(options: CancelReporterOptions): CancelReporter {
+  const cancelledModes = new Map<string, CancelledMode>()
+
+  /**
+   * Every descendant of `sessionID` (children-first, depth-first), as the
+   * dispatcher's own cascade would visit them. A linked child that was never
+   * admitted is included, so it still receives a fallback idle.
+   */
+  const descendantsOf = (sessionID: SessionID): SessionID[] => {
+    const descendants: SessionID[] = []
+    const visit = (id: SessionID): void => {
+      for (const child of options.childrenOf(id)) {
+        visit(child)
+        descendants.push(child)
+      }
+    }
+    visit(sessionID)
+    return descendants
+  }
+
+  /** A cancel mode that implies the worker already published its terminal idle. */
+  const workerPublishedIdle = (mode: CancelledMode | undefined): boolean =>
+    mode === "cooperative" || mode === "completed"
+
+  const cancelWithReport = async (sessionID: SessionID): Promise<CancelReport> => {
+    const descendants = descendantsOf(sessionID)
+    // Drop a prior request's recorded modes so its outcome is never reused.
+    cancelledModes.delete(sessionID)
+    for (const descendant of descendants) cancelledModes.delete(descendant)
+
+    // The dispatcher cascades to the descendants itself (children-first); the
+    // recorded modes below reconstruct each descendant's settlement.
+    const outcome = await options.dispatcher().cancelWithGrace(sessionID)
+
+    // Report the terminal outcome to every SSE client. `SessionV1.Event.Cancelled`
+    // is non-durable, and the live-only publisher refuses a durable definition, so
+    // this can never re-commit the session state already written through the writer.
+    //
+    // Publish only when a cancel actually won. A `completion` outcome means the
+    // run finished on its own during the grace window; telling the client it was
+    // cancelled would be a lie (and would race the run's own idle/completion).
+    // The hub deliberately emits no `session.status: idle` here — `run-state.ts`
+    // owns the canonical cancel-idle transition.
+    if (outcome !== undefined && outcome.winner === "cancel") {
+      options.events?.publishDefinition(SessionV1.Event.Cancelled, {
+        sessionID: outcome.sessionID,
+        mode: outcome.mode,
+        durationMs: outcome.durationMs,
+        acknowledged: outcome.acknowledged,
+      })
+    }
+    const reportDescendants = descendants.map((child) => ({
+      sessionID: child,
+      needsFallbackIdle: !workerPublishedIdle(cancelledModes.get(child)),
+    }))
+    options.log(workerLogMessage("cancel cascade"), {
+      level: "INFO",
+      sessionID,
+      descendants: reportDescendants.length,
+      needsFallbackIdle: reportDescendants.filter((descendant) => descendant.needsFallbackIdle).length,
+    })
+    return { outcome, descendants: reportDescendants }
+  }
+
+  return {
+    recordCancelled: (sessionID, mode) => {
+      cancelledModes.set(sessionID, mode)
+    },
+    cancelWithReport,
+  }
+}
+
+/** Compose the dispatcher + executor pool + cooperative cancel into one hub. */
+export function createSessionHub(options: SessionHubOptions): SessionHub {
+  const log = options.log ?? noopWorkerLogger
+  // The port authorities are built on the first attach (never at construction):
+  // a value is used as-is; a source function is invoked once and memoised.
+  const portSource = options.ports
+  let resolvedBackends: WorkerPortBackends | undefined
+  let backendsResolved = false
+  const portBackends = (): WorkerPortBackends | undefined => {
+    if (portSource === undefined) return undefined
+    if (typeof portSource !== "function") return portSource
+    if (!backendsResolved) {
+      resolvedBackends = portSource()
+      backendsResolved = true
+    }
+    return resolvedBackends
+  }
+  // Assigned once the pool exists; read lazily by the routing closures below.
+  let dispatcher: Dispatcher
+  // Assigned once the registry exists (below); read lazily by `portForSession`,
+  // which the job registry calls only after a dispatch has attached a port.
+  let ports: WorkerPortRegistry
+
+  const workerForSession = (sessionID: string): number | undefined =>
+    dispatcher.workerForSession(sessionID as SessionID)
+  const portForSession = (sessionID: string): JobPort | undefined => {
+    const workerID = workerForSession(sessionID)
+    return workerID === undefined ? undefined : ports.jobPortFor(workerID)
+  }
+  const jobs = options.jobs ?? createJobRegistry({ routeResult: createResultRouter(portForSession) })
+  // One registry for the whole hub: the job link routes a settled child to the
+  // worker currently hosting its `parentID` (the dispatcher's key→worker map).
+  ports = createWorkerPortRegistry({
+    log,
+    jobs,
+    backends: portBackends,
+    hubProxyHandlers,
+    onPidReport: options.onPidReport,
+  })
 
   /**
    * The served hub-proxy handler map: the caller's three authorities plus the
@@ -665,23 +767,28 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     return { ...base, dispatchSubagent: base.dispatchSubagent ?? dispatchSubagent }
   }
 
-  // Materialise the pool, wiring its transferred job ports into `attachJobPort`.
+  // Materialise the pool, wiring its transferred job ports into the registry.
   const onJobPort = (workerID: number, port: MessagePort): void => {
-    attachJobPort(workerID, jobPortFromMessagePort(port))
+    ports.attachJobPort(workerID, jobPortFromMessagePort(port))
   }
   const pool = typeof options.pool === "function" ? options.pool(onJobPort) : options.pool
   const resolvedCancellation =
     typeof options.cancellation === "function" ? options.cancellation(pool) : options.cancellation
   // Every terminal cancel mode the dispatcher reports, keyed by session id. The
   // dispatcher cascades children-first but discards a descendant's own outcome,
-  // so the hub records the modes here and reconstructs which descendants still
+  // so the reporter records the modes and reconstructs which descendants still
   // need a fallback idle (see `cancelWithReport`).
-  const cancelledModes = new Map<string, CancelledMode>()
   // The hub's job registry is the cross-worker parent→child authority (9.4), so
   // an unwired cancellation config still cascades to subagents and still marks a
   // cancelled job. An explicit config always wins.
   const childrenOf: (sessionID: SessionID) => ReadonlyArray<SessionID> =
     resolvedCancellation?.childrenOf ?? ((sessionID) => jobs.childrenOf(sessionID).map((child) => child as SessionID))
+  const cancelReporter = createCancelReporter({
+    dispatcher: () => dispatcher,
+    childrenOf,
+    events: options.events,
+    log,
+  })
   const baseOnCancelled = resolvedCancellation?.onCancelled
   const cancellation: CancellationConfig | undefined =
     resolvedCancellation === undefined
@@ -690,7 +797,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
           ...resolvedCancellation,
           childrenOf,
           onCancelled: (event) => {
-            cancelledModes.set(event.sessionID, event.mode)
+            cancelReporter.recordCancelled(event.sessionID, event.mode)
             if (baseOnCancelled !== undefined) baseOnCancelled(event)
             else void jobs.cancel(event.sessionID)
           },
@@ -718,89 +825,26 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   })
   const onDispatch = options.onDispatch
 
-  /**
-   * Every descendant of `sessionID` (children-first, depth-first), as the
-   * dispatcher's own cascade would visit them. A linked child that was never
-   * admitted is included, so it still receives a fallback idle.
-   */
-  const descendantsOf = (sessionID: SessionID): SessionID[] => {
-    const descendants: SessionID[] = []
-    const visit = (id: SessionID): void => {
-      for (const child of childrenOf(id)) {
-        visit(child)
-        descendants.push(child)
-      }
-    }
-    visit(sessionID)
-    return descendants
-  }
-
-  /** A cancel mode that implies the worker already published its terminal idle. */
-  const workerPublishedIdle = (mode: CancelledMode | undefined): boolean =>
-    mode === "cooperative" || mode === "completed"
-
-  const cancelWithReport = async (sessionID: SessionID): Promise<CancelReport> => {
-    const descendants = descendantsOf(sessionID)
-    // Drop a prior request's recorded modes so its outcome is never reused.
-    cancelledModes.delete(sessionID)
-    for (const descendant of descendants) cancelledModes.delete(descendant)
-
-    // The dispatcher cascades to the descendants itself (children-first); the
-    // recorded modes below reconstruct each descendant's settlement.
-    const outcome = await dispatcher.cancelWithGrace(sessionID)
-
-    // Report the terminal outcome to every SSE client. `SessionV1.Event.Cancelled`
-    // is non-durable, and the live-only publisher refuses a durable definition, so
-    // this can never re-commit the session state already written through the writer.
-    //
-    // Publish only when a cancel actually won. A `completion` outcome means the
-    // run finished on its own during the grace window; telling the client it was
-    // cancelled would be a lie (and would race the run's own idle/completion).
-    // The hub deliberately emits no `session.status: idle` here — `run-state.ts`
-    // owns the canonical cancel-idle transition.
-    if (outcome !== undefined && outcome.winner === "cancel") {
-      options.events?.publishDefinition(SessionV1.Event.Cancelled, {
-        sessionID: outcome.sessionID,
-        mode: outcome.mode,
-        durationMs: outcome.durationMs,
-        acknowledged: outcome.acknowledged,
-      })
-    }
-    const reportDescendants = descendants.map((child) => ({
-      sessionID: child,
-      needsFallbackIdle: !workerPublishedIdle(cancelledModes.get(child)),
-    }))
-    log(workerLogMessage("cancel cascade"), {
-      level: "INFO",
-      sessionID,
-      descendants: reportDescendants.length,
-      needsFallbackIdle: reportDescendants.filter((descendant) => descendant.needsFallbackIdle).length,
-    })
-    return { outcome, descendants: reportDescendants }
-  }
-
   return {
     dispatcher,
     jobs,
-    attachJobPort,
-    attachWorkerPorts,
-    attachHubProxyPort,
+    attachJobPort: ports.attachJobPort,
+    attachWorkerPorts: ports.attachWorkerPorts,
+    attachHubProxyPort: ports.attachHubProxyPort,
     ensureRunning: (sessionID) => {
       onDispatch?.(sessionID)
       return dispatch.ensureRunning(sessionID)
     },
-    startShell: (sessionID) => {
+    startShell: (sessionID, shell) => {
       onDispatch?.(sessionID)
-      return dispatch.startShell(sessionID)
+      return dispatch.startShell(sessionID, shell)
     },
     assertNotBusy: (sessionID) => dispatch.assertNotBusy(sessionID),
-    cancel: async (sessionID) => (await cancelWithReport(sessionID)).outcome,
-    cancelWithReport,
+    cancel: async (sessionID) => (await cancelReporter.cancelWithReport(sessionID)).outcome,
+    cancelWithReport: cancelReporter.cancelWithReport,
     cancelAll: () => dispatch.cancelAll(),
     async terminateAll() {
-      for (const dispose of jobDisposers.values()) dispose()
-      for (const dispose of workerPortDisposers.values()) dispose()
-      for (const dispose of hubProxyDisposers.values()) dispose()
+      ports.disposeAll()
       await dispatcher.terminateAll()
       // Only tear down backends we actually built (a source never attached to is
       // never constructed, so no isolate is spawned just to dispose it).
@@ -1094,57 +1138,88 @@ export function createBunExecutorWorkerPool(options: BunExecutorWorkerPoolOption
 // ---------------------------------------------------------------------------
 
 /**
+ * The mutable materialization state shared by every worker whose isolate is
+ * created on first use. The `materialize` policy owns the *why* (a lazy factory
+ * ignores the session; a session-bound factory rebinds); this helper owns the
+ * worker surface and the terminate race.
+ */
+interface MaterializingWorkerState {
+  /** The live isolate, or `undefined` before the first materialization. */
+  inner: ExecutorWorker | undefined
+  /** Set once `terminate` runs; a late materialization must never publish. */
+  terminated: boolean
+  /** The in-flight materialization, so concurrent executes share one isolate. */
+  materializing: Promise<ExecutorWorker> | undefined
+}
+
+/**
+ * Build the `ExecutorWorker` surface around a `materialize` policy, which
+ * resolves the isolate for a run's session and writes it back to `state.inner`.
+ * The helper enforces the terminate race: a terminate during materialization
+ * discards the fresh isolate rather than publishing a live worker. Before the
+ * first materialization, `cancel`/`assertNotBusy`/`resultFor` are no-ops, which
+ * is correct because no session can run on a worker that was never started.
+ */
+function createMaterializingExecutorWorker(
+  id: number,
+  materialize: (sessionID: SessionID, state: MaterializingWorkerState) => Promise<ExecutorWorker>,
+  log: WorkerLogger = noopWorkerLogger,
+): ExecutorWorker {
+  const state: MaterializingWorkerState = { inner: undefined, terminated: false, materializing: undefined }
+  const worker: ExecutorWorker = {
+    id,
+    get alive() {
+      return !state.terminated && (state.inner === undefined || state.inner.alive)
+    },
+    execute: async (run) => (await materialize(run.sessionID, state)).execute(run),
+    cancel: (sessionID) => (state.inner === undefined ? Promise.resolve() : state.inner.cancel(sessionID)),
+    assertNotBusy: (sessionID) =>
+      state.inner === undefined ? Promise.resolve(false) : state.inner.assertNotBusy(sessionID),
+    resultFor: (sessionID) => state.inner?.resultFor(sessionID),
+    cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID), log }),
+    terminate: async () => {
+      state.terminated = true
+      state.materializing = undefined
+      const current = state.inner
+      state.inner = undefined
+      if (current !== undefined) await current.terminate()
+    },
+  }
+  return worker
+}
+
+/**
  * Wrap a worker factory so the underlying isolate is created on first use. The
  * dispatcher reads `alive`/builds slots at construction, so a lazy worker reports
  * itself alive (and free) before it exists; the isolate appears on the first
- * `execute`. `cancel`/`assertNotBusy`/`resultFor` before materialisation are
- * no-ops, which is correct because no session can be running on a worker that was
- * never started. The factory may be async (the production init is resolved on
- * first dispatch).
+ * `execute`. The factory may be async (the production init is resolved on first
+ * dispatch).
  */
 export function createLazyExecutorWorker(
   id: number,
   create: LazyExecutorWorkerFactory,
   log: WorkerLogger = noopWorkerLogger,
 ): ExecutorWorker {
-  let inner: ExecutorWorker | undefined
-  let materializing: Promise<ExecutorWorker> | undefined
-  let terminated = false
-  const materialize = async (): Promise<ExecutorWorker> => {
-    if (terminated) throw new Error(`executor worker ${id} is terminated`)
-    if (inner !== undefined) return inner
-    materializing ??= Promise.resolve()
-      .then(create)
-      .then((worker) => {
-        // A terminate raced the materialisation: never publish a live worker.
-        if (terminated) {
-          void worker.terminate()
-          throw new Error(`executor worker ${id} is terminated`)
-        }
-        inner = worker
-        return worker
-      })
-    return materializing
-  }
-  const worker: ExecutorWorker = {
+  return createMaterializingExecutorWorker(
     id,
-    get alive() {
-      return !terminated && (inner === undefined || inner.alive)
+    async (_sessionID, state) => {
+      if (state.terminated) throw new Error(`executor worker ${id} is terminated`)
+      if (state.inner !== undefined) return state.inner
+      state.materializing ??= Promise.resolve()
+        .then(create)
+        .then((worker) => {
+          // A terminate raced the materialisation: never publish a live worker.
+          if (state.terminated) {
+            void worker.terminate()
+            throw new Error(`executor worker ${id} is terminated`)
+          }
+          state.inner = worker
+          return worker
+        })
+      return state.materializing
     },
-    execute: async (run) => (await materialize()).execute(run),
-    cancel: (sessionID) => (inner === undefined ? Promise.resolve() : inner.cancel(sessionID)),
-    assertNotBusy: (sessionID) => (inner === undefined ? Promise.resolve(false) : inner.assertNotBusy(sessionID)),
-    resultFor: (sessionID) => inner?.resultFor(sessionID),
-    cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID), log }),
-    terminate: async () => {
-      terminated = true
-      materializing = undefined
-      const current = inner
-      inner = undefined
-      if (current !== undefined) await current.terminate()
-    },
-  }
-  return worker
+    log,
+  )
 }
 
 /** Build one worker on first use; may be async (the production init is resolved on dispatch). */
@@ -1264,66 +1339,46 @@ export function createSessionBoundExecutorWorker(
   spawnFor: SessionBoundSpawner,
   log: WorkerLogger = noopWorkerLogger,
 ): ExecutorWorker {
-  let inner: ExecutorWorker | undefined
   let boundSession: SessionID | undefined
-  let materializing: Promise<ExecutorWorker> | undefined
-  let terminated = false
-
-  const materialize = (sessionID: SessionID): Promise<ExecutorWorker> => {
-    if (terminated) throw new Error(`executor worker ${id} is terminated`)
-    if (inner !== undefined && boundSession === sessionID) return Promise.resolve(inner)
-    const previousSession = boundSession
-    const previous = inner
-    inner = undefined
-    boundSession = sessionID
-    // A worker rebinding from one session to another is the observable signal
-    // that the isolate is being retired and rebuilt for a different model.
-    if (previousSession !== undefined && previousSession !== sessionID) {
-      log(workerLogMessage("worker rebound"), {
-        level: "INFO",
-        workerID: id,
-        fromSession: previousSession,
-        toSession: sessionID,
-        // The rebound-to session is always defined here (the branch guards
-        // `previousSession !== undefined`), so the log seam hoists it into the
-        // message prefix. `fromSession`/`toSession` stay for backward compat.
-        sessionID,
-      })
-    }
-    materializing = Promise.resolve()
-      // Retire the old isolate first so two models never share one worker.
-      .then(() => previous?.terminate().catch(() => undefined))
-      .then(() => spawnFor(id, sessionID))
-      .then((worker) => {
-        if (terminated) {
-          void worker.terminate()
-          throw new Error(`executor worker ${id} is terminated`)
-        }
-        inner = worker
-        return worker
-      })
-    return materializing
-  }
-
-  const worker: ExecutorWorker = {
+  return createMaterializingExecutorWorker(
     id,
-    get alive() {
-      return !terminated && (inner === undefined || inner.alive)
+    (sessionID, state) => {
+      if (state.terminated) throw new Error(`executor worker ${id} is terminated`)
+      if (state.inner !== undefined && boundSession === sessionID) return Promise.resolve(state.inner)
+      const previousSession = boundSession
+      const previous = state.inner
+      state.inner = undefined
+      boundSession = sessionID
+      // A worker rebinding from one session to another is the observable signal
+      // that the isolate is being retired and rebuilt for a different model.
+      if (previousSession !== undefined && previousSession !== sessionID) {
+        log(workerLogMessage("worker rebound"), {
+          level: "INFO",
+          workerID: id,
+          fromSession: previousSession,
+          toSession: sessionID,
+          // The rebound-to session is always defined here (the branch guards
+          // `previousSession !== undefined`), so the log seam hoists it into the
+          // message prefix. `fromSession`/`toSession` stay for backward compat.
+          sessionID,
+        })
+      }
+      state.materializing = Promise.resolve()
+        // Retire the old isolate first so two models never share one worker.
+        .then(() => previous?.terminate().catch(() => undefined))
+        .then(() => spawnFor(id, sessionID))
+        .then((worker) => {
+          if (state.terminated) {
+            void worker.terminate()
+            throw new Error(`executor worker ${id} is terminated`)
+          }
+          state.inner = worker
+          return worker
+        })
+      return state.materializing
     },
-    execute: async (run) => (await materialize(run.sessionID)).execute(run),
-    cancel: (sessionID) => (inner === undefined ? Promise.resolve() : inner.cancel(sessionID)),
-    assertNotBusy: (sessionID) => (inner === undefined ? Promise.resolve(false) : inner.assertNotBusy(sessionID)),
-    resultFor: (sessionID) => inner?.resultFor(sessionID),
-    cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID), log }),
-    terminate: async () => {
-      terminated = true
-      materializing = undefined
-      const current = inner
-      inner = undefined
-      if (current !== undefined) await current.terminate()
-    },
-  }
-  return worker
+    log,
+  )
 }
 
 /**
@@ -1374,13 +1429,6 @@ export function createProductionWorkerPool(options: ProductionWorkerPoolOptions)
     spawn: (id) => createSessionBoundExecutorWorker(id, spawnFor, log),
     log,
   })
-}
-
-/** A pool factory suitable for `SessionHubOptions.pool` (wires job ports). */
-export function productionWorkerPoolFactory(
-  options: Omit<ProductionWorkerPoolOptions, "onJobPort">,
-): ExecutorWorkerPoolFactory {
-  return (onJobPort) => createProductionWorkerPool({ ...options, onJobPort })
 }
 
 /** The port-transfer sinks a production pool routes worker messages to. */
@@ -1441,49 +1489,35 @@ function captureRuntimeContext(): Context.Context<never> | undefined {
   return Fiber.getCurrent()?.context
 }
 
-/**
- * Resolve the dispatching session's persisted provider/model pair from the
- * caller context captured at dispatch. The hub node deliberately does not declare
- * `Session` as a dependency (the graph stays stable), so it is read optionally:
- * when the ambient session store is absent (or the session has no model yet) the
- * worker falls back to the config/default model exactly as before.
- */
-async function resolveDispatchedSessionModel(
-  context: Context.Context<never> | undefined,
-  sessionID: SessionID | undefined,
-): Promise<WorkerModelSelection | undefined> {
-  if (context === undefined || sessionID === undefined) return undefined
-  const session = Context.getOption(context, Session.Service)
-  if (Option.isNone(session)) return undefined
-  const info = await Effect.runPromise(
-    session.value.get(sessionID).pipe(Effect.match({ onFailure: () => undefined, onSuccess: (value) => value })),
-  )
-  const model = info?.model
-  if (model === undefined) return undefined
-  return { providerID: model.providerID, modelID: model.id }
-}
-
 /** The per-request plugin input the hub can resolve before a worker runs. */
 interface DispatchedSessionRequest {
   readonly agent?: string
   readonly message?: unknown
 }
 
+/** The session-derived inputs the worker init needs, loaded in one `Session.get`. */
+interface DispatchedSession {
+  /** The session's persisted provider/model pair, when it has one. */
+  readonly model?: WorkerModelSelection
+  /** The per-request plugin input (agent + last user message), when resolvable. */
+  readonly request?: DispatchedSessionRequest
+}
+
 /**
- * Resolve the dispatching session's per-request plugin input — its agent and the
- * last user message — from the caller context captured at dispatch, mirroring
- * {@link resolveDispatchedSessionModel}. `Session` is read optionally (the graph
- * stays stable), so `undefined` means the ambient session store is absent and the
- * hooks keep the documented empty fallback.
+ * Load the dispatching session's init inputs from the caller context captured at
+ * dispatch, in ONE `Session.get`. The hub node deliberately does not declare
+ * `Session` as a dependency (the graph stays stable), so it is read optionally:
+ * `undefined` means the ambient session store is absent, and the worker falls
+ * back to the config/default model and the documented empty plugin input.
  *
  * This is the latest the hub can resolve: a worker binds to one session at init,
  * so the last user message at bind time is the message the first turn processes.
  * A later turn on the SAME worker (no rebind) stays approximate until it rebinds.
  */
-async function resolveDispatchedSessionRequest(
+async function loadDispatchedSession(
   context: Context.Context<never> | undefined,
   sessionID: SessionID | undefined,
-): Promise<DispatchedSessionRequest | undefined> {
+): Promise<DispatchedSession | undefined> {
   if (context === undefined || sessionID === undefined) return undefined
   const session = Context.getOption(context, Session.Service)
   if (Option.isNone(session)) return undefined
@@ -1500,10 +1534,12 @@ async function resolveDispatchedSessionRequest(
   // The user message carries the per-request agent; the session's persisted agent
   // is the fallback when the message is absent.
   const agent = (message?.role === "user" ? message.agent : undefined) ?? info?.agent
-  if (agent === undefined && message === undefined) return undefined
+  const model = info?.model
   return {
-    ...(agent === undefined ? {} : { agent }),
-    ...(message === undefined ? {} : { message }),
+    ...(model === undefined ? {} : { model: { providerID: model.providerID, modelID: model.id } }),
+    ...(agent === undefined && message === undefined
+      ? {}
+      : { request: { ...(agent === undefined ? {} : { agent }), ...(message === undefined ? {} : { message }) } }),
   }
 }
 
@@ -2002,11 +2038,12 @@ export function productionSessionHubLayer(
       // custom pool that resolves without a session id.
       const resolveInit = async (sessionID?: SessionID): Promise<SessionWorkerInit> => {
         const instance = capturedInstance ?? captureInstanceRef() ?? fallbackInstanceContext()
-        const session = await resolveDispatchedSessionModel(capturedContext, sessionID ?? dispatchedSession)
-        // The real per-request input (agent + last user message) the plugin hooks
-        // resolve against, so a hook keyed on either matches flag-off rather than
-        // seeing an empty stub.
-        const request = await resolveDispatchedSessionRequest(capturedContext, sessionID ?? dispatchedSession)
+        // One `Session.get` yields both the persisted model and the per-request
+        // plugin input (agent + last user message) the hooks resolve against, so a
+        // hook keyed on either matches flag-off rather than seeing an empty stub.
+        const dispatched = await loadDispatchedSession(capturedContext, sessionID ?? dispatchedSession)
+        const session = dispatched?.model
+        const request = dispatched?.request
         const pluginSources =
           options.plugins !== undefined ? await options.plugins() : await resolveContextPluginSources(capturedContext)
         // A non-serializable provider option or plugin hook is a configuration

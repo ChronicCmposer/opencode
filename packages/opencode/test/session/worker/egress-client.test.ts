@@ -164,6 +164,86 @@ describe("worker egress client adapts the mesh control link", () => {
   })
 })
 
+describe("worker egress client drives durable mesh subscriptions", () => {
+  test("a hub-side mesh publish wakes the worker subscriber and acks the delivery", async () => {
+    const egressChannel = new MessageChannel()
+    const controlChannel = new MessageChannel()
+    const mesh = createEgressMesh()
+    const attachment = attachMeshWorker(mesh, "w1", controlChannel.port2)
+    const client = createWorkerEgressClient(egressChannel.port1, { controlPort: controlChannel.port1 })
+
+    const commits: DurableCommit[] = []
+    client.subscribeDurable({ pattern: "message.updated", onDurable: (commit) => commits.push(commit) })
+    await pollUntil(() =>
+      mesh.subscriptions().some((s) => s.workerId === "w1" && s.pattern === "message.updated"),
+    )
+
+    mesh.publish({ meta: { generation: 1, ordinal: 1 }, event: durable("d1") })
+
+    await pollUntil(() => commits.length === 1)
+    expect(commits[0]?.event.id).toBe("d1")
+    // The subscriber's delivery is acknowledged automatically, freeing the slot.
+    await pollUntil(() => mesh.outstanding("w1") === 0)
+
+    client.dispose()
+    attachment.dispose()
+  })
+
+  test("an overflow resync reaches the subscriber and is acknowledged", async () => {
+    const egressChannel = new MessageChannel()
+    const controlChannel = new MessageChannel()
+    const mesh = createEgressMesh({ bound: 1 })
+    const attachment = attachMeshWorker(mesh, "w1", controlChannel.port2)
+    const client = createWorkerEgressClient(egressChannel.port1, { controlPort: controlChannel.port1 })
+
+    const commits: DurableCommit[] = []
+    const resyncs: string[] = []
+    client.subscribeDurable({
+      pattern: "*",
+      onDurable: (commit) => commits.push(commit),
+      onResync: (pattern) => resyncs.push(pattern),
+    })
+    await pollUntil(() => mesh.subscriptions().length === 1)
+
+    // The first delivery occupies the only slot; the second overflows to resync.
+    mesh.publish({ meta: { generation: 1, ordinal: 1 }, event: durable("d1") })
+    mesh.publish({ meta: { generation: 1, ordinal: 2 }, event: durable("d2") })
+
+    await pollUntil(() => resyncs.length === 1)
+    expect(resyncs).toEqual(["*"])
+    // The resync is acknowledged automatically, clearing the hub's pending resync.
+    await pollUntil(() => mesh.resyncPending.length === 0)
+
+    client.dispose()
+    attachment.dispose()
+  })
+
+  test("unsubscribing removes the pattern from the hub mesh", async () => {
+    const egressChannel = new MessageChannel()
+    const controlChannel = new MessageChannel()
+    const mesh = createEgressMesh()
+    const attachment = attachMeshWorker(mesh, "w1", controlChannel.port2)
+    const client = createWorkerEgressClient(egressChannel.port1, { controlPort: controlChannel.port1 })
+
+    const unsubscribe = client.subscribeDurable({ pattern: "message.updated", onDurable: () => {} })
+    await pollUntil(() => mesh.subscriptions().length === 1)
+
+    unsubscribe()
+    await pollUntil(() => mesh.subscriptions().length === 0)
+
+    client.dispose()
+    attachment.dispose()
+  })
+
+  test("subscribeDurable without a control port fails loud", () => {
+    const channel = new MessageChannel()
+    const client = createWorkerEgressClient(channel.port1)
+
+    expect(() => client.subscribeDurable({ pattern: "*", onDurable: () => {} })).toThrow(/no control port/)
+    client.dispose()
+  })
+})
+
 // ---------------------------------------------------------------------------
 // E2 — peer lifecycle logging. The data plane is "connected" once the sender is
 // adapted; the optional mesh control link is part of the same connect seam, so a

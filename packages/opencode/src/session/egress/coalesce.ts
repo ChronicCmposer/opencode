@@ -76,6 +76,15 @@ export function createCoalescer(options: CoalescerOptions): Coalescer {
   const scheduler = options.scheduler ?? defaultScheduler
   const onBatch = options.onBatch
 
+  // Parse the tuning options at the boundary: a fractional / negative window or a
+  // non-positive batch would make the flush schedule nonsensical, so fail loud.
+  if (!Number.isInteger(windowMs) || windowMs < 0) {
+    throw new Error(`invalid coalescing window: ${windowMs} (expected a non-negative integer)`)
+  }
+  if (!Number.isInteger(maxBatch) || maxBatch < 1) {
+    throw new Error(`invalid coalescing max batch: ${maxBatch} (expected a positive integer)`)
+  }
+
   let buffer: EventsFrame[] = []
   let timer: unknown
   let ended = false

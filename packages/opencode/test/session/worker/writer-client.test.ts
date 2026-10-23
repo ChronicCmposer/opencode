@@ -7,6 +7,7 @@
 // isolate or database is needed.
 
 import { describe, expect, test } from "bun:test"
+import { classifySqliteError, LockTimeoutError } from "effect/unstable/sql/SqlError"
 import { WorkerWriterError, createWorkerWriterClient, type WorkerWriterFrame } from "@/session/worker/writer-client"
 import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
 import { flush } from "../../lib/async"
@@ -78,6 +79,70 @@ describe("worker writer client (step 16)", () => {
     expect(error).toBeInstanceOf(WorkerWriterError)
     expect((error as WorkerWriterError).tag).toBe("SQLITE_BUSY")
     expect((error as WorkerWriterError).message).toBe("database is locked")
+    client.dispose()
+  })
+
+  test("carries a native SQLite code so a writer lock classifies as LockTimeoutError", async () => {
+    const channel = new MessageChannel()
+    respondWith(channel.port1, (frame) =>
+      frame.kind === "request"
+        ? {
+            kind: "reply",
+            id: frame.id,
+            ok: "error",
+            tag: "SQLITE_BUSY",
+            message: "database is locked",
+            code: "SQLITE_BUSY",
+          }
+        : undefined,
+    )
+    const client = createWorkerWriterClient(channel.port2)
+
+    const error = await client.query("all", "select 1").then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+
+    expect(error).toBeInstanceOf(WorkerWriterError)
+    expect((error as WorkerWriterError).code).toBe("SQLITE_BUSY")
+    expect(classifySqliteError(error)).toBeInstanceOf(LockTimeoutError)
+    client.dispose()
+  })
+
+  test("carries a numeric SQLite code (5 = BUSY) to the same classification", async () => {
+    const channel = new MessageChannel()
+    respondWith(channel.port1, (frame) =>
+      frame.kind === "request"
+        ? { kind: "reply", id: frame.id, ok: "error", tag: "WRITER_ERROR", message: "busy", code: 5 }
+        : undefined,
+    )
+    const client = createWorkerWriterClient(channel.port2)
+
+    const error = await client.query("all", "select 1").then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+
+    expect((error as WorkerWriterError).code).toBe(5)
+    expect(classifySqliteError(error)).toBeInstanceOf(LockTimeoutError)
+    client.dispose()
+  })
+
+  test("leaves the code absent when the writer sent none", async () => {
+    const channel = new MessageChannel()
+    respondWith(channel.port1, (frame) =>
+      frame.kind === "request"
+        ? { kind: "reply", id: frame.id, ok: "error", tag: "WRITER_ERROR", message: "boom" }
+        : undefined,
+    )
+    const client = createWorkerWriterClient(channel.port2)
+
+    const error = (await client.query("all", "select 1").then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )) as WorkerWriterError
+
+    expect(error.code).toBeUndefined()
     client.dispose()
   })
 

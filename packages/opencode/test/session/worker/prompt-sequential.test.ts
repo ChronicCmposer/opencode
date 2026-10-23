@@ -227,12 +227,14 @@ describe("Gate 7 — sequential prompts in one session over the writer-backed wo
     })
   }, 120_000)
 
-  test("a failed COMMIT still releases the writer pin across the writer port", async () => {
+  test("a busy COMMIT whose retries are exhausted still releases the writer pin across the writer port", async () => {
     await withE2EContext({ scripts: [{ text: "unused" }] }, async (ctx) => {
       // Construct the production lock condition locally: a pinned transaction
-      // whose COMMIT fails with `database is locked`. The fix's `finishTransaction`
-      // rolls back and releases the pin in a `finally`; before it, the pin stayed
-      // held and every queued operation starved until the 30s idle rollback.
+      // whose COMMIT fails with `database is locked`. `isSqliteBusy` classifies it
+      // as busy, so the writer keeps the pin and re-issues the COMMIT; once the
+      // retries are exhausted the finalization has failed, and the pin must not
+      // outlive it (otherwise every queued operation starves until the 30s idle
+      // rollback). The port surfaces the typed `SQLITE_BUSY_EXHAUSTED` failure.
       const originalRun = ctx.connection.run.bind(ctx.connection)
       let failCommit = true
       ctx.connection.run = ((sql: string, params?: ReadonlyArray<unknown>) => {
@@ -261,7 +263,9 @@ describe("Gate 7 — sequential prompts in one session over the writer-backed wo
         "commit did not settle",
       )
       expect(commitError).toBeInstanceOf(Error)
-      expect((commitError as Error).message).toMatch(/database is locked/i)
+      expect((commitError as { tag?: string }).tag).toBe("SQLITE_BUSY_EXHAUSTED")
+      expect((commitError as { code?: string }).code).toBe("SQLITE_BUSY")
+      expect((commitError as Error).message).toMatch(/SQLITE_BUSY|database is locked/i)
       failCommit = false
 
       // The failed commit must not leave the writer pinned: a queued read settles

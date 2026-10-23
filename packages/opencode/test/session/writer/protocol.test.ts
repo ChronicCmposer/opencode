@@ -5,7 +5,7 @@
 // with optional fields defaulted.
 
 import { describe, expect, test } from "bun:test"
-import { ProtocolError, isEnoent, parseWriterRequest, parseWriterResponse } from "@/session/writer/protocol"
+import { ProtocolError, errorCode, isEnoent, parseWriterRequest, parseWriterResponse } from "@/session/writer/protocol"
 
 describe("parseWriterRequest: remote-query proxy", () => {
   test("parses a positional query carrying {method, sql, params}", () => {
@@ -161,11 +161,37 @@ describe("parseWriterResponse (step 15)", () => {
     })
   })
 
+  test("carries the optional native SQLite code on a failure frame (R1#2)", () => {
+    expect(
+      parseWriterResponse({ type: "failure", id: 2, error: { tag: "X", message: "m", code: "SQLITE_BUSY" } }),
+    ).toEqual({ type: "failure", id: 2, error: { tag: "X", message: "m", code: "SQLITE_BUSY" } })
+    // An absent code is omitted rather than defaulted.
+    expect(parseWriterResponse({ type: "failure", id: 3, error: { tag: "X", message: "m" } })).toEqual({
+      type: "failure",
+      id: 3,
+      error: { tag: "X", message: "m" },
+    })
+  })
+
   test("fails loud on malformed responses", () => {
     expect(() => parseWriterResponse(null)).toThrow(ProtocolError)
     expect(() => parseWriterResponse({ type: "result", id: "x" })).toThrow(ProtocolError)
     expect(() => parseWriterResponse({ type: "failure", id: 1 })).toThrow(ProtocolError)
+    expect(() => parseWriterResponse({ type: "failure", id: 1, error: { tag: "X", message: "m", code: {} } })).toThrow(
+      ProtocolError,
+    )
     expect(() => parseWriterResponse({ type: "nope" })).toThrow(/unknown response type/)
+  })
+})
+
+describe("errorCode (R1#2)", () => {
+  test("reads the native code and the injected sqliteCode, ignoring everything else", () => {
+    expect(errorCode(Object.assign(new Error("locked"), { code: "SQLITE_BUSY" }))).toBe("SQLITE_BUSY")
+    expect(errorCode({ code: 5 })).toBe(5)
+    expect(errorCode({ sqliteCode: "SQLITE_LOCKED" })).toBe("SQLITE_LOCKED")
+    expect(errorCode(new Error("no code"))).toBeUndefined()
+    expect(errorCode(null)).toBeUndefined()
+    expect(errorCode("SQLITE_BUSY")).toBeUndefined()
   })
 })
 

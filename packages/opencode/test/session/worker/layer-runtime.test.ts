@@ -22,6 +22,7 @@ import {
   boundaryReplacements,
   createHubProxyClient,
   hubProxyReplacements,
+  llmBoundaryReplacements,
   llmModelClientLayer,
   permissionProxyLayer,
   questionProxyLayer,
@@ -30,10 +31,12 @@ import {
   serveHubProxy,
   sessionStatusProxyLayer,
   writerDatabaseLayer,
+  type HubProxyClient,
   type HubProxyClients,
   type WorkerModelConfig,
   type WriterClientHandle,
 } from "@/session/worker/layer"
+import type { HubProxyMethod } from "@/session/worker/hub-proxy-wire"
 import { Provider } from "@/provider/provider"
 import { LLM } from "@/session/llm"
 import { createWorkerPluginHost } from "@/session/worker/plugin-host"
@@ -147,11 +150,11 @@ describe("hub-proxy nodes (step 24)", () => {
     const store = new Map<string, SessionStatus.Info>()
     serveHubProxy(
       {
-        get: (sessionID) => store.get(sessionID as string) ?? { type: "idle" },
-        set: (sessionID, status) => {
+        "sessionStatus.get": (sessionID) => store.get(sessionID as string) ?? { type: "idle" },
+        "sessionStatus.set": (sessionID, status) => {
           store.set(sessionID as string, status as SessionStatus.Info)
         },
-        list: () => [...store.entries()],
+        "sessionStatus.list": () => [...store.entries()],
       },
       channel.port2,
     )
@@ -177,21 +180,21 @@ describe("hub-proxy nodes (step 24)", () => {
     const seen: string[] = []
     serveHubProxy(
       {
-        ask: (input) => {
+        "permission.ask": (input) => {
           seen.push((input as { permission: string }).permission)
         },
-        reply: () => {},
-        list: () => [],
+        "permission.reply": () => {},
+        "permission.list": () => [],
       },
       permissionChannel.port2,
     )
     const questionChannel = new MessageChannel()
     serveHubProxy(
       {
-        ask: () => [["yes"]],
-        reply: () => {},
-        reject: () => {},
-        list: () => [],
+        "question.ask": () => [["yes"]],
+        "question.reply": () => {},
+        "question.reject": () => {},
+        "question.list": () => [],
       },
       questionChannel.port2,
     )
@@ -220,7 +223,7 @@ describe("hub-proxy nodes (step 24)", () => {
     const channel = new MessageChannel()
     serveHubProxy({}, channel.port2)
     const client = createHubProxyClient(channel.port1)
-    await expect(client.call("nope", [])).rejects.toThrow(/unknown hub-proxy method/)
+    await expect(client.call("nope" as HubProxyMethod, [])).rejects.toThrow(/unknown hub-proxy method/)
   })
 
   test("hubProxyReplacements covers the three authorities", () => {
@@ -323,6 +326,47 @@ describe("llmModelClientLayer (step 26)", () => {
     )
 
     expect(completion.text).toBe("hub-zero")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// B3 — the reduced LLM sub-graph must route `Permission` to the hub authority
+// (fail loud on a denial) and never install a silent no-op.
+// ---------------------------------------------------------------------------
+
+describe("B3 — permission boundary in the reduced LLM sub-graph", () => {
+  const permissionLayerFor = (hubProxies?: HubProxyClients): Layer.Layer<Permission.Service> => {
+    const config = modelConfig({ baseUrl: "http://127.0.0.1:1/v1", apiKey: "k", model: "m" })
+    const entry = llmBoundaryReplacements(workerSnapshot(), config, hubProxies).find(
+      ([node]) => node.name === Permission.node.name,
+    )
+    if (entry === undefined) throw new Error("reduced LLM sub-graph has no Permission replacement")
+    return entry[1] as Layer.Layer<Permission.Service>
+  }
+
+  test("a denied authorization fails loud through the hub-proxy port", async () => {
+    const denied = {
+      call: async () => {
+        throw new Error("permission denied by policy")
+      },
+      dispose: () => {},
+    } as unknown as HubProxyClient
+    const hubProxies: HubProxyClients = { sessionStatus: denied, permission: denied, question: denied }
+    const run = Effect.gen(function* () {
+      const permission = yield* Permission.Service
+      return yield* permission.ask(undefined as never)
+    }).pipe(Effect.provide(permissionLayerFor(hubProxies)))
+    await expect(Effect.runPromise(run)).rejects.toThrow(/permission denied by policy/)
+  })
+
+  test("without a hub control plane an ask fails loud with a boundary error (never a mock)", async () => {
+    const run = Effect.gen(function* () {
+      const permission = yield* Permission.Service
+      return yield* permission.ask(undefined as never)
+    }).pipe(Effect.provide(permissionLayerFor(undefined)))
+    // Specifically a `SessionLayerBoundaryError`, not a `Layer.mock`'s
+    // `Unimplemented method "ask"` (which would still name Permission).
+    await expect(Effect.runPromise(run)).rejects.toThrow(/session worker boundary "Permission"/)
   })
 })
 

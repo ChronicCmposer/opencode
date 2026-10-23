@@ -1,7 +1,7 @@
 // Shared boot-measurement helpers (plan consolidation).
 //
 // The 3.11 boot/RSS harness (`boot-memory.ts`) and the 13.6 session-worker boot
-// harness (`mock-sse-harness.ts`) both summarise a level of boot timings the same
+// harness (`session-boot.ts`) both summarise a level of boot timings the same
 // way: a median, a max and the process RSS observed once the level was reached.
 // Those pure aggregations live here so both harnesses stay in lockstep.
 //
@@ -55,4 +55,52 @@ export async function bootMany<TSample>(count: number, bootOne: () => Promise<TS
   const samples: TSample[] = []
   for (let index = 0; index < count; index++) samples.push(await bootOne())
   return samples
+}
+
+export interface MeasureBootLevelsOptions<TSample extends { readonly bootMs: number }> {
+  /** Baseline worker count. */
+  readonly k: number
+  /** Extra workers spawned beyond K. */
+  readonly extra: number
+  /** Boot one worker and return its sample. */
+  readonly bootOne: () => Promise<TSample>
+  /** Read process RSS after a level is reached. */
+  readonly readRss: () => number
+}
+
+/** The two boot levels every measurement harness records: K and K+extra. */
+export interface BootLevels<TSample extends { readonly bootMs: number }> {
+  /** Process RSS before any worker booted. */
+  readonly baselineRssBytes: number
+  readonly atK: BootLevelSummary<TSample>
+  readonly atKPlusExtra: BootLevelSummary<TSample>
+}
+
+/**
+ * The shared boot-measurement loop: boot K workers, read RSS, boot `extra` more,
+ * read RSS, and summarise each level. Both the boot/RSS harness and the
+ * session-worker boot harness measure the same levels; only `bootOne` (and the
+ * RSS reader) differ, so the loop lives once here.
+ */
+export async function measureBootLevels<TSample extends { readonly bootMs: number }>(
+  options: MeasureBootLevelsOptions<TSample>,
+): Promise<BootLevels<TSample>> {
+  const { k, extra, bootOne, readRss } = options
+  if (!Number.isInteger(k) || k < 0) throw new Error(`invalid worker count k: ${k} (expected a non-negative integer)`)
+  if (!Number.isInteger(extra) || extra < 0) {
+    throw new Error(`invalid extra worker count: ${extra} (expected a non-negative integer)`)
+  }
+
+  const baselineRssBytes = readRss()
+  const atKSamples = await bootMany(k, bootOne)
+  const atKRssBytes = readRss()
+  const extraSamples = await bootMany(extra, bootOne)
+  const atKPlusExtraRssBytes = readRss()
+  const allSamples = [...atKSamples, ...extraSamples]
+
+  return {
+    baselineRssBytes,
+    atK: summarizeBootLevel(atKSamples.length, atKSamples, atKRssBytes),
+    atKPlusExtra: summarizeBootLevel(allSamples.length, allSamples, atKPlusExtraRssBytes),
+  }
 }
