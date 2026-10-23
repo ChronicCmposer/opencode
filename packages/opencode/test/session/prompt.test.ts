@@ -37,14 +37,12 @@ import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
-import { createSessionHub, SessionHubService } from "@/session/worker/hub"
 import {
-  createExecutorWorkerPool,
-  type ExecutorRun,
-  type ExecutorWorker,
-  type ExecutorWorkerPool,
-  type SessionExecutionResult,
-} from "@/session/worker/execute"
+  SubagentDispatchProxyService,
+  type SubagentDispatchProxy,
+  type SubagentDispatchRequest,
+} from "@/session/worker/subagent"
+import type { JobInfo } from "@/session/worker/job-registry"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -2770,37 +2768,42 @@ noLLMServer.instance(
 )
 
 // ---------------------------------------------------------------------------
-// W11 — the subagent dispatch seam. `SessionPrompt`'s `ops()` is the production
-// composition site for `TaskPromptOps`; when the hub is in the graph (the
-// flag-on worker graph) it must wire `dispatchSubagent`, so a real nested
-// subagent is admitted through the hub dispatcher at depth ≥ 1.
+// Solution 1 (B1) — the subagent dispatch seam. `SessionPrompt`'s `ops()` is the
+// production composition site for `TaskPromptOps`; it wires `dispatchSubagent`
+// from the hub-proxy `SubagentDispatchProxyService` (the worker has no
+// `SessionHubService`). Present with the proxy (a real nested subagent is routed
+// through it at depth ≥ 1); absent without it (the task runs inline).
 // ---------------------------------------------------------------------------
 
-/** An in-memory executor worker that completes instantly (no isolate). */
-class PromptImmediateWorker implements ExecutorWorker {
-  alive = true
-  constructor(readonly id: number) {}
-  async execute(_run: ExecutorRun): Promise<void> {}
-  async cancel(): Promise<void> {}
-  async assertNotBusy(): Promise<boolean> {
-    return false
-  }
-  resultFor(): SessionExecutionResult | undefined {
-    return undefined
-  }
-  async terminate(): Promise<void> {
-    this.alive = false
+/** A settled `JobInfo` as the hub-proxy dispatch would hand it back. */
+function dispatchedJob(request: SubagentDispatchRequest): JobInfo {
+  return {
+    id: request.childID,
+    type: request.type,
+    status: "completed",
+    started_at: 0,
+    completed_at: 1,
+    output: "dispatched output",
+    parentID: request.parentID,
+    depth: request.depth ?? 1,
   }
 }
 
-/** An in-memory pool so the hub schedules deterministically without isolates. */
-const immediatePool = (k: number): ExecutorWorkerPool =>
-  createExecutorWorkerPool({ k, spawn: (id) => new PromptImmediateWorker(id) })
+/** A recording `SubagentDispatchProxy` backing the worker's dispatch RPC. */
+function recordingDispatchProxy(calls: SubagentDispatchRequest[]): SubagentDispatchProxy {
+  return {
+    dispatchSubagent: (request) =>
+      Effect.sync(() => {
+        calls.push(request)
+        return dispatchedJob(request)
+      }),
+  }
+}
 
 it.instance(
-  "a nested subagent is admitted through the hub dispatcher at depth >= 1",
+  "a nested subagent is routed through the hub-proxy dispatchSubagent RPC at depth >= 1",
   () => {
-    const hub = createSessionHub({ pool: immediatePool(1) })
+    const calls: SubagentDispatchRequest[] = []
     return Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
       const prompt = yield* SessionPrompt.Service
@@ -2815,21 +2818,30 @@ it.instance(
 
       const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
 
-      // The task tool routes the child through `ops().dispatchSubagent`, which
-      // pre-admits it on the hub registry at depth ≥ 1 before running it inline.
-      const job = yield* pollWithTimeout(
-        Effect.sync(() => hub.jobs.list().find((item) => item.type === "task" && item.depth >= 1)),
-        "subagent never registered with the hub at depth >= 1",
+      // The task tool routes the child through `ops().dispatchSubagent`, which is
+      // wired from the proxy service the worker graph exposes.
+      const dispatch = yield* pollWithTimeout(
+        Effect.sync(() => calls[0]),
+        "subagent was never routed through the hub-proxy dispatchSubagent RPC",
       )
-      expect(job.depth).toBeGreaterThanOrEqual(1)
-      expect(job.parentID).toBe(chat.id)
-      // depth ≥ 1 selects the on-demand headroom kind in the live dispatcher.
-      expect(hub.dispatcher.headroomSlotCount).toBeGreaterThanOrEqual(1)
+      expect(dispatch.parentID).toBe(chat.id)
+      expect(dispatch.depth).toBeGreaterThanOrEqual(1)
 
       yield* prompt.cancel(chat.id)
       yield* Fiber.await(fiber)
-    }).pipe(Effect.provideService(SessionHubService, hub))
+    }).pipe(Effect.provideService(SubagentDispatchProxyService, recordingDispatchProxy(calls)))
   },
   { config: cfg },
   15_000,
+)
+
+it.instance(
+  "without the hub-proxy dispatch service no dispatchSubagent is wired",
+  () =>
+    Effect.gen(function* () {
+      const proxy = yield* Effect.serviceOption(SubagentDispatchProxyService)
+      // `ops` reads exactly this option: absent means the inline task path.
+      expect(proxy._tag).toBe("None")
+    }),
+  { config: cfg },
 )

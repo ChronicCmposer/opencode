@@ -16,6 +16,7 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
+import { SessionPrompt, type PromptInput } from "@/session/prompt"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { InstanceRef } from "@/effect/instance-ref"
@@ -752,6 +753,74 @@ describe("createSessionWork (step 27)", () => {
     expect(queries[0].method).toBe("all")
     expect(queries[0].params).toEqual([sid("ses_b")])
     expect(result.value).toMatchObject({ text: "worker text" })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// B2 — the carried sub-agent prompt. A dispatched child's prompt crosses the
+// executor frame; the worker must persist that user message and loop rather
+// than call a bare `loop` that expects the row to already exist. A prompt-less
+// run is unchanged.
+// ---------------------------------------------------------------------------
+
+describe("B2 carried prompt (createSessionWork)", () => {
+  /** A `SessionPrompt` service that records which entry point was taken. */
+  const promptServiceLayer = (record: string[]): Layer.Layer<unknown, unknown> =>
+    Layer.succeed(SessionPrompt.Service, {
+      cancel: () => Effect.succeed(undefined),
+      prompt: (input) => {
+        record.push("prompt")
+        return Effect.succeed(withParts(input.sessionID))
+      },
+      loop: (input) => {
+        record.push("loop")
+        return Effect.succeed(withParts(input.sessionID))
+      },
+      shell: () => Effect.die("the shell path is not exercised here"),
+      command: () => Effect.die("the command path is not exercised here"),
+      resolvePromptParts: () => Effect.succeed([]),
+    }) as unknown as Layer.Layer<unknown, unknown>
+
+  const writerFor = (queries: string[]) => ({
+    query: async (_method: string, sql: string) => {
+      queries.push(sql)
+      return []
+    },
+    publish: async () => ({ seq: 0, committed: false }),
+  })
+
+  test("a carried prompt persists the user message and loops via SessionPrompt.prompt", async () => {
+    const record: string[] = []
+    const queries: string[] = []
+    const work = createSessionWork({
+      layer: promptServiceLayer(record),
+      writer: writerFor(queries),
+      threadId: 0,
+      prompt: true,
+    })
+    const input: PromptInput = { sessionID: sid("ses_p"), parts: [{ type: "text", text: "hi" }] }
+
+    const result = await Effect.runPromise(work(sid("ses_p"), input))
+
+    expect(record).toEqual(["prompt"])
+    expect(result.sessionID).toBe(sid("ses_p"))
+    expect(result.value).toEqual(withParts(sid("ses_p")))
+  })
+
+  test("a prompt-less run loops as today and writes nothing", async () => {
+    const record: string[] = []
+    const queries: string[] = []
+    const work = createSessionWork({
+      layer: promptServiceLayer(record),
+      writer: writerFor(queries),
+      threadId: 0,
+      prompt: true,
+    })
+
+    await Effect.runPromise(work(sid("ses_q")))
+
+    expect(record).toEqual(["loop"])
+    expect(queries).toEqual([])
   })
 })
 

@@ -17,6 +17,7 @@
 
 import { Schema } from "effect"
 import type { SessionID } from "@/session/schema"
+import type { PromptInput } from "@/session/prompt"
 import { defined } from "@/util/object"
 import { parsePositiveInt } from "@/util/parse"
 import {
@@ -193,6 +194,11 @@ export interface DispatchRequest {
   readonly depth?: number
   /** Executor frame to run; defaults to `"run"` (a `"startShell"` takes the shell path). */
   readonly mode?: SessionRunMode
+  /**
+   * The sub-agent prompt the dispatched worker persists before looping
+   * (Solution 1 / B2). Absent keeps a plain run byte-for-byte unchanged.
+   */
+  readonly prompt?: PromptInput
 }
 
 export interface DispatcherOptions {
@@ -259,6 +265,8 @@ interface Pending {
   readonly kind: WorkerKind
   /** The executor frame this run produces; only `"startShell"` is carried on the run. */
   readonly mode: SessionRunMode
+  /** The sub-agent prompt the run carries to the worker (Solution 1). */
+  readonly prompt: PromptInput | undefined
   readonly promise: Promise<void>
   readonly resolve: () => void
   readonly reject: (error: unknown) => void
@@ -271,7 +279,13 @@ interface Pending {
   workerID: number | undefined
 }
 
-function createPending(sessionID: SessionID, depth: number, kind: WorkerKind, mode: SessionRunMode): Pending {
+function createPending(
+  sessionID: SessionID,
+  depth: number,
+  kind: WorkerKind,
+  mode: SessionRunMode,
+  prompt: PromptInput | undefined,
+): Pending {
   let resolve!: () => void
   let reject!: (error: unknown) => void
   const promise = new Promise<void>((res, rej) => {
@@ -283,6 +297,7 @@ function createPending(sessionID: SessionID, depth: number, kind: WorkerKind, mo
     depth,
     kind,
     mode,
+    prompt,
     promise,
     resolve,
     reject,
@@ -459,6 +474,9 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       // Carry the mode only when it deviates from the default so a plain run
       // keeps its minimal `{sessionID, depth}` shape.
       ...(pending.mode === "startShell" ? { mode: pending.mode } : {}),
+      // A subagent prompt rides the run frame only when present, so a plain run
+      // keeps its existing shape.
+      ...(pending.prompt === undefined ? {} : { prompt: pending.prompt }),
     }
     let execution: Promise<void>
     try {
@@ -711,7 +729,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     if (admitted !== undefined) {
       if (admitted.kind === kind && admitted.mode === mode) return admitted.promise
       // Different kind or frame mode: park behind the in-flight run, bounded per key.
-      const pending = createPending(sessionID, depth, kind, mode)
+      const pending = createPending(sessionID, depth, kind, mode, request.prompt)
       const waiters = waitersByKey.get(sessionID) ?? createBoundedQueue<Pending>("waiter", waiterCapacity)
       if (!waitersByKey.has(sessionID)) waitersByKey.set(sessionID, waiters)
       try {
@@ -724,7 +742,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       return pending.promise
     }
 
-    const pending = createPending(sessionID, depth, kind, mode)
+    const pending = createPending(sessionID, depth, kind, mode, request.prompt)
     byKey.set(sessionID, pending)
     startOrEnqueue(pending)
     return pending.promise

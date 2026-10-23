@@ -492,9 +492,13 @@ export interface SessionWorkOptions {
  * `LLM` and persists through the writer boundary. Otherwise it falls back to the
  * one-shot `SessionPipeline` reduction (pipeline-only graphs and the degraded
  * no-hub-port boot).
+ *
+ * A carried `prompt` (Solution 1 / B2) routes through the full
+ * `SessionPrompt.prompt` path — persist the user message for `sessionID`, then
+ * loop — instead of the bare `loop` that expects the row to already exist.
  */
 export function createSessionWork(options: SessionWorkOptions): SessionWork {
-  return (sessionID) => {
+  return (sessionID, carriedPrompt) => {
     const run = Effect.gen(function* () {
       if (options.registerControl !== undefined) {
         const runState = yield* Effect.serviceOption(SessionRunState.Service)
@@ -518,7 +522,13 @@ export function createSessionWork(options: SessionWorkOptions): SessionWork {
       if (options.prompt !== false) {
         const prompt = yield* Effect.serviceOption(SessionPrompt.Service)
         if (Option.isSome(prompt)) {
-          const result = yield* prompt.value.loop(new SessionPrompt.LoopInput({ sessionID }))
+          // A carried prompt persists its user message (`createUserMessage`)
+          // before looping; the run's `sessionID` is authoritative so the row
+          // always lands on the session this run was admitted for.
+          const result =
+            carriedPrompt === undefined
+              ? yield* prompt.value.loop(new SessionPrompt.LoopInput({ sessionID }))
+              : yield* prompt.value.prompt({ ...carriedPrompt, sessionID })
           return { sessionID, value: result } satisfies SessionExecutionResult
         }
       }

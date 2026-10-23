@@ -21,10 +21,12 @@ import {
   type ExecutorTransport,
   type ExecutorWorkerScope,
   type SessionExecutionResult,
+  type SessionExecutorInbound,
   type SessionExecutorOutbound,
   type SessionRunControl,
   type SessionWorkFactory,
 } from "@/session/worker/execute"
+import type { PromptInput } from "@/session/prompt"
 import type { CancelFrame } from "@/session/worker/cancel"
 import type { WorkerLogger } from "@/session/worker/log"
 
@@ -709,5 +711,74 @@ describe("liveness watchdog (execute)", () => {
     await expect(worker.execute({ sessionID: sid("ses_wedged"), depth: 0 })).rejects.toBeInstanceOf(
       SessionWorkerReplyTimeoutError,
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// B2 — the sub-agent prompt crosses the executor frame. A dispatched child runs
+// on a headroom worker whose `SessionWork` only knew how to `loop`; the prompt
+// the parent would have persisted is carried on the run frame so the worker can
+// persist + loop instead of reading a message that does not exist yet.
+// ---------------------------------------------------------------------------
+
+describe("B2 run prompt transport", () => {
+  /**
+   * A transport that records every posted frame and answers the most recent
+   * `run`/`startShell` with a `done` reply, so `execute` settles. The reply is
+   * matched by the executor's own predicate, mirroring the real transport.
+   */
+  const capturingTransport = (): {
+    readonly transport: ExecutorTransport
+    readonly posted: SessionExecutorInbound[]
+  } => {
+    const posted: SessionExecutorInbound[] = []
+    let alive = true
+    return {
+      posted,
+      transport: {
+        post: (message) => posted.push(message),
+        waitFor: async (match) => {
+          const last = posted[posted.length - 1] as { readonly id: number; readonly sessionID: SessionID }
+          const reply: SessionExecutorOutbound = { type: "done", id: last.id, result: { sessionID: last.sessionID } }
+          if (match(reply)) return reply
+          throw new Error("no matching reply")
+        },
+        get alive() {
+          return alive
+        },
+        async terminate() {
+          alive = false
+          return 0
+        },
+      },
+    }
+  }
+
+  const carriedPrompt: PromptInput = {
+    sessionID: sid("ses_1"),
+    agent: "build",
+    parts: [{ type: "text", text: "do the thing" }],
+  }
+
+  test("a run carrying a prompt forwards it on the run frame", async () => {
+    const { transport, posted } = capturingTransport()
+    const worker = createExecutorWorker({ id: 1, transport, workKind: "session" })
+
+    await worker.execute({ sessionID: sid("ses_1"), depth: 0, prompt: carriedPrompt })
+
+    const run = posted.find((message) => message.type === "run")
+    expect(run).toBeDefined()
+    if (run?.type === "run") expect(run.prompt).toEqual(carriedPrompt)
+  })
+
+  test("a prompt-less run forwards a frame without a prompt (unchanged shape)", async () => {
+    const { transport, posted } = capturingTransport()
+    const worker = createExecutorWorker({ id: 1, transport, workKind: "session" })
+
+    await worker.execute({ sessionID: sid("ses_2"), depth: 0 })
+
+    const run = posted.find((message) => message.type === "run")
+    expect(run).toBeDefined()
+    if (run !== undefined) expect("prompt" in run).toBe(false)
   })
 })

@@ -14,12 +14,14 @@ import type { SessionID } from "@/session/schema"
 import { createSessionHub } from "@/session/worker/hub"
 import { createJobClient, jobPortFromMessagePort } from "@/session/worker/job-client"
 import { BackgroundJobClientService, ModelClient, buildSessionWorkerLayer } from "@/session/worker/layer"
-import type {
-  ExecutorRun,
-  ExecutorSessionWorker,
-  ExecutorWorker,
-  ExecutorWorkerPool,
-  SessionExecutionResult,
+import { dispatchSubagent as dispatchSubagentToHub } from "@/session/worker/subagent"
+import {
+  createExecutorWorkerPool,
+  type ExecutorRun,
+  type ExecutorSessionWorker,
+  type ExecutorWorker,
+  type ExecutorWorkerPool,
+  type SessionExecutionResult,
 } from "@/session/worker/execute"
 import { flush, sid } from "../../lib/async"
 import { workerSnapshot } from "../../lib/snapshot"
@@ -196,5 +198,67 @@ describe("hub decoupled worker lookup", () => {
     dispose()
     client.dispose()
     await hub.terminateAll()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Solution 1 (B1) — bridging a dispatched child's worker result into the
+// registry. The hub's `dispatchSubagent` RPC settles the child's job with the
+// last assistant text the headroom worker produced, so `JobInfo.output` is
+// populated for the parent that awaits it.
+// ---------------------------------------------------------------------------
+
+/** An in-memory worker that completes instantly and keeps a `WithParts` result. */
+class FinalTextWorker implements ExecutorWorker {
+  alive = true
+  private readonly results = new Map<SessionID, SessionExecutionResult>()
+
+  constructor(readonly id: number) {}
+
+  async execute(run: ExecutorRun): Promise<void> {
+    this.results.set(run.sessionID, {
+      sessionID: run.sessionID,
+      value: {
+        info: { role: "assistant" },
+        parts: [
+          { type: "text", text: "thinking..." },
+          { type: "text", text: "the answer" },
+        ],
+      },
+    })
+  }
+  async cancel(): Promise<void> {}
+  async assertNotBusy(): Promise<boolean> {
+    return false
+  }
+  resultFor(sessionID: SessionID): SessionExecutionResult | undefined {
+    return this.results.get(sessionID)
+  }
+  async terminate(): Promise<void> {
+    this.alive = false
+  }
+}
+
+describe("B1 final assistant text bridge (dispatchSubagent)", () => {
+  test("a dispatched child settles with its last assistant text as JobInfo.output", async () => {
+    const pool = createExecutorWorkerPool({ k: 1, spawn: (id) => new FinalTextWorker(id) })
+    const hub = createSessionHub({ pool })
+    try {
+      const info = await dispatchSubagentToHub(
+        {
+          registry: hub.jobs,
+          scheduler: hub.dispatcher,
+          depthLimit: 1,
+          headroomFull: () => false,
+          resultFor: (sessionID) => pool.resultFor(sessionID),
+        },
+        { parentID: sid("ses_parent"), childID: sid("ses_child"), type: "task", depth: 1 },
+      )
+
+      expect(info).toMatchObject({ id: "ses_child", status: "completed", output: "the answer", depth: 1 })
+      expect(hub.jobs.get("ses_child")?.output).toBe("the answer")
+    } finally {
+      await hub.terminateAll()
+    }
   })
 })

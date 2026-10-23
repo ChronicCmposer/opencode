@@ -157,7 +157,13 @@ export const effectLayer = Layer.effect(
         const plugins = flags.pure ? [] : (cfg.plugin_origins ?? [])
         if (flags.pure && cfg.plugin_origins?.length) {
         }
-        if (plugins.length) yield* config.waitForDependencies()
+        if (plugins.length) {
+          // Config owns dependency installation and verification: it installs per config directory
+          // and logs a loud, non-fatal error when a directory ends up without `@opencode-ai/plugin`.
+          // Joining the install fibers is enough here. Re-verifying from this layer would re-enter
+          // `Config`'s instance state, which is unavailable in instance-less plugin contexts.
+          yield* config.waitForDependencies()
+        }
 
         const loaded = yield* Effect.promise(() =>
           PluginLoader.loadExternal({
@@ -204,16 +210,11 @@ export const effectLayer = Layer.effect(
               return message
             },
           }).pipe(
-            Effect.tapError((error) => Effect.logError("failed to load plugin", { path: load.spec, error })),
-            Effect.catch(() => {
-              // TODO: make proper events for this
-              // events.publish(Session.Event.Error, {
-              //   error: new NamedError.Unknown({
-              //     message: `Failed to load plugin ${load.spec}: ${message}`,
-              //   }).toObject(),
-              // })
-              return Effect.void
+            Effect.tapError((error) => {
+              publishPluginError(`Failed to load plugin ${load.spec}: ${error}`)
+              return Effect.logError("failed to load plugin", { path: load.spec, error })
             }),
+            Effect.catch(() => Effect.void),
           )
         }
 

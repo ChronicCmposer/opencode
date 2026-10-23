@@ -16,6 +16,7 @@ import { Cause, Effect, Exit, Schema, Scope } from "effect"
 import type { Latch } from "effect"
 import { Runner } from "@/effect/runner"
 import type { SessionID } from "@/session/schema"
+import type { PromptInput } from "@/session/prompt"
 import type { CancelFrame, CancelPort } from "./cancel"
 import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
 
@@ -25,7 +26,17 @@ export interface SessionExecutionResult {
   readonly value?: unknown
 }
 
-export type SessionWork = (sessionID: SessionID) => Effect.Effect<SessionExecutionResult>
+/**
+ * One unit of session work over a session key. `prompt`, when present, is the
+ * sub-agent turn the parent would have persisted (Solution 1 / B2): the worker
+ * runs the full `SessionPrompt.prompt` path — persist the user message, then
+ * loop — instead of the bare `loop` that expects the message to already exist.
+ * Optional so a prompt-less run (the existing foreground path) is unchanged.
+ */
+export type SessionWork = (
+  sessionID: SessionID,
+  prompt?: PromptInput,
+) => Effect.Effect<SessionExecutionResult>
 export type SessionWorkFactory = (kind: string) => SessionWork
 
 /**
@@ -123,7 +134,14 @@ export function createSessionRunMachine(options: SessionRunMachineOptions): Sess
 // --- Executor wire protocol -------------------------------------------------
 
 export type SessionExecutorInbound =
-  | { readonly type: "run"; readonly id: number; readonly sessionID: SessionID; readonly kind: string }
+  | {
+      readonly type: "run"
+      readonly id: number
+      readonly sessionID: SessionID
+      readonly kind: string
+      /** The sub-agent prompt to persist before looping; absent for a plain run. */
+      readonly prompt?: PromptInput
+    }
   | { readonly type: "startShell"; readonly id: number; readonly sessionID: SessionID; readonly kind: string }
   | { readonly type: "cancel"; readonly id: number; readonly sessionID: SessionID }
   | { readonly type: "assertNotBusy"; readonly id: number; readonly sessionID: SessionID }
@@ -241,6 +259,7 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
     sessionID: SessionID,
     kind: string,
     mode: "run" | "startShell",
+    prompt?: PromptInput,
   ): Promise<SessionExecutorOutbound> => {
     let work: SessionWork
     try {
@@ -256,7 +275,7 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
     }
     const effect =
       mode === "run"
-        ? options.machine.ensureRunning(sessionID, work(sessionID))
+        ? options.machine.ensureRunning(sessionID, work(sessionID, prompt))
         : options.machine.startShell(sessionID, work(sessionID))
     return run(settle(id, effect))
   }
@@ -271,7 +290,7 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
         await cancel(message.sessionID)
         return { type: "cancelled", id: message.id }
       case "run":
-        return runWork(message.id, message.sessionID, message.kind, "run")
+        return runWork(message.id, message.sessionID, message.kind, "run", message.prompt)
       case "startShell":
         return runWork(message.id, message.sessionID, message.kind, "startShell")
       default:
@@ -359,6 +378,13 @@ export interface ExecutorRun {
   readonly depth: number
   /** Frame to produce; defaults to `"run"` so a plain run stays `{sessionID, depth}`. */
   readonly mode?: SessionRunMode
+  /**
+   * The sub-agent prompt to run on the worker (Solution 1 / B2). When present,
+   * the worker persists the user message for `sessionID` and loops, instead of
+   * a bare `loop` that expects the message to already exist. Absent keeps a
+   * plain run byte-for-byte unchanged.
+   */
+  readonly prompt?: PromptInput
 }
 
 /** Structural mirror of dispatch's `SessionWorker` (keeps this module decoupled). */
@@ -559,7 +585,15 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
   const execute = async (run: ExecutorRun): Promise<void> => {
     const type: SessionRunMode = run.mode ?? "run"
     const id = nextRequestId++
-    transport.post({ type, id, sessionID: run.sessionID, kind: workKind })
+    // Carry the prompt only when present, so a plain run keeps its minimal
+    // `{type, id, sessionID, kind}` frame.
+    transport.post({
+      type,
+      id,
+      sessionID: run.sessionID,
+      kind: workKind,
+      ...(run.prompt === undefined || type !== "run" ? {} : { prompt: run.prompt }),
+    })
     const reply = transport.waitFor(
       (message) => isAddressed(message, id) && (message.type === "done" || message.type === "error"),
       NO_REPLY_DEADLINE,

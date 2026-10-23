@@ -15,6 +15,7 @@ import type { SessionPrompt } from "../../src/session/prompt"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
+import type { JobInfo } from "../../src/session/worker/job-registry"
 
 import { TaskTool, type TaskPromptOps, type TaskSubagentDispatch } from "../../src/tool/task"
 import { Truncate } from "@/tool/truncate"
@@ -66,6 +67,25 @@ function defer<T>() {
   return { promise, resolve }
 }
 
+/** A settled `JobInfo` as the hub dispatcher hands it back (B1's widened seam). */
+function jobInfo(input: {
+  id: string
+  status: JobInfo["status"]
+  output?: string
+  error?: string
+}): JobInfo {
+  return {
+    id: input.id,
+    type: "task",
+    status: input.status,
+    started_at: 0,
+    ...(input.status === "running" ? {} : { completed_at: 1 }),
+    depth: 1,
+    ...(input.output === undefined ? {} : { output: input.output }),
+    ...(input.error === undefined ? {} : { error: input.error }),
+  }
+}
+
 const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
   const session = yield* Session.Service
   const chat = yield* session.create({ title })
@@ -109,6 +129,28 @@ function stubOps(opts?: {
       Effect.sync(() => {
         opts?.onPrompt?.(input)
         return reply(input, opts?.text ?? "done", opts?.error, opts?.toolError)
+      }),
+  }
+}
+
+/** Ops whose child is owned by the hub dispatcher: `prompt` must never run the child. */
+function dispatchOps(opts: {
+  settle: (request: TaskSubagentDispatch) => JobInfo
+  onDispatch?: (request: TaskSubagentDispatch) => void
+  onPrompt?: (input: SessionPrompt.PromptInput) => void
+}): TaskPromptOps {
+  return {
+    cancel: () => Effect.void,
+    resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+    prompt: (input) =>
+      Effect.sync(() => {
+        opts.onPrompt?.(input)
+        return reply(input, "inline-output-should-not-exist")
+      }),
+    dispatchSubagent: (request) =>
+      Effect.sync(() => {
+        opts.onDispatch?.(request)
+        return opts.settle(request)
       }),
   }
 }
@@ -1099,19 +1141,70 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("routes a foreground child through the subagent dispatch seam at depth >= 1", () =>
+  it.instance("dispatch-first foreground: awaits the settled JobInfo and never runs the child inline", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
       const dispatched: TaskSubagentDispatch[] = []
-      const promptOps: TaskPromptOps = {
-        ...stubOps({ text: "done" }),
-        dispatchSubagent: (request) =>
-          Effect.sync(() => {
-            dispatched.push(request)
-          }),
-      }
+      const prompts: SessionPrompt.PromptInput[] = []
+      const emitted: Array<{ title?: string; metadata?: Record<string, unknown> }> = []
+      const promptOps = dispatchOps({
+        onDispatch: (request) => dispatched.push(request),
+        onPrompt: (input) => prompts.push(input),
+        settle: (request) => jobInfo({ id: request.childID, status: "completed", output: "dispatched output" }),
+      })
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: (input) =>
+            Effect.sync(() => {
+              emitted.push(input as { title?: string; metadata?: Record<string, unknown> })
+            }),
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(dispatched).toHaveLength(1)
+      expect(dispatched[0]?.parentID).toBe(chat.id)
+      expect(dispatched[0]?.childID).toBe(result.metadata.sessionId)
+      expect(dispatched[0]?.type).toBe("task")
+      expect(dispatched[0]?.depth).toBeGreaterThanOrEqual(1)
+
+      // The dispatcher owns the child; the tool must not also run it inline.
+      expect(prompts).toHaveLength(0)
+      expect(prompts.some((input) => input.sessionID === result.metadata.sessionId)).toBe(false)
+
+      // UI parity: caller metadata (the framework may add `truncated`), title,
+      // rendered completed output, and no accidental background promotion.
+      expect(emitted[0]?.title).toBe(result.title)
+      expect(result.metadata).toMatchObject(emitted[0]?.metadata ?? {})
+      expect(result.metadata.background).toBeUndefined()
+      expect(result.output).toContain(`<task id="${result.metadata.sessionId}" state="completed">`)
+      expect(result.output).toContain("<task_result>")
+      expect(result.output).toContain("dispatched output")
+    }),
+  )
+
+  it.instance("dispatch-first foreground: renders an errored JobInfo from output ?? error", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const promptOps = dispatchOps({
+        settle: (request) => jobInfo({ id: request.childID, status: "error", error: "child exploded" }),
+      })
 
       const result = yield* def.execute(
         {
@@ -1131,11 +1224,92 @@ describe("tool.task", () => {
         },
       )
 
+      expect(result.output).toContain(`<task id="${result.metadata.sessionId}" state="error">`)
+      expect(result.output).toContain("<task_error>")
+      expect(result.output).toContain("child exploded")
+    }),
+  )
+
+  it.instance("dispatch-first foreground: maps a cancelled JobInfo to the failure path", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const promptOps = dispatchOps({
+        settle: (request) => jobInfo({ id: request.childID, status: "cancelled" }),
+      })
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("expected task failure")
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      if (!(failure instanceof Error)) throw new Error("expected Error defect")
+      expect(failure.message).toBe("Task cancelled")
+    }),
+  )
+
+  background.instance("dispatch-first background: wraps the await in a local job and never runs inline", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const dispatched: TaskSubagentDispatch[] = []
+      const prompts: SessionPrompt.PromptInput[] = []
+      const promptOps = dispatchOps({
+        onDispatch: (request) => dispatched.push(request),
+        onPrompt: (input) => prompts.push(input),
+        settle: (request) => jobInfo({ id: request.childID, status: "completed", output: "dispatched output" }),
+      })
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          background: true,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
       expect(dispatched).toHaveLength(1)
-      expect(dispatched[0]?.parentID).toBe(chat.id)
-      expect(dispatched[0]?.childID).toBe(result.metadata.sessionId)
-      expect(dispatched[0]?.type).toBe("task")
-      expect(dispatched[0]?.depth).toBeGreaterThanOrEqual(1)
+      expect(result.metadata.background).toBe(true)
+      expect(result.output).toContain(`state="running"`)
+      expect(prompts.some((input) => input.sessionID === result.metadata.sessionId)).toBe(false)
+
+      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+      expect(waited.timedOut).toBe(false)
+      expect(waited.info?.status).toBe("completed")
+      expect(waited.info?.output).toBe("dispatched output")
     }),
   )
 

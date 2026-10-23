@@ -46,8 +46,7 @@ import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Type
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps, type TaskSubagentDispatch } from "@/tool/task"
 import { SessionRunState } from "./run-state"
-import { SessionHubService, type SessionHub } from "./worker/hub"
-import { dispatchSubagent as dispatchSubagentToHub } from "./worker/subagent"
+import { SubagentDispatchProxyService, type SubagentDispatchProxy } from "./worker/subagent"
 import type { CancelOutcome } from "./worker/cancel"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -155,44 +154,32 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
     const { db } = database
-    // The hub is in the caller's context only in the worker graph; resolve it
-    // once per layer instance (mirrors `run-state.ts`'s flag-on seam). Absent
-    // means the inline/flag-off behaviour: no subagent dispatch seam.
-    const hubIfEnabled: Effect.Effect<SessionHub | undefined> = yield* Effect.cached(
+    // The hub-proxy subagent-dispatch RPC is in the caller's context only in a
+    // worker that reaches a hub control plane; resolve it once per layer instance
+    // (mirrors `run-state.ts`'s flag-on seam). Absent means the inline/flag-off
+    // behaviour: no subagent dispatch seam.
+    const subagentDispatchIfEnabled: Effect.Effect<SubagentDispatchProxy | undefined> = yield* Effect.cached(
       Effect.gen(function* () {
-        const hub = yield* Effect.serviceOption(SessionHubService)
-        return Option.isNone(hub) ? undefined : hub.value
+        const dispatch = yield* Effect.serviceOption(SubagentDispatchProxyService)
+        return Option.isNone(dispatch) ? undefined : dispatch.value
       }),
     )
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
-      const hub = yield* hubIfEnabled
+      const dispatch = yield* subagentDispatchIfEnabled
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID).pipe(Effect.asVoid),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
-        // Route a subagent child through the hub dispatcher at depth ≥ 1 in
-        // addition to running it inline. `depthLimit` is the resolved
-        // `subagent_depth`; the dispatcher is the physical-headroom authority, so
-        // an over-deep or headroom-full child is refused loud rather than queued.
-        ...(hub === undefined
+        // Route a subagent child through the hub dispatcher at depth ≥ 1 via the
+        // hub-proxy RPC, instead of running it inline. The hub dispatcher is the
+        // physical-headroom and `subagent_depth` authority, so an over-deep or
+        // headroom-full child comes back as a status-bearing job. A transport
+        // fault is a defect (the port is the only channel back).
+        ...(dispatch === undefined
           ? {}
           : {
               dispatchSubagent: (request: TaskSubagentDispatch) =>
-                Effect.gen(function* () {
-                  const cfg = yield* config.get()
-                  yield* Effect.promise(() =>
-                    dispatchSubagentToHub(
-                      {
-                        registry: hub.jobs,
-                        scheduler: hub.dispatcher,
-                        depthLimit: cfg.subagent_depth ?? 1,
-                        headroomFull: () =>
-                          hub.dispatcher.headroomSlotCount >= hub.dispatcher.headroomCapacity,
-                      },
-                      request,
-                    ),
-                  )
-                }),
+                dispatch.dispatchSubagent(request).pipe(Effect.orDie),
             }),
       } satisfies TaskPromptOps
     })

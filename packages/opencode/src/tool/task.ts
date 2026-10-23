@@ -14,6 +14,7 @@ import { Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
+import type { JobInfo } from "@/session/worker/job-registry"
 
 /**
  * A subagent child routed to the hub dispatcher. The dispatcher owns depth
@@ -35,10 +36,12 @@ export interface TaskPromptOps {
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
   /**
    * Route a child through the subagent dispatcher at depth ≥ 1 instead of
-   * running it inline. Absent in flag-off/inline runs, where the child executes
-   * on the caller (the historical behaviour).
+   * running it inline, and resolve with the child's settled `JobInfo`. Absent in
+   * flag-off/inline runs, where the child executes on the caller (the historical
+   * behaviour). The dispatcher owns the child, so a domain failure is reported
+   * through the returned status rather than by failing this effect.
    */
-  dispatchSubagent?(request: TaskSubagentDispatch): Effect.Effect<void>
+  dispatchSubagent?(request: TaskSubagentDispatch): Effect.Effect<JobInfo>
 }
 
 const id = "task"
@@ -217,17 +220,6 @@ export const TaskTool = Tool.define(
       const ops = ctx.extra?.promptOps as TaskPromptOps
       if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
 
-      if (ops.dispatchSubagent) {
-        yield* ops.dispatchSubagent({
-          parentID: ctx.sessionID,
-          childID: nextSession.id,
-          type: id,
-          depth: depth + 1,
-          title: params.description,
-          metadata,
-        })
-      }
-
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
         const parts = yield* ops.resolvePromptParts(params.prompt)
         const result = yield* ops.prompt({
@@ -295,61 +287,57 @@ export const TaskTool = Tool.define(
         )
       })
 
-      if (yield* background.extend({ id: nextSession.id, run: runTask() })) {
-        return {
-          title: params.description,
-          metadata: {
-            ...metadata,
-            background: true,
-            jobId: nextSession.id,
-          },
-          output: renderOutput({
-            sessionID: nextSession.id,
-            state: "running",
-            summary: "Background task updated",
-            text: BACKGROUND_UPDATED,
-          }),
-        }
-      }
-
-      const info = yield* background.start({
-        id: nextSession.id,
-        type: id,
+      const updatedResult = () => ({
         title: params.description,
-        metadata,
-        parentID: ctx.sessionID,
-        onPromote: Effect.all([
-          ctx.metadata({
-            title: params.description,
-            metadata: { ...metadata, background: true, jobId: nextSession.id },
-          }),
-          notify(nextSession.id),
-        ]),
-        run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
+        metadata: {
+          ...metadata,
+          background: true,
+          jobId: nextSession.id,
+        },
+        output: renderOutput({
+          sessionID: nextSession.id,
+          state: "running",
+          summary: "Background task updated",
+          text: BACKGROUND_UPDATED,
+        }),
       })
 
-      function backgroundResult() {
-        return {
-          title: params.description,
-          metadata: {
-            ...metadata,
-            background: true,
-            jobId: info.id,
-          },
-          output: renderOutput({
-            sessionID: nextSession.id,
-            state: "running",
-            summary: "Background task started",
-            text: BACKGROUND_STARTED,
-          }),
-        }
-      }
+      const runningResult = (jobId: string) => ({
+        title: params.description,
+        metadata: {
+          ...metadata,
+          background: true,
+          jobId,
+        },
+        output: renderOutput({
+          sessionID: nextSession.id,
+          state: "running",
+          summary: "Background task started",
+          text: BACKGROUND_STARTED,
+        }),
+      })
 
-      if (runInBackground) {
-        yield* notify(info.id)
-        // A background child outlives this tool call, so the abort listener must
-        // be installed here — before the early return — or a parent abort would
-        // leave the child running. It is removed once the job settles.
+      const startJob = (run: Effect.Effect<string, unknown>) =>
+        background.start({
+          id: nextSession.id,
+          type: id,
+          title: params.description,
+          metadata,
+          parentID: ctx.sessionID,
+          onPromote: Effect.all([
+            ctx.metadata({
+              title: params.description,
+              metadata: { ...metadata, background: true, jobId: nextSession.id },
+            }),
+            notify(nextSession.id),
+          ]),
+          run: run.pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
+        })
+
+      // A background child outlives this tool call, so the abort listener must be
+      // installed before the early return — or a parent abort would leave the
+      // child running. It is removed once the job settles.
+      const awaitBackgroundAbort = Effect.fnUntraced(function* () {
         const runAbort = yield* EffectBridge.make()
         const abortChild = Effect.all([ops.cancel(nextSession.id), background.cancel(nextSession.id)], {
           discard: true,
@@ -359,7 +347,7 @@ export const TaskTool = Tool.define(
         }
         ctx.abort.addEventListener("abort", onBackgroundAbort)
         if (ctx.abort.aborted) onBackgroundAbort()
-        yield* background.wait({ id: info.id }).pipe(
+        yield* background.wait({ id: nextSession.id }).pipe(
           Effect.ensuring(
             Effect.sync(() => {
               ctx.abort.removeEventListener("abort", onBackgroundAbort)
@@ -367,7 +355,59 @@ export const TaskTool = Tool.define(
           ),
           Effect.forkIn(scope, { startImmediately: true }),
         )
-        return backgroundResult()
+      })
+
+      const dispatchSubagent = ops.dispatchSubagent
+      if (dispatchSubagent) {
+        const request: TaskSubagentDispatch = {
+          parentID: ctx.sessionID,
+          childID: nextSession.id,
+          type: id,
+          depth: depth + 1,
+          title: params.description,
+          metadata,
+        }
+
+        // Background joins/registers a local job whose run awaits the child, so
+        // the parent is notified through the existing background machinery. The
+        // foreground awaits the dispatcher's settled outcome directly.
+        if (runInBackground) {
+          const run = Effect.gen(function* () {
+            const settled = yield* dispatchSubagent(request)
+            if (settled.status === "completed") return settled.output ?? ""
+            return yield* Effect.fail(
+              new Error(settled.status === "cancelled" ? "Task cancelled" : (settled.error ?? "Task failed")),
+            )
+          })
+          if (yield* background.extend({ id: nextSession.id, run })) return updatedResult()
+          const info = yield* startJob(run)
+          yield* notify(info.id)
+          yield* awaitBackgroundAbort()
+          return runningResult(info.id)
+        }
+
+        const settled = yield* dispatchSubagent(request)
+        if (settled.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
+        return {
+          title: params.description,
+          metadata,
+          output: renderOutput({
+            sessionID: nextSession.id,
+            state: settled.status === "error" ? "error" : "completed",
+            text: settled.output ?? settled.error ?? "",
+          }),
+        }
+      }
+
+      // Inline fallback: the child runs on the caller (flag-off historical path).
+      if (yield* background.extend({ id: nextSession.id, run: runTask() })) return updatedResult()
+
+      const info = yield* startJob(runTask())
+
+      if (runInBackground) {
+        yield* notify(info.id)
+        yield* awaitBackgroundAbort()
+        return runningResult(info.id)
       }
 
       const runCancel = yield* EffectBridge.make()
@@ -387,7 +427,7 @@ export const TaskTool = Tool.define(
               background.wait({ id: nextSession.id }).pipe(Effect.map((waited) => waited.info)),
               background.waitForPromotion(nextSession.id),
             )
-            if (result?.metadata?.background === true) return backgroundResult()
+            if (result?.metadata?.background === true) return runningResult(nextSession.id)
             if (result?.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
             if (result?.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
             return {
