@@ -102,8 +102,14 @@ const instanceCtx = {
   project: {} as never,
 }
 
+/** The hub config roots the snapshot must carry so a worker scans the same roots. */
+const hubDirectories = ["/cfg/opencode", "/proj/.opencode"]
+
 const snapshotLayers = Layer.mergeAll(
-  Layer.mock(Config.Service, { get: () => Effect.succeed({ model: "test/model" } as ConfigV1.Info) }),
+  Layer.mock(Config.Service, {
+    get: () => Effect.succeed({ model: "test/model" } as ConfigV1.Info),
+    directories: () => Effect.succeed([...hubDirectories]),
+  }),
   Layer.mock(Auth.Service, {
     all: () => Effect.succeed({ anthropic: new Auth.Api({ type: "api", key: "sk-secret" }) }),
   }),
@@ -124,6 +130,7 @@ describe("buildWorkerSnapshot", () => {
     const snapshot = await Effect.runPromise(buildSnapshot({ workerCount: 3, clock: () => 1000 }))
 
     expect(snapshot.directory).toBe("/tmp/opencode-proj")
+    expect(snapshot.directories).toEqual(hubDirectories)
     expect(snapshot.workerCount).toBe(3)
     expect(snapshot.flags.experimentalSessionWorkers).toBe(true)
     expect(snapshot.config).toEqual({ model: "test/model" })
@@ -226,7 +233,10 @@ const modelLayers = (input: ModelLayerInput = {}) =>
       get: () => Effect.succeed(input.credential ?? new Auth.Api({ type: "api", key: "sk-auth" })),
       all: () => Effect.succeed({ anthropic: { type: "api", key: "sk-auth" } as unknown as Auth.Info }),
     }),
-    Layer.mock(Config.Service, { get: () => Effect.succeed((input.config ?? {}) as ConfigV1.Info) }),
+    Layer.mock(Config.Service, {
+      get: () => Effect.succeed((input.config ?? {}) as ConfigV1.Info),
+      directories: () => Effect.succeed([...hubDirectories]),
+    }),
     Layer.mock(ModelsDev.Service, { get: () => Effect.succeed({}) }),
     RuntimeFlags.layer({ experimentalSessionWorkers: true }),
   )

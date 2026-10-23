@@ -55,6 +55,7 @@ export const buildWorkerSnapshot = Effect.fn("WorkerSnapshot.build")(function* (
   const ctx = yield* InstanceState.context
 
   const [configInfo, authInfo, models] = yield* Effect.all([config.get(), auth.all(), modelsDev.get()])
+  const directories = yield* config.directories()
 
   const now = (options.clock ?? (() => Date.now()))()
   const epoch = nextEpoch(lastEpoch, now)
@@ -63,6 +64,9 @@ export const buildWorkerSnapshot = Effect.fn("WorkerSnapshot.build")(function* (
   return {
     epoch,
     directory: ctx.directory,
+    // The hub's config roots, so a worker scans the same directories the hub
+    // would; without them a worker's config discovery would diverge.
+    directories,
     // Ship the hub project's identity so the worker's ambient `InstanceRef` is
     // real, not the old `project: undefined as never` placeholder. `project` is
     // typed non-optional but the hub's fallback context leaves it undefined at

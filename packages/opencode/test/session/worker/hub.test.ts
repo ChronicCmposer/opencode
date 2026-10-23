@@ -973,7 +973,13 @@ const providerModel = {
 
 /** Replace the production node's declared service deps with dependency-free mocks. */
 const productionReplacements: LayerNode.Replacements = [
-  [Config.node, Layer.mock(Config.Service, { get: () => Effect.succeed({ model: "test/model" } as ConfigV1.Info) })],
+  [
+    Config.node,
+    Layer.mock(Config.Service, {
+      get: () => Effect.succeed({ model: "test/model" } as ConfigV1.Info),
+      directories: () => Effect.succeed(["/cfg/opencode"]),
+    }),
+  ],
   [
     Auth.node,
     Layer.mock(Auth.Service, {
@@ -1662,6 +1668,7 @@ describe("W2 session model threading", () => {
       const deps = Layer.mergeAll(
         Layer.mock(Config.Service, {
           get: () => Effect.succeed({ model: "config/default" } as ConfigV1.Info),
+          directories: () => Effect.succeed(["/cfg/opencode"]),
         }),
         Layer.mock(Auth.Service, {
           all: () => Effect.succeed({}),
@@ -1773,6 +1780,7 @@ describe("W4 plugin effect shipping", () => {
       const deps = Layer.mergeAll(
         Layer.mock(Config.Service, {
           get: () => Effect.succeed({ model: "config/default" } as ConfigV1.Info),
+          directories: () => Effect.succeed(["/cfg/opencode"]),
         }),
         Layer.mock(Auth.Service, {
           all: () => Effect.succeed({}),
@@ -2073,6 +2081,7 @@ describe("Fix 2 real plugin hook input", () => {
       const deps = Layer.mergeAll(
         Layer.mock(Config.Service, {
           get: () => Effect.succeed({ model: "config/default" } as ConfigV1.Info),
+          directories: () => Effect.succeed(["/cfg/opencode"]),
         }),
         Layer.mock(Auth.Service, {
           all: () => Effect.succeed({}),
