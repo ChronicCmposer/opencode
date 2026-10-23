@@ -52,7 +52,12 @@ import {
   type SessionWork,
   type SessionWorkFactory,
 } from "./execute"
-import { createWorkerPluginHost, type WorkerPlugin } from "./plugin-host"
+import {
+  createWorkerPluginHost,
+  type SystemTransformInput,
+  type SystemTransformOutput,
+  type WorkerPlugin,
+} from "./plugin-host"
 import {
   SessionPipeline,
   PIPELINE_SESSION_NODES,
@@ -64,6 +69,7 @@ import {
   reducedModelProviderLayer,
   type BackgroundJobClientHandle,
   type BrokerClientHandle,
+  type HubProxyClient,
   type HubProxyClients,
   type PipelineMessage,
   type WorkerEnv,
@@ -655,6 +661,22 @@ export function workerBridgeLogger(snapshot: WorkerSnapshot, logging?: Layer.Lay
   })
 }
 
+/**
+ * The hub-proxied `experimental.chat.system.transform` bridge: forwards the
+ * worker's system array to the hub authority over the control port, where the
+ * loaded plugins run and return the mutated `{ system }`. Every hub authority
+ * multiplexes one port, so the caller hands the shared client.
+ *
+ * Returns `undefined` when the worker has no hub client (degraded boot), so the
+ * plugin host omits the transform and the system array passes through unchanged.
+ */
+export function hubProxySystemTransform(
+  hubProxy: HubProxyClient | undefined,
+): ((input: SystemTransformInput, output: SystemTransformOutput) => Promise<SystemTransformOutput>) | undefined {
+  if (hubProxy === undefined) return undefined
+  return (input, output) => hubProxy.call("systemTransform", [input, output]) as Promise<SystemTransformOutput>
+}
+
 /** Options for {@link bootstrapSessionWorker}; every field is additive. */
 export interface BootstrapSessionWorkerOptions {
   /**
@@ -773,8 +795,14 @@ export function bootstrapSessionWorker(
   const config = modelConfig(init.model)
   // The worker runs the model-facing plugin hooks in its own isolate; build the
   // host from the shipped hooks so their `chat.params`/`chat.headers` mutations
-  // reach the reduced LLM exactly as flag-off. Absent hooks keep the no-op.
-  const plugins = init.plugins === undefined ? undefined : createWorkerPluginHost(init.plugins)
+  // reach the reduced LLM exactly as flag-off. The system transform is a hub
+  // proxy (the hub owns plugin loading and returns the mutated system): with no
+  // hub client (degraded boot) it is omitted and the system passes through.
+  const systemTransform = hubProxySystemTransform(hubProxies?.sessionStatus)
+  const plugins =
+    init.plugins === undefined
+      ? undefined
+      : createWorkerPluginHost(init.plugins, systemTransform === undefined ? undefined : { systemTransform })
   const modelClient = llmModelClientLayer(config).pipe(
     Layer.provide(reducedLlmLayer(init.snapshot, config, undefined, plugins)),
   )

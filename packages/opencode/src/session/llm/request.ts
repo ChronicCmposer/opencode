@@ -65,11 +65,15 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
   ]
 
   const header = system[0]
-  yield* input.plugin.trigger(
+  const transformed = yield* input.plugin.trigger(
     "experimental.chat.system.transform",
     { sessionID: input.sessionID, model: input.model },
     { system },
   )
+  // The in-process hub trigger mutates and returns `system` itself; a
+  // hub-proxied worker trigger returns a fresh `{ system }` (the rewrite cannot
+  // cross the control port in place). Reconcile whichever array came back.
+  if (transformed.system !== system) system.splice(0, system.length, ...transformed.system)
   if (system.length > 2 && system[0] === header) {
     const rest = system.slice(1)
     system.length = 0

@@ -1,7 +1,16 @@
 // Phase 6.3 — worker plugin host tests (`chat.params` / `chat.headers` in-worker).
 
 import { describe, expect, test } from "bun:test"
-import { DuplicatePluginError, createWorkerPluginHost, type WorkerPlugin } from "@/session/worker/plugin-host"
+import { Effect, Layer } from "effect"
+import { Plugin } from "@/plugin"
+import { ModelClient, buildSessionWorkerLayer } from "@/session/worker/layer"
+import {
+  DuplicatePluginError,
+  createWorkerPluginHost,
+  type SystemTransformInput,
+  type WorkerPlugin,
+} from "@/session/worker/plugin-host"
+import { workerSnapshot } from "../../lib/snapshot"
 
 describe("worker plugin host", () => {
   test("chat.params hooks run in registration order and compose mutations", async () => {
@@ -106,5 +115,93 @@ describe("worker plugin host", () => {
     const host = createWorkerPluginHost(plugins)
     plugins.push({ name: "b", hooks: {} })
     expect(host.names).toEqual(["a"])
+  })
+
+  test("experimental.chat.system.transform applies a plugin's system rewrite", async () => {
+    const host = createWorkerPluginHost([
+      {
+        name: "sys",
+        hooks: {
+          "experimental.chat.system.transform": (_input, output) => {
+            output.system = [...output.system, "plugin-added"]
+          },
+        },
+      },
+    ])
+    const input: SystemTransformInput = { sessionID: "s", model: {} }
+    const result = await host.systemTransform(input, { system: ["base"] })
+    expect(result.system).toEqual(["base", "plugin-added"])
+  })
+
+  test("the injected options.systemTransform runs after the plugin function hooks", async () => {
+    const order: string[] = []
+    const host = createWorkerPluginHost(
+      [
+        {
+          name: "sys",
+          hooks: {
+            "experimental.chat.system.transform": (_input, output) => {
+              order.push("plugin")
+              output.system = [...output.system, "plugin"]
+            },
+          },
+        },
+      ],
+      {
+        systemTransform: async (_input, output) => {
+          order.push("options")
+          return { system: [...output.system, "options"] }
+        },
+      },
+    )
+    const result = await host.systemTransform({ sessionID: "s", model: {} }, { system: ["base"] })
+    expect(order).toEqual(["plugin", "options"])
+    expect(result.system).toEqual(["base", "plugin", "options"])
+  })
+
+  test("through the worker Plugin.Service, system.transform reaches the host", async () => {
+    const host = createWorkerPluginHost([
+      {
+        name: "sys",
+        hooks: {
+          "experimental.chat.system.transform": (_input, output) => {
+            output.system = [...output.system, "worker"]
+          },
+        },
+      },
+    ])
+    const built = buildSessionWorkerLayer({
+      snapshot: workerSnapshot(),
+      env: { values: {} },
+      clients: {
+        writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
+        egress: { emit: () => {} },
+        broker: { call: async () => null },
+        backgroundJob: { wait: async () => null, cancel: async () => {} },
+      },
+      modelClient: Layer.succeed(ModelClient, { complete: () => Effect.succeed({ text: "stub" }) }),
+      plugins: host,
+    })
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const plugin = (yield* Plugin.Service) as Plugin.Interface
+        return yield* plugin.trigger(
+          "experimental.chat.system.transform",
+          { sessionID: "s", model: {} } as never,
+          { system: ["base"] },
+        )
+      }).pipe(Effect.provide(built.layer)),
+    )
+
+    expect((result as { system: string[] }).system).toEqual(["base", "worker"])
+  })
+
+  test("absent hook and options returns the input array unchanged", async () => {
+    const output = { system: ["base"] }
+    const host = createWorkerPluginHost([{ name: "empty", hooks: {} }])
+    const result = await host.systemTransform({}, output)
+    expect(result).toBe(output)
+    expect(result.system).toBe(output.system)
   })
 })

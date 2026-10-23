@@ -97,7 +97,7 @@ import {
   type PidReportEntry,
 } from "./pid-registry"
 import { Plugin } from "@/plugin"
-import type { WorkerPluginHooks } from "./plugin-host"
+import type { SystemTransformInput, SystemTransformOutput, WorkerPluginHooks } from "./plugin-host"
 import type { HubProxyFrame, HubProxyHandlers, HubProxyReply } from "./layer"
 import { portFromMessagePort } from "./port"
 import type { SessionWorkerInit } from "./session-worker"
@@ -482,6 +482,13 @@ export interface HubProxyAuthorities {
    * pool-aware authority on attach, so production leaves this absent.
    */
   readonly dispatchSubagent?: (request: SubagentDispatchRequest) => Promise<JobInfo>
+  /**
+   * Optional system-prompt transform authority. The worker cannot run
+   * `experimental.chat.system.transform` itself (plugins are loaded on the hub),
+   * so it calls the hub, which mutates and returns `output`. Absent means the
+   * handler returns `output` unchanged (flag-off / no plugin).
+   */
+  readonly systemTransform?: (input: SystemTransformInput, output: SystemTransformOutput) => Promise<SystemTransformOutput>
 }
 
 /**
@@ -521,6 +528,13 @@ export function buildHubProxyHandlers(authorities: HubProxyAuthorities, run: Hub
         ? run(authorities.question.reply(input as Parameters<Question.Interface["reply"]>[0]))
         : run(authorities.permission.reply(input as Parameters<Permission.Interface["reply"]>[0])),
     reject: (requestID) => run(authorities.question.reject(requestID as Parameters<Question.Interface["reject"]>[0])),
+    // Always served: a worker's `experimental.chat.system.transform` reaches the
+    // hub, which runs the plugin hook and returns the mutated `{system}`. Absent
+    // an authority the output passes through unchanged (never an unknown method).
+    systemTransform: (input, output) =>
+      authorities.systemTransform === undefined
+        ? (output as SystemTransformOutput)
+        : authorities.systemTransform(input as SystemTransformInput, output as SystemTransformOutput),
     ...(authorities.dispatchSubagent === undefined
       ? {}
       : {
@@ -1959,7 +1973,19 @@ export function productionSessionHubLayer(
         const context = capturedContext
         return Effect.runPromise(context === undefined ? effect : Effect.provide(effect, context))
       }
-      const hubProxy = buildHubProxyHandlers({ sessionStatus, permission, question }, runHubProxy)
+      // The worker cannot run `experimental.chat.system.transform` itself: the hub
+      // owns plugin loading (decision 70). Read `Plugin` from the dispatch context
+      // and run the trigger under it, so the per-directory `InstanceState` the
+      // plugin layer keys on is the dispatching instance's. Absent a context (or
+      // plugin) the output passes through unchanged.
+      const systemTransform: NonNullable<HubProxyAuthorities["systemTransform"]> = (input, output) => {
+        const context = capturedContext
+        const plugin = context === undefined ? Option.none() : Context.getOption(context, Plugin.Service)
+        return Option.isNone(plugin)
+          ? Promise.resolve(output)
+          : runHubProxy(plugin.value.trigger("experimental.chat.system.transform", input, output))
+      }
+      const hubProxy = buildHubProxyHandlers({ sessionStatus, permission, question, systemTransform }, runHubProxy)
       // The production port authorities: supplied ready, or built on the first
       // dispatch (the source is only invoked when a worker attaches a port).
       const ports: WorkerPortBackendsSource =
