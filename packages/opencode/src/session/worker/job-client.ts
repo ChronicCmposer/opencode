@@ -20,7 +20,7 @@
 import { defined } from "@/util/object"
 import type { JobInfo, JobRegistry, JobWaitResult, StartJobInput } from "./job-registry"
 import type { BackgroundJobClientHandle } from "./layer"
-import { messageOf, portFromMessagePort } from "./port"
+import { createRequestChannel, messageOf, portFromMessagePort } from "./port"
 
 /**
  * Every frame carries a `kind` discriminant, so both ends switch exhaustively
@@ -165,63 +165,36 @@ export interface CreateJobClientOptions {
   readonly timeoutMs?: number
 }
 
-interface PendingRequest {
-  readonly resolve: (frame: JobReply) => void
-  readonly reject: (error: unknown) => void
-  readonly timer: ReturnType<typeof setTimeout> | undefined
-}
-
 const DISPOSED_MESSAGE = "job client disposed"
 
 /** Worker side: a thin client over `port`. */
 export function createJobClient(port: JobPort, options: CreateJobClientOptions = {}): JobClient {
-  const defaultTimeoutMs = options.timeoutMs
   let nextId = 1
   let disposed = false
-  const pending = new Map<number, PendingRequest>()
   const childHandlers = new Set<(result: JobInfo) => void>()
 
-  const unsubscribe = port.onMessage((frame) => {
-    switch (frame.kind) {
-      case "push":
-        // Only `childResult` is defined today; switch keeps future pushes explicit.
-        if (frame.type === "childResult") for (const handler of childHandlers) handler(frame.result)
-        return
-      case "request":
-        // A worker client never serves requests.
-        return
-      case "reply": {
-        const waiter = pending.get(frame.id)
-        if (waiter === undefined) return
-        pending.delete(frame.id)
-        if (waiter.timer !== undefined) clearTimeout(waiter.timer)
-        if (frame.ok === "error") waiter.reject(new Error(frame.message))
-        else waiter.resolve(frame)
-        return
-      }
+  // The worker client never serves requests; the only unsolicited frame it acts
+  // on is a `childResult` push. Timers are unref'd by the shared scheduler.
+  const requests = createRequestChannel<JobFrame, JobReply, number>(port, {
+    timeoutMs: options.timeoutMs,
+    isReply: (frame): frame is JobReply => frame.kind === "reply",
+    idOf: (reply) => reply.id,
+    nextId: () => nextId++,
+    disposedError: () => new Error(DISPOSED_MESSAGE),
+    timeoutError: (_id, timeoutMs) => new Error(`job request timed out after ${timeoutMs}ms`),
+  })
+
+  requests.onFrame((frame) => {
+    // Only `childResult` is defined today; the type guard keeps future pushes explicit.
+    if (frame.kind === "push" && frame.type === "childResult") {
+      for (const handler of childHandlers) handler(frame.result)
     }
   })
 
-  const request = (build: (id: number) => JobRequest, timeoutMs = defaultTimeoutMs): Promise<JobReply> => {
-    if (disposed) return Promise.reject(new Error(DISPOSED_MESSAGE))
-    const id = nextId++
-    return new Promise<JobReply>((resolve, reject) => {
-      const timer =
-        timeoutMs === undefined
-          ? undefined
-          : setTimeout(() => {
-              pending.delete(id)
-              reject(new Error(`job request timed out after ${timeoutMs}ms`))
-            }, timeoutMs)
-      pending.set(id, { resolve, reject, timer })
-      try {
-        port.post(build(id))
-      } catch (error) {
-        pending.delete(id)
-        if (timer !== undefined) clearTimeout(timer)
-        reject(error)
-      }
-    })
+  const request = async (build: (id: number) => JobRequest, timeoutMs?: number): Promise<JobReply> => {
+    const reply = await requests.request(build, timeoutMs)
+    if (reply.ok === "error") throw new Error(reply.message)
+    return reply
   }
 
   const infoOf = (frame: JobReply): JobInfo | undefined => (frame.ok === "info" ? frame.info : undefined)
@@ -293,12 +266,7 @@ export function createJobClient(port: JobPort, options: CreateJobClientOptions =
     dispose() {
       if (disposed) return
       disposed = true
-      unsubscribe()
-      for (const waiter of pending.values()) {
-        if (waiter.timer !== undefined) clearTimeout(waiter.timer)
-        waiter.reject(new Error(DISPOSED_MESSAGE))
-      }
-      pending.clear()
+      requests.dispose()
       childHandlers.clear()
     },
   }

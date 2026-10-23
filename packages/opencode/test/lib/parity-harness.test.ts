@@ -54,22 +54,21 @@ import { createSessionWork } from "@/session/worker/session-worker"
 import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionSummary } from "@/session/summary"
+import { createE2EContext, type E2EContextOptions } from "./parity-harness"
 import {
   compareDurable,
   compareSequences,
   compareToGolden,
-  createE2EContext,
   goldenFromParity,
   readGolden,
   recordGolden,
   runParitySession,
   type DurableRow,
-  type E2EContextOptions,
   type ParityResult,
   type ParityRunContext,
   type ParityRunner,
   type SessionScript,
-} from "./parity-harness"
+} from "./parity-session"
 import { createBunSqliteConnection } from "@/session/writer/connection"
 import { createWriterCore } from "@/session/writer/core"
 import { serveWriterPort, type HubWriter } from "@/session/writer/client"

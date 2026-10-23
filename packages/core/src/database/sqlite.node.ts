@@ -11,9 +11,9 @@ import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as Client from "effect/unstable/sql/SqlClient"
 import type { Connection } from "effect/unstable/sql/SqlConnection"
-import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
+import { classifySqliteError, SqlError, UnknownError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
-import { withBusyRetry } from "./busy"
+import { BusyRetriesExhaustedError, withBusyRetry } from "./busy"
 import { resolveBusyRetryConfig } from "./pragmas"
 import { Sqlite } from "./sqlite"
 
@@ -91,7 +91,17 @@ const make = (options: Config) =>
     // The `Connection` is the single choke point every statement and every
     // Drizzle transaction statement flows through, so busy-retry lives here.
     const busy = resolveBusyRetryConfig()
-    const retryBusy = <A, E, R>(effect: Effect.Effect<A, E, R>) => withBusyRetry(effect, busy)
+    // `withBusyRetry` reports exhaustion as a typed `BusyRetriesExhaustedError`;
+    // the `Connection` interface only admits `SqlError`, so fold it back into that
+    // channel here (the last busy cause is preserved as the reason's cause).
+    const retryBusy = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      withBusyRetry(effect, busy).pipe(
+        Effect.mapError((error) =>
+          error instanceof BusyRetriesExhaustedError
+            ? new SqlError({ reason: new UnknownError({ cause: error, message: error.message }) })
+            : error,
+        ),
+      )
 
     const connection = identity<SqliteConnection>({
       execute(query, params, transformRows) {

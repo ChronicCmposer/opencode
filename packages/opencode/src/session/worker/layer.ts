@@ -30,7 +30,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { LLMEvent } from "@opencode-ai/llm"
-import { LLMClient } from "@opencode-ai/llm/route"
+import { LLMClient, type LLMClientService, type LLMClientShape } from "@opencode-ai/llm/route"
 import { llmClient } from "@opencode-ai/core/effect/app-node-platform"
 import type { LanguageModelV3 } from "@ai-sdk/provider"
 import { createAnthropic } from "@ai-sdk/anthropic"
@@ -42,6 +42,7 @@ import type { SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
+import { Latest } from "@/event-manifest"
 
 import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
@@ -100,9 +101,12 @@ import {
   WRITER_CLIENT_KEY,
   assertSessionLayer,
 } from "./node-table"
-import { createWorkerEventBridge } from "./event-bridge"
+import { createWorkerEventBridge, DURABLE_WAKEUP_METADATA_KEY } from "./event-bridge"
+import type { WorkerDurableSubscription } from "./egress-client"
+import type { DurableCommit, MeshWorkerClient } from "@/session/egress/mesh"
 import type { EventV2Event } from "./frame"
-import { messageOf, portFromMessagePort } from "./port"
+import { stringHeaders } from "./headers"
+import { HubProxyRemoteError, type HubProxyClient, type HubProxyMethod } from "./hub-proxy-wire"
 import type { JobClient } from "./job-client"
 import type {
   ChatHeadersOutput,
@@ -116,7 +120,7 @@ import type {
 import { writerSqlClientLayer, type WriterSqlHandle } from "./writer-sql-client"
 import { PidReporter, type PidReporterInterface } from "./pid-registry"
 import type { JobInfo } from "./job-registry"
-import { SubagentDispatchProxyService, type SubagentDispatchRequest } from "./subagent"
+import { SubagentDispatchProxyService } from "./subagent"
 
 export { PidReporter } from "./pid-registry"
 export type { PidReport, PidReportEntry, PidReporterInterface } from "./pid-registry"
@@ -159,6 +163,24 @@ export interface EventEgressClientHandle {
   readonly emit: (event: EventV2Event) => void
   /** Forward a durable boundary event; defaults to the transport's ordinal. */
   readonly emitDurable?: (event: EventV2Event) => void
+  /**
+   * The mesh control-plane client, present exactly when the worker was given a
+   * control port. It is the single source of truth for "can this worker receive
+   * cross-isolate durable wakeups": a handle with no mesh (`mesh === undefined`)
+   * has no transport to carry them, so {@link wireDurableWakeups} leaves the
+   * wakeup bridge unwired instead of reaching {@link subscribeDurable}. A
+   * DIRECT `subscribeDurable` call on a control-plane-less client still fails
+   * loud — that is a genuine caller misconfiguration, not this legitimate
+   * hub-less topology.
+   */
+  readonly mesh?: MeshWorkerClient | undefined
+  /**
+   * Register a durable wakeup subscription with the hub mesh (spec 5.9). The
+   * production egress client owns the control port and provides this; a reduced
+   * handle with no mesh (degraded boot / test stub) omits it, so the wakeup
+   * bridge is simply not wired.
+   */
+  readonly subscribeDurable?: (subscription: WorkerDurableSubscription) => () => void
 }
 
 export interface BrokerClientHandle {
@@ -214,6 +236,106 @@ export class WorkerEventBridge extends Context.Service<WorkerEventBridge, Worker
   EVENT_BRIDGE_KEY,
 ) {}
 
+// ---------------------------------------------------------------------------
+// Worker durable wakeups (spec 5.9): hub mesh commit → in-isolate EventV2.
+// ---------------------------------------------------------------------------
+
+/**
+ * The single durable wakeup pattern a worker subscribes to. The hub routes every
+ * matching durable commit over the mesh control plane; the worker's own EventV2
+ * performs the per-aggregate filtering, so the worker asks for the whole durable
+ * stream (`"*"` is the hub matcher's match-everything pattern).
+ */
+export const WORKER_DURABLE_WAKE_PATTERN = "*"
+
+/**
+ * The aggregate a durable commit belongs to, or `undefined` when the commit's
+ * type names no durable definition this build knows. The mesh frame carries the
+ * event verbatim (`{ id, type, properties }`) with no aggregate of its own, so it
+ * is parsed from the payload exactly as core's durable commit does: the
+ * definition's `durable.aggregate` field names the payload property. An unknown
+ * type is skipped rather than fatal — the commit is still republished live-only —
+ * so a synthetic or version-skewed durable event never breaks the control port.
+ * A KNOWN durable type whose payload omits the aggregate field is malformed and
+ * fails loud.
+ */
+function durableAggregateOf(commit: DurableCommit): string | undefined {
+  const aggregate = Latest.get(commit.event.type)?.durable?.aggregate
+  if (aggregate === undefined) return undefined
+  const properties = commit.event.properties
+  const aggregateID =
+    properties !== null && typeof properties === "object"
+      ? (properties as Readonly<Record<string, unknown>>)[aggregate]
+      : undefined
+  if (typeof aggregateID !== "string") {
+    throw new Error(`durable commit "${commit.event.type}" is missing string aggregate field ${aggregate}`)
+  }
+  return aggregateID
+}
+
+/**
+ * Bridge one hub-delivered durable commit into the worker's in-isolate EventV2.
+ * The commit already durably committed in the hub writer, so it is republished
+ * LIVE-ONLY — never re-committed — crossing verbatim as `{ id, type, properties }`
+ * (`properties` is the EventV2 `data` reference). Its committed aggregate is then
+ * woken so the isolate's `durable()` subscribers re-read and observe it.
+ * Synchronous because the mesh delivery runs on the synchronous control-port
+ * handler.
+ *
+ * The republished payload is stamped with {@link DURABLE_WAKEUP_METADATA_KEY} so
+ * the worker's own event bridge ({@link createWorkerEventBridge}) does not
+ * re-forward it: the mesh delivers a worker its OWN durable commit back too, and
+ * re-forwarding would make the hub publish that event a second time.
+ */
+export function republishDurableCommit(
+  events: Pick<EventV2.Interface, "publishLive" | "wakeDurable">,
+  commit: DurableCommit,
+): void {
+  Effect.runSync(
+    events.publishLive({
+      id: EventV2.ID.make(commit.event.id),
+      type: commit.event.type,
+      data: commit.event.properties,
+      metadata: { [DURABLE_WAKEUP_METADATA_KEY]: true },
+    }),
+  )
+  // The durable write already happened in the hub writer; the in-isolate
+  // `durable()` subscribers only need waking so their aggregate stream re-reads
+  // and observes it. A reduced handle without the seam, or a commit whose type
+  // this build does not know, skips the wake.
+  const wakeDurable = events.wakeDurable
+  if (wakeDurable === undefined) return
+  const aggregateID = durableAggregateOf(commit)
+  if (aggregateID === undefined) return
+  Effect.runSync(wakeDurable(aggregateID))
+}
+
+/**
+ * Wire the worker's durable wakeups: subscribe to the hub mesh through the egress
+ * handle's control plane and republish each delivered commit into the isolate's
+ * EventV2. Returns a disposer.
+ *
+ * A handle with no subscription surface, or with no mesh control plane (the
+ * hub-less / degraded topology, e.g. the in-process parity harness), cannot be
+ * woken durably: the bridge is simply not wired and the returned disposer is a
+ * no-op. This is a legitimate topology, never an error — only a DIRECT
+ * `subscribeDurable` call without a control port fails loud.
+ */
+export function wireDurableWakeups(
+  events: Pick<EventV2.Interface, "publishLive" | "wakeDurable">,
+  egress: Pick<EventEgressClientHandle, "subscribeDurable" | "mesh">,
+): () => void {
+  const subscribe = egress.subscribeDurable
+  if (subscribe === undefined || egress.mesh === undefined) return () => {}
+  return subscribe({
+    pattern: WORKER_DURABLE_WAKE_PATTERN,
+    onDurable: (commit) => republishDurableCommit(events, commit),
+    // A resync means the hub dropped a delivery under backpressure; the worker's
+    // next durable read catches it up, so there is nothing to replay here.
+    onResync: () => {},
+  })
+}
+
 /**
  * The egress handle IS the events-port sink: it accepts the verbatim
  * `{ id, type, properties }` event and its transport builds the `eventFrame`.
@@ -224,9 +346,15 @@ const eventBridgeLayer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const egress = yield* EventEgressClientService
     const bridge = yield* createWorkerEventBridge(events, egress)
-    // The subscription lives exactly as long as the layer scope; disposing the
+    // The hub→worker durable wakeup mesh: the egress control client owns the
+    // subscription; each delivered commit is republished into this isolate's
+    // EventV2. A handle without a mesh yields a no-op.
+    const unsubscribeDurable = wireDurableWakeups(events, egress)
+    // Both subscriptions live exactly as long as the layer scope; disposing the
     // scope (worker shutdown) unsubscribes.
-    yield* Effect.addFinalizer(() => bridge.dispose)
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => unsubscribeDurable()).pipe(Effect.andThen(bridge.dispose)),
+    )
     return WorkerEventBridge.of({ dispose: bridge.dispose })
   }),
 )
@@ -245,125 +373,55 @@ export const WorkerEventBridgeNode = LayerNode.make({
 // unchanged. This is the generic hub-proxy wire the three nodes share.
 // ---------------------------------------------------------------------------
 
-export type HubProxyRequest = {
-  readonly kind: "request"
-  readonly id: number
-  readonly method: string
-  readonly args: readonly unknown[]
-}
-
-export type HubProxyReply =
-  | { readonly kind: "reply"; readonly id: number; readonly ok: true; readonly value: unknown }
-  | { readonly kind: "reply"; readonly id: number; readonly ok: false; readonly message: string }
-
-export type HubProxyFrame = HubProxyRequest | HubProxyReply
-
-/** A typed failure returned by a hub authority across the port. */
-export class HubProxyRemoteError extends Error {
-  constructor(message: string) {
-    super(message)
-    this.name = "HubProxyRemoteError"
-  }
-}
-
-export interface HubProxyClient {
-  readonly call: (method: string, args: readonly unknown[]) => Promise<unknown>
-  /**
-   * The typed subagent-dispatch RPC (Solution 1). Optional so lightweight test
-   * doubles (`{ call, dispose }`) remain assignable; the multiplexed client
-   * always installs it.
-   */
-  readonly dispatchSubagent?: (request: SubagentDispatchRequest) => Promise<JobInfo>
-  dispose(): void
-}
-
-interface HubPending {
-  readonly resolve: (frame: HubProxyReply) => void
-  readonly reject: (error: unknown) => void
-}
+// The wire itself lives in `hub-proxy-wire.ts` so neither the worker nor the hub
+// imports the other. Re-exported here so existing consumers keep the same path.
+export {
+  createHubProxyClient,
+  HubProxyRemoteError,
+  serveHubProxy,
+} from "./hub-proxy-wire"
+export type {
+  HubProxyClient,
+  HubProxyFrame,
+  HubProxyHandlers,
+  HubProxyMethod,
+  HubProxyReply,
+  HubProxyRequest,
+} from "./hub-proxy-wire"
 
 /**
- * Worker side: a thin request/reply client over a hub-proxy `MessagePort`.
- * Requests carry a numeric `id` correlated by the client; replies echo it. Only
- * replies are addressed to the client, so request frames are ignored.
+ * Rebuild a hub authority's typed domain error from its wire form. The wire
+ * flattens a thrown error to a message + `_tag`; without this, a remote
+ * `Permission` / `Question` rejection reaches the processor as a generic
+ * `HubProxyRemoteError`, so its `instanceof PermissionV1.RejectedError` abort
+ * check misses and the run continues instead of stopping. Rebuilding the
+ * original class keeps the worker's abort behaviour identical to flag-off.
  */
-export function createHubProxyClient(port: MessagePort): HubProxyClient {
-  const channel = portFromMessagePort<HubProxyFrame>(port)
-  let nextId = 1
-  let disposed = false
-  const pending = new Map<number, HubPending>()
-
-  const unsubscribe = channel.onMessage((frame) => {
-    if (frame.kind !== "reply") return
-    const waiter = pending.get(frame.id)
-    if (waiter === undefined) return
-    pending.delete(frame.id)
-    waiter.resolve(frame)
-  })
-
-  const call = (method: string, args: readonly unknown[]): Promise<unknown> => {
-    if (disposed) return Promise.reject(new HubProxyRemoteError("hub proxy client disposed"))
-    const id = nextId++
-    return new Promise<unknown>((resolve, reject) => {
-      pending.set(id, {
-        resolve: (frame) => (frame.ok ? resolve(frame.value) : reject(new HubProxyRemoteError(frame.message))),
-        reject,
+function restoreHubProxyError(error: unknown): Error {
+  if (!(error instanceof HubProxyRemoteError)) return error instanceof Error ? error : new Error(String(error))
+  switch (error.tag) {
+    case "PermissionRejectedError":
+      return new PermissionV1.RejectedError()
+    case "PermissionCorrectedError":
+      return new PermissionV1.CorrectedError({
+        feedback: String((error.data as { feedback?: unknown } | undefined)?.feedback ?? ""),
       })
-      try {
-        channel.post({ kind: "request", id, method, args })
-      } catch (error) {
-        pending.delete(id)
-        reject(error)
-      }
-    })
+    case "PermissionDeniedError":
+      return new PermissionV1.DeniedError({
+        ruleset: (error.data as { ruleset?: unknown } | undefined)?.ruleset ?? [],
+      })
+    case "QuestionRejectedError":
+      return new Question.RejectedError()
+    default:
+      return error
   }
-
-  return {
-    call,
-    dispatchSubagent: (request) => call("dispatchSubagent", [request]) as Promise<JobInfo>,
-    dispose() {
-      if (disposed) return
-      disposed = true
-      unsubscribe()
-      for (const waiter of pending.values()) waiter.reject(new HubProxyRemoteError("hub proxy client disposed"))
-      pending.clear()
-    },
-  }
-}
-
-export type HubProxyHandlers = Readonly<Record<string, (...args: readonly unknown[]) => unknown>>
-
-/** Hub side: serve hub-proxy requests against `handlers`; returns a disposer. */
-export function serveHubProxy(handlers: HubProxyHandlers, port: MessagePort): () => void {
-  const channel = portFromMessagePort<HubProxyFrame>(port)
-  return channel.onMessage((frame) => {
-    if (frame.kind !== "request") return
-    const reply = (payload: HubProxyReply): void => {
-      try {
-        channel.post(payload)
-      } catch {
-        // Drop the reply: the worker is gone.
-      }
-    }
-    const handler = handlers[frame.method]
-    if (handler === undefined) {
-      reply({ kind: "reply", id: frame.id, ok: false, message: `unknown hub-proxy method "${frame.method}"` })
-      return
-    }
-    Promise.resolve()
-      .then(() => handler(...frame.args))
-      .then(
-        (value) => reply({ kind: "reply", id: frame.id, ok: true, value: value ?? null }),
-        (error) => reply({ kind: "reply", id: frame.id, ok: false, message: messageOf(error) }),
-      )
-  })
 }
 
 /** Await a hub-proxy call inside Effect; a remote failure is a typed error. */
-function hubProxyCall<A>(client: HubProxyClient, method: string, args: readonly unknown[]): Effect.Effect<A, Error> {
+function hubProxyCall<A>(client: HubProxyClient, method: HubProxyMethod, args: readonly unknown[]): Effect.Effect<A, Error> {
   return Effect.tryPromise({
     try: () => client.call(method, args) as Promise<A>,
-    catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+    catch: restoreHubProxyError,
   })
 }
 
@@ -378,12 +436,13 @@ export const QuestionProxyNode = questionClient.node
 /** `SessionStatus` proxy over a hub port; methods satisfy the real interface. */
 export function sessionStatusProxyLayer(client: HubProxyClient): Layer.Layer<SessionStatus.Service> {
   const service = {
-    get: (sessionID: SessionID) => hubProxyCall<SessionStatus.Info>(client, "get", [sessionID]),
+    get: (sessionID: SessionID) => hubProxyCall<SessionStatus.Info>(client, "sessionStatus.get", [sessionID]),
     list: () =>
-      hubProxyCall<ReadonlyArray<readonly [SessionID, SessionStatus.Info]>>(client, "list", []).pipe(
+      hubProxyCall<ReadonlyArray<readonly [SessionID, SessionStatus.Info]>>(client, "sessionStatus.list", []).pipe(
         Effect.map((entries) => new Map(entries)),
       ),
-    set: (sessionID: SessionID, status: SessionStatus.Info) => hubProxyCall<void>(client, "set", [sessionID, status]),
+    set: (sessionID: SessionID, status: SessionStatus.Info) =>
+      hubProxyCall<void>(client, "sessionStatus.set", [sessionID, status]),
   } as unknown as SessionStatus.Interface
   return Layer.succeed(SessionStatus.Service, service)
 }
@@ -391,9 +450,9 @@ export function sessionStatusProxyLayer(client: HubProxyClient): Layer.Layer<Ses
 /** `Permission` proxy over a hub port; methods satisfy the real interface. */
 export function permissionProxyLayer(client: HubProxyClient): Layer.Layer<Permission.Service> {
   const service = {
-    ask: (input: PermissionV1.AskInput) => hubProxyCall<void>(client, "ask", [input]),
-    reply: (input: PermissionV1.ReplyInput) => hubProxyCall<void>(client, "reply", [input]),
-    list: () => hubProxyCall<ReadonlyArray<PermissionV1.Request>>(client, "list", []),
+    ask: (input: PermissionV1.AskInput) => hubProxyCall<void>(client, "permission.ask", [input]),
+    reply: (input: PermissionV1.ReplyInput) => hubProxyCall<void>(client, "permission.reply", [input]),
+    list: () => hubProxyCall<ReadonlyArray<PermissionV1.Request>>(client, "permission.list", []),
   } as unknown as Permission.Interface
   return Layer.succeed(Permission.Service, service)
 }
@@ -402,14 +461,14 @@ export function permissionProxyLayer(client: HubProxyClient): Layer.Layer<Permis
 export function questionProxyLayer(client: HubProxyClient): Layer.Layer<Question.Service> {
   const service = {
     ask: (input: { sessionID: SessionID; questions: ReadonlyArray<Question.Info>; tool?: Question.Tool }) =>
-      hubProxyCall<ReadonlyArray<Question.Answer>>(client, "ask", [input]),
+      hubProxyCall<ReadonlyArray<Question.Answer>>(client, "question.ask", [input]),
     reply: (input: {
       requestID: Parameters<Question.Interface["reject"]>[0]
       answers: ReadonlyArray<Question.Answer>
-    }) => hubProxyCall<void>(client, "reply", [input]),
+    }) => hubProxyCall<void>(client, "question.reply", [input]),
     reject: (requestID: Parameters<Question.Interface["reject"]>[0]) =>
-      hubProxyCall<void>(client, "reject", [requestID]),
-    list: () => hubProxyCall<ReadonlyArray<Question.Request>>(client, "list", []),
+      hubProxyCall<void>(client, "question.reject", [requestID]),
+    list: () => hubProxyCall<ReadonlyArray<Question.Request>>(client, "question.list", []),
   } as unknown as Question.Interface
   return Layer.succeed(Question.Service, service)
 }
@@ -569,11 +628,17 @@ const pipelineLayer = Layer.effect(
         // or non-durable) publish emits nothing.
         const emitted = published.committed ? 1 : 0
         if (published.committed) {
-          egress.emit({
+          const boundary: EventV2Event = {
             id: `${input.sessionID}-text`,
             type: "session.text",
             properties: { text: completion.text, epoch: snapshot.epoch },
-          })
+          }
+          // The committed `session.text` is a durable boundary (5.5), so prefer
+          // the transport's durable path when the handle offers one: it carries
+          // a writer ordinal and bypasses delta coalescing. A handle without it
+          // (the reduced test stubs / degraded boot) falls back to `emit`.
+          if (egress.emitDurable !== undefined) egress.emitDurable(boundary)
+          else egress.emit(boundary)
         }
         return {
           text: completion.text,
@@ -611,39 +676,70 @@ export class SessionLayerBoundaryError extends Error {
 const boundaryViolation = (boundary: string, member: string): Effect.Effect<never> =>
   Effect.die(new SessionLayerBoundaryError(boundary, member))
 
+/**
+ * Build a hub/writer/broker-owned boundary service from the table of reads a
+ * worker legitimately performs. Every method NOT listed fails loud with a
+ * {@link SessionLayerBoundaryError} the moment it is called, so a method added
+ * to the interface later is denied by default instead of silently returning
+ * `undefined` or a `Layer.mock` no-op.
+ *
+ * The service is a `Proxy` because the method set is only known from the
+ * interface type (erased at runtime): an unlisted property resolves to a
+ * fail-loud function, so the table can never omit a denial.
+ */
+function failLoudBoundary<I, S extends object>(
+  boundary: string,
+  service: Context.Key<I, S>,
+  reads: Partial<S>,
+): Layer.Layer<I> {
+  const table = new Proxy(reads, {
+    get(target, member) {
+      if (typeof member === "symbol" || member in target) return Reflect.get(target, member)
+      return () => boundaryViolation(boundary, member)
+    },
+  })
+  return Layer.succeed(service, table as S)
+}
+
 /** Immutable snapshot-backed Config: workers never read files or write config. */
 export function snapshotConfigLayer(snapshot: WorkerSnapshot): Layer.Layer<Config.Service> {
-  const config: Config.Interface = {
+  return failLoudBoundary("Config", Config.Service, {
     get: () => Effect.succeed(snapshot.config),
     getGlobal: () => Effect.succeed(snapshot.config),
     getConsoleState: () => Effect.succeed(emptyConsoleState),
-    update: () => boundaryViolation("Config", "update"),
-    updateGlobal: () => boundaryViolation("Config", "updateGlobal"),
-    invalidate: () => boundaryViolation("Config", "invalidate"),
     directories: () => Effect.succeed([...(snapshot.directories ?? [snapshot.directory])]),
     waitForDependencies: () => Effect.void,
-  }
-  return Layer.succeed(Config.Service, config)
+  })
 }
 
 /** Immutable snapshot-backed Auth: credentials never touch `process.env`. */
 export function snapshotAuthLayer(snapshot: WorkerSnapshot): Layer.Layer<Auth.Service> {
-  const auth: Auth.Interface = {
+  return failLoudBoundary("Auth", Auth.Service, {
     get: (providerID: string) => Effect.succeed(snapshot.auth[providerID] as Auth.Info | undefined),
     all: () => Effect.succeed(snapshot.auth as Record<string, Auth.Info>),
-    set: () => boundaryViolation("Auth", "set"),
-    remove: () => boundaryViolation("Auth", "remove"),
-  }
-  return Layer.succeed(Auth.Service, auth)
+  })
 }
 
 /** Immutable snapshot-backed ModelsDev: catalog refresh is hub-only. */
 export function snapshotModelsDevLayer(snapshot: WorkerSnapshot): Layer.Layer<ModelsDev.Service> {
-  const modelsDev: ModelsDev.Interface = {
+  return failLoudBoundary("ModelsDev", ModelsDev.Service, {
     get: () => Effect.succeed(snapshot.modelsDev as Record<string, ModelsDev.Provider>),
-    refresh: () => boundaryViolation("ModelsDev", "refresh"),
-  }
-  return Layer.succeed(ModelsDev.Service, modelsDev)
+  })
+}
+
+/**
+ * Immutable snapshot-backed RuntimeFlags.
+ *
+ * A worker must NEVER re-derive flags from its own `process.env` / ConfigProvider:
+ * the hub already resolved them once (including any per-layer override) and froze
+ * the result into {@link WorkerSnapshot.flags}. Serving that value verbatim keeps
+ * the isolate in lockstep with the hub — the previous gap let the reduced LLM
+ * sub-graph see the hub flags while the full session loop silently fell back to
+ * the process environment, so a flag set only on the hub (e.g.
+ * `experimentalBackgroundSubagents`) never reached the session graph.
+ */
+export function snapshotRuntimeFlagsLayer(snapshot: WorkerSnapshot): Layer.Layer<RuntimeFlags.Service> {
+  return Layer.succeed(RuntimeFlags.Service, snapshot.flags)
 }
 
 /** Database is writer-owned: any access is a loud violation, never a silent `{}`. */
@@ -670,7 +766,7 @@ export function databaseBoundaryLayer(): Layer.Layer<Database.Service> {
 
 /** The MCP boundary: a worker owns no servers, so every catalog read is empty. */
 export function mcpBoundaryLayer(): Layer.Layer<MCP.Service> {
-  const mcp: MCP.Interface = {
+  return failLoudBoundary("MCP", MCP.Service, {
     status: () => Effect.succeed({}),
     clients: () => Effect.succeed({}),
     instructions: () => Effect.succeed([]),
@@ -683,20 +779,12 @@ export function mcpBoundaryLayer(): Layer.Layer<MCP.Service> {
     hasStoredTokens: () => Effect.succeed(false),
     getAuthStatus: () => Effect.succeed("not_authenticated"),
     supportsOAuth: () => Effect.succeed(false),
-    add: () => boundaryViolation("MCP", "add"),
-    connect: () => boundaryViolation("MCP", "connect"),
-    disconnect: () => boundaryViolation("MCP", "disconnect"),
-    startAuth: () => boundaryViolation("MCP", "startAuth"),
-    authenticate: () => boundaryViolation("MCP", "authenticate"),
-    finishAuth: () => boundaryViolation("MCP", "finishAuth"),
-    removeAuth: () => boundaryViolation("MCP", "removeAuth"),
-  }
-  return Layer.succeed(MCP.Service, mcp)
+  })
 }
 
 /** The LSP boundary: a worker owns no language servers, so every read is empty. */
 export function lspBoundaryLayer(): Layer.Layer<LSP.Service> {
-  const lsp: LSP.Interface = {
+  return failLoudBoundary("LSP", LSP.Service, {
     init: () => Effect.void,
     status: () => Effect.succeed([]),
     hasClients: () => Effect.succeed(false),
@@ -711,42 +799,29 @@ export function lspBoundaryLayer(): Layer.Layer<LSP.Service> {
     prepareCallHierarchy: () => Effect.succeed([]),
     incomingCalls: () => Effect.succeed([]),
     outgoingCalls: () => Effect.succeed([]),
-  }
-  return Layer.succeed(LSP.Service, lsp)
+  })
 }
 
 /** The MCP auth boundary: no stored tokens; persistence is hub-owned. */
 export function mcpAuthBoundaryLayer(): Layer.Layer<McpAuth.Service> {
-  const auth: McpAuth.Interface = {
+  return failLoudBoundary("McpAuth", McpAuth.Service, {
     all: () => Effect.succeed({}),
     get: () => Effect.succeed(undefined),
     getForUrl: () => Effect.succeed(undefined),
     getOAuthState: () => Effect.succeed(undefined),
-    set: () => boundaryViolation("McpAuth", "set"),
-    remove: () => boundaryViolation("McpAuth", "remove"),
-    updateTokens: () => boundaryViolation("McpAuth", "updateTokens"),
-    updateClientInfo: () => boundaryViolation("McpAuth", "updateClientInfo"),
-    updateCodeVerifier: () => boundaryViolation("McpAuth", "updateCodeVerifier"),
-    clearCodeVerifier: () => boundaryViolation("McpAuth", "clearCodeVerifier"),
-    updateOAuthState: () => boundaryViolation("McpAuth", "updateOAuthState"),
-    clearOAuthState: () => boundaryViolation("McpAuth", "clearOAuthState"),
-  }
-  return Layer.succeed(McpAuth.Service, auth)
+  })
 }
 
 /** The Npm boundary: a worker never installs packages; resolution is hub-only. */
 export function npmBoundaryLayer(): Layer.Layer<Npm.Service> {
-  const npm: Npm.Interface = {
+  return failLoudBoundary("Npm", Npm.Service, {
     which: () => Effect.succeed(undefined),
-    add: () => boundaryViolation("Npm", "add"),
-    install: () => boundaryViolation("Npm", "install"),
-  }
-  return Layer.succeed(Npm.Service, npm)
+  })
 }
 
 /** The Account boundary: read-only; a worker has no account authority. */
 export function accountBoundaryLayer(): Layer.Layer<Account.Service> {
-  const account: Account.Interface = {
+  return failLoudBoundary("Account", Account.Service, {
     active: () => Effect.succeed(Option.none()),
     activeOrg: () => Effect.succeed(Option.none()),
     list: () => Effect.succeed([]),
@@ -754,60 +829,28 @@ export function accountBoundaryLayer(): Layer.Layer<Account.Service> {
     orgs: () => Effect.succeed([]),
     config: () => Effect.succeed(Option.none()),
     token: () => Effect.succeed(Option.none()),
-    remove: () => boundaryViolation("Account", "remove"),
-    use: () => boundaryViolation("Account", "use"),
-    login: () => boundaryViolation("Account", "login"),
-    poll: () => boundaryViolation("Account", "poll"),
-  }
-  return Layer.succeed(Account.Service, account)
+  })
 }
 
 /** The AccountRepo boundary: read-only; persistence is hub-owned. */
 export function accountRepoBoundaryLayer(): Layer.Layer<AccountRepo.Service> {
-  const repo: AccountRepo.Interface = {
+  return failLoudBoundary("AccountRepo", AccountRepo.Service, {
     active: () => Effect.succeed(Option.none()),
     list: () => Effect.succeed([]),
     getRow: () => Effect.succeed(Option.none()),
-    remove: () => boundaryViolation("AccountRepo", "remove"),
-    use: () => boundaryViolation("AccountRepo", "use"),
-    persistToken: () => boundaryViolation("AccountRepo", "persistToken"),
-    persistAccount: () => boundaryViolation("AccountRepo", "persistAccount"),
-  }
-  return Layer.succeed(AccountRepo.Service, repo)
+  })
 }
 
 /** The Storage boundary: a worker owns no durable store; only `list` is empty. */
 export function storageBoundaryLayer(): Layer.Layer<Storage.Service> {
-  const storage: Storage.Interface = {
+  return failLoudBoundary("Storage", Storage.Service, {
     list: () => Effect.succeed([]),
-    read: () => boundaryViolation("Storage", "read"),
-    update: () => boundaryViolation("Storage", "update"),
-    write: () => boundaryViolation("Storage", "write"),
-    remove: () => boundaryViolation("Storage", "remove"),
-  }
-  return Layer.succeed(Storage.Service, storage)
+  })
 }
 
 /** The Git boundary: a worker owns no checkout; every operation is process-backed. */
 export function gitBoundaryLayer(): Layer.Layer<Git.Service> {
-  const git: Git.Interface = {
-    run: () => boundaryViolation("Git", "run"),
-    branch: () => boundaryViolation("Git", "branch"),
-    prefix: () => boundaryViolation("Git", "prefix"),
-    defaultBranch: () => boundaryViolation("Git", "defaultBranch"),
-    hasHead: () => boundaryViolation("Git", "hasHead"),
-    mergeBase: () => boundaryViolation("Git", "mergeBase"),
-    show: () => boundaryViolation("Git", "show"),
-    status: () => boundaryViolation("Git", "status"),
-    diff: () => boundaryViolation("Git", "diff"),
-    stats: () => boundaryViolation("Git", "stats"),
-    patch: () => boundaryViolation("Git", "patch"),
-    patchAll: () => boundaryViolation("Git", "patchAll"),
-    patchUntracked: () => boundaryViolation("Git", "patchUntracked"),
-    statUntracked: () => boundaryViolation("Git", "statUntracked"),
-    applyPatch: () => boundaryViolation("Git", "applyPatch"),
-  }
-  return Layer.succeed(Git.Service, git)
+  return failLoudBoundary("Git", Git.Service, {})
 }
 
 /**
@@ -818,39 +861,39 @@ export function gitBoundaryLayer(): Layer.Layer<Git.Service> {
 export function appProcessBoundaryLayer(): Layer.Layer<AppProcess.Service> {
   const unsupportedStream = (member: string): Stream.Stream<never, never> =>
     Stream.die(new SessionLayerBoundaryError("AppProcess", member))
-  const appProcess: AppProcess.Interface = {
-    spawn: () => boundaryViolation("AppProcess", "spawn"),
-    exitCode: () => boundaryViolation("AppProcess", "exitCode"),
+  return failLoudBoundary("AppProcess", AppProcess.Service, {
     streamString: () => unsupportedStream("streamString"),
     streamLines: () => unsupportedStream("streamLines"),
-    lines: () => boundaryViolation("AppProcess", "lines"),
-    string: () => boundaryViolation("AppProcess", "string"),
-    run: () => boundaryViolation("AppProcess", "run"),
     runStream: () => unsupportedStream("runStream"),
-  }
-  return Layer.succeed(AppProcess.Service, appProcess)
+  })
 }
 
 /** The ripgrep binary boundary: a worker never downloads or locates the binary. */
 export function ripgrepBinaryBoundaryLayer(): Layer.Layer<RipgrepBinary.Service> {
-  return Layer.succeed(RipgrepBinary.Service, {
-    filepath: boundaryViolation("RipgrepBinary", "filepath"),
-  })
+  return failLoudBoundary("RipgrepBinary", RipgrepBinary.Service, {})
 }
 
 /** The ripgrep boundary: a worker owns no search process; every search fails loud. */
 export function ripgrepBoundaryLayer(): Layer.Layer<Ripgrep.Service> {
-  return Layer.succeed(Ripgrep.Service, {
-    find: () => boundaryViolation("Ripgrep", "find"),
-    glob: () => boundaryViolation("Ripgrep", "glob"),
-    grep: () => boundaryViolation("Ripgrep", "grep"),
-  })
+  return failLoudBoundary("Ripgrep", Ripgrep.Service, {})
 }
 
 /** The MCP browser boundary: a worker never opens a browser. */
 export function mcpBrowserBoundaryLayer(): Layer.Layer<McpBrowser.Service> {
-  return Layer.succeed(McpBrowser.Service, {
-    open: () => boundaryViolation("McpBrowser", "open"),
+  return failLoudBoundary("McpBrowser", McpBrowser.Service, {})
+}
+
+/**
+ * The `Permission` boundary for a worker with no hub control plane (degraded
+ * boot). `Permission` is a hub-resident authority, so a worker that cannot reach
+ * the hub must fail loud when a session asks for authorization — never a silent
+ * `Layer.mock` no-op that would let a denied tool run. `list` is a neutral read
+ * and stays empty; `ask`/`reply` die with a descriptive
+ * {@link SessionLayerBoundaryError}.
+ */
+export function permissionBoundaryLayer(): Layer.Layer<Permission.Service> {
+  return failLoudBoundary("Permission", Permission.Service, {
+    list: () => Effect.succeed([]),
   })
 }
 
@@ -935,6 +978,12 @@ export function boundaryReplacements(
     [Config.node, snapshotConfigLayer(snapshot)],
     [Auth.node, snapshotAuthLayer(snapshot)],
     [ModelsDev.node, snapshotModelsDevLayer(snapshot)],
+    // The hub resolved every runtime flag (including any per-layer override) and
+    // froze it into the snapshot; the worker serves that value rather than
+    // re-deriving from its own `process.env`. Without this replacement the full
+    // session graph built the real RuntimeFlags node and re-read the environment,
+    // so a hub-only flag override never crossed the isolate boundary.
+    [RuntimeFlags.node, snapshotRuntimeFlagsLayer(snapshot)],
     [Database.node, writer === undefined ? databaseBoundaryLayer() : writerDatabaseLayer(writer)],
     // `SessionProjector` deliberately has NO boundary replacement: it runs IN the
     // worker. `Session.updateMessage`/`updatePart` publish durable events, and the
@@ -1110,16 +1159,6 @@ interface WorkerLanguageSdk {
   languageModel(modelID: string): LanguageModelV3
 }
 
-/** Keep only string-valued header entries from a serialized provider option. */
-function stringHeaders(value: unknown): Record<string, string> {
-  if (value === null || typeof value !== "object") return {}
-  const headers: Record<string, string> = {}
-  for (const [key, header] of Object.entries(value as Record<string, unknown>)) {
-    if (typeof header === "string") headers[key] = header
-  }
-  return headers
-}
-
 /** An abort controller that fires after `ms`, mirroring `provider.ts`'s timeout. */
 function timeoutController(ms: number) {
   const controller = new AbortController()
@@ -1177,12 +1216,18 @@ function wrapSseIdle(response: Response, ms: number, controller: AbortController
  * `timeoutFetch` (`provider.ts:1852`), so a worker request is bounded like
  * flag-off instead of using the unbounded global `fetch`.
  */
-function workerTimeoutFetch(options: Record<string, any>): typeof fetch {
-  const chunkTimeout = options["chunkTimeout"] ?? 300_000
-  const headerTimeout = options["headerTimeout"] ?? 300_000
-  const timeout = options["timeout"]
-  return (async (input: any, init?: any) => {
-    const opts = init ?? {}
+/** Bun's `fetch` accepts a `timeout` extension `RequestInit` does not declare. */
+interface BunRequestInit extends RequestInit {
+  /** `false` disables Bun's own request timeout. */
+  readonly timeout?: number | false
+}
+
+function workerTimeoutFetch(options: Readonly<Record<string, unknown>>): typeof fetch {
+  const chunkTimeout = (options["chunkTimeout"] ?? 300_000) as number
+  const headerTimeout = (options["headerTimeout"] ?? 300_000) as number | false
+  const timeout = options["timeout"] as number | false | undefined
+  return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const opts: RequestInit = init ?? {}
     const headerTimeoutMs = headerTimeout === false ? undefined : headerTimeout
     const chunkController = typeof chunkTimeout === "number" && chunkTimeout > 0 ? new AbortController() : undefined
     const headerController = typeof headerTimeoutMs === "number" ? timeoutController(headerTimeoutMs) : undefined
@@ -1192,12 +1237,12 @@ function workerTimeoutFetch(options: Record<string, any>): typeof fetch {
     if (headerController) signals.push(headerController.signal)
     if (timeout !== undefined && timeout !== null && timeout !== false) signals.push(AbortSignal.timeout(timeout))
     const signal = signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals)
-    const response = await fetch(input, {
+    const request: BunRequestInit = {
       ...opts,
       ...(signal === undefined ? {} : { signal }),
-      // @ts-ignore Bun-specific: disable Bun's own request timeout.
       timeout: false,
-    }).finally(() => headerController?.clear())
+    }
+    const response = await fetch(input, request).finally(() => headerController?.clear())
     if (chunkController === undefined) return response
     return wrapSseIdle(response, chunkTimeout, chunkController)
   }) as typeof fetch
@@ -1385,17 +1430,80 @@ export function llmModelClientLayer(config: WorkerModelConfig): Layer.Layer<Mode
 }
 
 /**
+ * A fail-loud service for a worker boundary the *standalone* reduced LLM
+ * sub-graph must never call. Every member access dies with a descriptive
+ * {@link SessionLayerBoundaryError} naming the boundary and member, so a
+ * mis-wired worker surfaces a precise diagnosis instead of a generic
+ * `UnimplementedError`. The full worker graph supplies the real nodes; this
+ * sub-graph only needs a satisfiable service so `LLM` compiles.
+ */
+function failLoudService<T extends object>(boundary: string): T {
+  return new Proxy(
+    {},
+    {
+      get(_target, member) {
+        if (typeof member === "symbol") return undefined
+        return () => boundaryViolation(boundary, member)
+      },
+    },
+  ) as T
+}
+
+/**
+ * The `EventV2Bridge` boundary for the standalone reduced LLM sub-graph: the
+ * isolate publishes through its own event port in the full graph, so this
+ * sub-graph never reaches the hub bridge and fails loud if it ever does.
+ */
+function eventV2BridgeBoundaryLayer(): Layer.Layer<EventV2Bridge.Service> {
+  return Layer.succeed(EventV2Bridge.Service, failLoudService<EventV2.Interface>("EventV2Bridge"))
+}
+
+/**
+ * The `LLMClient` boundary for the standalone reduced LLM sub-graph: the full
+ * worker graph builds the real platform client, so this sub-graph never issues a
+ * request and fails loud if it ever does.
+ */
+function llmClientBoundaryLayer(): Layer.Layer<LLMClientService> {
+  return Layer.succeed(LLMClient.Service, failLoudService<LLMClientShape>("LLMClient"))
+}
+
+/**
+ * The boundary replacements for the standalone reduced LLM sub-graph.
+ * `Permission` is a hub-resident authority: route it over the hub-proxy control
+ * port when the worker has one, otherwise fail loud. `EventV2Bridge`/`LLMClient`
+ * are hub-owned; this sub-graph only needs satisfiable services so `LLM`
+ * compiles and never reaches them. `Plugin` is a worker-safe replacement here
+ * (host when supplied, no-op otherwise); the full worker graph additionally
+ * replaces `Plugin.node` at the top level ({@link buildSessionWorkerLayer}).
+ *
+ * Exported so a test can assert the per-node boundary wiring without resolving
+ * the sub-graph's (single, `LLM`) output service.
+ */
+export function llmBoundaryReplacements(
+  snapshot: WorkerSnapshot,
+  config: WorkerModelConfig,
+  hubProxies?: HubProxyClients,
+  plugins?: WorkerPluginHost,
+): LayerNode.Replacements {
+  return [
+    [Auth.node, snapshotAuthLayer(snapshot)],
+    [Config.node, snapshotConfigLayer(snapshot)],
+    [Provider.node, reducedModelProviderLayer(config)],
+    workerPluginReplacement(plugins),
+    // `Permission` is a hub-resident authority: route it over the hub-proxy
+    // control port when the worker has one, otherwise fail loud. Never a silent
+    // mock, which would let a denied tool run in a degraded isolate.
+    [Permission.node, hubProxies === undefined ? permissionBoundaryLayer() : permissionProxyLayer(hubProxies.permission)],
+    [EventV2Bridge.node, eventV2BridgeBoundaryLayer()],
+    [llmClient, llmClientBoundaryLayer()],
+    [RuntimeFlags.node, snapshotRuntimeFlagsLayer(snapshot)],
+  ]
+}
+
+/**
  * The worker-local `LLM` service: the real `LLM` node composed over the reduced
  * provider, the snapshot Config/Auth/ModelsDev and the hub-proxy authorities.
  * This keeps the provider stream inside the isolate (design decision 20).
- *
- * `EventV2Bridge` / `LLMClient` are boundary services on the hub; the worker only
- * needs them at LLM build time (`Layer.mock` provides the service without their
- * hub-side behaviour, which the session-worker does not exercise for a single
- * reduced turn). `Plugin` is a worker-safe replacement here (host when supplied,
- * no-op otherwise) because this sub-graph is compiled standalone by callers such
- * as the reduced pipeline; the full worker graph additionally replaces
- * `Plugin.node` at the top level ({@link buildSessionWorkerLayer}).
  */
 export function reducedLlmLayer(
   snapshot: WorkerSnapshot,
@@ -1403,20 +1511,7 @@ export function reducedLlmLayer(
   hubProxies?: HubProxyClients,
   plugins?: WorkerPluginHost,
 ): Layer.Layer<LLM.Service> {
-  const replacements: LayerNode.Replacements = [
-    [Auth.node, snapshotAuthLayer(snapshot)],
-    [Config.node, snapshotConfigLayer(snapshot)],
-    [Provider.node, reducedModelProviderLayer(config)],
-    workerPluginReplacement(plugins),
-    [
-      Permission.node,
-      hubProxies === undefined ? Layer.mock(Permission.Service, {}) : permissionProxyLayer(hubProxies.permission),
-    ],
-    [EventV2Bridge.node, Layer.mock(EventV2Bridge.Service, {})],
-    [llmClient, Layer.mock(LLMClient.Service, {})],
-    [RuntimeFlags.node, Layer.succeed(RuntimeFlags.Service, snapshot.flags)],
-  ]
-  return AppNodeBuilderV1.build(LLM.node, replacements)
+  return AppNodeBuilderV1.build(LLM.node, llmBoundaryReplacements(snapshot, config, hubProxies, plugins))
 }
 
 // ---------------------------------------------------------------------------
@@ -1520,7 +1615,7 @@ export const PIPELINE_SESSION_NODES = LayerNode.group([
 
 export interface SessionLayerOptions {
   /** Node group; defaults to the full runnable session graph (`RUNNABLE_SESSION_NODES`). */
-  readonly nodes?: LayerNode.Node<unknown, unknown, any>
+  readonly nodes?: LayerNode.AnyNode
   readonly snapshot: WorkerSnapshot
   readonly env: WorkerEnv
   readonly clients: {
@@ -1567,7 +1662,7 @@ export interface SessionLayerOptions {
 }
 
 export interface SessionWorkerLayer {
-  readonly root: LayerNode.Node<unknown, unknown, any>
+  readonly root: LayerNode.AnyNode
   readonly replacements: LayerNode.Replacements
   readonly layer: Layer.Layer<unknown, unknown>
 }
@@ -1618,11 +1713,6 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
   // node-table assertion untouched. Absent keeps the layer unchanged.
   const withLogging = options.logging === undefined ? layer : Layer.merge(layer, options.logging)
   return { root, replacements, layer: withLogging }
-}
-
-/** Build a `ManagedRuntime`-style runner for the reduced layer. */
-export function createSessionWorkerRuntime(options: SessionLayerOptions): Layer.Layer<unknown, unknown> {
-  return buildSessionWorkerLayer(options).layer
 }
 
 export * as SessionWorkerLayer from "./layer"

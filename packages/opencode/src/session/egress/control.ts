@@ -47,7 +47,19 @@ export type ControlInbound = Exclude<ControlFrame, ControlOutbound>
 
 /** A request frame: the link stamps `id`, so callers may omit it. */
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
-export type ControlRequest = DistributiveOmit<ControlFrame, "id"> & { readonly id?: number }
+
+/**
+ * The frames a caller may send as a request: only request/reply pairs. Replies
+ * (`pong`, `listen.ok`) and push-only frames (`durable`, `resync`, `durable.ack`,
+ * `resync.ack`) are unrepresentable here — pushes go through {@link ControlLink.notify}.
+ */
+type ControlRequestFrame = Extract<ControlFrame, { readonly type: "ping" | "listen" | "unlisten" }>
+export type ControlRequest = DistributiveOmit<ControlRequestFrame, "id"> & { readonly id?: number }
+
+/** A non-negative integer — the only valid delivery/resync acknowledgement count. */
+export function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0
+}
 
 export interface ControlLink {
   /** Send a request and resolve with the reply carrying the same `id`. */
@@ -76,11 +88,15 @@ interface PendingRequest {
 /**
  * Shape check for the port boundary: accepts any object carrying a string
  * `type`, so unknown / forward-compatible frames are still forwarded to
- * `onMessage` rather than dropped.
+ * `onMessage` rather than dropped. A KNOWN frame with a malformed body (an ack
+ * whose `count` is not a non-negative integer) is rejected here so it never
+ * enters internal logic as a trusted {@link ControlFrame}.
  */
 function isControlFrame(data: unknown): data is ControlFrame {
   if (typeof data !== "object" || data === null || !("type" in data)) return false
-  return typeof data.type === "string"
+  if (typeof data.type !== "string") return false
+  if (data.type === "durable.ack") return isNonNegativeInteger((data as { readonly count?: unknown }).count)
+  return true
 }
 
 export function createControlLink(port: MessagePort, options: ControlLinkOptions = {}): ControlLink {
@@ -101,7 +117,14 @@ export function createControlLink(port: MessagePort, options: ControlLinkOptions
 
   port.onmessage = (event: MessageEvent) => {
     const data: unknown = event.data
-    if (!isControlFrame(data)) return
+    if (!isControlFrame(data)) {
+      // A malformed KNOWN frame is a protocol violation: surface it loudly
+      // instead of dropping it. Unknown / forward-compatible frames are ignored.
+      if (typeof data === "object" && data !== null && "type" in data && typeof data.type === "string") {
+        lastError = new Error(`invalid control frame: ${JSON.stringify(data)}`)
+      }
+      return
+    }
     if ("id" in data && typeof data.id === "number") {
       const waiter = pending.get(data.id)
       if (waiter) {

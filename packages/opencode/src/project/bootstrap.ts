@@ -8,7 +8,7 @@ import * as Vcs from "./vcs"
 import { InstanceState } from "@/effect/instance-state"
 import { Effect, Layer } from "effect"
 import { Config } from "@/config/config"
-import { logSessionWorkersFlagOnce, RuntimeFlags } from "@/effect/runtime-flags"
+import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Service } from "./bootstrap-service"
 
 export { Service } from "./bootstrap-service"
@@ -31,11 +31,9 @@ const layer = Layer.effect(
 
     const run = Effect.gen(function* () {
       const ctx = yield* InstanceState.context
-      yield* logSessionWorkersFlagOnce(
-        (message, fields) => Effect.logInfo(message, fields),
-        undefined,
-        runtimeFlags.experimentalSessionWorkers,
-      )
+      yield* Effect.logInfo("session workers flag", {
+        experimentalSessionWorkers: runtimeFlags.experimentalSessionWorkers,
+      })
       yield* Effect.logInfo("bootstrapping", { directory: ctx.directory })
       // everything depends on config so eager load it for nice traces
       yield* config.get()

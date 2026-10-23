@@ -24,7 +24,6 @@ import { SessionStatus } from "@/session/status"
 import { SessionRunState } from "@/session/run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge, type LiveEvent, type LiveEventPublisher } from "@/event-v2-bridge"
-import type { CancelFrame, CancelPort } from "@/session/worker/cancel"
 import {
   createProductionSessionHub,
   createSessionHub,
@@ -37,78 +36,14 @@ import { deriveHeadroom } from "@/session/worker/dispatch"
 import { reapSupport } from "@/session/worker/pid-registry"
 import { sessionWorkerInit } from "../../lib/session-worker-init"
 import { pollUntil } from "../../lib/poll"
-import {
-  SessionBusyError,
-  type ExecutorRun,
-  type ExecutorSessionWorker,
-  type ExecutorWorker,
-  type ExecutorWorkerPool,
-  type SessionExecutionResult,
-} from "@/session/worker/execute"
+import { SessionBusyError } from "@/session/worker/execute"
 import { withTmpdirInstance } from "../../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../../lib/effect"
 import { sid } from "../../lib/async"
 import { withParts } from "../../lib/session-parts"
+import { createFakeExecutorPool } from "../../lib/fake-worker-pool"
 
 const it = testEffect(Layer.empty)
-
-class FakeWorker implements ExecutorWorker {
-  busy = false
-  constructor(
-    readonly id: number,
-    private readonly onExecute: (run: ExecutorRun) => void,
-  ) {}
-  get alive(): boolean {
-    return true
-  }
-  async execute(run: ExecutorRun): Promise<void> {
-    this.onExecute(run)
-  }
-  async cancel(): Promise<void> {}
-  async assertNotBusy(): Promise<boolean> {
-    return this.busy
-  }
-  resultFor(): SessionExecutionResult | undefined {
-    return undefined
-  }
-  async terminate(): Promise<void> {}
-}
-
-class FakePool implements ExecutorWorkerPool {
-  readonly workers: FakeWorker[]
-  readonly spawned: FakeWorker[] = []
-  private readonly results = new Map<SessionID, SessionExecutionResult>()
-  private nextSpawnId = 100
-
-  constructor(
-    k: number,
-    private readonly value: unknown,
-  ) {
-    this.workers = Array.from({ length: k }, (_, index) => this.make(index + 1))
-  }
-
-  private make(id: number): FakeWorker {
-    return new FakeWorker(id, (run) => {
-      this.results.set(run.sessionID, { sessionID: run.sessionID, value: this.value })
-    })
-  }
-
-  spawn(): ExecutorSessionWorker {
-    const worker = this.make(this.nextSpawnId++)
-    this.spawned.push(worker)
-    return worker
-  }
-
-  async terminateAll(): Promise<void> {}
-
-  byID(id: number): ExecutorWorker | undefined {
-    return [...this.workers, ...this.spawned].find((worker) => worker.id === id)
-  }
-
-  resultFor(sessionID: SessionID): SessionExecutionResult | undefined {
-    return this.results.get(sessionID)
-  }
-}
 
 const runStateLayer = SessionRunState.layer.pipe(
   Layer.provide(
@@ -183,7 +118,7 @@ const flagsOn = RuntimeFlags.layer({ experimentalSessionWorkers: true })
 
 describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
   it.live("startShell calls the hub's startShell and opens the caller's ready latch", () => {
-    const pool = new FakePool(1, withParts(sid("ses_shell")))
+    const pool = createFakeExecutorPool(1, { value: withParts(sid("ses_shell")) })
     const base = createSessionHub({ pool })
     let shellCalls = 0
     const hub: SessionHub = {
@@ -213,7 +148,7 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
   })
 
   it.live("startShell maps a hub busy rejection to Session.BusyError", () => {
-    const pool = new FakePool(1, undefined)
+    const pool = createFakeExecutorPool(1)
     const base = createSessionHub({ pool })
     const hub: SessionHub = {
       ...base,
@@ -237,7 +172,7 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
   })
 
   it.live("cancel delegates to the hub cancel path", () => {
-    const pool = new FakePool(1, undefined)
+    const pool = createFakeExecutorPool(1)
     const base = createSessionHub({ pool })
     const cancelled: SessionID[] = []
     const hub: SessionHub = {
@@ -257,7 +192,7 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
   })
 
   it.live("cancel emits session.status idle after the hub cancel resolves", () => {
-    const pool = new FakePool(1, undefined)
+    const pool = createFakeExecutorPool(1)
     const base = createSessionHub({ pool })
     const order: string[] = []
     const hub: SessionHub = {
@@ -293,7 +228,7 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
     const flagOnCancelled: string[] = []
     const flagOffCancelled: string[] = []
 
-    const flagOnPool = new FakePool(1, undefined)
+    const flagOnPool = createFakeExecutorPool(1)
     const flagOnHub = createSessionHub({ pool: flagOnPool })
     const flagOn = withTmpdirInstance()(
       Effect.gen(function* () {
@@ -330,7 +265,7 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
     const flagOnCalls: StatusCall[] = []
     const flagOffCalls: StatusCall[] = []
 
-    const flagOnPool = new FakePool(1, undefined)
+    const flagOnPool = createFakeExecutorPool(1)
     const flagOnHub = createSessionHub({ pool: flagOnPool })
     const flagOn = withTmpdirInstance()(
       Effect.gen(function* () {
@@ -368,110 +303,10 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
 //
 // The audit (`o1-w4-audit.md` §5) found these facts covered by two separate
 // tests (`hub-wiring.test.ts` idle; `hub.test.ts` outcome+event) with no single
-// integrated run. The worker below stays running until cancelled and exposes a
-// cooperative cancel port, so the dispatcher's `cancelWithGrace` resolves on the
-// cooperative path instead of terminating.
+// integrated run. The shared blocking executor fake stays running until
+// cancelled and exposes a cooperative cancel port, so the dispatcher's
+// `cancelWithGrace` resolves on the cooperative path instead of terminating.
 // ---------------------------------------------------------------------------
-
-/** A worker that stays running until cancelled, with a cooperative cancel port. */
-class BlockingWorker implements ExecutorWorker {
-  readonly cancelPort: CancelPort
-  private readonly finish = new Map<string, () => void>()
-  private readonly results = new Map<SessionID, SessionExecutionResult>()
-  private readonly ackHandlers = new Set<(frame: CancelFrame) => void>()
-
-  constructor(
-    readonly id: number,
-    private readonly value: unknown,
-    /**
-     * Simulates the worker-local run-state (table B) publishing the terminal
-     * `session.status: idle` through the hub-proxy before it acknowledges the
-     * cancel. Phase 4 routes the executor cancel into that inner runner, so a
-     * dispatched run emits its own idle; the hub-side `SessionRunState.cancel`
-     * must not emit a second one.
-     */
-    private readonly onCancelIdle?: (sessionID: SessionID) => void,
-  ) {
-    this.cancelPort = {
-      notify: (frame) => {
-        if (frame.type !== "cancel") return
-        // table B publishes idle on unwind, BEFORE the ack. Then acknowledge:
-        // `cancelWithGrace` reclassifies a settle with no ack to a natural
-        // completion, so the ack must land before the run settles.
-        this.onCancelIdle?.(frame.sessionID as SessionID)
-        for (const handler of this.ackHandlers) {
-          handler({ type: "cancel-ack", sessionID: frame.sessionID, accepted: true })
-        }
-        this.finish.get(frame.sessionID)?.()
-      },
-      onMessage: (handler) => {
-        this.ackHandlers.add(handler)
-        return () => void this.ackHandlers.delete(handler)
-      },
-    }
-  }
-
-  get alive(): boolean {
-    return true
-  }
-
-  execute(run: ExecutorRun): Promise<void> {
-    return new Promise<void>((resolve) => {
-      this.finish.set(run.sessionID, () => {
-        this.results.set(run.sessionID, { sessionID: run.sessionID, value: this.value })
-        resolve()
-      })
-    })
-  }
-
-  async cancel(sessionID: SessionID): Promise<void> {
-    this.finish.get(sessionID)?.()
-  }
-
-  async assertNotBusy(sessionID: SessionID): Promise<boolean> {
-    return this.finish.has(sessionID)
-  }
-
-  resultFor(sessionID: SessionID): SessionExecutionResult | undefined {
-    return this.results.get(sessionID)
-  }
-
-  async terminate(): Promise<void> {}
-}
-
-class BlockingPool implements ExecutorWorkerPool {
-  readonly workers: BlockingWorker[]
-  readonly spawned: BlockingWorker[] = []
-  private nextSpawnId = 100
-
-  constructor(
-    k: number,
-    private readonly value: unknown,
-    private readonly onCancelIdle?: (sessionID: SessionID) => void,
-  ) {
-    this.workers = Array.from({ length: k }, (_, index) => new BlockingWorker(index + 1, this.value, onCancelIdle))
-  }
-
-  spawn(): ExecutorSessionWorker {
-    const worker = new BlockingWorker(this.nextSpawnId++, this.value, this.onCancelIdle)
-    this.spawned.push(worker)
-    return worker
-  }
-
-  async terminateAll(): Promise<void> {}
-
-  byID(id: number): ExecutorWorker | undefined {
-    return [...this.workers, ...this.spawned].find((worker) => worker.id === id)
-  }
-
-  resultFor(sessionID: SessionID): SessionExecutionResult | undefined {
-    for (const worker of [...this.workers, ...this.spawned]) {
-      const result = worker.resultFor(sessionID)
-      if (result !== undefined) return result
-    }
-    return undefined
-  }
-}
 
 /** A `LiveEventPublisher` spy that records every published event. */
 const recordingPublisher = () => {
@@ -494,9 +329,11 @@ describe("12 — integrated flag-on cancel (outcome + idle + session.cancelled)"
     // whose `onIdle` publishes the terminal idle through the hub-proxy. The pool
     // simulates that emit; the hub-side `SessionRunState.cancel` must not add a
     // second one.
-    const pool = new BlockingPool(1, withParts(sessionID), (id) =>
-      flagOnCalls.push({ sessionID: id, status: { type: "idle" } }),
-    )
+    const pool = createFakeExecutorPool(1, {
+      mode: "blocking",
+      value: withParts(sessionID),
+      onCancel: (id) => flagOnCalls.push({ sessionID: id, status: { type: "idle" } }),
+    })
     const { publisher, published } = recordingPublisher()
     const hub = createSessionHub({
       pool,
@@ -581,7 +418,7 @@ describe("12 — integrated flag-on cancel (outcome + idle + session.cancelled)"
 
   it.live("cancel with nothing running is a no-op-safe idle with a sensible outcome", () => {
     const sessionID = sid("ses_noop")
-    const pool = new BlockingPool(1, withParts(sessionID))
+    const pool = createFakeExecutorPool(1, { mode: "blocking", value: withParts(sessionID) })
     const { publisher, published } = recordingPublisher()
     const hub = createSessionHub({
       pool,
@@ -651,9 +488,11 @@ describe("12 — exactly one flag-on cancel idle per case (ON ≡ OFF)", () => {
     const onCalls: StatusCall[] = []
     const offCalls: StatusCall[] = []
     // The pool simulates table B publishing idle through the hub-proxy on cancel.
-    const pool = new BlockingPool(1, withParts(sessionID), (id) =>
-      onCalls.push({ sessionID: id, status: { type: "idle" } }),
-    )
+    const pool = createFakeExecutorPool(1, {
+      mode: "blocking",
+      value: withParts(sessionID),
+      onCancel: (id) => onCalls.push({ sessionID: id, status: { type: "idle" } }),
+    })
     const hub = createSessionHub({
       pool,
       cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort, graceMs: 5_000 }),
@@ -713,7 +552,7 @@ describe("12 — exactly one flag-on cancel idle per case (ON ≡ OFF)", () => {
     const onCalls: StatusCall[] = []
     const offCalls: StatusCall[] = []
     // One live worker holds `holderID`; `queuedID` is admitted with no worker.
-    const pool = new BlockingPool(1, withParts(holderID))
+    const pool = createFakeExecutorPool(1, { mode: "blocking", value: withParts(holderID) })
     const hub = createSessionHub({
       pool,
       cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort, graceMs: 5_000 }),
@@ -772,7 +611,7 @@ describe("12 — exactly one flag-on cancel idle per case (ON ≡ OFF)", () => {
     const sessionID = sid("ses_idle_one")
     const onCalls: StatusCall[] = []
     const offCalls: StatusCall[] = []
-    const pool = new BlockingPool(1, withParts(sessionID))
+    const pool = createFakeExecutorPool(1, { mode: "blocking", value: withParts(sessionID) })
     const hub = createSessionHub({
       pool,
       cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort, graceMs: 5_000 }),
@@ -832,8 +671,12 @@ describe("W4 — parent cancel settles every child to exactly one idle", () => {
     const { publisher, published } = recordingPublisher()
     // Only the parent runs on a worker; the child is a registered but never
     // dispatched subagent, so no worker can publish its idle.
-    const pool = new BlockingPool(1, withParts(parentID), (id) => {
-      if (id === parentID) calls.push({ sessionID: id, status: { type: "idle" } })
+    const pool = createFakeExecutorPool(1, {
+      mode: "blocking",
+      value: withParts(parentID),
+      onCancel: (id) => {
+        if (id === parentID) calls.push({ sessionID: id, status: { type: "idle" } })
+      },
     })
     const hub = createSessionHub({
       pool,
@@ -877,8 +720,12 @@ describe("W4 — parent cancel settles every child to exactly one idle", () => {
     const childID = sid("ses_w4_sweep_child")
     const calls: StatusCall[] = []
     // The parent runs; the child is only persisted (no hub registry link).
-    const pool = new BlockingPool(1, withParts(parentID), (id) => {
-      if (id === parentID) calls.push({ sessionID: id, status: { type: "idle" } })
+    const pool = createFakeExecutorPool(1, {
+      mode: "blocking",
+      value: withParts(parentID),
+      onCancel: (id) => {
+        if (id === parentID) calls.push({ sessionID: id, status: { type: "idle" } })
+      },
     })
     const hub = createSessionHub({
       pool,
@@ -945,7 +792,7 @@ const productionHubWithLog = (options: {
   createProductionSessionHub({
     init: sessionWorkerInit(),
     count: options.count,
-    poolFactory: () => new FakePool(options.count, undefined),
+    poolFactory: () => createFakeExecutorPool(options.count),
     log: options.log,
     ...(options.env === undefined ? {} : { env: options.env }),
     ...(options.entry === undefined ? {} : { entry: options.entry }),
@@ -1083,7 +930,7 @@ describe("W12 production wiring — the production hub layer emits the narrative
           const context = yield* Layer.build(
             // The production layer (the same one `productionSessionHubNode` wraps),
             // over an in-memory pool so no isolate is spawned at build.
-            productionSessionHubLayer({ count: 2, poolFactory: () => new FakePool(2, undefined) }).pipe(
+            productionSessionHubLayer({ count: 2, poolFactory: () => createFakeExecutorPool(2) }).pipe(
               Layer.provide(productionWiringServices),
             ),
           )

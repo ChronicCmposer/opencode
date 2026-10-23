@@ -11,7 +11,7 @@
 // this module owns only sizing.
 
 import os from "node:os"
-import { parsePositiveInt } from "@/util/parse"
+import { isPositiveInt, parsePositiveInt } from "@/util/parse"
 
 export const WORKER_COUNT_ENV = "OPENCODE_SESSION_WORKER_COUNT"
 export const OVERSUBSCRIPTION_ENV = "OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION"
@@ -86,7 +86,7 @@ export function resolveSessionWorkerIdleTimeoutMs(options: IdleTimeoutOptions = 
 function parseIdleTimeout(raw: string | undefined): number {
   if (raw === undefined || raw.trim() === "") return 0
   const parsed = Number(raw)
-  return Number.isInteger(parsed) && parsed >= 1 ? parsed : 0
+  return isPositiveInt(parsed) ? parsed : 0
 }
 
 export * as WorkerPoolModule from "./pool"

@@ -34,8 +34,16 @@ export interface BuildWorkerSnapshotOptions {
   readonly workerCount?: number
   /** Injected clock; defaults to `Date.now`. */
   readonly clock?: () => number
+  /**
+   * Explicit snapshot epoch. When supplied the build is pure/idempotent for that
+   * input (same options => same epoch), which lets a caller own the sequence.
+   * When absent the epoch is derived monotonically from the previous build and
+   * the clock, so a generation never regresses.
+   */
+  readonly epoch?: number
 }
 
+/** The last derived epoch, so the default sequence stays strictly monotonic. */
 let lastEpoch = 0
 
 /**
@@ -58,8 +66,9 @@ export const buildWorkerSnapshot = Effect.fn("WorkerSnapshot.build")(function* (
   const directories = yield* config.directories()
 
   const now = (options.clock ?? (() => Date.now()))()
-  const epoch = nextEpoch(lastEpoch, now)
-  lastEpoch = epoch
+  const epoch = options.epoch ?? nextEpoch(lastEpoch, now)
+  // Keep the derived sequence monotonic even after an explicit epoch is used.
+  lastEpoch = Math.max(lastEpoch, epoch)
 
   return {
     epoch,

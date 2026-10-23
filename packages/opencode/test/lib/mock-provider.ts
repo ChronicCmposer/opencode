@@ -6,6 +6,8 @@
 // `${baseUrl}/chat/completions`). The frames match what `worker-mock-llm.ts`
 // parses, and its `consumeChat` parser is reused in tests to prove it.
 
+import { chatChunk, sseData } from "./openai-frames"
+
 /** Token usage in OpenAI `prompt_tokens`/`completion_tokens` terms. */
 export interface MockProviderUsage {
   readonly input: number
@@ -66,22 +68,8 @@ interface ChatChunk {
   readonly usage?: MockProviderUsage
 }
 
-function toUsage(usage: MockProviderUsage): Record<string, number> {
-  return {
-    prompt_tokens: usage.input,
-    completion_tokens: usage.output,
-    total_tokens: usage.input + usage.output,
-  }
-}
-
 function frameOf(chunk: ChatChunk): string {
-  const payload = {
-    id: "chatcmpl-mock",
-    object: "chat.completion.chunk",
-    choices: [{ delta: chunk.delta, ...(chunk.finish === undefined ? {} : { finish_reason: chunk.finish }) }],
-    ...(chunk.usage === undefined ? {} : { usage: toUsage(chunk.usage) }),
-  }
-  return "data: " + JSON.stringify(payload) + "\n\n"
+  return sseData(chatChunk({ id: "chatcmpl-mock", delta: chunk.delta, finish: chunk.finish, usage: chunk.usage }))
 }
 
 /** Resolve a script's content deltas (chunks win over a single text). */

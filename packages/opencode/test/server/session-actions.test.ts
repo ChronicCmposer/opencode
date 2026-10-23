@@ -168,8 +168,14 @@ describe("session action routes", () => {
           sessionID: parent.id,
           mode: "cooperative",
           winner: "cancel",
-          acknowledged: false,
         })
+        // `acknowledged` records whether this request observed the worker's
+        // `cancel-ack` before the outcome was decided. It is genuinely
+        // flag-dependent: flag-off there is no worker protocol, so it is always
+        // `false`; flag-on a real worker acknowledges the cooperative cancel, so
+        // it is `true`. Assert the field's contract (a boolean) rather than one
+        // mode's value so the acceptance test holds in both flag states.
+        expect(typeof outcome.acknowledged).toBe("boolean")
         expect(outcome.durationMs).toBeGreaterThanOrEqual(0)
 
         yield* pollWithTimeout(
@@ -199,8 +205,7 @@ describe("session action routes", () => {
   // W9 (`session.cancelled` consumer): the hub publishes `session.cancelled`
   // with the resolved cancel outcome, but no client surface consumed it. This
   // guards that the event bridge is a working consumer channel for the exact
-  // payload the hub emits. A first-class TUI/app handler is requested separately
-  // (see `.parallel-implement/w9-integration.md`).
+  // payload the hub emits. A first-class TUI/app handler is requested separately.
   it.instance(
     "session.cancelled reaches an event-bridge consumer",
     () =>

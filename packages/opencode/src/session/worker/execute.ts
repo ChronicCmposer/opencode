@@ -16,7 +16,7 @@ import { Cause, Effect, Exit, Schema, Scope } from "effect"
 import type { Latch } from "effect"
 import { Runner } from "@/effect/runner"
 import type { SessionID } from "@/session/schema"
-import type { PromptInput } from "@/session/prompt"
+import type { PromptInput, ShellInput } from "@/session/prompt"
 import type { CancelFrame, CancelPort } from "./cancel"
 import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
 
@@ -36,6 +36,7 @@ export interface SessionExecutionResult {
 export type SessionWork = (
   sessionID: SessionID,
   prompt?: PromptInput,
+  shell?: ShellInput,
 ) => Effect.Effect<SessionExecutionResult>
 export type SessionWorkFactory = (kind: string) => SessionWork
 
@@ -142,7 +143,14 @@ export type SessionExecutorInbound =
       /** The sub-agent prompt to persist before looping; absent for a plain run. */
       readonly prompt?: PromptInput
     }
-  | { readonly type: "startShell"; readonly id: number; readonly sessionID: SessionID; readonly kind: string }
+  | {
+      readonly type: "startShell"
+      readonly id: number
+      readonly sessionID: SessionID
+      readonly kind: string
+      /** The shell command to run; carried so the worker resolves the real work. */
+      readonly shell?: ShellInput
+    }
   | { readonly type: "cancel"; readonly id: number; readonly sessionID: SessionID }
   | { readonly type: "assertNotBusy"; readonly id: number; readonly sessionID: SessionID }
   | { readonly type: "ping"; readonly id: number }
@@ -260,6 +268,7 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
     kind: string,
     mode: "run" | "startShell",
     prompt?: PromptInput,
+    shell?: ShellInput,
   ): Promise<SessionExecutorOutbound> => {
     let work: SessionWork
     try {
@@ -276,7 +285,7 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
     const effect =
       mode === "run"
         ? options.machine.ensureRunning(sessionID, work(sessionID, prompt))
-        : options.machine.startShell(sessionID, work(sessionID))
+        : options.machine.startShell(sessionID, work(sessionID, undefined, shell))
     return run(settle(id, effect))
   }
 
@@ -292,7 +301,7 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
       case "run":
         return runWork(message.id, message.sessionID, message.kind, "run", message.prompt)
       case "startShell":
-        return runWork(message.id, message.sessionID, message.kind, "startShell")
+        return runWork(message.id, message.sessionID, message.kind, "startShell", undefined, message.shell)
       default:
         return { type: "error", id: 0, message: "unknown executor request" }
     }
@@ -385,6 +394,8 @@ export interface ExecutorRun {
    * plain run byte-for-byte unchanged.
    */
   readonly prompt?: PromptInput
+  /** The shell command for a `"startShell"` run; absent for a plain run. */
+  readonly shell?: ShellInput
 }
 
 /** Structural mirror of dispatch's `SessionWorker` (keeps this module decoupled). */
@@ -425,6 +436,13 @@ export interface ExecutorWorker extends ExecutorSessionWorker {
    * remain valid; `createExecutorWorker` always provides it.
    */
   readonly cancelPort?: CancelPort
+  /**
+   * Per-session write barrier (R4#16): resolves once the run's durable egress
+   * write is acked. The dispatcher awaits it before releasing the worker to its
+   * next run, so a re-dispatch never overtakes the prior run's egress. Optional
+   * so minimal test fakes remain valid.
+   */
+  awaitEgress?(sessionID: SessionID): Promise<void>
 }
 
 export interface ExecutorCancelPortOptions {
@@ -496,9 +514,18 @@ export interface ExecutorWorkerOptions {
   readonly sessionID?: SessionID
   /** Why this isolate is spawning; defaults to `"initial"` (observability B1). */
   readonly reason?: WorkerSpawnReason
+  /**
+   * Per-session durable-egress barrier (R4#16). When supplied, `execute` does
+   * not resolve until the run's egress write is acked, so the dispatcher cannot
+   * hand the worker its next run early. Absent leaves the reply path unchanged.
+   */
+  readonly egressBarrier?: (sessionID: SessionID) => Promise<void> | undefined
   /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
   readonly log?: WorkerLogger
 }
+
+/** Cap on retained per-session run results; oldest distinct session evicted first. */
+export const RESULTS_CAP = 256
 
 export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWorker {
   const { transport } = options
@@ -508,6 +535,18 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
   const runIdleTimeoutMs = options.runIdleTimeoutMs ?? 0
   const results = new Map<SessionID, SessionExecutionResult>()
   let nextRequestId = 1
+
+  // Re-dispatch for a session evicts its prior result, so the Map only ever
+  // holds the newest per session; the insertion order then makes the oldest
+  // distinct session the victim once the cap is exceeded. This bounds a
+  // long-lived pool's memory without an unbounded key set.
+  const recordResult = (sessionID: SessionID, result: SessionExecutionResult): void => {
+    results.delete(sessionID)
+    results.set(sessionID, result)
+    if (results.size <= RESULTS_CAP) return
+    const oldest = results.keys().next().value
+    if (oldest !== undefined) results.delete(oldest)
+  }
 
   log(workerLogMessage("worker spawning"), {
     workerID: options.id,
@@ -593,6 +632,7 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
       sessionID: run.sessionID,
       kind: workKind,
       ...(run.prompt === undefined || type !== "run" ? {} : { prompt: run.prompt }),
+      ...(run.shell === undefined || type !== "startShell" ? {} : { shell: run.shell }),
     })
     const reply = transport.waitFor(
       (message) => isAddressed(message, id) && (message.type === "done" || message.type === "error"),
@@ -601,7 +641,10 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     const message = runIdleTimeoutMs > 0 ? await awaitReplyWithLiveness(reply, runIdleTimeoutMs) : await reply
     if (message.type === "error") throw new Error(message.message)
     if (message.type !== "done") throw new Error(`unexpected executor reply: ${message.type}`)
-    results.set(run.sessionID, message.result)
+    // R4#16: do not resolve the run until its durable egress write is acked, so
+    // the dispatcher cannot hand this worker the next run ahead of that write.
+    await options.egressBarrier?.(run.sessionID)
+    recordResult(run.sessionID, message.result)
   }
 
   const cancel = async (sessionID: SessionID): Promise<void> => {
@@ -632,6 +675,9 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     cancel,
     cancelPort,
     assertNotBusy,
+    ...(options.egressBarrier === undefined
+      ? {}
+      : { awaitEgress: (sessionID: SessionID) => Promise.resolve(options.egressBarrier?.(sessionID)) }),
     resultFor: (sessionID) => results.get(sessionID),
     terminate: async () => {
       // Evict recorded results with the isolate so the map cannot grow without
@@ -686,6 +732,12 @@ export function createExecutorWorkerPool(options: ExecutorWorkerPoolOptions): Ex
         cancel: (sessionID) => worker.cancel(sessionID),
         assertNotBusy: (sessionID) => worker.assertNotBusy(sessionID),
         resultFor: (sessionID) => worker.resultFor(sessionID),
+        // A spawned headroom worker must expose the same control surface as a
+        // foreground one: without the cancel port, `portFor` cannot notify it.
+        ...(worker.cancelPort === undefined ? {} : { cancelPort: worker.cancelPort }),
+        ...(worker.awaitEgress === undefined
+          ? {}
+          : { awaitEgress: (sessionID: SessionID) => worker.awaitEgress!(sessionID) }),
         terminate: async () => {
           // Drop the terminated worker from the headroom set so the pool's
           // bookkeeping tracks live workers only.
@@ -720,6 +772,7 @@ export interface SessionScheduler {
     readonly sessionID: SessionID
     readonly depth?: number
     readonly mode?: SessionRunMode
+    readonly shell?: ShellInput
   }): Promise<void>
   cancel(sessionID: SessionID): Promise<void>
   terminateAll(): Promise<void>
@@ -729,8 +782,11 @@ export interface SessionScheduler {
 export interface SessionDispatch {
   /** Dispatch `sessionID` at `depth` (default 0, or `depthOf(sessionID)`) and resolve its result. */
   ensureRunning(sessionID: SessionID, depth?: number): Promise<SessionExecutionResult>
-  /** Dispatch `sessionID` on the shell-start path at `depth` and resolve its result. */
-  startShell(sessionID: SessionID, depth?: number): Promise<SessionExecutionResult>
+  /**
+   * Dispatch `sessionID` on the shell-start path, carrying `shell` to the worker
+   * so it resolves the real shell work, at `depth` (default 0).
+   */
+  startShell(sessionID: SessionID, shell?: ShellInput, depth?: number): Promise<SessionExecutionResult>
   cancel(sessionID: SessionID): Promise<void>
   assertNotBusy(sessionID: SessionID): Promise<boolean>
   cancelAll(): Promise<void>
@@ -767,11 +823,17 @@ export function createSessionDispatch(options: SessionDispatchOptions): SessionD
   }
 
   /** Admit `sessionID` at its resolved depth and frame mode, then await admission. */
-  const admit = (sessionID: SessionID, depth: number | undefined, mode: SessionRunMode): Promise<void> =>
+  const admit = (
+    sessionID: SessionID,
+    depth: number | undefined,
+    mode: SessionRunMode,
+    shell?: ShellInput,
+  ): Promise<void> =>
     options.dispatcher.dispatch({
       sessionID,
       depth: depth ?? options.depthOf?.(sessionID) ?? 0,
       mode,
+      ...(shell === undefined ? {} : { shell }),
     })
 
   const ensureRunning = async (sessionID: SessionID, depth?: number): Promise<SessionExecutionResult> => {
@@ -784,9 +846,13 @@ export function createSessionDispatch(options: SessionDispatchOptions): SessionD
     return worker === undefined ? false : worker.assertNotBusy(sessionID)
   }
 
-  const startShell = async (sessionID: SessionID, depth?: number): Promise<SessionExecutionResult> => {
+  const startShell = async (
+    sessionID: SessionID,
+    shell?: ShellInput,
+    depth?: number,
+  ): Promise<SessionExecutionResult> => {
     if (await assertNotBusy(sessionID)) throw new SessionBusyError({ sessionID })
-    await admit(sessionID, depth, "startShell")
+    await admit(sessionID, depth, "startShell", shell)
     return requireResult(sessionID)
   }
 

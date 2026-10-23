@@ -803,12 +803,11 @@ describe("session.llm terminal event contract", () => {
 })
 
 // Integration coverage for the stream-boundary guard. The full `it.instance`
-// Provider harness cannot resolve models in this environment (see artifact
-// `.parallel-implement/w8-native-guard.md`: untouched processor-effect.test.ts is
-// 0/17 and provider.test.ts is 65 failing). To keep real `LLM.Service.stream`
-// coverage anyway, this block replaces Provider with a mock and LLMClient with a
-// scripted source: the guard still runs through the real service wiring, the real
-// request prep, and the real native adapter.
+// Provider harness cannot resolve models in this environment (untouched
+// processor-effect.test.ts is 0/17 and provider.test.ts is 65 failing). To keep
+// real `LLM.Service.stream` coverage anyway, this block replaces Provider with a
+// mock and LLMClient with a scripted source: the guard still runs through the real
+// service wiring, the real request prep, and the real native adapter.
 describe("session.llm.stream guard wiring", () => {
   const guardModel: Provider.Model = {
     id: ModelV2.ID.make("gpt-5-mini"),

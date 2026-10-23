@@ -129,9 +129,9 @@ export class SubagentDispatchProxyService extends Context.Service<
 
 /**
  * A dispatch rejection is a cancellation (not a failure) when it carries the
- * exact `SessionCancelledError` tag. `WorkerCrashedError` re-parents its
- * prototype to `SessionCancelledError`, so an `instanceof` test would misread a
- * crash as a cancel; the tag check keeps the two distinct.
+ * exact `SessionCancelledError` tag. `WorkerCrashedError` is a distinct tagged
+ * class, so an `instanceof`-style check could misread a crash as a cancel; the
+ * exact tag check keeps the two distinct.
  */
 function isSessionCancellation(error: unknown): boolean {
   return (

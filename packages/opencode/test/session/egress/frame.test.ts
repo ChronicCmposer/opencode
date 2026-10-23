@@ -6,7 +6,14 @@
 // translation. An unknown envelope version or a malformed body fails loud.
 
 import { describe, expect, test } from "bun:test"
-import { MalformedFrameError, decodeFrame, decodeFrames, encodeFrame, type EgressFrame } from "@/session/egress/frame"
+import {
+  MAX_FRAME_BYTES,
+  MalformedFrameError,
+  decodeFrame,
+  decodeFrames,
+  encodeFrame,
+  type EgressFrame,
+} from "@/session/egress/frame"
 import {
   ProtocolError,
   UnsupportedFrameVersionError,
@@ -118,6 +125,15 @@ describe("egress frame codec (events envelope)", () => {
   test("decodeFrame rejects a truncated frame", () => {
     const bytes = encodeFrame(endFrame())
     expect(() => decodeFrame(bytes.subarray(0, bytes.byteLength - 1))).toThrow(MalformedFrameError)
+  })
+
+  test("fails loud on a body length past MAX_FRAME_BYTES instead of pinning rest", () => {
+    // A corrupt `u32` length must not be treated as an incomplete frame; that
+    // would retain the buffer as `rest` forever.
+    const bytes = new Uint8Array(4)
+    new DataView(bytes.buffer).setUint32(0, MAX_FRAME_BYTES + 1, false)
+    expect(() => decodeFrames(bytes)).toThrow(MalformedFrameError)
+    expect(() => decodeFrame(bytes)).toThrow(MalformedFrameError)
   })
 })
 

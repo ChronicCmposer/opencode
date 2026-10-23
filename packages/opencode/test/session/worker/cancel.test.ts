@@ -22,7 +22,6 @@ import {
 import {
   createDispatcher,
   SessionCancelledError,
-  SessionCrashedError,
   WorkerCrashedError,
   type CancellationConfig,
   type SessionRun,
@@ -403,10 +402,11 @@ describe("11.4 graceful cancel reuses the worker; terminate path replaces it", (
 })
 
 describe("11.7 crash taxonomy", () => {
-  test("WorkerCrashedError is a SessionCrashedError (session failed)", () => {
+  test("WorkerCrashedError is the single crash identity (tag-matched, no reparent)", () => {
     const crash = new WorkerCrashedError({ message: "worker 1 crashed", workerID: 1 })
     expect(crash).toBeInstanceOf(WorkerCrashedError)
-    expect(crash).toBeInstanceOf(SessionCrashedError)
+    expect(crash._tag).toBe("WorkerCrashedError")
+    expect(Object.getPrototypeOf(crash)).toBe(WorkerCrashedError.prototype)
   })
 })
 
@@ -492,7 +492,7 @@ class CompletingPool implements WorkerPool {
 }
 
 describe("11.9 completion wins the cancel race (Q11)", () => {
-  test("a run that completes during the grace returns completed, unacknowledged", async () => {
+  test("a run that completes during the grace returns completed and the caller resolves", async () => {
     const pool = new CompletingPool(1)
     const cancelled: string[] = []
     const dispatcher = createDispatcher({
@@ -511,7 +511,9 @@ describe("11.9 completion wins the cancel race (Q11)", () => {
 
     const outcome = await dispatcher.cancelWithGrace(sid("ses_1"))
     expect(outcome).toMatchObject({ mode: "completed", winner: "completion", acknowledged: false })
-    expect(await run).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
+    // A2: the caller is reconciled with the reported winner — completion wins, so
+    // the dispatch promise RESOLVES (capture reports `{ ok: true }`).
+    expect(await run).toEqual({ ok: true, value: undefined })
     // The run completed on its own: the worker was neither terminated nor replaced.
     expect(pool.workers[0].alive).toBe(true)
     expect(pool.spawned).toHaveLength(0)
@@ -535,6 +537,8 @@ describe("12 D1 cancel requested logging", () => {
 
     const never = new Promise<void>(() => {})
     const first = controller.cancel(sid("ses_1"), { complete: never })
+    // `dispose` settles the in-flight request loud, so handle the rejection.
+    first.catch(() => undefined)
 
     expect(entries).toEqual([
       {
@@ -545,10 +549,45 @@ describe("12 D1 cancel requested logging", () => {
 
     // An idempotent join is not a new request: no second line.
     const second = controller.cancel(sid("ses_1"), { complete: never })
+    second.catch(() => undefined)
     expect(entries).toHaveLength(1)
 
     controller.dispose()
-    void first
-    void second
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A11 — dispose settles in-flight requests; cancel returns a rejected promise.
+// ---------------------------------------------------------------------------
+
+describe("A11 dispose settles in-flight cancels", () => {
+  test("dispose rejects an in-flight cancel instead of leaving it pending", async () => {
+    const pair = createPortPair()
+    const scheduler = createRecordingScheduler<CancelScheduler>()
+    const controller = createCancelController({
+      port: pair.hub,
+      terminate: () => {},
+      graceMs: 500,
+      schedule: scheduler.schedule,
+    })
+
+    const never = new Promise<void>(() => {})
+    const first = controller.cancel(sid("ses_1"), { complete: never })
+    controller.dispose()
+
+    await expect(first).rejects.toThrow(/disposed/)
+    expect(controller.pending).toBe(0)
+  })
+
+  test("cancel after dispose returns a rejected promise, not a synchronous throw", async () => {
+    const pair = createPortPair()
+    const controller = createCancelController({ port: pair.hub, terminate: () => {} })
+    controller.dispose()
+
+    let outcome: Promise<unknown> | undefined
+    expect(() => {
+      outcome = controller.cancel(sid("ses_1"))
+    }).not.toThrow()
+    await expect(outcome!).rejects.toThrow(/disposed/)
   })
 })

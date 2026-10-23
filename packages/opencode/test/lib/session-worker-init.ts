@@ -17,11 +17,9 @@ import type { Role } from "@/session/worker/node-table"
 import { workerSnapshot } from "./snapshot"
 
 /**
- * The mock-provider model bootstrap a worker consumes. It carries the full
- * serialized descriptor (identity, transport, capabilities, limit); the
- * legacy runtime mapping for the old `{baseUrl, apiKey, model}` bootstrap
- * derived `providerID`/`apiId` from the model name, so the same identity is
- * pinned here to keep boot behaviour unchanged.
+ * The mock-provider model bootstrap a worker consumes: the full serialized
+ * descriptor (identity, transport, capabilities, limit) the entry reads. The
+ * `providerID`/`apiId` mirror `modelID` so the pinned identity stays stable.
  */
 export const TEST_WORKER_MODEL: SessionWorkerModel = {
   providerID: "test-model",
@@ -37,12 +35,8 @@ export const TEST_WORKER_MODEL: SessionWorkerModel = {
 export interface SessionWorkerInitOverrides {
   readonly snapshot?: WorkerSnapshot
   readonly env?: WorkerEnv
-  /**
-   * Descriptor fields merged over {@link TEST_WORKER_MODEL}. The legacy `model`
-   * name is still accepted for backward compatibility and normalized to
-   * `modelID`; an explicit `modelID` always wins.
-   */
-  readonly model?: Partial<SessionWorkerModel> & { readonly model?: string }
+  /** Descriptor fields merged over {@link TEST_WORKER_MODEL}. */
+  readonly model?: Partial<SessionWorkerModel>
   /** Process role the worker adopts; defaults to `"session"`. */
   readonly role?: Role
 }
@@ -53,19 +47,11 @@ export interface SessionWorkerInitOverrides {
  * supplied fields merged on top.
  */
 export function sessionWorkerInit(overrides: SessionWorkerInitOverrides = {}): SessionWorkerInit {
-  const { model: legacyModelID, ...descriptor } = overrides.model ?? {}
   return {
     snapshot: overrides.snapshot ?? workerSnapshot(),
     env: overrides.env ?? { values: {} },
     role: overrides.role ?? "session",
-    // Normalize the legacy `model` name at this boundary so the emitted payload
-    // always carries the entry's `modelID` (which the entry's `modelConfig` reads
-    // as `modelID ?? model`), keeping a legacy override effective rather than inert.
-    model: {
-      ...TEST_WORKER_MODEL,
-      ...(legacyModelID === undefined ? {} : { modelID: legacyModelID }),
-      ...descriptor,
-    },
+    model: { ...TEST_WORKER_MODEL, ...overrides.model },
   }
 }
 

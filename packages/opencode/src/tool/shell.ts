@@ -6,6 +6,7 @@ import path from "path"
 import { containsPath, type InstanceContext } from "../project/instance-context"
 import { InstanceState } from "@/effect/instance-state"
 import { lazy } from "@/util/lazy"
+import { isPositiveInt } from "@/util/parse"
 import { Language, type Node } from "web-tree-sitter"
 
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -647,8 +648,8 @@ export const ShellTool = Tool.define(
               const cwd = params.workdir
                 ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
                 : instanceCtx.directory
-              if (params.timeout !== undefined && params.timeout < 0) {
-                throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)
+              if (params.timeout !== undefined && !isPositiveInt(params.timeout)) {
+                throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive integer.`)
               }
               const timeout = params.timeout ?? defaultTimeoutMs
               const ps = Shell.ps(shell)

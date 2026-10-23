@@ -1,172 +1,82 @@
-import { beforeEach, describe, expect, test } from "bun:test"
-import { Effect } from "effect"
-import { RuntimeFlags } from "../src/effect/runtime-flags"
+// Session-worker rollout flag: ON/OFF behavior and the parser↔Config lockstep.
+//
+// The F5 refactor removed the logging scaffolding that used to live in
+// `src/effect/runtime-flags.ts` (`describeSessionWorkersFlag`,
+// `sessionWorkersFlagFields`, `logSessionWorkersFlag*`, the once-guard). What
+// remains is:
+//   * `experimentalSessionWorkersFromEnv` — the canonical parser, and
+//   * the `RuntimeFlags.experimentalSessionWorkers` Config field, which
+//     `src/project/bootstrap.ts` emits exactly once via
+//     `Effect.logInfo("session workers flag", { experimentalSessionWorkers })`.
+//
+// This file pins the parser's ON/OFF behavior and proves the Config field never
+// disagrees with it, so the value bootstrap logs can't diverge from the graph
+// decision. The old source-attribution / field-shape / once-guard assertions are
+// gone with the scaffolding they targeted.
 
-type Env = Record<string, string | undefined>
-type Source = "dedicated" | "umbrella" | "default"
-type LogCall = { message: string; fields: RuntimeFlags.SessionWorkersFlagFields }
+import { describe, expect, test } from "bun:test"
+import { ConfigProvider, Effect, Layer } from "effect"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+import { RuntimeFlags } from "../src/effect/runtime-flags"
+import { it } from "./lib/effect"
 
 const SW = "OPENCODE_EXPERIMENTAL_SESSION_WORKERS"
 const EXP = "OPENCODE_EXPERIMENTAL"
 
-const recordingLogInfo = () => {
-  const calls: LogCall[] = []
-  const logInfo = (message: string, fields: RuntimeFlags.SessionWorkersFlagFields) => {
-    calls.push({ message, fields })
-    return Effect.void
-  }
-  return { calls, logInfo }
+type Env = Record<string, string | undefined>
+type FlagCase = {
+  readonly name: string
+  readonly env: Env
+  readonly enabled: boolean
+  // An invalid `OPENCODE_EXPERIMENTAL` makes the whole RuntimeFlags service
+  // unbuildable — unrelated strict booleans (`experimental`) die on it — so this
+  // case can only exercise the parser, not the Config path.
+  readonly parserOnly?: boolean
 }
 
-describe("describeSessionWorkersFlag", () => {
-  const cases: Array<{ name: string; env: Env; enabled: boolean; source: Source }> = [
-    { name: "nothing set", env: {}, enabled: false, source: "default" },
-    { name: "dedicated true", env: { [SW]: "true" }, enabled: true, source: "dedicated" },
-    { name: "dedicated yes", env: { [SW]: "yes" }, enabled: true, source: "dedicated" },
-    { name: "dedicated on", env: { [SW]: "on" }, enabled: true, source: "dedicated" },
-    { name: "dedicated 1", env: { [SW]: "1" }, enabled: true, source: "dedicated" },
-    { name: "dedicated y", env: { [SW]: "y" }, enabled: true, source: "dedicated" },
-    { name: "dedicated false", env: { [SW]: "false" }, enabled: false, source: "dedicated" },
-    { name: "dedicated no", env: { [SW]: "no" }, enabled: false, source: "dedicated" },
-    { name: "dedicated off", env: { [SW]: "off" }, enabled: false, source: "dedicated" },
-    { name: "dedicated 0", env: { [SW]: "0" }, enabled: false, source: "dedicated" },
-    { name: "dedicated n", env: { [SW]: "n" }, enabled: false, source: "dedicated" },
-    { name: "dedicated case-sensitive TRUE", env: { [SW]: "TRUE" }, enabled: false, source: "default" },
-    { name: "dedicated nonsense", env: { [SW]: "nonsense" }, enabled: false, source: "default" },
-    { name: "umbrella true", env: { [EXP]: "true" }, enabled: true, source: "umbrella" },
-    { name: "umbrella false", env: { [EXP]: "false" }, enabled: false, source: "umbrella" },
-    { name: "umbrella nonsense", env: { [EXP]: "nonsense" }, enabled: false, source: "default" },
-    { name: "dedicated true wins over umbrella false", env: { [SW]: "true", [EXP]: "false" }, enabled: true, source: "dedicated" },
-    { name: "dedicated false wins over umbrella true", env: { [SW]: "false", [EXP]: "true" }, enabled: false, source: "dedicated" },
-    { name: "dedicated invalid falls back to umbrella true", env: { [SW]: "nonsense", [EXP]: "true" }, enabled: true, source: "umbrella" },
-    { name: "undefined values treated as absent", env: { [SW]: undefined, [EXP]: undefined }, enabled: false, source: "default" },
-  ]
+const cases: readonly FlagCase[] = [
+  { name: "nothing set", env: {}, enabled: false },
+  { name: "dedicated true", env: { [SW]: "true" }, enabled: true },
+  { name: "dedicated yes", env: { [SW]: "yes" }, enabled: true },
+  { name: "dedicated on", env: { [SW]: "on" }, enabled: true },
+  { name: "dedicated 1", env: { [SW]: "1" }, enabled: true },
+  { name: "dedicated y", env: { [SW]: "y" }, enabled: true },
+  { name: "dedicated false", env: { [SW]: "false" }, enabled: false },
+  { name: "dedicated no", env: { [SW]: "no" }, enabled: false },
+  { name: "dedicated off", env: { [SW]: "off" }, enabled: false },
+  { name: "dedicated 0", env: { [SW]: "0" }, enabled: false },
+  { name: "dedicated n", env: { [SW]: "n" }, enabled: false },
+  { name: "dedicated case-sensitive TRUE is not boolean", env: { [SW]: "TRUE" }, enabled: false },
+  { name: "dedicated nonsense falls back to the default", env: { [SW]: "nonsense" }, enabled: false },
+  { name: "umbrella true", env: { [EXP]: "true" }, enabled: true },
+  { name: "umbrella false", env: { [EXP]: "false" }, enabled: false },
+  { name: "umbrella nonsense is treated as absent", env: { [EXP]: "nonsense" }, enabled: false, parserOnly: true },
+  { name: "dedicated true wins over umbrella false", env: { [SW]: "true", [EXP]: "false" }, enabled: true },
+  { name: "dedicated false wins over umbrella true", env: { [SW]: "false", [EXP]: "true" }, enabled: false },
+  { name: "dedicated nonsense falls back to umbrella true", env: { [SW]: "nonsense", [EXP]: "true" }, enabled: true },
+  { name: "undefined values are treated as absent", env: { [SW]: undefined, [EXP]: undefined }, enabled: false },
+]
 
+const fromConfig = (input: Env) =>
+  AppNodeBuilder.build(RuntimeFlags.node).pipe(Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown(input))))
+
+const readFlag = RuntimeFlags.Service.useSync((flags) => flags.experimentalSessionWorkers)
+
+describe("session-worker flag ON/OFF (parser and Config field in lockstep)", () => {
   for (const c of cases) {
-    test(`${c.name} -> ${c.enabled}/${c.source}`, () => {
-      const described = RuntimeFlags.describeSessionWorkersFlag(c.env)
-      expect(described).toEqual({ enabled: c.enabled, source: c.source })
+    test(`${c.name} -> parser ${c.enabled ? "ON" : "OFF"}`, () => {
+      expect(RuntimeFlags.experimentalSessionWorkersFromEnv(c.env)).toBe(c.enabled)
     })
 
-    test(`${c.name} stays in lockstep with the canonical parser`, () => {
-      const described = RuntimeFlags.describeSessionWorkersFlag(c.env)
-      expect(described.enabled).toBe(RuntimeFlags.experimentalSessionWorkersFromEnv(c.env))
-    })
+    if (c.parserOnly) continue
+
+    it.effect(`${c.name} -> Config field ${c.enabled ? "ON" : "OFF"}`, () =>
+      Effect.gen(function* () {
+        const resolved = yield* readFlag.pipe(Effect.provide(fromConfig(c.env)))
+
+        expect(resolved).toBe(c.enabled)
+        expect(resolved).toBe(RuntimeFlags.experimentalSessionWorkersFromEnv(c.env))
+      }),
+    )
   }
-})
-
-describe("sessionWorkersFlagFields", () => {
-  test("preserves raw values verbatim and marks unset with <unset>", () => {
-    expect(RuntimeFlags.sessionWorkersFlagFields({ [SW]: "yes" })).toEqual({
-      [SW]: "yes",
-      [EXP]: "<unset>",
-      experimentalSessionWorkers: true,
-      source: "dedicated",
-    })
-  })
-
-  test("reports umbrella source when only the umbrella is set", () => {
-    expect(RuntimeFlags.sessionWorkersFlagFields({ [EXP]: "true" })).toEqual({
-      [SW]: "<unset>",
-      [EXP]: "true",
-      experimentalSessionWorkers: true,
-      source: "umbrella",
-    })
-  })
-
-  test("reports default source when nothing is set", () => {
-    expect(RuntimeFlags.sessionWorkersFlagFields({})).toEqual({
-      [SW]: "<unset>",
-      [EXP]: "<unset>",
-      experimentalSessionWorkers: false,
-      source: "default",
-    })
-  })
-
-  test("omitting runtimeValue leaves the two runtime fields absent", () => {
-    const fields = RuntimeFlags.sessionWorkersFlagFields({ [SW]: "true" })
-
-    expect("runtimeExperimentalSessionWorkers" in fields).toBe(false)
-    expect("diverges" in fields).toBe(false)
-    expect(fields).toEqual({
-      [SW]: "true",
-      [EXP]: "<unset>",
-      experimentalSessionWorkers: true,
-      source: "dedicated",
-    })
-  })
-})
-
-describe("sessionWorkersFlagFields runtime gate", () => {
-  test("agree (both true) reports runtime true and diverges false", () => {
-    const fields = RuntimeFlags.sessionWorkersFlagFields({ [SW]: "true" }, true)
-
-    expect(fields.experimentalSessionWorkers).toBe(true)
-    expect(fields.runtimeExperimentalSessionWorkers).toBe(true)
-    expect(fields.diverges).toBe(false)
-  })
-
-  test("agree (both false) reports runtime false and diverges false", () => {
-    const fields = RuntimeFlags.sessionWorkersFlagFields({ [SW]: "false" }, false)
-
-    expect(fields.experimentalSessionWorkers).toBe(false)
-    expect(fields.runtimeExperimentalSessionWorkers).toBe(false)
-    expect(fields.diverges).toBe(false)
-  })
-
-  test("diverge (env false, runtime true) reports diverges true", () => {
-    const fields = RuntimeFlags.sessionWorkersFlagFields({ [SW]: "false" }, true)
-
-    expect(fields.experimentalSessionWorkers).toBe(false)
-    expect(fields.runtimeExperimentalSessionWorkers).toBe(true)
-    expect(fields.diverges).toBe(true)
-  })
-})
-
-describe("logSessionWorkersFlag", () => {
-  test("emits exactly the 'session workers flag' message with the derived fields", () => {
-    const { calls, logInfo } = recordingLogInfo()
-
-    Effect.runSync(RuntimeFlags.logSessionWorkersFlag(logInfo, { [SW]: "yes" }))
-
-    expect(calls).toHaveLength(1)
-    expect(calls[0].message).toBe("session workers flag")
-    expect(calls[0].fields).toEqual(RuntimeFlags.sessionWorkersFlagFields({ [SW]: "yes" }))
-  })
-
-  test("threads the runtime gate value into the emitted fields", () => {
-    const { calls, logInfo } = recordingLogInfo()
-
-    Effect.runSync(RuntimeFlags.logSessionWorkersFlag(logInfo, { [SW]: "false" }, true))
-
-    expect(calls).toHaveLength(1)
-    expect(calls[0].fields.runtimeExperimentalSessionWorkers).toBe(true)
-    expect(calls[0].fields.diverges).toBe(true)
-  })
-})
-
-describe("logSessionWorkersFlagOnce", () => {
-  beforeEach(() => {
-    RuntimeFlags.resetSessionWorkersFlagLoggedForTest()
-  })
-
-  test("emits the line exactly once across repeated invocations", () => {
-    const { calls, logInfo } = recordingLogInfo()
-
-    Effect.runSync(RuntimeFlags.logSessionWorkersFlagOnce(logInfo, {}))
-    Effect.runSync(RuntimeFlags.logSessionWorkersFlagOnce(logInfo, {}))
-
-    expect(calls).toHaveLength(1)
-    expect(calls[0].message).toBe("session workers flag")
-  })
-
-  test("threads the runtime gate value through the once-guard", () => {
-    const { calls, logInfo } = recordingLogInfo()
-
-    Effect.runSync(RuntimeFlags.logSessionWorkersFlagOnce(logInfo, {}, true))
-
-    expect(calls).toHaveLength(1)
-    expect(calls[0].fields.runtimeExperimentalSessionWorkers).toBe(true)
-    expect(calls[0].fields.diverges).toBe(true)
-  })
 })

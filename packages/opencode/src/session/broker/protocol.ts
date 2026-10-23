@@ -15,6 +15,8 @@
 //
 // It has no side effects and may be imported by both isolates.
 
+import { createFramePrimitives } from "@/session/worker/frame"
+
 /** Default `mcp_timeout` in ms, mirroring `src/mcp/index.ts` `DEFAULT_TIMEOUT`. */
 export const DEFAULT_MCP_TIMEOUT_MS = 30_000
 
@@ -220,22 +222,57 @@ export interface PingResult {
 
 const SERVER_KINDS: ReadonlyArray<ServerKind> = ["mcp", "lsp"]
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null
-}
+/**
+ * The shared frame primitives bound to the broker's own error type: one
+ * implementation of the "plain object / required field" parsers lives in
+ * `session/worker/frame.ts`, so the broker, writer and events protocols cannot
+ * drift. Binding `createFramePrimitives` keeps `BrokerProtocolError` as the loud
+ * failure channel this module's callers already expect.
+ */
+const frame = createFramePrimitives((message) => {
+  throw new BrokerProtocolError(message)
+})
 
+/** True for a plain object; `null` and arrays are excluded (shared parser). */
+const { isRecord } = frame
+
+/**
+ * Parse one required string field, delegating the type check and loud message to
+ * the shared parser. The broker's parsers take the field VALUE plus its path, so
+ * the value is presented to the shared record-based parser under its own path
+ * (`{ [field]: value }`): the lookup and the message then both use the path.
+ *
+ * On top of the shared check the broker rejects an empty string: every broker
+ * string field (`kind`, `requestId`, `directory`, `server`, `method`, `name`,
+ * `instanceId`) is meaningless when blank.
+ */
 function requireString(value: unknown, field: string): string {
-  if (typeof value !== "string" || value.length === 0) {
-    throw new BrokerProtocolError(`${field} must be a non-empty string`)
-  }
-  return value
+  const parsed = frame.requireString({ [field]: value }, field)
+  if (parsed.length === 0) throw new BrokerProtocolError(`${field} must be a non-empty string`)
+  return parsed
 }
 
+/** Parse one required integer field through the shared parser (value + path). */
 function requireInteger(value: unknown, field: string): number {
-  if (typeof value !== "number" || !Number.isInteger(value)) {
-    throw new BrokerProtocolError(`${field} must be an integer`)
+  return frame.requireInteger({ [field]: value }, field)
+}
+
+/** Cap for the broker's queued-cancellation registry. */
+export const DEFAULT_CANCELLED_CAP = 1024
+
+/**
+ * Insert `id` into `set`, evicting the oldest entry first once `cap` is reached.
+ * A cancellation that never matches a dispatched call must not grow the registry
+ * without bound (plan A14). `Set` iterates in insertion order, so "oldest" is the
+ * first value.
+ */
+export function rememberBounded<T>(set: Set<T>, id: T, cap: number = DEFAULT_CANCELLED_CAP): void {
+  if (set.has(id)) return
+  if (set.size >= cap) {
+    const oldest = set.values().next().value
+    if (oldest !== undefined) set.delete(oldest)
   }
-  return value
+  set.add(id)
 }
 
 function requirePositiveInteger(value: unknown, field: string): number {
@@ -323,7 +360,15 @@ export function parseBrokerRequest(value: unknown): BrokerRequest {
       const server = requireString(value.server, "server")
       const method = requireString(value.method, "method")
       const timeoutMs = parseOptionalTimeout(value.timeoutMs, "timeoutMs")
-      return { kind, requestId, directory, server, method, ...(value.params === undefined ? {} : { params: value.params }), ...(timeoutMs === undefined ? {} : { timeoutMs }) }
+      return {
+        kind,
+        requestId,
+        directory,
+        server,
+        method,
+        ...(value.params === undefined ? {} : { params: value.params }),
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      }
     }
     case "cancel":
       return { kind, requestId, targetId: requireString(value.targetId, "targetId") }
@@ -337,16 +382,6 @@ export function parseBrokerRequest(value: unknown): BrokerRequest {
       return { kind, requestId }
     default:
       throw new BrokerProtocolError(`unknown kind "${kind}"`)
-  }
-}
-
-/** Total, non-throwing membership predicate; narrows to `BrokerRequest`. */
-export function isBrokerRequest(value: unknown): value is BrokerRequest {
-  try {
-    parseBrokerRequest(value)
-    return true
-  } catch {
-    return false
   }
 }
 

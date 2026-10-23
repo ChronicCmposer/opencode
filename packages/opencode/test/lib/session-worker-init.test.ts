@@ -35,13 +35,6 @@ describe("sessionWorkerInit builder", () => {
     })
   })
 
-  test("a legacy `model` override is normalized to `modelID`", () => {
-    const init = sessionWorkerInit({ model: { model: "other-model" } })
-
-    expect(init.model).toEqual({ ...TEST_WORKER_MODEL, modelID: "other-model" })
-    expect(assertStructuredCloneable(init)).toEqual(init)
-  })
-
   test("a built init survives a structuredClone round-trip unchanged", () => {
     const init = sessionWorkerInit({ env: { values: { A: "1" } } })
 

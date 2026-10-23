@@ -32,7 +32,7 @@ import {
   type CallRequest,
   type ServerSpec,
 } from "./protocol"
-import { BrokerFailure, parseBrokerRequest, resolveRequestTimeout } from "./protocol"
+import { BrokerFailure, parseBrokerRequest, rememberBounded, resolveRequestTimeout } from "./protocol"
 import { mergeEnv } from "./env"
 import { setThreadName } from "@/util/thread-name"
 
@@ -157,6 +157,8 @@ interface ChildHandle {
   /** Resolves with the exit code once this isolate has reaped the child. */
   readonly exited: Promise<number>
   nextId: number
+  /** Serializes stdin writes (and their flush) so frames never interleave. */
+  stdinChain: Promise<void>
   /** True once teardown or the exit watcher has claimed cleanup. */
   stopped: boolean
   exitEmitted: boolean
@@ -190,8 +192,14 @@ function postFrame(frame: BrokerFrame): void {
 function writeChild(child: ChildHandle, text: string): void {
   const sink = child.process.stdin as Bun.FileSink | undefined
   if (!sink) return
-  void sink.write(text)
-  void sink.flush()
+  // Chain write → flush on the child's stdin queue: firing them independently
+  // lets a later frame's write overtake an earlier frame's flush, reordering
+  // frames on the wire (plan A15).
+  child.stdinChain = child.stdinChain
+    .then(() => sink.write(text))
+    .then(() => sink.flush())
+    .then(() => undefined)
+    .catch(() => undefined)
 }
 
 function emitChildExit(child: ChildHandle, code: number | null): void {
@@ -298,6 +306,7 @@ function spawnChild(directory: string, spec: ServerSpec): ChildHandle {
     pending: new Map(),
     exited: process_.exited,
     nextId: 1,
+    stdinChain: Promise.resolve(),
     stopped: false,
     exitEmitted: false,
   }
@@ -470,7 +479,9 @@ async function handleCall(request: CallRequest): Promise<unknown> {
 function handleCancel(request: BrokerRequest & { kind: "cancel" }): void {
   const active = activeCalls.get(request.targetId)
   if (!active) {
-    cancelled.add(request.targetId)
+    // Bound the queued-cancellation registry: an id that never matches a
+    // dispatched call must not accumulate forever (plan A14).
+    rememberBounded(cancelled, request.targetId)
     return
   }
   active.abort(new BrokerFailure("cancelled", `call ${request.targetId} cancelled`))

@@ -12,8 +12,9 @@ import {
   type ControlFrame,
   type ControlInbound,
   type ControlOutbound,
+  type ControlRequest,
 } from "@/session/egress/control"
-import { createEgressHub } from "@/session/egress/hub"
+import { createEgressHub } from "./hub"
 import { decodeFrame, encodeFrame, type EgressFrame } from "@/session/egress/frame"
 import { attachMeshWorker, createEgressMesh } from "@/session/egress/mesh"
 import { createEgressReceiver } from "@/session/egress/receiver"
@@ -310,5 +311,11 @@ describe("control link liveness", () => {
     const inbound: ControlInbound = { type: "durable.ack", count: 2 }
     expect(outbound.type).toBe("resync")
     expect(inbound.type).toBe("durable.ack")
+  })
+
+  test("ControlRequest is narrowed to request/reply frames (push-only frames are unrepresentable)", () => {
+    // @ts-expect-error a `resync` is a hub push, never a request
+    const pushOnly: ControlRequest = { type: "resync", pattern: "message.*" }
+    expect(pushOnly).toBeDefined()
   })
 })

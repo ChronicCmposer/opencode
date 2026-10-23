@@ -17,7 +17,10 @@
 import os from "node:os"
 import { parsePositiveInt } from "@/util/parse"
 import { DEFAULT_OVERSUBSCRIPTION_FACTOR, OVERSUBSCRIPTION_ENV, resolveWorkerCount } from "@/session/worker/pool"
-import { DEFAULT_BURN_ITERATIONS, startMockSseServer, runParallelSessions } from "../test/lib/mock-sse-harness"
+import { runParallelSessions } from "../test/lib/session-parallelism"
+import { DEFAULT_BURN_ITERATIONS } from "../test/lib/mock-sse-worker"
+import { startMockProvider } from "../test/lib/mock-provider"
+import { median } from "../test/lib/worker-boot"
 import type { Leak } from "../test/lib/leak-detector"
 
 const TARGET_SPEEDUP = 1.5
@@ -28,12 +31,6 @@ function readPositiveInt(name: string, fallback: number): number {
   const raw = process.env[name]
   if (raw === undefined || raw.trim() === "") return fallback
   return parsePositiveInt(raw, name)
-}
-
-function median(values: ReadonlyArray<number>): number {
-  const sorted = values.slice().sort((left, right) => left - right)
-  const middle = Math.floor(sorted.length / 2)
-  return sorted.length % 2 === 1 ? sorted[middle]! : (sorted[middle - 1]! + sorted[middle]!) / 2
 }
 
 interface MeasureOptions {
@@ -113,10 +110,11 @@ async function main(): Promise<void> {
   const burn = readPositiveInt("OPENCODE_BENCH_BURN", DEFAULT_BURN_ITERATIONS * 2)
   const repeats = readPositiveInt("OPENCODE_BENCH_REPEATS", DEFAULT_REPEATS)
 
-  const server = startMockSseServer()
+  // Same streamed shape the retired `startMockSseServer` produced: 8 content deltas.
+  const server = startMockProvider({ chunks: Array.from({ length: 8 }, (_, index) => `token${index} `) })
   try {
-    const baseline = await measure({ baseUrl: server.url, sessions, poolSize: 1, burn, repeats })
-    const parallel = await measure({ baseUrl: server.url, sessions, poolSize: k, burn, repeats })
+    const baseline = await measure({ baseUrl: server.baseUrl, sessions, poolSize: 1, burn, repeats })
+    const parallel = await measure({ baseUrl: server.baseUrl, sessions, poolSize: k, burn, repeats })
     const speedup = ratioOrNull(baseline.wallMs, parallel.wallMs)
     const throughputGain = ratioOrNull(parallel.throughputPerSec, baseline.throughputPerSec)
 
@@ -139,7 +137,7 @@ async function main(): Promise<void> {
     }
     console.log(JSON.stringify(report, null, 2))
   } finally {
-    server.close()
+    await server.stop()
   }
 }
 

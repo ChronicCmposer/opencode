@@ -21,6 +21,7 @@
 // port as DATA — a registered SQL statement — never as closures (plan line 31).
 
 import { defined } from "@/util/object"
+import { createFramePrimitives } from "@/session/worker/frame"
 
 /** The four execution shapes the Effect SQL connection reduces to. */
 export type QueryMethod = "all" | "values" | "run" | "exec"
@@ -113,6 +114,26 @@ export interface WriterResult {
 export interface WriterErrorInfo {
   readonly tag: string
   readonly message: string
+  /**
+   * The native SQLite code (`SQLITE_BUSY`, `SQLITE_BUSY_SNAPSHOT`, …), when the
+   * underlying driver error carried one. Carrying it across the port lets the
+   * receiving side classify a lock as a `LockTimeoutError` instead of collapsing
+   * to `UnknownError`.
+   */
+  readonly code?: string | number
+}
+
+/**
+ * The native code carried by a driver error, if any. Reads `code` (bun:sqlite /
+ * node:sqlite) or `sqliteCode` (the injected `CommitFault`), so a writer failure
+ * keeps the code the receiver needs to classify it.
+ */
+export function errorCode(error: unknown): string | number | undefined {
+  if (typeof error !== "object" || error === null) return undefined
+  const record = error as { code?: unknown; sqliteCode?: unknown }
+  if (typeof record.code === "string" || typeof record.code === "number") return record.code
+  if (typeof record.sqliteCode === "string" || typeof record.sqliteCode === "number") return record.sqliteCode
+  return undefined
 }
 
 export interface WriterFailure {
@@ -144,26 +165,18 @@ export function isEnoent(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && (error as { code: unknown }).code === "ENOENT"
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  // Arrays are objects but never valid records here, so exclude them explicitly.
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-}
-
-function requireString(record: Record<string, unknown>, field: string): string {
-  const value = record[field]
-  if (typeof value !== "string") {
-    throw new ProtocolError(`field "${field}" must be a string (got ${JSON.stringify(value)})`)
-  }
-  return value
-}
-
-function requireNumber(record: Record<string, unknown>, field: string): number {
-  const value = record[field]
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new ProtocolError(`field "${field}" must be a finite number (got ${JSON.stringify(value)})`)
-  }
-  return value
-}
+/**
+ * The shared frame primitives bound to this module's error type. The "plain
+ * object / required string / required finite number / optional" parsers live in
+ * `session/worker/frame.ts` so the writer, broker and events protocols share one
+ * implementation; binding `createFramePrimitives` keeps `ProtocolError` as the
+ * loud failure channel this boundary already failed with.
+ */
+const { isRecord, requireString, requireNumber, optionalString, optionalBoolean } = createFramePrimitives(
+  (message) => {
+    throw new ProtocolError(message)
+  },
+)
 
 function requireStringArray(record: Record<string, unknown>, field: string): string[] {
   const value = record[field]
@@ -201,20 +214,11 @@ function parseEvent(record: Record<string, unknown>): WriterEvent {
   }
 }
 
-function optionalString(record: Record<string, unknown>, field: string): string | undefined {
+function optionalCode(record: Record<string, unknown>, field: string): string | number | undefined {
   const value = record[field]
   if (value === undefined) return undefined
-  if (typeof value !== "string") {
-    throw new ProtocolError(`field "${field}" must be a string (got ${JSON.stringify(value)})`)
-  }
-  return value
-}
-
-function optionalBoolean(record: Record<string, unknown>, field: string): boolean | undefined {
-  const value = record[field]
-  if (value === undefined) return undefined
-  if (typeof value !== "boolean") {
-    throw new ProtocolError(`field "${field}" must be a boolean (got ${JSON.stringify(value)})`)
+  if (typeof value !== "string" && typeof value !== "number") {
+    throw new ProtocolError(`field "${field}" must be a string or number (got ${JSON.stringify(value)})`)
   }
   return value
 }
@@ -339,10 +343,11 @@ export function parseWriterResponse(input: unknown): WriterResponse {
     case "failure": {
       const error = input["error"]
       if (!isRecord(error)) throw new ProtocolError(`field "error" must be an object (got ${JSON.stringify(error)})`)
+      const code = optionalCode(error, "code")
       return {
         type: "failure",
         id: requireNumber(input, "id"),
-        error: { tag: requireString(error, "tag"), message: requireString(error, "message") },
+        error: { tag: requireString(error, "tag"), message: requireString(error, "message"), ...defined({ code }) },
       }
     }
     default:

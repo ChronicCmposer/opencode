@@ -12,6 +12,7 @@ import { SessionStatus } from "./status"
 import { SessionHubService, type SessionHub } from "./worker/hub"
 import { SessionBusyError, type SessionExecutionResult } from "./worker/execute"
 import type { CancelOutcome } from "./worker/cancel"
+import type { ShellInput } from "./prompt"
 
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
@@ -26,6 +27,7 @@ export interface Interface {
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
     ready?: Latch.Latch,
+    shell?: ShellInput,
   ) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
 }
 
@@ -143,19 +145,21 @@ export const layer = Layer.effect(
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
       ready?: Latch.Latch,
+      shell?: ShellInput,
     ) {
       const hub = yield* hubIfEnabled
       if (hub !== undefined) {
-        // The hub protocol carries only the session id: the worker resolves the
-        // work by kind and owns the interrupt, so the caller's `work`/`onInterrupt`
-        // closures cannot cross the isolate (exactly as `ensureRunning` does). The
-        // `ready` latch has no hub-side equivalent, so open it here rather than
-        // leave a caller waiting on a signal the hub will never send.
+        // The hub protocol carries the session id and the shell command: the
+        // worker resolves the work by kind and owns the interrupt, so the
+        // caller's `work`/`onInterrupt` closures cannot cross the isolate
+        // (exactly as `ensureRunning` does). The `ready` latch has no hub-side
+        // equivalent, so open it here rather than leave a caller waiting on a
+        // signal the hub will never send.
         if (ready !== undefined) yield* ready.open
         // `hub.startShell` performs its own busy assertion and rejects with a
         // worker-local `SessionBusyError`; map it onto the domain `Session.BusyError`.
         return yield* Effect.tryPromise({
-          try: () => hub.startShell(sessionID),
+          try: () => hub.startShell(sessionID, shell),
           catch: (error) => error,
         }).pipe(
           Effect.flatMap(parseSessionResult),

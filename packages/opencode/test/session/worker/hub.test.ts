@@ -77,8 +77,8 @@ import { testEffect } from "../../lib/effect"
 import { TestLLMServer } from "../../lib/llm-server"
 import { sid } from "../../lib/async"
 import { pollUntil } from "../../lib/poll"
-import { workerSnapshot } from "../../lib/snapshot"
 import { createHubProxyClient } from "@/session/worker/layer"
+import type { HubProxyMethod } from "@/session/worker/hub-proxy-wire"
 import { createWorkerWriterClient } from "@/session/worker/writer-client"
 import { createWorkerBrokerClient } from "@/session/worker/broker-client"
 import { createWorkerEgressClient } from "@/session/worker/egress-client"
@@ -135,12 +135,13 @@ describe("12.1 the hub executes zero sessions", () => {
         k: 1,
         entry: SESSION_WORKER,
         timeoutMs: 15_000,
-        workerData: {
-          snapshot: workerSnapshot(),
-          env: { values: {} },
-          role: "session",
-          model: { baseUrl: llm.url, apiKey: "test-key", model: "test-model" },
-        },
+        // `sessionWorkerInit` defaults the model identity (`providerID`/`modelID`/
+        // `apiId` = `test-model`); only the transport is overridden to the mock
+        // server. The entry's `modelConfig` reads the descriptor directly (D8
+        // dropped the legacy `{model}` fallback).
+        workerData: sessionWorkerInit({
+          model: { baseUrl: llm.url, apiKey: "test-key" },
+        }),
       })
       const hub = createSessionHub({ pool })
       try {
@@ -874,14 +875,14 @@ describe("35a worker port serving", () => {
   test("serves the hub-proxy authorities over a worker control port", async () => {
     const hub = createSessionHub({
       pool: trackedLazyPool(1, []),
-      ports: { writer: hubWriter, broker: {} as never, hubProxy: { ping: () => "pong" } },
+      ports: { writer: hubWriter, broker: {} as never, hubProxy: { "sessionStatus.get": () => "pong" } },
     })
     const channel = new MessageChannel()
     const dispose = hub.attachHubProxyPort(1, channel.port1)
     const client = createHubProxyClient(channel.port2)
 
-    expect(await client.call("ping", [])).toBe("pong")
-    const missing = await client.call("missing", []).then(
+    expect(await client.call("sessionStatus.get", [])).toBe("pong")
+    const missing = await client.call("missing" as HubProxyMethod, []).then(
       (value) => ({ ok: true as const, value }),
       (error) => ({ ok: false as const, message: error instanceof Error ? error.message : String(error) }),
     )
@@ -1221,7 +1222,7 @@ describe("36 production port backends", () => {
             yield* Effect.promise(() => hub.ensureRunning(sid("ses_hubproxy")))
             yield* Effect.promise(async () => {
               const client = createHubProxyClient(captured.hubProxy!)
-              expect(await client.call("get", [sid("ses_hubproxy")])).toEqual({ type: "idle" })
+              expect(await client.call("sessionStatus.get", [sid("ses_hubproxy")])).toEqual({ type: "idle" })
               client.dispose()
             })
           }),
@@ -1554,7 +1555,8 @@ describe("Q9/Q23 session.cancelled", () => {
       const outcome = await hub.cancel(sid("ses_completed"))
       expect(outcome).toMatchObject({ mode: "completed", winner: "completion" })
       expect(published.filter((event) => event.type === SESSION_CANCELLED_TYPE)).toHaveLength(0)
-      expect(await settled).toBeInstanceOf(SessionCancelledError)
+      // The run finished on its own, so the dispatch promise resolves (no error).
+      expect(await settled).toBeUndefined()
     } finally {
       await hub.terminateAll()
     }

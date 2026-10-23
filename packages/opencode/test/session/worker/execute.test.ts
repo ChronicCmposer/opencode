@@ -15,10 +15,12 @@ import {
   createSessionRunMachine,
   DEFAULT_WORK_KIND,
   installSessionExecutor,
+  RESULTS_CAP,
   SessionBusyError,
   SessionWorkerReplyTimeoutError,
   UnknownWorkKindError,
   type ExecutorTransport,
+  type ExecutorWorker,
   type ExecutorWorkerScope,
   type SessionExecutionResult,
   type SessionExecutorInbound,
@@ -780,5 +782,137 @@ describe("B2 run prompt transport", () => {
     const run = posted.find((message) => message.type === "run")
     expect(run).toBeDefined()
     if (run !== undefined) expect("prompt" in run).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Shell dispatch (Part 1), result-map bounding (A9), pool cancel port (A10) and
+// the durable-egress write barrier (2.6 / R4#16).
+// ---------------------------------------------------------------------------
+
+/** A transport that answers the most recent run/startShell with a distinct result. */
+function replyingTransport(): { readonly transport: ExecutorTransport; readonly posted: SessionExecutorInbound[] } {
+  const posted: SessionExecutorInbound[] = []
+  let alive = true
+  let n = 0
+  return {
+    posted,
+    transport: {
+      post: (message) => posted.push(message),
+      waitFor: async (match) => {
+        const last = posted[posted.length - 1] as { readonly id: number; readonly sessionID: SessionID }
+        n += 1
+        const reply: SessionExecutorOutbound = { type: "done", id: last.id, result: { sessionID: last.sessionID, value: n } }
+        if (match(reply)) return reply
+        throw new Error("no matching reply")
+      },
+      get alive() {
+        return alive
+      },
+      async terminate() {
+        alive = false
+        return 0
+      },
+    },
+  }
+}
+
+describe("Part 1 shell dispatch over the executor frame", () => {
+  const shell = { sessionID: sid("ses_1"), agent: "build", command: "ls" }
+
+  test("a startShell frame carries the shell command to the work", () =>
+    withScope(async (scope) => {
+      const seen: Array<{ prompt: unknown; shell: unknown }> = []
+      const work: SessionWorkFactory = () => (sessionID, prompt, passedShell) =>
+        Effect.sync(() => {
+          seen.push({ prompt, shell: passedShell })
+          return result(sessionID, "shell")
+        })
+      const executor = createSessionExecutor({ machine: createSessionRunMachine({ scope }), work })
+
+      const out = await executor.handle({ type: "startShell", id: 1, sessionID: sid("ses_1"), kind: "x", shell })
+
+      expect(out).toEqual({ type: "done", id: 1, result: result("ses_1", "shell") })
+      expect(seen).toEqual([{ prompt: undefined, shell }])
+    }))
+
+  test("createExecutorWorker posts the shell command on the startShell frame", async () => {
+    const { transport, posted } = replyingTransport()
+    const worker = createExecutorWorker({ id: 1, transport, workKind: "session" })
+
+    await worker.execute({ sessionID: sid("ses_1"), depth: 0, mode: "startShell", shell })
+
+    const frame = posted.find((message) => message.type === "startShell")
+    expect(frame).toBeDefined()
+    if (frame?.type === "startShell") expect(frame.shell).toEqual(shell)
+  })
+
+  test("a shell-less startShell frame omits the shell field", async () => {
+    const { transport, posted } = replyingTransport()
+    const worker = createExecutorWorker({ id: 1, transport, workKind: "session" })
+
+    await worker.execute({ sessionID: sid("ses_1"), depth: 0, mode: "startShell" })
+
+    const frame = posted.find((message) => message.type === "startShell")
+    expect(frame).toBeDefined()
+    if (frame !== undefined) expect("shell" in frame).toBe(false)
+  })
+})
+
+describe("A9 the per-session results map is bounded", () => {
+  test("re-dispatch refreshes recency and the oldest result is evicted at the cap", async () => {
+    const { transport } = replyingTransport()
+    const worker = createExecutorWorker({ id: 1, transport, workKind: "session" })
+
+    for (let index = 0; index < RESULTS_CAP; index++) {
+      await worker.execute({ sessionID: sid(`ses_${index}`), depth: 0 })
+    }
+    // Refresh ses_0 so it is no longer the oldest.
+    await worker.execute({ sessionID: sid("ses_0"), depth: 0 })
+    // One more distinct session pushes the map past the cap.
+    await worker.execute({ sessionID: sid("ses_extra"), depth: 0 })
+
+    expect(worker.resultFor(sid("ses_0"))).toBeDefined()
+    expect(worker.resultFor(sid("ses_extra"))).toBeDefined()
+    // ses_1 was the oldest live entry and is the eviction victim.
+    expect(worker.resultFor(sid("ses_1"))).toBeUndefined()
+  })
+})
+
+describe("A10 the pool spawn wrapper exposes the cancel port", () => {
+  test("a spawned pool worker carries its cancel port", async () => {
+    const pool = createExecutorWorkerPool({
+      k: 1,
+      spawn: (id) => createExecutorWorker({ id, transport: noopTransport() }),
+    })
+
+    const spawned = pool.spawn("headroom") as ExecutorWorker
+    expect(spawned.cancelPort).toBeDefined()
+    await pool.terminateAll()
+  })
+})
+
+describe("2.6 durable-egress write barrier", () => {
+  test("execute does not resolve or record the result until egress is acked", async () => {
+    const { transport } = replyingTransport()
+    let releaseBarrier!: () => void
+    const barrier = new Promise<void>((resolve) => {
+      releaseBarrier = resolve
+    })
+    const worker = createExecutorWorker({ id: 1, transport, workKind: "session", egressBarrier: () => barrier })
+
+    let settled = false
+    const running = worker.execute({ sessionID: sid("ses_1"), depth: 0 }).then(() => {
+      settled = true
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(settled).toBe(false)
+    expect(worker.resultFor(sid("ses_1"))).toBeUndefined()
+
+    releaseBarrier()
+    await running
+    expect(settled).toBe(true)
+    expect(worker.resultFor(sid("ses_1"))).toBeDefined()
   })
 })

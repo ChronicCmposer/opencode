@@ -11,11 +11,11 @@ import {
   BrokerFailure,
   BrokerProtocolError,
   DEFAULT_MCP_TIMEOUT_MS,
-  isBrokerRequest,
   parseAcquireResult,
   parseBrokerRequest,
   parseOAuthResult,
   parsePingResult,
+  rememberBounded,
   resolveRequestTimeout,
 } from "@/session/broker/protocol"
 
@@ -105,18 +105,18 @@ describe("parseBrokerRequest", () => {
     ).toThrow(/command/)
   })
 
-  test("isBrokerRequest is a total predicate that never throws and narrows the type", () => {
-    expect(isBrokerRequest({ kind: "ping", requestId: "r" })).toBe(true)
-    expect(isBrokerRequest({ kind: "nope" })).toBe(false)
-    expect(isBrokerRequest(undefined)).toBe(false)
-    expect(isBrokerRequest(() => {})).toBe(false)
-
-    const value: unknown = { kind: "ping", requestId: "r" }
-    if (!isBrokerRequest(value)) throw new Error("expected a broker request")
-    // `value` is now `BrokerRequest`: this property access only compiles because
-    // the predicate is a type guard.
-    expect(value.kind).toBe("ping")
+  test("rejects an array where a record is required (A12)", () => {
+    // `env` must be an object; an array is an object at runtime but not a record.
+    expect(() =>
+      parseBrokerRequest({
+        kind: "acquire",
+        requestId: "r",
+        directory: "/d",
+        servers: [{ name: "s", kind: "mcp", command: ["x"], env: [] }],
+      }),
+    ).toThrow(/env/)
   })
+
 })
 
 describe("response-value parsers (parse, don't validate)", () => {
@@ -168,5 +168,19 @@ describe("resolveRequestTimeout", () => {
     })()
     expect(error).toBeInstanceOf(BrokerFailure)
     expect((error as BrokerFailure).code).toBe("invalid-request")
+  })
+})
+
+describe("rememberBounded (A14)", () => {
+  test("evicts the oldest entry once the cap is reached", () => {
+    const set = new Set<string>()
+    for (let i = 0; i < 5; i++) rememberBounded(set, `r${i}`, 3)
+    expect([...set]).toEqual(["r2", "r3", "r4"])
+  })
+
+  test("is a no-op for an id already present", () => {
+    const set = new Set<string>(["a"])
+    rememberBounded(set, "a", 3)
+    expect([...set]).toEqual(["a"])
   })
 })

@@ -3,6 +3,7 @@ import * as Http from "node:http"
 import { Deferred, Effect, Layer, Context, Stream } from "effect"
 import * as HttpServer from "effect/unstable/http/HttpServer"
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+import { chatChunk, sseData } from "./openai-frames"
 
 export type Usage = { input: number; output: number }
 
@@ -54,30 +55,11 @@ const done = Symbol("done")
 
 function line(input: unknown) {
   if (input === done) return "data: [DONE]\n\n"
-  return `data: ${JSON.stringify(input)}\n\n`
-}
-
-function tokens(input?: Usage) {
-  if (!input) return
-  return {
-    prompt_tokens: input.input,
-    completion_tokens: input.output,
-    total_tokens: input.input + input.output,
-  }
+  return sseData(input)
 }
 
 function chunk(input: { delta?: Record<string, unknown>; finish?: string; usage?: Usage }) {
-  return {
-    id: "chatcmpl-test",
-    object: "chat.completion.chunk",
-    choices: [
-      {
-        delta: input.delta ?? {},
-        ...(input.finish ? { finish_reason: input.finish } : {}),
-      },
-    ],
-    ...(input.usage ? { usage: tokens(input.usage) } : {}),
-  } satisfies Line
+  return chatChunk(input) satisfies Line
 }
 
 function role() {

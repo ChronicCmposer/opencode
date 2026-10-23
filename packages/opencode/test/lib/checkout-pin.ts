@@ -1,7 +1,7 @@
 /**
- * Checkout-pin verification (plan task 3.1).
+ * Checkout-pin verification.
  *
- * The plan declares the checkout must sit on tag `v1.19.3`. Reading a revision
+ * The release pin is tag `v1.19.3`. Reading a revision
  * is a boundary concern: the raw git output is parsed into a trusted revision
  * string, and {@link assertCheckoutPin} compares that trusted value against the
  * declared pin. The comparison is pure so the repository-level assertion and
@@ -13,7 +13,7 @@ export interface DeclaredPin {
   readonly revision: string
 }
 
-/** Declared pin from `.parallel-implement/multicore-session-parallelism.md`. */
+/** Declared pin for the `v1.19.3` release tag this checkout is expected to sit on. */
 export const DECLARED_PIN: DeclaredPin = {
   tag: "v1.19.3",
   revision: "e3c4eb242585dcd77be1a867391b7c25fd47ce52",

@@ -10,14 +10,16 @@
 // threshold (repo convention).
 //
 // 13.4 (full `bun test` flag off/on) and the K-session admission/shutdown paths are
-// integration-gated on Phase 9/12; see `.parallel-implement/phase13-e2e.md`.
+// integration-gated on the earlier session-parallelism phases.
 
 import { describe, expect, test } from "bun:test"
 import { existsSync } from "node:fs"
 import { Effect } from "effect"
 import { testEffect } from "../../lib/effect"
 import { TestLLMServer } from "../../lib/llm-server"
-import { DEFAULT_BURN_ITERATIONS, measureSessionWorkerBoot, runParallelSessions } from "../../lib/mock-sse-harness"
+import { DEFAULT_BURN_ITERATIONS } from "../../lib/mock-sse-worker"
+import { measureSessionWorkerBoot } from "../../lib/session-boot"
+import { runParallelSessions } from "../../lib/session-parallelism"
 
 const it = testEffect(TestLLMServer.layer)
 

@@ -34,6 +34,7 @@ import { DEFAULT_CHECKPOINT_INTERVAL_MS } from "@opencode-ai/core/database/pragm
 import { isDeepStrictEqual } from "node:util"
 import { Faults } from "@/testing/faults"
 import { isSqliteBusy, type WriterConnection } from "./connection"
+import { errorCode } from "./protocol"
 
 /** Arms `task` to run every `intervalMs`; the returned function cancels it. */
 export type CheckpointScheduler = (task: () => void, intervalMs: number) => () => void
@@ -145,17 +146,24 @@ export interface WriterCoreOptions {
 
 export class WriterError extends Error {
   readonly tag: string
-  constructor(tag: string, message: string) {
+  /** Native SQLite code carried for the receiving side's classifier, when known. */
+  readonly code?: string | number
+  constructor(tag: string, message: string, code?: string | number) {
     super(message)
     this.name = tag
     this.tag = tag
+    if (code !== undefined) this.code = code
   }
 }
 
 export class WriterBusyExhaustedError extends WriterError {
   readonly attempts: number
   constructor(point: string, attempts: number) {
-    super("SQLITE_BUSY_EXHAUSTED", `SQLITE_BUSY retries exhausted at ${point} after ${attempts} attempts`)
+    super(
+      "SQLITE_BUSY_EXHAUSTED",
+      `SQLITE_BUSY retries exhausted at ${point} after ${attempts} attempts`,
+      "SQLITE_BUSY",
+    )
     this.attempts = attempts
   }
 }
@@ -190,9 +198,24 @@ export class WriterClosedError extends WriterError {
   }
 }
 
-export function writerErrorInfo(error: unknown): { tag: string; message: string } {
-  if (error instanceof WriterError) return { tag: error.tag, message: error.message }
-  return { tag: "UNKNOWN", message: error instanceof Error ? error.message : String(error) }
+/**
+ * Raised when a transaction could not be unwound and the connection's
+ * transaction state is no longer trustworthy. The writer refuses all further
+ * work rather than wedging on "cannot start a transaction within a transaction".
+ */
+export class ConnectionPoisonedError extends WriterError {
+  constructor(reason: string) {
+    super("CONNECTION_POISONED", `writer connection is poisoned: ${reason}`)
+  }
+}
+
+export function writerErrorInfo(error: unknown): { tag: string; message: string; code?: string | number } {
+  const code = errorCode(error)
+  if (error instanceof WriterError) {
+    return { tag: error.tag, message: error.message, ...(code === undefined ? {} : { code }) }
+  }
+  const info = { tag: "UNKNOWN", message: error instanceof Error ? error.message : String(error) }
+  return code === undefined ? info : { ...info, code }
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +360,12 @@ export class WriterCore {
   private draining = false
   private closed = false
   private pinned: PinnedTransaction | undefined
+  /**
+   * Set once a transaction could not be unwound (a failed ROLLBACK). Every later
+   * operation fails loud with this instead of running against a connection whose
+   * transaction state is unknown.
+   */
+  private poisoned: ConnectionPoisonedError | undefined
   private txCounter = 0
   private ordinalCounter = 0
   /** Settles when the currently-running job finishes; `close()` awaits it. */
@@ -397,6 +426,7 @@ export class WriterCore {
   // -- queue ----------------------------------------------------------------
 
   private enqueue<T>(task: () => Promise<T> | T, options: { readonly txHandle?: string } = {}): Promise<T> {
+    if (this.poisoned !== undefined) return Promise.reject(this.poisoned)
     if (this.closed) return Promise.reject(new WriterClosedError())
     return new Promise<T>((resolve, reject) => {
       const admit = () => {
@@ -408,6 +438,11 @@ export class WriterCore {
           txHandle: options.txHandle,
           reject,
           run: () => {
+            if (this.poisoned !== undefined) {
+              reject(this.poisoned)
+              this.afterJob()
+              return
+            }
             this.draining = true
             this.inflight = Promise.resolve()
               .then(task)
@@ -496,6 +531,14 @@ export class WriterCore {
     }
   }
 
+  /**
+   * Run `body` inside a raw `BEGIN IMMEDIATE … COMMIT`. Unlike a reserved-handle
+   * transaction this one is not tracked in `pinned`, so if `body` throws and the
+   * ROLLBACK cannot restore the connection the writer is left with an open,
+   * untracked transaction. That state is unwedgeable from here, so it is recorded
+   * as a poison and every later operation fails loud rather than silently
+   * issuing statements inside the abandoned transaction.
+   */
   private async inTransaction<T>(body: () => Promise<T>): Promise<T> {
     this.connection.run("BEGIN IMMEDIATE", [])
     let committed = false
@@ -508,8 +551,12 @@ export class WriterCore {
       if (!committed) {
         try {
           this.connection.run("ROLLBACK", [])
-        } catch {
-          // already rolled back by the connection
+        } catch (error) {
+          // The transaction is still open and untracked: fail loud and poison.
+          this.poisoned = new ConnectionPoisonedError(
+            `ROLLBACK failed (${error instanceof Error ? error.message : String(error)})`,
+          )
+          throw this.poisoned
         }
       }
     }
@@ -577,15 +624,29 @@ export class WriterCore {
   }
 
   commitTransaction(handle: string): Promise<void> {
-    return this.enqueue(() => {
-      this.assertPinned(handle)
-      // A mid-commit crash (only armed in a real isolate) fires before COMMIT, so
-      // the open transaction is never committed; the isolate dying rolls it back
-      // and nothing partial survives — the reserved-handle analogue of the
-      // publish path's mid-commit crash.
-      Faults.crashWorker("writer:tx-commit")
-      this.finishTransaction("COMMIT")
-    }, { txHandle: handle })
+    return this.enqueue(
+      () =>
+        // A COMMIT can be the statement that loses the write-lock race. Retry the
+        // whole finalization on `SQLITE_BUSY`; the pin is held across the retry
+        // (see `finishTransaction`), so a busy COMMIT is re-issued on the still-open
+        // transaction rather than surfacing as a hard failure. Once the retries are
+        // exhausted the COMMIT has failed outright, so the pin must not outlive it.
+        this.runBusyRetried("writer:tx-commit", () => {
+          this.assertPinned(handle)
+          // A mid-commit crash (only armed in a real isolate) fires before COMMIT, so
+          // the open transaction is never committed; the isolate dying rolls it back
+          // and nothing partial survives — the reserved-handle analogue of the
+          // publish path's mid-commit crash.
+          Faults.crashWorker("writer:tx-commit")
+          this.finishTransaction("COMMIT")
+        }).catch((error: unknown) => {
+          // `finishTransaction` releases the pin on every non-busy failure; a pin
+          // still held here is a busy COMMIT whose retries were exhausted.
+          if (this.pinned?.handle === handle) this.unwindExhaustedCommit()
+          throw error
+        }),
+      { txHandle: handle },
+    )
   }
 
   rollbackTransaction(handle: string): Promise<void> {
@@ -596,17 +657,22 @@ export class WriterCore {
   }
 
   /**
-   * End the pinned transaction with `statement` and release the pin no matter
-   * what. A failed `COMMIT` leaves SQLite's transaction open, so it is rolled back
-   * before the pin clears; a failed `ROLLBACK` cannot be undone at the SQL level,
-   * but the handle is still spent, so a queued `begin` can proceed instead of
-   * starving behind a transaction that has logically finished.
+   * End the pinned transaction with `statement` and release the pin. A busy
+   * `COMMIT` is special: the transaction is still open and intact, so the pin is
+   * deliberately kept for `runBusyRetried` to re-issue the COMMIT. Any other
+   * failure rolls back (when committing) and releases the pin — a failed
+   * `ROLLBACK` cannot be undone at the SQL level, but the handle is still spent,
+   * so a queued `begin` can proceed instead of starving behind a transaction that
+   * has logically finished.
    */
   private finishTransaction(statement: "COMMIT" | "ROLLBACK"): void {
     try {
       this.connection.run(statement, [])
-      if (statement === "COMMIT") this.cache.clear()
     } catch (error) {
+      if (statement === "COMMIT" && isSqliteBusy(error)) {
+        // Leave the transaction open and the pin held: the caller retries COMMIT.
+        throw error
+      }
       if (statement === "COMMIT") {
         try {
           this.connection.run("ROLLBACK", [])
@@ -614,11 +680,34 @@ export class WriterCore {
           // SQLite already unwound the transaction; nothing left to discard.
         }
       }
+      this.releasePin()
       throw error
-    } finally {
-      this.clearIdleTimer()
-      this.pinned = undefined
     }
+    if (statement === "COMMIT") this.cache.clear()
+    this.releasePin()
+  }
+
+  /**
+   * Discard a pinned transaction whose busy COMMIT retries were exhausted. The
+   * transaction is still open, so it must be rolled back; if the ROLLBACK itself
+   * fails the connection's transaction state is unknown, so the writer is poisoned
+   * (fail loud) rather than let a later `begin` wedge on a nested transaction. The
+   * pin always clears, so a failed COMMIT never starves the queue.
+   */
+  private unwindExhaustedCommit(): void {
+    try {
+      this.connection.run("ROLLBACK", [])
+    } catch (error) {
+      this.poisoned = new ConnectionPoisonedError(
+        `ROLLBACK failed (${error instanceof Error ? error.message : String(error)})`,
+      )
+    }
+    this.releasePin()
+  }
+
+  private releasePin(): void {
+    this.clearIdleTimer()
+    this.pinned = undefined
   }
 
   private assertPinned(handle: string): void {
@@ -661,9 +750,23 @@ export class WriterCore {
     })
   }
 
-  private async runProjectors(event: CommittedEvent, input: PublishInput): Promise<void> {
-    for (const projector of this.projectors.get(event.type) ?? []) await projector(event)
-    if (input.commit) await input.commit(event)
+  /**
+   * Run the projectors for one commit. Registered SQL projectors are
+   * transactional — a whole-transaction busy retry rolls their insert back and
+   * re-applies it — so they run on every attempt. In-process projectors are not
+   * transactional, so `runOnce` gates them to fire at most once per publish call:
+   * a busy retry must not double-fire their side effects.
+   */
+  private async runProjectors(
+    event: CommittedEvent,
+    input: PublishInput,
+    runOnce: { done: boolean },
+  ): Promise<void> {
+    if (!runOnce.done) {
+      for (const projector of this.projectors.get(event.type) ?? []) await projector(event)
+      if (input.commit) await input.commit(event)
+      runOnce.done = true
+    }
     if (input.commitId !== undefined) {
       const registered = this.registeredProjectors.get(input.commitId)
       if (registered === undefined) throw new WriterError("PROJECTOR", `unknown projector "${input.commitId}"`)
@@ -684,8 +787,11 @@ export class WriterCore {
       // Fire-and-forget: no database work, no sequence, no ordinal, liveness only.
       return this.enqueue(() => ({ seq: null, committed: false, ordinal: null, idempotent: false }))
     }
-    return this.enqueue(() =>
-      this.runBusyRetried("writer:commit", () =>
+    return this.enqueue(() => {
+      // One gate per publish call, shared across busy retries, so an in-process
+      // projector cannot double-fire when the transaction is retried.
+      const runOnce = { done: false }
+      return this.runBusyRetried("writer:commit", () =>
         this.inTransaction(async () => {
           if (Faults.abortTxAfter("writer:tx")) throw new AbortedWriteError("requester died before commit")
 
@@ -695,7 +801,7 @@ export class WriterCore {
 
           const seq = latest.seq + 1
           const committed: CommittedEvent = { id: event.id, type: event.type, aggregateID: event.aggregateID, seq, data: event.data }
-          await this.runProjectors(committed, input)
+          await this.runProjectors(committed, input, runOnce)
 
           const busy = Faults.failCommitAt("writer:commit")
           if (busy) throw busy
@@ -709,15 +815,16 @@ export class WriterCore {
           this.cache.invalidateTables(["event", "event_sequence"])
           return { seq, committed: true, ordinal: this.nextOrdinal(), idempotent: false }
         }),
-      ),
-    )
+      )
+    })
   }
 
   // -- replay ---------------------------------------------------------------
 
   replay(input: ReplayInput): Promise<PublishResult> {
-    return this.enqueue(() =>
-      this.runBusyRetried("writer:commit", () =>
+    return this.enqueue(() => {
+      const runOnce = { done: false }
+      return this.runBusyRetried("writer:commit", () =>
         this.inTransaction(async () => {
           const { event, seq } = input
           const latest = this.readLatest(event.aggregateID)
@@ -748,14 +855,14 @@ export class WriterCore {
           }
 
           const committed: CommittedEvent = { id: event.id, type: event.type, aggregateID: event.aggregateID, seq, data: event.data }
-          await this.runProjectors(committed, { event, durable: true, ownerID: input.ownerID })
+          await this.runProjectors(committed, { event, durable: true, ownerID: input.ownerID }, runOnce)
           this.writeSequence(event.aggregateID, seq, input.ownerID)
           this.writeEvent(committed)
           this.cache.invalidateTables(["event", "event_sequence"])
           return { seq, committed: true, ordinal: this.nextOrdinal(), idempotent: false }
         }),
-      ),
-    )
+      )
+    })
   }
 
   // -- ownership ------------------------------------------------------------

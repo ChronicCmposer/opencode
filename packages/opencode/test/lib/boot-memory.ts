@@ -10,7 +10,7 @@
 
 import path from "node:path"
 import { deriveWorkerCount } from "@/session/worker/pool"
-import { bootMany, summarizeBootLevel } from "./worker-boot"
+import { measureBootLevels, type BootLevelSummary } from "./worker-boot"
 import { createWorkerHarness } from "./worker-harness"
 
 const DEFAULT_TIMEOUT_MS = 10000
@@ -23,15 +23,8 @@ export interface BootSample {
   readonly reportedRssBytes: number
 }
 
-export interface BootLevelReport {
-  readonly workers: number
-  readonly samples: ReadonlyArray<BootSample>
-  readonly bootMs: ReadonlyArray<number>
-  readonly medianBootMs: number
-  readonly maxBootMs: number
-  /** Hub-side process RSS after this level was reached. */
-  readonly rssBytes: number
-}
+/** One boot level: the shared summary shape over this harness's sample type. */
+export type BootLevelReport = BootLevelSummary<BootSample>
 
 export interface BootMemoryReport {
   readonly cores: number
@@ -79,14 +72,7 @@ export async function measureBootMemory(options: MeasureBootMemoryOptions = {}):
   const cores = harness.cores
   const k = options.k ?? deriveWorkerCount(cores)
   const extra = options.extra ?? DEFAULT_EXTRA_WORKERS
-
-  if (!Number.isInteger(k) || k < 0) throw new Error(`invalid worker count k: ${k} (expected a non-negative integer)`)
-  if (!Number.isInteger(extra) || extra < 0) {
-    throw new Error(`invalid extra worker count: ${extra} (expected a non-negative integer)`)
-  }
-
   const entry = options.entry ?? path.join(import.meta.dir, "../fixture/boot-worker.ts")
-  const baselineRssBytes = readRssBytes()
 
   const bootWorker = async (): Promise<BootSample> => {
     const started = performance.now()
@@ -96,20 +82,15 @@ export async function measureBootMemory(options: MeasureBootMemoryOptions = {}):
   }
 
   try {
-    const atKSamples = await bootMany(k, bootWorker)
-    const atKRssBytes = readRssBytes()
-    const extraSamples = await bootMany(extra, bootWorker)
-    const atKPlusExtraRssBytes = readRssBytes()
-
-    const allSamples = [...atKSamples, ...extraSamples]
+    const levels = await measureBootLevels({ k, extra, bootOne: bootWorker, readRss: readRssBytes })
     return {
       cores,
       k,
       extra,
-      baselineRssBytes,
-      atK: summarizeBootLevel(atKSamples.length, atKSamples, atKRssBytes),
-      atKPlusExtra: summarizeBootLevel(allSamples.length, allSamples, atKPlusExtraRssBytes),
-      totalBootMs: allSamples.reduce((sum, sample) => sum + sample.bootMs, 0),
+      baselineRssBytes: levels.baselineRssBytes,
+      atK: levels.atK,
+      atKPlusExtra: levels.atKPlusExtra,
+      totalBootMs: levels.atKPlusExtra.bootMs.reduce((sum, bootMs) => sum + bootMs, 0),
     }
   } finally {
     await harness.terminateAll()

@@ -58,9 +58,27 @@ export type EgressEvent = EventV2Event
  */
 export type EgressFrame = EventsFrame
 
+/**
+ * The writer-stamped `(generation, ordinal)` a durable `event` frame carries, or
+ * `undefined` for a non-durable delta / a non-`event` frame. This is the single
+ * durability test the fan-out (backpressure) and receiver (ordering) share, so
+ * both agree on exactly which frames may be dropped and which are ordered.
+ *
+ * Re-exported from the shared envelope (`session/worker/frame.ts`) so there is
+ * exactly one implementation; the events-port codec simply surfaces it.
+ */
+export { durableMetaOf } from "@/session/worker/frame"
+
 const HEADER_BYTES = 4
 const textEncoder = new TextEncoder()
 const textDecoder = new TextDecoder()
+
+/**
+ * Upper bound on a single frame body. The wire length is an untrusted `u32`, so
+ * a corrupt or hostile header could otherwise claim up to 4 GiB and pin the
+ * reassembly buffer forever. A length past this bound fails loud instead.
+ */
+export const MAX_FRAME_BYTES = 16 * 1024 * 1024
 
 /** Raised when the byte framing is wrong (truncated, multi-frame, or bad JSON). */
 export class MalformedFrameError extends Error {
@@ -99,7 +117,7 @@ export function decodeFrame(bytes: Uint8Array): EventsFrame {
   if (bytes.byteLength < HEADER_BYTES) {
     throw new MalformedFrameError(`truncated frame header: ${bytes.byteLength} of ${HEADER_BYTES} byte(s)`)
   }
-  const length = new DataView(bytes.buffer, bytes.byteOffset, HEADER_BYTES).getUint32(0, false)
+  const length = readFrameLength(bytes, 0)
   const total = HEADER_BYTES + length
   if (bytes.byteLength < total) {
     throw new MalformedFrameError(`truncated frame body: ${bytes.byteLength - HEADER_BYTES} of ${length} byte(s)`)
@@ -132,7 +150,7 @@ export function decodeFrameChunks(bytes: Uint8Array): DecodedFrameChunks {
   const frames: FrameChunk[] = []
   let offset = 0
   while (offset + HEADER_BYTES <= bytes.byteLength) {
-    const length = new DataView(bytes.buffer, bytes.byteOffset + offset, HEADER_BYTES).getUint32(0, false)
+    const length = readFrameLength(bytes, offset)
     if (offset + HEADER_BYTES + length > bytes.byteLength) break
     const view = bytes.subarray(offset, offset + HEADER_BYTES + length)
     frames.push({
@@ -150,6 +168,15 @@ export function decodeFrameChunks(bytes: Uint8Array): DecodedFrameChunks {
 export function decodeFrames(bytes: Uint8Array): DecodedFrames {
   const { frames, rest } = decodeFrameChunks(bytes)
   return { frames: frames.map((chunk) => chunk.frame), rest }
+}
+
+/** Read the big-endian body length at `offset`, failing loud past {@link MAX_FRAME_BYTES}. */
+function readFrameLength(bytes: Uint8Array, offset: number): number {
+  const length = new DataView(bytes.buffer, bytes.byteOffset + offset, HEADER_BYTES).getUint32(0, false)
+  if (length > MAX_FRAME_BYTES) {
+    throw new MalformedFrameError(`frame length ${length} exceeds the ${MAX_FRAME_BYTES}-byte maximum`)
+  }
+  return length
 }
 
 /** Parse the framed body as an events-port frame; malformed bodies fail loud. */

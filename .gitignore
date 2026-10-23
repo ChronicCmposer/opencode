@@ -27,6 +27,7 @@ target
 .direnv/
 
 # Local dev files
+packages/opencode/.parallel-implement/
 opencode-dev
 UPCOMING_CHANGELOG.md
 logs/

@@ -22,6 +22,7 @@ import { defined } from "@/util/object"
 import type { StorageReadResult } from "./core"
 import {
   ProtocolError,
+  errorCode,
   parseWriterResponse,
   type QueryMethod,
   type WriterEvent,
@@ -57,10 +58,13 @@ export class WriterTimeoutError extends Error {
 /** A typed failure returned by the writer isolate (e.g. `SQLITE_BUSY_EXHAUSTED`). */
 export class WriterRemoteError extends Error {
   readonly tag: string
-  constructor(tag: string, message: string) {
+  /** Native SQLite code carried across the port, when the failure had one. */
+  readonly code?: string | number
+  constructor(tag: string, message: string, code?: string | number) {
     super(message)
     this.name = tag
     this.tag = tag
+    if (code !== undefined) this.code = code
   }
 }
 
@@ -136,6 +140,23 @@ const DEFAULT_ENTRY = resolveWriterWorkerEntry()
 /** `Omit` over a union collapses to common keys; distribute so each frame keeps its fields. */
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
 type WriterFrame = DistributiveOmit<WriterRequest, "id">
+
+/**
+ * True for frames that only read: a timeout on one of these can safely reject
+ * the caller without dropping the writer generation. Mutations, transaction
+ * control, admin statements and storage writes are all fatal-on-timeout.
+ */
+function isReadOnlyFrame(frame: WriterFrame): boolean {
+  switch (frame.type) {
+    case "query":
+      return frame.method === "all" || frame.method === "values"
+    case "storage.read":
+    case "storage.list":
+      return true
+    default:
+      return false
+  }
+}
 
 export class WriterClient {
   private readonly entry: string | URL
@@ -287,15 +308,19 @@ export class WriterClient {
     this.pending.delete(message.id)
     clearTimeout(pending.timer)
     if (message.type === "result") pending.resolve(message.value)
-    else pending.reject(new WriterRemoteError(message.error.tag, message.error.message))
+    else pending.reject(new WriterRemoteError(message.error.tag, message.error.message, message.error.code))
   }
 
   /**
    * Tear the worker down: reject the ready promise and every in-flight request, and
    * forget the worker so the next call respawns. Never requeues (at-most-once).
+   *
+   * A crash is reported for every generation, including one that dies during
+   * startup before it was ever marked alive, so a supervisor sees the crash it
+   * otherwise would have missed. A deliberate `close()` is not a crash and does
+   * not notify.
    */
-  private crash(error: WriterCrashedError): void {
-    const wasAlive = this.alive
+  private crash(error: WriterCrashedError, options: { readonly notify?: boolean } = {}): void {
     this.alive = false
     this.starting = false
     this.worker = undefined
@@ -308,14 +333,14 @@ export class WriterClient {
       pending.reject(error)
     }
     this.pending.clear()
-    if (wasAlive) this.onCrash?.(error)
+    if (options.notify ?? true) this.onCrash?.(error)
   }
 
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
     const worker = this.worker
-    this.crash(new WriterCrashedError("writer client is closed"))
+    this.crash(new WriterCrashedError("writer client is closed"), { notify: false })
     if (worker !== undefined) await worker.terminate()
   }
 
@@ -333,18 +358,32 @@ export class WriterClient {
   /** Post a frame to the live isolate; the caller has already awaited `ensure()`. */
   private send<T>(frame: WriterFrame): Promise<T> {
     if (this.worker === undefined || !this.alive) return Promise.reject(new WriterCrashedError("writer is not running"))
-    return this.post<T>(frame)
+    return this.post<T>(frame, { fatalOnTimeout: !isReadOnlyFrame(frame) })
   }
 
-  /** Post a frame without the liveness gate, for the respawn re-open handshake. */
-  private post<T>(frame: WriterFrame): Promise<T> {
+  /**
+   * Post a frame without the liveness gate, for the respawn re-open handshake.
+   *
+   * `fatalOnTimeout` is for mutating and transaction frames: a timed-out write
+   * may still execute inside the isolate, so the whole generation is dropped
+   * rather than risk committing a write the caller never observed. Read frames
+   * simply reject the caller and keep the worker.
+   */
+  private post<T>(frame: WriterFrame, options: { readonly fatalOnTimeout?: boolean } = {}): Promise<T> {
     const worker = this.worker
     if (worker === undefined) return Promise.reject(new WriterCrashedError("writer is not running"))
     return new Promise<T>((resolve, reject) => {
       const id = this.nextId++
       const timer = setTimeout(() => {
         this.pending.delete(id)
-        reject(new WriterTimeoutError(`writer request ${id} timed out after ${this.timeoutMs}ms`))
+        const timeout = new WriterTimeoutError(
+          `writer request ${id} (${frame.type}) timed out after ${this.timeoutMs}ms`,
+        )
+        if (options.fatalOnTimeout === true) {
+          void worker.terminate()
+          this.crash(new WriterCrashedError(timeout.message))
+        }
+        reject(timeout)
       }, this.timeoutMs)
       this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer })
       worker.postMessage({ ...frame, id })
@@ -354,9 +393,11 @@ export class WriterClient {
   // -- typed API ------------------------------------------------------------
 
   async open(filename: string): Promise<{ opened: boolean; filename: string }> {
-    const result = await this.request<{ opened: boolean; filename: string }>({ type: "admin.open", filename })
+    // Record before issuing: if the isolate crashes after opening but before
+    // replying, a respawn must still replay this open rather than come up with no
+    // connection.
     this.openFilename = filename
-    return result
+    return this.request<{ opened: boolean; filename: string }>({ type: "admin.open", filename })
   }
 
   pragma(sql: string): Promise<void> {
@@ -435,8 +476,9 @@ export class WriterClient {
   // -- file-KV storage (plan 7.13) -----------------------------------------
 
   async openStorage(dir: string): Promise<void> {
-    await this.request({ type: "admin.openStorage", dir })
+    // Record before issuing, for the same mid-open crash reason as `open`.
     this.storageDir = dir
+    await this.request({ type: "admin.openStorage", dir })
   }
 
   storageRead(key: ReadonlyArray<string>): Promise<StorageReadResult> {
@@ -515,6 +557,9 @@ function toWriterEvent(event: WorkerWriterEvent): WriterEvent {
  * disposer. A reply to a closed port is swallowed (the worker is gone); a rejected
  * request becomes a typed error reply, never an unhandled rejection.
  */
+/** The error reply plus the optional native code the worker classifier consumes. */
+type WriterErrorReply = Extract<WorkerWriterReply, { readonly ok: "error" }> & { readonly code?: string | number }
+
 export function serveWriterPort(hubWriter: HubWriter, port: MessagePort): () => void {
   const channel = portFromMessagePort<WorkerWriterFrame>(port)
   return channel.onMessage((frame) => {
@@ -527,8 +572,19 @@ export function serveWriterPort(hubWriter: HubWriter, port: MessagePort): () => 
         // Drop the reply: the port is gone.
       }
     }
-    const replyError = (error: unknown): void =>
-      reply({ kind: "reply", id, ok: "error", tag: writerErrorTag(error), message: messageOf(error) })
+    const replyError = (error: unknown): void => {
+      // Forward the native SQLite code so the worker-side `classifySqliteError`
+      // can map a lock onto `LockTimeoutError` rather than `UnknownError`.
+      const payload: WriterErrorReply = {
+        kind: "reply",
+        id,
+        ok: "error",
+        tag: writerErrorTag(error),
+        message: messageOf(error),
+        ...defined({ code: errorCode(error) }),
+      }
+      reply(payload)
+    }
     try {
       switch (frame.op) {
         case "query":

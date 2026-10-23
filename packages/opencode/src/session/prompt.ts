@@ -1432,7 +1432,15 @@ const layer = Layer.effect(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
       const ready = yield* Latch.make()
-      return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
+      // The `input` rides the dispatch so a hub-hosted worker can resolve the
+      // shell payload (the closures cannot cross the isolate).
+      return yield* state.startShell(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        shellImpl(input, ready),
+        ready,
+        input,
+      )
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {

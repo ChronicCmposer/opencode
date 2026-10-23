@@ -1,19 +1,24 @@
-// Phase 8.6 + 8.8 — pre-encode once, bounded per-client fan-out (plan tasks 8.6, 8.8).
+// Test-only egress fan-out (relocated from `src/session/egress/fanout.ts`, plan
+// finding B1). Production serves the worker events port through
+// `session/worker/hub.ts`; this bounded fan-out was never wired to a production
+// caller, so it lives under `test/` and backs the hub/SSE stream tests only.
 //
 // The hub is the only place frames are encoded: `publish` encodes a frame ONCE
 // and queues the same byte buffer for every subscriber, so an SSE client receives
-// bytes rather than a re-serialized object (plan decision line 129 / task 8.6).
+// bytes rather than a re-serialized object.
 //
 // Backpressure is per subscriber and never blocks the publisher: each subscriber
 // holds at most `bound` (default 256) frames. On overflow the OLDEST non-durable
-// frame is dropped; if every queued frame is durable the subscriber is reported
-// in `PublishResult.overflowed` and flagged until it drains (plan decision line 70
-// / task 8.8). Durable frames are never dropped, so a durable boundary is always
-// observable.
+// frame is dropped, so a non-durable delta is never dropped silently; only when
+// every queued frame is durable and an incoming DURABLE cannot be enqueued does
+// the subscriber get reported in `PublishResult.overflowed` and flagged until it
+// drains. A durable boundary is therefore never dropped silently; an overflow
+// surfaces `EgressStreamOverflowError` to the subscriber's stream.
 
-import { decodeFrame, encodeFrame, type EgressFrame } from "./frame"
+import { decodeFrame, encodeFrame, type EgressFrame } from "@/session/egress/frame"
+import { durableMetaOf } from "@/session/worker/frame"
 
-/** Per-client egress bound (plan decision line 70). */
+/** Per-client egress bound. */
 export const SUBSCRIBER_BOUND = 256
 
 export class SubscriberOverflowError extends Error {
@@ -31,11 +36,11 @@ interface QueuedFrame {
 /**
  * A durable event is an `event` frame carrying BOTH `generation` and `ordinal`
  * (frame metadata, not event fields); a non-durable delta carries neither.
- * Mirrors the receiver's durability test so backpressure and commit ordering
- * agree on exactly which frames may be dropped.
+ * Shares the receiver's {@link durableMetaOf} test so backpressure and commit
+ * ordering agree on exactly which frames may be dropped.
  */
 function isDurable(frame: EgressFrame): boolean {
-  return frame.kind === "event" && frame.payload.generation !== undefined && frame.payload.ordinal !== undefined
+  return durableMetaOf(frame) !== undefined
 }
 
 export interface FanoutSubscriber {
@@ -55,8 +60,10 @@ export interface FanoutSubscriber {
 
 export interface PublishResult {
   readonly delivered: number
-  /** Subscribers whose durable-saturated queue overflowed on this publish. */
+  /** Subscribers whose durable-saturated queue dropped an incoming durable (a lost commit). */
   readonly overflowed: readonly string[]
+  /** Subscribers whose durable-saturated queue dropped an incoming non-durable delta (lossy, expected). */
+  readonly droppedDeltas: readonly string[]
 }
 
 export interface Fanout {
@@ -64,15 +71,15 @@ export interface Fanout {
   unsubscribe(id: string): void
   publish(frame: EgressFrame): PublishResult
   /**
-   * Fan out ALREADY-ENCODED frame bytes (plan task 8.6): the bytes received from
-   * a worker are handed to every subscriber verbatim, with no hub re-encode.
-   * `frame` is only consulted to classify durables for backpressure.
+   * Fan out ALREADY-ENCODED frame bytes: the bytes received from a worker are
+   * handed to every subscriber verbatim, with no hub re-encode. `frame` is only
+   * consulted to classify durables for backpressure.
    */
   publishBytes(bytes: Uint8Array, frame: EgressFrame): PublishResult
   /**
-   * Terminal broadcast (plan task 8.12): drop every subscriber's non-durable
-   * frames, then deliver `frame` to all of them unconditionally (bypassing the
-   * bound, so an `end` marker is never lost). Durable frames are kept.
+   * Terminal broadcast: drop every subscriber's non-durable frames, then deliver
+   * `frame` to all of them unconditionally (bypassing the bound, so an `end`
+   * marker is never lost). Durable frames are kept.
    */
   finalize(frame: EgressFrame): void
   readonly subscribers: readonly FanoutSubscriber[]
@@ -92,7 +99,10 @@ interface SubscriberState {
   handle?: FanoutSubscriber
 }
 
-type EnqueueOutcome = { readonly enqueued: true } | { readonly enqueued: false }
+type EnqueueOutcome =
+  | { readonly outcome: "enqueued" }
+  | { readonly outcome: "dropped-delta" }
+  | { readonly outcome: "dropped-durable" }
 
 export function createFanout(options: FanoutOptions = {}): Fanout {
   const bound = options.bound ?? SUBSCRIBER_BOUND
@@ -107,13 +117,13 @@ export function createFanout(options: FanoutOptions = {}): Fanout {
   const enqueue = (state: SubscriberState, bytes: Uint8Array, durable: boolean): EnqueueOutcome => {
     if (state.queue.length < bound) {
       state.queue.push({ bytes, durable })
-      return { enqueued: true }
+      return { outcome: "enqueued" }
     }
     const oldestNonDurable = state.queue.findIndex((entry) => !entry.durable)
-    if (oldestNonDurable === -1) return { enqueued: false }
+    if (oldestNonDurable === -1) return { outcome: durable ? "dropped-durable" : "dropped-delta" }
     state.queue.splice(oldestNonDurable, 1)
     state.queue.push({ bytes, durable })
-    return { enqueued: true }
+    return { outcome: "enqueued" }
   }
 
   const drainBytes = (state: SubscriberState, limit?: number): Uint8Array[] => {
@@ -154,13 +164,23 @@ export function createFanout(options: FanoutOptions = {}): Fanout {
   const publishBytes = (bytes: Uint8Array, frame: EgressFrame): PublishResult => {
     const durable = isDurable(frame)
     const overflowed: string[] = []
+    const droppedDeltas: string[] = []
+    let delivered = 0
     for (const state of states.values()) {
       const outcome = enqueue(state, bytes, durable)
-      if (outcome.enqueued) continue
+      if (outcome.outcome === "enqueued") {
+        delivered++
+        continue
+      }
+      if (outcome.outcome === "dropped-delta") {
+        droppedDeltas.push(state.id)
+        continue
+      }
+      // A durable could not be enqueued: a committed boundary was lost.
       state.overflowed = true
       overflowed.push(state.id)
     }
-    return { delivered: states.size - overflowed.length, overflowed }
+    return { delivered, overflowed, droppedDeltas }
   }
 
   return {
@@ -198,5 +218,3 @@ export function createFanout(options: FanoutOptions = {}): Fanout {
     },
   }
 }
-
-export * as EgressFanout from "./fanout"

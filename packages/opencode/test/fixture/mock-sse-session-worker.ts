@@ -21,7 +21,7 @@ import {
   type SessionWorkFactory,
 } from "@/session/worker/execute"
 import { currentThreadId } from "../lib/loop-gap"
-import { MOCK_SSE_WORK_KIND, burnCpu, consumeMockSse, readMockSseConfig } from "../lib/mock-sse-harness"
+import { MOCK_SSE_WORK_KIND, burnCpu, consumeMockSse, readMockSseConfig } from "../lib/mock-sse-worker"
 
 interface WorkerScope {
   onmessage: ((event: { data: unknown }) => void) | null

@@ -27,6 +27,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { startMockProvider } from "../test/lib/mock-provider"
+import { readSsePayloads } from "../test/lib/sse"
 import { testProviderConfig } from "../test/lib/test-provider"
 
 // --- Contract ---------------------------------------------------------------
@@ -153,20 +154,6 @@ function observedType(event: unknown): string | undefined {
   return typeof type === "string" ? type : undefined
 }
 
-/** Parse SSE `data:` frames from a text chunk, invoking `onEvent` per JSON body. */
-function consumeSseChunk(chunk: string, onEvent: (event: unknown) => void): void {
-  for (const line of chunk.split("\n")) {
-    if (!line.startsWith("data:")) continue
-    const raw = line.slice("data:".length).trim()
-    if (raw.length === 0) continue
-    try {
-      onEvent(JSON.parse(raw))
-    } catch {
-      // Non-JSON heartbeat payloads are not events we assert on.
-    }
-  }
-}
-
 /** Match the "listening on http://host:port" sentinel out of captured stdout. */
 function parseListeningUrl(stdout: string): string | undefined {
   return /listening on (http:\/\/[^\s]+)/.exec(stdout)?.[1]
@@ -216,7 +203,7 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
 
   const sseAbort = new AbortController()
   const eventTypeSeen = new Set<string>()
-  let sseReader: ReadableStreamDefaultReader<Uint8Array> | undefined
+  let sseDrain: Promise<void> | undefined
 
   try {
     const url = await waitForListening(stdout, () => serverExitCode)
@@ -237,14 +224,14 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
     if (!eventResponse.ok || eventResponse.body === null) {
       throw new Error(`GET /global/event failed: HTTP ${eventResponse.status}`)
     }
-    sseReader = eventResponse.body.getReader()
-    const sseDrain = drainSse(sseReader, (event) => {
+    sseDrain = readSsePayloads(eventResponse.body, (event) => {
       const type = observedType(event)
       if (type === undefined || eventTypeSeen.has(type)) return
       eventTypeSeen.add(type)
       observed.push(type)
+    }).catch(() => {
+      // Aborted at teardown.
     })
-    void sseDrain
 
     const session = await createSession(url, worktree)
     await promptAsync(url, worktree, session)
@@ -266,7 +253,7 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
     })
   } finally {
     sseAbort.abort()
-    await sseReader?.cancel().catch(() => {})
+    await sseDrain
     await stopServer(server)
     await Promise.allSettled([stdoutDrain, stderrDrain])
     rmSync(home, { recursive: true, force: true })
@@ -327,29 +314,6 @@ async function promptAsync(url: string, directory: string, sessionID: string): P
   })
   if (response.status !== 204) {
     throw new Error(`POST /session/:id/prompt_async failed: HTTP ${response.status} ${await response.text()}`)
-  }
-}
-
-async function drainSse(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  onEvent: (event: unknown) => void,
-): Promise<void> {
-  const decoder = new TextDecoder()
-  let buffer = ""
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) return
-      buffer += decoder.decode(value, { stream: true })
-      let boundary = buffer.indexOf("\n\n")
-      while (boundary !== -1) {
-        consumeSseChunk(buffer.slice(0, boundary), onEvent)
-        buffer = buffer.slice(boundary + 2)
-        boundary = buffer.indexOf("\n\n")
-      }
-    }
-  } catch {
-    // Aborted at teardown.
   }
 }
 

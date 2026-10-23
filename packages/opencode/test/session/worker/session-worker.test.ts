@@ -960,11 +960,11 @@ describe("worker run-state idle parity (flag-on)", () => {
     const store = new Map<string, SessionStatus.Info>()
     serveHubProxy(
       {
-        get: (sessionID) => store.get(sessionID as string) ?? { type: "idle" },
-        set: (sessionID, status) => {
+        "sessionStatus.get": (sessionID) => store.get(sessionID as string) ?? { type: "idle" },
+        "sessionStatus.set": (sessionID, status) => {
           store.set(sessionID as string, status as SessionStatus.Info)
         },
-        list: () => [...store.entries()],
+        "sessionStatus.list": () => [...store.entries()],
       },
       channel.port2,
     )
@@ -1208,9 +1208,8 @@ describe("real SessionPrompt.loop over the writer-backed worker Database (E2E)",
 // End-to-end: a real worker `SessionPrompt.loop` run that ERRORS. The processor
 // halts on the provider failure and publishes a NON-durable `session.error`,
 // which the worker's EventV2→egress bridge forwards verbatim across the isolate
-// to the hub-side sink. The audit (`.parallel-implement/o1-w4-audit.md`, phase 5)
-// flagged that `session.error` was only unit-covered at the hub sink, never over
-// a real worker error run.
+// to the hub-side sink. `session.error` was previously only unit-covered at the
+// hub sink, never over a real worker error run.
 //
 // The verbatim shape is the flag-OFF EventV2 wire shape `{ id, type, properties }`
 // (`properties` is the event `data`), NOT the writer-style `{ id, type, data }`.

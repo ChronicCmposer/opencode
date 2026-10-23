@@ -18,7 +18,8 @@ import { Effect, Exit, Scope } from "effect"
 import type { SessionID } from "@/session/schema"
 import { createSessionRunMachine, type SessionExecutionResult } from "@/session/worker/execute"
 import { createGoldenCapture, type GoldenCapture, type GoldenRow } from "./golden"
-import { DEFAULT_BURN_ITERATIONS, burnCpu, consumeMockSse, runParallelSessions } from "./mock-sse-harness"
+import { DEFAULT_BURN_ITERATIONS, burnCpu, consumeMockSse } from "./mock-sse-worker"
+import { runParallelSessions } from "./session-parallelism"
 
 /** The default per-run owner fencing every durable row in a rollout capture. */
 export const DEFAULT_OWNER = "run-rollout"

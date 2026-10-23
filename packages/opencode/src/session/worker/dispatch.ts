@@ -17,7 +17,7 @@
 
 import { Schema } from "effect"
 import type { SessionID } from "@/session/schema"
-import type { PromptInput } from "@/session/prompt"
+import type { PromptInput, ShellInput } from "@/session/prompt"
 import { defined } from "@/util/object"
 import { parsePositiveInt } from "@/util/parse"
 import {
@@ -109,18 +109,11 @@ export interface WorkerPool {
 type Assignable<From, To> = [From] extends [To] ? true : never
 type ExecutorPoolFitsWorkerPool = Assignable<ExecutorWorkerPool, WorkerPool>
 
-/** Raised when a session has failed because its worker crashed (plan 11.7). */
-export class SessionCrashedError extends Schema.TaggedErrorClass<SessionCrashedError>()("SessionCrashedError", {
-  message: Schema.String,
-  workerID: Schema.Number,
-  /** The underlying isolate failure, when one was captured. */
-  cause: Schema.optional(Schema.Defect()),
-}) {}
-
 /**
- * Worker-level crash. It is also a `SessionCrashedError` (the session failed),
- * so a caller may catch either the worker- or the session-level error. It keeps
- * its own `_tag` for `Effect.catchTag("WorkerCrashedError")`.
+ * Raised when a session has failed because its worker crashed (plan 11.7). It is
+ * the single crash error: a crashed run rejects with this, and callers match it
+ * by tag (`Effect.catchTag("WorkerCrashedError")`) or structurally. There is no
+ * separate session-level crash class to keep in sync, so no prototype surgery.
  */
 export class WorkerCrashedError extends Schema.TaggedErrorClass<WorkerCrashedError>()("WorkerCrashedError", {
   message: Schema.String,
@@ -133,11 +126,6 @@ export class WorkerCrashedError extends Schema.TaggedErrorClass<WorkerCrashedErr
 function describeFailure(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
-
-// A crashed session failed, so `WorkerCrashedError` is also a
-// `SessionCrashedError`: re-parent its prototype to keep `instanceof
-// SessionCrashedError` true while its own `_tag` stays "WorkerCrashedError".
-Object.setPrototypeOf(WorkerCrashedError.prototype, SessionCrashedError.prototype)
 
 /** Raised to the caller when a session is cancelled. */
 export class SessionCancelledError extends Schema.TaggedErrorClass<SessionCancelledError>()("SessionCancelledError", {
@@ -199,6 +187,8 @@ export interface DispatchRequest {
    * (Solution 1 / B2). Absent keeps a plain run byte-for-byte unchanged.
    */
   readonly prompt?: PromptInput
+  /** The shell command for a `"startShell"` dispatch; absent for a plain run. */
+  readonly shell?: ShellInput
 }
 
 export interface DispatcherOptions {
@@ -218,6 +208,13 @@ export interface DispatcherOptions {
   readonly cancellation?: CancellationConfig
   /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
   readonly log?: WorkerLogger
+  /**
+   * Per-session write barrier (R4#16). When supplied, a completed run is not
+   * released (its slot freed, its waiters promoted) until the barrier for that
+   * session resolves — the hub wires it to the worker's durable-egress ack, so
+   * the next run never overtakes the prior run's egress write.
+   */
+  readonly writeBarrier?: (sessionID: SessionID) => Promise<void> | undefined
 }
 
 export interface Dispatcher extends AsyncDisposable {
@@ -267,9 +264,26 @@ interface Pending {
   readonly mode: SessionRunMode
   /** The sub-agent prompt the run carries to the worker (Solution 1). */
   readonly prompt: PromptInput | undefined
+  /** The shell command the run carries to the worker for a `"startShell"` run. */
+  readonly shell: ShellInput | undefined
   readonly promise: Promise<void>
   readonly resolve: () => void
   readonly reject: (error: unknown) => void
+  /**
+   * Resolves when the underlying run settles, independent of the caller's
+   * `promise`. A graceful cancel detects a settle through this, so deferring the
+   * caller's settlement (plan 11.9) never hides the run's own completion.
+   */
+  readonly settled: Promise<void>
+  readonly markSettled: () => void
+  /**
+   * True once the run finished NATURALLY (its executor promise resolved); stays
+   * false when the run settled by rejecting (an interrupt/failure). The graceful
+   * cancel reads it to tell a completion that won the race from a cancel that
+   * unwound the run — a distinction the worker's `cancel-ack` cannot make alone,
+   * because a real worker only acks after the run has already settled.
+   */
+  completed: boolean
   /** First-writer-wins between a cancel and a natural completion (plan 11.9). */
   readonly gate: OutcomeGate
   slot: Slot | undefined
@@ -277,6 +291,13 @@ interface Pending {
   startedAt: number | undefined
   /** The worker id hosting the run, captured at admission so it survives slot detach. */
   workerID: number | undefined
+  /**
+   * True while a graceful cancel owns this run's settlement (plan 11.9): a
+   * completion or failure must not settle the caller itself, because the
+   * controller's winner decides whether the caller resolves or rejects. This is
+   * what keeps the caller consistent with the reported outcome.
+   */
+  cancelPending: boolean
 }
 
 function createPending(
@@ -285,6 +306,7 @@ function createPending(
   kind: WorkerKind,
   mode: SessionRunMode,
   prompt: PromptInput | undefined,
+  shell: ShellInput | undefined,
 ): Pending {
   let resolve!: () => void
   let reject!: (error: unknown) => void
@@ -292,19 +314,28 @@ function createPending(
     resolve = res
     reject = rej
   })
+  let markSettled!: () => void
+  const settled = new Promise<void>((res) => {
+    markSettled = res
+  })
   return {
     sessionID,
     depth,
     kind,
     mode,
     prompt,
+    shell,
     promise,
     resolve,
     reject,
+    settled,
+    markSettled,
+    completed: false,
     gate: createOutcomeGate(),
     slot: undefined,
     startedAt: undefined,
     workerID: undefined,
+    cancelPending: false,
   }
 }
 
@@ -321,6 +352,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const onDegraded = options.onDegraded
   const cancellation = options.cancellation
   const log = options.log ?? noopWorkerLogger
+  const writeBarrier = options.writeBarrier
 
   const admission: BoundedQueue<Pending> = createBoundedQueue("admission", admissionCapacity)
   const children: BoundedQueue<Pending> = createBoundedQueue("child", childCapacity)
@@ -348,7 +380,11 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const freeSlot = (kind: WorkerKind): Slot | undefined =>
     slots.find((slot) => slot.kind === kind && slot.busy === null && !slot.retiring && slot.worker.alive)
 
-  const countHeadroomSlots = (): number => slots.filter((slot) => slot.kind === "headroom").length
+  // Capacity counts only slots that can actually take a run: a dead or retiring
+  // headroom slot must not read as free capacity (that would falsely refuse a
+  // child as "headroom full" while its replacement is still spawning).
+  const countHeadroomSlots = (): number =>
+    slots.filter((slot) => slot.kind === "headroom" && !slot.retiring && slot.worker.alive).length
   const countBusySlots = (): number => slots.filter((slot) => slot.busy !== null).length
 
   /** The queue a run of `kind` waits in; its size is the depth reported at admission. */
@@ -387,6 +423,12 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     slot.respawnCancel = undefined
   }
 
+  /**
+   * Detach `slot` from the scheduler AND retire its isolate: removing a slot is
+   * the scheduler's one "this worker is gone" transition, so the terminate lives
+   * here rather than being repeated at every call site. `terminate` is
+   * idempotent, so a slot already killed (a crash) is harmless.
+   */
   const removeSlot = (slot: Slot, options: { forget?: boolean } = {}): void => {
     clearIdleReap(slot)
     clearRespawn(slot)
@@ -401,6 +443,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     }
     const index = slots.indexOf(slot)
     if (index >= 0) slots.splice(index, 1)
+    void slot.worker.terminate().catch(() => undefined)
   }
 
   const cancelled = (sessionID: SessionID): SessionCancelledError =>
@@ -442,8 +485,9 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     pending.reject(cancelled(sessionID))
     if (slot !== undefined) {
       slot.busy = null
+      // `removeSlot` retires the isolate; reap its mirrored PGIDs before the
+      // replacement slot is spawned.
       removeSlot(slot)
-      await slot.worker.terminate().catch(() => undefined)
       if (options.reap) cancellation?.reap?.(slot.worker)
       if (!terminated) addSlot(slot.kind, pool.spawn(slot.kind))
     }
@@ -477,6 +521,8 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       // A subagent prompt rides the run frame only when present, so a plain run
       // keeps its existing shape.
       ...(pending.prompt === undefined ? {} : { prompt: pending.prompt }),
+      // The shell command rides a `startShell` run only when present.
+      ...(pending.shell === undefined ? {} : { shell: pending.shell }),
     }
     let execution: Promise<void>
     try {
@@ -502,11 +548,37 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
         workerID: slot.worker.id,
         idleMs: headroomIdleReapMs,
       })
-      void slot.worker.terminate().catch(() => undefined)
     })
   }
 
+  /**
+   * Release a completed run. The release is held behind the per-session write
+   * barrier (R4#16) so the run's durable egress write is acked before the slot
+   * is freed and the session's next run is promoted — the next run can never
+   * overtake the prior run's egress. A graceful cancel in flight owns settlement
+   * (`cancelPending`) and skips the barrier, since its controller reconciles the
+   * caller with the reported winner.
+   */
   const complete = (pending: Pending): void => {
+    // The run itself has settled: signal the graceful-cancel controller before any
+    // barrier or deferred caller settlement, so it can never miss the settle. The
+    // run resolved (not rejected), so record it as a NATURAL completion.
+    pending.completed = true
+    pending.markSettled()
+    const barrier = pending.cancelPending ? undefined : writeBarrier?.(pending.sessionID)
+    if (barrier === undefined) {
+      finalizeCompletion(pending)
+      return
+    }
+    // A barrier rejection is not a run failure: the run already completed, so
+    // release either way rather than wedging the slot forever.
+    void barrier.then(
+      () => finalizeCompletion(pending),
+      () => finalizeCompletion(pending),
+    )
+  }
+
+  const finalizeCompletion = (pending: Pending): void => {
     const slot = pending.slot
     registry.release(pending.sessionID)
     byKey.delete(pending.sessionID)
@@ -522,13 +594,20 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       durationMs: pending.startedAt === undefined ? 0 : Date.now() - pending.startedAt,
     })
     // First-writer-wins: a cancel claimed before this completion rejects instead.
-    if (pending.gate.claim("completion")) pending.resolve()
-    else pending.reject(cancelled(pending.sessionID))
+    // A graceful cancel in flight defers settlement to its controller so the
+    // caller always matches the reported winner.
+    if (!pending.cancelPending) {
+      if (pending.gate.claim("completion")) pending.resolve()
+      else pending.reject(cancelled(pending.sessionID))
+    }
     pump()
     nextWaiter(pending.sessionID)
   }
 
   const fail = (pending: Pending, error: unknown): void => {
+    // The run has settled (failed): signal the graceful-cancel controller so a
+    // cancel racing a failure resolves instead of waiting out its grace window.
+    pending.markSettled()
     const slot = pending.slot
     registry.release(pending.sessionID)
     byKey.delete(pending.sessionID)
@@ -536,6 +615,16 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     // (a) A cancelled run's rejection is a cancellation, not a crash (no respawn).
     if (pending.gate.winner === "cancel") {
       pending.reject(cancelled(pending.sessionID))
+      if (slot !== undefined) maybeReap(slot)
+      pump()
+      nextWaiter(pending.sessionID)
+      return
+    }
+    // (a') A graceful cancel in flight owns settlement: a terminate-induced (or
+    // raced) rejection must not log a run failure or reject the caller here — the
+    // controller reconciles the caller with its winner. The slot is already
+    // detached by the cancel, so there is no crash to retire.
+    if (pending.cancelPending) {
       if (slot !== undefined) maybeReap(slot)
       pump()
       nextWaiter(pending.sessionID)
@@ -632,6 +721,9 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       slot.retiring = false
       pump()
     })
+    // Drain whatever OTHER free slots can take now; the retiring slot itself
+    // rejoins capacity only when its respawn fires.
+    pump()
   }
 
   const pump = (): void => {
@@ -683,6 +775,21 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     for (const waiter of waiters.items) waiter.reject(error)
   }
 
+  /**
+   * Drain every different-run waiter parked behind a session whose run is being
+   * cancelled. A cancelled session never promotes a waiter, so each is rejected
+   * with the same cancellation instead of being left parked forever.
+   */
+  const rejectWaiters = (sessionID: SessionID, error: unknown): void => {
+    const waiters = waitersByKey.get(sessionID)
+    if (waiters === undefined) return
+    waitersByKey.delete(sessionID)
+    for (const waiter of waiters.items) {
+      waiter.gate.claim("cancel")
+      waiter.reject(error)
+    }
+  }
+
   /** A depth ≥ 1 child refused because the physical headroom is saturated. */
   const headroomFull = (): HeadroomFullError =>
     new HeadroomFullError({
@@ -724,6 +831,27 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     enqueue(pending)
   }
 
+  /**
+   * Whether an in-flight run is the exact same run as a new request. The dedup
+   * key is the full run identity — kind, frame mode, EXACT depth and the prompt
+   * and shell payloads by reference — so a same-session dispatch at a different
+   * depth (or carrying a different prompt) parks as a waiter instead of silently
+   * joining a run it does not describe.
+   */
+  const isSameRun = (
+    admitted: Pending,
+    depth: number,
+    kind: WorkerKind,
+    mode: SessionRunMode,
+    prompt: PromptInput | undefined,
+    shell: ShellInput | undefined,
+  ): boolean =>
+    admitted.depth === depth &&
+    admitted.kind === kind &&
+    admitted.mode === mode &&
+    admitted.prompt === prompt &&
+    admitted.shell === shell
+
   const dispatch = (request: DispatchRequest): Promise<void> => {
     const depth = request.depth ?? 0
     if (!Number.isInteger(depth) || depth < 0) {
@@ -734,12 +862,14 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const kind: WorkerKind = workerKindForDepth(depth)
     const mode: SessionRunMode = request.mode ?? "run"
     const sessionID = request.sessionID
+    const prompt = request.prompt
+    const shell = request.shell
 
     const admitted = byKey.get(sessionID)
     if (admitted !== undefined) {
-      if (admitted.kind === kind && admitted.mode === mode) return admitted.promise
-      // Different kind or frame mode: park behind the in-flight run, bounded per key.
-      const pending = createPending(sessionID, depth, kind, mode, request.prompt)
+      if (isSameRun(admitted, depth, kind, mode, prompt, shell)) return admitted.promise
+      // Different run identity: park behind the in-flight run, bounded per key.
+      const pending = createPending(sessionID, depth, kind, mode, prompt, shell)
       const waiters = waitersByKey.get(sessionID) ?? createBoundedQueue<Pending>("waiter", waiterCapacity)
       if (!waitersByKey.has(sessionID)) waitersByKey.set(sessionID, waiters)
       try {
@@ -752,25 +882,40 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       return pending.promise
     }
 
-    const pending = createPending(sessionID, depth, kind, mode, request.prompt)
+    const pending = createPending(sessionID, depth, kind, mode, prompt, shell)
     byKey.set(sessionID, pending)
     startOrEnqueue(pending)
     return pending.promise
   }
 
   const cancel = async (sessionID: SessionID): Promise<void> => {
+    const error = cancelled(sessionID)
     const queued =
       admission.remove((pending) => pending.sessionID === sessionID) ??
       children.remove((pending) => pending.sessionID === sessionID)
     if (queued !== undefined) {
+      queued.gate.claim("cancel")
       byKey.delete(sessionID)
-      queued.reject(cancelled(sessionID))
+      queued.reject(error)
+      rejectWaiters(sessionID, error)
       return
     }
 
     const admitted = byKey.get(sessionID)
-    if (admitted === undefined) return
+    if (admitted === undefined) {
+      rejectWaiters(sessionID, error)
+      return
+    }
     registry.markCancelling(sessionID)
+    // Claim the gate BEFORE terminating: the terminate-induced rejection is then
+    // reported as a cancellation (`winner:"cancel"`) instead of a crash or a
+    // spurious "worker run failed" ERROR (the slot is detached by terminateSlot,
+    // so `fail` would otherwise fall through to its plain-failure branch).
+    admitted.gate.claim("cancel")
+    // Drain the waiters BEFORE terminating: the terminate-induced rejection runs
+    // `fail`, whose `nextWaiter` would otherwise promote a waiter for a session
+    // that is being cancelled.
+    rejectWaiters(sessionID, error)
     // `terminateSlot` detaches the slot first, so the terminate-induced rejection
     // is not mistaken for a crash (which would schedule a spurious respawn).
     await terminateSlot(sessionID, admitted, admitted.slot, { reap: false })
@@ -793,9 +938,10 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       admission.remove((pending) => pending.sessionID === sessionID) ??
       children.remove((pending) => pending.sessionID === sessionID)
     if (queued !== undefined) {
-      byKey.delete(sessionID)
       queued.gate.claim("cancel")
+      byKey.delete(sessionID)
       queued.reject(cancelled(sessionID))
+      rejectWaiters(sessionID, cancelled(sessionID))
       config.onCancelled?.({ sessionID, mode: "queued", workerID: undefined, resumeFromDb: true })
       return { sessionID, mode: "terminated", winner: "cancel", acknowledged: false, durationMs: 0 }
     }
@@ -803,13 +949,17 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const admitted = byKey.get(sessionID)
     if (admitted === undefined) return undefined
 
-    admitted.gate.claim("cancel")
     registry.markCancelling(sessionID)
     const slot = admitted.slot
     const port = slot === undefined ? undefined : config.portFor?.(slot.worker)
 
-    // No control channel: fall straight through to the terminate path.
+    // No control channel: claim the cancel and terminate in place. Claiming the
+    // gate first keeps the terminate-induced rejection a cancellation.
     if (slot === undefined || port === undefined) {
+      admitted.gate.claim("cancel")
+      // Drain waiters before terminating, so the terminate-induced `fail` cannot
+      // promote one for a session that is being cancelled.
+      rejectWaiters(sessionID, cancelled(sessionID))
       await terminateSlot(sessionID, admitted, slot, {
         reap: true,
         onRetired: () =>
@@ -822,40 +972,56 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
 
     // Detach the slot so the terminate-induced rejection is not misread as a crash.
     admitted.slot = undefined
-    const outcome = await controllerFor(config, slot, port).cancel(sessionID, { complete: admitted.promise })
-    // Q11 — completion wins. The dispatcher claims the cancel gate before the
-    // controller runs, so a run that settles on its own during the grace window
-    // is reported by the controller as `cooperative`. The worker's `cancel-ack`
-    // is the discriminator: a settle with no ack means the run completed
-    // naturally, so reclassify the outcome to `completed`/`completion`. The ack
-    // already reflects the worker's real reply and is preserved verbatim.
-    const resolved: CancelOutcome =
-      outcome.mode === "cooperative" && !outcome.acknowledged
-        ? { ...outcome, mode: "completed", winner: "completion" }
-        : outcome
-
-    // A `cooperative` outcome means the worker's run settled at a checkpoint.
-    // The run-control seam (`execute.ts` `SessionRunControl`, registered by the
-    // worker) delegates the executor's `cancel`/`busy` into the worker-local
-    // run-state, so the `cancel-ack` reflects the real loop unwinding — this
-    // branch can trust it and reuse the live worker. A grace *expiry* is
-    // unambiguous and lands below: the controller has terminated + reaped, and
-    // this releases the slot.
-    if (resolved.mode === "terminated") {
-      // The controller terminated the isolate and reaped its PGIDs; terminate
-      // again is idempotent, so only the reservation + slot need releasing.
-      await terminateSlot(sessionID, admitted, slot, { reap: false })
-      pump()
-      nextWaiter(sessionID)
-    } else {
-      // Cooperative or completed: the run settled at a checkpoint; reuse the live
-      // worker (11.4).
-      slot.busy = null
-      maybeReap(slot)
-      pump()
+    // The graceful cancel owns the caller's settlement: `complete`/`fail` must not
+    // settle it while this runs, because the controller's winner decides whether
+    // the caller resolves (completion) or rejects (cancel). This is the
+    // reconciliation that keeps the caller consistent with the reported outcome.
+    admitted.cancelPending = true
+    // Drain waiters up-front: `complete`/`fail` still call `nextWaiter` while the
+    // controller runs, and a cancelled session must never promote a waiter.
+    rejectWaiters(sessionID, cancelled(sessionID))
+    let resolved: CancelOutcome = {
+      sessionID,
+      mode: "terminated",
+      winner: "cancel",
+      acknowledged: false,
+      durationMs: 0,
     }
-    config.onCancelled?.({ sessionID, mode: resolved.mode, workerID: slot.worker.id, resumeFromDb: true })
-    return resolved
+    try {
+      const outcome = await controllerFor(config, slot, port).cancel(sessionID, { complete: admitted.settled })
+      // Q11 — completion wins, decided by how the run settled rather than by the
+      // worker's ack alone (a real worker acks only after the run has settled, so
+      // the ack is often not visible yet). A cooperative settle of a run that
+      // resolved naturally, with no accepted cancel, is a completion; a run that
+      // settled by rejecting is a cancel even without an ack.
+      resolved =
+        outcome.mode === "cooperative" && !outcome.acknowledged && admitted.completed
+          ? { ...outcome, mode: "completed", winner: "completion" }
+          : outcome
+
+      // A `cooperative` outcome means the worker's run settled at a checkpoint;
+      // the live worker is reused (11.4). A grace *expiry* is unambiguous: the
+      // controller terminated + reaped, and this releases the slot. A `completed`
+      // outcome means the run finished on its own; the live worker is reused too.
+      if (resolved.mode === "terminated") {
+        await terminateSlot(sessionID, admitted, slot, { reap: false })
+        pump()
+        nextWaiter(sessionID)
+      } else {
+        slot.busy = null
+        maybeReap(slot)
+        pump()
+      }
+      config.onCancelled?.({ sessionID, mode: resolved.mode, workerID: slot.worker.id, resumeFromDb: true })
+      return resolved
+    } finally {
+      admitted.cancelPending = false
+      // Reconcile the caller with the reported winner. `terminateSlot` already
+      // rejected it on the terminated path, so the extra settle is a no-op there.
+      if (resolved.winner === "completion") admitted.resolve()
+      else admitted.reject(cancelled(sessionID))
+      rejectWaiters(sessionID, cancelled(sessionID))
+    }
   }
 
   const terminateAll = async (): Promise<void> => {

@@ -187,10 +187,12 @@ test("fails loudly when the busy retry budget is exhausted", async () => {
         const db = yield* EffectDrizzleSqlite.makeWithDefaults()
         yield* db.run(sql`pragma busy_timeout = 0`)
 
+        // `BusyRetriesExhaustedError` is a typed `Schema.TaggedErrorClass`, so it
+        // rides the error channel: `Effect.flip` surfaces it as a plain value.
         return yield* withBusyRetry(
           db.transaction((tx) => tx.insert(users).values({ name: "Blocked" }), { behavior: "immediate" }),
           { retries: 2, baseDelayMs: 1, maxDelayMs: 1, sleep: () => Effect.void },
-        ).pipe(Effect.catchDefect((cause) => Effect.succeed(cause)))
+        ).pipe(Effect.flip)
       }).pipe(Effect.provide(SqliteClient.layer({ filename, disableWAL: true })), Effect.scoped),
     )
 

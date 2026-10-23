@@ -35,92 +35,8 @@ const UMBRELLA_ENV = "OPENCODE_EXPERIMENTAL"
  * graph decision (`SessionWorkerNodes.sessionWorkersEnabled`) and the runtime
  * gate below, so the two cannot disagree on how a value is interpreted.
  */
-export const experimentalSessionWorkersFromEnv = (
-  env: Record<string, string | undefined> = process.env,
-): boolean =>
+export const experimentalSessionWorkersFromEnv = (env: Record<string, string | undefined> = process.env): boolean =>
   parseBoolean(env[SESSION_WORKERS_ENV]) ?? parseBoolean(env[UMBRELLA_ENV]) ?? false
-
-export type SessionWorkersFlagSource = "dedicated" | "umbrella" | "default"
-
-export interface SessionWorkersFlagDescription {
-  readonly enabled: boolean
-  readonly source: SessionWorkersFlagSource
-}
-
-export interface SessionWorkersFlagFields {
-  readonly OPENCODE_EXPERIMENTAL_SESSION_WORKERS: string
-  readonly OPENCODE_EXPERIMENTAL: string
-  readonly experimentalSessionWorkers: boolean
-  readonly source: SessionWorkersFlagSource
-  /**
-   * Present only when the caller supplies the runtime gate value. This is the
-   * flag as resolved through the active ConfigProvider at instance-init time,
-   * which can differ from `experimentalSessionWorkers` (the module-eval graph
-   * decision) when the provider injects a different value.
-   */
-  readonly runtimeExperimentalSessionWorkers?: boolean
-  /** Present only alongside `runtimeExperimentalSessionWorkers`; true when the two disagree. */
-  readonly diverges?: boolean
-}
-
-/**
- * The resolved session-worker rollout flag plus WHICH variable decided it.
- * `enabled` always comes from the canonical `experimentalSessionWorkersFromEnv`,
- * so this can never disagree with the graph decision; `source` only reports
- * which input won.
- */
-export const describeSessionWorkersFlag = (
-  env: Record<string, string | undefined> = process.env,
-): SessionWorkersFlagDescription => {
-  const enabled = experimentalSessionWorkersFromEnv(env)
-  if (parseBoolean(env[SESSION_WORKERS_ENV]) !== undefined) return { enabled, source: "dedicated" }
-  if (parseBoolean(env[UMBRELLA_ENV]) !== undefined) return { enabled, source: "umbrella" }
-  return { enabled, source: "default" }
-}
-
-export const sessionWorkersFlagFields = (
-  env: Record<string, string | undefined> = process.env,
-  runtimeValue?: boolean,
-): SessionWorkersFlagFields => {
-  const { enabled, source } = describeSessionWorkersFlag(env)
-  const fields: SessionWorkersFlagFields = {
-    OPENCODE_EXPERIMENTAL_SESSION_WORKERS: env[SESSION_WORKERS_ENV] ?? "<unset>",
-    OPENCODE_EXPERIMENTAL: env[UMBRELLA_ENV] ?? "<unset>",
-    experimentalSessionWorkers: enabled,
-    source,
-  }
-  if (runtimeValue === undefined) return fields
-  return {
-    ...fields,
-    runtimeExperimentalSessionWorkers: runtimeValue,
-    diverges: runtimeValue !== enabled,
-  }
-}
-
-export const logSessionWorkersFlag = <A, E, R>(
-  logInfo: (message: string, fields: SessionWorkersFlagFields) => Effect.Effect<A, E, R>,
-  env: Record<string, string | undefined> = process.env,
-  runtimeValue?: boolean,
-): Effect.Effect<A, E, R> => logInfo("session workers flag", sessionWorkersFlagFields(env, runtimeValue))
-
-let sessionWorkersFlagLogged = false
-
-/** Emits the startup line at most once per process. */
-export const logSessionWorkersFlagOnce = <A, E, R>(
-  logInfo: (message: string, fields: SessionWorkersFlagFields) => Effect.Effect<A, E, R>,
-  env: Record<string, string | undefined> = process.env,
-  runtimeValue?: boolean,
-): Effect.Effect<void, E, R> =>
-  Effect.suspend(() => {
-    if (sessionWorkersFlagLogged) return Effect.void
-    sessionWorkersFlagLogged = true
-    return logSessionWorkersFlag(logInfo, env, runtimeValue).pipe(Effect.asVoid)
-  })
-
-/** Test seam: reset the process-wide once-guard. */
-export const resetSessionWorkersFlagLoggedForTest = (): void => {
-  sessionWorkersFlagLogged = false
-}
 
 /**
  * Read an optional string from the ConfigProvider. A missing *or* unparseable
@@ -212,5 +128,51 @@ export const layer = (overrides: Partial<Info> = {}) =>
   ).pipe(Layer.provide(emptyConfigLayer))
 
 export const node = LayerNode.make({ service: Service, layer: Service.layer.pipe(Layer.orDie), deps: [] })
+
+/**
+ * The all-defaults flag set, resolved once from an empty `ConfigProvider`.
+ *
+ * Used as the recovery baseline when a hub-serialized snapshot omits a flag (a
+ * version-skewed worker), so parsing a snapshot never falls back to the
+ * isolate's `process.env`.
+ */
+let cachedDefaults: Info | undefined
+const defaults = (): Info => {
+  cachedDefaults ??= Effect.runSync(
+    Effect.gen(function* () {
+      return yield* Service
+    }).pipe(Effect.provide(emptyConfigLayer)),
+  )
+  return cachedDefaults
+}
+
+/**
+ * Parse a hub-serialized `RuntimeFlags` snapshot at the worker boundary.
+ *
+ * The hub resolves every flag once (including any per-layer override) and freezes
+ * the result into the worker snapshot; the isolate must trust that value rather
+ * than re-deriving it from its own `ConfigProvider`/`process.env`. This parses the
+ * serialized record against the canonical schema's defaults: a known flag with the
+ * right runtime type is carried through, and a missing or malformed entry recovers
+ * to its default. The result is a trusted {@link Info} for the rest of the isolate.
+ */
+export const parseInfo = (input: unknown): Info => {
+  const fallback = defaults() as Record<string, unknown>
+  if (typeof input !== "object" || input === null) return fallback as Info
+  const source = input as Record<string, unknown>
+  const parsed: Record<string, unknown> = { ...fallback }
+  for (const key of Object.keys(fallback)) {
+    const expected = fallback[key]
+    const value = source[key]
+    // An optional numeric flag (`outputTokenMax`, `bashDefaultTimeoutMs`) defaults
+    // to `undefined`; accept any finite number.
+    if (expected === undefined) {
+      if (value === undefined || (typeof value === "number" && Number.isFinite(value))) parsed[key] = value
+      continue
+    }
+    if (typeof value === typeof expected) parsed[key] = value
+  }
+  return parsed as Info
+}
 
 export * as RuntimeFlags from "./runtime-flags"
