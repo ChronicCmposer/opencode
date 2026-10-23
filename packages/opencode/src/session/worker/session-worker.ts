@@ -26,6 +26,7 @@ import { Cause, Effect, Fiber, Layer, Option } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { isRole, setProcessRole } from "@/effect/process-role"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { AppProcess } from "@opencode-ai/core/process"
 import { Project } from "@opencode-ai/schema/project"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRunState } from "@/session/run-state"
@@ -79,6 +80,7 @@ import {
   type WriterClientHandle,
 } from "./layer"
 import { workerSnapshotBoundaryLayer } from "./snapshot"
+import { workerAppProcessNode } from "./app-process-report"
 import { PidReporter, type PidReport, type PidReporterInterface } from "./pid-registry"
 import type { Role } from "./node-table"
 
@@ -629,11 +631,27 @@ function directClients(backgroundJob: BackgroundJobClientHandle): WorkerClients 
  * serves exactly one serialized model) and the fail-soft `Snapshot` boundary (the
  * isolate cannot run `git`). Kept as one seam so the production entry and its
  * tests wire the identical replacements.
+ *
+ * When the worker owns a control-port `reporter`, `AppProcess` is replaced with
+ * the reporting wrapper ({@link workerAppProcessNode}): the worker runs real
+ * child processes (`Ripgrep` searches, formatters), and a mid-flight child would
+ * otherwise be orphaned on terminate (no finalizers run). The replacement is a
+ * NODE, so the graph provides its `CrossSpawnSpawner` dependency. It is applied
+ * after `boundaryReplacements`, so it wins over any default.
  */
-export function workerGraphReplacements(config: WorkerModelConfig): LayerNode.Replacements {
+export function workerGraphReplacements(
+  config: WorkerModelConfig,
+  reporter?: PidReporterInterface,
+): LayerNode.Replacements {
+  // The reporting `AppProcess` replacement is a NODE (not a plain layer), so the
+  // graph provides its `CrossSpawnSpawner` dependency; typed as `Replacements`
+  // here so the tuple survives the spread.
+  const appProcess: LayerNode.Replacements =
+    reporter === undefined ? [] : [[AppProcess.node, workerAppProcessNode(reporter)]]
   return [
     [Provider.node, reducedModelProviderLayer(config)],
     [Snapshot.node, workerSnapshotBoundaryLayer()],
+    ...appProcess,
   ]
 }
 
@@ -837,8 +855,10 @@ export function bootstrapSessionWorker(
     backgroundJob: backgroundJobClientLayer(jobClient),
     // The worker serves exactly one serialized model, so the reduced provider is
     // the graph's provider (the real loop's `LLM` and `SessionPrompt` use it), and
-    // snapshot tracking is a fail-soft no-op (the isolate cannot run `git`).
-    replacements: workerGraphReplacements(config),
+    // snapshot tracking is a fail-soft no-op (the isolate cannot run `git`). With
+    // a control-port reporter, `AppProcess` is replaced by the reporting wrapper
+    // so a mid-flight `rg` child's PGID reaches the hub mirror before terminate.
+    replacements: workerGraphReplacements(config, pidReporter),
     // The worker-hosted plugin host reaches the graph's `LLM`/`Plugin` node too,
     // not just the `ModelClient` sealed below, so plugin-set sampling/headers
     // apply identically in both. Absent keeps the graph's no-op pass-through.

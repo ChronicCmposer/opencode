@@ -21,6 +21,9 @@ import { testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceStore } from "@/project/instance-store"
+import { PidReporter, type PidReporterInterface } from "@/session/worker/pid-registry"
+import { isAlive, isGroupAlive } from "../lib/process-tree"
+import { pollUntil } from "../lib/poll"
 
 const shellLayer = Layer.mergeAll(
   LayerNode.compile(
@@ -216,6 +219,42 @@ describe("tool.shell", () => {
         }),
       )
     }),
+  )
+})
+
+describe("tool.shell boundary", () => {
+  // Parse, don't validate: an empty command is an illegal state the parameter
+  // schema cannot express, so the boundary halts loud instead of spawning a
+  // shell that exits silently with no output.
+  it.live("rejects an empty command with a descriptive error", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const err = yield* fail({ command: "" })
+        expect(err.message).toMatch(/command/i)
+        expect(err.message).toMatch(/empty/i)
+      }),
+    ),
+  )
+
+  it.live("rejects a whitespace-only command", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const err = yield* fail({ command: "   \n\t  " })
+        expect(err.message).toMatch(/empty/i)
+      }),
+    ),
+  )
+
+  it.live("rejects a missing command at the schema boundary", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const err = yield* fail({} as Tool.InferParameters<typeof ShellTool>)
+        expect(err.message).toMatch(/invalid arguments/i)
+      }),
+    ),
   )
 })
 

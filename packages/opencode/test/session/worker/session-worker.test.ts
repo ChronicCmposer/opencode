@@ -9,8 +9,11 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { Effect, Latch, Layer, Option, Schema, Sink, Stream } from "effect"
-import { ChildProcessSpawner } from "effect/unstable/process"
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { AppProcess } from "@opencode-ai/core/process"
+import { RipgrepBinary } from "@opencode-ai/core/ripgrep/binary"
+import { workerAppProcessLayer } from "@/session/worker/app-process-report"
 import { ShellTool } from "@/tool/shell"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -684,6 +687,82 @@ describe("worker→hub PID reporting (P5 prerequisite)", () => {
 })
 
 // ---------------------------------------------------------------------------
+// Fix 2 — worker-local ripgrep: the binary path comes from the snapshot and the
+// real `AppProcess` spawns report their detached PGID so the hub reaps a
+// mid-flight `rg` on cancel/terminate (worker terminate runs NO finalizers).
+//
+// `Ripgrep.Service` spawns through `AppProcess.spawn`; `RipgrepBinary` is
+// snapshot-backed (never locates/downloads). The worker replaces `AppProcess`
+// with a reporting wrapper built over a *private* `ChildProcessSpawner`, so the
+// shell tool's own `ChildProcessSpawner` reports stay untouched (no double report
+// with a mismatched label, which `PidRegistry.register` rejects).
+// ---------------------------------------------------------------------------
+
+describe("worker-local ripgrep binary from the snapshot (Fix 2)", () => {
+  test("RipgrepBinary.Filepath resolves to the snapshot's ripgrepPath", async () => {
+    // `RipgrepBinary.node` is a transitive dependency (via `ToolRegistry`), so
+    // `Layer.provide` would hide its service. Promote it to a root of the same
+    // runnable graph so the boot wiring's snapshot-backed replacement is directly
+    // observable — the rest of the graph (and the client-key assertion) is intact.
+    const built = buildSessionWorkerLayer({
+      nodes: LayerNode.group([...RUNNABLE_SESSION_NODES.dependencies, RipgrepBinary.node]),
+      snapshot: workerSnapshot({ ripgrepPath: "/custom/rg" }),
+      env: { values: {} },
+      clients: stubClients(),
+      modelClient: modelLayer("worker text"),
+    })
+
+    const filepath = await Effect.runPromise(
+      Effect.gen(function* () {
+        const binary = yield* RipgrepBinary.Service
+        return yield* binary.filepath
+      }).pipe(Effect.provide(built.layer)),
+    )
+
+    // The worker never locates or downloads `rg`; it runs exactly the hub's path.
+    expect(filepath).toBe("/custom/rg")
+  })
+})
+
+describe("worker-local AppProcess PID reporting (Fix 2)", () => {
+  test("a spawn through the reporting AppProcess reports its detached {pid,pgid}", async () => {
+    const reports: Array<{ pid: number; pgid: number; label: string }> = []
+    // The fixed-PID fake replaces the underlying `ChildProcessSpawner`, exactly
+    // as the shell-tool harness fakes `CrossSpawnSpawner.node` for deterministic
+    // PIDs. The reporting wrapper wraps the real `AppProcess` over that fake.
+    const layer = workerAppProcessLayer({ report: (entry) => void reports.push(entry) }).pipe(
+      Layer.provide(fixedPidSpawnerLayer(4321)),
+    )
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const process = yield* AppProcess.Service
+        const handle = yield* Effect.scoped(process.spawn(ChildProcess.make("rg", ["--version"])))
+        expect(Number(handle.pid)).toBe(4321)
+      }).pipe(Effect.provide(layer)),
+    )
+
+    // POSIX detached children lead their own group, so `pgid === pid`.
+    expect(reports).toEqual([{ pid: 4321, pgid: 4321, label: "rg --version" }])
+  })
+
+  test("delegates the spawn unchanged and stays silent without a reporter", async () => {
+    const layer = workerAppProcessLayer(undefined).pipe(Layer.provide(fixedPidSpawnerLayer(7)))
+
+    const pid = await Effect.runPromise(
+      Effect.gen(function* () {
+        const process = yield* AppProcess.Service
+        const handle = yield* Effect.scoped(process.spawn(ChildProcess.make("rg", ["--files"])))
+        return Number(handle.pid)
+      }).pipe(Effect.provide(layer)),
+    )
+
+    // A degraded/absent reporter must not change the spawn's observable result.
+    expect(pid).toBe(7)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Step 28 — work-kind registry.
 // ---------------------------------------------------------------------------
 
@@ -821,6 +900,74 @@ describe("B2 carried prompt (createSessionWork)", () => {
 
     expect(record).toEqual(["loop"])
     expect(queries).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// B3 — the carried shell. A dispatched shell's input crosses the executor frame;
+// the worker must replay the caller's full `SessionPrompt.shell` path (persist +
+// shell + settle) rather than the bare `loop`. The run's `sessionID` is
+// authoritative, so a stale id on the carried shell never wins. The executor
+// passes the shell as the third `SessionWork` argument, so the frozen contract
+// is `createSessionWork(sessionID, carriedPrompt, carriedShell)`.
+// ---------------------------------------------------------------------------
+
+describe("B3 carried shell (createSessionWork)", () => {
+  /** A `SessionPrompt` service that records the shell input; loop/prompt die. */
+  const shellServiceLayer = (record: Array<Record<string, unknown>>): Layer.Layer<unknown, unknown> =>
+    Layer.succeed(SessionPrompt.Service, {
+      cancel: () => Effect.succeed(undefined),
+      prompt: () => Effect.die("the prompt path is not exercised here"),
+      loop: () => Effect.die("the loop path is not exercised here"),
+      shell: (input) => {
+        record.push(input as unknown as Record<string, unknown>)
+        return Effect.succeed(withParts(input.sessionID))
+      },
+      command: () => Effect.die("the command path is not exercised here"),
+      resolvePromptParts: () => Effect.succeed([]),
+    }) as unknown as Layer.Layer<unknown, unknown>
+
+  const writerFor = () => ({
+    query: async () => [],
+    publish: async () => ({ seq: 0, committed: false }),
+  })
+
+  test("a carried shell runs SessionPrompt.shell with the run's sessionID, not loop", async () => {
+    const shells: Array<Record<string, unknown>> = []
+    const work = createSessionWork({
+      layer: shellServiceLayer(shells),
+      writer: writerFor(),
+      threadId: 0,
+      prompt: true,
+    })
+    // A stale sessionID on the carried shell: the run's id must win because the
+    // implementation spreads `{ ...carriedShell, sessionID }`.
+    const carried = { sessionID: sid("ses_stale"), agent: "build", command: "echo hi" }
+
+    const result = await Effect.runPromise(work(sid("ses_shell"), undefined, carried))
+
+    expect(shells).toHaveLength(1)
+    expect(shells[0]).toEqual({ sessionID: sid("ses_shell"), agent: "build", command: "echo hi" })
+    expect(result.sessionID).toBe(sid("ses_shell"))
+    expect(result.value).toEqual(withParts(sid("ses_shell")))
+  })
+
+  test("a carried shell takes precedence over a carried prompt", async () => {
+    const shells: Array<Record<string, unknown>> = []
+    const work = createSessionWork({
+      layer: shellServiceLayer(shells),
+      writer: writerFor(),
+      threadId: 0,
+      prompt: true,
+    })
+    const input: PromptInput = { sessionID: sid("ses_p"), parts: [{ type: "text", text: "hi" }] }
+    const carried = { sessionID: sid("ses_stale"), agent: "build", command: "pwd" }
+
+    await Effect.runPromise(work(sid("ses_both"), input, carried))
+
+    // Only the shell path ran; the prompt path died if it were taken.
+    expect(shells).toHaveLength(1)
+    expect(shells[0]).toEqual({ sessionID: sid("ses_both"), agent: "build", command: "pwd" })
   })
 })
 

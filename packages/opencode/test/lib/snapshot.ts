@@ -86,6 +86,8 @@ export function workerSnapshot(overrides: Partial<WorkerSnapshot> = {}): WorkerS
   return {
     epoch: 1,
     directory: "/tmp/opencode-worker",
+    // The hub's resolved ripgrep path; a worker runs this binary in-isolate.
+    ripgrepPath: "/usr/bin/rg",
     config: {},
     auth: {},
     modelsDev: {},

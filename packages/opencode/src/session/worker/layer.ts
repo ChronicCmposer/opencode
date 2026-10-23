@@ -85,8 +85,6 @@ import { Storage } from "@/storage/storage"
 import { Git } from "@/git"
 import { BackgroundJob } from "@/background/job"
 import { Global } from "@opencode-ai/core/global"
-import { AppProcess } from "@opencode-ai/core/process"
-import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { RipgrepBinary } from "@opencode-ai/core/ripgrep/binary"
 import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
 import { BackgroundJob as CoreBackgroundJob } from "@opencode-ai/core/background-job"
@@ -538,6 +536,12 @@ export interface WorkerSnapshot {
    * `[directory]`.
    */
   readonly directories?: readonly string[]
+  /**
+   * The hub's resolved ripgrep executable path. Shipped so the worker runs the
+   * same `rg` the hub uses instead of locating/downloading its own; absent ⇒ the
+   * worker falls back to a PATH-resolved `rg`.
+   */
+  readonly ripgrepPath?: string
   readonly config: ConfigV1.Info
   readonly auth: Readonly<Record<string, unknown>>
   readonly modelsDev: Readonly<Record<string, ModelsDev.Provider>>
@@ -854,28 +858,15 @@ export function gitBoundaryLayer(): Layer.Layer<Git.Service> {
 }
 
 /**
- * The AppProcess boundary: a worker owns no OS child-process authority, so
- * every operation fails loud. `spawn`/`run` are Effects; the two stream forms
- * use `Stream.die` to fail in their own stream channel.
+ * The ripgrep binary a worker runs.
+ *
+ * `Ripgrep` runs in-worker (the worker has the real `AppProcess` over its
+ * `CrossSpawnSpawner`), but it must never download or locate the binary itself:
+ * the hub resolved the real path and froze it into the snapshot. Serve that path
+ * verbatim, falling back to a PATH-resolved `rg` when the snapshot omits it.
  */
-export function appProcessBoundaryLayer(): Layer.Layer<AppProcess.Service> {
-  const unsupportedStream = (member: string): Stream.Stream<never, never> =>
-    Stream.die(new SessionLayerBoundaryError("AppProcess", member))
-  return failLoudBoundary("AppProcess", AppProcess.Service, {
-    streamString: () => unsupportedStream("streamString"),
-    streamLines: () => unsupportedStream("streamLines"),
-    runStream: () => unsupportedStream("runStream"),
-  })
-}
-
-/** The ripgrep binary boundary: a worker never downloads or locates the binary. */
-export function ripgrepBinaryBoundaryLayer(): Layer.Layer<RipgrepBinary.Service> {
-  return failLoudBoundary("RipgrepBinary", RipgrepBinary.Service, {})
-}
-
-/** The ripgrep boundary: a worker owns no search process; every search fails loud. */
-export function ripgrepBoundaryLayer(): Layer.Layer<Ripgrep.Service> {
-  return failLoudBoundary("Ripgrep", Ripgrep.Service, {})
+export function snapshotRipgrepBinaryLayer(snapshot: WorkerSnapshot): Layer.Layer<RipgrepBinary.Service> {
+  return Layer.succeed(RipgrepBinary.Service, { filepath: Effect.succeed(snapshot.ripgrepPath ?? "rg") })
 }
 
 /** The MCP browser boundary: a worker never opens a browser. */
@@ -1012,9 +1003,11 @@ export function boundaryReplacements(
     // `Global` is a plain record of paths (no I/O); the real value is safe and
     // lets any read of `Global.Path`/`Service` work rather than return undefined.
     [Global.node, Layer.succeed(Global.Service, Global.make())],
-    [AppProcess.node, appProcessBoundaryLayer()],
-    [RipgrepBinary.node, ripgrepBinaryBoundaryLayer()],
-    [Ripgrep.node, ripgrepBoundaryLayer()],
+    // `AppProcess` and `Ripgrep` run IN the worker: the worker already has a real
+    // `CrossSpawnSpawner` (via `ToolRegistry`), so its ripgrep search path is
+    // functional, not a fail-loud boundary. Only the binary path is frozen — the
+    // worker must never locate or download `rg` on its own.
+    [RipgrepBinary.node, snapshotRipgrepBinaryLayer(snapshot)],
     [McpBrowser.node, mcpBrowserBoundaryLayer()],
     // The hub composes the location service map; the worker never resolves a
     // location for a V1 session, so a lazily-built empty map satisfies the graph

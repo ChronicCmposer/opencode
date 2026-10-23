@@ -58,6 +58,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
+import { withParts } from "../lib/session-parts"
 import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -296,6 +297,32 @@ const withMcpInstructions = testEffect(
 )
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
+
+// The `SessionPrompt.shell` seam: a spy run-state captures the exact arguments
+// `shell` passes to `startShell`, so the test can pin that the `ShellInput`
+// rides the dispatch (the closures cannot cross the worker isolate).
+const shellStartCalls: Array<readonly unknown[]> = []
+const shellSeamRunState = Layer.succeed(
+  SessionRunState.Service,
+  SessionRunState.Service.of({
+    assertNotBusy: () => Effect.void,
+    cancel: () => Effect.succeed(undefined),
+    ensureRunning: () => Effect.die("unexpected ensureRunning in the shell seam test"),
+    startShell: (...args) => {
+      shellStartCalls.push(args)
+      return Effect.succeed(withParts(args[0]))
+    },
+  }),
+)
+const shellSeam = testEffect(
+  LayerNode.compile(promptRoot, [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, runtimeFlags],
+    [SessionRunState.node, shellSeamRunState],
+  ] as const),
+)
 
 // Config that registers a custom "test" provider with a "test-model" model
 // so provider model lookup succeeds inside the loop.
@@ -1833,6 +1860,23 @@ noLLMServer.instance("assertNotBusy succeeds when idle", () =>
 )
 
 // Shell semantics
+
+shellSeam.instance("shell passes the ShellInput into state.startShell", () =>
+  Effect.gen(function* () {
+    shellStartCalls.length = 0
+    const prompt = yield* SessionPrompt.Service
+    const input = { sessionID: SessionID.make("ses_shell_seam"), agent: "build", command: "echo seam" }
+
+    const result = yield* prompt.shell(input)
+
+    expect(result).toEqual(withParts(input.sessionID))
+    expect(shellStartCalls).toHaveLength(1)
+    const [sessionID, , , , shell] = shellStartCalls[0]!
+    expect(sessionID).toBe(input.sessionID)
+    // The exact payload rides the dispatch: the worker resolves the shell by it.
+    expect(shell).toEqual(input)
+  }),
+)
 
 it.instance("shell rejects with BusyError when loop running", () =>
   Effect.gen(function* () {
