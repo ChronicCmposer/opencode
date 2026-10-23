@@ -13,6 +13,8 @@ import * as Client from "effect/unstable/sql/SqlClient"
 import type { Connection } from "effect/unstable/sql/SqlConnection"
 import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
+import { withBusyRetry } from "./busy"
+import { resolveBusyRetryConfig } from "./pragmas"
 import { Sqlite } from "./sqlite"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
@@ -86,15 +88,20 @@ const make = (options: Config) =>
         }
       })
 
+    // The `Connection` is the single choke point every statement and every
+    // Drizzle transaction statement flows through, so busy-retry lives here.
+    const busy = resolveBusyRetryConfig()
+    const retryBusy = <A, E, R>(effect: Effect.Effect<A, E, R>) => withBusyRetry(effect, busy)
+
     const connection = identity<SqliteConnection>({
       execute(query, params, transformRows) {
-        return transformRows ? Effect.map(run(query, params), transformRows) : run(query, params)
+        return retryBusy(transformRows ? Effect.map(run(query, params), transformRows) : run(query, params))
       },
       executeRaw(query, params) {
-        return run(query, params)
+        return retryBusy(run(query, params))
       },
       executeValues(query, params) {
-        return runValues(query, params)
+        return retryBusy(runValues(query, params))
       },
       executeUnprepared(query, params, transformRows) {
         return this.execute(query, params, transformRows)

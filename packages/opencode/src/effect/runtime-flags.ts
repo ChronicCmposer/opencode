@@ -40,6 +40,88 @@ export const experimentalSessionWorkersFromEnv = (
 ): boolean =>
   parseBoolean(env[SESSION_WORKERS_ENV]) ?? parseBoolean(env[UMBRELLA_ENV]) ?? false
 
+export type SessionWorkersFlagSource = "dedicated" | "umbrella" | "default"
+
+export interface SessionWorkersFlagDescription {
+  readonly enabled: boolean
+  readonly source: SessionWorkersFlagSource
+}
+
+export interface SessionWorkersFlagFields {
+  readonly OPENCODE_EXPERIMENTAL_SESSION_WORKERS: string
+  readonly OPENCODE_EXPERIMENTAL: string
+  readonly experimentalSessionWorkers: boolean
+  readonly source: SessionWorkersFlagSource
+  /**
+   * Present only when the caller supplies the runtime gate value. This is the
+   * flag as resolved through the active ConfigProvider at instance-init time,
+   * which can differ from `experimentalSessionWorkers` (the module-eval graph
+   * decision) when the provider injects a different value.
+   */
+  readonly runtimeExperimentalSessionWorkers?: boolean
+  /** Present only alongside `runtimeExperimentalSessionWorkers`; true when the two disagree. */
+  readonly diverges?: boolean
+}
+
+/**
+ * The resolved session-worker rollout flag plus WHICH variable decided it.
+ * `enabled` always comes from the canonical `experimentalSessionWorkersFromEnv`,
+ * so this can never disagree with the graph decision; `source` only reports
+ * which input won.
+ */
+export const describeSessionWorkersFlag = (
+  env: Record<string, string | undefined> = process.env,
+): SessionWorkersFlagDescription => {
+  const enabled = experimentalSessionWorkersFromEnv(env)
+  if (parseBoolean(env[SESSION_WORKERS_ENV]) !== undefined) return { enabled, source: "dedicated" }
+  if (parseBoolean(env[UMBRELLA_ENV]) !== undefined) return { enabled, source: "umbrella" }
+  return { enabled, source: "default" }
+}
+
+export const sessionWorkersFlagFields = (
+  env: Record<string, string | undefined> = process.env,
+  runtimeValue?: boolean,
+): SessionWorkersFlagFields => {
+  const { enabled, source } = describeSessionWorkersFlag(env)
+  const fields: SessionWorkersFlagFields = {
+    OPENCODE_EXPERIMENTAL_SESSION_WORKERS: env[SESSION_WORKERS_ENV] ?? "<unset>",
+    OPENCODE_EXPERIMENTAL: env[UMBRELLA_ENV] ?? "<unset>",
+    experimentalSessionWorkers: enabled,
+    source,
+  }
+  if (runtimeValue === undefined) return fields
+  return {
+    ...fields,
+    runtimeExperimentalSessionWorkers: runtimeValue,
+    diverges: runtimeValue !== enabled,
+  }
+}
+
+export const logSessionWorkersFlag = <A, E, R>(
+  logInfo: (message: string, fields: SessionWorkersFlagFields) => Effect.Effect<A, E, R>,
+  env: Record<string, string | undefined> = process.env,
+  runtimeValue?: boolean,
+): Effect.Effect<A, E, R> => logInfo("session workers flag", sessionWorkersFlagFields(env, runtimeValue))
+
+let sessionWorkersFlagLogged = false
+
+/** Emits the startup line at most once per process. */
+export const logSessionWorkersFlagOnce = <A, E, R>(
+  logInfo: (message: string, fields: SessionWorkersFlagFields) => Effect.Effect<A, E, R>,
+  env: Record<string, string | undefined> = process.env,
+  runtimeValue?: boolean,
+): Effect.Effect<void, E, R> =>
+  Effect.suspend(() => {
+    if (sessionWorkersFlagLogged) return Effect.void
+    sessionWorkersFlagLogged = true
+    return logSessionWorkersFlag(logInfo, env, runtimeValue).pipe(Effect.asVoid)
+  })
+
+/** Test seam: reset the process-wide once-guard. */
+export const resetSessionWorkersFlagLoggedForTest = (): void => {
+  sessionWorkersFlagLogged = false
+}
+
 /**
  * Read an optional string from the ConfigProvider. A missing *or* unparseable
  * value yields `None`, so the flag recovers to its fallback instead of dying on

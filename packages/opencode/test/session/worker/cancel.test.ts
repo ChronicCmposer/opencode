@@ -34,6 +34,16 @@ import { createWorkerHarness } from "../../lib/worker-harness"
 import { capture, flush, sid } from "../../lib/async"
 import { createListenerPair } from "../../lib/port-pair"
 import { createRecordingScheduler } from "../../lib/scheduler"
+import type { WorkerLogger } from "@/session/worker/log"
+
+/** A recording logger: captures every `(message, fields)` pair in call order. */
+function recordingLog(): {
+  readonly log: WorkerLogger
+  readonly entries: Array<{ message: string; fields: Record<string, unknown> }>
+} {
+  const entries: Array<{ message: string; fields: Record<string, unknown> }> = []
+  return { log: (message, fields) => entries.push({ message, fields }), entries }
+}
 
 /** An in-process pair of cancel ports; `hub.notify` reaches the worker side. */
 function createPortPair(): { hub: CancelPort; worker: CancelPort } {
@@ -506,5 +516,39 @@ describe("11.9 completion wins the cancel race (Q11)", () => {
     expect(pool.workers[0].alive).toBe(true)
     expect(pool.spawned).toHaveLength(0)
     expect(cancelled).toEqual(["ses_1:completed"])
+  })
+})
+
+describe("12 D1 cancel requested logging", () => {
+  test("createCancelController emits 'cancel requested' once with sessionID, workerID and graceMs", () => {
+    const pair = createPortPair()
+    const scheduler = createRecordingScheduler<CancelScheduler>()
+    const { log, entries } = recordingLog()
+    const controller = createCancelController({
+      port: pair.hub,
+      terminate: () => {},
+      graceMs: 250,
+      workerID: 5,
+      schedule: scheduler.schedule,
+      log,
+    })
+
+    const never = new Promise<void>(() => {})
+    const first = controller.cancel(sid("ses_1"), { complete: never })
+
+    expect(entries).toEqual([
+      {
+        message: "session workers: cancel requested",
+        fields: { sessionID: "ses_1", workerID: 5, graceMs: 250 },
+      },
+    ])
+
+    // An idempotent join is not a new request: no second line.
+    const second = controller.cancel(sid("ses_1"), { complete: never })
+    expect(entries).toHaveLength(1)
+
+    controller.dispose()
+    void first
+    void second
   })
 })

@@ -29,6 +29,9 @@ import {
   type SessionExecutorOutbound,
 } from "@/session/worker/execute"
 import { createDispatcher } from "@/session/worker/dispatch"
+// Canonical pool sizing, so the harness's implicit default K tracks the same
+// Option B oversubscription the hub uses (rather than a test-side duplicate).
+import { deriveWorkerCount } from "@/session/worker/pool"
 import { createLeakDetector, type LeakReport } from "./leak-detector"
 import {
   LINUX_CLOCK_TICKS_PER_SECOND,
@@ -39,7 +42,7 @@ import {
   type ThreadCpuTicks,
 } from "./loop-gap"
 import { createMetrics, type Metrics, type MetricsSnapshot } from "./metrics"
-import { deriveWorkerCount, readRssBytes } from "./boot-memory"
+import { readRssBytes } from "./boot-memory"
 import { bootMany, summarizeBootLevel } from "./worker-boot"
 import { createWorkerHarness, type HarnessWorker, type WorkerHarness } from "./worker-harness"
 

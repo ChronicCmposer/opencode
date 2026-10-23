@@ -17,6 +17,7 @@
 import type { SessionID } from "@/session/schema"
 import { defined } from "@/util/object"
 import { parsePositiveInt } from "@/util/parse"
+import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
 import { defaultSchedule } from "./port"
 
 export const CANCEL_GRACE_ENV = "OPENCODE_SESSION_CANCEL_GRACE_MS"
@@ -111,6 +112,10 @@ export interface CancelControllerOptions {
   /** Reap the worker's mirrored PGIDs when the terminate path runs (plan 11.5). */
   readonly reap?: () => void | Promise<void>
   readonly now?: () => number
+  /** The worker this controller belongs to, when known (observability D1). */
+  readonly workerID?: number
+  /** Optional structured logger seam; absent defaults to a no-op (observability D1). */
+  readonly log?: WorkerLogger
 }
 
 export interface CancelController {
@@ -124,6 +129,7 @@ export function createCancelController(options: CancelControllerOptions): Cancel
   const graceMs = options.graceMs ?? resolveCancelGraceMs()
   const schedule = options.schedule ?? defaultSchedule
   const now = options.now ?? (() => Date.now())
+  const log = options.log ?? noopWorkerLogger
   const inFlight = new Map<SessionID, Promise<CancelOutcome>>()
   // Per-run ack waiters, keyed by the raw session id string (no brand cast). The
   // waiter is registered before the cancel frame is sent and pruned in `run`'s
@@ -216,6 +222,9 @@ export function createCancelController(options: CancelControllerOptions): Cancel
       if (disposed) throw new Error("cancel controller has been disposed")
       const existing = inFlight.get(sessionID)
       if (existing !== undefined) return existing
+      // A new (non-joining) request is the one that emits; the idempotent join
+      // above never re-logs.
+      log(workerLogMessage("cancel requested"), { sessionID, workerID: options.workerID, graceMs })
       const promise = run(sessionID, request).finally(() => inFlight.delete(sessionID))
       inFlight.set(sessionID, promise)
       return promise

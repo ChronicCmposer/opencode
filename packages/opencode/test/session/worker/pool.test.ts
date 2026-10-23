@@ -1,8 +1,10 @@
 // Session worker pool sizing and the production pool wrapper.
 //
-// K = `os.availableParallelism() − 2`, floor 1, a single worker below 4 cores,
-// overridable with `OPENCODE_SESSION_WORKER_COUNT`. Cores are injected so sizing
-// is deterministic.
+// K = `floor(cores × F)`, floor 1, where F defaults to
+// `DEFAULT_OVERSUBSCRIPTION_FACTOR` (2) and cores defaults to
+// `os.availableParallelism()`. `OPENCODE_SESSION_WORKER_COUNT` overrides K
+// absolutely; `OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION` retunes F. Cores are
+// injected so sizing is deterministic.
 
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
@@ -21,7 +23,13 @@ import {
   buildWorkerEnv,
   resolveWorkerModel,
 } from "@/session/worker/init"
-import { WORKER_COUNT_ENV, resolveWorkerCount } from "@/session/worker/pool"
+import {
+  DEFAULT_OVERSUBSCRIPTION_FACTOR,
+  OVERSUBSCRIPTION_ENV,
+  WORKER_COUNT_ENV,
+  deriveWorkerCount,
+  resolveWorkerCount,
+} from "@/session/worker/pool"
 import { createProductionWorkerPool } from "@/session/worker/hub"
 import { buildWorkerSnapshot, nextEpoch } from "@/session/worker/snapshot"
 import { assertStructuredCloneable, sessionWorkerInit } from "../../lib/session-worker-init"
@@ -32,23 +40,42 @@ import { sid } from "../../lib/async"
 const EXECUTOR_FIXTURE = new URL("../../fixture/session-execute-worker.ts", import.meta.url)
 
 describe("worker count sizing", () => {
-  test("reserves two cores on four or more cores", () => {
-    expect(resolveWorkerCount({ availableParallelism: () => 4, env: {} })).toBe(2)
-    expect(resolveWorkerCount({ availableParallelism: () => 8, env: {} })).toBe(6)
+  test("oversubscribes cores by the default factor", () => {
+    expect(resolveWorkerCount({ availableParallelism: () => 4, env: {} })).toBe(8)
+    expect(resolveWorkerCount({ availableParallelism: () => 8, env: {} })).toBe(16)
   })
 
-  test("uses a single worker below four cores", () => {
-    for (const cores of [1, 2, 3]) {
-      expect(resolveWorkerCount({ availableParallelism: () => cores, env: {} })).toBe(1)
+  test("derives nproc × factor on small machines", () => {
+    for (const [cores, expected] of [
+      [1, 2],
+      [2, 4],
+      [3, 6],
+    ] as const) {
+      expect(resolveWorkerCount({ availableParallelism: () => cores, env: {} })).toBe(expected)
     }
   })
 
-  test("the env override wins over available parallelism", () => {
-    expect(resolveWorkerCount({ availableParallelism: () => 8, env: { [WORKER_COUNT_ENV]: "3" } })).toBe(3)
+  test("deriveWorkerCount floors cores × factor with a floor of one", () => {
+    expect(deriveWorkerCount(4)).toBe(4 * DEFAULT_OVERSUBSCRIPTION_FACTOR)
+    expect(deriveWorkerCount(4, 3)).toBe(12)
+    expect(deriveWorkerCount(1)).toBe(2)
+  })
+
+  test("the oversubscription factor is overridable", () => {
+    expect(resolveWorkerCount({ availableParallelism: () => 4, env: { [OVERSUBSCRIPTION_ENV]: "3" } })).toBe(12)
+    expect(resolveWorkerCount({ availableParallelism: () => 4, env: { [OVERSUBSCRIPTION_ENV]: "1.5" } })).toBe(6)
+  })
+
+  test("the absolute count override wins over the factor", () => {
     expect(resolveWorkerCount({ availableParallelism: () => 2, env: { [WORKER_COUNT_ENV]: "5" } })).toBe(5)
   })
 
-  test("an invalid override or core count fails loud", () => {
+  test("an invalid factor, override or core count fails loud", () => {
+    for (const factor of ["0", "abc"]) {
+      expect(() =>
+        resolveWorkerCount({ availableParallelism: () => 4, env: { [OVERSUBSCRIPTION_ENV]: factor } }),
+      ).toThrow(/OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION/)
+    }
     expect(() => resolveWorkerCount({ availableParallelism: () => 8, env: { [WORKER_COUNT_ENV]: "0" } })).toThrow(
       /OPENCODE_SESSION_WORKER_COUNT/,
     )
@@ -56,6 +83,8 @@ describe("worker count sizing", () => {
       /OPENCODE_SESSION_WORKER_COUNT/,
     )
     expect(() => resolveWorkerCount({ availableParallelism: () => 0, env: {} })).toThrow(/availableParallelism/)
+    expect(() => deriveWorkerCount(0)).toThrow(/availableParallelism/)
+    expect(() => deriveWorkerCount(2.5)).toThrow(/availableParallelism/)
   })
 
   test("falls back to the real available parallelism when not injected", () => {
@@ -338,16 +367,19 @@ describe("buildSessionWorkerInit", () => {
 // ---------------------------------------------------------------------------
 
 describe("createProductionWorkerPool", () => {
-  test("wraps the production entry with K workers that become ready on use", async () => {
+  test("wraps the production entry with an oversubscribed pool that becomes ready on use", async () => {
+    const cores = 4
+    const count = resolveWorkerCount({ availableParallelism: () => cores, env: {} })
     const pool = createProductionWorkerPool({
       init: sessionWorkerInit(),
-      count: 3,
+      count,
       entry: EXECUTOR_FIXTURE,
       workKind: "instant",
       timeoutMs: 15_000,
     })
 
-    expect(pool.workers).toHaveLength(3)
+    expect(count).toBeGreaterThan(cores)
+    expect(pool.workers).toHaveLength(count)
 
     await Promise.all(pool.workers.map((worker, index) => worker.execute({ sessionID: sid(`ses_${index}`), depth: 0 })))
 
@@ -357,5 +389,5 @@ describe("createProductionWorkerPool", () => {
     }
 
     await pool.terminateAll()
-  })
+  }, 30_000)
 })

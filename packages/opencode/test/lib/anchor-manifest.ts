@@ -92,7 +92,7 @@ export const ANCHORS: readonly Anchor[] = [
   { id: "response", plan: "2.2 non-transferable", module: null, symbol: "Response" },
   { id: "readable-stream", plan: "2.2 non-transferable", module: null, symbol: "ReadableStream" },
   { id: "abort-signal", plan: "2.2 non-transferable", module: null, symbol: "AbortSignal" },
-  { id: "available-parallelism", plan: "4.2 K sizing", module: "node:os", symbol: "availableParallelism" },
+  { id: "available-parallelism", plan: "4.2 K = nproc × F sizing", module: "node:os", symbol: "availableParallelism" },
 
   // Effect primitives the architecture relies upon.
   { id: "effect.deferred", plan: "11.9 cancel awaits", module: "effect", symbol: "Deferred" },

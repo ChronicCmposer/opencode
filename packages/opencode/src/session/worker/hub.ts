@@ -14,6 +14,7 @@
 // down with the layer scope.
 
 import { Context, Effect, Fiber, Layer, Option } from "effect"
+import os from "node:os"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Database } from "@opencode-ai/core/database/database"
@@ -22,6 +23,7 @@ import { Config } from "@/config/config"
 import { Provider } from "@/provider/provider"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceRef } from "@/effect/instance-ref"
+import { EffectBridge } from "@/effect/bridge"
 import { SessionStatus } from "@/session/status"
 import { Permission } from "@/permission"
 import { Question } from "@/question"
@@ -50,8 +52,10 @@ import {
 import { migrationStatements } from "../writer/migration.statements.gen"
 import type { SessionID } from "@/session/schema"
 import { defined } from "@/util/object"
+import { setThreadName } from "@/util/thread-name"
 import {
   createDispatcher,
+  deriveHeadroom,
   type CancellationConfig,
   type CancelledMode,
   type Dispatcher,
@@ -64,6 +68,7 @@ import {
   createExecutorWorker,
   createExecutorWorkerPool,
   createSessionDispatch,
+  SessionWorkerReplyTimeoutError,
   type ExecutorTransport,
   type ExecutorWorker,
   type ExecutorWorkerPool,
@@ -71,9 +76,10 @@ import {
   type SessionExecutionResult,
   type SessionExecutorInbound,
   type SessionExecutorOutbound,
+  type WorkerSpawnReason,
 } from "./execute"
 import { resolveCancelGraceMs, type CancelOutcome } from "./cancel"
-import { resolveWorkerCount } from "./pool"
+import { resolveSessionWorkerIdleTimeoutMs, resolveWorkerCount, WORKER_COUNT_ENV } from "./pool"
 import {
   buildSessionWorkerInit,
   resolveWorkerPlugins,
@@ -83,6 +89,7 @@ import {
 } from "./init"
 import {
   createPidRegistry,
+  reapSupport,
   registerReported,
   type PidRegistry,
   type PidReport,
@@ -93,6 +100,7 @@ import type { WorkerPluginHooks } from "./plugin-host"
 import type { HubProxyFrame, HubProxyHandlers, HubProxyReply } from "./layer"
 import { portFromMessagePort } from "./port"
 import type { SessionWorkerInit } from "./session-worker"
+import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
 import { Session } from "@/session/session"
 
 /** A descendant cancelled by the subagent cascade, and whether it needs a fallback idle. */
@@ -166,6 +174,12 @@ export interface WorkerTransferredPorts {
   readonly egress?: MessagePort
   readonly egressControl?: MessagePort
   readonly broker?: MessagePort
+}
+
+/** The data ports present in a transfer, in a stable order (for diagnostics). */
+const TRANSFERRED_PORT_NAMES = ["writer", "egress", "broker"] as const
+function transferredPortNames(ports: WorkerTransferredPorts): string[] {
+  return TRANSFERRED_PORT_NAMES.filter((name) => ports[name] !== undefined)
 }
 
 /**
@@ -275,6 +289,8 @@ export interface SessionHubOptions {
    * `PidRegistry`; absent means pid reports are ignored (a pure hub, no reaper).
    */
   readonly onPidReport?: (workerID: number, report: PidReport) => void
+  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
+  readonly log?: WorkerLogger
 }
 
 /**
@@ -496,6 +512,7 @@ export function buildHubProxyHandlers(authorities: HubProxyAuthorities, run: Hub
 
 /** Compose the dispatcher + executor pool + cooperative cancel into one hub. */
 export function createSessionHub(options: SessionHubOptions): SessionHub {
+  const log = options.log ?? noopWorkerLogger
   // One registry for the whole hub. A settled child is routed to the worker
   // currently hosting its `parentID` (the dispatcher's key→worker map).
   const jobPorts = new Map<number, JobPort>()
@@ -529,6 +546,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   const jobs = options.jobs ?? createJobRegistry({ routeResult: createResultRouter(portForSession) })
 
   const attachJobPort = (workerID: number, port: JobPort): (() => void) => {
+    log(workerLogMessage("ports connected"), { level: "INFO", workerID, ports: ["job"] })
     jobDisposers.get(workerID)?.()
     jobPorts.set(workerID, port)
     const disposeServer = serveJobRegistry(jobs, port)
@@ -545,6 +563,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   // authorities. A port the hub has no backend for is left unserved (the worker
   // only transfers ports the hub advertised in `capabilities.sessionWorkerPorts`).
   const attachWorkerPorts = (workerID: number, ports: WorkerTransferredPorts): (() => void) => {
+    log(workerLogMessage("ports connected"), { level: "INFO", workerID, ports: transferredPortNames(ports) })
     workerPortDisposers.get(workerID)?.()
     const disposers: (() => void)[] = []
     const backends = portBackends()
@@ -570,6 +589,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   // Serve the hub-proxy authorities over a worker's control port, plus any
   // `{type:"pid-report"}` frames the worker sends on the same port (plan 11.5).
   const attachHubProxyPort = (workerID: number, port: MessagePort): (() => void) => {
+    log(workerLogMessage("ports connected"), { level: "INFO", workerID, ports: ["hub-proxy"] })
     hubProxyDisposers.get(workerID)?.()
     const disposers: (() => void)[] = []
     const handlers = portBackends()?.hubProxy
@@ -628,6 +648,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       headroomIdleReapMs: options.headroomIdleReapMs,
       cancellation,
       onDegraded: options.onDegraded,
+      log,
     }),
   })
   // Production depth plumbing: a session's subagent depth lives on the hub job
@@ -689,13 +710,17 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
         acknowledged: outcome.acknowledged,
       })
     }
-    return {
-      outcome,
-      descendants: descendants.map((child) => ({
-        sessionID: child,
-        needsFallbackIdle: !workerPublishedIdle(cancelledModes.get(child)),
-      })),
-    }
+    const reportDescendants = descendants.map((child) => ({
+      sessionID: child,
+      needsFallbackIdle: !workerPublishedIdle(cancelledModes.get(child)),
+    }))
+    log(workerLogMessage("cancel cascade"), {
+      level: "INFO",
+      sessionID,
+      descendants: reportDescendants.length,
+      needsFallbackIdle: reportDescendants.filter((descendant) => descendant.needsFallbackIdle).length,
+    })
+    return { outcome, descendants: reportDescendants }
   }
 
   return {
@@ -746,6 +771,10 @@ export interface BunExecutorTransportOptions {
   readonly onWorkerPorts?: (ports: WorkerTransferredPorts) => void
   /** Called with the worker's transferred hub-proxy control port. */
   readonly onHubProxyPort?: (port: MessagePort) => void
+  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
+  readonly log?: WorkerLogger
+  /** Hub slot id for diagnostics (a boot/import failure is reported under it). */
+  readonly workerID?: number
 }
 
 const DEFAULT_TRANSPORT_TIMEOUT_MS = 30_000
@@ -805,7 +834,8 @@ interface PendingWaiter {
   readonly predicate: (message: SessionExecutorOutbound) => boolean
   readonly resolve: (message: SessionExecutorOutbound) => void
   readonly reject: (error: Error) => void
-  readonly timer: ReturnType<typeof setTimeout>
+  /** Absent when the wait has no deadline (`timeoutMs <= 0`). */
+  readonly timer: ReturnType<typeof setTimeout> | undefined
 }
 
 /**
@@ -814,6 +844,7 @@ interface PendingWaiter {
  * loud on timeout or isolate error.
  */
 export function createBunExecutorTransport(options: BunExecutorTransportOptions): ExecutorTransport {
+  const log = options.log ?? noopWorkerLogger
   const timeoutMs = options.timeoutMs ?? DEFAULT_TRANSPORT_TIMEOUT_MS
   const bufferCapacity = options.bufferCapacity ?? DEFAULT_TRANSPORT_BUFFER_CAPACITY
   const worker = new Worker(options.entry, {
@@ -826,7 +857,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
 
   const failWaiters = (error: Error): void => {
     for (const waiter of waiters) {
-      clearTimeout(waiter.timer)
+      if (waiter.timer !== undefined) clearTimeout(waiter.timer)
       waiters.delete(waiter)
       waiter.reject(error)
     }
@@ -858,7 +889,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       if (index === -1) break
       if (!waiter.predicate(message)) continue
       messages.splice(index, 1)
-      clearTimeout(waiter.timer)
+      if (waiter.timer !== undefined) clearTimeout(waiter.timer)
       waiters.delete(waiter)
       waiter.resolve(message)
     }
@@ -876,9 +907,15 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     const cause = event.error
     const detail =
       cause instanceof Error && cause.message !== "" && cause.message !== event.message ? `: ${cause.message}` : ""
-    failWaiters(
-      new Error(`session worker error: ${event.message}${detail}`, cause === undefined ? undefined : { cause }),
-    )
+    const message = `session worker error: ${event.message}${detail}`
+    // A boot/import failure is the loudest signal a worker could not start;
+    // report it before the waiters fail so the operator sees why.
+    log(workerLogMessage("worker boot failed"), {
+      level: "ERROR",
+      workerID: options.workerID,
+      message,
+    })
+    failWaiters(new Error(message, cause === undefined ? undefined : { cause }))
     void worker.terminate()
   }
 
@@ -892,10 +929,16 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       if (buffered !== undefined) return Promise.resolve(buffered)
       const waitMs = waitOptions?.timeoutMs ?? timeoutMs
       return new Promise<SessionExecutorOutbound>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          waiters.delete(waiter)
-          reject(new Error(`timed out waiting for a session worker reply after ${waitMs}ms`))
-        }, waitMs)
+        // `timeoutMs <= 0` means "no deadline": a run/startShell reply is a whole
+        // LLM turn that can outlast any fixed budget, so it never gets a timer.
+        // The configured deadline applies only to the short control frames.
+        const timer =
+          waitMs > 0
+            ? setTimeout(() => {
+                waiters.delete(waiter)
+                reject(new SessionWorkerReplyTimeoutError(waitMs))
+              }, waitMs)
+            : undefined
         const waiter: PendingWaiter = { predicate, resolve, reject, timer }
         waiters.add(waiter)
       })
@@ -919,6 +962,8 @@ export interface BunExecutorWorkerPoolOptions {
   readonly env?: Record<string, string | undefined>
   readonly workerData?: unknown
   readonly timeoutMs?: number
+  /** Run-reply liveness budget; `0`/absent disables the watchdog. */
+  readonly runIdleTimeoutMs?: number
   readonly workKind?: string
   /** Receive each worker's transferred job port, keyed by worker id (plan 9.2). */
   readonly onJobPort?: (workerID: number, port: MessagePort) => void
@@ -926,6 +971,12 @@ export interface BunExecutorWorkerPoolOptions {
   readonly onWorkerPorts?: (workerID: number, ports: WorkerTransferredPorts) => void
   /** Receive each worker's transferred hub-proxy control port (plan 24). */
   readonly onHubProxyPort?: (workerID: number, port: MessagePort) => void
+  /** The session the isolate is bound to, when known at spawn (observability B1). */
+  readonly sessionID?: SessionID
+  /** Why this isolate is spawning; defaults to `"initial"` (observability B1). */
+  readonly reason?: WorkerSpawnReason
+  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
+  readonly log?: WorkerLogger
 }
 
 /** Create one eager Bun executor worker speaking the frame protocol. */
@@ -939,6 +990,8 @@ export function spawnBunExecutorWorker(id: number, options: BunExecutorWorkerPoo
       env: options.env,
       workerData: options.workerData,
       timeoutMs: options.timeoutMs,
+      log: options.log,
+      workerID: id,
       onPort: onJobPort === undefined ? undefined : (port: MessagePort) => onJobPort(id, port),
       onWorkerPorts:
         onWorkerPorts === undefined ? undefined : (ports: WorkerTransferredPorts) => onWorkerPorts(id, ports),
@@ -948,13 +1001,27 @@ export function spawnBunExecutorWorker(id: number, options: BunExecutorWorkerPoo
   return createExecutorWorker({
     id,
     transport,
-    ...defined({ workKind: options.workKind, timeoutMs: options.timeoutMs }),
+    ...defined({
+      workKind: options.workKind,
+      timeoutMs: options.timeoutMs,
+      runIdleTimeoutMs: options.runIdleTimeoutMs,
+      sessionID: options.sessionID,
+      reason: options.reason,
+      // Forward the resolved logger so the B1 `worker spawning` line fires in
+      // production, where this helper (not a test's direct `createExecutorWorker`)
+      // builds the executor.
+      log: options.log,
+    }),
   })
 }
 
 /** Production `ExecutorWorkerPool`: K executor workers speaking the frame protocol. */
 export function createBunExecutorWorkerPool(options: BunExecutorWorkerPoolOptions): ExecutorWorkerPool {
-  return createExecutorWorkerPool({ k: options.k, spawn: (id) => spawnBunExecutorWorker(id, options) })
+  return createExecutorWorkerPool({
+    k: options.k,
+    spawn: (id) => spawnBunExecutorWorker(id, options),
+    ...(options.log === undefined ? {} : { log: options.log }),
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -970,7 +1037,11 @@ export function createBunExecutorWorkerPool(options: BunExecutorWorkerPoolOption
  * never started. The factory may be async (the production init is resolved on
  * first dispatch).
  */
-export function createLazyExecutorWorker(id: number, create: LazyExecutorWorkerFactory): ExecutorWorker {
+export function createLazyExecutorWorker(
+  id: number,
+  create: LazyExecutorWorkerFactory,
+  log: WorkerLogger = noopWorkerLogger,
+): ExecutorWorker {
   let inner: ExecutorWorker | undefined
   let materializing: Promise<ExecutorWorker> | undefined
   let terminated = false
@@ -999,7 +1070,7 @@ export function createLazyExecutorWorker(id: number, create: LazyExecutorWorkerF
     cancel: (sessionID) => (inner === undefined ? Promise.resolve() : inner.cancel(sessionID)),
     assertNotBusy: (sessionID) => (inner === undefined ? Promise.resolve(false) : inner.assertNotBusy(sessionID)),
     resultFor: (sessionID) => inner?.resultFor(sessionID),
-    cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID) }),
+    cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID), log }),
     terminate: async () => {
       terminated = true
       materializing = undefined
@@ -1018,13 +1089,15 @@ export interface LazyExecutorWorkerPoolOptions {
   readonly k: number
   /** Build one worker on first use. */
   readonly create: (id: number) => ExecutorWorker | Promise<ExecutorWorker>
+  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
+  readonly log?: WorkerLogger
 }
 
 /** A pool whose K foreground workers (and any headroom) spawn on first use. */
 export function createLazyExecutorWorkerPool(options: LazyExecutorWorkerPoolOptions): ExecutorWorkerPool {
   return createExecutorWorkerPool({
     k: options.k,
-    spawn: (id) => createLazyExecutorWorker(id, () => options.create(id)),
+    spawn: (id) => createLazyExecutorWorker(id, () => options.create(id), options.log),
   })
 }
 
@@ -1040,21 +1113,45 @@ declare global {
   const OPENCODE_SESSION_WORKER_PATH: string | undefined
 }
 
+/** The mechanism a resolved session-worker entry came from. */
+export type SessionWorkerEntrySource = "env" | "definedPath" | "default"
+
+/** A resolved session-worker entry and where it came from. */
+export interface DescribedSessionWorkerEntry {
+  readonly entry: string | URL
+  readonly source: SessionWorkerEntrySource
+}
+
 /**
- * Resolve the production session-worker entry: the runtime env override, else
- * the build-time define, else the source-relative isolate. Pure so the
- * resolution is testable without re-importing the module.
+ * Resolve the production session-worker entry AND the mechanism it came from:
+ * the runtime env override (`"env"`), the build-time define / an explicit path
+ * (`"definedPath"`), or the source-relative isolate (`"default"`). Pure, so the
+ * resolution (and its diagnostics) are testable without re-importing the module.
  */
-export function resolveSessionWorkerEntry(
+export function describeSessionWorkerEntry(
   options: { readonly env?: Record<string, string | undefined>; readonly definedPath?: string } = {},
-): string | URL {
+): DescribedSessionWorkerEntry {
   const defined =
     options.definedPath ??
     (typeof OPENCODE_SESSION_WORKER_PATH !== "undefined" ? OPENCODE_SESSION_WORKER_PATH : undefined)
   const fromEnv = (options.env ?? process.env).OPENCODE_SESSION_WORKER_PATH
+  // The env override wins when set (even an empty string, which falls through to
+  // the default — matching `resolveSessionWorkerEntry`'s original precedence).
   const resolved = fromEnv ?? defined
-  if (resolved === undefined || resolved === "") return new URL("./session-worker.ts", import.meta.url)
-  return resolved
+  if (resolved === undefined || resolved === "") {
+    return { entry: new URL("./session-worker.ts", import.meta.url), source: "default" }
+  }
+  return { entry: resolved, source: fromEnv !== undefined ? "env" : "definedPath" }
+}
+
+/**
+ * Resolve the production session-worker entry: the runtime env override, else
+ * the build-time define, else the source-relative isolate.
+ */
+export function resolveSessionWorkerEntry(
+  options: { readonly env?: Record<string, string | undefined>; readonly definedPath?: string } = {},
+): string | URL {
+  return describeSessionWorkerEntry(options).entry
 }
 
 /** The production session-worker entry (the reduced-layer isolate). */
@@ -1076,10 +1173,14 @@ export interface ProductionWorkerPoolOptions {
   readonly entry?: string | URL
   readonly env?: Record<string, string | undefined>
   readonly timeoutMs?: number
+  /** Run-reply liveness budget; `0`/absent disables the watchdog. */
+  readonly runIdleTimeoutMs?: number
   readonly workKind?: string
   readonly onJobPort?: (workerID: number, port: MessagePort) => void
   readonly onWorkerPorts?: (workerID: number, ports: WorkerTransferredPorts) => void
   readonly onHubProxyPort?: (workerID: number, port: MessagePort) => void
+  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
+  readonly log?: WorkerLogger
 }
 
 /** Build one isolate for `sessionID` under a fixed worker id. */
@@ -1093,7 +1194,11 @@ export type SessionBoundSpawner = (id: number, sessionID: SessionID) => Promise<
  * the same id with that session's init. Reuse across turns of the same session
  * (the common case) keeps the isolate.
  */
-export function createSessionBoundExecutorWorker(id: number, spawnFor: SessionBoundSpawner): ExecutorWorker {
+export function createSessionBoundExecutorWorker(
+  id: number,
+  spawnFor: SessionBoundSpawner,
+  log: WorkerLogger = noopWorkerLogger,
+): ExecutorWorker {
   let inner: ExecutorWorker | undefined
   let boundSession: SessionID | undefined
   let materializing: Promise<ExecutorWorker> | undefined
@@ -1102,9 +1207,24 @@ export function createSessionBoundExecutorWorker(id: number, spawnFor: SessionBo
   const materialize = (sessionID: SessionID): Promise<ExecutorWorker> => {
     if (terminated) throw new Error(`executor worker ${id} is terminated`)
     if (inner !== undefined && boundSession === sessionID) return Promise.resolve(inner)
+    const previousSession = boundSession
     const previous = inner
     inner = undefined
     boundSession = sessionID
+    // A worker rebinding from one session to another is the observable signal
+    // that the isolate is being retired and rebuilt for a different model.
+    if (previousSession !== undefined && previousSession !== sessionID) {
+      log(workerLogMessage("worker rebound"), {
+        level: "INFO",
+        workerID: id,
+        fromSession: previousSession,
+        toSession: sessionID,
+        // The rebound-to session is always defined here (the branch guards
+        // `previousSession !== undefined`), so the log seam hoists it into the
+        // message prefix. `fromSession`/`toSession` stay for backward compat.
+        sessionID,
+      })
+    }
     materializing = Promise.resolve()
       // Retire the old isolate first so two models never share one worker.
       .then(() => previous?.terminate().catch(() => undefined))
@@ -1129,7 +1249,7 @@ export function createSessionBoundExecutorWorker(id: number, spawnFor: SessionBo
     cancel: (sessionID) => (inner === undefined ? Promise.resolve() : inner.cancel(sessionID)),
     assertNotBusy: (sessionID) => (inner === undefined ? Promise.resolve(false) : inner.assertNotBusy(sessionID)),
     resultFor: (sessionID) => inner?.resultFor(sessionID),
-    cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID) }),
+    cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID), log }),
     terminate: async () => {
       terminated = true
       materializing = undefined
@@ -1148,6 +1268,7 @@ export function createSessionBoundExecutorWorker(id: number, spawnFor: SessionBo
  * with distinct models share a generation without a `WorkerModelMismatchError`.
  */
 export function createProductionWorkerPool(options: ProductionWorkerPoolOptions): ExecutorWorkerPool {
+  const log = options.log ?? noopWorkerLogger
   const resolveSource: (sessionID?: SessionID) => SessionWorkerInit | Promise<SessionWorkerInit> =
     typeof options.init === "function" ? options.init : () => options.init as SessionWorkerInit
   // One init per session: a session's model/variants are stable for its lifetime.
@@ -1170,7 +1291,12 @@ export function createProductionWorkerPool(options: ProductionWorkerPoolOptions)
       ...defined({
         env: options.env,
         timeoutMs: options.timeoutMs,
+        runIdleTimeoutMs: options.runIdleTimeoutMs,
         workKind: options.workKind,
+        log,
+        // The session this isolate is bound to, so the B1 `worker spawning`
+        // line names it (the init was already resolved for the same session).
+        sessionID,
         onJobPort: options.onJobPort,
         onWorkerPorts: options.onWorkerPorts,
         onHubProxyPort: options.onHubProxyPort,
@@ -1179,7 +1305,8 @@ export function createProductionWorkerPool(options: ProductionWorkerPoolOptions)
   }
   return createExecutorWorkerPool({
     k: options.count,
-    spawn: (id) => createSessionBoundExecutorWorker(id, spawnFor),
+    spawn: (id) => createSessionBoundExecutorWorker(id, spawnFor, log),
+    log,
   })
 }
 
@@ -1525,6 +1652,11 @@ export interface ProductionSessionHubOptions {
   readonly count?: number
   readonly entry?: string | URL
   readonly timeoutMs?: number
+  /**
+   * Run-reply liveness budget for the spawned workers. Defaults to
+   * `OPENCODE_SESSION_WORKER_IDLE_TIMEOUT_MS` (`0` = disabled).
+   */
+  readonly runIdleTimeoutMs?: number
   readonly workKind?: string
   readonly env?: Record<string, string | undefined>
   readonly headroom?: number
@@ -1545,6 +1677,8 @@ export interface ProductionSessionHubOptions {
   readonly events?: LiveEventPublisher
   /** Test seam: build the pool from the lazy init resolver. Defaults to the production pool. */
   readonly poolFactory?: ProductionPoolFactory
+  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
+  readonly log?: WorkerLogger
 }
 
 /** Reaping is best-effort teardown: a failed kill must not block cancellation. */
@@ -1556,8 +1690,39 @@ function ignoreReapFailure(reap: () => void): void {
   }
 }
 
+/** Whether `OPENCODE_SESSION_WORKER_COUNT` is set to a usable (non-empty) value. */
+function isWorkerCountOverride(env: Record<string, string | undefined> | undefined): boolean {
+  const raw = (env ?? process.env)[WORKER_COUNT_ENV]
+  return raw !== undefined && raw.trim() !== ""
+}
+
 /** Compose the production pool + hub, with cooperative cancellation wired. */
 export function createProductionSessionHub(options: ProductionSessionHubOptions): SessionHub {
+  // Name the hub's main OS thread for human observability (Linux-only, fail-soft).
+  setThreadName("och")
+  const log = options.log ?? noopWorkerLogger
+  const workerCount = options.count ?? resolveWorkerCount()
+  // Resolve the run-reply liveness budget once, at the hub boundary: an explicit
+  // option wins, else the env override, else disabled (0).
+  const runIdleTimeoutMs = options.runIdleTimeoutMs ?? resolveSessionWorkerIdleTimeoutMs({ env: options.env })
+  // Resolve the entry the pool will actually spawn (an explicit entry wins, then
+  // the env override, then the build-time define, then the source-relative URL).
+  const describedEntry: DescribedSessionWorkerEntry =
+    options.entry !== undefined
+      ? { entry: options.entry, source: "definedPath" }
+      : describeSessionWorkerEntry({ env: options.env })
+  log(workerLogMessage("pool resolved"), {
+    level: "INFO",
+    workerCount,
+    override: isWorkerCountOverride(options.env),
+    availableParallelism: os.availableParallelism(),
+    headroom: options.headroom ?? deriveHeadroom(workerCount),
+  })
+  log(workerLogMessage("worker entry resolved"), {
+    level: "INFO",
+    entry: String(describedEntry.entry),
+    source: describedEntry.source,
+  })
   // The hub is assigned after the pool is built; port transfers arrive only on
   // dispatch (post-assignment), so the deferred reference is safe.
   let hub: SessionHub | undefined
@@ -1577,10 +1742,12 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
       ? options.poolFactory(resolveInit, sinks)
       : createProductionWorkerPool({
           init: resolveInit,
-          count: options.count ?? resolveWorkerCount(),
+          count: workerCount,
+          log,
           ...defined({
-            entry: options.entry,
+            entry: describedEntry.entry,
             timeoutMs: options.timeoutMs,
+            runIdleTimeoutMs,
             workKind: options.workKind,
             env: options.env,
           }),
@@ -1591,7 +1758,10 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   // Filled by the worker's `{type:"pid-report"}` control-port frames below; a
   // report for an already-mirrored group only advances its generation.
   const pids = createPidRegistry()
+  const support = reapSupport()
+  log(workerLogMessage("reap support"), { level: "INFO", supported: support.supported, reason: support.reason })
   const onPidReport = (workerID: number, report: PidReport): void => {
+    log(workerLogMessage("pid report"), { level: "INFO", workerID, entries: report.entries.length })
     try {
       // `workerID` is the hub's slot association (authoritative); the registry
       // refuses a PGID reassignment to a different owner.
@@ -1602,6 +1772,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   }
   hub = createSessionHub({
     pool,
+    log,
     ...defined({ ports: options.ports, onDispatch: options.onDispatch, events: options.events, onPidReport }),
     cancellation: (pool) =>
       createWorkerCancellation(pool, {
@@ -1629,6 +1800,8 @@ export interface ProductionSessionHubNodeOptions {
   readonly count?: number
   readonly entry?: string | URL
   readonly timeoutMs?: number
+  /** Run-reply liveness budget; defaults to `OPENCODE_SESSION_WORKER_IDLE_TIMEOUT_MS`. */
+  readonly runIdleTimeoutMs?: number
   readonly workKind?: string
   readonly env?: Record<string, string | undefined>
   readonly headroom?: number
@@ -1772,12 +1945,21 @@ export function productionSessionHubLayer(
           ),
         )
       }
+      // The production narrative seam: an EffectBridge (R/E = never, so it adds no
+      // graph dependency) whose `fork` carries the ambient logger, mirroring the
+      // test-only `createSessionHubLayer`. Without this the production graph passed
+      // no `log`, so A1–A3 / B2/B3 / D3 / E1/E3 and everything forwarded through
+      // dispatch/execute/cancel were dormant. `bridge` names the EventV2Bridge
+      // above, hence `effectBridge`.
+      const effectBridge = yield* EffectBridge.make()
+      const log = workerLoggerFromBridge(effectBridge)
       const hub = createProductionSessionHub({
         ...options,
         count,
         init: resolveInit,
         ports,
         events,
+        log,
         onDispatch: (sessionID) => {
           capturedInstance ??= captureInstanceRef()
           capturedContext ??= captureRuntimeContext()
@@ -1829,7 +2011,9 @@ export function createSessionHubLayer(options: SessionHubOptions): Layer.Layer<S
   return Layer.effect(
     SessionHubService,
     Effect.gen(function* () {
-      const hub = createSessionHub(options)
+      const bridge = yield* EffectBridge.make()
+      const log = workerLoggerFromBridge(bridge)
+      const hub = createSessionHub({ ...options, log })
       yield* Effect.addFinalizer(() => Effect.promise(() => hub.terminateAll().catch(() => undefined)))
       return SessionHubService.of(hub)
     }),

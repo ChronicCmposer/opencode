@@ -19,7 +19,13 @@ import { describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { Effect } from "effect"
+import { Cause, Effect, Exit, Fiber } from "effect"
+import { sql } from "drizzle-orm"
+import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
+import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { createWriterCore } from "@/session/writer/core"
+import { openWriterConnection } from "@/session/writer/connection"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { InstanceRef } from "@/effect/instance-ref"
@@ -304,4 +310,101 @@ describe("Gate 7 — sequential prompts in one session over the writer-backed wo
       expect(Number(rows[0]?.n)).toBeGreaterThanOrEqual(2)
     })
   }, 120_000)
+})
+
+// ---------------------------------------------------------------------------
+// Regression: a MAIN-process durable write must survive the session-worker
+// writer holding the sole SQLite write lock.
+//
+// The E2E harness above cannot express this one: `createE2EContext` opens a
+// single `:memory:` connection (shared with the worker over a `MessagePort`),
+// so it exposes no INDEPENDENT main-process `Database.Service` connection and
+// a second `:memory:` connection would be a different database. This test
+// therefore builds the two connections the failure needs, over one real FILE:
+//
+//   * the session-worker writer — the production `WriterCore` over its own
+//     `openWriterConnection` (driving the core in-process is the same lock
+//     semantics; production just moves it behind the writer isolate), and
+//   * the main process — `Database.layerFromPath` -> `Database.Service`,
+//     issuing the durable write at the exact `event.ts` `commitDurableEvent`
+//     seam: `db.transaction(..., { behavior: "immediate" })`.
+//
+// While the writer's `BEGIN IMMEDIATE` is pinned, the main transaction's own
+// `BEGIN IMMEDIATE` hits `SQLITE_BUSY` -> `database is locked` /
+// `LockTimeoutError`. Before the main connection had a bounded busy-retry the
+// write died outright; with it, the retry rides out the contention until the
+// writer releases.
+//
+// `PRAGMA busy_timeout = 0` is applied to the main connection so the lock
+// surfaces immediately (rather than after the production 5s wait) — the same
+// technique the `effect-drizzle-sqlite` lock test uses. The contention itself
+// is real: a second connection genuinely holds the write lock.
+
+/** How long the worker writer holds its write lock while the main write contends. */
+const MAIN_WRITE_CONTENTION_MS = 200
+
+describe("Main-process durable write vs the session-worker writer lock", () => {
+  test("a main-process durable write settles instead of dying with database is locked", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-main-write-"))
+    const dbPath = path.join(directory, "main.db")
+    try {
+      const outcome = await Effect.runPromise(
+        Effect.gen(function* () {
+          const { db } = yield* Database.Service
+          // Fail fast on the lock instead of waiting the production `busy_timeout`.
+          yield* db.run(sql`PRAGMA busy_timeout = 0`)
+
+          // The session-worker writer: its own connection to the SAME file.
+          const writerConnection = openWriterConnection(dbPath)
+          const writer = createWriterCore({ connection: writerConnection, checkpointIntervalMs: 0 })
+          yield* Effect.addFinalizer(() => Effect.sync(() => writerConnection.close()))
+
+          // 1. Pin the sole write lock (as a running worker prompt would).
+          const handle = yield* Effect.promise(() => writer.beginTransaction())
+
+          // 2. Concurrent main-process durable write.
+          const write = db.transaction(
+            () =>
+              Effect.gen(function* () {
+                yield* db
+                  .insert(EventSequenceTable)
+                  .values([{ aggregate_id: "b-regression", seq: 0 }])
+                  .run()
+                yield* db
+                  .insert(EventTable)
+                  .values([
+                    {
+                      id: EventV2.ID.create(),
+                      aggregate_id: "b-regression",
+                      seq: 0,
+                      type: "regression",
+                      data: {},
+                    },
+                  ])
+                  .run()
+              }),
+            { behavior: "immediate" },
+          )
+          const fiber = yield* write.pipe(Effect.forkScoped({ startImmediately: true }))
+
+          // 3. Hold the lock while the main write contends, then release it.
+          yield* Effect.sleep(MAIN_WRITE_CONTENTION_MS)
+          yield* Effect.promise(() => writer.rollbackTransaction(handle))
+
+          // 4. The main write must settle.
+          const exit = yield* Fiber.join(fiber).pipe(Effect.exit)
+          return Exit.isSuccess(exit)
+            ? { settled: true as const, message: "" }
+            : { settled: false as const, message: Cause.pretty(exit.cause) }
+        }).pipe(Effect.provide(Database.layerFromPath(dbPath)), Effect.scoped),
+      )
+
+      expect(
+        outcome.settled,
+        outcome.settled ? "" : `main-process durable write died under writer contention:\n${outcome.message}`,
+      ).toBe(true)
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  }, 30_000)
 })

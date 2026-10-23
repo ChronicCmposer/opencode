@@ -8,6 +8,7 @@ import * as Vcs from "./vcs"
 import { InstanceState } from "@/effect/instance-state"
 import { Effect, Layer } from "effect"
 import { Config } from "@/config/config"
+import { logSessionWorkersFlagOnce, RuntimeFlags } from "@/effect/runtime-flags"
 import { Service } from "./bootstrap-service"
 
 export { Service } from "./bootstrap-service"
@@ -26,9 +27,15 @@ const layer = Layer.effect(
     const project = yield* Project.Service
     const snapshot = yield* Snapshot.Service
     const vcs = yield* Vcs.Service
+    const runtimeFlags = yield* RuntimeFlags.Service
 
     const run = Effect.gen(function* () {
       const ctx = yield* InstanceState.context
+      yield* logSessionWorkersFlagOnce(
+        (message, fields) => Effect.logInfo(message, fields),
+        undefined,
+        runtimeFlags.experimentalSessionWorkers,
+      )
       yield* Effect.logInfo("bootstrapping", { directory: ctx.directory })
       // everything depends on config so eager load it for nice traces
       yield* config.get()
@@ -50,7 +57,7 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer: layer,
-  deps: [Config.node, Format.node, LSP.node, Plugin.node, Project.node, Snapshot.node, Vcs.node],
+  deps: [Config.node, Format.node, LSP.node, Plugin.node, Project.node, RuntimeFlags.node, Snapshot.node, Vcs.node],
 })
 
 export * as InstanceBootstrap from "./bootstrap"

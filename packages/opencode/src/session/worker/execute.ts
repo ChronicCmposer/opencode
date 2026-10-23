@@ -17,6 +17,7 @@ import type { Latch } from "effect"
 import { Runner } from "@/effect/runner"
 import type { SessionID } from "@/session/schema"
 import type { CancelFrame, CancelPort } from "./cancel"
+import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
 
 /** JSON-safe result of one session run (the full message crosses via egress). */
 export interface SessionExecutionResult {
@@ -65,6 +66,18 @@ export class UnknownWorkKindError extends Schema.TaggedErrorClass<UnknownWorkKin
 export class SessionBusyError extends Schema.TaggedErrorClass<SessionBusyError>()("SessionBusyError", {
   sessionID: Schema.String,
 }) {}
+
+/**
+ * Raised when a worker reply does not arrive within its wait deadline. Defined
+ * here (not in `hub.ts`) because `dispatch.ts` imports `execute.ts` while
+ * `hub.ts` imports `dispatch.ts`; placing it in `hub.ts` would close a cycle.
+ */
+export class SessionWorkerReplyTimeoutError extends Error {
+  constructor(readonly waitMs: number) {
+    super(`timed out waiting for a session worker reply after ${waitMs}ms`)
+    this.name = "SessionWorkerReplyTimeoutError"
+  }
+}
 
 export interface SessionRunMachineOptions {
   readonly scope: Scope.Scope
@@ -184,6 +197,12 @@ export interface SessionExecutorOptions {
    * executor's own machine answers.
    */
   readonly control?: SessionRunControl
+  /**
+   * Run-start seam: called once with the run's `sessionID` after the work is
+   * resolved and before it executes (e.g. to rename the worker's thread).
+   * Invoked fail-soft, so a throwing callback never unwinds or fails the run.
+   */
+  readonly onRunStart?: (sessionID: SessionID) => void
   /** Effect runner seam; defaults to `Effect.runPromise`. */
   readonly run?: SessionEffectRunner
 }
@@ -229,6 +248,12 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
     } catch (error) {
       return failed(id, error)
     }
+    // Fail-soft: a throwing run-start callback must never unwind or fail the run.
+    try {
+      options.onRunStart?.(sessionID)
+    } catch {
+      // Intentionally swallowed — the seam is best-effort observability.
+    }
     const effect =
       mode === "run"
         ? options.machine.ensureRunning(sessionID, work(sessionID))
@@ -266,6 +291,8 @@ export interface SessionExecutorInstallOptions {
   readonly work: SessionWorkFactory
   /** Worker-local run control; forwarded to the installed executor (Phase 4). */
   readonly control?: SessionRunControl
+  /** Run-start seam; forwarded to the installed executor. */
+  readonly onRunStart?: (sessionID: SessionID) => void
   readonly onIdle?: (sessionID: SessionID) => Effect.Effect<void>
   readonly onBusy?: (sessionID: SessionID) => Effect.Effect<void>
   readonly threadId?: number
@@ -290,7 +317,12 @@ export function installSessionExecutor(
   const ownsScope = options.scope === undefined
   const workerScope = options.scope ?? Effect.runSync(Scope.make())
   const machine = createSessionRunMachine({ scope: workerScope, onIdle: options.onIdle, onBusy: options.onBusy })
-  const executor = createSessionExecutor({ machine, work: options.work, control: options.control })
+  const executor = createSessionExecutor({
+    machine,
+    work: options.work,
+    control: options.control,
+    onRunStart: options.onRunStart,
+  })
 
   scope.onmessage = (event) => {
     const message = event.data as SessionExecutorInbound | undefined
@@ -342,6 +374,12 @@ export type ExecutorWorkerKind = "foreground" | "headroom"
 /** The transport the hub adapter needs; a worker harness handle satisfies it. */
 export interface ExecutorTransport {
   post(message: SessionExecutorInbound): void
+  /**
+   * Resolve with the first frame matching `match`. A `timeoutMs` that is
+   * `undefined` uses the transport default; `<= 0` means "no deadline" (used
+   * for a long `run`/`startShell` reply — a full LLM turn — so it is never
+   * bounded by the control-frame budget).
+   */
   waitFor(
     match: (message: SessionExecutorOutbound) => boolean,
     options?: { timeoutMs?: number },
@@ -365,7 +403,18 @@ export interface ExecutorWorker extends ExecutorSessionWorker {
 
 export interface ExecutorCancelPortOptions {
   readonly cancel: (sessionID: SessionID) => Promise<void>
+  /** Optional structured logger seam; absent defaults to a no-op (observability D2). */
+  readonly log?: WorkerLogger
 }
+
+/**
+ * Terminal disposition of a worker cancel (observability D2). `"cooperative"`
+ * means the worker accepted the cancel and will settle at a checkpoint;
+ * `"terminate"` means it rejected it and the hub must terminate the isolate.
+ * `"queued"` is the dispatch-level outcome for a session not yet on a worker, so
+ * a worker's cancel port never emits it — it is part of the shared vocabulary.
+ */
+export type ExecutorCancelMode = "cooperative" | "terminate" | "queued"
 
 /**
  * Adapt an executor worker's request/reply `cancel` into the Phase-11
@@ -373,16 +422,25 @@ export interface ExecutorCancelPortOptions {
  * echoed back as a `cancel-ack` (accepted on success, rejected otherwise).
  */
 export function createExecutorCancelPort(options: ExecutorCancelPortOptions): CancelPort {
+  const log = options.log ?? noopWorkerLogger
   const handlers = new Set<(frame: CancelFrame) => void>()
   const emit = (frame: CancelFrame): void => {
     for (const handler of [...handlers]) handler(frame)
   }
+  const outcome = (sessionID: string, mode: ExecutorCancelMode, accepted: boolean): void =>
+    log(workerLogMessage("cancel outcome"), { sessionID, mode, accepted })
   return {
     notify(frame) {
       if (frame.type !== "cancel") return
       options.cancel(frame.sessionID as SessionID).then(
-        () => emit({ type: "cancel-ack", sessionID: frame.sessionID, accepted: true }),
-        () => emit({ type: "cancel-ack", sessionID: frame.sessionID, accepted: false }),
+        () => {
+          emit({ type: "cancel-ack", sessionID: frame.sessionID, accepted: true })
+          outcome(frame.sessionID, "cooperative", true)
+        },
+        () => {
+          emit({ type: "cancel-ack", sessionID: frame.sessionID, accepted: false })
+          outcome(frame.sessionID, "terminate", false)
+        },
       )
     },
     onMessage(handler) {
@@ -392,35 +450,121 @@ export function createExecutorCancelPort(options: ExecutorCancelPortOptions): Ca
   }
 }
 
+/** Why a worker isolate is spawning (observability B1). */
+export type WorkerSpawnReason = "initial" | "rebind" | "respawn"
+
 export interface ExecutorWorkerOptions {
   readonly id: number
   readonly transport: ExecutorTransport
   readonly workKind?: string
   readonly timeoutMs?: number
+  /**
+   * Liveness watchdog budget for a `run`/`startShell` reply, in ms. When `> 0`,
+   * a watchdog probes the worker with a `ping` every interval while the run is in
+   * flight and rejects with `SessionWorkerReplyTimeoutError` if a matching `pong`
+   * does not arrive within that interval. Defaults to `0` (disabled), so the run
+   * reply keeps its unbounded wait unless a caller opts in.
+   */
+  readonly runIdleTimeoutMs?: number
+  /** The session the isolate is bound to, when known at spawn (observability B1). */
+  readonly sessionID?: SessionID
+  /** Why this isolate is spawning; defaults to `"initial"` (observability B1). */
+  readonly reason?: WorkerSpawnReason
+  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
+  readonly log?: WorkerLogger
 }
 
 export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWorker {
   const { transport } = options
+  const log = options.log ?? noopWorkerLogger
   const workKind = options.workKind ?? DEFAULT_WORK_KIND
   const waitOptions = options.timeoutMs === undefined ? undefined : { timeoutMs: options.timeoutMs }
+  const runIdleTimeoutMs = options.runIdleTimeoutMs ?? 0
   const results = new Map<SessionID, SessionExecutionResult>()
   let nextRequestId = 1
+
+  log(workerLogMessage("worker spawning"), {
+    workerID: options.id,
+    kind: workKind,
+    ...(options.sessionID === undefined ? {} : { sessionID: options.sessionID }),
+    reason: options.reason ?? "initial",
+  })
 
   const request = async (
     build: (id: number) => SessionExecutorInbound,
     accept: (message: SessionExecutorOutbound) => boolean,
+    wait: { timeoutMs?: number } | undefined,
   ): Promise<SessionExecutorOutbound> => {
     const id = nextRequestId++
     transport.post(build(id))
-    return transport.waitFor((message) => isAddressed(message, id) && accept(message), waitOptions)
+    return transport.waitFor((message) => isAddressed(message, id) && accept(message), wait)
+  }
+
+  // A `run`/`startShell` reply is a whole `SessionPrompt.loop` including a full
+  // LLM turn, so it must never be bounded by the short control-frame deadline.
+  // `timeoutMs: 0` is the transport's "no deadline" sentinel.
+  const NO_REPLY_DEADLINE = { timeoutMs: 0 } as const
+
+  /**
+   * Await the run reply while probing the worker's liveness. Every `intervalMs`
+   * the watchdog posts a `ping` and requires the matching `pong` within the same
+   * window. A worker whose event loop is wedged cannot answer, so the probe
+   * rejects with `SessionWorkerReplyTimeoutError` (the dispatcher then terminates
+   * the isolate); a healthy worker answers each ping promptly, so a long run
+   * resolves however many intervals it spans.
+   *
+   * The pong waiter and the run waiter coexist: the transport matches each frame
+   * by predicate and consumes it for exactly one waiter, and the two predicates
+   * (`pong` vs `done`/`error`) are disjoint.
+   */
+  const awaitReplyWithLiveness = async (
+    reply: Promise<SessionExecutorOutbound>,
+    intervalMs: number,
+  ): Promise<SessionExecutorOutbound> => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let stopped = false
+    const wedged = new Promise<never>((_resolve, reject) => {
+      const probe = (): void => {
+        if (stopped) return
+        const pingId = nextRequestId++
+        try {
+          transport.post({ type: "ping", id: pingId })
+          transport
+            .waitFor((message) => message.type === "pong" && message.id === pingId, { timeoutMs: intervalMs })
+            .then(
+              () => {
+                if (!stopped) timer = setTimeout(probe, intervalMs)
+              },
+              () => {
+                if (!stopped) reject(new SessionWorkerReplyTimeoutError(intervalMs))
+              },
+            )
+        } catch (error) {
+          // `post` throws once the isolate is gone; surface it the same way a
+          // dead worker is surfaced rather than escaping the timer callback.
+          if (!stopped) reject(error instanceof Error ? error : new Error(String(error)))
+        }
+      }
+      timer = setTimeout(probe, intervalMs)
+    })
+    try {
+      return await Promise.race([reply, wedged])
+    } finally {
+      // Settle the watchdog the moment the run does, so no timer outlives it.
+      stopped = true
+      if (timer !== undefined) clearTimeout(timer)
+    }
   }
 
   const execute = async (run: ExecutorRun): Promise<void> => {
     const type: SessionRunMode = run.mode ?? "run"
-    const message = await request(
-      (id) => ({ type, id, sessionID: run.sessionID, kind: workKind }),
-      (reply) => reply.type === "done" || reply.type === "error",
+    const id = nextRequestId++
+    transport.post({ type, id, sessionID: run.sessionID, kind: workKind })
+    const reply = transport.waitFor(
+      (message) => isAddressed(message, id) && (message.type === "done" || message.type === "error"),
+      NO_REPLY_DEADLINE,
     )
+    const message = runIdleTimeoutMs > 0 ? await awaitReplyWithLiveness(reply, runIdleTimeoutMs) : await reply
     if (message.type === "error") throw new Error(message.message)
     if (message.type !== "done") throw new Error(`unexpected executor reply: ${message.type}`)
     results.set(run.sessionID, message.result)
@@ -430,6 +574,7 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     await request(
       (id) => ({ type: "cancel", id, sessionID }),
       (reply) => reply.type === "cancelled",
+      waitOptions,
     )
   }
 
@@ -437,11 +582,12 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     const message = await request(
       (id) => ({ type: "assertNotBusy", id, sessionID }),
       (reply) => reply.type === "busy",
+      waitOptions,
     )
     return message.type === "busy" ? message.busy : false
   }
 
-  const cancelPort = createExecutorCancelPort({ cancel })
+  const cancelPort = createExecutorCancelPort({ cancel, log })
 
   return {
     id: options.id,
@@ -466,6 +612,8 @@ export interface ExecutorWorkerPoolOptions {
   readonly k: number
   /** Spawn one executor worker (production: a Bun worker + transport). */
   readonly spawn: (id: number) => ExecutorWorker
+  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
+  readonly log?: WorkerLogger
 }
 
 /** Structural mirror of dispatch's `WorkerPool` plus result/worker lookup. */
@@ -478,6 +626,7 @@ export interface ExecutorWorkerPool {
 }
 
 export function createExecutorWorkerPool(options: ExecutorWorkerPoolOptions): ExecutorWorkerPool {
+  const log = options.log ?? noopWorkerLogger
   const foreground = Array.from({ length: options.k }, (_, index) => options.spawn(index + 1))
   const extra: ExecutorWorker[] = []
   // One monotonic counter shared by foreground and extra, so a slot that is

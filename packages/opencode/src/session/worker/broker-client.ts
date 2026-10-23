@@ -32,6 +32,7 @@ import {
 } from "../broker/protocol"
 import type { BrokerClientHandle } from "./layer"
 import { messageOf, portFromMessagePort } from "./port"
+import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
 
 /** Every frame either end may post: requests outbound, response/push frames inbound. */
 export type BrokerWireFrame = BrokerRequest | BrokerFrame
@@ -61,6 +62,14 @@ export interface WorkerBrokerClientOptions {
    * request rejects with a `timeout` `BrokerFailure` instead of hanging.
    */
   readonly timeoutMs?: number
+  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
+  readonly log?: WorkerLogger
+  /**
+   * The worker's owner id, when the caller knows it. Included on the lifecycle
+   * log lines so a hub-side reader can correlate the broker peer with its pool
+   * slot. Omitted (never fabricated) when not supplied.
+   */
+  readonly workerID?: number
 }
 
 interface PendingRequest {
@@ -71,17 +80,47 @@ interface PendingRequest {
 
 const DISPOSED_MESSAGE = "worker broker client disposed"
 
+/** The lifecycle log fields shared by the connect/close lines for this peer. */
+const brokerLifecycleFields = (workerID: number | undefined, level: "info" | "warn"): Record<string, unknown> => ({
+  peer: "broker",
+  level,
+  ...(workerID === undefined ? {} : { workerID }),
+})
+
 /**
  * Adapt a transferred `MessagePort` into a worker broker client. The client
  * never serves requests and never receives hub→worker pushes, so every inbound
  * frame other than a correlated `response` is ignored.
+ *
+ * Emits the E2 peer lifecycle lines: an INFO `broker connected` at construction,
+ * a WARN `broker connect failed` (with `reason`) if `port.start()` throws, and an
+ * INFO `broker closed` at dispose.
  */
 export function createWorkerBrokerClient(
   port: MessagePort,
   options: WorkerBrokerClientOptions = {},
 ): WorkerBrokerClient {
+  const log = options.log ?? noopWorkerLogger
+  const workerID = options.workerID
+  try {
+    const client = buildBrokerClient(port, options)
+    log(workerLogMessage("broker connected"), brokerLifecycleFields(workerID, "info"))
+    return client
+  } catch (error) {
+    log(workerLogMessage("broker connect failed"), {
+      ...brokerLifecycleFields(workerID, "warn"),
+      reason: messageOf(error),
+    })
+    throw error
+  }
+}
+
+/** The connect seam: build the client over a started port; a start failure throws. */
+function buildBrokerClient(port: MessagePort, options: WorkerBrokerClientOptions): WorkerBrokerClient {
   const channel = portFromMessagePort<BrokerWireFrame>(port)
   const defaultTimeoutMs = options.timeoutMs
+  const log = options.log ?? noopWorkerLogger
+  const workerID = options.workerID
 
   let nextRequestId = 0
   let disposed = false
@@ -176,6 +215,7 @@ export function createWorkerBrokerClient(
         waiter.reject(new BrokerFailure("crashed", DISPOSED_MESSAGE))
       }
       pending.clear()
+      log(workerLogMessage("broker closed"), brokerLifecycleFields(workerID, "info"))
     },
   }
 }

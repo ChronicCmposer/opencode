@@ -4,8 +4,10 @@
 // the REAL `createDispatcher` pool, each session fetching a streamed reply from
 // the hub's mock provider and burning CPU (the simulated per-delta assembly cost).
 // A 1-worker pool therefore pins exactly one hot thread; a K-worker pool spreads
-// the same work over ≥2 threads. All timing/RSS numbers are RECORDED, never
-// asserted against a machine-dependent threshold (repo convention).
+// the same work over ≥2 threads. An oversubscribed pool (Option B) keeps more
+// threads genuinely busy than the legacy `nproc − 2` ceiling allowed. All
+// timing/RSS numbers are RECORDED, never asserted against a machine-dependent
+// threshold (repo convention).
 //
 // 13.4 (full `bun test` flag off/on) and the K-session admission/shutdown paths are
 // integration-gated on Phase 9/12; see `.parallel-implement/phase13-e2e.md`.
@@ -22,6 +24,16 @@ const it = testEffect(TestLLMServer.layer)
 const CORES = 4
 const SESSIONS = 4
 const BURN_ITERATIONS = DEFAULT_BURN_ITERATIONS
+
+/**
+ * Option B oversubscription: on a 4-core host the legacy `nproc − 2` sizing
+ * capped the pool at 2 workers. A pool of 6 (with the sessions to fill it) must
+ * therefore keep more than 2 threads busy at once.
+ */
+const OVERSUBSCRIBED_CORES = 4
+const OVERSUBSCRIBED_POOL_SIZE = 6
+const OVERSUBSCRIBED_SESSIONS = 6
+const LEGACY_BUSY_THREAD_CEILING = 2
 
 /**
  * The per-thread CPU reader (and therefore busy-thread accounting) needs the
@@ -72,6 +84,34 @@ describe("13.1 mock-SSE harness drives N concurrent sessions through the pool", 
       for (const result of report.results) expect(result.value).toMatchObject({ text: "ok" })
       expect(report.busyThreads).toBeGreaterThanOrEqual(2)
     }),
+  )
+
+  cpuIt("an oversubscribed K=6 pool on 4 cores keeps work beyond the legacy nproc-2 ceiling", () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      const report = yield* Effect.promise(() =>
+        runParallelSessions({
+          sessions: OVERSUBSCRIBED_SESSIONS,
+          poolSize: OVERSUBSCRIBED_POOL_SIZE,
+          baseUrl: llm.url,
+          cores: OVERSUBSCRIBED_CORES,
+          burnIterations: BURN_ITERATIONS,
+        }),
+      )
+
+      expect(report.cores).toBe(OVERSUBSCRIBED_CORES)
+      expect(report.poolSize).toBe(OVERSUBSCRIBED_POOL_SIZE)
+      expect(report.results).toHaveLength(OVERSUBSCRIBED_SESSIONS)
+      for (const result of report.results) expect(result.value).toMatchObject({ text: "ok" })
+
+      // The legacy `nproc − 2` pool capped a 4-core host at 2 workers; the
+      // oversubscribed pool keeps strictly more threads than that ceiling busy.
+      expect(report.poolSize).toBeGreaterThan(LEGACY_BUSY_THREAD_CEILING)
+      expect(report.busyThreads).toBeGreaterThan(LEGACY_BUSY_THREAD_CEILING)
+    }),
+    // Six live session isolates boot and burn concurrently; under host load this
+    // can outrun the 5s default, so give it the same generous budget as 13.6.
+    30_000,
   )
 })
 
@@ -129,7 +169,9 @@ describe("13.6 per-worker boot ms + RSS at K and K+2 are recorded", () => {
   // bounded retry, must not race the default per-test timeout when the whole test
   // directory runs in parallel. Boot is a one-time cost; the fast path stays ~3s.
   test("records boot timing for the real session-worker entry at K and K+2", async () => {
-    const report = await measureSessionWorkerBoot({ cores: 4 }) // K = 2, extra = 2 -> K+2 = 4
+    // Pin K=2 explicitly: the Option B default for 4 cores is 8, so relying on the
+    // implicit default would boot 8 (then 10) isolates here.
+    const report = await measureSessionWorkerBoot({ cores: 4, k: 2 }) // K = 2, extra = 2 -> K+2 = 4
 
     expect(report.k).toBe(2)
     expect(report.extra).toBe(2)

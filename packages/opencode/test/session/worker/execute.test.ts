@@ -16,16 +16,44 @@ import {
   DEFAULT_WORK_KIND,
   installSessionExecutor,
   SessionBusyError,
+  SessionWorkerReplyTimeoutError,
   UnknownWorkKindError,
   type ExecutorTransport,
   type ExecutorWorkerScope,
   type SessionExecutionResult,
+  type SessionExecutorOutbound,
   type SessionRunControl,
   type SessionWorkFactory,
 } from "@/session/worker/execute"
 import type { CancelFrame } from "@/session/worker/cancel"
+import type { WorkerLogger } from "@/session/worker/log"
 
 const sid = (value: string) => value as SessionID
+
+/** A recording logger: captures every `(message, fields)` pair in call order. */
+function recordingLog(): {
+  readonly log: WorkerLogger
+  readonly entries: Array<{ message: string; fields: Record<string, unknown> }>
+} {
+  const entries: Array<{ message: string; fields: Record<string, unknown> }> = []
+  return { log: (message, fields) => entries.push({ message, fields }), entries }
+}
+
+/** A transport that answers nothing and can be terminated; enough to build a worker. */
+const noopTransport = (): ExecutorTransport => {
+  let alive = true
+  return {
+    post: () => {},
+    waitFor: async () => ({ type: "pong", id: 0 }),
+    get alive() {
+      return alive
+    },
+    async terminate() {
+      alive = false
+      return 0
+    },
+  }
+}
 
 /**
  * Run `body` against a fresh Effect scope, closing it when `body` settles so the
@@ -284,6 +312,61 @@ describe("5.1 executor protocol", () => {
   })
 })
 
+describe("WS3 onRunStart run-start seam", () => {
+  test("onRunStart fires once with the run sessionID before the work executes", () =>
+    withScope(async (scope) => {
+      const calls: SessionID[] = []
+      const order: string[] = []
+      const work: SessionWorkFactory = () => (sessionID) =>
+        Effect.sync(() => {
+          order.push("work")
+          return result(sessionID, "ran")
+        })
+      const executor = createSessionExecutor({
+        machine: createSessionRunMachine({ scope }),
+        work,
+        onRunStart: (sessionID) => {
+          calls.push(sessionID)
+          order.push("onRunStart")
+        },
+      })
+
+      const out = await executor.handle({ type: "run", id: 2, sessionID: sid("ses_1"), kind: "echo" })
+
+      expect(out).toEqual({ type: "done", id: 2, result: result("ses_1", "ran") })
+      expect(calls).toEqual([sid("ses_1")])
+      expect(order).toEqual(["onRunStart", "work"])
+    }))
+
+  test("a throwing onRunStart never fails the run", () =>
+    withScope(async (scope) => {
+      const executor = createSessionExecutor({
+        machine: createSessionRunMachine({ scope }),
+        work: echoWork,
+        onRunStart: () => {
+          throw new Error("thread rename boom")
+        },
+      })
+
+      const out = await executor.handle({ type: "run", id: 2, sessionID: sid("ses_1"), kind: "echo" })
+
+      expect(out).toEqual({ type: "done", id: 2, result: result("ses_1", "echo") })
+    }))
+
+  test("installSessionExecutor forwards onRunStart to the executor", async () => {
+    const workerScope: ExecutorWorkerScope = { onmessage: null, postMessage: () => {} }
+    const calls: SessionID[] = []
+    const installed = installSessionExecutor(workerScope, {
+      work: echoWork,
+      onRunStart: (sessionID) => calls.push(sessionID),
+    })
+
+    await installed.handle({ type: "run", id: 2, sessionID: sid("ses_1"), kind: "echo" })
+    expect(calls).toEqual([sid("ses_1")])
+    await installed.dispose()
+  })
+})
+
 describe("5.4 SessionRunControl seam (Phase 4 + 6.3)", () => {
   test("cancel routes to the provided run control, not the executor machine", () =>
     withScope(async (scope) => {
@@ -459,5 +542,172 @@ describe("13 executor cancel port", () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
 
     expect(acks).toEqual([{ type: "cancel-ack", sessionID: "ses_1", accepted: false }])
+  })
+
+  test("D2 an accepted cancel emits 'cancel outcome' as cooperative", async () => {
+    const { transport } = replyingTransport((request) => ({
+      type: "cancelled",
+      id: (request as { readonly id?: number }).id,
+    }))
+    const { log, entries } = recordingLog()
+    const worker = createExecutorWorker({ id: 1, transport, log })
+
+    worker.cancelPort?.notify({ type: "cancel", sessionID: "ses_1" })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(entries).toContainEqual({
+      message: "session workers: cancel outcome",
+      fields: { sessionID: "ses_1", mode: "cooperative", accepted: true },
+    })
+  })
+
+  test("D2 a rejected cancel emits 'cancel outcome' as terminate", async () => {
+    const transport: ExecutorTransport = {
+      post: () => {},
+      waitFor: async () => {
+        throw new Error("cancel transport failed")
+      },
+      alive: true,
+      async terminate() {
+        return 0
+      },
+    }
+    const { log, entries } = recordingLog()
+    const worker = createExecutorWorker({ id: 1, transport, log })
+
+    worker.cancelPort?.notify({ type: "cancel", sessionID: "ses_1" })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(entries).toContainEqual({
+      message: "session workers: cancel outcome",
+      fields: { sessionID: "ses_1", mode: "terminate", accepted: false },
+    })
+  })
+})
+
+describe("12 B1 worker spawning logging", () => {
+  test("createExecutorWorker emits 'worker spawning' with the default reason", () => {
+    const { log, entries } = recordingLog()
+    createExecutorWorker({ id: 7, transport: noopTransport(), workKind: "session", log })
+
+    expect(entries).toContainEqual({
+      message: "session workers: worker spawning",
+      fields: { workerID: 7, kind: "session", reason: "initial" },
+    })
+  })
+
+  test("createExecutorWorker includes sessionID when known and honors an explicit reason", () => {
+    const { log, entries } = recordingLog()
+    createExecutorWorker({
+      id: 3,
+      transport: noopTransport(),
+      workKind: "session",
+      sessionID: sid("ses_1"),
+      reason: "rebind",
+      log,
+    })
+
+    expect(entries).toContainEqual({
+      message: "session workers: worker spawning",
+      fields: { workerID: 3, kind: "session", sessionID: "ses_1", reason: "rebind" },
+    })
+  })
+})
+
+describe("liveness watchdog (execute)", () => {
+  /**
+   * A transport whose worker answers every `ping` with a `pong` and only
+   * completes a `run` once it has answered `pongsBeforeDone` pings. Frames are
+   * matched by predicate exactly like the real transport, so the run waiter and
+   * a pong waiter coexist without stealing each other's frames.
+   */
+  const pongingTransport = (
+    pongsBeforeDone: number,
+  ): { readonly transport: ExecutorTransport; readonly pings: () => number } => {
+    let pings = 0
+    let run: { readonly id: number; readonly sessionID: SessionID } | undefined
+    const waiters = new Set<{
+      readonly predicate: (message: SessionExecutorOutbound) => boolean
+      readonly resolve: (message: SessionExecutorOutbound) => void
+    }>()
+    const deliver = (message: SessionExecutorOutbound): void => {
+      for (const waiter of [...waiters]) {
+        if (!waiter.predicate(message)) continue
+        waiters.delete(waiter)
+        waiter.resolve(message)
+      }
+    }
+    const answerPing = (id: number): void => {
+      pings += 1
+      queueMicrotask(() => deliver({ type: "pong", id }))
+      const pending = run
+      if (pending !== undefined && pings >= pongsBeforeDone) {
+        run = undefined
+        queueMicrotask(() => deliver({ type: "done", id: pending.id, result: { sessionID: pending.sessionID } }))
+      }
+    }
+    return {
+      pings: () => pings,
+      transport: {
+        post: (message) => {
+          if (message.type === "ping") answerPing(message.id)
+          else if (message.type === "run" || message.type === "startShell") {
+            run = { id: message.id, sessionID: message.sessionID }
+          }
+        },
+        waitFor: (predicate, options) =>
+          new Promise<SessionExecutorOutbound>((resolve, reject) => {
+            const waitMs = options?.timeoutMs ?? 30_000
+            let timer: ReturnType<typeof setTimeout> | undefined
+            const waiter = {
+              predicate,
+              resolve: (message: SessionExecutorOutbound) => {
+                if (timer !== undefined) clearTimeout(timer)
+                waiters.delete(waiter)
+                resolve(message)
+              },
+            }
+            if (waitMs > 0) {
+              timer = setTimeout(() => {
+                waiters.delete(waiter)
+                reject(new SessionWorkerReplyTimeoutError(waitMs))
+              }, waitMs)
+            }
+            waiters.add(waiter)
+          }),
+        alive: true,
+        terminate: async () => 0,
+      },
+    }
+  }
+
+  test("a run survives several idle intervals when the worker answers pings", async () => {
+    const { transport, pings } = pongingTransport(2)
+    const worker = createExecutorWorker({ id: 1, transport, workKind: "slow", runIdleTimeoutMs: 15 })
+
+    await worker.execute({ sessionID: sid("ses_alive"), depth: 0 })
+
+    expect(pings()).toBeGreaterThanOrEqual(2)
+    expect(worker.resultFor(sid("ses_alive"))?.sessionID).toBe("ses_alive")
+  })
+
+  test("a worker that stops answering pings times the run out", async () => {
+    const transport: ExecutorTransport = {
+      post: () => {},
+      waitFor: (_match, options) => {
+        const waitMs = options?.timeoutMs ?? 30_000
+        if (waitMs <= 0) return new Promise(() => {})
+        return new Promise((_resolve, reject) =>
+          setTimeout(() => reject(new SessionWorkerReplyTimeoutError(waitMs)), waitMs),
+        )
+      },
+      alive: true,
+      terminate: async () => 0,
+    }
+    const worker = createExecutorWorker({ id: 1, transport, workKind: "slow", runIdleTimeoutMs: 15 })
+
+    await expect(worker.execute({ sessionID: sid("ses_wedged"), depth: 0 })).rejects.toBeInstanceOf(
+      SessionWorkerReplyTimeoutError,
+    )
   })
 })

@@ -12,7 +12,8 @@
 //   12.4 HTTP ingress + SSE stay functional while K sessions run.
 
 import { describe, expect, test } from "bun:test"
-import { Context, Effect, Exit, Layer, ManagedRuntime, Option } from "effect"
+import { Context, Effect, Exit, Fiber, Layer, Logger, ManagedRuntime, Option } from "effect"
+import type { EffectBridge } from "@/effect/bridge"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import type { SessionID } from "@/session/schema"
 import {
@@ -20,12 +21,15 @@ import {
   createBunExecutorTransport,
   createBunExecutorWorkerPool,
   createHubEventSink,
+  createLazyExecutorWorker,
   createLazyExecutorWorkerPool,
+  createProductionSessionHub,
   createProductionWorkerPool,
   createSessionBoundExecutorWorker,
   createSessionHub,
   createSessionHubLayer,
   createWorkerCancellation,
+  describeSessionWorkerEntry,
   fallbackInstanceContext,
   lazyOpenWriter,
   makeSessionHubNode,
@@ -33,6 +37,7 @@ import {
   productionSessionHubNode,
   resolveSessionWorkerEntry,
   serveEventsPort,
+  spawnBunExecutorWorker,
   SESSION_CANCELLED_TYPE,
   SessionHubService,
   type ProductionPoolFactory,
@@ -41,6 +46,7 @@ import {
   type WorkerTransferredPorts,
 } from "@/session/worker/hub"
 import { ackFrame, endFrame, eventFrame, resyncFrame } from "@/session/worker/frame"
+import { resolveSessionWorkerIdleTimeoutMs, SESSION_WORKER_IDLE_TIMEOUT_ENV } from "@/session/worker/pool"
 import { encodeFrame } from "@/session/egress/frame"
 import { createMeshWorkerClient, type DurableCommit } from "@/session/egress/mesh"
 import { createLiveEventPublisher, EventV2Bridge, type LiveEvent, type LiveEventPublisher } from "@/event-v2-bridge"
@@ -59,9 +65,11 @@ import type {
   SessionExecutorInbound,
   SessionExecutorOutbound,
 } from "@/session/worker/execute"
+import { SessionWorkerReplyTimeoutError } from "@/session/worker/execute"
 import type { CancelFrame, CancelPort, CancelScheduler } from "@/session/worker/cancel"
 import type { SessionWorkerInit } from "@/session/worker/session-worker"
 import { createPidRegistry, registerReported } from "@/session/worker/pid-registry"
+import { workerLoggerFromBridge, workerLogMessage, type WorkerLogger } from "@/session/worker/log"
 import { createWorkerPluginHost } from "@/session/worker/plugin-host"
 import { sessionWorkerInit, assertStructuredCloneable } from "../../lib/session-worker-init"
 import { Session } from "@/session/session"
@@ -286,7 +294,7 @@ class FakeWorker {
 
 async function withFakeWorker(
   run: (fake: FakeWorker, transport: ExecutorTransport) => Promise<void>,
-  options: { readonly bufferCapacity?: number } = {},
+  options: { readonly bufferCapacity?: number; readonly log?: WorkerLogger; readonly workerID?: number } = {},
 ): Promise<void> {
   const original = (globalThis as { Worker?: unknown }).Worker
   ;(globalThis as { Worker?: unknown }).Worker = FakeWorker
@@ -294,6 +302,8 @@ async function withFakeWorker(
     const transport = createBunExecutorTransport({
       entry: "fake://session-worker",
       ...(options.bufferCapacity === undefined ? {} : { bufferCapacity: options.bufferCapacity }),
+      ...(options.log === undefined ? {} : { log: options.log }),
+      ...(options.workerID === undefined ? {} : { workerID: options.workerID }),
     })
     const fake = FakeWorker.last
     if (fake === undefined) throw new Error("fake worker was never constructed")
@@ -303,15 +313,40 @@ async function withFakeWorker(
   }
 }
 
+/** A `log` sink that records every emitted line for assertions. */
+interface RecordedLogLine {
+  readonly message: string
+  readonly fields: Record<string, unknown>
+}
+const recordingLog = (): { readonly log: WorkerLogger; readonly lines: RecordedLogLine[] } => {
+  const lines: RecordedLogLine[] = []
+  return { log: (message, fields) => void lines.push({ message, fields }), lines }
+}
+const lineFor = (lines: RecordedLogLine[], event: string): RecordedLogLine => {
+  const line = lines.find((entry) => entry.message === workerLogMessage(event))
+  if (line === undefined) {
+    throw new Error(`no log line for "${event}"; saw ${JSON.stringify(lines.map((entry) => entry.message))}`)
+  }
+  return line
+}
+
 describe("12.x executor transport buffering", () => {
   test("a buffered frame is consumed by the first matching wait", async () => {
     await withFakeWorker(async (fake, transport) => {
       fake.emit({ marker: 1 })
       const first = await transport.waitFor((message) => markerOf(message) === 1)
       expect(markerOf(first)).toBe(1)
-      await expect(transport.waitFor((message) => markerOf(message) === 1, { timeoutMs: 20 })).rejects.toThrow(
-        /timed out/,
-      )
+      const rejection = transport.waitFor((message) => markerOf(message) === 1, { timeoutMs: 20 })
+      await expect(rejection).rejects.toThrow(/timed out/)
+      await expect(rejection).rejects.toBeInstanceOf(SessionWorkerReplyTimeoutError)
+    })
+  })
+
+  test("timeoutMs 0 means no deadline: a frame emitted after the call still resolves", async () => {
+    await withFakeWorker(async (fake, transport) => {
+      const pending = transport.waitFor((message) => markerOf(message) === 7, { timeoutMs: 0 })
+      fake.emit({ marker: 7 })
+      expect(markerOf(await pending)).toBe(7)
     })
   })
 
@@ -355,6 +390,23 @@ describe("12.x executor transport buffering", () => {
     })
     await expect(transport.waitFor(() => true)).rejects.toThrow(/snapshot is required/)
     await transport.terminate()
+  })
+
+  test("B2 a worker boot/import failure is logged as an error with its workerID", async () => {
+    const { log, lines } = recordingLog()
+    await withFakeWorker(
+      async (fake, transport) => {
+        const pending = transport.waitFor(() => true)
+        fake.fail("Cannot find module './session-worker.ts'", new Error("Cannot find module './session-worker.ts'"))
+
+        await expect(pending).rejects.toThrow("session worker error")
+        const line = lineFor(lines, "worker boot failed")
+        expect(line.fields.workerID).toBe(11)
+        expect(line.fields.level).toBe("ERROR")
+        expect(String(line.fields.message)).toContain("Cannot find module")
+      },
+      { log, workerID: 11 },
+    )
   })
 })
 
@@ -1842,6 +1894,31 @@ describe("A define-aware session worker entry", () => {
   })
 })
 
+describe("A2 describeSessionWorkerEntry reports the resolution source", () => {
+  test("an env override yields source \"env\" and the same entry", () => {
+    const described = describeSessionWorkerEntry({ env: { OPENCODE_SESSION_WORKER_PATH: "/opt/worker.js" } })
+    expect(described).toEqual({ entry: "/opt/worker.js", source: "env" })
+    expect(described.entry).toBe(resolveSessionWorkerEntry({ env: { OPENCODE_SESSION_WORKER_PATH: "/opt/worker.js" } }))
+  })
+
+  test("a build-time define yields source \"definedPath\"", () => {
+    const described = describeSessionWorkerEntry({ env: {}, definedPath: "/$bunfs/root/session-worker.ts" })
+    expect(described).toEqual({ entry: "/$bunfs/root/session-worker.ts", source: "definedPath" })
+  })
+
+  test("neither set yields source \"default\" and the source-relative isolate", () => {
+    const described = describeSessionWorkerEntry({ env: {} })
+    expect(described.source).toBe("default")
+    expect(described.entry).toBeInstanceOf(URL)
+    expect(String(described.entry)).toContain("session-worker.ts")
+  })
+
+  test("an empty env override falls through to the default source", () => {
+    const described = describeSessionWorkerEntry({ env: { OPENCODE_SESSION_WORKER_PATH: "" } })
+    expect(described.source).toBe("default")
+  })
+})
+
 describe("C writer migration runs after open", () => {
   /** A `WriterClient` whose admin calls are recorded; tx methods fail loud if reached. */
   const spyWriter = (calls: string[], onMigrate?: () => void): WriterClient =>
@@ -2148,6 +2225,304 @@ describe("W4 cancelWithReport", () => {
       expect(report.descendants).toEqual([{ sessionID: childID, needsFallbackIdle: true }])
       expect(await parent).toBeInstanceOf(SessionCancelledError)
     } finally {
+      await hub.terminateAll()
+    }
+  })
+
+  test("D3 logs the cancel cascade with descendant and fallback-idle counts", async () => {
+    const parentID = sid("ses_cascade_parent")
+    const childID = sid("ses_cascade_child")
+    const { log, lines } = recordingLog()
+    const pool = new ControllablePool(1, "resolve", true)
+    const hub = createSessionHub({
+      pool,
+      log,
+      cancellation: {
+        portFor: (worker) => (worker as ControllableWorker).cancelPort,
+        graceMs: 500,
+        schedule: neverSchedule,
+      },
+    })
+    try {
+      hub.jobs.start({ id: parentID, type: "task" })
+      hub.jobs.start({ id: childID, type: "task", parentID })
+      hub.jobs.linkChild(parentID, childID)
+
+      const parent = settleOf(hub.dispatcher.dispatch({ sessionID: parentID, depth: 0 }))
+      await pollUntil(() => hub.dispatcher.registry.get(parentID)?.state === "running", {
+        message: "parent never started",
+      })
+
+      await hub.cancelWithReport(parentID)
+
+      const line = lineFor(lines, "cancel cascade")
+      expect(line.fields).toEqual({ level: "INFO", sessionID: parentID, descendants: 1, needsFallbackIdle: 1 })
+      expect(await parent).toBeInstanceOf(SessionCancelledError)
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// W12 observability — session-bound worker rebind and hub port connections.
+// ---------------------------------------------------------------------------
+
+describe("W12 observability — rebind and ports", () => {
+  test("B3 logs a rebound worker's session transition", async () => {
+    const { log, lines } = recordingLog()
+    const worker = createSessionBoundExecutorWorker(5, async (id) => new ImmediateWorker(id), log)
+    try {
+      await worker.execute({ sessionID: sid("ses_a"), depth: 0 })
+      await worker.execute({ sessionID: sid("ses_b"), depth: 0 })
+
+      const rebound = lineFor(lines, "worker rebound").fields
+      expect(rebound).toEqual({
+        level: "INFO",
+        workerID: 5,
+        fromSession: "ses_a",
+        toSession: "ses_b",
+        sessionID: "ses_b",
+      })
+      // The rebound-to session rides the hoisted `sessionID` field so the log
+      // seam prefixes this line with it, while `fromSession`/`toSession` stay.
+      expect(rebound.sessionID).toBe(rebound.toSession)
+    } finally {
+      await worker.terminate()
+    }
+  })
+
+  test("B3 renders the rebound line through workerLoggerFromBridge with the bare ULID prefix", async () => {
+    const rendered: Array<{ readonly logLevel: string; readonly message: unknown }> = []
+    // A bridge whose `fork` runs the logging effect synchronously under a
+    // capturing logger, so this test observes what `workerLoggerFromBridge`
+    // emits in production: both concurrent edits composed end-to-end.
+    const capturingBridge: EffectBridge.Shape = {
+      promise: () => Promise.reject(new Error("capturing bridge: promise is unused")),
+      fork: <A, E, R>(effect: Effect.Effect<A, E, R>): Fiber.Fiber<A, E> => {
+        Effect.runSync(
+          (effect as unknown as Effect.Effect<A, E, never>).pipe(
+            Effect.provide(
+              Logger.layer([
+                Logger.make<unknown, void>(({ logLevel, message }) => {
+                  rendered.push({ logLevel, message })
+                }),
+              ]),
+            ),
+          ),
+        )
+        return undefined as unknown as Fiber.Fiber<A, E>
+      },
+      run: <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E> =>
+        effect as unknown as Effect.Effect<A, E>,
+      bind: <Args extends readonly unknown[], Result>(fn: (...args: Args) => Result) => fn,
+    }
+    const worker = createSessionBoundExecutorWorker(
+      7,
+      async (id) => new ImmediateWorker(id),
+      workerLoggerFromBridge(capturingBridge),
+    )
+    try {
+      await worker.execute({ sessionID: sid("ses_a"), depth: 0 })
+      await worker.execute({ sessionID: sid("ses_b"), depth: 0 })
+
+      const rebound = rendered.find(
+        (entry) => Array.isArray(entry.message) && entry.message[0] === "session workers[b]: worker rebound",
+      )
+      expect(rebound).toBeDefined()
+      // The prefix shows only the bare ULID; the full branded id is retained as a field.
+      expect(rebound?.message).toEqual([
+        "session workers[b]: worker rebound",
+        { workerID: 7, fromSession: "ses_a", toSession: "ses_b", sessionID: "ses_b" },
+      ])
+      expect(rebound?.logLevel).toBe("Info")
+    } finally {
+      await worker.terminate()
+    }
+  })
+
+  test("B3 does not log a rebind when the same session is reused", async () => {
+    const { log, lines } = recordingLog()
+    const worker = createSessionBoundExecutorWorker(6, async (id) => new ImmediateWorker(id), log)
+    try {
+      await worker.execute({ sessionID: sid("ses_same"), depth: 0 })
+      await worker.execute({ sessionID: sid("ses_same"), depth: 0 })
+
+      expect(lines.some((entry) => entry.message === workerLogMessage("worker rebound"))).toBe(false)
+    } finally {
+      await worker.terminate()
+    }
+  })
+
+  test("E1 logs each connected hub port under its worker id", async () => {
+    const { log, lines } = recordingLog()
+    const hub = createSessionHub({ pool: trackedLazyPool(1, []), log })
+    const job = new MessageChannel()
+    const writer = new MessageChannel()
+    const broker = new MessageChannel()
+    const hubProxy = new MessageChannel()
+    try {
+      hub.attachJobPort(3, jobPortFromMessagePort(job.port1))
+      hub.attachWorkerPorts(4, { writer: writer.port1, broker: broker.port1 })
+      hub.attachHubProxyPort(5, hubProxy.port1)
+
+      const connected = lines.filter((entry) => entry.message === workerLogMessage("ports connected"))
+      const portsByWorker = new Map(connected.map((entry) => [entry.fields.workerID, entry.fields.ports]))
+      expect(portsByWorker.get(3)).toEqual(["job"])
+      expect(portsByWorker.get(4)).toEqual(["writer", "broker"])
+      expect(portsByWorker.get(5)).toEqual(["hub-proxy"])
+    } finally {
+      job.port1.close()
+      job.port2.close()
+      writer.port1.close()
+      writer.port2.close()
+      broker.port1.close()
+      broker.port2.close()
+      hubProxy.port1.close()
+      hubProxy.port2.close()
+      await hub.terminateAll()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// dbwal-12-07 WIRING — the production spawn/cancel helpers must forward their
+// `log` seam so B1 `worker spawning` and D2 `cancel outcome` actually fire.
+// Before the wiring: `spawnBunExecutorWorker` built its executor without `log`
+// (B1 dormant), and `createSessionBoundExecutorWorker` / `createLazyExecutorWorker`
+// built their cancel ports without `log` (D2 dormant).
+// ---------------------------------------------------------------------------
+
+describe("dbwal-12-07 hub wiring — B1/D2 forward log through production paths", () => {
+  test("B1 spawnBunExecutorWorker forwards log into createExecutorWorker", async () => {
+    const original = (globalThis as { Worker?: unknown }).Worker
+    ;(globalThis as { Worker?: unknown }).Worker = FakeWorker
+    const { log, lines } = recordingLog()
+    const worker = spawnBunExecutorWorker(7, { k: 1, entry: "fake://spawn", workKind: "slow", log })
+    try {
+      expect(lineFor(lines, "worker spawning").fields).toEqual({ workerID: 7, kind: "slow", reason: "initial" })
+    } finally {
+      ;(globalThis as { Worker?: unknown }).Worker = original
+      await worker.terminate()
+    }
+  })
+
+  test("D2 createSessionBoundExecutorWorker forwards log into its cancel port", async () => {
+    const { log, lines } = recordingLog()
+    const worker = createSessionBoundExecutorWorker(5, async (id) => new ImmediateWorker(id), log)
+    try {
+      await worker.execute({ sessionID: sid("ses_d2"), depth: 0 })
+      await worker.cancelPort!.notify({ type: "cancel", sessionID: sid("ses_d2") })
+      await pollUntil(() => lines.some((entry) => entry.message === workerLogMessage("cancel outcome")), {
+        message: "cancel outcome never logged",
+      })
+      expect(lineFor(lines, "cancel outcome").fields).toEqual({
+        sessionID: "ses_d2",
+        mode: "cooperative",
+        accepted: true,
+      })
+    } finally {
+      await worker.terminate()
+    }
+  })
+
+  test("D2 createLazyExecutorWorker forwards log into its cancel port", async () => {
+    const { log, lines } = recordingLog()
+    const worker = createLazyExecutorWorker(9, async () => new ImmediateWorker(9), log)
+    try {
+      await worker.cancelPort!.notify({ type: "cancel", sessionID: sid("ses_lazy_d2") })
+      await pollUntil(() => lines.some((entry) => entry.message === workerLogMessage("cancel outcome")), {
+        message: "cancel outcome never logged",
+      })
+      expect(lineFor(lines, "cancel outcome").fields).toEqual({
+        sessionID: "ses_lazy_d2",
+        mode: "cooperative",
+        accepted: true,
+      })
+    } finally {
+      await worker.terminate()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Liveness watchdog — the transport must let a pong waiter and a run waiter
+// coexist, and the production wiring must resolve the env override into the
+// worker that spawns.
+// ---------------------------------------------------------------------------
+
+describe("liveness watchdog wiring", () => {
+  test("a pong waiter and a run waiter coexist on one transport without stealing frames", async () => {
+    await withFakeWorker(async (fake, transport) => {
+      const run = transport.waitFor((message) => message.type === "done" && message.id === 1, { timeoutMs: 0 })
+      const pong = transport.waitFor((message) => message.type === "pong" && message.id === 2, { timeoutMs: 0 })
+
+      // The pong arrives first; it must be consumed by the pong waiter only, so
+      // the later done still reaches the run waiter.
+      fake.emit({ type: "pong", id: 2 })
+      fake.emit({ type: "done", id: 1, result: { sessionID: "ses_1" } })
+
+      expect(await pong).toEqual({ type: "pong", id: 2 })
+      expect((await run).type).toBe("done")
+    })
+  })
+
+  test("resolveSessionWorkerIdleTimeoutMs reads a positive integer and defaults anything else to 0", () => {
+    expect(resolveSessionWorkerIdleTimeoutMs({ env: {} })).toBe(0)
+    expect(resolveSessionWorkerIdleTimeoutMs({ env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "250" } })).toBe(250)
+    // Absent, empty, zero, negative and non-numeric all mean "disabled".
+    expect(resolveSessionWorkerIdleTimeoutMs({ env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "0" } })).toBe(0)
+    expect(resolveSessionWorkerIdleTimeoutMs({ env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "-5" } })).toBe(0)
+    expect(resolveSessionWorkerIdleTimeoutMs({ env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "abc" } })).toBe(0)
+    expect(resolveSessionWorkerIdleTimeoutMs({ env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "  " } })).toBe(0)
+  })
+
+  test("createProductionWorkerPool threads runIdleTimeoutMs into the spawned worker", async () => {
+    const original = (globalThis as { Worker?: unknown }).Worker
+    ;(globalThis as { Worker?: unknown }).Worker = FakeWorker
+    const pool = createProductionWorkerPool({
+      init: () => sessionWorkerInit(),
+      count: 1,
+      entry: "fake://idle-timeout",
+      workKind: "instant",
+      runIdleTimeoutMs: 25,
+    })
+    try {
+      // The fake isolate never replies, so only a watchdog that actually reached
+      // the worker can reject this instead of hanging.
+      await expect(pool.workers[0].execute({ sessionID: sid("ses_idle"), depth: 0 })).rejects.toBeInstanceOf(
+        SessionWorkerReplyTimeoutError,
+      )
+    } finally {
+      ;(globalThis as { Worker?: unknown }).Worker = original
+      await pool.terminateAll()
+    }
+  })
+
+  test("createProductionSessionHub resolves the env override and reaches the worker", async () => {
+    const original = (globalThis as { Worker?: unknown }).Worker
+    ;(globalThis as { Worker?: unknown }).Worker = FakeWorker
+    const hub = createProductionSessionHub({
+      init: () => sessionWorkerInit(),
+      count: 1,
+      entry: "fake://idle-env",
+      workKind: "instant",
+      env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "25" },
+    })
+    try {
+      // Resolved from the env override: the dispatch must settle (the watchdog
+      // fired) rather than hang forever. The exact rejection is the dispatcher's
+      // concern (it may terminate the worker), so only settlement is asserted.
+      const outcome = await Promise.race([
+        hub.ensureRunning(sid("ses_idle_env")).then(
+          () => "resolved" as const,
+          (error: unknown) => error,
+        ),
+        new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 3_000)),
+      ])
+      expect(outcome).not.toBe("hung")
+    } finally {
+      ;(globalThis as { Worker?: unknown }).Worker = original
       await hub.terminateAll()
     }
   })

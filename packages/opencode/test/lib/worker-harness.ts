@@ -180,19 +180,24 @@ function createHandle<TOut, TIn>(
 
     const timeoutMs = options?.timeoutMs ?? defaultTimeoutMs
     return new Promise<TOut>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        waiters.delete(waiter)
-        reject(new Error(`timed out waiting for worker message after ${timeoutMs}ms`))
-      }, timeoutMs)
+      // A non-positive `timeoutMs` means "no deadline" (mirrors the executor
+      // transport): wait indefinitely for a matching message.
+      const timer =
+        timeoutMs > 0
+          ? setTimeout(() => {
+              waiters.delete(waiter)
+              reject(new Error(`timed out waiting for worker message after ${timeoutMs}ms`))
+            }, timeoutMs)
+          : undefined
       const waiter: PendingWaiter<TOut> = {
         predicate,
         resolve: (message) => {
-          clearTimeout(timer)
+          if (timer !== undefined) clearTimeout(timer)
           waiters.delete(waiter)
           resolve(message)
         },
         reject: (error) => {
-          clearTimeout(timer)
+          if (timer !== undefined) clearTimeout(timer)
           waiters.delete(waiter)
           reject(error)
         },

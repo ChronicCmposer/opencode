@@ -9,17 +9,34 @@
 // reaches the hub. The hub runs over an in-memory executor pool so the wiring is
 // tested deterministically without spawning isolates.
 
-import { describe, expect } from "bun:test"
-import { Deferred, Effect, Fiber, Latch, Layer } from "effect"
+import { describe, expect, test } from "bun:test"
+import { Context, Deferred, Effect, Fiber, Latch, Layer, Logger } from "effect"
+import { ModelsDev } from "@opencode-ai/core/models-dev"
+import { Auth } from "@/auth"
+import { Config } from "@/config/config"
 import type { SessionID } from "@/session/schema"
 import { BackgroundJob } from "@/background/job"
 import { Session } from "@/session/session"
+import { Permission } from "@/permission"
+import { Provider } from "@/provider/provider"
+import { Question } from "@/question"
 import { SessionStatus } from "@/session/status"
 import { SessionRunState } from "@/session/run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
-import type { LiveEvent, LiveEventPublisher } from "@/event-v2-bridge"
+import { EventV2Bridge, type LiveEvent, type LiveEventPublisher } from "@/event-v2-bridge"
 import type { CancelFrame, CancelPort } from "@/session/worker/cancel"
-import { createSessionHub, SessionHubService, type SessionHub } from "@/session/worker/hub"
+import {
+  createProductionSessionHub,
+  createSessionHub,
+  productionSessionHubLayer,
+  SessionHubService,
+  type SessionHub,
+} from "@/session/worker/hub"
+import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
+import { deriveHeadroom } from "@/session/worker/dispatch"
+import { reapSupport } from "@/session/worker/pid-registry"
+import { sessionWorkerInit } from "../../lib/session-worker-init"
+import { pollUntil } from "../../lib/poll"
 import {
   SessionBusyError,
   type ExecutorRun,
@@ -893,6 +910,191 @@ describe("W4 — parent cancel settles every child to exactly one idle", () => {
         // The sweep cancelled the persisted child through the hub and wrote its idle.
         expect(idles.filter((call) => call.sessionID === childID)).toBeArrayOfSize(1)
       }),
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// W12 observability — the production hub logs pool/entry/reap resolution and
+// pid reports through the injected `log` seam.
+// ---------------------------------------------------------------------------
+
+interface RecordedLogLine {
+  readonly message: string
+  readonly fields: Record<string, unknown>
+}
+
+const recordingLog = (): { readonly log: WorkerLogger; readonly lines: RecordedLogLine[] } => {
+  const lines: RecordedLogLine[] = []
+  return { log: (message, fields) => void lines.push({ message, fields }), lines }
+}
+
+const lineFor = (lines: RecordedLogLine[], event: string): RecordedLogLine => {
+  const line = lines.find((entry) => entry.message === workerLogMessage(event))
+  if (line === undefined) throw new Error(`no log line for "${event}"; saw ${JSON.stringify(lines.map((l) => l.message))}`)
+  return line
+}
+
+/** A production hub over an in-memory pool: no isolate is ever spawned. */
+const productionHubWithLog = (options: {
+  readonly count: number
+  readonly env?: Record<string, string | undefined>
+  readonly entry?: string | URL
+  readonly log: WorkerLogger
+}): SessionHub =>
+  createProductionSessionHub({
+    init: sessionWorkerInit(),
+    count: options.count,
+    poolFactory: () => new FakePool(options.count, undefined),
+    log: options.log,
+    ...(options.env === undefined ? {} : { env: options.env }),
+    ...(options.entry === undefined ? {} : { entry: options.entry }),
+  })
+
+describe("W12 observability — hub construction resolution", () => {
+  test("A1 logs the resolved pool with count, override, parallelism and headroom", async () => {
+    const { log, lines } = recordingLog()
+    const hub = productionHubWithLog({ count: 4, env: {}, log })
+    try {
+      const line = lineFor(lines, "pool resolved")
+      expect(line.fields.workerCount).toBe(4)
+      expect(line.fields.override).toBe(false)
+      expect(typeof line.fields.availableParallelism).toBe("number")
+      expect(line.fields.availableParallelism as number).toBeGreaterThan(0)
+      expect(line.fields.headroom).toBe(deriveHeadroom(4))
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+
+  test("A1 reports the env override when OPENCODE_SESSION_WORKER_COUNT is set", async () => {
+    const { log, lines } = recordingLog()
+    const hub = productionHubWithLog({ count: 3, env: { OPENCODE_SESSION_WORKER_COUNT: "3" }, log })
+    try {
+      const line = lineFor(lines, "pool resolved")
+      expect(line.fields.workerCount).toBe(3)
+      expect(line.fields.override).toBe(true)
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+
+  test("A2 logs the resolved worker entry and its source (explicit path)", async () => {
+    const { log, lines } = recordingLog()
+    const hub = productionHubWithLog({ count: 1, env: {}, entry: "/opt/session-worker.js", log })
+    try {
+      const line = lineFor(lines, "worker entry resolved")
+      expect(line.fields.entry).toBe("/opt/session-worker.js")
+      expect(line.fields.source).toBe("definedPath")
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+
+  test("A2 reports the env source when the entry comes from the environment", async () => {
+    const { log, lines } = recordingLog()
+    const hub = productionHubWithLog({ count: 1, env: { OPENCODE_SESSION_WORKER_PATH: "/env/worker.js" }, log })
+    try {
+      const line = lineFor(lines, "worker entry resolved")
+      expect(line.fields.entry).toBe("/env/worker.js")
+      expect(line.fields.source).toBe("env")
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+
+  test("A3 logs reap support for this platform", async () => {
+    const support = reapSupport()
+    const { log, lines } = recordingLog()
+    const hub = productionHubWithLog({ count: 1, env: {}, log })
+    try {
+      const line = lineFor(lines, "reap support")
+      expect(line.fields).toEqual({ level: "INFO", supported: support.supported, reason: support.reason })
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+
+  test("E3 logs a pid report with the mirrored entry count", async () => {
+    const { log, lines } = recordingLog()
+    const hub = productionHubWithLog({ count: 1, env: {}, log })
+    const channel = new MessageChannel()
+    try {
+      hub.attachHubProxyPort(7, channel.port1)
+      channel.port2.postMessage({
+        type: "pid-report",
+        workerID: 7,
+        entries: [
+          { pid: 4242, pgid: 4242, label: "shell", workerID: 7 },
+          { pid: 4343, pgid: 4343, label: "shell", workerID: 7 },
+        ],
+      })
+
+      await pollUntil(() => lines.some((entry) => entry.message === workerLogMessage("pid report")), {
+        message: "pid report never logged",
+      })
+      expect(lineFor(lines, "pid report").fields).toEqual({ level: "INFO", workerID: 7, entries: 2 })
+    } finally {
+      channel.port1.close()
+      channel.port2.close()
+      await hub.terminateAll()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// W12 production wiring — the hub-path narrative must emit through the
+// PRODUCTION layer, not only the test-only `createSessionHubLayer`.
+//
+// The verification agent found `productionSessionHubLayer` never created a
+// bridge logger, so `options.log` defaulted to `noopWorkerLogger` and A1/A2/A3
+// (and every transitively forwarded event) were dormant on the real app graphs
+// (`app-runtime.ts`, `server/routes/instance/httpapi/server.ts`). This builds
+// that exact layer, provides the nine services it needs as mocks, injects a
+// capturing Effect `Logger`, and asserts the bring-up line emits.
+// ---------------------------------------------------------------------------
+
+/** The nine services `productionSessionHubLayer` requires; none is called at build. */
+const productionWiringServices = Layer.mergeAll(
+  Layer.mock(Config.Service, {}),
+  Layer.mock(Auth.Service, {}),
+  Layer.mock(ModelsDev.Service, {}),
+  Layer.mock(Provider.Service, {}),
+  RuntimeFlags.layer({ experimentalSessionWorkers: true }),
+  Layer.mock(SessionStatus.Service, {}),
+  Layer.mock(Permission.Service, {}),
+  Layer.mock(Question.Service, {}),
+  Layer.mock(EventV2Bridge.Service, {}),
+)
+
+describe("W12 production wiring — the production hub layer emits the narrative", () => {
+  test("productionSessionHubLayer creates a bridge logger so A1 emits (not the noop)", async () => {
+    // The bridge logger forks `Effect.logInfo`; capture the raw Effect messages.
+    const messages: unknown[] = []
+    const logger = Logger.make<unknown, void>((entry) => {
+      messages.push(entry.message)
+    })
+    const emitted = () =>
+      messages.some((message) => Array.isArray(message) && message[0] === workerLogMessage("pool resolved"))
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const context = yield* Layer.build(
+            // The production layer (the same one `productionSessionHubNode` wraps),
+            // over an in-memory pool so no isolate is spawned at build.
+            productionSessionHubLayer({ count: 2, poolFactory: () => new FakePool(2, undefined) }).pipe(
+              Layer.provide(productionWiringServices),
+            ),
+          )
+          const hub = Context.get(context, SessionHubService)
+          expect(hub).toBeDefined()
+          // The bridge forks the line asynchronously; poll the captured messages.
+          yield* Effect.promise(() =>
+            pollUntil(emitted, { message: "production layer never logged 'pool resolved'" }),
+          )
+        }),
+      ).pipe(Effect.provide(Logger.layer([logger]))),
     )
   })
 })

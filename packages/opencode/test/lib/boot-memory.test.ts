@@ -1,17 +1,28 @@
 import { describe, expect, test } from "bun:test"
+import { deriveWorkerCount as canonicalDeriveWorkerCount } from "@/session/worker/pool"
 import { deriveWorkerCount, measureBootMemory, readRssBytes } from "./boot-memory"
 
 describe("worker count derivation", () => {
-  test("K = availableParallelism - 2, floor 1, single worker below 4 cores", () => {
-    expect(deriveWorkerCount(1)).toBe(1)
-    expect(deriveWorkerCount(3)).toBe(1)
-    expect(deriveWorkerCount(4)).toBe(2)
-    expect(deriveWorkerCount(8)).toBe(6)
+  // WS2: `boot-memory` no longer owns sizing. It re-exports the canonical pool
+  // helper so the harness and production sizing can never drift apart.
+  test("re-exports the canonical pool sizing helper", () => {
+    expect(deriveWorkerCount).toBe(canonicalDeriveWorkerCount)
+  })
+
+  test("oversubscribes: floor(cores * factor), default factor 2", () => {
+    expect(deriveWorkerCount(4)).toBe(8)
+    expect(deriveWorkerCount(8)).toBe(16)
+  })
+
+  test("agrees with the canonical helper across core counts (incl. small machines)", () => {
+    for (const cores of [1, 2, 3, 4, 6, 8, 16, 32]) {
+      expect(deriveWorkerCount(cores)).toBe(canonicalDeriveWorkerCount(cores))
+    }
   })
 
   test("fails loudly on an invalid core count", () => {
-    expect(() => deriveWorkerCount(0)).toThrow(/core count/)
-    expect(() => deriveWorkerCount(2.5)).toThrow(/core count/)
+    expect(() => deriveWorkerCount(0)).toThrow(/availableParallelism/)
+    expect(() => deriveWorkerCount(2.5)).toThrow(/availableParallelism/)
   })
 })
 
@@ -20,7 +31,9 @@ describe("boot/memory measurement harness", () => {
   // machine-dependent threshold assertion: we assert scenario completion and that
   // metrics were collected, never that boot ms or RSS falls under a bound.
   test("records per-worker boot ms and RSS at K and at K+2", async () => {
-    const report = await measureBootMemory({ cores: 4 }) // K = 2, extra = 2 -> K+2 = 4
+    // Explicit `k` keeps this test booting 4 isolates rather than the
+    // oversubscribed default of `cores * 2` (which would be 8 here).
+    const report = await measureBootMemory({ cores: 4, k: 2, extra: 2 }) // K = 2, K+2 = 4
 
     expect(report.k).toBe(2)
     expect(report.extra).toBe(2)

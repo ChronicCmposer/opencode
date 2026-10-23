@@ -9,6 +9,9 @@ import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core"
 import { Effect } from "effect"
 import type { SqlClient as SqlClientService } from "effect/unstable/sql/SqlClient"
 import { isSqlError } from "effect/unstable/sql/SqlError"
+// effect-drizzle-sqlite is intentionally generic and does not depend on
+// @opencode-ai/core, so the integration test reaches the retry helper directly.
+import { BusyRetriesExhaustedError, withBusyRetry } from "../../core/src/database/busy"
 import { EffectDrizzleSqlite } from "../src"
 
 const users = sqliteTable("users", {
@@ -123,6 +126,78 @@ test("preserves failed transaction begin errors", async () => {
         expect(error.reason.cause instanceof Error ? error.reason.cause.message : "").toContain("database is locked")
       }).pipe(Effect.provide(SqliteClient.layer({ filename, disableWAL: true })), Effect.scoped),
     )
+  } finally {
+    if (holder.inTransaction) holder.run("rollback")
+    holder.close()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("recovers a contended transactional write under bounded busy retry", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "effect-drizzle-sqlite-"))
+  const filename = join(dir, "busy-retry.db")
+  const holder = new Database(filename)
+
+  try {
+    holder.run("create table users (id integer primary key autoincrement, name text not null)")
+    holder.run("pragma busy_timeout = 0")
+    holder.run("begin immediate")
+
+    let released = false
+    const release = (): void => {
+      if (released) return
+      released = true
+      holder.run("rollback")
+    }
+
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+        yield* db.run(sql`pragma busy_timeout = 0`)
+
+        // The holder owns the write lock until the first backoff sleep releases
+        // it, so the first attempt fails busy and a later attempt commits.
+        yield* withBusyRetry(
+          db.transaction((tx) => tx.insert(users).values({ name: "Recovered" }), { behavior: "immediate" }),
+          { retries: 10, baseDelayMs: 1, maxDelayMs: 5, sleep: () => Effect.sync(release) },
+        )
+
+        expect(yield* db.select().from(users)).toEqual([{ id: 1, name: "Recovered" }])
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, disableWAL: true })), Effect.scoped),
+    )
+  } finally {
+    if (holder.inTransaction) holder.run("rollback")
+    holder.close()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("fails loudly when the busy retry budget is exhausted", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "effect-drizzle-sqlite-"))
+  const filename = join(dir, "busy-exhausted.db")
+  const holder = new Database(filename)
+
+  try {
+    holder.run("create table users (id integer primary key autoincrement, name text not null)")
+    holder.run("pragma busy_timeout = 0")
+    holder.run("begin immediate")
+
+    const outcome = await Effect.runPromise(
+      Effect.gen(function* () {
+        const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+        yield* db.run(sql`pragma busy_timeout = 0`)
+
+        return yield* withBusyRetry(
+          db.transaction((tx) => tx.insert(users).values({ name: "Blocked" }), { behavior: "immediate" }),
+          { retries: 2, baseDelayMs: 1, maxDelayMs: 1, sleep: () => Effect.void },
+        ).pipe(Effect.catchDefect((cause) => Effect.succeed(cause)))
+      }).pipe(Effect.provide(SqliteClient.layer({ filename, disableWAL: true })), Effect.scoped),
+    )
+
+    expect(outcome).toBeInstanceOf(BusyRetriesExhaustedError)
+    const error = outcome as BusyRetriesExhaustedError
+    expect(error.attempts).toBe(3)
+    expect(isSqlError(error.lastCause)).toBe(true)
   } finally {
     if (holder.inTransaction) holder.run("rollback")
     holder.close()
