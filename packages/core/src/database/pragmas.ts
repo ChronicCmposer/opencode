@@ -14,9 +14,17 @@ export const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES = 64 * MEBIBYTE
 /** Cadence of the writer's idle truncating checkpoint. */
 export const DEFAULT_CHECKPOINT_INTERVAL_MS = 5 * 60 * 1000
 
+/** Default driver-level `busy_timeout` applied immediately after open. */
+export const DEFAULT_BUSY_TIMEOUT_MS = 5000
+
 export interface WalConfig {
   readonly journalSizeLimitBytes: number
   readonly checkpointIntervalMs: number
+  /**
+   * Driver `busy_timeout` resolved at the boundary. Optional so a caller may pass
+   * only the fields it overrides (the writer keeps its own short timeout).
+   */
+  readonly busyTimeoutMs?: number
 }
 
 type Environment = Record<string, string | undefined>
@@ -37,6 +45,7 @@ export function resolveWalConfig(env: Environment = process.env): WalConfig {
   return {
     journalSizeLimitBytes: parseInteger(env.OPENCODE_DB_JOURNAL_SIZE_LIMIT, DEFAULT_JOURNAL_SIZE_LIMIT_BYTES, -1),
     checkpointIntervalMs: parseInteger(env.OPENCODE_DB_CHECKPOINT_INTERVAL_MS, DEFAULT_CHECKPOINT_INTERVAL_MS, 0),
+    busyTimeoutMs: parseInteger(env.OPENCODE_DB_BUSY_TIMEOUT_MS, DEFAULT_BUSY_TIMEOUT_MS, 0),
   }
 }
 
@@ -64,15 +73,18 @@ export function resolveBusyRetryConfig(env: Environment = process.env): BusyRetr
   }
 }
 
-export interface WalPragmaOptions {
-  readonly journalSizeLimitBytes?: number
-  readonly busyTimeoutMs?: number
-}
+/**
+ * The resolved WAL settings a connection needs at open. Taken as a partial of
+ * the canonical {@link WalConfig} so a connection can pass the whole resolved
+ * config (including `checkpointIntervalMs`, which the writer core consumes) and
+ * override only the connection-specific busy timeout.
+ */
+export type WalPragmaOptions = Partial<WalConfig>
 
 /** Pragmas every connection applies immediately after open. */
 export function walPragmas(options: WalPragmaOptions = {}): string[] {
   const journalSizeLimitBytes = options.journalSizeLimitBytes ?? DEFAULT_JOURNAL_SIZE_LIMIT_BYTES
-  const busyTimeoutMs = options.busyTimeoutMs ?? 5000
+  const busyTimeoutMs = options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS
   return [
     "PRAGMA journal_mode = WAL",
     "PRAGMA synchronous = NORMAL",

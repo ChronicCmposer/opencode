@@ -28,31 +28,48 @@ function isBusyCode(code: string): boolean {
   return BUSY_SQLITE_CODES.some((base) => code === base || code.startsWith(`${base}_`))
 }
 
-function hasBusyCode(error: object): boolean {
-  const code = (error as { code?: unknown }).code
-  if (typeof code === "string" && isBusyCode(code)) return true
-  // The writer-side classifier reads `sqliteCode`; mirror that for parity.
-  const sqliteCode = (error as { sqliteCode?: unknown }).sqliteCode
-  return typeof sqliteCode === "string" && isBusyCode(sqliteCode)
+/**
+ * The recognizable shape of a native SQLite driver error. Both the bun
+ * (`SQLiteError`) and node (`node:sqlite`) drivers surface a subset of these, so
+ * narrowing to this interface lets the rest of the classifier read the fields
+ * without repeated casts.
+ */
+export interface NativeSqliteError {
+  readonly name?: unknown
+  readonly code?: unknown
+  readonly sqliteCode?: unknown
+  readonly errno?: unknown
+  readonly message?: unknown
 }
 
 /**
  * True when `error` carries a recognizable native-driver shape. The "database is
  * locked" message fallback is only trustworthy for these: an arbitrary error
  * whose message happens to contain that text must not trigger a retry.
+ *
+ * This is the single guard; the writer isolate should reuse it rather than
+ * re-implementing its own driver-shape check.
  */
-function isNativeSqliteError(error: object): boolean {
-  const name = (error as { name?: unknown }).name
-  if (name === "SQLiteError") return true
-  if (typeof (error as { errno?: unknown }).errno === "number") return true
-  if (typeof (error as { sqliteCode?: unknown }).sqliteCode === "string") return true
-  const code = (error as { code?: unknown }).code
+export function isNativeSqliteError(error: unknown): error is NativeSqliteError {
+  if (typeof error !== "object" || error === null) return false
+  const candidate = error as NativeSqliteError
+  if (candidate.name === "SQLiteError") return true
+  if (typeof candidate.errno === "number") return true
+  if (typeof candidate.sqliteCode === "string") return true
+  const code = candidate.code
   return (typeof code === "string" && code.startsWith("SQLITE_")) || typeof code === "number"
 }
 
-function hasBusyMessage(error: object): boolean {
-  if (!isNativeSqliteError(error)) return false
-  const message = (error as { message?: unknown }).message
+function hasBusyCode(error: NativeSqliteError): boolean {
+  const code = error.code
+  if (typeof code === "string" && isBusyCode(code)) return true
+  // The writer-side classifier reads `sqliteCode`; mirror that for parity.
+  const sqliteCode = error.sqliteCode
+  return typeof sqliteCode === "string" && isBusyCode(sqliteCode)
+}
+
+function hasBusyMessage(error: NativeSqliteError): boolean {
+  const message = error.message
   if (typeof message !== "string") return false
   return message.includes("SQLITE_BUSY") || message.includes("SQLITE_LOCKED") || message.includes(LOCKED_MESSAGE)
 }
@@ -68,7 +85,7 @@ function hasBusyMessage(error: object): boolean {
 export function isBusySqlError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false
   if (isSqlError(error) && error.reason._tag === "LockTimeoutError") return true
-  return hasBusyCode(error) || hasBusyMessage(error)
+  return isNativeSqliteError(error) && (hasBusyCode(error) || hasBusyMessage(error))
 }
 
 export interface BusyRetryOptions {

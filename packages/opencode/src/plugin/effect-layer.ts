@@ -31,13 +31,22 @@ import { registerAdapter } from "@/control-plane/adapters"
 import type { WorkspaceAdapter } from "@/control-plane/types"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { InstallationChannel } from "@opencode-ai/core/installation/version"
 import { Service, experimentalWebSocketsEnabled } from "./index"
 import type { TriggerName } from "./index"
 
 type State = {
   hooks: Hooks[]
 }
+
+type PluginEvent = Parameters<NonNullable<Hooks["event"]>>[0]["event"]
+
+// A hook that follows the `(input, output) => Promise<void>` trigger shape. The
+// `Hooks[Name]` indexed type does not reduce for a generic `Name`, so the
+// trigger loop narrows to this callable before invoking it.
+type TriggerHook<Name extends TriggerName> = (
+  input: Parameters<Required<Hooks>[Name]>[0],
+  output: Parameters<Required<Hooks>[Name]>[1],
+) => Promise<void>
 
 // Built-in plugins that are directly imported (not installed from npm)
 function internalPlugins(flags: RuntimeFlags.Info): PluginInstance[] {
@@ -155,8 +164,6 @@ export const effectLayer = Layer.effect(
         }
 
         const plugins = flags.pure ? [] : (cfg.plugin_origins ?? [])
-        if (flags.pure && cfg.plugin_origins?.length) {
-        }
         if (plugins.length) {
           // Config owns dependency installation and verification: it installs per config directory
           // and logs a loud, non-fatal error when a directory ends up without `@opencode-ai/plugin`.
@@ -170,9 +177,9 @@ export const effectLayer = Layer.effect(
             items: plugins,
             kind: "server",
             report: {
-              start(candidate) {},
-              missing(candidate, _retry, message) {},
-              error(candidate, _retry, stage, error, resolved) {
+              start(_candidate) {},
+              missing(_candidate, _retry, _message) {},
+              error(candidate, _retry, stage, error, _resolved) {
                 const spec = candidate.plan.spec
                 const cause = error instanceof Error ? (error.cause ?? error) : error
                 const message = stage === "load" ? errorMessage(error) : errorMessage(cause)
@@ -221,7 +228,8 @@ export const effectLayer = Layer.effect(
         // Notify plugins of current config
         for (const hook of hooks) {
           yield* Effect.tryPromise({
-            try: () => Promise.resolve((hook as any).config?.(cfg)),
+            try: () =>
+              Promise.resolve(hook.config?.(cfg as Parameters<NonNullable<Hooks["config"]>>[0])),
             catch: errorMessage,
           }).pipe(
             Effect.tapError((error) => Effect.logError("plugin config hook failed", { error })),
@@ -232,8 +240,9 @@ export const effectLayer = Layer.effect(
         const unsubscribe = yield* events.listen((event) => {
           if (event.location?.directory !== ctx.directory) return Effect.void
           return Effect.sync(() => {
+            const pluginEvent = { id: event.id, type: event.type, properties: event.data } as PluginEvent
             for (const hook of hooks) {
-              void hook["event"]?.({ event: { id: event.id, type: event.type, properties: event.data } as any })
+              void hook.event?.({ event: pluginEvent })
             }
           })
         })
@@ -266,9 +275,13 @@ export const effectLayer = Layer.effect(
       if (!name) return output
       const s = yield* InstanceState.get(state)
       for (const hook of s.hooks) {
-        const fn = hook[name] as any
+        const fn = hook[name] as TriggerHook<Name> | undefined
         if (!fn) continue
-        yield* Effect.promise(async () => fn(input, output))
+        yield* Effect.promise(() =>
+          Promise.resolve(
+            fn(input as Parameters<Required<Hooks>[Name]>[0], output as Parameters<Required<Hooks>[Name]>[1]),
+          ),
+        )
       }
       return output
     })

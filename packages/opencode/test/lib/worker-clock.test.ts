@@ -7,6 +7,7 @@
 // `Effect.sleep` resolves exactly when the hub advances time.
 
 import { describe, expect, test } from "bun:test"
+import { pollUntil } from "./poll"
 import { createWorkerHarness, type HarnessWorker, type WorkerHarness } from "./worker-harness"
 import {
   createClockController,
@@ -24,15 +25,6 @@ interface ClockWorkerContext {
   readonly harness: WorkerHarness
   readonly worker: HarnessWorker<WorkerOut, ClockWorkerInbound>
   readonly controller: ClockController
-}
-
-async function pollUntil(predicate: () => Promise<boolean>, timeoutMs = 2000): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (await predicate()) return
-    await new Promise((resolve) => setTimeout(resolve, 5))
-  }
-  throw new Error(`pollUntil timed out after ${timeoutMs}ms`)
 }
 
 async function spawnClockWorker(): Promise<ClockWorkerContext> {
@@ -65,7 +57,7 @@ describe("worker fake clock", () => {
   test("advance resolves an Effect.sleep scheduled for the advanced time", async () => {
     await withClockWorker(async ({ worker, controller }) => {
       worker.post({ type: "sleep", id: "s1", ms: 1000 })
-      await pollUntil(async () => (await controller.read()).pending === 1)
+      await pollUntil(async () => (await controller.read()).pending === 1, { message: "sleep never became pending" })
 
       const advanced = await controller.advance(1000)
       expect(advanced.timestamp).toBe(1000)
@@ -80,7 +72,7 @@ describe("worker fake clock", () => {
   test("advancing past a sleep's target resolves it at the target time", async () => {
     await withClockWorker(async ({ worker, controller }) => {
       worker.post({ type: "sleep", id: "s2", ms: 500 })
-      await pollUntil(async () => (await controller.read()).pending === 1)
+      await pollUntil(async () => (await controller.read()).pending === 1, { message: "sleep never became pending" })
 
       await controller.advance(2000)
 
@@ -92,7 +84,7 @@ describe("worker fake clock", () => {
   test("an insufficient advance leaves the sleep pending", async () => {
     await withClockWorker(async ({ worker, controller }) => {
       worker.post({ type: "sleep", id: "s3", ms: 1000 })
-      await pollUntil(async () => (await controller.read()).pending === 1)
+      await pollUntil(async () => (await controller.read()).pending === 1, { message: "sleep never became pending" })
 
       const advanced = await controller.advance(400)
       expect(advanced.timestamp).toBe(400)
@@ -106,7 +98,7 @@ describe("worker fake clock", () => {
   test("set jumps to an absolute timestamp and fires due sleeps", async () => {
     await withClockWorker(async ({ worker, controller }) => {
       worker.post({ type: "sleep", id: "s4", ms: 1000 })
-      await pollUntil(async () => (await controller.read()).pending === 1)
+      await pollUntil(async () => (await controller.read()).pending === 1, { message: "sleep never became pending" })
 
       const set = await controller.set(1000)
       expect(set.timestamp).toBe(1000)
@@ -121,7 +113,7 @@ describe("worker fake clock", () => {
     await withClockWorker(async ({ worker, controller }) => {
       worker.post({ type: "sleep", id: "late", ms: 300 })
       worker.post({ type: "sleep", id: "early", ms: 100 })
-      await pollUntil(async () => (await controller.read()).pending === 2)
+      await pollUntil(async () => (await controller.read()).pending === 2, { message: "sleeps never became pending" })
 
       await controller.advance(300)
 

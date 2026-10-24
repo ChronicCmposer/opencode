@@ -43,6 +43,7 @@ describe("processRole", () => {
       expect(report.nodesAfter).toBe(0)
 
       // A conflicting re-set fails loud; the same role is an idempotent no-op.
+      if (report.conflict === null) throw new Error("expected the conflicting re-set to fail loudly")
       expect(report.conflict).toContain("session")
       expect(report.conflict).toContain("writer")
       expect(report.sameRole).toBeNull()

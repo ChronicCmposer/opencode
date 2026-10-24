@@ -18,7 +18,6 @@ import {
   SessionCancelledError,
   WorkerCrashedError,
   type DispatchRequest,
-  type Scheduler,
 } from "@/session/worker/dispatch"
 import {
   createExecutorWorker,
@@ -35,29 +34,10 @@ import { createWorkerHarness } from "../../lib/worker-harness"
 import { withFaults } from "../../lib/faults"
 import { capture, flush, sid } from "../../lib/async"
 import { FaultPool, createFakeWorkerPool, type FakeSessionWorker } from "../../lib/fake-worker-pool"
+import { createRecordingScheduler } from "../../lib/scheduler"
 
-interface TestTimer {
-  readonly delayMs: number
-  readonly run: () => void
-  cancelled: boolean
-}
-
-/** A scheduler that records timers so tests can fire them deterministically. */
-function createTestScheduler() {
-  const timers: TestTimer[] = []
-  const schedule: Scheduler = (delayMs, run) => {
-    const timer: TestTimer = { delayMs, run, cancelled: false }
-    timers.push(timer)
-    return () => {
-      timer.cancelled = true
-    }
-  }
-  return {
-    schedule,
-    timers,
-    pending: () => timers.filter((timer) => !timer.cancelled),
-  }
-}
+/** The shared recording scheduler, so timer assertions read the same everywhere. */
+const createTestScheduler = createRecordingScheduler
 
 describe("4.3 one active session per worker", () => {
   test("extra sessions queue instead of multiplexing a busy worker", async () => {
@@ -1426,6 +1406,28 @@ describe("2.6 per-session write barrier", () => {
 
     pool.workers[0].finish(sid("ses_2"))
     await second
+    await dispatcher.terminateAll()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 11.8 — a cyclic childrenOf graph must still terminate the cascade.
+// ---------------------------------------------------------------------------
+
+describe("11.8 cyclic subagent cascade", () => {
+  test("a childrenOf graph that reports a cycle terminates instead of recursing forever", async () => {
+    const pool = createFakeWorkerPool(1)
+    const parent = sid("ses_parent")
+    const child = sid("ses_child")
+    const childrenOf = (sessionID: SessionID): ReadonlyArray<SessionID> =>
+      sessionID === parent ? [child] : sessionID === child ? [parent] : []
+    const dispatcher = createDispatcher({ pool, cancellation: { childrenOf } })
+
+    // Without a visited-set guard the parent→child→parent cycle would recurse
+    // until the stack overflows; the guard makes the cascade terminate.
+    const outcome = await dispatcher.cancelWithGrace(parent)
+    expect(outcome).toBeUndefined()
+
     await dispatcher.terminateAll()
   })
 })

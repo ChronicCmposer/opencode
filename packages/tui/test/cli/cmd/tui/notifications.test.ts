@@ -61,6 +61,7 @@ async function setup() {
     emit(event: Event) {
       for (const handler of handlers.get(event.type) ?? []) handler(event)
     },
+    flush: () => new Promise<void>((resolve) => setTimeout(resolve, 0)),
   }
 }
 
@@ -154,6 +155,7 @@ describe("internal notifications TUI plugin", () => {
       type: "session.status",
       properties: { sessionID: "session", status: { type: "idle" } },
     })
+    await harness.flush()
 
     expect(harness.notifications).toEqual([
       {
@@ -179,6 +181,7 @@ describe("internal notifications TUI plugin", () => {
       type: "session.status",
       properties: { sessionID: "subagent", status: { type: "idle" } },
     })
+    await harness.flush()
 
     expect(harness.notifications).toEqual([
       {
@@ -214,6 +217,7 @@ describe("internal notifications TUI plugin", () => {
       type: "session.status",
       properties: { sessionID: "session", status: { type: "idle" } },
     })
+    await harness.flush()
 
     expect(harness.notifications).toEqual([
       {

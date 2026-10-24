@@ -36,15 +36,32 @@ export interface ListenerPair<Frame> {
 
 type FrameHandler<Frame> = (frame: Frame) => void
 
-function createEndpoint<Frame>(side: "hub" | "worker"): {
-  endpoint: ListenerPort<Frame>
-  deliver(frame: Frame): void
-} {
+/** Optional per-endpoint wire behaviour; each hook receives the endpoint it belongs to. */
+export interface EndpointHooks<Frame> {
+  readonly post?: (self: ListenerPort<Frame>, frame: Frame) => void
+  readonly onMessage?: (self: ListenerPort<Frame>, handler: FrameHandler<Frame>) => () => void
+}
+
+interface EndpointBundle<Frame> {
+  readonly endpoint: ListenerPort<Frame>
+  readonly deliver: FrameHandler<Frame>
+}
+
+/**
+ * Build one endpoint from its wire hooks up front, so the returned object is
+ * never mutated after construction. The default `post` cross-delivers to the
+ * peer; `peerDeliver` is a lazy accessor because the peer does not exist yet.
+ */
+function createEndpoint<Frame>(
+  side: "hub" | "worker",
+  hooks: EndpointHooks<Frame>,
+  peerDeliver: () => FrameHandler<Frame>,
+): EndpointBundle<Frame> {
   const handlers = new Set<FrameHandler<Frame>>()
   const received: Frame[] = []
   let closed = false
 
-  const deliver = (frame: Frame): void => {
+  const deliver: FrameHandler<Frame> = (frame) => {
     if (closed) return
     received.push(frame)
     // Snapshot so a handler that unsubscribes (or subscribes) does not perturb
@@ -52,15 +69,17 @@ function createEndpoint<Frame>(side: "hub" | "worker"): {
     for (const handler of [...handlers]) handler(frame)
   }
 
+  const subscribe = (handler: FrameHandler<Frame>): (() => void) => {
+    handlers.add(handler)
+    return () => {
+      handlers.delete(handler)
+    }
+  }
+
   const endpoint: ListenerPort<Frame> = {
     side,
-    post: () => {
-      throw new Error(`listener port "${side}" is not connected`)
-    },
-    onMessage: (handler) => {
-      handlers.add(handler)
-      return () => handlers.delete(handler)
-    },
+    post: (frame) => (hooks.post ? hooks.post(endpoint, frame) : peerDeliver()(frame)),
+    onMessage: (handler) => (hooks.onMessage ? hooks.onMessage(endpoint, handler) : subscribe(handler)),
     get received() {
       return received.slice()
     },
@@ -73,7 +92,9 @@ function createEndpoint<Frame>(side: "hub" | "worker"): {
     },
   }
 
-  return { endpoint, deliver }
+  // The endpoint is fully formed here and never reassigned; freeze it so the
+  // wire behaviour cannot be swapped out after construction.
+  return { endpoint: Object.freeze(endpoint), deliver }
 }
 
 /**
@@ -90,18 +111,19 @@ export function createListenerPair<Frame>(
   post?: (port: ListenerPort<Frame>, frame: Frame) => void,
   onMessage?: (port: ListenerPort<Frame>, handler: FrameHandler<Frame>) => () => void,
 ): ListenerPair<Frame> {
-  const hub = createEndpoint<Frame>("hub")
-  const worker = createEndpoint<Frame>("worker")
-
-  // `post` always needs a destination, so it is always overridden; `onMessage`
-  // is only overridden when a hook is supplied, otherwise the built-in
-  // subscriber set is used (overriding it with a self-call would recurse).
-  hub.endpoint.post = post ? (frame) => post(hub.endpoint, frame) : (frame) => worker.deliver(frame)
-  worker.endpoint.post = post ? (frame) => post(worker.endpoint, frame) : (frame) => hub.deliver(frame)
-  if (onMessage) {
-    hub.endpoint.onMessage = (handler) => onMessage(hub.endpoint, handler)
-    worker.endpoint.onMessage = (handler) => onMessage(worker.endpoint, handler)
+  // Deliver closures are bound lazily: each endpoint is constructed before its
+  // peer's `deliver` exists, so the peer accessors read these bindings.
+  let deliverToHub: FrameHandler<Frame> = () => {}
+  let deliverToWorker: FrameHandler<Frame> = () => {}
+  const hooks: EndpointHooks<Frame> = {
+    ...(post === undefined ? {} : { post }),
+    ...(onMessage === undefined ? {} : { onMessage }),
   }
+
+  const hub = createEndpoint<Frame>("hub", hooks, () => deliverToWorker)
+  const worker = createEndpoint<Frame>("worker", hooks, () => deliverToHub)
+  deliverToHub = hub.deliver
+  deliverToWorker = worker.deliver
 
   return {
     hub: hub.endpoint,

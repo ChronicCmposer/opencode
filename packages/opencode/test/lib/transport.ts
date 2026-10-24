@@ -22,12 +22,16 @@ export interface SpawnTransportOptions {
  * Adapt an existing harness worker into an `ExecutorTransport`. Split out from
  * `spawnTransport` so a caller that already owns a handle (e.g. to observe a
  * transferred `job-port` frame) reuses the exact same transport shape.
+ *
+ * The handle is pinned to the executor protocol, so the inbound/outbound frames
+ * and the `waitFor` predicate line up without any casting.
  */
-export function adaptTransport<TOut, TIn>(handle: HarnessWorker<TOut, TIn>): ExecutorTransport {
+export function adaptTransport(
+  handle: HarnessWorker<SessionExecutorOutbound, SessionExecutorInbound>,
+): ExecutorTransport {
   return {
-    post: (message) => handle.post(message as unknown as TIn),
-    waitFor: (match, options) =>
-      handle.waitFor(match as (message: TOut) => boolean, options) as unknown as Promise<SessionExecutorOutbound>,
+    post: (message) => handle.post(message),
+    waitFor: (match, options) => handle.waitFor(match, options),
     get alive() {
       return handle.alive
     },
@@ -42,4 +46,60 @@ export function spawnTransport(harness: WorkerHarness, options: SpawnTransportOp
     ...(options.env === undefined ? {} : { env: options.env }),
   })
   return adaptTransport(handle)
+}
+
+/** A transport that answers a bare pong to every wait; enough to build a worker. */
+export function noopTransport(): ExecutorTransport {
+  let alive = true
+  return {
+    post: () => {},
+    waitFor: async () => ({ type: "pong", id: 0 }),
+    get alive() {
+      return alive
+    },
+    async terminate() {
+      alive = false
+      return 0
+    },
+  }
+}
+
+/** A recording scripted transport: the worker-side frames plus their fake replies. */
+export interface RecordingTransport {
+  readonly transport: ExecutorTransport
+  /** Every inbound frame the worker posted, in order. */
+  readonly posted: ReadonlyArray<SessionExecutorInbound>
+}
+
+/**
+ * A fake `ExecutorTransport` that records each posted frame and answers the
+ * pending wait from the most recent one. `reply` maps a request to its outbound
+ * frame; a wait with no posted request, or a reply the waiter does not match,
+ * fails loudly instead of hanging.
+ */
+export function recordingTransport(
+  reply: (request: SessionExecutorInbound) => SessionExecutorOutbound,
+): RecordingTransport {
+  const posted: SessionExecutorInbound[] = []
+  let alive = true
+  return {
+    posted,
+    transport: {
+      post: (message) => posted.push(message),
+      waitFor: async (match) => {
+        const request = posted[posted.length - 1]
+        if (request === undefined) throw new Error("scripted transport waitFor called before any post")
+        const outbound = reply(request)
+        if (!match(outbound)) throw new Error("scripted transport produced a frame the waiter did not match")
+        return outbound
+      },
+      get alive() {
+        return alive
+      },
+      async terminate() {
+        alive = false
+        return 0
+      },
+    },
+  }
 }

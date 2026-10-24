@@ -11,7 +11,7 @@
 // worker keeps receiving.
 
 import { createControlLink, isNonNegativeInteger, type ControlInbound, type ControlOutbound } from "./control"
-import type { EgressEvent } from "./frame"
+import type { EventV2Event } from "./frame"
 import type { WriterOrdinal } from "./ordinal"
 
 /** Per-worker subscription backlog bound (plan decision line 87). */
@@ -19,7 +19,7 @@ export const MESH_SUBSCRIPTION_BOUND = 256
 
 export interface DurableCommit {
   readonly meta: WriterOrdinal
-  readonly event: EgressEvent
+  readonly event: EventV2Event
 }
 
 export interface MeshSubscription {
@@ -69,6 +69,16 @@ export function matchesMeshPattern(pattern: string, type: string): boolean {
   if (pattern === "*") return true
   if (pattern.endsWith("*")) return type.startsWith(pattern.slice(0, -1))
   return pattern === type
+}
+
+/** Run a best-effort push; a failing sink must never abort the whole fan-out. */
+function bestEffort(push: () => void): boolean {
+  try {
+    push()
+    return true
+  } catch {
+    return false
+  }
 }
 
 export interface EgressMeshOptions {
@@ -133,16 +143,19 @@ export function createEgressMesh(options: EgressMeshOptions = {}): EgressMesh {
       for (const workerId of subscriptions.keys()) {
         const pattern = firstMatchingPattern(workerId, commit.event.type)
         if (pattern === undefined) continue
+        const sink = sinks.get(workerId)
         const pending = outstanding.get(workerId) ?? 0
         if (pending >= bound) {
           dropped.push(workerId)
           flagResync(workerId, pattern)
-          sinks.get(workerId)?.sendResync(pattern)
+          if (sink) bestEffort(() => sink.sendResync(pattern))
           continue
         }
+        // A delivery counts only once its push succeeded: a closed or failing
+        // port must not inflate `outstanding` or claim a worker it never reached.
+        if (sink && !bestEffort(() => sink.sendDurable(commit))) continue
         outstanding.set(workerId, pending + 1)
         delivered.push(workerId)
-        sinks.get(workerId)?.sendDurable(commit)
       }
       return { delivered, dropped }
     },

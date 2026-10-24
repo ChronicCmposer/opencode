@@ -14,6 +14,7 @@
 
 import { Context } from "effect"
 import { parsePositiveInt } from "@/util/parse"
+import { assertWorkerID } from "./supervision"
 
 /** Kills a whole process group. Injecting one makes reaping deterministic in tests. */
 export interface ProcessReaper {
@@ -243,12 +244,6 @@ export function registerReported(
   workerID: number = report.workerID,
 ): ReadonlyArray<RegisteredChild> {
   return report.entries.map((entry) => registry.register({ ...entry, workerID }))
-}
-
-function assertWorkerID(workerID: number): void {
-  if (!Number.isInteger(workerID) || workerID < 0) {
-    throw new Error(`invalid workerID: ${workerID} (expected a non-negative integer)`)
-  }
 }
 
 function assertLabel(label: string): void {

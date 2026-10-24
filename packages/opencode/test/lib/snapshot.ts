@@ -12,7 +12,7 @@
 // `normalizeForSnapshot` for the common "snapshot subprocess output" path.
 import fs from "node:fs"
 import os from "node:os"
-import type { RuntimeFlags } from "@/effect/runtime-flags"
+import { RuntimeFlags } from "@/effect/runtime-flags"
 import type { WorkerSnapshot } from "@/session/worker/layer"
 
 const TMP = os.tmpdir()
@@ -91,7 +91,7 @@ export function workerSnapshot(overrides: Partial<WorkerSnapshot> = {}): WorkerS
     config: {},
     auth: {},
     modelsDev: {},
-    flags: {} as RuntimeFlags.Info,
+    flags: RuntimeFlags.parseInfo({}),
     workerCount: 2,
     ...overrides,
   }

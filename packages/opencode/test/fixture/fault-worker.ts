@@ -9,31 +9,25 @@
 // On startup: { type: "ready" }
 
 import { Faults } from "../../src/testing/faults"
+import { onMessage, postToParent } from "./worker-scope"
 
 interface Incoming {
   type?: string
   point?: string
 }
 
-interface WorkerScope {
-  postMessage(message: unknown): void
-  onmessage: ((event: { data: unknown }) => void) | null
-}
-
-const scope = globalThis as unknown as WorkerScope
-
-scope.onmessage = (event) => {
-  const input = (event.data ?? {}) as Incoming
+onMessage<Incoming>((raw) => {
+  const input: Incoming = raw ?? {}
   if (input.type !== "crash") return
 
   const point = input.point ?? ""
   Faults.crashWorker(point, {
     onCrash: (directive) => {
-      scope.postMessage({ type: "crashing", point: directive.point })
+      postToParent({ type: "crashing", point: directive.point })
       process.exit(Faults.WORKER_CRASH_EXIT_CODE)
     },
   })
-  scope.postMessage({ type: "survived", point })
-}
+  postToParent({ type: "survived", point })
+})
 
-scope.postMessage({ type: "ready" })
+postToParent({ type: "ready" })

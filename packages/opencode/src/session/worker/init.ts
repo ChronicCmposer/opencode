@@ -29,6 +29,7 @@ import type {
 } from "./session-worker"
 import type { WorkerEnv } from "./layer"
 import type { Role } from "./node-table"
+import { CHAT_PARAM_KEYS } from "./plugin-host"
 import type {
   ChatHeadersOutput,
   ChatParamsOutput,
@@ -350,9 +351,6 @@ function pluginHookInput(
     ...(message === undefined ? {} : { message }),
   }
 }
-
-/** The sampling fields a `chat.params` hook may set or clear. */
-const CHAT_PARAM_KEYS = ["temperature", "topP", "topK", "maxOutputTokens"] as const
 
 /**
  * The baseline `chat.params` output the hub resolves a hook against. The worker

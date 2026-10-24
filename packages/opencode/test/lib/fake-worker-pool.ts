@@ -25,7 +25,6 @@ import {
 import type { CancelFrame, CancelPort } from "@/session/worker/cancel"
 import {
   type ExecutorRun,
-  type ExecutorSessionWorker,
   type ExecutorWorker,
   type ExecutorWorkerKind,
   type ExecutorWorkerPool,
@@ -152,9 +151,11 @@ export class FakeSessionWorker implements SessionWorker {
 
   async terminate(): Promise<void> {
     this.alive = false
-    const pending = [...this.pending.values()]
+    const pending = [...this.pending.entries()]
     this.pending.clear()
-    for (const run of pending) run.reject(new SessionCancelledError({ message: "terminated", sessionID: "" }))
+    for (const [sessionID, run] of pending) {
+      run.reject(new SessionCancelledError({ message: "terminated", sessionID }))
+    }
   }
 
   private take(sessionID: SessionID): PendingRun | undefined {
@@ -168,7 +169,7 @@ export class FakeSessionWorker implements SessionWorker {
     const pending = this.take(sessionID)
     if (pending === undefined) return
     if (this.onCancel === "resolve") pending.resolve()
-    else pending.reject(new Error("executor machine interrupted"))
+    else pending.reject(new SessionCancelledError({ message: "executor machine interrupted", sessionID }))
   }
 
   private crashError(): WorkerCrashedError {
@@ -234,11 +235,6 @@ export class FakePool implements WorkerPool {
 /** Convenience factory for {@link FakePool}. */
 export function createFakeWorkerPool(k: number, options: FakeWorkerPoolOptions = {}): FakePool {
   return new FakePool(k, options)
-}
-
-/** Cast a fake pool's typed worker list to the `WorkerPool` view. */
-export function fakeWorkers(pool: FakePool): ReadonlyArray<FakeSessionWorker> {
-  return pool.workers
 }
 
 // ---------------------------------------------------------------------------
@@ -423,7 +419,7 @@ export class FakeExecutorPool implements ExecutorWorkerPool {
     this.nextSpawnId = firstSpawnId ?? this.workers.length + 1
   }
 
-  spawn(_kind: ExecutorWorkerKind): ExecutorSessionWorker {
+  spawn(_kind: ExecutorWorkerKind): FakeExecutorWorker {
     const worker = new FakeExecutorWorker(this.nextSpawnId++, this.workerOptions)
     this.spawned.push(worker)
     return worker

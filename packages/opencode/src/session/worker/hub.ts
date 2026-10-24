@@ -42,6 +42,7 @@ import { createEgressReceiver } from "@/session/egress/receiver"
 import { attachMeshWorker, createEgressMesh, type DurableCommit, type EgressMesh } from "@/session/egress/mesh"
 import { durableMetaOf, type EventV2Event, type EventsAckPayload, type EventsResyncPayload } from "./frame"
 import { createLiveEventPublisher, instanceLocation, EventV2Bridge, type LiveEventPublisher } from "@/event-v2-bridge"
+import type { EventV2 } from "@opencode-ai/core/event"
 import {
   createWriterClient,
   serveWriterPort,
@@ -59,6 +60,7 @@ import {
   type CancellationConfig,
   type CancelledMode,
   type Dispatcher,
+  type DispatcherOptions,
   type SessionWorker,
 } from "./dispatch"
 import { createJobRegistry, type JobInfo, type JobRegistry } from "./job-registry"
@@ -81,6 +83,7 @@ import {
 } from "./execute"
 import { resolveCancelGraceMs, type CancelOutcome } from "./cancel"
 import { resolveSessionWorkerIdleTimeoutMs, resolveWorkerCount, WORKER_COUNT_ENV } from "./pool"
+import { createEpochSequence, makeInstanceContext, type EpochSequence } from "./snapshot"
 import {
   buildSessionWorkerInit,
   resolveWorkerPlugins,
@@ -302,6 +305,12 @@ export interface SessionHubOptions {
   readonly headroomIdleReapMs?: number
   readonly cancellation?: CancellationSource
   readonly onDegraded?: (workerID: number) => void
+  /**
+   * Per-session durable-write barrier (plan 2.6 / R4#16): the dispatcher holds a
+   * completed run's slot until this resolves, so the next run can never overtake
+   * the prior run's durable egress. Absent means a released slot is immediate.
+   */
+  readonly writeBarrier?: DispatcherOptions["writeBarrier"]
   /**
    * Live-only event publisher. When present, the hub republishes worker events
    * from their port and publishes `session.cancelled` after a cancel.
@@ -753,6 +762,13 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     }
     return resolvedBackends
   }
+  // The backends to dispose at teardown, or `undefined` when none exist: a value
+  // source is disposed directly; a function source is disposed only if it was
+  // actually built (a lazy source that never attached owns no resources).
+  const disposables = (): WorkerPortBackends | undefined => {
+    if (typeof portSource !== "function") return portSource
+    return backendsResolved ? resolvedBackends : undefined
+  }
   // Assigned once the pool exists; read lazily by the routing closures below.
   let dispatcher: Dispatcher
   // Assigned once the registry exists (below); read lazily by `portForSession`,
@@ -847,6 +863,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       childCapacity: options.childCapacity,
       headroomIdleReapMs: options.headroomIdleReapMs,
       cancellation,
+      writeBarrier: options.writeBarrier,
       onDegraded: options.onDegraded,
       log,
     }),
@@ -887,7 +904,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       await dispatcher.terminateAll()
       // Only tear down backends we actually built (a source never attached to is
       // never constructed, so no isolate is spawned just to dispose it).
-      const backends = backendsResolved ? resolvedBackends : typeof portSource === "function" ? undefined : portSource
+      const backends = disposables()
       await backends?.dispose?.()
     },
   }
@@ -999,8 +1016,14 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
   const messages: SessionExecutorOutbound[] = []
   const waiters = new Set<PendingWaiter>()
   let alive = true
+  // The error a boot/termination raised. A worker can die before a caller's
+  // `waitFor` registers (an isolate that throws at import is that fast), so the
+  // terminal error is remembered and replayed to a late waiter instead of
+  // leaving it to time out.
+  let terminal: Error | undefined
 
   const failWaiters = (error: Error): void => {
+    terminal = error
     for (const waiter of waiters) {
       if (waiter.timer !== undefined) clearTimeout(waiter.timer)
       waiters.delete(waiter)
@@ -1026,18 +1049,19 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       return
     }
     const message = event.data as SessionExecutorOutbound
-    messages.push(message)
-    if (messages.length > bufferCapacity) messages.shift()
+    // Offer the frame to a waiting caller BEFORE buffering, so a matching reply
+    // can never be evicted by the capacity cap. A frame is consumed by exactly
+    // one waiter; only a frame no waiter wants is buffered (and the buffer only
+    // ever drops oldest frames that no waiter has claimed).
     for (const waiter of [...waiters]) {
-      const index = messages.indexOf(message)
-      // A prior waiter consumed this frame; no other waiter may match it.
-      if (index === -1) break
       if (!waiter.predicate(message)) continue
-      messages.splice(index, 1)
       if (waiter.timer !== undefined) clearTimeout(waiter.timer)
       waiters.delete(waiter)
       waiter.resolve(message)
+      return
     }
+    messages.push(message)
+    if (messages.length > bufferCapacity) messages.shift()
   }
 
   worker.onerror = (event: ErrorEvent) => {
@@ -1072,6 +1096,10 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     waitFor(predicate, waitOptions) {
       const buffered = takeBuffered(predicate)
       if (buffered !== undefined) return Promise.resolve(buffered)
+      // A buffered frame still wins (it arrived before the failure); otherwise an
+      // already-dead isolate fails the wait immediately rather than after the
+      // full deadline.
+      if (terminal !== undefined) return Promise.reject(terminal)
       const waitMs = waitOptions?.timeoutMs ?? timeoutMs
       return new Promise<SessionExecutorOutbound>((resolve, reject) => {
         // `timeoutMs <= 0` means "no deadline": a run/startShell reply is a whole
@@ -1086,6 +1114,17 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
             : undefined
         const waiter: PendingWaiter = { predicate, resolve, reject, timer }
         waiters.add(waiter)
+        // A caller that abandons the wait (the liveness probe on a resolved run)
+        // aborts, so the waiter does not linger until its own deadline.
+        waitOptions?.signal?.addEventListener(
+          "abort",
+          () => {
+            if (!waiters.delete(waiter)) return
+            if (timer !== undefined) clearTimeout(timer)
+            reject(new Error("session worker wait aborted"))
+          },
+          { once: true },
+        )
       })
     },
     get alive() {
@@ -1110,6 +1149,12 @@ export interface BunExecutorWorkerPoolOptions {
   /** Run-reply liveness budget; `0`/absent disables the watchdog. */
   readonly runIdleTimeoutMs?: number
   readonly workKind?: string
+  /**
+   * Per-session durable-egress barrier (plan 2.6 / R4#16): `execute` holds the
+   * run until this resolves, so a result is never recorded before the run's
+   * durable egress write is acked. Absent makes the result immediate.
+   */
+  readonly egressBarrier?: (sessionID: SessionID) => Promise<void> | undefined
   /** Receive each worker's transferred job port, keyed by worker id (plan 9.2). */
   readonly onJobPort?: (workerID: number, port: MessagePort) => void
   /** Receive each worker's transferred writer / egress / broker ports (plan 8/17/19). */
@@ -1155,6 +1200,7 @@ export function spawnBunExecutorWorker(id: number, options: BunExecutorWorkerPoo
       runIdleTimeoutMs: options.runIdleTimeoutMs,
       sessionID: options.sessionID,
       reason: options.reason,
+      egressBarrier: options.egressBarrier,
       // Forward the resolved logger so the B1 `worker spawning` line fires in
       // production, where this helper (not a test's direct `createExecutorWorker`)
       // builds the executor.
@@ -1355,6 +1401,8 @@ export interface ProductionWorkerPoolOptions {
   /** Run-reply liveness budget; `0`/absent disables the watchdog. */
   readonly runIdleTimeoutMs?: number
   readonly workKind?: string
+  /** Per-session durable-egress barrier (plan 2.6 / R4#16). */
+  readonly egressBarrier?: (sessionID: SessionID) => Promise<void> | undefined
   readonly onJobPort?: (workerID: number, port: MessagePort) => void
   readonly onWorkerPorts?: (workerID: number, ports: WorkerTransferredPorts) => void
   readonly onHubProxyPort?: (workerID: number, port: MessagePort) => void
@@ -1463,6 +1511,7 @@ export function createProductionWorkerPool(options: ProductionWorkerPoolOptions)
         timeoutMs: options.timeoutMs,
         runIdleTimeoutMs: options.runIdleTimeoutMs,
         workKind: options.workKind,
+        egressBarrier: options.egressBarrier,
         log,
         // The session this isolate is bound to, so the B1 `worker spawning`
         // line names it (the init was already resolved for the same session).
@@ -1510,16 +1559,7 @@ function withSessionWorkerPorts(init: SessionWorkerInit): SessionWorkerInit {
  */
 export function fallbackInstanceContext(): InstanceContext {
   const directory = process.cwd()
-  return {
-    directory,
-    worktree: directory,
-    project: {
-      id: Project.ID.global,
-      worktree: directory,
-      time: { created: 0, updated: 0 },
-      sandboxes: [],
-    },
-  }
+  return makeInstanceContext({ directory, projectID: Project.ID.global })
 }
 
 /** The ambient instance context for the current fiber, if any (the `attach` pattern). */
@@ -1569,16 +1609,7 @@ interface DispatchedSession {
 export function instanceFromSession(session: DispatchedSession): InstanceContext | undefined {
   const directory = session.directory
   if (directory === undefined) return undefined
-  return {
-    directory,
-    worktree: directory,
-    project: {
-      id: Project.ID.make(session.projectID ?? Project.ID.global),
-      worktree: directory,
-      time: { created: 0, updated: 0 },
-      sandboxes: [],
-    },
-  }
+  return makeInstanceContext({ directory, projectID: session.projectID ?? Project.ID.global })
 }
 
 /**
@@ -1862,6 +1893,16 @@ export interface ProductionSessionHubOptions {
   /** Cancellation tuning; cooperative cancel is always wired (step 13). */
   readonly cancellation?: WorkerCancellationOptions
   readonly onDegraded?: (workerID: number) => void
+  /**
+   * Per-session durable-write barrier (plan 2.6 / R4#16) forwarded to the
+   * dispatcher: a completed run's slot is held until it resolves.
+   */
+  readonly writeBarrier?: DispatcherOptions["writeBarrier"]
+  /**
+   * Per-session durable-egress barrier (plan 2.6 / R4#16) forwarded to every
+   * spawned worker's executor.
+   */
+  readonly egressBarrier?: (sessionID: SessionID) => Promise<void> | undefined
   /** Resolved `subagent_depth` for the hub-proxy `dispatchSubagent` RPC. */
   readonly subagentDepth?: number
   /**
@@ -1908,7 +1949,35 @@ function isWorkerCountOverride(env: Record<string, string | undefined> | undefin
   return raw !== undefined && raw.trim() !== ""
 }
 
-/** Compose the production pool + hub, with cooperative cancellation wired. */
+/**
+ * Resolve the ambient instance a session's worker boots under: this session's
+ * captured instance (or an ancestor's), else its persisted directory, else the
+ * resolving fiber's ambient instance, else the documented global fallback
+ * (warned, because it is a hub-side gap).
+ */
+function resolveSessionInstance(
+  sessionID: SessionID | undefined,
+  dispatched: DispatchedSession | undefined,
+  instanceOfSession: (id: SessionID | undefined) => InstanceContext | undefined,
+  log: WorkerLogger,
+): InstanceContext {
+  const resolved =
+    instanceOfSession(sessionID) ??
+    (dispatched === undefined ? undefined : instanceFromSession(dispatched)) ??
+    captureInstanceRef()
+  if (resolved !== undefined) return resolved
+  const fallback = fallbackInstanceContext()
+  log(workerLogMessage("instance fallback"), {
+    level: "WARN",
+    sessionID,
+    directory: fallback.directory,
+  })
+  return fallback
+}
+
+/**
+ * Compose the production pool + hub, with cooperative cancellation wired.
+ */
 export function createProductionSessionHub(options: ProductionSessionHubOptions): SessionHub {
   // Name the hub's main OS thread for human observability (Linux-only, fail-soft).
   // Role-gating keeps a session-worker isolate from ever building a nested hub (its
@@ -1965,6 +2034,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
             runIdleTimeoutMs,
             workKind: options.workKind,
             env: options.env,
+            egressBarrier: options.egressBarrier,
             onSessionRebound: options.onSessionRebound,
           }),
           ...sinks,
@@ -1995,6 +2065,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
       onSubagentDispatch: options.onSubagentDispatch,
       events: options.events,
       eventPublisherFor: options.eventPublisherFor,
+      writeBarrier: options.writeBarrier,
       onPidReport,
     }),
     cancellation: (pool) =>
@@ -2061,6 +2132,234 @@ export interface ProductionSessionHubNodeOptions {
   readonly onSessionRebound?: (sessionID: SessionID) => void
 }
 
+/** The hub-authoritative services a per-session worker init is built from. */
+interface ProductionInitServices {
+  readonly config: Config.Interface
+  readonly auth: Auth.Interface
+  readonly modelsDev: ModelsDev.Interface
+  readonly provider: Provider.Interface
+  readonly flags: RuntimeFlags.Info
+}
+
+/** Inputs a {@link createPerSessionResolvers} factory closes over. */
+interface PerSessionResolverDeps {
+  readonly services: ProductionInitServices
+  readonly bridge: EventV2.Interface
+  readonly authorities: HubProxyAuthorities
+  /** Resolved pool size, shipped on every generation's snapshot. */
+  readonly count: number
+  /** The hub-owned epoch sequence, so each generation's epoch strictly increases. */
+  readonly epochSequence: EpochSequence
+  readonly initOptions: BuildSessionWorkerInitOptions | undefined
+  readonly plugins: (() => Promise<readonly WorkerPluginSource[]>) | undefined
+  readonly log: WorkerLogger
+  /** The parent of a session (the job registry's parent chain), if known. */
+  readonly parentOf: (sessionID: SessionID) => SessionID | undefined
+  /** The session a worker is currently bound to, if known. */
+  readonly sessionOfWorker: (workerID: number) => SessionID | undefined
+}
+
+/**
+ * The per-session resolvers the production hub is composed from: the session →
+ * instance/context registry, the derived deep lookups (ancestor chain), the live
+ * publishers stamped with the session's own location, and the per-worker
+ * hub-proxy handlers and init resolver. One worker serves one session at a time,
+ * so every resolver is keyed by that session rather than latching the first
+ * dispatched one.
+ */
+interface PerSessionResolvers {
+  /** The shared live publisher (used when a caller reaches `createSessionHub` directly). */
+  readonly events: LiveEventPublisher
+  readonly eventsForSession: (sessionID: SessionID) => LiveEventPublisher
+  readonly eventsForWorker: (workerID: number) => LiveEventPublisher | undefined
+  readonly hubProxyFor: (workerID: number) => HubProxyHandlers
+  readonly instanceOfSessionDeep: (sessionID: SessionID | undefined) => InstanceContext | undefined
+  readonly resolveInit: (sessionID?: SessionID) => Promise<SessionWorkerInit>
+  readonly recordDispatch: (sessionID: SessionID) => void
+  readonly copyContextToChild: (childID: SessionID, parentID: SessionID) => void
+  readonly releaseSession: (sessionID: SessionID) => void
+  readonly clearSessions: () => void
+}
+
+function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionResolvers {
+  const { services, bridge, authorities, log } = deps
+  // Per-session state, written on EVERY dispatch (never latched with `??=`).
+  // A session's own ambient `InstanceRef` and full runtime context are stored
+  // under its id, so a second project's worker is never built — and its
+  // hub-proxy calls never run — under the first project's directory/instance.
+  const instanceBySession = new Map<SessionID, InstanceContext>()
+  const contextBySession = new Map<SessionID, Context.Context<never>>()
+  // Release one session's per-session state; the finalizer clears the rest.
+  // Called on every rebind and at teardown, so the maps stay bounded by the set
+  // of live sessions. A session's own entry is dropped once its worker rebinds
+  // away (the isolate is retired) or the hub tears down; there is no race-free
+  // job-settle hook to release it earlier (the registry routes a settled child's
+  // result but surfaces no settle callback here), and releasing on settle would
+  // race a later turn that re-resolves its init. An ancestor's entry is still
+  // reachable through the parent chain below.
+  const releaseSession = (sessionID: SessionID): void => {
+    instanceBySession.delete(sessionID)
+    contextBySession.delete(sessionID)
+  }
+  const clearSessions = (): void => {
+    instanceBySession.clear()
+    contextBySession.clear()
+  }
+  // The session currently being dispatched. Updated on every dispatch; used only
+  // as the fallback when a pool resolves an init without a session id.
+  let dispatchedSession: SessionID | undefined
+  // A session's per-session entry may be absent: a subagent child admitted by the
+  // raw scheduler (whose parent's `copyContextToChild` was skipped), or a session
+  // whose worker already rebound and released it. Resolve it through the job
+  // registry's parent chain so the SAME project's ancestor supplies the
+  // instance/context — never a last-writer-wins latch, which under concurrent
+  // multi-project dispatch can hold ANOTHER project's instance. Subagents share
+  // the parent's directory, so an ancestor entry is always the same project.
+  // `seen` guards a corrupt/cyclic parent edge.
+  const findUp = <T>(sessionID: SessionID | undefined, get: (id: SessionID) => T | undefined): T | undefined => {
+    let id = sessionID
+    const seen = new Set<string>()
+    while (id !== undefined && !seen.has(id)) {
+      seen.add(id)
+      const value = get(id)
+      if (value !== undefined) return value
+      id = deps.parentOf(id)
+    }
+    return undefined
+  }
+  const instanceOfSessionDeep = (sessionID: SessionID | undefined): InstanceContext | undefined =>
+    findUp(sessionID, (id) => instanceBySession.get(id))
+  const contextOfSessionDeep = (sessionID: SessionID | undefined): Context.Context<never> | undefined =>
+    findUp(sessionID, (id) => contextBySession.get(id))
+  const contextOfWorker = (workerID: number): Context.Context<never> | undefined =>
+    contextOfSessionDeep(deps.sessionOfWorker(workerID))
+  // Live-only publisher, stamped with the emitting session's own location so a
+  // republished worker event passes THAT session's `/event` SSE directory filter
+  // — never a first-dispatch directory.
+  const eventsForSession = (sessionID: SessionID): LiveEventPublisher =>
+    createLiveEventPublisher(bridge, { location: () => instanceLocation(instanceOfSessionDeep(sessionID)) })
+  const eventsForWorker = (workerID: number): LiveEventPublisher | undefined => {
+    const sessionID = deps.sessionOfWorker(workerID)
+    return sessionID === undefined ? undefined : eventsForSession(sessionID)
+  }
+  // Shared fallback publisher (a caller may reach `createSessionHub` directly).
+  const events = createLiveEventPublisher(bridge)
+  // A hub authority effect is closed over its own services but reads the ambient
+  // `InstanceRef`; run it under the worker's session context so it resolves.
+  const runHubProxyFor = (context: Context.Context<never> | undefined): HubProxyRunner => (effect) =>
+    Effect.runPromise(context === undefined ? effect : Effect.provide(effect, context))
+  // The worker cannot run `experimental.chat.system.transform` itself: the hub
+  // owns plugin loading (decision 70). Read `Plugin` from the worker's session
+  // context and run the trigger under it, so the per-directory `InstanceState`
+  // the plugin layer keys on is the emitting instance's.
+  const systemTransformFor =
+    (context: Context.Context<never> | undefined): NonNullable<HubProxyAuthorities["systemTransform"]> =>
+    (input, output) => {
+      const plugin = context === undefined ? Option.none() : Context.getOption(context, Plugin.Service)
+      return Option.isNone(plugin)
+        ? Promise.resolve(output)
+        : runHubProxyFor(context)(plugin.value.trigger("experimental.chat.system.transform", input, output))
+    }
+  // Build the handler map per worker under THAT worker's session context. A
+  // worker is bound to exactly one session, so its control port reaches the
+  // right `SessionStatus`/`Permission`/`Question`/`systemTransform` instance.
+  const hubProxyFor = (workerID: number): HubProxyHandlers => {
+    const context = contextOfWorker(workerID)
+    return buildHubProxyHandlers(
+      {
+        sessionStatus: authorities.sessionStatus,
+        permission: authorities.permission,
+        question: authorities.question,
+        systemTransform: systemTransformFor(context),
+      },
+      runHubProxyFor(context),
+    )
+  }
+  // Per-session: the pool passes the session it is building a worker for, so
+  // this session's instance/model (and plugin effect) is the one shipped, never
+  // the first dispatched session's. `dispatchedSession` is the fallback for a
+  // custom pool that resolves without a session id.
+  const resolveInit = async (sessionID?: SessionID): Promise<SessionWorkerInit> => {
+    const session = sessionID ?? dispatchedSession
+    // The ancestor-chain context keeps `loadDispatchedSession` reachable for a
+    // child whose own entry is missing, so its PERSISTED directory/project still
+    // resolves instead of the hub cwd.
+    const context = contextOfSessionDeep(session)
+    // One `Session.get` yields the persisted model, directory/project and the
+    // per-request plugin input (agent + last user message) the hooks resolve
+    // against, so a hook keyed on either matches flag-off rather than an empty stub.
+    const dispatched = await loadDispatchedSession(context, session)
+    const instance = resolveSessionInstance(session, dispatched, instanceOfSessionDeep, log)
+    const model = dispatched?.model
+    const request = dispatched?.request
+    const pluginSources = deps.plugins !== undefined ? await deps.plugins() : await resolveContextPluginSources(context)
+    // A non-serializable provider option or plugin hook is a configuration
+    // defect: die loud rather than widen every graph's error channel with the
+    // typed failure.
+    return Effect.runPromise(
+      buildSessionWorkerInit({
+        ...deps.initOptions,
+        // The session's persisted model is authoritative; config/default only
+        // applies when the dispatch carried no session model.
+        model: model === undefined ? deps.initOptions?.model : { ...deps.initOptions?.model, session: model },
+        snapshot: { ...deps.initOptions?.snapshot, workerCount: deps.count, epochSequence: deps.epochSequence },
+        plugins:
+          pluginSources === undefined
+            ? deps.initOptions?.plugins
+            : (resolvedModel) =>
+                resolveWorkerPlugins({
+                  model: resolvedModel,
+                  sources: pluginSources,
+                  sessionID: session,
+                  ...(request ?? {}),
+                }),
+      }).pipe(
+        Effect.provideService(Config.Service, services.config),
+        Effect.provideService(Auth.Service, services.auth),
+        Effect.provideService(ModelsDev.Service, services.modelsDev),
+        Effect.provideService(Provider.Service, services.provider),
+        Effect.provideService(RuntimeFlags.Service, services.flags),
+        Effect.provideService(InstanceRef, instance),
+        Effect.orDie,
+      ),
+    )
+  }
+  const recordDispatch = (sessionID: SessionID): void => {
+    // Overwrite on every dispatch (never `??=`): each session keeps its own
+    // ambient instance/context, so a later project never inherits the first.
+    const instance = captureInstanceRef()
+    if (instance !== undefined) instanceBySession.set(sessionID, instance)
+    const context = captureRuntimeContext()
+    if (context !== undefined) contextBySession.set(sessionID, context)
+    dispatchedSession = sessionID
+  }
+  const copyContextToChild = (childID: SessionID, parentID: SessionID): void => {
+    // A subagent child is dispatched by the raw scheduler, so `recordDispatch`
+    // never runs for it. Copy the parent's captured per-session instance/context
+    // onto the child BEFORE its worker materialises, so `resolveInit(child)`
+    // binds the parent's directory (not the hub cwd) and the child's per-worker
+    // hub-proxy handlers run under a live `InstanceRef`. Nested subagents inherit
+    // recursively: a child's own entry is copied here when IT dispatches a
+    // grandchild.
+    const instance = instanceBySession.get(parentID)
+    if (instance !== undefined) instanceBySession.set(childID, instance)
+    const context = contextBySession.get(parentID)
+    if (context !== undefined) contextBySession.set(childID, context)
+  }
+  return {
+    events,
+    eventsForSession,
+    eventsForWorker,
+    hubProxyFor,
+    instanceOfSessionDeep,
+    resolveInit,
+    recordDispatch,
+    copyContextToChild,
+    releaseSession,
+    clearSessions,
+  }
+}
+
 /**
  * Provide `SessionHubService` from the production hub, terminating it on scope
  * close. The `workerData` init is resolved per dispatched session (never at graph
@@ -2112,28 +2411,10 @@ export function productionSessionHubLayer(
       // republished live-only through it (never re-committed).
       const bridge = yield* EventV2Bridge.Service
       const count = options.count ?? resolveWorkerCount()
-      // Per-session state, written on EVERY dispatch (never latched with `??=`).
-      // A session's own ambient `InstanceRef` and full runtime context are stored
-      // under its id, so a second project's worker is never built — and its
-      // hub-proxy calls never run — under the first project's directory/instance.
-      const instanceBySession = new Map<SessionID, InstanceContext>()
-      const contextBySession = new Map<SessionID, Context.Context<never>>()
-      // Release one session's per-session state; the finalizer clears the rest.
-      // Called on every rebind and at teardown, so the maps stay bounded by the
-      // set of live sessions. A session's own entry is dropped once its worker
-      // rebinds away (the isolate is retired) or the hub tears down; there is no
-      // race-free job-settle hook to release it earlier (the registry routes a
-      // settled child's result but surfaces no settle callback here), and
-      // releasing on settle would race a later turn that re-resolves its init.
-      // An ancestor's entry is still reachable through the parent chain below.
-      const releaseSession = (sessionID: SessionID): void => {
-        instanceBySession.delete(sessionID)
-        contextBySession.delete(sessionID)
-      }
-      // The session currently being dispatched. Updated on every dispatch; used
-      // only as the fallback when a pool resolves an init without a session id
-      // (the production pool passes the session it is binding a worker to).
-      let dispatchedSession: SessionID | undefined
+      // The hub owns the snapshot epoch sequence for its lifetime, so each
+      // generation's epoch is strictly greater than the last even when the wall
+      // clock jumps backwards (an explicit holder, not hidden module state).
+      const epochSequence = createEpochSequence()
       // The production narrative seam: an EffectBridge (R/E = never, so it adds no
       // graph dependency) whose `fork` carries the ambient logger, mirroring the
       // test-only `createSessionHubLayer`. Without this the production graph passed
@@ -2141,75 +2422,25 @@ export function productionSessionHubLayer(
       // dispatch/execute/cancel were dormant. `bridge` names the EventV2Bridge above.
       const effectBridge = yield* EffectBridge.make()
       const log = workerLoggerFromBridge(effectBridge)
-      // The hub is assigned after the pool is built; these per-worker resolvers run
-      // lazily on the first port attach (post-assignment), so the reference is safe.
+      // The hub is assigned after the pool is built; the resolver's per-worker
+      // lookups run lazily on the first port attach (post-assignment), so the
+      // deferred reference is safe.
       let hubRef: SessionHub | undefined
-      const sessionOfWorker = (workerID: number): SessionID | undefined => hubRef?.sessionOfWorker(workerID)
-      // A session's per-session entry may be absent: a subagent child admitted by
-      // the raw scheduler (whose parent's `onSubagentDispatch` copy was skipped),
-      // or a session whose worker already rebound and released it. Resolve it
-      // through the job registry's parent chain so the SAME project's ancestor
-      // supplies the instance/context — never a last-writer-wins latch, which
-      // under concurrent multi-project dispatch can hold ANOTHER project's
-      // instance. Subagents share the parent's directory, so an ancestor entry is
-      // always the same project. `seen` guards a corrupt/cyclic parent edge.
-      const findUp = <T>(
-        sessionID: SessionID | undefined,
-        get: (id: SessionID) => T | undefined,
-      ): T | undefined => {
-        let id = sessionID
-        const seen = new Set<string>()
-        while (id !== undefined && !seen.has(id)) {
-          seen.add(id)
-          const value = get(id)
-          if (value !== undefined) return value
-          id = hubRef?.jobs.get(id)?.parentID as SessionID | undefined
-        }
-        return undefined
-      }
-      const instanceOfSessionDeep = (sessionID: SessionID | undefined): InstanceContext | undefined =>
-        findUp(sessionID, (id) => instanceBySession.get(id))
-      const contextOfSessionDeep = (sessionID: SessionID | undefined): Context.Context<never> | undefined =>
-        findUp(sessionID, (id) => contextBySession.get(id))
-      const contextOfWorker = (workerID: number): Context.Context<never> | undefined =>
-        contextOfSessionDeep(sessionOfWorker(workerID))
-      // Live-only publisher, stamped with the emitting session's own location so a
-      // republished worker event passes THAT session's `/event` SSE directory
-      // filter — never a first-dispatch directory.
-      const eventsForSession = (sessionID: SessionID): LiveEventPublisher =>
-        createLiveEventPublisher(bridge, { location: () => instanceLocation(instanceOfSessionDeep(sessionID)) })
-      const eventsForWorker = (workerID: number): LiveEventPublisher | undefined => {
-        const sessionID = sessionOfWorker(workerID)
-        return sessionID === undefined ? undefined : eventsForSession(sessionID)
-      }
-      // Shared fallback publisher (a caller may reach `createSessionHub` directly).
-      const events = createLiveEventPublisher(bridge)
-      // A hub authority effect is closed over its own services but reads the
-      // ambient `InstanceRef`; run it under the worker's session context so it resolves.
-      const runHubProxyFor = (context: Context.Context<never> | undefined): HubProxyRunner => (effect) =>
-        Effect.runPromise(context === undefined ? effect : Effect.provide(effect, context))
-      // The worker cannot run `experimental.chat.system.transform` itself: the hub
-      // owns plugin loading (decision 70). Read `Plugin` from the worker's session
-      // context and run the trigger under it, so the per-directory `InstanceState`
-      // the plugin layer keys on is the emitting instance's.
-      const systemTransformFor =
-        (context: Context.Context<never> | undefined): NonNullable<HubProxyAuthorities["systemTransform"]> =>
-        (input, output) => {
-          const plugin = context === undefined ? Option.none() : Context.getOption(context, Plugin.Service)
-          return Option.isNone(plugin)
-            ? Promise.resolve(output)
-            : runHubProxyFor(context)(plugin.value.trigger("experimental.chat.system.transform", input, output))
-        }
-      // Build the handler map per worker under THAT worker's session context. A
-      // worker is bound to exactly one session, so its control port reaches the
-      // right `SessionStatus`/`Permission`/`Question`/`systemTransform` instance.
-      const hubProxyFor = (workerID: number): HubProxyHandlers => {
-        const context = contextOfWorker(workerID)
-        return buildHubProxyHandlers(
-          { sessionStatus, permission, question, systemTransform: systemTransformFor(context) },
-          runHubProxyFor(context),
-        )
-      }
+      // The per-session resolvers (the session → instance/context registry, the
+      // live publishers, and the per-worker hub-proxy handlers and init) live in
+      // one factory; the layer body only wires them to the hub.
+      const resolvers = createPerSessionResolvers({
+        services: { config, auth, modelsDev, provider, flags },
+        bridge,
+        authorities: { sessionStatus, permission, question },
+        count,
+        epochSequence,
+        initOptions: options.initOptions,
+        plugins: options.plugins,
+        log,
+        parentOf: (sessionID) => hubRef?.jobs.get(sessionID)?.parentID as SessionID | undefined,
+        sessionOfWorker: (workerID) => hubRef?.sessionOfWorker(workerID),
+      })
       // The production port authorities: supplied ready, or built on the first
       // dispatch (the source is only invoked when a worker attaches a port).
       const ports: WorkerPortBackendsSource =
@@ -2218,121 +2449,34 @@ export function productionSessionHubLayer(
           buildProductionPortBackends({
             ...options.backends,
             hubProxy: options.backends?.hubProxy,
-            hubProxyFor: options.backends?.hubProxyFor ?? hubProxyFor,
-            events,
-            eventsForWorker,
+            hubProxyFor: options.backends?.hubProxyFor ?? resolvers.hubProxyFor,
+            events: resolvers.events,
+            eventsForWorker: resolvers.eventsForWorker,
           }))
-      // Per-session: the pool passes the session it is building a worker for, so
-      // this session's instance/model (and plugin effect) is the one shipped,
-      // never the first dispatched session's. `dispatchedSession` is the fallback
-      // for a custom pool that resolves without a session id.
-      const resolveInit = async (sessionID?: SessionID): Promise<SessionWorkerInit> => {
-        const session = sessionID ?? dispatchedSession
-        // The ancestor-chain context keeps `loadDispatchedSession` reachable for a
-        // child whose own entry is missing, so its PERSISTED directory/project
-        // still resolves instead of the hub cwd.
-        const context = contextOfSessionDeep(session)
-        // One `Session.get` yields the persisted model, directory/project and the
-        // per-request plugin input (agent + last user message) the hooks resolve
-        // against, so a hook keyed on either matches flag-off rather than an empty stub.
-        const dispatched = await loadDispatchedSession(context, session)
-        // Provider order: this session's captured instance (or an ancestor's,
-        // found through the parent chain), else its PERSISTED directory, else the
-        // resolving fiber's ambient instance, else the documented global fallback
-        // (warned: it is a hub-side gap).
-        const instance =
-          instanceOfSessionDeep(session) ??
-          (dispatched === undefined ? undefined : instanceFromSession(dispatched)) ??
-          captureInstanceRef() ??
-          (() => {
-            const fallback = fallbackInstanceContext()
-            log(workerLogMessage("instance fallback"), {
-              level: "WARN",
-              sessionID: session,
-              directory: fallback.directory,
-            })
-            return fallback
-          })()
-        const model = dispatched?.model
-        const request = dispatched?.request
-        const pluginSources =
-          options.plugins !== undefined ? await options.plugins() : await resolveContextPluginSources(context)
-        // A non-serializable provider option or plugin hook is a configuration
-        // defect: die loud rather than widen every graph's error channel with the
-        // typed failure.
-        return Effect.runPromise(
-          buildSessionWorkerInit({
-            ...options.initOptions,
-            // The session's persisted model is authoritative; config/default only
-            // applies when the dispatch carried no session model.
-            model: model === undefined ? options.initOptions?.model : { ...options.initOptions?.model, session: model },
-            snapshot: { ...options.initOptions?.snapshot, workerCount: count },
-            plugins:
-              pluginSources === undefined
-                ? options.initOptions?.plugins
-                : (resolvedModel) =>
-                    resolveWorkerPlugins({
-                      model: resolvedModel,
-                      sources: pluginSources,
-                      sessionID: session,
-                      ...(request ?? {}),
-                    }),
-          }).pipe(
-            Effect.provideService(Config.Service, config),
-            Effect.provideService(Auth.Service, auth),
-            Effect.provideService(ModelsDev.Service, modelsDev),
-            Effect.provideService(Provider.Service, provider),
-            Effect.provideService(RuntimeFlags.Service, flags),
-            Effect.provideService(InstanceRef, instance),
-            Effect.orDie,
-          ),
-        )
-      }
       const hub = createProductionSessionHub({
         ...options,
         count,
-        init: resolveInit,
+        init: resolvers.resolveInit,
         ports,
-        events,
-        eventPublisherFor: eventsForSession,
+        events: resolvers.events,
+        eventPublisherFor: resolvers.eventsForSession,
         log,
         subagentDepth,
         onSessionRebound: (sessionID) => {
           // The rebinding worker's old session is done with its isolate; release
           // its state so the maps cannot grow without bound.
-          releaseSession(sessionID)
+          resolvers.releaseSession(sessionID)
           options.onSessionRebound?.(sessionID)
         },
-        onDispatch: (sessionID) => {
-          // Overwrite on every dispatch (never `??=`): each session keeps its own
-          // ambient instance/context, so a later project never inherits the first.
-          const instance = captureInstanceRef()
-          if (instance !== undefined) instanceBySession.set(sessionID, instance)
-          const context = captureRuntimeContext()
-          if (context !== undefined) contextBySession.set(sessionID, context)
-          dispatchedSession = sessionID
-        },
-        onSubagentDispatch: (childID, parentID) => {
-          // PRIMARY FIX: a subagent child is dispatched by the raw scheduler, so
-          // `onDispatch` never runs for it. Copy the parent's captured per-session
-          // instance/context onto the child BEFORE its worker materialises, so
-          // `resolveInit(child)` binds the parent's directory (not the hub cwd)
-          // and the child's per-worker hub-proxy handlers run under a live
-          // `InstanceRef`. Nested subagents inherit recursively: a child's own
-          // entry is copied here when IT dispatches a grandchild.
-          const instance = instanceBySession.get(parentID)
-          if (instance !== undefined) instanceBySession.set(childID, instance)
-          const context = contextBySession.get(parentID)
-          if (context !== undefined) contextBySession.set(childID, context)
-        },
+        onDispatch: resolvers.recordDispatch,
+        onSubagentDispatch: resolvers.copyContextToChild,
       })
       hubRef = hub
       yield* Effect.addFinalizer(() =>
         Effect.promise(async () => {
           await hub.terminateAll().catch(() => undefined)
           // Release every per-session entry so a rebuild starts clean.
-          instanceBySession.clear()
-          contextBySession.clear()
+          resolvers.clearSessions()
         }),
       )
       return SessionHubService.of(hub)

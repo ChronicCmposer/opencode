@@ -60,9 +60,12 @@ function parseOversubscriptionFactor(raw: string | undefined): number {
   return factor
 }
 
+/**
+ * Read the detected core count without validating it: `deriveWorkerCount` is the
+ * single place that validates, so the check is not applied twice.
+ */
 function readParallelism(availableParallelism?: () => number): number {
-  const detected = (availableParallelism ?? os.availableParallelism.bind(os))()
-  return parsePositiveInt(detected, "availableParallelism")
+  return (availableParallelism ?? os.availableParallelism.bind(os))()
 }
 
 export interface IdleTimeoutOptions {

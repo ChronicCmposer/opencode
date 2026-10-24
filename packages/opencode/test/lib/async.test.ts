@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { capture, flush, sid } from "./async"
+import { capture, flush, settleOf, sid } from "./async"
 
 describe("async test primitives", () => {
   test("flush lets queued microtasks and zero-delay timers run", async () => {
@@ -23,6 +23,22 @@ describe("async test primitives", () => {
     const settled = await capture(Promise.reject(boom))
     expect(settled.ok).toBe(false)
     if (!settled.ok) expect(settled.error).toBe(boom)
+  })
+
+  test("settleOf reports success as { ok: true, value }", async () => {
+    await expect(settleOf(Promise.resolve("done"))).resolves.toEqual({ ok: true, value: "done" })
+  })
+
+  test("settleOf reports failure as { ok: false, error } without throwing", async () => {
+    const boom = new Error("boom")
+    const settled = await settleOf(Promise.reject(boom))
+    expect(settled.ok).toBe(false)
+
+    if (!settled.ok) expect(settled.error).toBe(boom)
+  })
+
+  test("settleOf and capture are the same primitive", () => {
+    expect(capture).toBe(settleOf)
   })
 
   test("sid brands a plain string for the session boundary", () => {

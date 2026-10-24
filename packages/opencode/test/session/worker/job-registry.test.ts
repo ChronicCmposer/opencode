@@ -264,6 +264,24 @@ describe("bounded retention (9.2)", () => {
     expect(registry.size).toBe(0)
   })
 
+  test("evicting a parent prunes both directions of its children index", () => {
+    const scheduler = createRecordingScheduler<JobScheduler>()
+    const registry = createJobRegistry({ schedule: scheduler.schedule, retentionMs: 1_000 })
+    registry.start({ id: "ses_parent", type: "task" })
+    registry.complete("ses_parent", "done")
+    registry.start({ id: "ses_child", type: "task", parentID: "ses_parent" })
+
+    const eviction = scheduler.timers.find((timer) => timer.delayMs === 1_000)
+    expect(eviction).toBeDefined()
+    eviction!.run()
+
+    expect(registry.get("ses_parent")).toBeUndefined()
+    expect(registry.childrenOf("ses_parent")).toEqual([])
+    expect(registry.parentOf("ses_child")).toBeUndefined()
+    // The running child itself is not evicted with its parent.
+    expect(registry.get("ses_child")?.status).toBe("running")
+  })
+
   test("the retention cap evicts the oldest settled jobs first", () => {
     let clock = 0
     const registry = createJobRegistry({ maxJobs: 2, retentionMs: Infinity, now: () => (clock += 10) })

@@ -79,27 +79,18 @@ export const PermissionResponsePayload = Schema.Struct({
 // on `mode`. `sessionID`, `mode` and `winner` are always present, so an idle body
 // with no outcome (`{}`) is not a valid response; the handler supplies the idle
 // "completed" outcome explicitly.
-const AbortOutcomeCooperative = Schema.Struct({
-  sessionID: SessionID,
-  mode: Schema.Literal("cooperative"),
-  winner: Schema.Literal("cancel"),
-  acknowledged: Schema.Boolean,
-  durationMs: Schema.Number,
-})
-const AbortOutcomeTerminated = Schema.Struct({
-  sessionID: SessionID,
-  mode: Schema.Literal("terminated"),
-  winner: Schema.Literal("cancel"),
-  acknowledged: Schema.Boolean,
-  durationMs: Schema.Number,
-})
-const AbortOutcomeCompleted = Schema.Struct({
-  sessionID: SessionID,
-  mode: Schema.Literal("completed"),
-  winner: Schema.Literal("completion"),
-  acknowledged: Schema.Boolean,
-  durationMs: Schema.Number,
-})
+const abortOutcome = <const Mode extends string, const Winner extends string>(mode: Mode, winner: Winner) =>
+  Schema.Struct({
+    sessionID: SessionID,
+    mode: Schema.Literal(mode),
+    winner: Schema.Literal(winner),
+    acknowledged: Schema.Boolean,
+    durationMs: Schema.Number,
+  })
+
+const AbortOutcomeCooperative = abortOutcome("cooperative", "cancel")
+const AbortOutcomeTerminated = abortOutcome("terminated", "cancel")
+const AbortOutcomeCompleted = abortOutcome("completed", "completion")
 export const AbortOutcome = Schema.Union([
   AbortOutcomeCooperative,
   AbortOutcomeTerminated,

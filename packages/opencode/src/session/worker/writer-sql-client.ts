@@ -47,11 +47,32 @@ const sqlError =
 const transactionNotOpen = (operation: string) =>
   sqlError(operation)(new Error("statement executed outside an open writer transaction"))
 
-// The port is the trust boundary: the writer returns `unknown` rows, parsed here.
-const asRows = (value: unknown): ReadonlyArray<Record<string, unknown>> =>
-  value as ReadonlyArray<Record<string, unknown>>
-const asValues = (value: unknown): ReadonlyArray<ReadonlyArray<unknown>> =>
-  value as ReadonlyArray<ReadonlyArray<unknown>>
+// The port is the trust boundary: the writer returns `unknown`, so the row shape
+// is validated here (and a violation fails loud into the `SqlError` channel)
+// rather than blindly cast into a shape the caller then trusts.
+function asRows(value: unknown): ReadonlyArray<Record<string, unknown>> {
+  if (!Array.isArray(value)) {
+    throw new Error(`writer returned a non-array for a row query (got ${JSON.stringify(value)})`)
+  }
+  for (const row of value) {
+    if (typeof row !== "object" || row === null || Array.isArray(row)) {
+      throw new Error(`writer returned a non-object row (got ${JSON.stringify(row)})`)
+    }
+  }
+  return value as ReadonlyArray<Record<string, unknown>>
+}
+
+function asValues(value: unknown): ReadonlyArray<ReadonlyArray<unknown>> {
+  if (!Array.isArray(value)) {
+    throw new Error(`writer returned a non-array for a value query (got ${JSON.stringify(value)})`)
+  }
+  for (const row of value) {
+    if (!Array.isArray(row)) {
+      throw new Error(`writer returned a non-array row for a value query (got ${JSON.stringify(row)})`)
+    }
+  }
+  return value as ReadonlyArray<ReadonlyArray<unknown>>
+}
 
 const writerQuery = <A>(
   writer: WriterSqlHandle,

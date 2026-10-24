@@ -216,12 +216,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       const decoded = yield* Schema.decodeUnknownEffect(Session.CreateInput)(json).pipe(
         Effect.mapError(() => new HttpApiError.BadRequest({})),
       )
-      const payload = decoded
-        ? {
-            ...decoded,
-            permission: decoded.permission ? [...decoded.permission] : undefined,
-          }
-        : decoded
+      const payload = {
+        ...decoded,
+        permission: decoded?.permission ? [...decoded.permission] : undefined,
+      }
       return yield* create({ payload })
     })
 

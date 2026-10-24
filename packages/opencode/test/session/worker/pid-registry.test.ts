@@ -193,7 +193,9 @@ describe("11.5 real detached process-group reaping", () => {
         expect(isAlive(child.pid)).toBe(true)
 
         expect(registry.reap(1, "SIGTERM")).toEqual([child.pgid])
-        expect(await waitForDeath([child.pid], { timeoutMs: 10_000 })).toBe(true)
+        // A group SIGTERM reaches `sleep` immediately; poll tightly and fail in
+        // seconds, never minutes, if the signal is lost.
+        expect(await waitForDeath([child.pid], { timeoutMs: 3_000, intervalMs: 10 })).toBe(true)
 
         // ESRCH-safe: reaping a vanished group must not throw.
         expect(() => registry.reapAll("SIGTERM")).not.toThrow()
@@ -205,6 +207,6 @@ describe("11.5 real detached process-group reaping", () => {
         }
       }
     },
-    20_000,
+    10_000,
   )
 })

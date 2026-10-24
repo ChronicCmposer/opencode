@@ -258,4 +258,33 @@ describe("layer node", () => {
       dependencies: [],
     })
   })
+
+  test("detects cycles through the shared graph visitor", () => {
+    // A cycle requires mutable `dependencies`; a real node type is readonly.
+    const first = {
+      kind: "layer" as const,
+      name: "first",
+      implementation: Layer.empty,
+      dependencies: [] as LayerNode.AnyNode[],
+    }
+    const second = {
+      kind: "layer" as const,
+      name: "second",
+      implementation: Layer.empty,
+      dependencies: [first] as LayerNode.AnyNode[],
+    }
+    first.dependencies.push(second)
+
+    expect(() => LayerNode.compile(first)).toThrow("Cycle detected in layer tree: first -> second -> first")
+  })
+
+  test("reports unbound membership, including a cached false result", () => {
+    const unbound = LayerNode.unbound(Value, tags.values.app)
+    const other = LayerNode.unbound(Greeting, tags.values.app)
+    const greeting = make({ service: Greeting, layer: greetingLayer, deps: [unbound] })
+    const tree = LayerNode.group([greeting])
+
+    expect(LayerNode.hasUnbound(tree, unbound)).toBe(true)
+    expect(LayerNode.hasUnbound(tree, other)).toBe(false)
+  })
 })

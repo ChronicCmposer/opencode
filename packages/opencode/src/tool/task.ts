@@ -131,9 +131,14 @@ export const TaskTool = Tool.define(
       }
 
       const parent = yield* sessions.get(ctx.sessionID)
+      const visited = new Set<SessionID>([ctx.sessionID])
       let current = parent
       let depth = 0
       while (current.parentID) {
+        if (visited.has(current.parentID)) {
+          return yield* Effect.fail(new Error("Subagent parent chain is cyclic"))
+        }
+        visited.add(current.parentID)
         depth++
         current = yield* sessions.get(current.parentID)
       }

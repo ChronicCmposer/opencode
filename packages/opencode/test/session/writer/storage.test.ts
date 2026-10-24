@@ -5,7 +5,7 @@
 // over the storage frames (openStorage / storage.read|write|remove|list).
 
 import { describe, expect, test } from "bun:test"
-import { mkdir, writeFile } from "node:fs/promises"
+import { mkdir, readdir, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { createWriterClient } from "@/session/writer/client"
 import { createBunSqliteConnection } from "@/session/writer/connection"
@@ -73,6 +73,36 @@ describe("file-KV key safety (steps 22, 23)", () => {
     )
     expect(error).toBeInstanceOf(Error)
     expect((error as { tag?: string }).tag).toBe("STORAGE_PARSE")
+  })
+})
+
+describe("file-KV durability: undefined content and crash-safe writes (109)", () => {
+  test("writing undefined persists an explicit JSON value and reads back", async () => {
+    await using tmp = await tmpdir()
+    const storage = createFileStorage(path.join(tmp.path, "storage"))
+
+    await storage.write(["u"], undefined)
+
+    expect(await storage.read(["u"])).toEqual({ found: true, content: null })
+  })
+
+  test("an interrupted write cannot truncate the committed value", async () => {
+    await using tmp = await tmpdir()
+    const root = path.join(tmp.path, "storage")
+    const storage = createFileStorage(root)
+    await storage.write(["doc"], { v: 1 })
+
+    // A temp file left behind by a crashed write must never be read as the target
+    // or listed as an entry: the rename is the only thing that swaps the value in.
+    await writeFile(path.join(root, "doc.json.crashed.tmp"), '{"v":2')
+
+    expect(await storage.read(["doc"])).toEqual({ found: true, content: { v: 1 } })
+    expect(await storage.list([])).toEqual([["doc"]])
+
+    // A completed write fully replaces the value and leaves no temp residue of its own.
+    await storage.write(["doc"], { v: 3 })
+    expect(await storage.read(["doc"])).toEqual({ found: true, content: { v: 3 } })
+    expect((await readdir(root)).filter((name) => name.endsWith(".tmp"))).toEqual(["doc.json.crashed.tmp"])
   })
 })
 

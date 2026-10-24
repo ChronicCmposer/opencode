@@ -244,13 +244,4 @@ function buildWriterClient(port: MessagePort, options: CreateWorkerWriterClientO
   }
 }
 
-/** Coerce an unknown thrown value to a frame-safe error tag. */
-export function writerErrorTag(error: unknown): string {
-  if (typeof error === "object" && error !== null && "tag" in error) {
-    const tag = (error as { tag: unknown }).tag
-    if (typeof tag === "string") return tag
-  }
-  return "WRITER_ERROR"
-}
-
 export * as WorkerWriterClientModule from "./writer-client"

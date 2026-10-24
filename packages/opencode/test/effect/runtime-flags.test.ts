@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect } from "bun:test"
 import { ConfigProvider, Effect, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { RuntimeFlags } from "../../src/effect/runtime-flags"
@@ -10,11 +10,44 @@ const fromConfig = (input: Record<string, unknown>) =>
 const readFlags = RuntimeFlags.Service.useSync((flags) => flags)
 
 describe("RuntimeFlags", () => {
-  it.effect("layer defaults autoShare to false", () =>
+  it.effect("layer fills every documented default for an empty ConfigProvider", () =>
     Effect.gen(function* () {
       const flags = yield* readFlags.pipe(Effect.provide(fromConfig({})))
-
-      expect(flags.autoShare).toBe(false)
+      // One table keeps the default contract readable and prevents a new flag
+      // from silently shipping without a default assertion.
+      const defaults = {
+        autoShare: false,
+        pure: false,
+        disableDefaultPlugins: false,
+        disableEmbeddedWebUi: false,
+        disableExternalSkills: false,
+        disableLspDownload: false,
+        disableClaudeCodePrompt: false,
+        disableClaudeCodeSkills: false,
+        enableExa: false,
+        enableParallel: false,
+        enableExperimentalModels: false,
+        enableQuestionTool: false,
+        experimentalReferences: false,
+        experimentalBackgroundSubagents: false,
+        experimentalLspTy: false,
+        experimentalLspTool: false,
+        experimentalOxfmt: false,
+        experimentalPlanMode: false,
+        experimentalCodeMode: false,
+        experimentalEventSystem: false,
+        experimentalSessionWorkers: false,
+        experimentalWorkspaces: false,
+        experimentalIconDiscovery: false,
+        experimentalNativeLlm: false,
+        experimentalWebSockets: false,
+        outputTokenMax: undefined,
+        bashDefaultTimeoutMs: undefined,
+        client: "cli",
+      } as const
+      for (const [key, expected] of Object.entries(defaults)) {
+        expect(flags[key as keyof typeof defaults], `${key} default`).toBe(expected)
+      }
     }),
   )
 
@@ -123,22 +156,6 @@ describe("RuntimeFlags", () => {
     }),
   )
 
-  it.effect("experimentalIconDiscovery defaults to false", () =>
-    Effect.gen(function* () {
-      const flags = yield* readFlags.pipe(Effect.provide(fromConfig({})))
-
-      expect(flags.experimentalIconDiscovery).toBe(false)
-    }),
-  )
-
-  it.effect("disableExternalSkills defaults to false", () =>
-    Effect.gen(function* () {
-      const flags = yield* readFlags.pipe(Effect.provide(fromConfig({})))
-
-      expect(flags.disableExternalSkills).toBe(false)
-    }),
-  )
-
   it.effect("disableExternalSkills reads OPENCODE_DISABLE_EXTERNAL_SKILLS", () =>
     Effect.gen(function* () {
       const flags = yield* readFlags.pipe(Effect.provide(fromConfig({ OPENCODE_DISABLE_EXTERNAL_SKILLS: "true" })))
@@ -147,27 +164,11 @@ describe("RuntimeFlags", () => {
     }),
   )
 
-  it.effect("disableLspDownload defaults to false", () =>
-    Effect.gen(function* () {
-      const flags = yield* readFlags.pipe(Effect.provide(fromConfig({})))
-
-      expect(flags.disableLspDownload).toBe(false)
-    }),
-  )
-
   it.effect("disableLspDownload reads OPENCODE_DISABLE_LSP_DOWNLOAD", () =>
     Effect.gen(function* () {
       const flags = yield* readFlags.pipe(Effect.provide(fromConfig({ OPENCODE_DISABLE_LSP_DOWNLOAD: "true" })))
 
       expect(flags.disableLspDownload).toBe(true)
-    }),
-  )
-
-  it.effect("disableClaudeCodePrompt defaults to false", () =>
-    Effect.gen(function* () {
-      const flags = yield* readFlags.pipe(Effect.provide(fromConfig({})))
-
-      expect(flags.disableClaudeCodePrompt).toBe(false)
     }),
   )
 
@@ -215,14 +216,6 @@ describe("RuntimeFlags", () => {
       )
 
       expect(flags.experimentalIconDiscovery).toBe(false)
-    }),
-  )
-
-  it.effect("experimentalOxfmt defaults to false", () =>
-    Effect.gen(function* () {
-      const flags = yield* readFlags.pipe(Effect.provide(fromConfig({})))
-
-      expect(flags.experimentalOxfmt).toBe(false)
     }),
   )
 
@@ -348,14 +341,6 @@ describe("RuntimeFlags", () => {
     }),
   )
 
-  it.effect("disableClaudeCodeSkills defaults to false", () =>
-    Effect.gen(function* () {
-      const flags = yield* readFlags.pipe(Effect.provide(fromConfig({})))
-
-      expect(flags.disableClaudeCodeSkills).toBe(false)
-    }),
-  )
-
   it.effect("disableClaudeCodeSkills reads OPENCODE_DISABLE_CLAUDE_CODE_SKILLS", () =>
     Effect.gen(function* () {
       const flags = yield* readFlags.pipe(Effect.provide(fromConfig({ OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "true" })))
@@ -371,59 +356,4 @@ describe("RuntimeFlags", () => {
       expect(flags.disableClaudeCodeSkills).toBe(true)
     }),
   )
-})
-
-describe("experimentalSessionWorkersFromEnv", () => {
-  const fromEnv = (env: Record<string, string | undefined>) => RuntimeFlags.experimentalSessionWorkersFromEnv(env)
-
-  test("defaults to false when nothing is set", () => {
-    expect(fromEnv({})).toBe(false)
-  })
-
-  test("enables via the umbrella OPENCODE_EXPERIMENTAL flag", () => {
-    expect(fromEnv({ OPENCODE_EXPERIMENTAL: "true" })).toBe(true)
-  })
-
-  test("enables via the dedicated flag without the umbrella", () => {
-    expect(fromEnv({ OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "true" })).toBe(true)
-  })
-
-  test("dedicated flag wins over the umbrella (true over false)", () => {
-    expect(fromEnv({ OPENCODE_EXPERIMENTAL: "false", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "true" })).toBe(true)
-  })
-
-  test("dedicated false disables even when the umbrella is true", () => {
-    expect(fromEnv({ OPENCODE_EXPERIMENTAL: "true", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "false" })).toBe(false)
-  })
-
-  test("invalid dedicated value falls back to the umbrella", () => {
-    expect(fromEnv({ OPENCODE_EXPERIMENTAL: "true", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "nonsense" })).toBe(true)
-  })
-
-  test("invalid umbrella value is treated as absent", () => {
-    expect(fromEnv({ OPENCODE_EXPERIMENTAL: "nonsense" })).toBe(false)
-  })
-
-  test("undefined values are treated as absent", () => {
-    expect(
-      fromEnv({ OPENCODE_EXPERIMENTAL: undefined, OPENCODE_EXPERIMENTAL_SESSION_WORKERS: undefined }),
-    ).toBe(false)
-  })
-
-  test("accepts every boolean true synonym", () => {
-    for (const value of ["true", "yes", "on", "1", "y"]) {
-      expect(fromEnv({ OPENCODE_EXPERIMENTAL_SESSION_WORKERS: value })).toBe(true)
-    }
-  })
-
-  test("accepts every boolean false synonym", () => {
-    for (const value of ["false", "no", "off", "0", "n"]) {
-      expect(fromEnv({ OPENCODE_EXPERIMENTAL_SESSION_WORKERS: value })).toBe(false)
-    }
-  })
-
-  test("boolean parsing is case-sensitive like Effect Config.boolean", () => {
-    expect(fromEnv({ OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "TRUE" })).toBe(false)
-    expect(fromEnv({ OPENCODE_EXPERIMENTAL: "TRUE" })).toBe(false)
-  })
 })

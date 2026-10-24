@@ -234,8 +234,12 @@ export function measureLoopGap(options: MeasureLoopGapOptions = {}): Promise<Loo
   assertPositive(windowMs, "windowMs")
 
   const probe = createLoopGapProbe(options)
-  return new Promise((resolve) => {
+  return new Promise<LoopGapSample>((resolve) => {
     setTimeout(() => resolve(probe.stop()), windowMs)
+  }).finally(() => {
+    // Idempotent: guarantee the sampling interval is cleared even if the window
+    // wait or the resolution path is interrupted.
+    probe.stop()
   })
 }
 

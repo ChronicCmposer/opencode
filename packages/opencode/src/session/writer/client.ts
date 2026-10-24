@@ -11,23 +11,34 @@
 //     `ready` frame, so survivors can detect a stale writer.
 
 import { mergeEnv } from "@/session/broker/env"
-import { messageOf, portFromMessagePort } from "@/session/worker/port"
 import {
-  writerErrorTag,
-  type WorkerWriterEvent,
-  type WorkerWriterFrame,
+  createRequestChannel,
+  portFromMessagePort,
+  resolveWorkerEntry,
+  servePort,
+  type FrameChannel,
+  type RequestChannel,
+} from "@/session/worker/port"
+import {
+  type WorkerWriterPublishResult,
   type WorkerWriterReply,
+  type WorkerWriterRequest,
 } from "@/session/worker/writer-client"
+import { isRecord } from "@/session/worker/frame"
 import { defined } from "@/util/object"
 import type { StorageReadResult } from "./core"
 import {
   ProtocolError,
-  errorCode,
+  parseQueryMethod,
+  parseWriterEventValue,
   parseWriterResponse,
+  writerErrorInfo,
   type QueryMethod,
   type WriterEvent,
+  type WriterFailure,
   type WriterRequest,
   type WriterResponse,
+  type WriterResult,
 } from "./protocol"
 
 export interface PublishResult {
@@ -99,12 +110,6 @@ export interface ReplayOptions {
   readonly strictOwner?: boolean
 }
 
-interface Pending {
-  readonly resolve: (value: unknown) => void
-  readonly reject: (error: unknown) => void
-  readonly timer: ReturnType<typeof setTimeout>
-}
-
 const DEFAULT_TIMEOUT_MS = 10_000
 
 declare global {
@@ -126,16 +131,15 @@ declare global {
 export function resolveWriterWorkerEntry(
   options: { readonly env?: Record<string, string | undefined>; readonly definedPath?: string } = {},
 ): string | URL {
-  const defined =
-    options.definedPath ??
-    (typeof OPENCODE_WRITER_WORKER_PATH !== "undefined" ? OPENCODE_WRITER_WORKER_PATH : undefined)
-  const fromEnv = (options.env ?? process.env).OPENCODE_WRITER_WORKER_PATH
-  const resolved = fromEnv ?? defined
-  if (resolved === undefined || resolved === "") return new URL("./worker.ts", import.meta.url)
-  return resolved
+  return resolveWorkerEntry({
+    env: options.env,
+    definedPath:
+      options.definedPath ??
+      (typeof OPENCODE_WRITER_WORKER_PATH !== "undefined" ? OPENCODE_WRITER_WORKER_PATH : undefined),
+    envVar: "OPENCODE_WRITER_WORKER_PATH",
+    fallback: new URL("./worker.ts", import.meta.url),
+  })
 }
-
-const DEFAULT_ENTRY = resolveWriterWorkerEntry()
 
 /** `Omit` over a union collapses to common keys; distribute so each frame keeps its fields. */
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
@@ -166,7 +170,20 @@ export class WriterClient {
   private readonly onCrash: ((error: WriterCrashedError) => void) | undefined
 
   private worker: Worker | undefined
-  private readonly pending = new Map<number, Pending>()
+  /**
+   * The request/response channel over the writer port. Correlation, timeouts and
+   * dispose live in the shared `createRequestChannel`; this class supplies the
+   * frame codec, the per-call post target and the crash/ready handling.
+   */
+  private readonly requests: RequestChannel<WriterRequest | WriterResponse, WriterResult | WriterFailure, number>
+  /** The channel's inbound sink; set when `createRequestChannel` subscribes. */
+  private inboundHandler: ((frame: WriterRequest | WriterResponse) => void) | undefined
+  /**
+   * The spawn the next post targets. Set synchronously around `request`, so a
+   * re-open handshake can target a captured spawn while a frame from a sibling
+   * call cannot observe a torn-down `this.worker`.
+   */
+  private postTarget: Worker | undefined
   private nextId = 1
   private generationValue = 0
   private alive = false
@@ -180,11 +197,42 @@ export class WriterClient {
   private storageDir: string | undefined
 
   constructor(options: WriterClientOptions = {}) {
-    this.entry = options.entry ?? DEFAULT_ENTRY
+    // Honour the caller's env overlay rather than the import-time process env.
+    this.entry = options.entry ?? resolveWriterWorkerEntry({ env: options.env })
     this.env = mergeEnv(options.env)
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     this.baseWorkerData = options.workerData ?? {}
     this.onCrash = options.onCrash
+
+    // The port facade: outbound frames post to the per-call target; inbound
+    // responses are emitted to the channel's single subscriber. The target is
+    // mutated synchronously around each `request`, so a reply can never race it.
+    const channel: FrameChannel<WriterRequest | WriterResponse> = {
+      post: (frame) => {
+        const target = this.postTarget
+        if (target === undefined) throw new WriterCrashedError("writer is not running")
+        target.postMessage(frame)
+      },
+      onMessage: (handler) => {
+        this.inboundHandler = handler
+        return () => {
+          this.inboundHandler = undefined
+        }
+      },
+    }
+    this.requests = createRequestChannel<WriterRequest | WriterResponse, WriterResult | WriterFailure, number>(
+      channel,
+      {
+        timeoutMs: this.timeoutMs,
+        isReply: (message): message is WriterResult | WriterFailure =>
+          message.type === "result" || message.type === "failure",
+        idOf: (reply) => reply.id,
+        nextId: () => this.nextId++,
+        disposedError: () => new WriterCrashedError("writer client is closed"),
+        timeoutError: (id, timeoutMs) =>
+          new WriterTimeoutError(`writer request ${id} timed out after ${timeoutMs}ms`),
+      },
+    )
   }
 
   get generation(): number {
@@ -239,19 +287,28 @@ export class WriterClient {
         }
         try {
           // A fresh isolate owns no connection: restore the replayed state before
-          // admitting any other caller.
+          // admitting any other caller. Target the captured spawn, never
+          // `this.worker`, which a crash could have replaced mid-await.
           if (this.openFilename !== undefined) {
-            await this.post<{ opened: boolean }>({ type: "admin.open", filename: this.openFilename })
+            await this.postTo<{ opened: boolean }>(worker, { type: "admin.open", filename: this.openFilename })
           }
           if (this.storageDir !== undefined) {
-            await this.post<unknown>({ type: "admin.openStorage", dir: this.storageDir })
+            await this.postTo<unknown>(worker, { type: "admin.openStorage", dir: this.storageDir })
           }
         } catch (error) {
           // Reopen failed: never mark the worker alive, so callers respawn instead
-          // of posting into a half-initialised isolate.
-          this.alive = false
+          // of posting into a half-initialised isolate. Only crash the generation
+          // that actually failed.
+          if (worker === this.worker) {
+            this.crash(new WriterCrashedError("writer failed to restore state after respawn"))
+          }
           reject(error instanceof Error ? error : new WriterCrashedError(String(error)))
-          this.crash(new WriterCrashedError("writer failed to restore state after respawn"))
+          return
+        }
+        // The ready echo belongs to the captured spawn: never mark a replacement
+        // (or a torn-down) worker alive on this generation's behalf.
+        if (worker !== this.worker) {
+          reject(new WriterCrashedError("writer was replaced before it became ready"))
           return
         }
         this.alive = true
@@ -274,7 +331,18 @@ export class WriterClient {
           void becomeReady(message.generation)
           return
         }
-        this.handleResponse(message)
+        if (message.id === -1) {
+          // The isolate could not parse a frame we sent — a protocol violation.
+          // Treat it as fatal for this worker: reject every in-flight request and
+          // drop it.
+          const detail = message.type === "failure" ? message.error.tag : "unknown"
+          void worker.terminate()
+          this.crash(new WriterCrashedError(`writer rejected a malformed frame (${detail})`))
+          return
+        }
+        // A correlated reply: hand it to the shared channel, which resolves the
+        // matching pending request. `id: -1` and `ready` are handled above.
+        this.inboundHandler?.(message)
       }
       worker.onerror = (event: ErrorEvent) => {
         if (worker !== this.worker) return
@@ -291,24 +359,6 @@ export class WriterClient {
     })
     this.readyPromise = ready
     return ready
-  }
-
-  private handleResponse(message: WriterResponse): void {
-    if (message.type === "ready") return
-    if (message.id === -1) {
-      // The isolate could not parse a frame we sent — a protocol violation. Treat it
-      // as fatal for this worker: reject every in-flight request and drop it.
-      const detail = message.type === "failure" ? message.error.tag : "unknown"
-      void this.worker?.terminate()
-      this.crash(new WriterCrashedError(`writer rejected a malformed frame (${detail})`))
-      return
-    }
-    const pending = this.pending.get(message.id)
-    if (pending === undefined) return
-    this.pending.delete(message.id)
-    clearTimeout(pending.timer)
-    if (message.type === "result") pending.resolve(message.value)
-    else pending.reject(new WriterRemoteError(message.error.tag, message.error.message, message.error.code))
   }
 
   /**
@@ -328,11 +378,9 @@ export class WriterClient {
     this.readyReject = undefined
     this.readyPromise = undefined
     rejectReady?.(error)
-    for (const pending of this.pending.values()) {
-      clearTimeout(pending.timer)
-      pending.reject(error)
-    }
-    this.pending.clear()
+    // Reject every in-flight request (never requeue) while leaving the channel
+    // usable, so the next call respawns against it.
+    this.requests.fail(error)
     if (options.notify ?? true) this.onCrash?.(error)
   }
 
@@ -341,6 +389,8 @@ export class WriterClient {
     this.closed = true
     const worker = this.worker
     this.crash(new WriterCrashedError("writer client is closed"), { notify: false })
+    // Permanently retire the channel so no later call can post into a torn-down client.
+    this.requests.dispose()
     if (worker !== undefined) await worker.terminate()
   }
 
@@ -370,24 +420,31 @@ export class WriterClient {
    * simply reject the caller and keep the worker.
    */
   private post<T>(frame: WriterFrame, options: { readonly fatalOnTimeout?: boolean } = {}): Promise<T> {
-    const worker = this.worker
-    if (worker === undefined) return Promise.reject(new WriterCrashedError("writer is not running"))
-    return new Promise<T>((resolve, reject) => {
-      const id = this.nextId++
-      const timer = setTimeout(() => {
-        this.pending.delete(id)
-        const timeout = new WriterTimeoutError(
-          `writer request ${id} (${frame.type}) timed out after ${this.timeoutMs}ms`,
-        )
-        if (options.fatalOnTimeout === true) {
-          void worker.terminate()
-          this.crash(new WriterCrashedError(timeout.message))
-        }
-        reject(timeout)
-      }, this.timeoutMs)
-      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer })
-      worker.postMessage({ ...frame, id })
+    return this.postTo<T>(this.worker, frame).catch((error: unknown) => {
+      // A timed-out mutation may still execute inside the isolate, so the whole
+      // generation is dropped rather than risk committing a write the caller
+      // never observed. Reads simply reject and keep the worker.
+      if (options.fatalOnTimeout === true && error instanceof WriterTimeoutError) {
+        void this.worker?.terminate()
+        this.crash(new WriterCrashedError(error.message))
+      }
+      throw error
     })
+  }
+
+  /** Post to one captured spawn, so a reopen cannot land on a replacement worker. */
+  private postTo<T>(target: Worker | undefined, frame: WriterFrame): Promise<T> {
+    if (target === undefined) return Promise.reject(new WriterCrashedError("writer is not running"))
+    this.postTarget = target
+    try {
+      return this.requests.request((id) => ({ ...frame, id })).then((reply) => {
+        if (reply.type === "result") return reply.value as T
+        throw new WriterRemoteError(reply.error.tag, reply.error.message, reply.error.code)
+      })
+    } finally {
+      // `request` posted synchronously above, so the target is no longer needed.
+      this.postTarget = undefined
+    }
   }
 
   // -- typed API ------------------------------------------------------------
@@ -533,105 +590,154 @@ export interface HubWriter {
   readonly rollback: (handle: string) => Promise<void>
 }
 
-const QUERY_METHODS: ReadonlySet<string> = new Set<QueryMethod>(["all", "values", "run", "exec"])
+/** The error reply plus the optional native code the worker classifier consumes. */
+type WriterErrorReply = Extract<WorkerWriterReply, { readonly ok: "error" }> & { readonly code?: string | number }
 
-/** Parse a wire method string into the trusted `QueryMethod`; fail loud otherwise. */
-function toQueryMethod(method: string): QueryMethod {
-  if (!QUERY_METHODS.has(method)) {
-    throw new ProtocolError(`unknown query method "${method}"; expected all, values, run or exec`)
+/** Parse a required string field of an inbound worker frame; fail loud otherwise. */
+function requestString(record: Record<string, unknown>, field: string): string {
+  const value = record[field]
+  if (typeof value !== "string") {
+    throw new ProtocolError(`field "${field}" must be a string (got ${JSON.stringify(value)})`)
   }
-  return method as QueryMethod
+  return value
 }
 
-/** Parse a wire event into a trusted `WriterEvent`; `data` must be a record. */
-function toWriterEvent(event: WorkerWriterEvent): WriterEvent {
-  const data = event.data
-  if (typeof data !== "object" || data === null || Array.isArray(data)) {
-    throw new ProtocolError(`event.data must be an object (got ${JSON.stringify(data)})`)
+/** Parse the optional positional `params` of an inbound worker frame. */
+function requestParams(record: Record<string, unknown>): readonly unknown[] | undefined {
+  const value = record["params"]
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) throw new ProtocolError(`field "params" must be an array (got ${JSON.stringify(value)})`)
+  return value
+}
+
+/**
+ * Parse an untrusted worker writer frame into a trusted request, failing loud. The
+ * port is the trust boundary: a frame that is not a well-formed request must never
+ * be trusted field by field, and a non-request is a protocol violation.
+ */
+export function parseWorkerWriterRequest(input: unknown): WorkerWriterRequest {
+  if (!isRecord(input)) throw new ProtocolError(`writer frame must be an object (got ${JSON.stringify(input)})`)
+  if (input["kind"] !== "request") {
+    throw new ProtocolError(`writer frame must have kind "request" (got ${JSON.stringify(input["kind"])})`)
   }
-  return { id: event.id, type: event.type, aggregateID: event.aggregateID, data: data as Record<string, unknown> }
+  const id = input["id"]
+  if (typeof id !== "number" || !Number.isInteger(id)) {
+    throw new ProtocolError(`field "id" must be an integer (got ${JSON.stringify(id)})`)
+  }
+  const op = input["op"]
+  switch (op) {
+    case "query": {
+      const params = requestParams(input)
+      return {
+        kind: "request",
+        id,
+        op,
+        method: requestString(input, "method"),
+        sql: requestString(input, "sql"),
+        ...defined({ params }),
+      }
+    }
+    case "publish":
+      // The event is validated here, so the server hands an already-trusted shape
+      // to the hub writer rather than trusting a bare `event` field.
+      return { kind: "request", id, op, event: parseWriterEventValue(input["event"]) }
+    case "tx.begin":
+      return { kind: "request", id, op }
+    case "tx.query": {
+      const params = requestParams(input)
+      return {
+        kind: "request",
+        id,
+        op,
+        handle: requestString(input, "handle"),
+        method: requestString(input, "method"),
+        sql: requestString(input, "sql"),
+        ...defined({ params }),
+      }
+    }
+    case "tx.commit":
+      return { kind: "request", id, op, handle: requestString(input, "handle") }
+    case "tx.rollback":
+      return { kind: "request", id, op, handle: requestString(input, "handle") }
+    default:
+      throw new ProtocolError(`unknown writer request op ${JSON.stringify(op)}`)
+  }
 }
 
 /**
  * Hub side: serve worker writer requests on `port` against `hubWriter`. Returns a
- * disposer. A reply to a closed port is swallowed (the worker is gone); a rejected
- * request becomes a typed error reply, never an unhandled rejection.
+ * disposer. Inbound frames are parsed at this boundary; a reply to a closed port is
+ * swallowed (the worker is gone); a rejected request becomes a typed error reply,
+ * never an unhandled rejection.
  */
-/** The error reply plus the optional native code the worker classifier consumes. */
-type WriterErrorReply = Extract<WorkerWriterReply, { readonly ok: "error" }> & { readonly code?: string | number }
-
 export function serveWriterPort(hubWriter: HubWriter, port: MessagePort): () => void {
-  const channel = portFromMessagePort<WorkerWriterFrame>(port)
-  return channel.onMessage((frame) => {
-    if (frame.kind !== "request") return
-    const id = frame.id
-    const reply = (payload: WorkerWriterReply): void => {
-      try {
-        channel.post(payload)
-      } catch {
-        // Drop the reply: the port is gone.
-      }
-    }
-    const replyError = (error: unknown): void => {
-      // Forward the native SQLite code so the worker-side `classifySqliteError`
-      // can map a lock onto `LockTimeoutError` rather than `UnknownError`.
-      const payload: WriterErrorReply = {
-        kind: "reply",
-        id,
-        ok: "error",
-        tag: writerErrorTag(error),
-        message: messageOf(error),
-        ...defined({ code: errorCode(error) }),
-      }
-      reply(payload)
-    }
+  const channel = portFromMessagePort<unknown>(port)
+
+  const reply = (payload: WorkerWriterReply): void => {
     try {
-      switch (frame.op) {
-        case "query":
-          hubWriter.query(toQueryMethod(frame.method), frame.sql, frame.params ?? []).then(
-            (value) => reply({ kind: "reply", id, ok: "query", value: value ?? null }),
-            replyError,
-          )
-          return
-        case "publish":
-          hubWriter.publish(toWriterEvent(frame.event), { durable: true }).then(
-            (result) => reply({ kind: "reply", id, ok: "publish", result }),
-            replyError,
-          )
-          return
-        case "tx.begin":
-          hubWriter.begin().then(
-            (handle) => reply({ kind: "reply", id, ok: "tx.begin", handle }),
-            replyError,
-          )
-          return
-        case "tx.query":
-          hubWriter.txQuery(frame.handle, toQueryMethod(frame.method), frame.sql, frame.params ?? []).then(
-            (value) => reply({ kind: "reply", id, ok: "tx.query", value: value ?? null }),
-            replyError,
-          )
-          return
-        case "tx.commit":
-          hubWriter.commit(frame.handle).then(
-            () => reply({ kind: "reply", id, ok: "tx.commit" }),
-            replyError,
-          )
-          return
-        case "tx.rollback":
-          hubWriter.rollback(frame.handle).then(
-            () => reply({ kind: "reply", id, ok: "tx.rollback" }),
-            replyError,
-          )
-          return
-        default: {
-          const unknown: never = frame
-          replyError(new Error(`unknown writer request: ${JSON.stringify(unknown)}`))
-        }
-      }
-    } catch (error) {
-      replyError(error)
+      channel.post(payload)
+    } catch {
+      // Drop the reply: the port is gone.
     }
-  })
+  }
+  const replyError = (id: number, error: unknown): void => {
+    // `writerErrorInfo` forwards the native SQLite code so the worker-side
+    // `classifySqliteError` can map a lock onto `LockTimeoutError` rather than
+    // `UnknownError`.
+    const payload: WriterErrorReply = { kind: "reply", id, ok: "error", ...writerErrorInfo(error) }
+    reply(payload)
+  }
+
+  return servePort(
+    channel,
+    parseWorkerWriterRequest,
+    (request) => executeWorkerWriterRequest(hubWriter, request),
+    (raw, outcome) => {
+      if (!outcome.ok) {
+        // Correlate by the parsed id, or by the raw id when the frame was unparseable.
+        if (outcome.request !== undefined) replyError(outcome.request.id, outcome.error)
+        else if (isRecord(raw) && typeof raw["id"] === "number") replyError(raw["id"], outcome.error)
+        return
+      }
+      reply(replyForWorkerWriter(outcome.request, outcome.value))
+    },
+  )
+}
+
+/** Dispatch one parsed worker writer request to the hub writer; returns its raw value. */
+function executeWorkerWriterRequest(hubWriter: HubWriter, request: WorkerWriterRequest): unknown {
+  switch (request.op) {
+    case "query":
+      return hubWriter.query(parseQueryMethod(request.method), request.sql, request.params ?? [])
+    case "publish":
+      return hubWriter.publish(parseWriterEventValue(request.event), { durable: true })
+    case "tx.begin":
+      return hubWriter.begin()
+    case "tx.query":
+      return hubWriter.txQuery(request.handle, parseQueryMethod(request.method), request.sql, request.params ?? [])
+    case "tx.commit":
+      return hubWriter.commit(request.handle)
+    case "tx.rollback":
+      return hubWriter.rollback(request.handle)
+  }
+}
+
+/** Encode a dispatched value as the op-specific success reply. */
+function replyForWorkerWriter(request: WorkerWriterRequest, value: unknown): WorkerWriterReply {
+  switch (request.op) {
+    case "query":
+      return { kind: "reply", id: request.id, ok: "query", value: value ?? null }
+    case "publish":
+      return { kind: "reply", id: request.id, ok: "publish", result: value as WorkerWriterPublishResult }
+    case "tx.begin":
+      return { kind: "reply", id: request.id, ok: "tx.begin", handle: value as string }
+    case "tx.query":
+      return { kind: "reply", id: request.id, ok: "tx.query", value: value ?? null }
+    case "tx.commit":
+      return { kind: "reply", id: request.id, ok: "tx.commit" }
+    case "tx.rollback":
+      return { kind: "reply", id: request.id, ok: "tx.rollback" }
+  }
 }
 
 export * as WriterClientModule from "./client"

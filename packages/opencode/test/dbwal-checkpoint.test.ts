@@ -9,12 +9,13 @@ import { describe, expect, spyOn, test } from "bun:test"
 import { statSync } from "node:fs"
 import path from "node:path"
 import { createWriterClient } from "@/session/writer/client"
-import { createBunSqliteConnection, openWriterConnection } from "@/session/writer/connection"
+import { openWriterConnection } from "@/session/writer/connection"
 import { createWriterCore, type WriterCore } from "@/session/writer/core"
+import { isEnoent } from "@/session/writer/protocol"
 import { flush } from "./lib/async"
 import { pollUntil } from "./lib/poll"
 import { tmpdir } from "./fixture/fixture"
-import { SCHEMA_SQL, healthyEnv } from "./session/writer/fixtures"
+import { SCHEMA_SQL, healthyEnv, writerHarness } from "./session/writer/fixtures"
 
 const WAL_LIMIT = 64 * 1024
 
@@ -46,22 +47,25 @@ function fakeScheduler(): FakeScheduler {
   }
 }
 
+/**
+ * Size of the `-wal` sidecar, or `0` when it is legitimately absent (no WAL yet).
+ * Any other stat failure is rethrown: swallowing it would let a broken checkpoint
+ * look green by masquerading as an empty WAL.
+ */
 function walSize(file: string): number {
   try {
     return statSync(`${file}-wal`).size
-  } catch {
-    return 0
+  } catch (error) {
+    if (isEnoent(error)) return 0
+    throw error
   }
 }
 
 function memoryCore(options: { checkpointIntervalMs: number; schedule?: FakeScheduler["schedule"] }): WriterCore {
-  const connection = createBunSqliteConnection({ filename: ":memory:" })
-  connection.exec(SCHEMA_SQL)
-  return createWriterCore({
-    connection,
+  return writerHarness({
     checkpointIntervalMs: options.checkpointIntervalMs,
     ...(options.schedule === undefined ? {} : { schedule: options.schedule }),
-  })
+  }).core
 }
 
 describe("dbwal C1: writer connection applies journal_size_limit at open", () => {

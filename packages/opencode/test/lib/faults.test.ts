@@ -28,9 +28,6 @@ afterEach(() => {
   serveFaults(originalGate)
 })
 
-/** Set (or clear) the gate for one case. */
-const serve = serveFaults
-
 describe("parseFaultPlan", () => {
   test("is disabled when the gate is unset or blank", () => {
     for (const raw of [undefined, "", "   ", ",", " , "]) {
@@ -76,7 +73,7 @@ describe("parseFaultPlan", () => {
 
 describe("fault hooks are inert by default", () => {
   test("crashWorker does not invoke the crash action when unset", () => {
-    serve(undefined)
+    serveFaults(undefined)
     let called = false
     crashWorker("worker:run", {
       onCrash: () => {
@@ -88,7 +85,7 @@ describe("fault hooks are inert by default", () => {
   })
 
   test("the commit and abort hooks report nothing when unset", () => {
-    serve(undefined)
+    serveFaults(undefined)
     expect(failCommitAt("writer:commit")).toBeUndefined()
     expect(abortTxAfter("writer:tx")).toBe(false)
   })
@@ -96,7 +93,7 @@ describe("fault hooks are inert by default", () => {
 
 describe("fault hooks fire at their point", () => {
   test("crashWorker fires only at the armed point", () => {
-    serve("crashWorker@worker:run")
+    serveFaults("crashWorker@worker:run")
     const seen: string[] = []
     const report = {
       onCrash: (directive: { kind: string; point: string }) => {
@@ -111,7 +108,7 @@ describe("fault hooks fire at their point", () => {
   })
 
   test("failCommitAt returns a SQLITE_BUSY fault only at the armed point", () => {
-    serve("failCommitAt@writer:commit")
+    serveFaults("failCommitAt@writer:commit")
 
     expect(failCommitAt("writer:other")).toBeUndefined()
     const fault = failCommitAt("writer:commit")
@@ -122,7 +119,7 @@ describe("fault hooks fire at their point", () => {
   })
 
   test("abortTxAfter is true only at the armed point", () => {
-    serve("abortTxAfter@writer:tx")
+    serveFaults("abortTxAfter@writer:tx")
 
     expect(abortTxAfter("writer:commit")).toBe(false)
     expect(abortTxAfter("writer:tx")).toBe(true)
@@ -131,25 +128,25 @@ describe("fault hooks fire at their point", () => {
 
 describe("activeFaults reads the gate at call time", () => {
   test("reflects a change between calls", () => {
-    serve(undefined)
+    serveFaults(undefined)
     expect(activeFaults().enabled).toBe(false)
 
-    serve("abortTxAfter@writer:tx")
+    serveFaults("abortTxAfter@writer:tx")
     expect(activeFaults().has("abortTxAfter", "writer:tx")).toBe(true)
   })
 
   test("a malformed gate fails loudly and does not poison later reads", () => {
-    serve("not-a-directive")
+    serveFaults("not-a-directive")
     expect(() => activeFaults()).toThrow(FaultSpecError)
 
-    serve("abortTxAfter@writer:tx")
+    serveFaults("abortTxAfter@writer:tx")
     expect(activeFaults().has("abortTxAfter", "writer:tx")).toBe(true)
   })
 })
 
 describe("withFaults scopes the gate to a block", () => {
   test("arms inside the block and restores the prior value after", async () => {
-    serve("failCommitAt@writer:commit")
+    serveFaults("failCommitAt@writer:commit")
     const inside = await withFaults("abortTxAfter@writer:tx", () => abortTxAfter("writer:tx"))
     expect(inside).toBe(true)
     // the outer gate is back: the abort point is no longer armed...
@@ -159,7 +156,7 @@ describe("withFaults scopes the gate to a block", () => {
   })
 
   test("restores the gate even when the block throws", async () => {
-    serve(undefined)
+    serveFaults(undefined)
     await expect(
       withFaults("crashWorker@worker:run", () => {
         throw new Error("boom")

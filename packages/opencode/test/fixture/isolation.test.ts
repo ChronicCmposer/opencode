@@ -3,7 +3,10 @@ import os from "os"
 import path from "path"
 import { assertIsolatedDatabasePath, isInsideTemp } from "./isolation"
 
-const productionDatabase = "/var/lib/opencode/.local/share/opencode/opencode.db"
+// The production database lives at `$XDG_DATA_HOME/opencode/opencode.db`, which
+// defaults to `~/.local/share`. Derive it from the home directory rather than a
+// hardcoded absolute path so the guard travels with the host.
+const productionDatabase = path.join(os.homedir(), ".local", "share", "opencode", "opencode.db")
 
 describe("isInsideTemp", () => {
   test("accepts a path directly under the OS temp directory", async () => {

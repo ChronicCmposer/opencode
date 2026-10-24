@@ -9,10 +9,16 @@
 /**
  * Recursively `Object.freeze` `value` and every nested object or array.
  * Primitives and `null`/`undefined` are returned unchanged.
+ *
+ * Only own enumerable string-keyed properties are traversed (the same set
+ * `Object.values` sees). `Map`, `Set`, typed arrays and other exotic objects are
+ * frozen as objects but their *contents* are not reached, because `Object.values`
+ * does not enumerate their entries. Callers that need entry-level immutability
+ * must freeze those containers explicitly.
  */
 export function deepFreeze<T>(value: T): T {
   if (value === null || typeof value !== "object") return value
   Object.freeze(value)
-  for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested)
+  for (const nested of Object.values(value)) deepFreeze(nested)
   return value
 }

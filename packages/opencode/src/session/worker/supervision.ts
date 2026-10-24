@@ -36,7 +36,11 @@ export function crashBackoffMs(attempts: number): number {
   return Math.min(CRASH_BACKOFF_MAX_MS, CRASH_BACKOFF_INITIAL_MS * 2 ** Math.min(attempts - 1, 30))
 }
 
-function assertWorkerID(workerID: number): void {
+/**
+ * Reject a non-integer or negative pool slot id. Shared with `pid-registry.ts`
+ * so both the supervision counters and the PID mirror validate ids identically.
+ */
+export function assertWorkerID(workerID: number): void {
   if (!Number.isInteger(workerID) || workerID < 0) {
     throw new Error(`invalid workerID: ${workerID} (expected a non-negative integer)`)
   }

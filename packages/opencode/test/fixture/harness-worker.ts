@@ -9,6 +9,7 @@
 // On startup: { type: "ready", pid, threadId }
 
 import { threadId } from "node:worker_threads"
+import { onMessage, postToParent, scope } from "./worker-scope"
 
 interface Incoming {
   type?: string
@@ -17,30 +18,22 @@ interface Incoming {
   ms?: number
 }
 
-interface WorkerScope {
-  postMessage(message: unknown): void
-  onmessage: ((event: { data: unknown }) => void) | null
-  close(): void
-}
-
-const scope = globalThis as unknown as WorkerScope
-
-scope.onmessage = (event) => {
-  const input = (event.data ?? {}) as Incoming
+onMessage<Incoming>((raw) => {
+  const input: Incoming = raw ?? {}
 
   switch (input.type) {
     case "echo":
-      scope.postMessage({ type: "echo", data: input.data })
+      postToParent({ type: "echo", data: input.data })
       return
     case "error":
-      scope.postMessage({ type: "error", message: input.message ?? "worker error" })
+      postToParent({ type: "error", message: input.message ?? "worker error" })
       return
     case "spin": {
       const deadline = Date.now() + (input.ms ?? 0)
       while (Date.now() < deadline) {
         // deliberately synchronous: proves terminate() can interrupt a tight loop
       }
-      scope.postMessage({ type: "spun" })
+      postToParent({ type: "spun" })
       return
     }
     case "throw":
@@ -49,8 +42,8 @@ scope.onmessage = (event) => {
       scope.close()
       return
     default:
-      scope.postMessage({ type: "unknown" })
+      postToParent({ type: "unknown" })
   }
-}
+})
 
-scope.postMessage({ type: "ready", pid: process.pid, threadId })
+postToParent({ type: "ready", pid: process.pid, threadId })

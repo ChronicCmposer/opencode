@@ -47,18 +47,62 @@ export class InvalidDurableEventError extends Schema.TaggedErrorClass<InvalidDur
   },
 ) {}
 
-const decodeSerializedEvent = (event: SerializedEvent): Payload => {
-  const definition = Durable.get(event.type)
-  if (!definition?.durable) {
-    throw new InvalidDurableEventError({ type: event.type, message: `Unknown durable event type ${event.type}` })
-  }
-  return {
-    id: event.id,
-    type: definition.type,
-    durable: { aggregateID: event.aggregateID, seq: event.seq, version: definition.durable.version },
-    data: Schema.decodeUnknownSync(definition.data)(event.data),
-  }
+/** A stored `event` row as the SQL layer presents it (before any decoding). */
+type StoredEventRow = {
+  readonly id: ID
+  readonly type: string
+  readonly aggregate_id: string
+  readonly seq: number
+  readonly data: Record<string, unknown>
 }
+
+/**
+ * Lift a stored row into the serialized envelope both decode paths share. The
+ * stored `type` is the *versioned* key (`message.removed.1`), which is what the
+ * durable manifest is indexed by, so it must be preserved verbatim.
+ */
+const serializeStoredRow = (row: StoredEventRow): SerializedEvent => ({
+  id: row.id,
+  type: row.type,
+  aggregateID: row.aggregate_id,
+  seq: row.seq,
+  data: row.data,
+})
+
+/**
+ * The undecoded payload envelope every stored event decodes into. Centralizing it
+ * keeps `readAggregate` and `readAfter` from drifting on how `durable.version`
+ * and the aggregate identity are laid out.
+ */
+const payloadEnvelope = <Version extends number | undefined>(
+  event: SerializedEvent,
+  definition: Definition,
+  version: Version,
+) => ({
+  id: event.id,
+  type: definition.type,
+  durable: {
+    aggregateID: event.aggregateID,
+    seq: event.seq,
+    version,
+  },
+  data: event.data,
+})
+
+/**
+ * Decode one durable stored event. Returns a typed failure (rather than the
+ * previous synchronous throw / raw `decodeUnknownSync`) so callers must decide
+ * how an unknown or malformed durable row is surfaced.
+ */
+const decodeSerializedEvent = (event: SerializedEvent): Effect.Effect<Payload, InvalidDurableEventError> =>
+  Effect.gen(function* () {
+    const definition = Durable.get(event.type)
+    if (!definition?.durable) {
+      return yield* new InvalidDurableEventError({ type: event.type, message: `Unknown durable event type ${event.type}` })
+    }
+    const data = yield* Schema.decodeUnknownEffect(definition.data)(event.data).pipe(Effect.orDie)
+    return { ...payloadEnvelope(event, definition, definition.durable.version), data }
+  })
 
 export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
   db: Database.Interface["db"],
@@ -89,18 +133,14 @@ export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
     .pipe(Effect.orDie)
   const page = rows.slice(0, input.limit)
   const decode = Schema.decodeUnknownSync(input.manifest.schema)
-  const events = page.map((event) =>
-    decode({
-      id: event.id,
-      type: input.manifest.definitions.get(event.type)?.type ?? event.type,
-      durable: {
-        aggregateID: event.aggregate_id,
-        seq: event.seq,
-        version: input.manifest.definitions.get(event.type)?.durable?.version,
-      },
-      data: event.data,
-    }),
-  )
+  const events = page.flatMap((row) => {
+    const definition = input.manifest.definitions.get(row.type)
+    // The query already restricted rows to the manifest's definition keys, so a
+    // missing definition is impossible; skip defensively rather than fabricate a
+    // type from the raw row.
+    if (definition === undefined) return []
+    return [decode(payloadEnvelope(serializeStoredRow(row), definition, definition.durable?.version))]
+  })
   return {
     events,
     hasMore: rows.length > input.limit,
@@ -568,17 +608,8 @@ export const layerWith = (options?: LayerOptions) =>
               .all(),
           ),
           Effect.orDie,
-          Effect.map((rows) =>
-            rows.map((event) =>
-              decodeSerializedEvent({
-                id: event.id,
-                aggregateID: event.aggregate_id,
-                seq: event.seq,
-                type: event.type,
-                data: event.data,
-              }),
-            ),
-          ),
+          Effect.flatMap((rows) => Effect.forEach(rows, (row) => decodeSerializedEvent(serializeStoredRow(row)))),
+          Effect.orDie,
         )
 
       const subscribeDurable = (aggregateID: string) =>

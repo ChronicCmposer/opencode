@@ -366,17 +366,45 @@ describe("writer port server (step 17)", () => {
     // A guarded reply to a closed port must be swallowed, not thrown.
     expect(() => dispose()).not.toThrow()
   })
+
+  test("rejects a malformed worker frame with a typed PROTOCOL error reply", async () => {
+    const hub: HubWriter = {
+      query: async () => null,
+      publish: async () => ({ seq: null, committed: false }),
+      ...noTx,
+    }
+    const channel = new MessageChannel()
+    const dispose = serveWriterPort(hub, channel.port1)
+
+    const replies: unknown[] = []
+    const bothReplied = new Promise<void>((resolve) => {
+      channel.port2.onmessage = (event) => {
+        replies.push(event.data)
+        if (replies.length === 2) resolve()
+      }
+    })
+    channel.port2.start?.()
+
+    // An unknown op and a missing required field are both protocol violations.
+    channel.port2.postMessage({ kind: "request", id: 7, op: "bogus" })
+    channel.port2.postMessage({ kind: "request", id: 8, op: "query", method: "all" })
+    await bothReplied
+
+    expect(replies).toMatchObject([
+      { kind: "reply", id: 7, ok: "error", tag: "PROTOCOL" },
+      { kind: "reply", id: 8, ok: "error", tag: "PROTOCOL" },
+    ])
+    channel.port2.close()
+    dispose()
+  })
 })
 
 describe("writer port server: transactions over the real writer (step 17)", () => {
   const INSERT_SEQUENCE = "INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (?, ?, ?)"
   const SELECT_SEQUENCES = "SELECT aggregate_id FROM event_sequence ORDER BY aggregate_id"
 
-  /** Open a real writer isolate over a temp file and serve it to a worker client. */
-  async function servedWriter(tmpPath: string) {
-    const writer = createWriterClient({ env: healthyEnv })
-    await writer.open(path.join(tmpPath, "writer.db"))
-    await writer.migrate(SCHEMA)
+  /** Serve an already-open writer to a worker client; owns teardown of both. */
+  async function serveClient(writer: ReturnType<typeof createWriterClient>) {
     const channel = new MessageChannel()
     const dispose = serveWriterPort(writer, channel.port1)
     const client = createWorkerWriterClient(channel.port2)
@@ -389,6 +417,14 @@ describe("writer port server: transactions over the real writer (step 17)", () =
         await writer.close()
       },
     }
+  }
+
+  /** Open a real writer isolate over a temp file and serve it to a worker client. */
+  async function servedWriter(tmpPath: string) {
+    const writer = createWriterClient({ env: healthyEnv })
+    await writer.open(path.join(tmpPath, "writer.db"))
+    await writer.migrate(SCHEMA)
+    return serveClient(writer)
   }
 
   test("begin → txQuery → commit persists, and a concurrent non-tx query queues behind the pin", async () => {
@@ -458,9 +494,8 @@ describe("writer port server: transactions over the real writer (step 17)", () =
 
     const writer = createWriterClient({ env: { [FAULTS_ENV]: "abortTxAfter@writer:tx" } })
     await writer.open(file)
-    const channel = new MessageChannel()
-    const dispose = serveWriterPort(writer, channel.port1)
-    const client = createWorkerWriterClient(channel.port2)
+    await using served = await serveClient(writer)
+    const client = served.client
 
     const handle = await client.begin()
     const error = await client.txQuery(handle, "run", INSERT_SEQUENCE, ["e", 0, null]).then(
@@ -475,10 +510,6 @@ describe("writer port server: transactions over the real writer (step 17)", () =
     const next = await client.begin()
     await client.rollback(next)
     expect(await client.query("all", SELECT_SEQUENCES)).toEqual([])
-
-    client.dispose()
-    dispose()
-    await writer.close()
   })
 
   test("a worker crash during a transaction commit surfaces a typed error and the client recovers", async () => {
@@ -492,9 +523,8 @@ describe("writer port server: transactions over the real writer (step 17)", () =
 
     const writer = createWriterClient({ env: { [FAULTS_ENV]: "crashWorker@writer:tx-commit" } })
     await writer.open(file)
-    const channel = new MessageChannel()
-    const dispose = serveWriterPort(writer, channel.port1)
-    const client = createWorkerWriterClient(channel.port2)
+    await using served = await serveClient(writer)
+    const client = served.client
 
     const handle = await client.begin()
     await client.txQuery(handle, "run", INSERT_SEQUENCE, ["d", 0, null])
@@ -524,10 +554,6 @@ describe("writer port server: transactions over the real writer (step 17)", () =
     // A fresh transaction begins on the recovered writer.
     const next = await client.begin()
     await client.rollback(next)
-
-    client.dispose()
-    dispose()
-    await writer.close()
   })
 
   test("a completed run releases the pin so back-to-back transactions and reads settle promptly", async () => {
@@ -573,5 +599,16 @@ describe("writer worker entry resolution", () => {
     const entry = resolveWriterWorkerEntry({ env: {} })
     expect(entry).toBeInstanceOf(URL)
     expect(String(entry).endsWith("/worker.ts")).toBe(true)
+  })
+
+  test("the client spawns the isolate named by the caller's env overlay (item 14)", async () => {
+    // Point the override at the fake worker in `silent` mode: if the constructor
+    // ignored `options.env`, the real writer isolate would become ready instead.
+    await using client = createWriterClient({
+      env: { OPENCODE_WRITER_WORKER_PATH: fakeEntry.pathname },
+      workerData: { mode: "silent" },
+      timeoutMs: 50,
+    })
+    await expect(client.open("x.db")).rejects.toBeInstanceOf(WriterTimeoutError)
   })
 })

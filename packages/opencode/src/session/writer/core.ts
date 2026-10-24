@@ -223,14 +223,27 @@ export function writerErrorInfo(error: unknown): { tag: string; message: string;
 // ---------------------------------------------------------------------------
 
 const SELECT_QUERY = /^\s*(?:select|with)\b/i
-const TABLE_REFERENCE = /\b(?:from|join|into|update)\s+[`"[]?([A-Za-z_][A-Za-z0-9_]*)/gi
+const TABLE_REFERENCE =
+  /\b(?:from|join|into|update)\s+([`"[]?[A-Za-z_][A-Za-z0-9_]*[`"\]]?(?:\s*\.\s*[`"[]?[A-Za-z_][A-Za-z0-9_]*[`"\]]?)*)/gi
 
-/** Tables a statement reads or writes; used to invalidate cached reads. */
+/** The bare table name of a possibly schema-qualified reference (`main.event` -> `event`). */
+function bareTableName(reference: string): string {
+  const segment = reference.split(".").at(-1) ?? reference
+  return segment.replace(/^[`"[]/, "").replace(/[`"\]]$/, "").toLowerCase()
+}
+
+/**
+ * Tables a statement reads or writes; used to invalidate cached reads. A
+ * schema-qualified reference (`main.event`) resolves to its bare table name so it
+ * invalidates the same entry as `event`. An empty result means the tables could
+ * not be attributed, which the caller treats as "invalidate everything / do not
+ * cache" rather than mis-attributing the statement.
+ */
 export function tablesTouched(sql: string): ReadonlyArray<string> {
   const tables = new Set<string>()
   TABLE_REFERENCE.lastIndex = 0
   let match: RegExpExecArray | null
-  while ((match = TABLE_REFERENCE.exec(sql)) !== null) tables.add(match[1]!.toLowerCase())
+  while ((match = TABLE_REFERENCE.exec(sql)) !== null) tables.add(bareTableName(match[1]!))
   return [...tables]
 }
 
@@ -242,8 +255,38 @@ function isMutating(method: string, sql: string): boolean {
   return method === "run" || method === "exec" || !SELECT_QUERY.test(sql)
 }
 
+/**
+ * A stable, collision-free encoding of one parameter for the read cache. It keeps
+ * values `JSON.stringify` conflates distinct (`undefined` vs `null`, `NaN` vs
+ * `null`) and serializes `BigInt` instead of throwing.
+ */
+function encodeCacheParam(value: unknown): string {
+  if (value === undefined) return "u"
+  if (value === null) return "z"
+  switch (typeof value) {
+    case "string":
+      return `s${value.length}:${value}`
+    case "number":
+      return Number.isFinite(value) ? `d${value}` : `d:${String(value)}`
+    case "bigint":
+      return `i${value.toString()}`
+    case "boolean":
+      return value ? "b1" : "b0"
+    case "object": {
+      if (Array.isArray(value)) return `a[${value.map(encodeCacheParam).join(",")}]`
+      if (value instanceof Uint8Array) return `y${Buffer.from(value).toString("base64")}`
+      if (value instanceof Date) return `t${value.getTime()}`
+      const record = value as Record<string, unknown>
+      const keys = Object.keys(record).sort()
+      return `o{${keys.map((key) => `${key.length}:${key}=${encodeCacheParam(record[key])}`).join(",")}}`
+    }
+    default:
+      return `${typeof value}:${String(value)}`
+  }
+}
+
 function cacheKey(method: string, sql: string, params: ReadonlyArray<unknown>): string {
-  return `${method}\u0000${sql}\u0000${JSON.stringify(params)}`
+  return `${method}\u0000${sql}\u0000${params.map(encodeCacheParam).join("\u0001")}`
 }
 
 /**
@@ -571,15 +614,21 @@ export class WriterCore {
     options: { readonly cache?: boolean } = {},
   ): Promise<unknown> {
     return this.enqueue(() => {
-      const useCache = (options.cache ?? true) && this.cacheEnabled && isReadQuery(method, sql)
+      const tables = tablesTouched(sql)
+      // A read whose tables cannot be attributed is never cached: there is no
+      // table to invalidate it by, so it would otherwise go permanently stale.
+      const useCache =
+        (options.cache ?? true) && this.cacheEnabled && isReadQuery(method, sql) && tables.length > 0
       const key = useCache ? cacheKey(method, sql, params) : undefined
       if (key !== undefined) {
         const cached = this.cache.get(key)
         if (cached !== undefined) return cached
       }
       const value = this.execute(method, sql, params)
-      if (isMutating(method, sql)) this.cache.invalidateTables(tablesTouched(sql))
-      else if (key !== undefined) this.cache.set(key, value, tablesTouched(sql))
+      // An unrecognized mutating statement (no attributable table) clears the whole
+      // cache rather than risk leaving a stale entry behind.
+      if (isMutating(method, sql)) this.cache.invalidateTables(tables)
+      else if (key !== undefined) this.cache.set(key, value, tables)
       return value
     })
   }
@@ -813,9 +862,13 @@ export class WriterCore {
           Faults.crashWorker("writer:commit")
 
           this.cache.invalidateTables(["event", "event_sequence"])
-          return { seq, committed: true, ordinal: this.nextOrdinal(), idempotent: false }
+          return { seq, committed: true as const, idempotent: false as const }
         }),
       )
+      // The ordinal is stamped only after the commit lands. Allocating it inside the
+      // transaction body would consume one on every busy retry (or failed commit),
+      // leaving gaps in the egress sequence.
+      .then((result) => ({ ...result, ordinal: this.nextOrdinal() }))
     })
   }
 
@@ -843,7 +896,7 @@ export class WriterCore {
               stored.type === event.type &&
               this.sameData(stored.data, event.data)
             ) {
-              return { seq, committed: false, ordinal: null, idempotent: true }
+              return { seq, committed: false as const, idempotent: true as const }
             }
             throw new SequenceError(`replay diverged at aggregate ${event.aggregateID} sequence ${seq}`)
           }
@@ -859,9 +912,12 @@ export class WriterCore {
           this.writeSequence(event.aggregateID, seq, input.ownerID)
           this.writeEvent(committed)
           this.cache.invalidateTables(["event", "event_sequence"])
-          return { seq, committed: true, ordinal: this.nextOrdinal(), idempotent: false }
+          return { seq, committed: true as const, idempotent: false as const }
         }),
       )
+      // Stamp the ordinal after the commit: a busy retry or a diverged replay must
+      // never consume one, and an idempotent replay carries no durable frame.
+      .then((result) => ({ ...result, ordinal: result.committed ? this.nextOrdinal() : null }))
     })
   }
 
@@ -873,9 +929,14 @@ export class WriterCore {
       ? "UPDATE event_sequence SET owner_id = ? WHERE aggregate_id = ? AND owner_id IS NULL"
       : "UPDATE event_sequence SET owner_id = ? WHERE aggregate_id = ?"
     const outcome = this.connection.run(sql, [ownerID, aggregateID])
-    if (options.onlyIfUnowned && outcome.changes === 0) {
+    // Zero matched rows means the aggregate has no sequence row: `claim` and `steal`
+    // are symmetric here and both reject rather than silently no-op (which would let
+    // a takeover of a nonexistent aggregate report success).
+    if (outcome.changes === 0) {
       throw new OwnerMismatchError(
-        `claim rejected for aggregate ${aggregateID}: already owned (or absent), cannot become ${ownerID}`,
+        options.onlyIfUnowned
+          ? `claim rejected for aggregate ${aggregateID}: already owned (or absent), cannot become ${ownerID}`
+          : `steal rejected for aggregate ${aggregateID}: no such aggregate`,
       )
     }
     this.cache.invalidateTables(["event_sequence"])

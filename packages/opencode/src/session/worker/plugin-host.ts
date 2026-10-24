@@ -133,8 +133,11 @@ async function runHook<TInput, TOutput>(
   return output
 }
 
-/** The mutable sampling fields a `chat.params` plugin may set. */
-const CHAT_PARAM_KEYS = ["temperature", "topP", "topK", "maxOutputTokens"] as const
+/**
+ * The mutable sampling fields a `chat.params` plugin may set. Exported so the
+ * hub-side resolver (`init.ts`) diffs exactly the same keys this host applies.
+ */
+export const CHAT_PARAM_KEYS = ["temperature", "topP", "topK", "maxOutputTokens"] as const
 type ChatParamKey = (typeof CHAT_PARAM_KEYS)[number]
 
 /**

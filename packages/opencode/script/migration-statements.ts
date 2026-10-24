@@ -57,39 +57,53 @@ function schemaStatements(): string[] {
   return statements
 }
 
-/** The only idempotent statement heads this list may emit. */
-const IDEMPOTENT_PREFIXES: ReadonlyArray<string> = [
-  "CREATE TABLE IF NOT EXISTS",
-  "CREATE UNIQUE INDEX IF NOT EXISTS",
-  "CREATE INDEX IF NOT EXISTS",
-  "INSERT OR IGNORE INTO",
-]
+/**
+ * One create/insert statement, split so the identifier is parsed once and can be
+ * re-emitted verbatim rather than being matched by a chain of lookahead regexes.
+ */
+type ParsedStatement =
+  | { readonly kind: "create"; readonly indent: string; readonly verb: string; readonly identifier: string; readonly tail: string }
+  | { readonly kind: "insert"; readonly indent: string; readonly identifier: string; readonly tail: string }
 
-/** A statement already written in an idempotent form, regardless of leading whitespace. */
-function isIdempotent(statement: string): boolean {
-  const head = statement.trimStart().toUpperCase()
-  return IDEMPOTENT_PREFIXES.some((prefix) => head.startsWith(prefix))
+/** A single SQL identifier: backticked, double-quoted, bracketed, or bare. */
+const IDENTIFIER = "(?:`[^`]*`|\"[^\"]*\"|\\[[^\\]]*\\]|[^\\s(]+)"
+
+const CREATE_STATEMENT = new RegExp(
+  `^(\\s*)CREATE\\s+(TABLE|UNIQUE\\s+INDEX|INDEX)\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(${IDENTIFIER})(.*)$`,
+  "is",
+)
+const INSERT_STATEMENT = new RegExp(`^(\\s*)INSERT\\s+(?:OR\\s+IGNORE\\s+)?INTO\\s+(${IDENTIFIER})(.*)$`, "is")
+
+function parseStatement(statement: string): ParsedStatement | undefined {
+  const create = CREATE_STATEMENT.exec(statement)
+  if (create) {
+    const [, indent, verb, identifier, tail] = create
+    return { kind: "create", indent, verb: verb.toUpperCase().replace(/\s+/g, " "), identifier, tail }
+  }
+  const insert = INSERT_STATEMENT.exec(statement)
+  if (insert) {
+    const [, indent, identifier, tail] = insert
+    return { kind: "insert", indent, identifier, tail }
+  }
+  return undefined
 }
 
 /**
  * Rewrite one statement into an idempotent form so re-applying the migration to a
- * database the main process already migrated is a safe no-op. A statement that is
- * not a recognized idempotent-able form fails loud: silently emitting
- * non-idempotent SQL would reintroduce the boot crash this list exists to prevent.
+ * database the main process already migrated is a safe no-op. The parsed
+ * identifier is preserved exactly (quoting included) and a statement that is not
+ * a recognized idempotent-able form fails loud: silently emitting non-idempotent
+ * SQL would reintroduce the boot crash this list exists to prevent.
  */
 function toIdempotent(statement: string): string {
-  if (isIdempotent(statement)) return statement
-  const rewritten = statement
-    .replace(/^(\s*)CREATE TABLE (?!IF NOT EXISTS )/i, "$1CREATE TABLE IF NOT EXISTS ")
-    .replace(/^(\s*)CREATE UNIQUE INDEX (?!IF NOT EXISTS )/i, "$1CREATE UNIQUE INDEX IF NOT EXISTS ")
-    .replace(/^(\s*)CREATE INDEX (?!IF NOT EXISTS )/i, "$1CREATE INDEX IF NOT EXISTS ")
-    .replace(/^(\s*)INSERT INTO (`migration`)/i, "$1INSERT OR IGNORE INTO $2")
-  if (!isIdempotent(rewritten)) {
+  const parsed = parseStatement(statement)
+  if (parsed === undefined) {
     throw new Error(
       `migration statement cannot be made idempotent (extend script/migration-statements.ts): ${JSON.stringify(statement)}`,
     )
   }
-  return rewritten
+  if (parsed.kind === "create") return `${parsed.indent}CREATE ${parsed.verb} IF NOT EXISTS ${parsed.identifier}${parsed.tail}`
+  return `${parsed.indent}INSERT OR IGNORE INTO ${parsed.identifier}${parsed.tail}`
 }
 
 function migrationStatements(): string[] {

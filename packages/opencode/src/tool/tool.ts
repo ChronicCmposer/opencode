@@ -2,8 +2,6 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Effect, Schema } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { JSONSchema7 } from "@ai-sdk/provider"
-import type { MessageV2 } from "../session/message-v2"
-import type { Permission } from "../permission"
 import type { SessionID, MessageID } from "../session/schema"
 import * as Truncate from "./truncate"
 import { Agent } from "@/agent/agent"
@@ -11,9 +9,6 @@ import { Agent } from "@/agent/agent"
 interface Metadata {
   [key: string]: any
 }
-
-// TODO: remove this hack
-export type DynamicDescription = (agent: Agent.Info) => Effect.Effect<string>
 
 /**
  * Raised when the LLM calls a tool with arguments that fail the parameter

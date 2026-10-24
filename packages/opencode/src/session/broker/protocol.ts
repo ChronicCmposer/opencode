@@ -267,10 +267,16 @@ export const DEFAULT_CANCELLED_CAP = 1024
  * first value.
  */
 export function rememberBounded<T>(set: Set<T>, id: T, cap: number = DEFAULT_CANCELLED_CAP): void {
+  if (!Number.isInteger(cap) || cap <= 0) {
+    throw new BrokerProtocolError(`cap must be a positive integer (got ${String(cap)})`)
+  }
   if (set.has(id)) return
   if (set.size >= cap) {
-    const oldest = set.values().next().value
-    if (oldest !== undefined) set.delete(oldest)
+    // Read the iterator's `done` flag rather than comparing the value to
+    // `undefined`: a set may legitimately store `undefined`, and mistaking that
+    // member for "no oldest entry" would skip the eviction and exceed the cap.
+    const oldest = set.values().next()
+    if (!oldest.done) set.delete(oldest.value)
   }
   set.add(id)
 }
@@ -383,6 +389,125 @@ export function parseBrokerRequest(value: unknown): BrokerRequest {
     default:
       throw new BrokerProtocolError(`unknown kind "${kind}"`)
   }
+}
+
+const BROKER_ERROR_CODES: ReadonlyArray<BrokerErrorCode> = [
+  "timeout",
+  "cancelled",
+  "crashed",
+  "invalid-request",
+  "unknown-directory",
+  "unknown-server",
+  "spawn-failed",
+  "handshake-failed",
+  "child-exited",
+  "protocol",
+]
+
+function isBrokerErrorCode(value: unknown): value is BrokerErrorCode {
+  return typeof value === "string" && (BROKER_ERROR_CODES as ReadonlyArray<string>).includes(value)
+}
+
+/**
+ * Map any thrown failure onto the wire error taxonomy. This is the single
+ * mapping shared by both broker boundaries (the hub port server and the broker
+ * worker's RPC loop): a `BrokerFailure` or any error already carrying a valid
+ * broker code keeps that code, an unparseable request is `invalid-request`, and
+ * anything else is `protocol`.
+ */
+export function toBrokerError(reason: unknown): BrokerError {
+  if (reason instanceof BrokerFailure) return { code: reason.code, message: reason.message }
+  if (reason instanceof BrokerProtocolError) return { code: "invalid-request", message: reason.message }
+  if (isRecord(reason) && isBrokerErrorCode(reason["code"])) {
+    return { code: reason["code"], message: reason instanceof Error ? reason.message : String(reason) }
+  }
+  return { code: "protocol", message: reason instanceof Error ? reason.message : String(reason) }
+}
+
+function parseBrokerError(value: unknown): BrokerError {
+  if (!isRecord(value)) throw new BrokerProtocolError("error must be an object")
+  const code = requireString(value.code, "error.code")
+  if (!(BROKER_ERROR_CODES as ReadonlyArray<string>).includes(code)) {
+    throw new BrokerProtocolError(`unknown broker error code "${code}"`)
+  }
+  return { code: code as BrokerErrorCode, message: requireString(value.message, "error.message") }
+}
+
+function parseExitCode(value: unknown): number | null {
+  return value === null ? null : requireInteger(value, "code")
+}
+
+/**
+ * Parse an untrusted broker→hub frame arriving on the RPC port. The port is the
+ * trust boundary: a malformed frame is a broker bug and fails loud, so the hub's
+ * pending/mirror state never accepts a half-formed frame.
+ */
+export function parseBrokerFrame(value: unknown): BrokerFrame {
+  if (!isRecord(value)) throw new BrokerProtocolError("frame must be an object")
+  const kind = requireString(value.kind, "kind")
+  switch (kind) {
+    case "response": {
+      const requestId = requireString(value.requestId, "requestId")
+      if (value.ok === true) return { kind, requestId, ok: true, value: value.value ?? null }
+      if (value.ok !== false) throw new BrokerProtocolError('response field "ok" must be a boolean')
+      return { kind, requestId, ok: false, error: parseBrokerError(value.error) }
+    }
+    case "notification":
+      return {
+        kind,
+        directory: requireString(value.directory, "directory"),
+        server: requireString(value.server, "server"),
+        method: requireString(value.method, "method"),
+        ...(value.params === undefined ? {} : { params: value.params }),
+      }
+    case "child":
+      return {
+        kind,
+        directory: requireString(value.directory, "directory"),
+        server: requireString(value.server, "server"),
+        pid: requirePositiveInteger(value.pid, "pid"),
+        pgid: requirePositiveInteger(value.pgid, "pgid"),
+      }
+    case "child-exit":
+      return {
+        kind,
+        directory: requireString(value.directory, "directory"),
+        server: requireString(value.server, "server"),
+        pid: requirePositiveInteger(value.pid, "pid"),
+        pgid: requirePositiveInteger(value.pgid, "pgid"),
+        code: parseExitCode(value.code),
+      }
+    default:
+      throw new BrokerProtocolError(`unknown broker frame kind "${kind}"`)
+  }
+}
+
+/**
+ * Parse an untrusted broker-worker→hub handshake frame (`ready` / `attached`),
+ * so the hub never branches on an unchecked `type`/`threadId` pair.
+ */
+export function parseWorkerHandshake(value: unknown): BrokerWorkerOutbound {
+  if (!isRecord(value)) throw new BrokerProtocolError("handshake must be an object")
+  const type = requireString(value.type, "type")
+  switch (type) {
+    case "ready":
+      return { type, threadId: requireInteger(value.threadId, "threadId") }
+    case "attached":
+      return { type, threadId: requireInteger(value.threadId, "threadId") }
+    default:
+      throw new BrokerProtocolError(`unknown handshake type "${type}"`)
+  }
+}
+
+/**
+ * Parse the hub→broker-worker `attach` handshake. The transferred `MessagePort`
+ * is the only payload and must be a real port.
+ */
+export function parseWorkerAttach(value: unknown): BrokerWorkerInbound {
+  if (!isRecord(value)) throw new BrokerProtocolError("attach frame must be an object")
+  if (value.type !== "attach") throw new BrokerProtocolError('attach frame must have type "attach"')
+  if (!(value.port instanceof MessagePort)) throw new BrokerProtocolError("attach frame must carry a MessagePort")
+  return { type: "attach", port: value.port }
 }
 
 function parseAcquiredServer(value: unknown, index: number): AcquiredServer {

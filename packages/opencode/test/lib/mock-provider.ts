@@ -140,6 +140,16 @@ function optionsScript(options: MockProviderOptions): MockProviderScript {
   }
 }
 
+/**
+ * Parse a request body into a plain record. Anything that is not a non-null,
+ * non-array object (malformed JSON, a JSON scalar) becomes `{}`, so the recorded
+ * request body is always a trusted record (Law of "Parse, Don't Validate").
+ */
+function requestBody(value: unknown): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {}
+  return Object.fromEntries(Object.entries(value))
+}
+
 /** Select the script for request `index`; the last script repeats once drained. */
 function scriptFor(scripts: readonly MockProviderScript[], index: number): MockProviderScript {
   return scripts[Math.min(index, scripts.length - 1)] ?? {}
@@ -181,7 +191,7 @@ export function startMockProvider(options: MockProviderOptions = {}): MockProvid
         return new Response("not found", { status: 404 })
       }
 
-      const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+      const body = requestBody(await request.json().catch(() => ({})))
       requests.push({ url: url.pathname, authorization: request.headers.get("authorization") ?? undefined, body })
       settleWaits()
 

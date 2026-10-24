@@ -13,7 +13,7 @@
 // the reason in its name (same pattern as `parallel-sessions.test.ts`).
 
 import { describe, expect, test } from "bun:test"
-import { existsSync, readdirSync, readFileSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createBroker } from "@/session/broker/broker"
@@ -76,8 +76,11 @@ describe("WS4 — static thread names", () => {
     async () => {
       const writer = createWriterClient({ env: healthyEnv })
       const broker = createBroker()
+      // The writer's on-disk database is process-scoped, so every run of this
+      // file would otherwise leak one into the temp directory.
+      const databasePath = join(tmpdir(), `oc-thread-naming-${process.pid}.db`)
       try {
-        await writer.open(join(tmpdir(), `oc-thread-naming-${process.pid}.db`))
+        await writer.open(databasePath)
         await broker.ready
         const hub = createProductionSessionHub({
           init: sessionWorkerInit(),
@@ -92,8 +95,12 @@ describe("WS4 — static thread names", () => {
           await hub.terminateAll()
         }
       } finally {
-        await broker.teardown().catch(() => undefined)
-        await writer.close()
+        try {
+          await broker.teardown().catch(() => undefined)
+          await writer.close()
+        } finally {
+          rmSync(databasePath, { force: true })
+        }
       }
     },
   )

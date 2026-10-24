@@ -14,7 +14,7 @@
 import { Context, Effect, Schema } from "effect"
 import type { SessionID } from "@/session/schema"
 import type { PromptInput } from "@/session/prompt"
-import { HeadroomFullError } from "./dispatch"
+import { HeadroomFullError, SessionCancelledError } from "./dispatch"
 import type { SessionExecutionResult } from "./execute"
 import type { JobInfo, JobRegistry } from "./job-registry"
 import { messageOf } from "./port"
@@ -137,17 +137,12 @@ export class SubagentDispatchProxyService extends Context.Service<
 >()("@opencode/session-worker/SubagentDispatch") {}
 
 /**
- * A dispatch rejection is a cancellation (not a failure) when it carries the
- * exact `SessionCancelledError` tag. `WorkerCrashedError` is a distinct tagged
- * class, so an `instanceof`-style check could misread a crash as a cancel; the
- * exact tag check keeps the two distinct.
+ * A dispatch rejection is a cancellation (not a failure) exactly when it is a
+ * {@link SessionCancelledError}. `WorkerCrashedError` is a distinct class, so
+ * `instanceof` keeps the two apart without inspecting a `_tag` string.
  */
 function isSessionCancellation(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    (error as { readonly _tag?: unknown })._tag === "SessionCancelledError"
-  )
+  return error instanceof SessionCancelledError
 }
 
 /** A text part carries the assistant prose the parent renders as output. */

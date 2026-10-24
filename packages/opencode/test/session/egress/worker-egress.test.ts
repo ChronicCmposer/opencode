@@ -7,20 +7,14 @@
 // non-durable / ends the stream.
 
 import { describe, expect, test } from "bun:test"
-import {
-  createControlLink,
-  type ControlFrame,
-  type ControlInbound,
-  type ControlOutbound,
-  type ControlRequest,
-} from "@/session/egress/control"
+import { createControlLink, type ControlFrame } from "@/session/egress/control"
 import { createEgressHub } from "./hub"
-import { decodeFrame, encodeFrame, type EgressFrame } from "@/session/egress/frame"
+import { decodeFrame, type EventsFrame } from "@/session/egress/frame"
 import { attachMeshWorker, createEgressMesh } from "@/session/egress/mesh"
-import { createEgressReceiver } from "@/session/egress/receiver"
 import { endFrame } from "@/session/worker/frame"
 import { createWorkerHarness } from "../../lib/worker-harness"
 import { deltasFrame, durable, durableFrame } from "../../lib/egress-fixtures"
+import { pollUntil } from "../../lib/poll"
 
 const WORKER_ENTRY = new URL("../../fixture/egress-worker.ts", import.meta.url)
 
@@ -56,14 +50,9 @@ type WorkerIn = {
   readonly pattern?: string
 }
 
-async function pollUntil(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (predicate()) return
-    await new Promise((resolve) => setTimeout(resolve, 5))
-  }
-  throw new Error(`pollUntil timed out after ${timeoutMs}ms`)
-}
+// Cross-isolate waits settle more slowly than an in-process `MessageChannel`, so
+// budget more time here than the shared helper's default.
+const pollWorker = (predicate: () => boolean) => pollUntil(predicate, { timeoutMs: 3000 })
 
 /**
  * Spawn the egress fixture worker and wire its ports to a hub. The returned
@@ -104,7 +93,7 @@ describe("egress across a worker isolate", () => {
     expect(ports.egress).not.toBe(ports.control)
     const subscriber = hub.fanout.subscribe("sse")
     worker.post({ type: "delta", id: "w1" })
-    await pollUntil(() => hub.frames === 1)
+    await pollWorker(() => hub.frames === 1)
     expect(subscriber.drain()).toEqual([deltasFrame("w1")])
   })
 
@@ -114,7 +103,7 @@ describe("egress across a worker isolate", () => {
     const subscriber = hub.fanout.subscribe("sse")
     worker.post({ type: "durable", id: "d1", ordinal: 1 })
     worker.post({ type: "durable", id: "d2", ordinal: 2 })
-    await pollUntil(() => hub.frames === 2)
+    await pollWorker(() => hub.frames === 2)
     const frames = subscriber.drain()
     expect(
       frames.map((frame) => (frame.kind === "event" ? [frame.payload.ordinal ?? -1, frame.payload.event.id] : [-1, ""])),
@@ -135,8 +124,8 @@ describe("egress across a worker isolate", () => {
     expect(pong.type).toBe("pong")
 
     // Both channels make progress: the flood completes and egress delivers.
-    await pollUntil(() => controlMessages.includes("flood.done"))
-    await pollUntil(() => hub.frames > 0)
+    await pollWorker(() => controlMessages.includes("flood.done"))
+    await pollWorker(() => hub.frames > 0)
   })
 
   test("hub terminate drops buffered non-durable and flushes durable", async () => {
@@ -145,7 +134,7 @@ describe("egress across a worker isolate", () => {
     const subscriber = hub.fanout.subscribe("sse")
     worker.post({ type: "delta", id: "dropped" })
     worker.post({ type: "durable", id: "kept", ordinal: 1 })
-    await pollUntil(() => hub.frames === 2)
+    await pollWorker(() => hub.frames === 2)
     hub.close()
 
     expect(subscriber.drain()).toEqual([durableFrame("kept", 1), endFrame()])
@@ -154,11 +143,11 @@ describe("egress across a worker isolate", () => {
   test("a worker `end` command terminates the stream", async () => {
     await using session = await spawnEgressWorker()
     const { worker, hub } = session
-    const frames: EgressFrame[] = []
+    const frames: EventsFrame[] = []
     const consumer = (async () => {
       for await (const bytes of hub.stream("sse")) frames.push(decodeFrame(bytes))
     })()
-    await pollUntil(() => hub.fanout.subscribers.length === 1)
+    await pollWorker(() => hub.fanout.subscribers.length === 1)
     worker.post({ type: "end" })
     await consumer
     expect(frames).toEqual([endFrame()])
@@ -186,7 +175,7 @@ describe("egress across a worker isolate", () => {
     expect(mesh.outstanding("w1")).toBe(1)
 
     worker.post({ type: "mesh.ack", count: 1 })
-    await pollUntil(() => mesh.outstanding("w1") === 0)
+    await pollWorker(() => mesh.outstanding("w1") === 0)
   })
 
   test("mesh overflow resync crosses the worker boundary and is acknowledged", async () => {
@@ -206,49 +195,85 @@ describe("egress across a worker isolate", () => {
     expect(mesh.resyncPending).toEqual(["w1"])
 
     worker.post({ type: "mesh.resync.ack", pattern: "message.*" })
-    await pollUntil(() => mesh.resyncPending.length === 0)
+    await pollWorker(() => mesh.resyncPending.length === 0)
   })
 })
 
-describe("egress receiver framing boundaries", () => {
-  test("accepts an ArrayBuffer chunk", async () => {
+describe("control frame variant validation", () => {
+  /**
+   * Post one candidate frame, then a known-good `resync` sentinel. A malformed
+   * KNOWN frame must be rejected (lastError set) and must NOT reach the observer,
+   * so the only frame observed is the sentinel.
+   */
+  async function rejectedFrames(frame: unknown): Promise<void> {
     const channel = new MessageChannel()
-    const receiver = createEgressReceiver({ port: channel.port2, onFrame: () => {} })
-    const bytes = encodeFrame(endFrame())
-    channel.port1.postMessage(bytes.buffer)
-    await pollUntil(() => receiver.ended)
-    expect(receiver.lastError).toBeUndefined()
-    receiver.close()
-    channel.port1.close()
+    const link = createControlLink(channel.port1)
+    const seen: ControlFrame[] = []
+    link.onMessage((next) => seen.push(next))
+    channel.port2.postMessage(frame)
+    channel.port2.postMessage({ type: "resync", pattern: "sentinel" })
+    await pollWorker(() => link.lastError !== undefined && seen.length === 1)
+    expect(link.lastError?.message).toMatch(/invalid control frame/)
+    expect(seen).toEqual([{ type: "resync", pattern: "sentinel" }])
+    link.dispose()
+    channel.port2.close()
+  }
+
+  test("rejects a known frame whose body is malformed", async () => {
+    const malformed: readonly unknown[] = [
+      { type: "ping" }, // no id
+      { type: "ping", id: "1" }, // non-numeric id
+      { type: "pong", id: 1.5 }, // fractional id
+      { type: "listen", id: 1 }, // no pattern
+      { type: "listen", id: 1, pattern: 2 }, // non-string pattern
+      { type: "unlisten", id: 1 }, // no pattern
+      { type: "listen.ok" }, // no id
+      { type: "durable", meta: { generation: 1 }, event: durable("d") }, // malformed ordinal
+      { type: "durable", meta: { generation: 1, ordinal: 1 }, event: { id: "d", type: "t" } }, // no properties
+      { type: "resync" }, // no pattern
+      { type: "resync", pattern: 3 }, // non-string pattern
+      { type: "durable.ack", count: -1 }, // negative count
+      { type: "resync.ack", pattern: 4 }, // non-string pattern
+    ]
+    for (const frame of malformed) await rejectedFrames(frame)
+  }, 30000)
+
+  test("accepts a well-formed frame of every variant and narrows it", async () => {
+    const valid: ControlFrame[] = [
+      { type: "ping", id: 1 },
+      { type: "pong", id: 2 },
+      { type: "listen", id: 3, pattern: "message.*" },
+      { type: "unlisten", id: 4, pattern: "message.*" },
+      { type: "listen.ok", id: 5 },
+      { type: "durable", meta: { generation: 1, ordinal: 1 }, event: durable("d") },
+      { type: "resync", pattern: "message.*" },
+      { type: "durable.ack", count: 0 },
+      { type: "resync.ack" },
+      { type: "resync.ack", pattern: "message.*" },
+    ]
+    const channel = new MessageChannel()
+    const link = createControlLink(channel.port1)
+    const seen: ControlFrame[] = []
+    link.onMessage((frame) => seen.push(frame))
+    for (const frame of valid) channel.port2.postMessage(frame)
+    await pollWorker(() => seen.length === valid.length)
+    expect(seen).toEqual(valid)
+    expect(link.lastError).toBeUndefined()
+    link.dispose()
+    channel.port2.close()
   })
 
-  test("accepts a typed-array view over a larger buffer", async () => {
+  test("passes an unknown forward-compatible frame through to the observer", async () => {
     const channel = new MessageChannel()
-    const frames: EgressFrame[] = []
-    const receiver = createEgressReceiver({ port: channel.port2, onFrame: (frame) => frames.push(frame) })
-    const framed = encodeFrame(deltasFrame("v1"))
-    const padded = new Uint8Array(framed.byteLength + 8)
-    padded.set(framed, 4)
-    const view = padded.subarray(4, 4 + framed.byteLength)
-    channel.port1.postMessage(view)
-    await pollUntil(() => frames.length === 1)
-    expect(receiver.lastError).toBeUndefined()
-    expect(frames[0]).toEqual(deltasFrame("v1"))
-    receiver.close()
-    channel.port1.close()
-  })
-
-  test("does not commit trailing bytes when a batch fails mid-way", async () => {
-    const channel = new MessageChannel()
-    const receiver = createEgressReceiver({ port: channel.port2, onFrame: () => {} })
-    const first = encodeFrame(durableFrame("d2", 2))
-    const stale = encodeFrame(durableFrame("d1", 1))
-    const partial = first.subarray(0, first.byteLength - 2)
-    channel.port1.postMessage(new Uint8Array([...first, ...stale, ...partial]))
-    await pollUntil(() => receiver.lastError !== undefined)
-    expect(receiver.pendingBytes).toBe(0)
-    receiver.close()
-    channel.port1.close()
+    const link = createControlLink(channel.port1)
+    const seen: unknown[] = []
+    link.onMessage((frame) => seen.push(frame))
+    channel.port2.postMessage({ type: "future.ping", payload: 1 })
+    await pollWorker(() => seen.length === 1)
+    expect(seen).toEqual([{ type: "future.ping", payload: 1 }])
+    expect(link.lastError).toBeUndefined()
+    link.dispose()
+    channel.port2.close()
   })
 })
 
@@ -296,7 +321,7 @@ describe("control link liveness", () => {
     channel.port2.postMessage({ type: "durable.ack", count: 3 })
     channel.port2.postMessage({ type: "resync.ack", pattern: "message.*" })
     channel.port2.postMessage({ type: "resync.ack" })
-    await pollUntil(() => received.length === 3)
+    await pollWorker(() => received.length === 3)
     expect(received).toEqual([
       { type: "durable.ack", count: 3 },
       { type: "resync.ack", pattern: "message.*" },
@@ -306,16 +331,29 @@ describe("control link liveness", () => {
     channel.port2.close()
   })
 
-  test("direction aliases accept their frames (hub pushes / worker acks)", () => {
-    const outbound: ControlOutbound = { type: "resync", pattern: "message.*" }
-    const inbound: ControlInbound = { type: "durable.ack", count: 2 }
-    expect(outbound.type).toBe("resync")
-    expect(inbound.type).toBe("durable.ack")
-  })
+  test("hub pushes and worker acks cross the control link in both directions", async () => {
+    const channel = new MessageChannel()
+    const hub = createControlLink(channel.port2)
+    const worker = createControlLink(channel.port1)
+    const atWorker: ControlFrame[] = []
+    const atHub: ControlFrame[] = []
+    worker.onMessage((frame) => atWorker.push(frame))
+    hub.onMessage((frame) => atHub.push(frame))
 
-  test("ControlRequest is narrowed to request/reply frames (push-only frames are unrepresentable)", () => {
-    // @ts-expect-error a `resync` is a hub push, never a request
-    const pushOnly: ControlRequest = { type: "resync", pattern: "message.*" }
-    expect(pushOnly).toBeDefined()
+    // Outbound (hub → worker): a resync push and a durable wake.
+    hub.notify({ type: "resync", pattern: "message.*" })
+    hub.notify({ type: "durable", meta: { generation: 1, ordinal: 1 }, event: durable("wake") })
+    // Inbound (worker → hub): the matching acknowledgements.
+    worker.notify({ type: "durable.ack", count: 2 })
+    worker.notify({ type: "resync.ack", pattern: "message.*" })
+
+    await pollWorker(() => atWorker.length === 2 && atHub.length === 2)
+    expect(atWorker.map((frame) => frame.type)).toEqual(["resync", "durable"])
+    expect(atHub.map((frame) => frame.type)).toEqual(["durable.ack", "resync.ack"])
+
+    hub.dispose()
+    worker.dispose()
+    channel.port1.close()
+    channel.port2.close()
   })
 })

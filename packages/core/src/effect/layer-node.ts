@@ -163,28 +163,44 @@ export function isNode(input: Layer.Any | AnyNode): input is AnyNode {
 
 type Visit<Result> = (node: AnyNode, context: VisitContext<Result>) => Result
 
+/**
+ * Cache entries are boxed so a cached result can be any value, including a
+ * falsy one, without colliding with the `undefined` a `Map.get` miss returns.
+ */
+type VisitCache<Result> = Map<AnyNode, { readonly value: Result }>
+
 type VisitContext<Result> = {
-  readonly cache: Map<AnyNode, Result>
+  readonly cache: VisitCache<Result>
   readonly visit: (node: AnyNode) => Result
 }
 
-function walk<Result>(
-  root: AnyNode,
-  visit: Visit<Result>,
-  options: {
-    readonly cache?: Map<AnyNode, Result>
-    readonly resolve?: (node: AnyNode) => AnyNode
-    readonly detectCycles?: boolean
-  } = {},
-) {
-  const cache = options.cache ?? new Map<AnyNode, Result>()
+interface VisitOptions<Result> {
+  readonly cache?: VisitCache<Result>
+  readonly resolve?: (node: AnyNode) => AnyNode
+  readonly detectCycles?: boolean
+  /** Whether `resolve` also applies to the root node (default true). */
+  readonly resolveRoot?: boolean
+}
+
+/**
+ * The single graph visitor shared by compilation, hoisting, replacement
+ * rewriting, and unbound checks. It owns the cycle guard and result cache so
+ * every traversal agrees on what a cycle is and each node is visited once.
+ */
+function visitTree<Result>(root: AnyNode, visit: Visit<Result>, options: VisitOptions<Result> = {}): Result {
+  const cache = options.cache ?? new Map<AnyNode, { readonly value: Result }>()
   const visiting = new Set<AnyNode>()
   const stack: AnyNode[] = []
 
-  const recur = (node: AnyNode): Result => {
-    const target = options.resolve?.(node) ?? node
-    const cached = cache.get(target)
-    if (cached !== undefined || cache.has(target)) return cached!
+  const resolve = (node: AnyNode, isRoot: boolean): AnyNode => {
+    if (isRoot && options.resolveRoot === false) return node
+    return options.resolve?.(node) ?? node
+  }
+
+  const visitNode = (node: AnyNode, isRoot: boolean): Result => {
+    const target = resolve(node, isRoot)
+    const hit = cache.get(target)
+    if (hit) return hit.value
 
     if (options.detectCycles !== false && visiting.has(target)) {
       const start = stack.indexOf(target)
@@ -196,8 +212,8 @@ function walk<Result>(
     visiting.add(target)
     stack.push(target)
     try {
-      const result = visit(target, { cache, visit: recur })
-      if (!cache.has(target)) cache.set(target, result)
+      const result = visit(target, { cache, visit: (child) => visitNode(child, false) })
+      cache.set(target, { value: result })
       return result
     } finally {
       stack.pop()
@@ -205,7 +221,7 @@ function walk<Result>(
     }
   }
 
-  return recur(root)
+  return visitNode(root, true)
 }
 
 export function hoist<A, E, T extends Tag, const Items extends Replacements = readonly []>(
@@ -219,7 +235,7 @@ export function hoist<A, E, T extends Tag, const Items extends Replacements = re
   const hoisted = new Map<string, AnyNode>()
   const replacementMap = replacementMapFrom(replacements)
 
-  const node = walk<AnyNode>(
+  const node = visitTree<AnyNode>(
     root,
     (node, context) => {
       if (node.kind === "group") {
@@ -252,9 +268,9 @@ export function compile<A, E, const Items extends Replacements = readonly []>(
   replacements?: ValidReplacements<Items>,
 ): Layer.Layer<A, E> {
   const replacementMap = replacementMapFrom(replacements)
-  const cache = new Map<AnyNode, RuntimeLayer>()
+  const cache = new Map<AnyNode, { readonly value: RuntimeLayer }>()
   const compileNode = (node: AnyNode) =>
-    walk<RuntimeLayer>(
+    visitTree<RuntimeLayer>(
       node,
       (node, context) => {
         if (node.kind === "unbound") throw new Error(`Unbound layer node: ${node.name}`)
@@ -285,42 +301,24 @@ function replacementMapFrom(replacements?: Replacements) {
 
 function rewriteReplacementDependencies(root: AnyNode, replacements: ReadonlyMap<string, AnyNode>) {
   if (replacements.size === 0) return root
-  const cache = new Map<AnyNode, AnyNode>()
-  const visiting = new Set<AnyNode>()
-  const stack: AnyNode[] = []
-
-  const recur = (node: AnyNode, isRoot = false): AnyNode => {
-    const target = isRoot ? node : (replacements.get(node.name) ?? node)
-    const cached = cache.get(target)
-    if (cached !== undefined || cache.has(target)) return cached!
-    if (visiting.has(target)) {
-      const start = stack.indexOf(target)
-      throw new Error(
-        `Cycle detected in layer tree: ${[...stack.slice(start), target].map((item) => item.name).join(" -> ")}`,
-      )
-    }
-
-    visiting.add(target)
-    stack.push(target)
-    try {
-      const dependencies = target.dependencies.map((dependency) => recur(dependency))
-      const result = dependencies.every((dependency, index) => dependency === target.dependencies[index])
-        ? target
-        : { ...target, dependencies }
-      cache.set(target, result)
-      return result
-    } finally {
-      stack.pop()
-      visiting.delete(target)
-    }
-  }
-
-  return recur(root, true)
+  return visitTree<AnyNode>(
+    root,
+    (node, context) => {
+      const dependencies = node.dependencies.map(context.visit)
+      return dependencies.every((dependency, index) => dependency === node.dependencies[index])
+        ? node
+        : { ...node, dependencies }
+    },
+    {
+      resolveRoot: false,
+      resolve: (node) => replacements.get(node.name) ?? node,
+    },
+  )
 }
 
 export function hasUnbound(root: Node<unknown, unknown, any>, source: AnyNode): boolean {
   if (source.kind !== "unbound") throw new Error(`Cannot check non-unbound layer node: ${source.name}`)
-  return walk<boolean>(root, (node, context) => {
+  return visitTree<boolean>(root, (node, context) => {
     if (node === source) return true
     return node.dependencies.some(context.visit)
   })

@@ -50,6 +50,8 @@ const JOURNAL = process.env.BROKER_CHILD_JOURNAL
 const MANIFEST = process.env.BROKER_CHILD_MANIFEST
 const ROLE = process.env.BROKER_CHILD_ROLE ?? "root"
 const FAIL_INIT = process.env.BROKER_CHILD_FAIL_INIT === "1"
+/** Never answer `initialize`, so the broker's handshake timeout is exercised. */
+const HANG_INIT = process.env.BROKER_CHILD_HANG_INIT === "1"
 
 let active = 0
 
@@ -84,6 +86,7 @@ async function handleMcp(message: JsonRpcMessage): Promise<void> {
   const id = message.id
 
   if (message.method === "initialize") {
+    if (HANG_INIT) return
     if (FAIL_INIT) {
       sendMcp({ jsonrpc: "2.0", id, error: { code: -32000, message: "initialize refused" } })
       return
@@ -125,6 +128,7 @@ async function handleLsp(message: JsonRpcMessage): Promise<void> {
   if (message.id === undefined) return
   const id = message.id
   if (message.method === "initialize") {
+    if (HANG_INIT) return
     sendLsp({
       jsonrpc: "2.0",
       id,

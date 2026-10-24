@@ -11,7 +11,7 @@ describe("public event manifest", () => {
   test("owns the complete public event surface", () => {
     expect(EventManifest.ServerDefinitions.length).toBe(58)
     expect(EventManifest.Definitions.length).toBe(89)
-    expect(SessionV1.Event.Definitions).toEqual([
+    const legacy = [
       SessionV1.Event.Created,
       SessionV1.Event.Updated,
       SessionV1.Event.Deleted,
@@ -23,7 +23,9 @@ describe("public event manifest", () => {
       SessionV1.Event.Diff,
       SessionV1.Event.Error,
       SessionV1.Event.Cancelled,
-    ])
+    ] as const
+    expect(SessionV1.Event.Definitions.length).toBe(legacy.length)
+    legacy.forEach((definition, index) => expect(SessionV1.Event.Definitions[index]).toBe(definition))
     expect(EventManifest.Latest.size).toBe(89)
     expect(EventManifest.Durable.size).toBe(35)
   })
@@ -43,12 +45,13 @@ describe("public event manifest", () => {
     expect(Reference.Event.Definitions).toEqual([Reference.Event.Updated])
     expect(EventManifest.Latest.has("ide.installed")).toBe(false)
     expect(IdeEvent.Definitions).toEqual([IdeEvent.Installed])
-    expect(EventManifest.Definitions.slice(43, 47)).toEqual([
-      SessionV1.Event.PartDelta,
-      SessionV1.Event.Diff,
-      SessionV1.Event.Error,
-      SessionV1.Event.Cancelled,
-    ])
+    // Membership by definition identity: a duplicate/re-exported definition would
+    // be deep-equal but a different object, and must not satisfy the manifest.
+    const tail = EventManifest.Definitions.slice(43, 47)
+    expect(tail[0]).toBe(SessionV1.Event.PartDelta)
+    expect(tail[1]).toBe(SessionV1.Event.Diff)
+    expect(tail[2]).toBe(SessionV1.Event.Error)
+    expect(tail[3]).toBe(SessionV1.Event.Cancelled)
     expect(EventManifest.Durable.has("session.next.step.ended.1")).toBe(false)
     expect(EventManifest.Durable.get("session.next.step.ended.2")).toBe(SessionEvent.Step.Ended)
   })

@@ -7,7 +7,7 @@
 // database so transaction and sequence semantics are exercised for real.
 
 import { resolveWalConfig, walPragmas, type WalConfig } from "@opencode-ai/core/database/pragmas"
-import { Database } from "bun:sqlite"
+import { Database, type SQLQueryBindings } from "bun:sqlite"
 
 /**
  * A synchronous driver must never stall the writer isolate on a lock, so the
@@ -33,8 +33,8 @@ function spread(params: QueryParams): unknown[] {
 }
 
 /** Native variadic bindings; the driver validates each value at execution time. */
-function nativeBindings(params: QueryParams): never[] {
-  return spread(params) as never[]
+function nativeBindings(params: QueryParams): SQLQueryBindings[] {
+  return spread(params) as SQLQueryBindings[]
 }
 
 export interface WriterConnection {
@@ -77,7 +77,15 @@ export interface BunSqliteConnectionOptions {
  */
 export function createBunSqliteConnection(options: BunSqliteConnectionOptions): WriterConnection {
   const native = new Database(options.filename, { create: true })
-  for (const pragma of options.pragmas ?? []) native.exec(pragma)
+  try {
+    for (const pragma of options.pragmas ?? []) native.exec(pragma)
+  } catch (error) {
+    // A rejected pragma leaves an open handle (and its file descriptor) behind:
+    // close it before surfacing the failure so a bad config never leaks the
+    // connection it just opened.
+    native.close()
+    throw error
+  }
 
   return {
     all: (sql, params = []) => native.query(sql).all(...nativeBindings(params)) as ReadonlyArray<Record<string, unknown>>,

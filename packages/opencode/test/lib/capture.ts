@@ -56,7 +56,7 @@ export interface CaptureHarness {
   reset(): void
 }
 
-const CHANNELS: ReadonlySet<string> = new Set<CaptureChannel>(["event", "db", "worker"])
+const CHANNELS: ReadonlySet<CaptureChannel> = new Set(["event", "db", "worker"])
 
 export function createCapture(options: CaptureOptions = {}): CaptureHarness {
   const clock = options.clock ?? (() => Date.now())

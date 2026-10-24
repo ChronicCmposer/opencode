@@ -12,9 +12,12 @@ import {
   BrokerProtocolError,
   DEFAULT_MCP_TIMEOUT_MS,
   parseAcquireResult,
+  parseBrokerFrame,
   parseBrokerRequest,
   parseOAuthResult,
   parsePingResult,
+  parseWorkerAttach,
+  parseWorkerHandshake,
   rememberBounded,
   resolveRequestTimeout,
 } from "@/session/broker/protocol"
@@ -182,5 +185,90 @@ describe("rememberBounded (A14)", () => {
     const set = new Set<string>(["a"])
     rememberBounded(set, "a", 3)
     expect([...set]).toEqual(["a"])
+  })
+
+  test("enforces the cap when a legitimate undefined is the oldest member", () => {
+    // The eviction must read the iterator's `done` flag, not compare the value to
+    // `undefined`: a set may legitimately store `undefined`, and treating it as
+    // "empty" would silently skip the eviction and let the set exceed its cap.
+    const set = new Set<string | undefined>([undefined])
+    rememberBounded(set, "x", 1)
+    expect([...set]).toEqual(["x"])
+  })
+
+  test("fails fast on a non-positive or non-integer cap", () => {
+    expect(() => rememberBounded(new Set<string>(), "x", 0)).toThrow(/cap/)
+    expect(() => rememberBounded(new Set<string>(), "x", -1)).toThrow(/cap/)
+    expect(() => rememberBounded(new Set<string>(), "x", 1.5)).toThrow(/cap/)
+  })
+})
+
+describe("parseBrokerFrame", () => {
+  test("parses every broker→hub frame kind", () => {
+    expect(parseBrokerFrame({ kind: "response", requestId: "r1", ok: true, value: { a: 1 } })).toEqual({
+      kind: "response",
+      requestId: "r1",
+      ok: true,
+      value: { a: 1 },
+    })
+    expect(
+      parseBrokerFrame({
+        kind: "response",
+        requestId: "r2",
+        ok: false,
+        error: { code: "timeout", message: "slow" },
+      }),
+    ).toEqual({ kind: "response", requestId: "r2", ok: false, error: { code: "timeout", message: "slow" } })
+    expect(parseBrokerFrame({ kind: "notification", directory: "/d", server: "s", method: "m", params: [1] })).toEqual({
+      kind: "notification",
+      directory: "/d",
+      server: "s",
+      method: "m",
+      params: [1],
+    })
+    expect(parseBrokerFrame({ kind: "child", directory: "/d", server: "s", pid: 10, pgid: 10 })).toEqual({
+      kind: "child",
+      directory: "/d",
+      server: "s",
+      pid: 10,
+      pgid: 10,
+    })
+    expect(
+      parseBrokerFrame({ kind: "child-exit", directory: "/d", server: "s", pid: 10, pgid: 10, code: null }),
+    ).toEqual({ kind: "child-exit", directory: "/d", server: "s", pid: 10, pgid: 10, code: null })
+  })
+
+  test("fails loud on a malformed frame", () => {
+    expect(() => parseBrokerFrame(null)).toThrow(BrokerProtocolError)
+    expect(() => parseBrokerFrame({ kind: "nope" })).toThrow(/unknown broker frame kind/)
+    expect(() => parseBrokerFrame({ kind: "response", requestId: "r", ok: "yes" })).toThrow(BrokerProtocolError)
+    expect(() =>
+      parseBrokerFrame({ kind: "response", requestId: "r", ok: false, error: { code: "nope", message: "x" } }),
+    ).toThrow(/unknown broker error code/)
+    expect(() => parseBrokerFrame({ kind: "child", directory: "/d", server: "s", pid: 0, pgid: 1 })).toThrow(
+      BrokerProtocolError,
+    )
+  })
+})
+
+describe("worker handshake", () => {
+  test("parses ready and attached handshake frames", () => {
+    expect(parseWorkerHandshake({ type: "ready", threadId: 7 })).toEqual({ type: "ready", threadId: 7 })
+    expect(parseWorkerHandshake({ type: "attached", threadId: 7 })).toEqual({ type: "attached", threadId: 7 })
+  })
+
+  test("fails loud on an unknown or malformed handshake", () => {
+    expect(() => parseWorkerHandshake({ type: "nope", threadId: 1 })).toThrow(/unknown handshake type/)
+    expect(() => parseWorkerHandshake({ type: "ready", threadId: "1" })).toThrow(BrokerProtocolError)
+    expect(() => parseWorkerHandshake(null)).toThrow(BrokerProtocolError)
+  })
+
+  test("parses an attach frame carrying a real MessagePort", () => {
+    const channel = new MessageChannel()
+    expect(parseWorkerAttach({ type: "attach", port: channel.port1 })).toEqual({ type: "attach", port: channel.port1 })
+    expect(() => parseWorkerAttach({ type: "attach", port: {} })).toThrow(/MessagePort/)
+    expect(() => parseWorkerAttach({ type: "nope" })).toThrow(/type "attach"/)
+    channel.port1.close()
+    channel.port2.close()
   })
 })

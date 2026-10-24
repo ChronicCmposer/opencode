@@ -588,12 +588,6 @@ function waitRequest(pathname: string, response: Response) {
   return pending.promise
 }
 
-function timeout(ms: number) {
-  return new Promise<never>((_, reject) => {
-    setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)
-  })
-}
-
 function waitStreamingRequest(pathname: string) {
   const request = deferred<Capture>()
   const requestAborted = deferred<void>()
@@ -673,33 +667,15 @@ afterAll(() => {
 })
 
 function createChatStream(text: string) {
-  const payload =
-    [
-      `data: ${JSON.stringify({
-        id: "chatcmpl-1",
-        object: "chat.completion.chunk",
-        choices: [{ delta: { role: "assistant" } }],
-      })}`,
-      `data: ${JSON.stringify({
-        id: "chatcmpl-1",
-        object: "chat.completion.chunk",
-        choices: [{ delta: { content: text } }],
-      })}`,
-      `data: ${JSON.stringify({
-        id: "chatcmpl-1",
-        object: "chat.completion.chunk",
-        choices: [{ delta: {}, finish_reason: "stop" }],
-      })}`,
-      "data: [DONE]",
-    ].join("\n\n") + "\n\n"
-
-  const encoder = new TextEncoder()
-  return new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.enqueue(encoder.encode(payload))
-      controller.close()
-    },
+  const frame = (delta: Record<string, unknown>) => ({
+    id: "chatcmpl-1",
+    object: "chat.completion.chunk",
+    choices: [{ delta }],
   })
+  return createEventStream(
+    [frame({ role: "assistant" }), frame({ content: text }), frame({ finish_reason: "stop" })],
+    true,
+  )
 }
 
 const MODELS_FIXTURE = JSON.parse(
@@ -1444,7 +1420,11 @@ describe("session.llm.stream", () => {
         yield* Effect.promise(() => pending.request)
         yield* Fiber.interrupt(fiber)
 
-        yield* Effect.promise(() => Promise.race([pending.responseCanceled, timeout(500)]))
+        // Await the provider-side cancellation signal directly instead of racing
+        // an arbitrary 500ms timer: the interrupt deterministically triggers the
+        // response-body cancel, and the race's losing timeout branch produced
+        // unhandled rejections under load.
+        yield* Effect.promise(() => pending.responseCanceled)
         const exit = yield* Fiber.await(fiber)
         // Fiber.await returns an Exit<Exit<...>>. Unwrap once.
         const inner = Exit.isSuccess(exit) ? exit.value : exit
@@ -1452,7 +1432,7 @@ describe("session.llm.stream", () => {
         if (Exit.isFailure(inner)) {
           expect(Cause.hasInterrupts(inner.cause)).toBe(true)
         }
-        yield* Effect.promise(() => Promise.race([pending.requestAborted, timeout(500)]).catch(() => undefined))
+        yield* Effect.promise(() => pending.requestAborted)
       }),
     {
       config: () => ({

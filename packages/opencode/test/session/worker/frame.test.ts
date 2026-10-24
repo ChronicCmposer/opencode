@@ -27,6 +27,7 @@ import {
   requireString,
   resyncFrame,
   type EventsFrame,
+  type WorkerFrameEnvelope,
 } from "@/session/worker/frame"
 
 describe("parseWorkerFrame", () => {
@@ -93,6 +94,17 @@ describe("worker frame codec", () => {
     for (const frame of frames) {
       expect(parseEventsFrame(decodeWorkerFrame(encodeWorkerFrame(frame)))).toEqual(frame)
     }
+  })
+
+  test("round-trips a non-events port envelope (job) through encode/decode", () => {
+    const frame: WorkerFrameEnvelope = {
+      v: WORKER_FRAME_VERSION,
+      port: "job",
+      kind: "cancel",
+      id: 3,
+      payload: { jobID: "ses_1" },
+    }
+    expect(decodeWorkerFrame(encodeWorkerFrame(frame))).toEqual(frame)
   })
 
   test("decodeWorkerFrame rejects invalid JSON as ProtocolError", () => {

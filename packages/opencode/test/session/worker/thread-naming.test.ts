@@ -30,14 +30,16 @@ import { adaptTransport } from "../../lib/transport"
 import { createWorkerHarness, type HarnessWorker, type WorkerHarness } from "../../lib/worker-harness"
 
 const TASK_DIR = "/proc/self/task"
-const procAvailable = existsSync("/proc/thread-self") || existsSync("/proc/self/task")
+// Same predicate as the readers below: the test can only observe thread names
+// when this exact directory is listable.
+const procAvailable = existsSync(TASK_DIR)
 
 /** Distinct slots per test so a lingering thread cannot satisfy another test. */
 const BOOT_SLOT = 9
 const DYNAMIC_SLOT = 2
 const CANCEL_SLOT = 3
 
-const FIXTURE_ENTRY = new URL("../../fixture/thread-name-fixture.ts", import.meta.url)
+const FIXTURE_ENTRY = new URL("../../fixture/thread-name-worker.ts", import.meta.url)
 
 /** The OS thread name of `tid`, or `undefined` if the thread is gone. */
 function threadName(tid: number): string | undefined {

@@ -22,6 +22,7 @@ import {
 } from "./event-sink"
 import type { InstanceContext } from "@/project/instance-context"
 import { MessageID, PartID, SessionID } from "@/session/schema"
+import { parityProject } from "./parity-project"
 
 const DEFAULT_TIMEOUT_MS = 30_000
 
@@ -73,6 +74,12 @@ export interface ParityRunContext {
   readonly sessionID: SessionID
   readonly messageID: MessageID
   readonly partID: PartID
+  /**
+   * Aborted when this side's timeout fires, so a long-running runner can stop
+   * its work instead of leaking past the deadline (the harness still records the
+   * timeout as `side.error`).
+   */
+  readonly signal: AbortSignal
 }
 
 /** Runs one flag-state of the scripted session; may reject (captured by the harness). */
@@ -106,9 +113,17 @@ export interface RunParitySessionOptions {
 }
 
 /** Reject `promise` with a descriptive error if it has not settled within `timeoutMs`. */
-function withTimeout(promise: Promise<void>, timeoutMs: number, message: string): Promise<void> {
+function withTimeout(
+  promise: Promise<void>,
+  timeoutMs: number,
+  message: string,
+  onTimeout: () => void = () => {},
+): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+    const timer = setTimeout(() => {
+      onTimeout()
+      reject(new Error(message))
+    }, timeoutMs)
     promise.then(
       () => {
         clearTimeout(timer)
@@ -162,14 +177,14 @@ async function runSide(
 
   const startedAt = performance.now()
   let error: string | undefined
+  const controller = new AbortController()
   const instance: InstanceContext = {
     directory: instanceDirectory(flag, options.script.name),
     worktree: instanceDirectory(flag, options.script.name),
     // A parity runner needs no project loader; the only reader on the event path
     // (`EventV2Bridge`'s GlobalBus listener) requires `project.id` to be present.
-    // The field is typed by `InstanceContext`, so it is parsed once here rather
-    // than re-checked by every service.
-    project: { id: "parity" } as never,
+    // The record is parsed once at this boundary rather than forced past the type.
+    project: parityProject("parity"),
   }
   try {
     const run = Promise.resolve(
@@ -183,9 +198,12 @@ async function runSide(
         sessionID: ids.sessionID,
         messageID: ids.messageID,
         partID: ids.partID,
+        signal: controller.signal,
       }),
     )
-    await withTimeout(run, timeoutMs, `parity ${flagLabel(flag)} run timed out after ${timeoutMs}ms`)
+    await withTimeout(run, timeoutMs, `parity ${flagLabel(flag)} run timed out after ${timeoutMs}ms`, () =>
+      controller.abort(),
+    )
   } catch (cause) {
     error = cause instanceof Error ? cause.message : String(cause)
   }
@@ -425,11 +443,37 @@ export async function recordGolden(path: string, result: ParityResult, name?: st
   return reference
 }
 
-/** Read a golden fixture, failing loud when it is missing. */
+/** Parse one untrusted sink event from a golden fixture, failing loud on a bad shape. */
+function parseGoldenEvent(value: unknown, path: string, index: number): SinkEvent {
+  if (value === null || typeof value !== "object") {
+    throw new Error(`golden fixture ${path}: event #${index} is not an object`)
+  }
+  const record = value as Record<string, unknown>
+  if (typeof record.id !== "string" || typeof record.type !== "string") {
+    throw new Error(`golden fixture ${path}: event #${index} needs string "id" and "type"`)
+  }
+  return { id: record.id, type: record.type, properties: record.properties }
+}
+
+/** Parse an untrusted golden fixture body into a trusted {@link GoldenReference}. */
+export function parseGoldenReference(value: unknown, path = "<memory>"): GoldenReference {
+  if (value === null || typeof value !== "object") {
+    throw new Error(`golden fixture ${path} is not an object`)
+  }
+  const record = value as Record<string, unknown>
+  if (typeof record.name !== "string") throw new Error(`golden fixture ${path} has no string "name"`)
+  if (!Array.isArray(record.events)) throw new Error(`golden fixture ${path} has no "events" array`)
+  return {
+    name: record.name,
+    events: record.events.map((event, index) => parseGoldenEvent(event, path, index)),
+  }
+}
+
+/** Read a golden fixture, failing loud when it is missing or malformed. */
 export async function readGolden(path: string): Promise<GoldenReference> {
   const file = Bun.file(path)
   if (!(await file.exists())) throw new Error(`golden fixture not found: ${path}`)
-  return (await file.json()) as GoldenReference
+  return parseGoldenReference(await file.json(), path)
 }
 
 /** Compare a captured sequence against the flag-OFF golden reference. */

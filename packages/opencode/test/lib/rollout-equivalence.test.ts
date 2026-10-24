@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import type { SessionID } from "@/session/schema"
 import type { SessionExecutionResult } from "@/session/worker/execute"
 import { createGoldenCapture, diffGolden } from "./golden"
-import { DEFAULT_OWNER, projectSessionDurable, recordSessionDurable, specCapture } from "./rollout-equivalence"
+import { DEFAULT_OWNER, projectSessionDurable, recordSessionDurable, sessionBurnHash, specCapture } from "./rollout-equivalence"
 
 const sessionID = "ses_unit" as SessionID
 
@@ -16,10 +16,20 @@ describe("rollout durable transcript", () => {
   })
 
   test("recordSessionDurable and specCapture agree", () => {
-    const result = { sessionID, value: { text: "hi", chunks: 2 } } as SessionExecutionResult
+    const result = { sessionID, value: { text: "hi", chunks: 2, hash: 42 } }
     const recorded = createGoldenCapture()
     recordSessionDurable(recorded, result)
     const spec = specCapture(sessionID, { text: "hi", chunks: 2 })
     expect(diffGolden(spec.snapshot(), recorded.snapshot())).toEqual([])
+  })
+
+  test("sessionBurnHash surfaces the parsed fingerprint instead of discarding it", () => {
+    expect(sessionBurnHash({ sessionID, value: { text: "hi", chunks: 2, hash: 7 } })).toBe(7)
+  })
+
+  test("a run result without a CPU-burn hash fails loudly", () => {
+    const result = { sessionID, value: { text: "hi", chunks: 2 } } as SessionExecutionResult
+    const recorded = createGoldenCapture()
+    expect(() => recordSessionDurable(recorded, result)).toThrow(/hash must be a non-negative integer/)
   })
 })

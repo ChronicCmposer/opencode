@@ -189,6 +189,9 @@ function buildEgressClient(port: MessagePort, options: WorkerEgressClientOptions
       wireMesh(control)
       subscriptions.set(subscription.pattern, subscription)
       void control.listen(subscription.pattern).catch((error) => {
+        // The hub never registered the pattern, so drop the local entry: a stale
+        // subscription would route nothing yet outlive its unsubscribe handle.
+        if (subscriptions.get(subscription.pattern) === subscription) subscriptions.delete(subscription.pattern)
         log(workerLogMessage("egress durable subscribe failed"), {
           ...peerLifecycle("egress", workerID)("warn"),
           pattern: subscription.pattern,

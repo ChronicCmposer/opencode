@@ -9,12 +9,25 @@ import { describe, expect, test } from "bun:test"
 import { parseSessionWorkerInit } from "@/session/worker/session-worker"
 import { workerSnapshot } from "../../lib/snapshot"
 
-/** The minimal payload `parseSessionWorkerInit` inspects (only `model.baseUrl`). */
+/** The complete model descriptor every required-field test needs. */
+function fullModel(): Record<string, unknown> {
+  return {
+    providerID: "test",
+    modelID: "test-model",
+    apiId: "test-api-id",
+    baseUrl: "http://127.0.0.1:0/v1",
+    apiKey: "sk-test",
+    capabilities: { temperature: false, reasoning: true },
+    limit: { context: 1_000, output: 1_000 },
+  }
+}
+
+/** The minimal payload `parseSessionWorkerInit` accepts. */
 function payload(extra: Record<string, unknown> = {}): unknown {
   return {
     snapshot: workerSnapshot(),
     env: { values: {} },
-    model: { baseUrl: "http://127.0.0.1:0/v1" },
+    model: fullModel(),
     ...extra,
   }
 }
@@ -40,5 +53,34 @@ describe("parseSessionWorkerInit — role", () => {
 
   test("throws loud when the role has the wrong type", () => {
     expect(() => parseSessionWorkerInit(payload({ role: 3 }))).toThrow(/role/)
+  })
+})
+
+describe("parseSessionWorkerInit — required fields", () => {
+  test("throws loud when env.values is missing", () => {
+    expect(() => parseSessionWorkerInit(payload({ env: {} }))).toThrow(/env\.values/)
+  })
+
+  test("throws loud when the model is missing", () => {
+    const { model, ...withoutModel } = payload() as Record<string, unknown>
+    expect(() => parseSessionWorkerInit(withoutModel)).toThrow(/model is required/)
+  })
+
+  test.each(["providerID", "modelID", "apiId", "baseUrl", "apiKey"])(
+    "throws loud when model.%s is missing",
+    (field) => {
+      const model = { ...fullModel() }
+      delete model[field]
+      expect(() => parseSessionWorkerInit(payload({ model }))).toThrow(new RegExp(`model\\.${field}`))
+    },
+  )
+
+  test("throws loud when model.capabilities is missing", () => {
+    const model = { ...fullModel(), capabilities: undefined }
+    expect(() => parseSessionWorkerInit(payload({ model }))).toThrow(/capabilities/)
+  })
+
+  test("accepts a payload with every required field", () => {
+    expect(parseSessionWorkerInit(payload({ role: "session" })).model.providerID).toBe("test")
   })
 })

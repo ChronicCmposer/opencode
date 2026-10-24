@@ -109,6 +109,9 @@ export function applySseFrame(accumulator: SseAccumulator, frame: string): void 
   for (const payload of parseSseFrame(frame)) applySsePayload(accumulator, payload)
 }
 
+/** The frame boundary: a blank line, tolerating both LF and CRLF endings. */
+const FRAME_BOUNDARY = /\r?\n\r?\n/
+
 /**
  * Read an SSE body, invoking `onPayload` for every decoded `data:` payload as it
  * arrives. This is the streaming primitive both the accumulator and consumers
@@ -124,19 +127,24 @@ export async function readSsePayloads(
   const drain = (frame: string): void => {
     for (const payload of parseSseFrame(frame)) onPayload(payload)
   }
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    let boundary = buffer.indexOf("\n\n")
-    while (boundary !== -1) {
-      drain(buffer.slice(0, boundary))
-      buffer = buffer.slice(boundary + 2)
-      boundary = buffer.indexOf("\n\n")
+  const drainFrames = (): void => {
+    for (let boundary = FRAME_BOUNDARY.exec(buffer); boundary !== null; boundary = FRAME_BOUNDARY.exec(buffer)) {
+      drain(buffer.slice(0, boundary.index))
+      buffer = buffer.slice(boundary.index + boundary[0].length)
     }
   }
-  buffer += decoder.decode()
-  if (buffer.trim() !== "") drain(buffer)
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      drainFrames()
+    }
+    buffer += decoder.decode()
+    if (buffer.trim() !== "") drain(buffer)
+  } finally {
+    reader.releaseLock()
+  }
 }
 
 /** Read an SSE body, applying every `data:` payload to `accumulator`. */

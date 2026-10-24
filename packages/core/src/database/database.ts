@@ -25,6 +25,10 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const db = yield* makeDatabase
 
+    // One resolved config feeds both the pragma list applied here (journal size
+    // limit + busy timeout) and the writer core's periodic checkpoint cadence
+    // (`checkpointIntervalMs`, consumed by `session/writer/worker.ts`); neither
+    // setting is dropped between the two connections.
     for (const pragma of walPragmas(resolveWalConfig())) yield* db.run(pragma)
     yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
     yield* DatabaseMigration.apply(db)

@@ -41,15 +41,15 @@ function cursor(input: Record<string, unknown>) {
   return Buffer.from(JSON.stringify(input)).toString("base64url")
 }
 
-function data(validate: (value: any) => void) {
-  return (body: any) => {
+function data(validate: (value: unknown) => void) {
+  return (body: unknown) => {
     object(body)
     validate(body.data)
   }
 }
 
-function locationData(validate: (value: any) => void) {
-  return (body: any) => {
+function locationData(validate: (value: unknown) => void) {
+  return (body: unknown) => {
     object(body)
     object(body.location)
     object(body.location.project)

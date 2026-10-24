@@ -10,6 +10,7 @@ import { describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
 import path from "node:path"
 import {
+  DEFAULT_BUSY_TIMEOUT_MS,
   DEFAULT_CHECKPOINT_INTERVAL_MS,
   DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
   resolveWalConfig,
@@ -22,9 +23,11 @@ describe("dbwal: WAL pragma source of truth", () => {
     expect(resolveWalConfig({})).toEqual({
       journalSizeLimitBytes: DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
       checkpointIntervalMs: DEFAULT_CHECKPOINT_INTERVAL_MS,
+      busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
     })
     expect(DEFAULT_JOURNAL_SIZE_LIMIT_BYTES).toBe(64 * 1024 * 1024)
     expect(DEFAULT_CHECKPOINT_INTERVAL_MS).toBe(5 * 60 * 1000)
+    expect(DEFAULT_BUSY_TIMEOUT_MS).toBe(5000)
   })
 
   test("environment overrides are parsed and invalid values fall back", () => {
@@ -32,17 +35,20 @@ describe("dbwal: WAL pragma source of truth", () => {
       resolveWalConfig({
         OPENCODE_DB_JOURNAL_SIZE_LIMIT: "1048576",
         OPENCODE_DB_CHECKPOINT_INTERVAL_MS: "1500",
+        OPENCODE_DB_BUSY_TIMEOUT_MS: "250",
       }),
-    ).toEqual({ journalSizeLimitBytes: 1048576, checkpointIntervalMs: 1500 })
+    ).toEqual({ journalSizeLimitBytes: 1048576, checkpointIntervalMs: 1500, busyTimeoutMs: 250 })
 
     expect(
       resolveWalConfig({
         OPENCODE_DB_JOURNAL_SIZE_LIMIT: "not-a-number",
         OPENCODE_DB_CHECKPOINT_INTERVAL_MS: "-5",
+        OPENCODE_DB_BUSY_TIMEOUT_MS: "-1",
       }),
     ).toEqual({
       journalSizeLimitBytes: DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
       checkpointIntervalMs: DEFAULT_CHECKPOINT_INTERVAL_MS,
+      busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
     })
   })
 
@@ -51,8 +57,19 @@ describe("dbwal: WAL pragma source of truth", () => {
       resolveWalConfig({
         OPENCODE_DB_JOURNAL_SIZE_LIMIT: "-1",
         OPENCODE_DB_CHECKPOINT_INTERVAL_MS: "0",
+        OPENCODE_DB_BUSY_TIMEOUT_MS: "0",
       }),
-    ).toEqual({ journalSizeLimitBytes: -1, checkpointIntervalMs: 0 })
+    ).toEqual({ journalSizeLimitBytes: -1, checkpointIntervalMs: 0, busyTimeoutMs: 0 })
+  })
+
+  test("the resolved busy timeout is applied unless a connection overrides it", () => {
+    // `database.ts` passes the whole resolved config; the busy timeout must flow
+    // through rather than stay hard-coded.
+    expect(walPragmas(resolveWalConfig({ OPENCODE_DB_BUSY_TIMEOUT_MS: "1234" }))).toContain(
+      "PRAGMA busy_timeout = 1234",
+    )
+    // The writer's shorter timeout stays an explicit per-connection override.
+    expect(walPragmas({ busyTimeoutMs: 250 })).toContain("PRAGMA busy_timeout = 250")
   })
 
   test("walPragmas applies the configured journal size limit and busy timeout", () => {

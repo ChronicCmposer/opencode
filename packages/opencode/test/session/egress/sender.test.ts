@@ -9,15 +9,7 @@ import { describe, expect, test } from "bun:test"
 import { decodeFrames } from "@/session/egress/frame"
 import { createEgressSender } from "@/session/egress/sender"
 import { type EventV2Event, ackFrame, endFrame, eventFrame } from "@/session/worker/frame"
-
-async function pollUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (predicate()) return
-    await new Promise((resolve) => setTimeout(resolve, 5))
-  }
-  throw new Error(`pollUntil timed out after ${timeoutMs}ms`)
-}
+import { pollUntil } from "../../lib/poll"
 
 const deltaEvent = (id: string, text?: string): EventV2Event => ({
   id,

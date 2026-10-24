@@ -7,19 +7,11 @@
 
 import { describe, expect, test } from "bun:test"
 import { EgressStreamOverflowError, createEgressHub } from "./hub"
-import { decodeFrame, encodeFrame, type EgressFrame } from "@/session/egress/frame"
+import { decodeFrame, encodeFrame, type EventsFrame } from "@/session/egress/frame"
 import { createEgressSender } from "@/session/egress/sender"
 import { endFrame } from "@/session/worker/frame"
 import { delta, deltasFrame, durable, durableFrame } from "../../lib/egress-fixtures"
-
-async function pollUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (predicate()) return
-    await new Promise((resolve) => setTimeout(resolve, 5))
-  }
-  throw new Error(`pollUntil timed out after ${timeoutMs}ms`)
-}
+import { pollUntil } from "../../lib/poll"
 
 function setup(options: { windowMs?: number; maxBatch?: number } = {}) {
   const channel = new MessageChannel()
@@ -29,7 +21,7 @@ function setup(options: { windowMs?: number; maxBatch?: number } = {}) {
 }
 
 async function startConsumer(hub: ReturnType<typeof createEgressHub>, id: string) {
-  const frames: EgressFrame[] = []
+  const frames: EventsFrame[] = []
   const done = (async () => {
     for await (const bytes of hub.stream(id)) frames.push(decodeFrame(bytes))
   })()
@@ -114,7 +106,7 @@ describe("egress hub over MessagePort", () => {
     const { hub } = setup()
     hub.close()
 
-    const frames: EgressFrame[] = []
+    const frames: EventsFrame[] = []
     for await (const bytes of hub.stream("late")) frames.push(decodeFrame(bytes))
 
     // The late SSE client must observe the terminal marker, not an empty stream.
@@ -126,7 +118,7 @@ describe("egress hub over MessagePort", () => {
     sender.end()
     await pollUntil(() => hub.closed)
 
-    const frames: EgressFrame[] = []
+    const frames: EventsFrame[] = []
     for await (const bytes of hub.stream("late")) frames.push(decodeFrame(bytes))
     expect(frames).toEqual([endFrame()])
   })

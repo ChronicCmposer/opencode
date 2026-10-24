@@ -33,7 +33,12 @@ export interface BootMemoryReport {
   readonly baselineRssBytes: number
   readonly atK: BootLevelReport
   readonly atKPlusExtra: BootLevelReport
-  readonly totalBootMs: number
+  /**
+   * Sum of the individual per-worker boot durations (boots run sequentially).
+   * This is NOT wall-clock elapsed measurement time — the harness reads RSS
+   * between levels — so it is named for what it sums.
+   */
+  readonly sumWorkerBootMs: number
 }
 
 export interface MeasureBootMemoryOptions {
@@ -90,7 +95,7 @@ export async function measureBootMemory(options: MeasureBootMemoryOptions = {}):
       baselineRssBytes: levels.baselineRssBytes,
       atK: levels.atK,
       atKPlusExtra: levels.atKPlusExtra,
-      totalBootMs: levels.atKPlusExtra.bootMs.reduce((sum, bootMs) => sum + bootMs, 0),
+      sumWorkerBootMs: levels.atKPlusExtra.bootMs.reduce((sum, bootMs) => sum + bootMs, 0),
     }
   } finally {
     await harness.terminateAll()

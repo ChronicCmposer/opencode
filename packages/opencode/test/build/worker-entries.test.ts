@@ -60,9 +60,12 @@ const ENTRIES: readonly WorkerEntry[] = [
 
 const read = (relative: string): Promise<string> => Bun.file(path.join(PACKAGE_DIR, relative)).text()
 
+// Read the build script once; three assertions inspect the same source.
+const buildSource = await read("script/build.ts")
+
 describe("script/build.ts bundles every worker entry", () => {
   test("each source entry is listed in `entrypoints`", async () => {
-    const build = await read("script/build.ts")
+    const build = buildSource
     const missing = ENTRIES.filter((entry) => entry.source !== undefined && !build.includes(`"${entry.source}"`)).map(
       (entry) => entry.name,
     )
@@ -70,7 +73,7 @@ describe("script/build.ts bundles every worker entry", () => {
   })
 
   test("each flat shim is embedded in `files`", async () => {
-    const build = await read("script/build.ts")
+    const build = buildSource
     const missing = ENTRIES.filter((entry) => entry.shim !== undefined && !build.includes(entry.shim)).map(
       (entry) => entry.name,
     )
@@ -78,7 +81,7 @@ describe("script/build.ts bundles every worker entry", () => {
   })
 
   test("each build-time define is injected", async () => {
-    const build = await read("script/build.ts")
+    const build = buildSource
     const missing = ENTRIES.filter((entry) => !build.includes(`${entry.define}:`)).map((entry) => entry.name)
     expect(missing).toEqual([])
   })

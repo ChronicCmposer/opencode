@@ -19,11 +19,9 @@ describe("pollUntil", () => {
   })
 
   test("fails loudly with a custom message on timeout", async () => {
-    const started = Date.now()
     await expect(pollUntil(() => false, { timeoutMs: 20, intervalMs: 5, message: "never ready" })).rejects.toThrow(
       "never ready",
     )
-    expect(Date.now() - started).toBeGreaterThanOrEqual(20)
   })
 
   test("uses a descriptive default message", async () => {

@@ -23,6 +23,7 @@ import {
 } from "@/session/broker/broker"
 import { BrokerFailure, type ServerSpec } from "@/session/broker/protocol"
 import { createWorkerBrokerClient } from "@/session/worker/broker-client"
+import { flush } from "../../lib/async"
 import { createLeakDetector } from "../../lib/leak-detector"
 import { pollUntil } from "../../lib/poll"
 import {
@@ -103,9 +104,10 @@ describe("exactly one set of children across session workers (10.1)", () => {
   test("two acquisitions of one directory share one child and one instanceId", async () => {
     const broker = track(createBroker())
     const servers = [mcpSpec()]
+    const directory = makeTmp()
 
-    const first = await broker.acquire({ directory: "/work/a", servers })
-    const second = await broker.acquire({ directory: "/work/a", servers })
+    const first = await broker.acquire({ directory, servers })
+    const second = await broker.acquire({ directory, servers })
 
     expect(second.instanceId).toBe(first.instanceId)
     expect(first.servers).toHaveLength(1)
@@ -193,12 +195,14 @@ describe("per-directory serialization + mcp_timeout (10.3)", () => {
     const journalB = join(makeTmp(), "b.jsonl")
     const specA = mcpSpec({ name: "a", env: { BROKER_CHILD_DELAY_MS: "120", BROKER_CHILD_JOURNAL: journalA } })
     const specB = mcpSpec({ name: "b", env: { BROKER_CHILD_DELAY_MS: "120", BROKER_CHILD_JOURNAL: journalB } })
+    const directoryA = makeTmp()
+    const directoryB = makeTmp()
 
-    await broker.acquire({ directory: "/work/a", servers: [specA] })
-    await broker.acquire({ directory: "/work/b", servers: [specB] })
+    await broker.acquire({ directory: directoryA, servers: [specA] })
+    await broker.acquire({ directory: directoryB, servers: [specB] })
     await Promise.all([
-      broker.call({ directory: "/work/a", server: "a", method: "work" }),
-      broker.call({ directory: "/work/b", server: "b", method: "work" }),
+      broker.call({ directory: directoryA, server: "a", method: "work" }),
+      broker.call({ directory: directoryB, server: "b", method: "work" }),
     ])
 
     const a = readJournal(journalA)
@@ -211,14 +215,17 @@ describe("per-directory serialization + mcp_timeout (10.3)", () => {
     expect(Math.max(aStart, bStart)).toBeLessThan(Math.min(aEnd, bEnd))
   })
 
-  test("enforces mcp_timeout on the handshake", async () => {
+  test("enforces mcp_timeout on the handshake and reaps the silent child", async () => {
     const broker = track(createBroker())
-    // `sleep` never speaks MCP, so the initialize handshake never completes.
-    const spec: ServerSpec = { name: "silent", kind: "mcp", command: ["sleep", "60"], timeoutMs: 200 }
+    // The fixture child loads but never answers `initialize`, so the handshake
+    // times out (no `sleep` process, so this runs on every platform).
+    const spec: ServerSpec = mcpSpec({ name: "silent", env: { BROKER_CHILD_HANG_INIT: "1" }, timeoutMs: 200 })
 
-    const error = await broker.acquire({ directory: "/work/silent", servers: [spec] }).catch((reason: unknown) => reason)
+    const error = await broker.acquire({ directory: makeTmp(), servers: [spec] }).catch((reason: unknown) => reason)
     expect(error).toBeInstanceOf(BrokerRequestError)
     expect((error as BrokerRequestError).code).toBe("timeout")
+    // The timed-out child was torn down, not left in the mirror.
+    await waitFor(() => broker.children.length === 0, { message: "silent child was not reaped" })
   })
 
   test("enforces mcp_timeout on a call that is never answered", async () => {
@@ -231,7 +238,7 @@ describe("per-directory serialization + mcp_timeout (10.3)", () => {
       .call({ directory, server: "fake", method: "hang", timeoutMs: 150 })
       .catch((reason: unknown) => reason)
     expect((error as BrokerRequestError).code).toBe("timeout")
-    expect(Date.now() - started).toBeLessThan(2000)
+    expect(Date.now() - started).toBeLessThan(1000)
   })
 })
 
@@ -307,7 +314,38 @@ describe("refactor guards: crash-before-ready, handshake, acquire", () => {
     const error = await broker.acquire({ directory: "/work/a", servers: [mcpSpec()] }).catch((reason: unknown) => reason)
     expect(error).toBeInstanceOf(BrokerRequestError)
     expect((error as BrokerRequestError).code).toBe("timeout")
-    expect(Date.now() - started).toBeLessThan(2000)
+    expect(Date.now() - started).toBeLessThan(1000)
+  })
+
+  test("rejects `ready` when the worker never completes the handshake (item 9)", async () => {
+    const broker = track(
+      createBroker({ entry: new URL("./never-ready-worker.ts", import.meta.url), readyTimeoutMs: 100 }),
+    )
+    const error = await broker.ready.then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+    expect(error).toBeInstanceOf(BrokerRequestError)
+    expect((error as BrokerRequestError).code).toBe("timeout")
+  })
+
+  test("teardown before ready rejects a pending `ready` (item 9)", async () => {
+    const broker = createBroker({
+      entry: new URL("./never-ready-worker.ts", import.meta.url),
+      readyTimeoutMs: 10_000,
+    })
+    await broker.teardown()
+    await expect(broker.ready).rejects.toBeInstanceOf(BrokerRequestError)
+  })
+
+  test("resolves the isolate from the caller's env overlay (item 14)", async () => {
+    const broker = track(
+      createBroker({
+        env: { OPENCODE_BROKER_WORKER_PATH: new URL("./never-ready-worker.ts", import.meta.url).pathname },
+        readyTimeoutMs: 100,
+      }),
+    )
+    await expect(broker.ready).rejects.toThrow(/did not become ready/)
   })
 
   test("two concurrent acquisitions of one directory spawn exactly one child", async () => {
@@ -329,6 +367,45 @@ describe("refactor guards: crash-before-ready, handshake, acquire", () => {
     expect(error).toBeInstanceOf(BrokerRequestError)
     expect((error as BrokerRequestError).code).toBe("handshake-failed")
     expect(broker.children).toHaveLength(0)
+  })
+
+  test("rejects a missing directory instead of spawning in the hub's cwd (item 21)", async () => {
+    const broker = track(createBroker())
+    const error = await broker
+      .acquire({ directory: "/definitely/not/a/real/directory", servers: [mcpSpec()] })
+      .catch((reason: unknown) => reason)
+    expect(error).toBeInstanceOf(BrokerRequestError)
+    expect((error as BrokerRequestError).code).toBe("unknown-directory")
+  })
+
+  test("honours a per-call timeout override (item 20)", async () => {
+    const broker = track(createBroker({ timeoutMs: 5_000 }))
+    const directory = makeTmp()
+    await broker.acquire({ directory, servers: [mcpSpec()] })
+
+    const started = Date.now()
+    const error = await broker
+      .call({ directory, server: "fake", method: "hang", timeoutMs: 100 })
+      .catch((reason: unknown) => reason)
+    expect(error).toBeInstanceOf(BrokerRequestError)
+    expect((error as BrokerRequestError).code).toBe("timeout")
+    expect(Date.now() - started).toBeLessThan(1_000)
+  })
+
+  test("rejects a duplicate in-flight request id (item 19)", async () => {
+    const broker = track(createBroker())
+    const directory = makeTmp()
+    await broker.acquire({ directory, servers: [mcpSpec({ env: { BROKER_CHILD_DELAY_MS: "300" } })] })
+
+    const first = broker.call({ directory, server: "fake", method: "work", requestId: "dup" })
+    const duplicate = await broker
+      .call({ directory, server: "fake", method: "work", requestId: "dup" })
+      .catch((reason: unknown) => reason)
+
+    expect(duplicate).toBeInstanceOf(BrokerRequestError)
+    expect((duplicate as BrokerRequestError).code).toBe("invalid-request")
+
+    await first.catch(() => undefined)
   })
 
   test("resets the observable handshake per generation", async () => {
@@ -585,7 +662,9 @@ describe("serveBrokerPort — hub-side worker broker proxy (step 19)", () => {
       const listener = listeners[0]
       if (listener === undefined) throw new Error("serveBrokerPort did not subscribe")
       listener({ data: { kind: "ping", requestId: "r1" } })
-      await new Promise((resolve) => setTimeout(resolve, 20))
+      // `flush` yields exactly one macrotask, enough for the reply promise chain
+      // (and any resulting unhandled rejection) to settle — no arbitrary sleep.
+      await flush()
       expect(rejections).toHaveLength(0)
       dispose()
     } finally {

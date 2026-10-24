@@ -51,6 +51,15 @@ interface ErrorReport {
 type WorkerReport = CounterReport | ErrorReport
 
 /**
+ * The probe plugin publishes its bounded client call on the isolate global so
+ * the probe can await the actual async work instead of sleeping for a fixed
+ * window. Absent on the worker-safe path, where the plugin never runs.
+ */
+interface WorkerProbeGlobal {
+  __ws4PluginCall?: Promise<unknown>
+}
+
+/**
  * The worker half. Boots the REAL worker session graph (the same
  * `buildSessionWorkerLayer` the isolate entry builds), configures a plugin that
  * uses its client, runs a plugin-triggering hook, then reports the number of
@@ -67,77 +76,81 @@ async function runWorkerProbe(): Promise<CounterReport> {
   const { serverAppGraphBuildCount } = await import("@/server/routes/instance/httpapi/server")
 
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-ws4-worker-"))
-  const pluginFile = path.join(directory, "app-graph-probe-plugin.ts")
+  try {
+    const pluginFile = path.join(directory, "app-graph-probe-plugin.ts")
 
-  // An isolated plugin that uses its client. `Plugin.state` hands plugins a
-  // client whose `fetch` falls back to `Server.Default().app.fetch`, so this
-  // call is exactly what forces the server app graph on the buggy path. It is
-  // bounded by a timeout so a hung request can never wedge the worker.
-  fs.writeFileSync(
-    pluginFile,
-    [
-      "export default async function plugin(input) {",
-      "  try {",
-      "    await Promise.race([",
-      "      input.client.config.get(),",
-      "      new Promise((resolve) => setTimeout(resolve, 3000)),",
-      "    ])",
-      "  } catch {}",
-      "  return {}",
-      "}",
-      "",
-    ].join("\n"),
-  )
+    // An isolated plugin that uses its client. `Plugin.state` hands plugins a
+    // client whose `fetch` falls back to `Server.Default().app.fetch`, so this
+    // call is exactly what forces the server app graph on the buggy path. It is
+    // bounded by a timeout so a hung request can never wedge the worker, and the
+    // promise is published so the probe can await the real work (never a sleep).
+    fs.writeFileSync(
+      pluginFile,
+      [
+        "export default async function plugin(input) {",
+        "  const call = Promise.race([",
+        "    input.client.config.get(),",
+        "    new Promise((resolve) => setTimeout(resolve, 3000)),",
+        "  ]).catch(() => {})",
+        "  globalThis.__ws4PluginCall = call",
+        "  await call",
+        "  return {}",
+        "}",
+        "",
+      ].join("\n"),
+    )
 
-  const snapshot = workerSnapshot({
-    directory,
-    config: {
-      plugin_origins: [
-        {
-          spec: pathToFileURL(pluginFile).href,
-          source: path.join(directory, "opencode.json"),
-          scope: "local",
-        },
-      ],
-    } as never,
-  })
+    const snapshot = workerSnapshot({
+      directory,
+      config: {
+        plugin_origins: [
+          {
+            spec: pathToFileURL(pluginFile).href,
+            source: path.join(directory, "opencode.json"),
+            scope: "local",
+          },
+        ],
+      } as never,
+    })
 
-  // The exact clients the runtime tests use: the full runnable session graph
-  // (which would carry the real `Plugin.node` if the worker replacement were
-  // missing) with inert boundary clients.
-  const clients = {
-    writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
-    egress: { emit: () => {} },
-    broker: { call: async () => null },
-    backgroundJob: { wait: async () => null, cancel: async () => {} },
-  } as never
-  const modelClient = Layer.succeed(ModelClient, {
-    complete: () => Effect.succeed({ text: "worker" }),
-  } as never)
+    // The exact clients the runtime tests use: the full runnable session graph
+    // (which would carry the real `Plugin.node` if the worker replacement were
+    // missing) with inert boundary clients.
+    const clients = {
+      writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
+      egress: { emit: () => {} },
+      broker: { call: async () => null },
+      backgroundJob: { wait: async () => null, cancel: async () => {} },
+    } as never
+    const modelClient = Layer.succeed(ModelClient, {
+      complete: () => Effect.succeed({ text: "worker" }),
+    } as never)
 
-  const built = buildSessionWorkerLayer({
-    snapshot,
-    env: { values: {} },
-    clients,
-    modelClient,
-  })
+    const built = buildSessionWorkerLayer({
+      snapshot,
+      env: { values: {} },
+      clients,
+      modelClient,
+    })
 
-  const instance = { directory, worktree: directory, project: { id: "ws4" } as never }
+    const instance = { directory, worktree: directory, project: { id: "ws4" } as never }
 
-  await Effect.runPromise(
-    Effect.gen(function* () {
-      const plugin = yield* Plugin.Service
-      yield* plugin.trigger("chat.params" as never, {} as never, {} as never)
-    }).pipe(Effect.provide(built.layer), Effect.provideService(InstanceRef, instance)),
-  )
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const plugin = yield* Plugin.Service
+        yield* plugin.trigger("chat.params" as never, {} as never, {} as never)
+      }).pipe(Effect.provide(built.layer), Effect.provideService(InstanceRef, instance)),
+    )
 
-  // The plugin's client call is awaited (bounded) inside `Plugin.state`, so the
-  // build — if it happened — has already happened. A short settle guards the
-  // final microtasks before we read the counter.
-  await Bun.sleep(250)
-  fs.rmSync(directory, { recursive: true, force: true })
+    // Await the plugin's bounded client call when the real plugin ran (buggy
+    // path). On the worker-safe path the plugin never loads, so there is no
+    // pending work and no fixed settle window to race.
+    await (globalThis as WorkerProbeGlobal).__ws4PluginCall
 
-  return { type: "counter", value: serverAppGraphBuildCount() }
+    return { type: "counter", value: serverAppGraphBuildCount() }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
 }
 
 async function runWorker(): Promise<void> {

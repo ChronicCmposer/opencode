@@ -41,6 +41,12 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
+import {
+  formatMcpResourceBytes,
+  MAX_MCP_RESOURCE_BLOB_BYTES,
+  mcpResourceBase64Size,
+  SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES,
+} from "@/util/mcp-resource"
 import { Process } from "@/util/process"
 import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
@@ -64,14 +70,6 @@ globalThis.AI_SDK_LOG_WARNINGS = false
 
 const decodeMessageInfo = Schema.decodeUnknownExit(SessionV1.Info)
 const decodeMessagePart = Schema.decodeUnknownExit(SessionV1.Part)
-const MAX_MCP_RESOURCE_BLOB_BYTES = 10 * 1024 * 1024
-const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
-  "application/pdf",
-  "image/gif",
-  "image/jpeg",
-  "image/png",
-  "image/webp",
-])
 
 const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
 
@@ -82,18 +80,6 @@ IMPORTANT:
 - This tool provides your final answer - no further actions are taken after calling it`
 
 const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested structured output. You MUST use the StructuredOutput tool to provide your final response. Do NOT respond with plain text - you MUST call the StructuredOutput tool with your answer formatted according to the schema.`
-
-function mcpResourceBase64Size(value: string) {
-  const trimmed = value.replace(/\s/g, "")
-  const padding = trimmed.endsWith("==") ? 2 : trimmed.endsWith("=") ? 1 : 0
-  return Math.max(0, Math.floor((trimmed.length * 3) / 4) - padding)
-}
-
-function formatMcpResourceBytes(value: number) {
-  if (value < 1024) return `${value} B`
-  if (value < 1024 * 1024) return `${Math.ceil(value / 1024)} KB`
-  return `${Math.ceil(value / (1024 * 1024))} MB`
-}
 
 function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   // cleanup() marks abandoned tool_use blocks this way after retries/aborts.
@@ -287,6 +273,25 @@ const layer = Layer.effect(
         .pipe(Effect.catchCause((cause) => Effect.logError("failed to generate title", { error: Cause.squash(cause) })))
     })
 
+    /**
+     * Resolve an agent by name (or the configured default when the name is
+     * absent), failing loudly with the same "not found + available agents" hint
+     * and error event at every call site. Centralised so the five prompt paths
+     * cannot drift in their error contract.
+     */
+    const requireAgent = Effect.fn("SessionPrompt.requireAgent")(function* (
+      sessionID: SessionID,
+      name: string | undefined,
+    ) {
+      const agent: Agent.Info | undefined = name ? yield* agents.get(name) : yield* agents.defaultInfo()
+      if (agent) return agent
+      const available = (yield* agents.list()).filter((item) => !item.hidden).map((item) => item.name)
+      const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
+      const error = new NamedError.Unknown({ message: `Agent not found: "${name}".${hint}` })
+      yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
+      return yield* Effect.die(error)
+    })
+
     const handleSubtask = Effect.fn("SessionPrompt.handleSubtask")(function* (input: {
       task: SessionV1.SubtaskPart
       model: Provider.Model
@@ -345,14 +350,7 @@ const layer = Layer.effect(
         { args: taskArgs },
       )
 
-      const taskAgent = yield* agents.get(task.agent)
-      if (!taskAgent) {
-        const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-        const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-        const error = new NamedError.Unknown({ message: `Agent not found: "${task.agent}".${hint}` })
-        yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
-        throw error
-      }
+      const taskAgent = yield* requireAgent(sessionID, task.agent)
 
       let error: Error | undefined
       const taskAbort = new AbortController()
@@ -493,14 +491,7 @@ const layer = Layer.effect(
             if (session.revert) {
               yield* revert.cleanup(session)
             }
-            const agent = yield* agents.get(input.agent)
-            if (!agent) {
-              const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-              const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-              const error = new NamedError.Unknown({ message: `Agent not found: "${input.agent}".${hint}` })
-              yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
-              throw error
-            }
+            const agent = yield* requireAgent(input.sessionID, input.agent)
             const model = input.model ?? agent.model ?? (yield* currentModel(input.sessionID))
             const userMsg: SessionV1.User = {
               id: input.messageID ?? MessageID.ascending(),
@@ -669,14 +660,7 @@ const layer = Layer.effect(
 
     const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
       const agentName = input.agent
-      const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
-      if (!ag) {
-        const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-        const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-        const error = new NamedError.Unknown({ message: `Agent not found: "${agentName}".${hint}` })
-        yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
-        throw error
-      }
+      const ag = yield* requireAgent(input.sessionID, agentName)
 
       const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
@@ -726,304 +710,251 @@ const layer = Layer.effect(
       yield* Effect.addFinalizer(() => instruction.clear(info.id))
 
       type Draft<T> = T extends SessionV1.Part ? Omit<T, "id"> & { id?: string } : never
-      const assign = (part: Draft<SessionV1.Part>): SessionV1.Part => ({
+      type DraftPart = Draft<SessionV1.Part>
+      type InputPart = PromptInput["parts"][number]
+      type FileInputPart = Extract<InputPart, { type: "file" }>
+      type AgentInputPart = Extract<InputPart, { type: "agent" }>
+
+      const assign = (part: DraftPart): SessionV1.Part => ({
         ...part,
         id: part.id ? PartID.make(part.id) : PartID.ascending(),
       })
 
-      const resolvePart: (part: PromptInput["parts"][number]) => Effect.Effect<Draft<SessionV1.Part>[]> = Effect.fn(
+      const textPiece = (text: string): DraftPart => ({
+        messageID: info.id,
+        sessionID: input.sessionID,
+        type: "text",
+        synthetic: true,
+        text,
+      })
+
+      // Resolve an MCP `resource` file part into synthetic text/file pieces. Each
+      // binary blob is attached only when its MIME type is attachable and its
+      // decoded size is under the ceiling; otherwise the model gets a notice.
+      const resolveMcpResourcePart: (part: FileInputPart) => Effect.Effect<DraftPart[]> = Effect.fnUntraced(
+        function* (part: FileInputPart) {
+        const { clientName, uri } = part.source as Extract<NonNullable<FileInputPart["source"]>, { type: "resource" }>
+        yield* Effect.logInfo("mcp resource", { clientName, uri, mime: part.mime })
+        const pieces: DraftPart[] = [textPiece(`Reading MCP resource: ${part.filename} (${uri})`)]
+        const exit = yield* mcp.readResource(clientName, uri).pipe(Effect.exit)
+        if (Exit.isFailure(exit)) {
+          const error = Cause.squash(exit.cause)
+          yield* Effect.logError("failed to read MCP resource", { error, clientName, uri })
+          const message = error instanceof Error ? error.message : String(error)
+          pieces.push(textPiece(`Failed to read MCP resource ${part.filename}: ${message}`))
+          return pieces
+        }
+        const content = exit.value
+        if (!content) return yield* Effect.die(new Error(`Resource not found: ${clientName}/${uri}`))
+        const items = Array.isArray(content.contents) ? content.contents : [content.contents]
+        for (const c of items) {
+          if (!c || typeof c !== "object") continue
+          if ("text" in c && typeof c.text === "string" && c.text) {
+            pieces.push(textPiece(c.text))
+            continue
+          }
+          if (!("blob" in c) || typeof c.blob !== "string" || !c.blob) continue
+          const mime = "mimeType" in c && typeof c.mimeType === "string" ? c.mimeType : part.mime
+          const filename = "uri" in c && typeof c.uri === "string" ? c.uri : part.filename
+          const size = mcpResourceBase64Size(c.blob)
+          if (!SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES.has(mime)) {
+            pieces.push(
+              textPiece(
+                `[Binary MCP resource omitted: ${filename ?? uri} (${mime}, ${formatMcpResourceBytes(size)}) is not a supported attachment type]`,
+              ),
+            )
+            continue
+          }
+          if (size > MAX_MCP_RESOURCE_BLOB_BYTES) {
+            pieces.push(
+              textPiece(
+                `[Binary MCP resource omitted: ${filename ?? uri} (${mime}, ${formatMcpResourceBytes(size)}) exceeds ${formatMcpResourceBytes(MAX_MCP_RESOURCE_BLOB_BYTES)}]`,
+              ),
+            )
+            continue
+          }
+          pieces.push(textPiece(`[Binary MCP resource attached: ${filename ?? uri} (${mime})]`))
+          pieces.push({
+            messageID: info.id,
+            sessionID: input.sessionID,
+            type: "file",
+            mime,
+            filename,
+            url: `data:${mime};base64,${c.blob}`,
+          })
+        }
+        return pieces
+      })
+
+      // Resolve a file part: inline data URLs, read tool-backed file/directory
+      // URLs (with optional line ranges), and fall back to passing the part
+      // through untouched for protocols the prompt does not special-case.
+      const resolveFilePart: (part: FileInputPart) => Effect.Effect<DraftPart[]> = Effect.fnUntraced(
+        function* (part: FileInputPart) {
+        const url = yield* Effect.try({
+          try: () => new URL(part.url),
+          catch: (cause) => new Error(`Invalid part URL: ${part.url}`, { cause }),
+        }).pipe(Effect.orDie)
+        switch (url.protocol) {
+          case "data:":
+            if (part.mime !== "text/plain") break
+            return [
+              textPiece(
+                `Called the Read tool with the following input: ${JSON.stringify({ filePath: part.filename })}`,
+              ),
+              textPiece(decodeDataUrl(part.url)),
+              { ...part, messageID: info.id, sessionID: input.sessionID },
+            ]
+          case "file:": {
+            yield* Effect.logInfo("file", { mime: part.mime })
+            const filepath = fileURLToPath(part.url)
+            const mime = (yield* fsys.isDir(filepath)) ? "application/x-directory" : part.mime
+
+            const { read } = yield* registry.named()
+            const execRead = (args: Parameters<typeof read.execute>[0], extra?: Tool.Context["extra"]) => {
+              const controller = new AbortController()
+              return read
+                .execute(args, {
+                  sessionID: input.sessionID,
+                  abort: controller.signal,
+                  agent: ag.name,
+                  messageID: info.id,
+                  extra: { bypassCwdCheck: true, ...extra },
+                  messages: [],
+                  metadata: () => Effect.void,
+                  ask: () => Effect.void,
+                })
+                .pipe(Effect.onInterrupt(() => Effect.sync(() => controller.abort())))
+            }
+
+            if (mime === "text/plain") {
+              let offset: number | undefined
+              let limit: number | undefined
+              const range = { start: url.searchParams.get("start"), end: url.searchParams.get("end") }
+              if (range.start != null) {
+                const filePathURI = part.url.split("?")[0]
+                let start = parseInt(range.start)
+                let end = range.end ? parseInt(range.end) : undefined
+                if (start === end) {
+                  const symbols = yield* lsp.documentSymbol(filePathURI).pipe(Effect.catch(() => Effect.succeed([])))
+                  for (const symbol of symbols) {
+                    let r: LSP.Range | undefined
+                    if ("range" in symbol) r = symbol.range
+                    else if ("location" in symbol) r = symbol.location.range
+                    if (r?.start?.line && r?.start?.line === start) {
+                      start = r.start.line
+                      end = r?.end?.line ?? start
+                      break
+                    }
+                  }
+                }
+                offset = Math.max(start, 1)
+                if (end) limit = end - (offset - 1)
+              }
+              const args = { filePath: filepath, offset, limit }
+              const pieces: DraftPart[] = [
+                textPiece(`Called the Read tool with the following input: ${JSON.stringify(args)}`),
+              ]
+              const exit = yield* provider.getModel(info.model.providerID, info.model.modelID).pipe(
+                Effect.flatMap((mdl) => execRead(args, { model: mdl })),
+                Effect.exit,
+              )
+              if (Exit.isSuccess(exit)) {
+                const result = exit.value
+                pieces.push(textPiece(result.output))
+                if (result.attachments?.length) {
+                  pieces.push(
+                    ...result.attachments.map((a) => ({
+                      ...a,
+                      synthetic: true,
+                      filename: a.filename ?? part.filename,
+                      messageID: info.id,
+                      sessionID: input.sessionID,
+                    })),
+                  )
+                } else {
+                  pieces.push({ ...part, mime, messageID: info.id, sessionID: input.sessionID })
+                }
+              } else {
+                const error = Cause.squash(exit.cause)
+                yield* Effect.logError("failed to read file", { error, filepath })
+                const message = error instanceof Error ? error.message : String(error)
+                yield* events.publish(Session.Event.Error, {
+                  sessionID: input.sessionID,
+                  error: new NamedError.Unknown({ message }).toObject(),
+                })
+                pieces.push(
+                  textPiece(`Read tool failed to read ${filepath} with the following error: ${message}`),
+                )
+              }
+              return pieces
+            }
+
+            if (mime === "application/x-directory") {
+              const args = { filePath: filepath }
+              const exit = yield* execRead(args).pipe(Effect.exit)
+              if (Exit.isFailure(exit)) {
+                const error = Cause.squash(exit.cause)
+                yield* Effect.logError("failed to read directory", { error, filepath })
+                const message = error instanceof Error ? error.message : String(error)
+                yield* events.publish(Session.Event.Error, {
+                  sessionID: input.sessionID,
+                  error: new NamedError.Unknown({ message }).toObject(),
+                })
+                return [textPiece(`Read tool failed to read ${filepath} with the following error: ${message}`)]
+              }
+              return [
+                textPiece(`Called the Read tool with the following input: ${JSON.stringify(args)}`),
+                textPiece(exit.value.output),
+                { ...part, mime, messageID: info.id, sessionID: input.sessionID },
+              ]
+            }
+
+            return [
+              textPiece(`Called the Read tool with the following input: {"filePath":"${filepath}"}`),
+              {
+                id: part.id,
+                messageID: info.id,
+                sessionID: input.sessionID,
+                type: "file",
+                url:
+                  `data:${mime};base64,` +
+                  Buffer.from(yield* fsys.readFile(filepath).pipe(Effect.catch(Effect.die))).toString("base64"),
+                mime,
+                filename: part.filename,
+                source: part.source,
+              },
+            ]
+          }
+        }
+        return [{ ...part, messageID: info.id, sessionID: input.sessionID }]
+      })
+
+      // Resolve an agent part: pass it through and append the instruction that
+      // tells the model to invoke the task tool for that subagent.
+      const resolveAgentPart: (part: AgentInputPart) => Effect.Effect<DraftPart[]> = Effect.fnUntraced(
+        function* (part: AgentInputPart) {
+        const perm = Permission.evaluate("task", part.name, ag.permission)
+        const hint = perm.action === "deny" ? " . Invoked by user; guaranteed to exist." : ""
+        return [
+          { ...part, messageID: info.id, sessionID: input.sessionID },
+          textPiece(
+            " Use the above message and context to generate a prompt and call the task tool with subagent: " +
+              part.name +
+              hint,
+          ),
+        ]
+      })
+
+      const resolvePart: (part: InputPart) => Effect.Effect<DraftPart[]> = Effect.fn(
         "SessionPrompt.resolveUserPart",
       )(function* (part) {
         if (part.type === "file") {
-          if (part.source?.type === "resource") {
-            const { clientName, uri } = part.source
-            yield* Effect.logInfo("mcp resource", { clientName, uri, mime: part.mime })
-            const pieces: Draft<SessionV1.Part>[] = [
-              {
-                messageID: info.id,
-                sessionID: input.sessionID,
-                type: "text",
-                synthetic: true,
-                text: `Reading MCP resource: ${part.filename} (${uri})`,
-              },
-            ]
-            const exit = yield* mcp.readResource(clientName, uri).pipe(Effect.exit)
-            if (Exit.isSuccess(exit)) {
-              const content = exit.value
-              if (!content) throw new Error(`Resource not found: ${clientName}/${uri}`)
-              const items = Array.isArray(content.contents) ? content.contents : [content.contents]
-              for (const c of items) {
-                if (!c || typeof c !== "object") continue
-                if ("text" in c && typeof c.text === "string" && c.text) {
-                  pieces.push({
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: c.text,
-                  })
-                } else if ("blob" in c && typeof c.blob === "string" && c.blob) {
-                  const mime = "mimeType" in c && typeof c.mimeType === "string" ? c.mimeType : part.mime
-                  const filename = "uri" in c && typeof c.uri === "string" ? c.uri : part.filename
-                  const size = mcpResourceBase64Size(c.blob)
-                  if (!SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES.has(mime)) {
-                    pieces.push({
-                      messageID: info.id,
-                      sessionID: input.sessionID,
-                      type: "text",
-                      synthetic: true,
-                      text: `[Binary MCP resource omitted: ${filename ?? uri} (${mime}, ${formatMcpResourceBytes(size)}) is not a supported attachment type]`,
-                    })
-                    continue
-                  }
-                  if (size > MAX_MCP_RESOURCE_BLOB_BYTES) {
-                    pieces.push({
-                      messageID: info.id,
-                      sessionID: input.sessionID,
-                      type: "text",
-                      synthetic: true,
-                      text: `[Binary MCP resource omitted: ${filename ?? uri} (${mime}, ${formatMcpResourceBytes(size)}) exceeds ${formatMcpResourceBytes(MAX_MCP_RESOURCE_BLOB_BYTES)}]`,
-                    })
-                    continue
-                  }
-                  pieces.push({
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: `[Binary MCP resource attached: ${filename ?? uri} (${mime})]`,
-                  })
-                  pieces.push({
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "file",
-                    mime,
-                    filename,
-                    url: `data:${mime};base64,${c.blob}`,
-                  })
-                }
-              }
-            } else {
-              const error = Cause.squash(exit.cause)
-              yield* Effect.logError("failed to read MCP resource", { error, clientName, uri })
-              const message = error instanceof Error ? error.message : String(error)
-              pieces.push({
-                messageID: info.id,
-                sessionID: input.sessionID,
-                type: "text",
-                synthetic: true,
-                text: `Failed to read MCP resource ${part.filename}: ${message}`,
-              })
-            }
-            return pieces
-          }
-          const url = new URL(part.url)
-          switch (url.protocol) {
-            case "data:":
-              if (part.mime === "text/plain") {
-                return [
-                  {
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: `Called the Read tool with the following input: ${JSON.stringify({ filePath: part.filename })}`,
-                  },
-                  {
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: decodeDataUrl(part.url),
-                  },
-                  { ...part, messageID: info.id, sessionID: input.sessionID },
-                ]
-              }
-              break
-            case "file:": {
-              yield* Effect.logInfo("file", { mime: part.mime })
-              const filepath = fileURLToPath(part.url)
-              const mime = (yield* fsys.isDir(filepath)) ? "application/x-directory" : part.mime
-
-              const { read } = yield* registry.named()
-              const execRead = (args: Parameters<typeof read.execute>[0], extra?: Tool.Context["extra"]) => {
-                const controller = new AbortController()
-                return read
-                  .execute(args, {
-                    sessionID: input.sessionID,
-                    abort: controller.signal,
-                    agent: input.agent!,
-                    messageID: info.id,
-                    extra: { bypassCwdCheck: true, ...extra },
-                    messages: [],
-                    metadata: () => Effect.void,
-                    ask: () => Effect.void,
-                  })
-                  .pipe(Effect.onInterrupt(() => Effect.sync(() => controller.abort())))
-              }
-
-              if (mime === "text/plain") {
-                let offset: number | undefined
-                let limit: number | undefined
-                const range = { start: url.searchParams.get("start"), end: url.searchParams.get("end") }
-                if (range.start != null) {
-                  const filePathURI = part.url.split("?")[0]
-                  let start = parseInt(range.start)
-                  let end = range.end ? parseInt(range.end) : undefined
-                  if (start === end) {
-                    const symbols = yield* lsp.documentSymbol(filePathURI).pipe(Effect.catch(() => Effect.succeed([])))
-                    for (const symbol of symbols) {
-                      let r: LSP.Range | undefined
-                      if ("range" in symbol) r = symbol.range
-                      else if ("location" in symbol) r = symbol.location.range
-                      if (r?.start?.line && r?.start?.line === start) {
-                        start = r.start.line
-                        end = r?.end?.line ?? start
-                        break
-                      }
-                    }
-                  }
-                  offset = Math.max(start, 1)
-                  if (end) limit = end - (offset - 1)
-                }
-                const args = { filePath: filepath, offset, limit }
-                const pieces: Draft<SessionV1.Part>[] = [
-                  {
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: `Called the Read tool with the following input: ${JSON.stringify(args)}`,
-                  },
-                ]
-                const exit = yield* provider.getModel(info.model.providerID, info.model.modelID).pipe(
-                  Effect.flatMap((mdl) => execRead(args, { model: mdl })),
-                  Effect.exit,
-                )
-                if (Exit.isSuccess(exit)) {
-                  const result = exit.value
-                  pieces.push({
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: result.output,
-                  })
-                  if (result.attachments?.length) {
-                    pieces.push(
-                      ...result.attachments.map((a) => ({
-                        ...a,
-                        synthetic: true,
-                        filename: a.filename ?? part.filename,
-                        messageID: info.id,
-                        sessionID: input.sessionID,
-                      })),
-                    )
-                  } else {
-                    pieces.push({ ...part, mime, messageID: info.id, sessionID: input.sessionID })
-                  }
-                } else {
-                  const error = Cause.squash(exit.cause)
-                  yield* Effect.logError("failed to read file", { error, filepath })
-                  const message = error instanceof Error ? error.message : String(error)
-                  yield* events.publish(Session.Event.Error, {
-                    sessionID: input.sessionID,
-                    error: new NamedError.Unknown({ message }).toObject(),
-                  })
-                  pieces.push({
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: `Read tool failed to read ${filepath} with the following error: ${message}`,
-                  })
-                }
-                return pieces
-              }
-
-              if (mime === "application/x-directory") {
-                const args = { filePath: filepath }
-                const exit = yield* execRead(args).pipe(Effect.exit)
-                if (Exit.isFailure(exit)) {
-                  const error = Cause.squash(exit.cause)
-                  yield* Effect.logError("failed to read directory", { error, filepath })
-                  const message = error instanceof Error ? error.message : String(error)
-                  yield* events.publish(Session.Event.Error, {
-                    sessionID: input.sessionID,
-                    error: new NamedError.Unknown({ message }).toObject(),
-                  })
-                  return [
-                    {
-                      messageID: info.id,
-                      sessionID: input.sessionID,
-                      type: "text",
-                      synthetic: true,
-                      text: `Read tool failed to read ${filepath} with the following error: ${message}`,
-                    },
-                  ]
-                }
-                return [
-                  {
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: `Called the Read tool with the following input: ${JSON.stringify(args)}`,
-                  },
-                  {
-                    messageID: info.id,
-                    sessionID: input.sessionID,
-                    type: "text",
-                    synthetic: true,
-                    text: exit.value.output,
-                  },
-                  { ...part, mime, messageID: info.id, sessionID: input.sessionID },
-                ]
-              }
-
-              return [
-                {
-                  messageID: info.id,
-                  sessionID: input.sessionID,
-                  type: "text",
-                  synthetic: true,
-                  text: `Called the Read tool with the following input: {"filePath":"${filepath}"}`,
-                },
-                {
-                  id: part.id,
-                  messageID: info.id,
-                  sessionID: input.sessionID,
-                  type: "file",
-                  url:
-                    `data:${mime};base64,` +
-                    Buffer.from(yield* fsys.readFile(filepath).pipe(Effect.catch(Effect.die))).toString("base64"),
-                  mime,
-                  filename: part.filename!,
-                  source: part.source,
-                },
-              ]
-            }
-          }
+          return part.source?.type === "resource"
+            ? yield* resolveMcpResourcePart(part)
+            : yield* resolveFilePart(part)
         }
-
-        if (part.type === "agent") {
-          const perm = Permission.evaluate("task", part.name, ag.permission)
-          const hint = perm.action === "deny" ? " . Invoked by user; guaranteed to exist." : ""
-          return [
-            { ...part, messageID: info.id, sessionID: input.sessionID },
-            {
-              messageID: info.id,
-              sessionID: input.sessionID,
-              type: "text",
-              synthetic: true,
-              text:
-                " Use the above message and context to generate a prompt and call the task tool with subagent: " +
-                part.name +
-                hint,
-            },
-          ]
-        }
-
+        if (part.type === "agent") return yield* resolveAgentPart(part)
         return [{ ...part, messageID: info.id, sessionID: input.sessionID }]
       })
 
@@ -1110,7 +1041,7 @@ const layer = Layer.effect(
       if (Option.isSome(match)) return match.value
       const msgs = yield* sessions.messages({ sessionID, limit: 1 }).pipe(Effect.orDie)
       if (msgs.length > 0) return msgs[0]
-      throw new Error("Impossible")
+      return yield* Effect.die(new Error("Impossible"))
     })
 
     const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
@@ -1130,7 +1061,8 @@ const layer = Layer.effect(
 
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
-          if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+          if (!lastUser)
+            return yield* Effect.die(new Error("No user message found in stream. This should never happen."))
 
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1199,14 +1131,7 @@ const layer = Layer.effect(
             continue
           }
 
-          const agent = yield* agents.get(lastUser.agent)
-          if (!agent) {
-            const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-            const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-            const error = new NamedError.Unknown({ message: `Agent not found: "${lastUser.agent}".${hint}` })
-            yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
-            throw error
-          }
+          const agent = yield* requireAgent(sessionID, lastUser.agent)
           const maxSteps = agent.steps ?? MAX_STEPS_DEFAULT
           const isLastStep = step >= maxSteps
           msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
@@ -1510,14 +1435,7 @@ const layer = Layer.effect(
 
       yield* getModel(taskModel.providerID, taskModel.modelID, input.sessionID)
 
-      const agent = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
-      if (!agent) {
-        const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-        const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-        const error = new NamedError.Unknown({ message: `Agent not found: "${agentName}".${hint}` })
-        yield* events.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
-        throw error
-      }
+      const agent = yield* requireAgent(input.sessionID, agentName)
 
       const templateParts = yield* resolvePromptParts(template)
       const inputFiles = new Set(

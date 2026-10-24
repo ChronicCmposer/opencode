@@ -8,7 +8,7 @@
 // `hub → layer → run-state → hub` import cycle and the duplicated hub-side
 // `serveHubProxy` workaround.
 
-import { messageOf, portFromMessagePort } from "./port"
+import { createRequestChannel, errorTagOf, messageOf, workerFrameChannel } from "./port"
 import type { JobInfo } from "./job-registry"
 import type { SubagentDispatchRequest } from "./subagent"
 
@@ -87,60 +87,50 @@ export interface HubProxyClient {
   dispose(): void
 }
 
-interface HubPending {
-  readonly resolve: (frame: HubProxyReply) => void
-  readonly reject: (error: unknown) => void
+export interface HubProxyClientOptions {
+  /**
+   * Default per-request timeout in ms. `undefined` (the default) waits for a
+   * reply indefinitely, matching the historical behaviour; when set, an
+   * unanswered request rejects with a `HubProxyRemoteError`.
+   */
+  readonly timeoutMs?: number
 }
+
+const DISPOSED_MESSAGE = "hub proxy client disposed"
 
 /**
  * Worker side: a thin request/reply client over a hub-proxy `MessagePort`.
  * Requests carry a numeric `id` correlated by the client; replies echo it. Only
  * replies are addressed to the client, so request frames are ignored.
+ *
+ * Correlation, timeout and dispose plumbing live in the shared
+ * `createRequestChannel`; this module only supplies the frame codec and error
+ * mapping.
  */
-export function createHubProxyClient(port: MessagePort): HubProxyClient {
-  const channel = portFromMessagePort<HubProxyFrame>(port)
+export function createHubProxyClient(port: MessagePort, options: HubProxyClientOptions = {}): HubProxyClient {
+  const channel = workerFrameChannel<HubProxyFrame>(port, "hub-proxy")
   let nextId = 1
-  let disposed = false
-  const pending = new Map<number, HubPending>()
 
-  const unsubscribe = channel.onMessage((frame) => {
-    if (frame.kind !== "reply") return
-    const waiter = pending.get(frame.id)
-    if (waiter === undefined) return
-    pending.delete(frame.id)
-    waiter.resolve(frame)
+  const requests = createRequestChannel<HubProxyFrame, HubProxyReply, number>(channel, {
+    timeoutMs: options.timeoutMs,
+    isReply: (frame): frame is HubProxyReply => frame.kind === "reply",
+    idOf: (reply) => reply.id,
+    nextId: () => nextId++,
+    disposedError: () => new HubProxyRemoteError(DISPOSED_MESSAGE),
+    timeoutError: (id, timeoutMs) =>
+      new HubProxyRemoteError(`hub proxy request ${id} timed out after ${timeoutMs}ms`),
   })
 
-  const call = (method: HubProxyMethod, args: readonly unknown[]): Promise<unknown> => {
-    if (disposed) return Promise.reject(new HubProxyRemoteError("hub proxy client disposed"))
-    const id = nextId++
-    return new Promise<unknown>((resolve, reject) => {
-      pending.set(id, {
-        resolve: (frame) =>
-          frame.ok
-            ? resolve(frame.value)
-            : reject(new HubProxyRemoteError(frame.message, { tag: frame.tag, data: frame.data })),
-        reject,
-      })
-      try {
-        channel.post({ kind: "request", id, method, args })
-      } catch (error) {
-        pending.delete(id)
-        reject(error)
-      }
-    })
+  const call = async (method: HubProxyMethod, args: readonly unknown[]): Promise<unknown> => {
+    const reply = await requests.request((id) => ({ kind: "request", id, method, args }))
+    if (reply.ok) return reply.value
+    throw new HubProxyRemoteError(reply.message, { tag: reply.tag, data: reply.data })
   }
 
   return {
     call,
     dispatchSubagent: (request) => call("dispatchSubagent", [request]) as Promise<JobInfo>,
-    dispose() {
-      if (disposed) return
-      disposed = true
-      unsubscribe()
-      for (const waiter of pending.values()) waiter.reject(new HubProxyRemoteError("hub proxy client disposed"))
-      pending.clear()
-    },
+    dispose: () => requests.dispose(),
   }
 }
 
@@ -148,13 +138,6 @@ export type HubProxyHandlers = Readonly<Partial<Record<HubProxyMethod, (...args:
 
 /** Own fields not worth carrying: the message rides the reply, the rest are noise. */
 const UNSERIALISED_ERROR_FIELDS = new Set(["message", "name", "stack", "cause", "_tag"])
-
-/** The `_tag` (or `name`) of a thrown tagged error, when it has one. */
-function errorTagOf(error: unknown): string | undefined {
-  if (error === null || typeof error !== "object") return undefined
-  const tag = (error as { _tag?: unknown })._tag ?? (error as { name?: unknown }).name
-  return typeof tag === "string" ? tag : undefined
-}
 
 /**
  * A tagged error's own structured-clone-safe fields, or `undefined` when there
@@ -173,7 +156,7 @@ function errorDataOf(error: unknown): unknown {
 
 /** Hub side: serve hub-proxy requests against `handlers`; returns a disposer. */
 export function serveHubProxy(handlers: HubProxyHandlers, port: MessagePort): () => void {
-  const channel = portFromMessagePort<HubProxyFrame>(port)
+  const channel = workerFrameChannel<HubProxyFrame>(port, "hub-proxy")
   return channel.onMessage((frame) => {
     if (frame.kind !== "request") return
     const reply = (payload: HubProxyReply): void => {

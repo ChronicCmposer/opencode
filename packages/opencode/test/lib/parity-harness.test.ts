@@ -50,6 +50,8 @@ import {
   type HubProxyAuthorities,
   type HubProxyRunner,
 } from "@/session/worker/hub"
+import { HUB_PROXIED_EVENT_TYPES } from "@/session/worker/event-bridge"
+import { recordingHubAuthorities } from "./hub-proxy"
 import { createSessionWork } from "@/session/worker/session-worker"
 import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
@@ -270,13 +272,10 @@ async function createHubBridge(context: ParityRunContext): Promise<HubBridge> {
   const sessionStatus = runtime.runSync(SessionStatus.Service)
   const run: HubProxyRunner = (effect) =>
     runtime.runPromise(effect.pipe(Effect.provideService(InstanceRef, context.instance)))
-  const authorities: HubProxyAuthorities = {
-    sessionStatus,
-    // A worker turn here never asks a permission/question; the handler map is only
-    // built so the control port resolves.
-    permission: {} as never,
-    question: {} as never,
-  }
+  // A worker turn here never asks a permission/question, but the handler map must
+  // be complete so the control port resolves; the shared recorder supplies inert
+  // (and observable) stubs instead of empty objects.
+  const authorities: HubProxyAuthorities = recordingHubAuthorities({ sessionStatus }).authorities
   const hubProxyChannel = new MessageChannel()
   const disposeProxy = serveHubProxy(buildHubProxyHandlers(authorities, run), hubProxyChannel.port2)
 
@@ -354,22 +353,31 @@ async function runBridgeSide(context: ParityRunContext, options: BridgeSideOptio
     const sink = workerSink ?? context.capture(workerRuntime)
 
     const expectedHubEvents = DELTAS.length + 1
+    const { sessionID, messageID, partID } = context
+
+    // Publish the deltas first, on their own run, then wait on the sink (not a
+    // fixed sleep) until they have been observed before setting status. The
+    // events port is an independent channel, so only the observed readiness
+    // guarantees both sides order `session.status` last.
     await runtime.runPromise(
       Effect.gen(function* () {
         const events = yield* EventV2Bridge.Service
-        const status = yield* SessionStatus.Service
-        const sessionID = context.sessionID
-        const messageID = context.messageID
-        const partID = context.partID
         if (options.directStatus === true) {
           yield* events.publish(SessionStatusEvent.Status, { sessionID, status: { type: "busy" } })
         }
         for (const delta of DELTAS) {
           yield* events.publish(SessionV1.Event.PartDelta, { sessionID, messageID, partID, field: "text", delta })
         }
-        // Let the egress port flush the deltas before the hub-proxied status, so
-        // both sides observe the same order (the port is a different channel).
-        yield* Effect.sleep("25 millis")
+      }).pipe(Effect.provideService(InstanceRef, context.instance)),
+    )
+
+    await pollUntil(() => sink.types().length >= DELTAS.length, {
+      message: `parity deltas never reached the sink (saw ${sink.types().length})`,
+    })
+
+    await runtime.runPromise(
+      Effect.gen(function* () {
+        const status = yield* SessionStatus.Service
         yield* status.set(sessionID, { type: "busy" })
       }).pipe(Effect.provideService(InstanceRef, context.instance)),
     )
@@ -449,13 +457,16 @@ describe("real worker session against the mock provider", () => {
     const config = modelConfig(provider)
     const snapshot = workerSnapshot()
     const emitted: string[] = []
+    // One stub-client set shared by the layer graph and the work scope, so the
+    // worker's writer is the exact one the test owns.
+    const clients = stubClients()
 
     const built = buildSessionWorkerLayer({
       nodes: PIPELINE_SESSION_NODES,
       snapshot,
       env: { values: {} },
       clients: {
-        ...stubClients(),
+        ...clients,
         egress: { emit: (event) => void emitted.push(event.type) },
       },
       modelClient: llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(snapshot, config))),
@@ -463,7 +474,7 @@ describe("real worker session against the mock provider", () => {
 
     const work = createSessionWork({
       layer: built.layer,
-      writer: stubClients().writer,
+      writer: clients.writer,
       threadId: 7,
       prompt: false,
       readMessages: () => Effect.succeed([{ role: "user", content: "say hello" }]),
@@ -528,9 +539,15 @@ function typeCounts(types: ReadonlyArray<string>): Record<string, number> {
 
 /**
  * Event types the hub owns (hub-proxied): the worker never forwards them over the
- * events port, the hub authority publishes them on the hub surface instead.
+ * events port, the hub authority publishes them on the hub surface instead. The
+ * base set comes from production's `HUB_PROXIED_EVENT_TYPES` (the exact set the
+ * worker bridge drops); `SessionStatus.set(idle)` also publishes the deprecated
+ * `session.idle` on the hub, so it rides the same hub-proxy channel.
  */
-const HUB_OWNED_TYPES: ReadonlySet<string> = new Set(["session.status", "session.idle"])
+const HUB_OWNED_TYPES: ReadonlySet<string> = new Set([
+  ...HUB_PROXIED_EVENT_TYPES,
+  SessionStatusEvent.Idle.type,
+])
 
 /**
  * Split a captured sequence by the channel it crossed. The worker event bridge

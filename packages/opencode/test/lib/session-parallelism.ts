@@ -27,6 +27,7 @@ import {
   createLoopGapProbe,
   readThreadCpuTicks,
   recordLoopGap,
+  type LoopGapProbe,
   type LoopGapSample,
   type ThreadCpuTicks,
 } from "./loop-gap"
@@ -208,6 +209,7 @@ export async function runParallelSessions(options: ParallelSessionOptions): Prom
   const dispatcher = createDispatcher({ pool })
   const dispatch = createSessionDispatch({ dispatcher, pool })
 
+  let probe: LoopGapProbe | undefined
   let report: Omit<ParallelSessionReport, "leak"> | undefined
   try {
     const bootstraps = await Promise.all(spawned.map((worker) => worker.spawn))
@@ -218,7 +220,7 @@ export async function runParallelSessions(options: ParallelSessionOptions): Prom
     }
 
     const before = threadIds.map((threadId) => readThreadCpuTicks(threadId))
-    const probe = createLoopGapProbe({ intervalMs: LOOP_GAP_INTERVAL_MS })
+    probe = createLoopGapProbe({ intervalMs: LOOP_GAP_INTERVAL_MS })
     const startedAt = performance.now()
     const sessionIDs = Array.from({ length: sessions }, (_, index) => `ses_par_${index}` as SessionID)
     const results = await Promise.all(sessionIDs.map((sessionID) => dispatch.ensureRunning(sessionID)))
@@ -243,6 +245,7 @@ export async function runParallelSessions(options: ParallelSessionOptions): Prom
       results,
     }
   } finally {
+    probe?.stop()
     for (const port of leakDetector.ports) port.close()
     await dispatcher.terminateAll().catch(() => undefined)
     await harness.dispose().catch(() => undefined)

@@ -1,6 +1,7 @@
-import { Effect } from "effect"
+import { Effect, Layer, Schema } from "effect"
+import type { unhandled } from "effect/Types"
 import { HttpServerResponse } from "effect/unstable/http"
-import { HttpApiMiddleware } from "effect/unstable/httpapi"
+import { HttpApiError, HttpApiMiddleware } from "effect/unstable/httpapi"
 import { InvalidRequestError } from "../errors"
 
 // Effect's Issue formatter recursively dumps the rejected `actual` value with
@@ -22,7 +23,10 @@ export class SchemaErrorMiddleware extends HttpApiMiddleware.Service<SchemaError
   },
 ) {}
 
-export const schemaErrorLayer = HttpApiMiddleware.layerSchemaErrorTransform(SchemaErrorMiddleware, (error, context) => {
+const respond = (
+  error: HttpApiError.HttpApiSchemaError,
+  context: { readonly endpoint: { readonly path: string } },
+): Effect.Effect<HttpServerResponse.HttpServerResponse, InvalidRequestError, never> => {
   const reason = truncateReason(error.cause.message)
   const response = context.endpoint.path.startsWith("/api/")
     ? Effect.fail(
@@ -38,4 +42,27 @@ export const schemaErrorLayer = HttpApiMiddleware.layerSchemaErrorTransform(Sche
         ),
       )
   return Effect.logWarning("schema rejection", { kind: error.kind, reason }).pipe(Effect.andThen(response))
-})
+}
+
+// A schema rejection can surface two ways:
+//   1. A framework-typed `HttpApiSchemaError` failure (param/query/payload decode
+//      or response encode), caught by `Effect.catch`.
+//   2. A `SchemaError` defect thrown synchronously by a boundary decoder that
+//      validates untrusted persisted data with `Schema.decodeUnknownSync`
+//      (e.g. session message/part hydration), caught by `Effect.catchDefect`.
+// Both are the same class of failure and must render the same NamedError-shaped
+// 400, so both route through `respond`. Non-schema defects and typed errors are
+// re-raised unchanged.
+export const schemaErrorLayer = Layer.succeed(SchemaErrorMiddleware, (httpEffect, options) =>
+  Effect.catch(
+    Effect.catchDefect(httpEffect, (defect) =>
+      Schema.isSchemaError(defect)
+        ? Effect.fail(new HttpApiError.HttpApiSchemaError({ kind: "Body", cause: defect }))
+        : Effect.die(defect),
+    ),
+    (
+      error,
+    ): Effect.Effect<HttpServerResponse.HttpServerResponse, unhandled | InvalidRequestError, never> =>
+      HttpApiError.HttpApiSchemaError.is(error) ? respond(error, options) : Effect.fail(error),
+  ),
+)

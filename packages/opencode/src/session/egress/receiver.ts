@@ -13,7 +13,7 @@
 // non-durable delta is DROPPED and a resync is surfaced, so a slow hub never
 // blocks the worker. Durable events are never dropped.
 
-import { type EventsAckPayload, type EventsFrame, type EventsResyncPayload, decodeFrameChunks } from "./frame"
+import { type EventsAckPayload, type EventsFrame, type EventsResyncPayload, createFrameDecoder } from "./frame"
 // The single durability test lives on the shared envelope; the codec re-exports
 // it, but the receiver depends on the canonical module so there is one source.
 import { durableMetaOf } from "@/session/worker/frame"
@@ -72,8 +72,6 @@ export interface EgressReceiver {
   close(): void
 }
 
-const EMPTY = new Uint8Array(0)
-
 function asBytes(data: unknown): Uint8Array {
   if (data instanceof Uint8Array) return data
   if (data instanceof ArrayBuffer) return new Uint8Array(data)
@@ -81,14 +79,6 @@ function asBytes(data: unknown): Uint8Array {
   throw new Error(
     `egress receiver expected Uint8Array, ArrayBuffer, or ArrayBufferView, got: ${Object.prototype.toString.call(data)}`,
   )
-}
-
-function concat(left: Uint8Array, right: Uint8Array): Uint8Array {
-  if (left.byteLength === 0) return right
-  const joined = new Uint8Array(left.byteLength + right.byteLength)
-  joined.set(left, 0)
-  joined.set(right, left.byteLength)
-  return joined
 }
 
 /**
@@ -107,7 +97,9 @@ function assertDurableOrder(meta: WriterOrdinal, last: WriterOrdinal | undefined
 
 export function createEgressReceiver(options: EgressReceiverOptions): EgressReceiver {
   const { port } = options
-  let rest: Uint8Array = EMPTY
+  // One preallocated reassembly buffer (see `createFrameDecoder`): a frame split
+  // across many deliveries reassembles in linear time, never quadratic.
+  const decoder = createFrameDecoder()
   let received = 0
   let dropped = 0
   let resyncs = 0
@@ -118,6 +110,8 @@ export function createEgressReceiver(options: EgressReceiverOptions): EgressRece
   const fail = (error: Error): void => {
     if (lastError) return
     lastError = error
+    // The receiver stops here, so buffered bytes can never complete a frame.
+    decoder.reset()
     options.onError?.(error)
     port.close()
   }
@@ -164,11 +158,7 @@ export function createEgressReceiver(options: EgressReceiverOptions): EgressRece
     if (lastError || ended) return
     try {
       const chunk = asBytes(event.data)
-      const { frames, rest: nextRest } = decodeFrameChunks(concat(rest, chunk))
-      // Commit the trailing bytes only once every frame in the batch is handled:
-      // a mid-batch failure must not advance `rest` past undelivered frames.
-      for (const { frame, bytes } of frames) handleFrame(frame, bytes)
-      rest = nextRest
+      for (const { frame, bytes } of decoder.push(chunk)) handleFrame(frame, bytes)
     } catch (error) {
       fail(error instanceof Error ? error : new Error(String(error)))
     }
@@ -189,7 +179,7 @@ export function createEgressReceiver(options: EgressReceiverOptions): EgressRece
       return ended
     },
     get pendingBytes() {
-      return rest.byteLength
+      return decoder.pending
     },
     get lastError() {
       return lastError

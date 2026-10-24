@@ -13,11 +13,7 @@ import {
   type SessionWork,
   type SessionWorkFactory,
 } from "@/session/worker/execute"
-
-const scope = globalThis as unknown as {
-  onmessage: ((event: { data: unknown }) => void) | null
-  postMessage(message: unknown): void
-}
+import { scope } from "./worker-scope"
 
 const DURATIONS: Record<string, number> = {
   instant: 0,

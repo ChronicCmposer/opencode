@@ -249,6 +249,15 @@ describe("5.1 executor protocol", () => {
       if (out.type === "error") expect(out.tag).toBe("UnknownWorkKindError")
     }))
 
+  test("an unrecognised request echoes the caller's correlation id instead of 0", () =>
+    withScope(async (scope) => {
+      const executor = createSessionExecutor({ machine: createSessionRunMachine({ scope }), work: echoWork })
+      const out = await executor.handle({ type: "not-a-request", id: 42 } as never)
+      // Echoing the inbound id lets the sender match the failure instead of
+      // waiting forever on the reserved id 0.
+      expect(out).toEqual({ type: "error", id: 42, message: "unknown executor request" })
+    }))
+
   test("assertNotBusy reflects worker-local state", () =>
     withScope(async (scope) => {
       const machine = createSessionRunMachine({ scope })
@@ -627,7 +636,11 @@ describe("liveness watchdog (execute)", () => {
    */
   const pongingTransport = (
     pongsBeforeDone: number,
-  ): { readonly transport: ExecutorTransport; readonly pings: () => number } => {
+  ): {
+    readonly transport: ExecutorTransport
+    readonly pings: () => number
+    readonly pendingWaiters: () => number
+  } => {
     let pings = 0
     let run: { readonly id: number; readonly sessionID: SessionID } | undefined
     const waiters = new Set<{
@@ -652,6 +665,7 @@ describe("liveness watchdog (execute)", () => {
     }
     return {
       pings: () => pings,
+      pendingWaiters: () => waiters.size,
       transport: {
         post: (message) => {
           if (message.type === "ping") answerPing(message.id)
@@ -678,6 +692,17 @@ describe("liveness watchdog (execute)", () => {
               }, waitMs)
             }
             waiters.add(waiter)
+            // Honour the abort the watchdog sends once the run settles, so an
+            // abandoned pong waiter is removed immediately.
+            options?.signal?.addEventListener(
+              "abort",
+              () => {
+                if (!waiters.delete(waiter)) return
+                if (timer !== undefined) clearTimeout(timer)
+                reject(new Error("aborted"))
+              },
+              { once: true },
+            )
           }),
         alive: true,
         terminate: async () => 0,
@@ -713,6 +738,47 @@ describe("liveness watchdog (execute)", () => {
     await expect(worker.execute({ sessionID: sid("ses_wedged"), depth: 0 })).rejects.toBeInstanceOf(
       SessionWorkerReplyTimeoutError,
     )
+  })
+
+  test("a resolved run cancels its outstanding liveness probe instead of leaking the waiter", async () => {
+    // The ping probe is posted at 100ms and never answered; the run completes at
+    // 150ms, while the probe waiter is still outstanding (its own deadline is
+    // 200ms). The watchdog must abort the probe, not leave it registered.
+    const waiters = new Set<{ readonly resolve: (message: SessionExecutorOutbound) => void }>()
+    const deliver = (message: SessionExecutorOutbound): void => {
+      for (const waiter of [...waiters]) {
+        waiters.delete(waiter)
+        waiter.resolve(message)
+      }
+    }
+    const transport: ExecutorTransport = {
+      post: (message) => {
+        if (message.type === "run" || message.type === "startShell") {
+          setTimeout(() => deliver({ type: "done", id: message.id, result: { sessionID: message.sessionID } }), 150)
+        }
+      },
+      waitFor: (_match, options) =>
+        new Promise<SessionExecutorOutbound>((resolve, reject) => {
+          const waitMs = options?.timeoutMs ?? 30_000
+          const waiter = { resolve }
+          const settle = (fail: () => void): void => {
+            if (!waiters.delete(waiter)) return
+            fail()
+          }
+          if (waitMs > 0) setTimeout(() => settle(() => reject(new SessionWorkerReplyTimeoutError(waitMs))), waitMs)
+          options?.signal?.addEventListener("abort", () => settle(() => reject(new Error("aborted"))), { once: true })
+          waiters.add(waiter)
+        }),
+      alive: true,
+      terminate: async () => 0,
+    }
+    const worker = createExecutorWorker({ id: 1, transport, workKind: "slow", runIdleTimeoutMs: 100 })
+
+    await worker.execute({ sessionID: sid("ses_probe"), depth: 0 })
+
+    // The probe's pong waiter must be gone: only the watchdog's abort removes it
+    // before its own 200ms deadline.
+    expect(waiters.size).toBe(0)
   })
 })
 

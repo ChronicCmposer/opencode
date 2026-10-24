@@ -11,7 +11,7 @@
 //   12.3 the hub loop stays I/O-only while K sessions run;
 //   12.4 HTTP ingress + SSE stay functional while K sessions run.
 
-import { describe, expect, test } from "bun:test"
+import { beforeEach, describe, expect, test } from "bun:test"
 import { Context, Effect, Exit, Fiber, Layer, Logger, ManagedRuntime, Option } from "effect"
 import type { EffectBridge } from "@/effect/bridge"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -76,7 +76,8 @@ import { Session } from "@/session/session"
 import type { ShellInput } from "@/session/prompt"
 import { testEffect } from "../../lib/effect"
 import { TestLLMServer } from "../../lib/llm-server"
-import { sid } from "../../lib/async"
+import { settleOf, sid } from "../../lib/async"
+import { lineFor, recordingLogger } from "../../lib/recorders"
 import { pollUntil } from "../../lib/poll"
 import { createHubProxyClient } from "@/session/worker/layer"
 import type { HubProxyMethod } from "@/session/worker/hub-proxy-wire"
@@ -277,6 +278,12 @@ class FakeWorker {
     FakeWorker.instances.push(this)
   }
 
+  /** Clear the shared statics so an assertion never reads a previous test's worker. */
+  static reset(): void {
+    FakeWorker.last = undefined
+    FakeWorker.instances.length = 0
+  }
+
   postMessage(message: unknown): void {
     this.posted.push(message)
   }
@@ -295,13 +302,30 @@ class FakeWorker {
   }
 }
 
+// Every test starts from a clean FakeWorker fleet, so `last`/`instances` can never
+// leak one test's workers into the next.
+beforeEach(() => FakeWorker.reset())
+
+/**
+ * Swap `globalThis.Worker` for {@link FakeWorker} for the duration of `run`. A
+ * test that builds its own pool (rather than a transport) uses this instead of
+ * hand-rolling the swap, so the restore is always paired with the install.
+ */
+async function withGlobalFakeWorker(run: () => Promise<void>): Promise<void> {
+  const original = (globalThis as { Worker?: unknown }).Worker
+  ;(globalThis as { Worker?: unknown }).Worker = FakeWorker
+  try {
+    await run()
+  } finally {
+    ;(globalThis as { Worker?: unknown }).Worker = original
+  }
+}
+
 async function withFakeWorker(
   run: (fake: FakeWorker, transport: ExecutorTransport) => Promise<void>,
   options: { readonly bufferCapacity?: number; readonly log?: WorkerLogger; readonly workerID?: number } = {},
 ): Promise<void> {
-  const original = (globalThis as { Worker?: unknown }).Worker
-  ;(globalThis as { Worker?: unknown }).Worker = FakeWorker
-  try {
+  await withGlobalFakeWorker(async () => {
     const transport = createBunExecutorTransport({
       entry: "fake://session-worker",
       ...(options.bufferCapacity === undefined ? {} : { bufferCapacity: options.bufferCapacity }),
@@ -311,27 +335,11 @@ async function withFakeWorker(
     const fake = FakeWorker.last
     if (fake === undefined) throw new Error("fake worker was never constructed")
     await run(fake, transport)
-  } finally {
-    ;(globalThis as { Worker?: unknown }).Worker = original
-  }
+  })
 }
 
-/** A `log` sink that records every emitted line for assertions. */
-interface RecordedLogLine {
-  readonly message: string
-  readonly fields: Record<string, unknown>
-}
-const recordingLog = (): { readonly log: WorkerLogger; readonly lines: RecordedLogLine[] } => {
-  const lines: RecordedLogLine[] = []
-  return { log: (message, fields) => void lines.push({ message, fields }), lines }
-}
-const lineFor = (lines: RecordedLogLine[], event: string): RecordedLogLine => {
-  const line = lines.find((entry) => entry.message === workerLogMessage(event))
-  if (line === undefined) {
-    throw new Error(`no log line for "${event}"; saw ${JSON.stringify(lines.map((entry) => entry.message))}`)
-  }
-  return line
-}
+/** The shared log recorder; `lineFor` fails loud when a line is missing. */
+const recordingLog = recordingLogger
 
 describe("12.x executor transport buffering", () => {
   test("a buffered frame is consumed by the first matching wait", async () => {
@@ -369,6 +377,21 @@ describe("12.x executor transport buffering", () => {
     )
   })
 
+  test("a frame matching an outstanding waiter resolves even when the cap would drop it", async () => {
+    await withFakeWorker(
+      async (fake, transport) => {
+        // The waiter is registered first; an unmatched frame fills the (zero)
+        // buffer, then the awaited frame arrives. It must be matched before the
+        // cap can evict it, rather than being discarded and starving the waiter.
+        const pending = transport.waitFor((message) => markerOf(message) === 9, { timeoutMs: 0 })
+        fake.emit({ marker: 8 })
+        fake.emit({ marker: 9 })
+        expect(markerOf(await pending)).toBe(9)
+      },
+      { bufferCapacity: 0 },
+    )
+  })
+
   test("a worker error terminates the isolate, detaches handlers and fails waiters", async () => {
     await withFakeWorker(async (fake, transport) => {
       const pending = transport.waitFor(() => true)
@@ -388,7 +411,9 @@ describe("12.x executor transport buffering", () => {
   test("a malformed workerData fails loud at the isolate boundary", async () => {
     const transport = createBunExecutorTransport({
       entry: SESSION_WORKER,
-      timeoutMs: 5_000,
+      // A cold worker import graph can outlast a tight budget on a loaded host;
+      // the assertion is about the failure surfacing, not its latency.
+      timeoutMs: 15_000,
       workerData: { snapshot: null, env: {}, model: { baseUrl: "http://localhost:1" } },
     })
     await expect(transport.waitFor(() => true)).rejects.toThrow(/snapshot is required/)
@@ -1681,11 +1706,11 @@ describe("Q9/Q23 session.cancelled", () => {
 // W2 — production cancellation authorities (Phase 5.3/6.2/6.4).
 // ---------------------------------------------------------------------------
 
-const settleOf = (promise: Promise<unknown>): Promise<unknown> =>
-  promise.then(
-    () => undefined,
-    (error: unknown) => error,
-  )
+/** The shared settlement primitive, adapted to this suite's rejection-or-undefined shape. */
+const rejectionOf = async (promise: Promise<unknown>): Promise<unknown> => {
+  const settled = await settleOf(promise)
+  return settled.ok ? undefined : settled.error
+}
 
 describe("W2 cancellation authorities", () => {
   test("childrenOf defaults to the job registry and onCancelled marks jobs cancelled", async () => {
@@ -1697,8 +1722,8 @@ describe("W2 cancellation authorities", () => {
       hub.jobs.start({ id: "ses_child", type: "task", parentID: "ses_parent" })
       hub.jobs.linkChild("ses_parent", "ses_child")
 
-      const parent = settleOf(hub.dispatcher.dispatch({ sessionID: sid("ses_parent"), depth: 0 }))
-      const child = settleOf(hub.dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 }))
+      const parent = rejectionOf(hub.dispatcher.dispatch({ sessionID: sid("ses_parent"), depth: 0 }))
+      const child = rejectionOf(hub.dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 }))
       await pollUntil(() => hub.dispatcher.registry.get(sid("ses_child"))?.state === "running", {
         message: "child never started",
       })
@@ -2226,34 +2251,32 @@ describe("fallbackInstanceContext (Wave-2 consolidation)", () => {
 
 describe("Fix 1 workerID threading", () => {
   test("the production pool ships the pool slot id as workerData.workerID", async () => {
-    const original = (globalThis as { Worker?: unknown }).Worker
-    ;(globalThis as { Worker?: unknown }).Worker = FakeWorker
-    const started = FakeWorker.instances.length
-    const pool = createProductionWorkerPool({
-      init: () => sessionWorkerInit(),
-      count: 2,
-      entry: "fake://workerid",
-      workKind: "instant",
-      timeoutMs: 5_000,
-    })
-    try {
-      // Fire both runs but never await: the fake isolate never replies, and the
-      // only thing under test is the `workerData` the pool hands to `new Worker`.
-      // Terminating the pool below rejects these pending runs (all caught).
-      for (const [index, worker] of pool.workers.entries()) {
-        void worker.execute({ sessionID: sid(`ses_wid_${index}`), depth: 0 }).catch(() => undefined)
-      }
-      await pollUntil(() => FakeWorker.instances.length - started === 2, { message: "workers never spawned" })
+    await withGlobalFakeWorker(async () => {
+      const pool = createProductionWorkerPool({
+        init: () => sessionWorkerInit(),
+        count: 2,
+        entry: "fake://workerid",
+        workKind: "instant",
+        timeoutMs: 5_000,
+      })
+      try {
+        // Fire both runs but never await: the fake isolate never replies, and the
+        // only thing under test is the `workerData` the pool hands to `new Worker`.
+        // Terminating the pool below rejects these pending runs (all caught).
+        for (const [index, worker] of pool.workers.entries()) {
+          void worker.execute({ sessionID: sid(`ses_wid_${index}`), depth: 0 }).catch(() => undefined)
+        }
+        await pollUntil(() => FakeWorker.instances.length === 2, { message: "workers never spawned" })
 
-      const workerIDs = FakeWorker.instances
-        .slice(started)
-        .map((worker) => (worker.options?.workerData as { workerID?: number } | undefined)?.workerID)
-      // Slot ids 1 and 2 — never the isolate threadId.
-      expect(workerIDs).toEqual([1, 2])
-    } finally {
-      ;(globalThis as { Worker?: unknown }).Worker = original
-      await pool.terminateAll()
-    }
+        const workerIDs = FakeWorker.instances.map(
+          (worker) => (worker.options?.workerData as { workerID?: number } | undefined)?.workerID,
+        )
+        // Slot ids 1 and 2 — never the isolate threadId.
+        expect(workerIDs).toEqual([1, 2])
+      } finally {
+        await pool.terminateAll()
+      }
+    })
   })
 
   test("a worker rebinds to a second session under the SAME pool slot id", async () => {
@@ -2402,8 +2425,8 @@ describe("W4 cancelWithReport", () => {
       hub.jobs.start({ id: childID, type: "task", parentID })
       hub.jobs.linkChild(parentID, childID)
 
-      const parent = settleOf(hub.dispatcher.dispatch({ sessionID: parentID, depth: 0 }))
-      const child = settleOf(hub.dispatcher.dispatch({ sessionID: childID, depth: 1 }))
+      const parent = rejectionOf(hub.dispatcher.dispatch({ sessionID: parentID, depth: 0 }))
+      const child = rejectionOf(hub.dispatcher.dispatch({ sessionID: childID, depth: 1 }))
       await pollUntil(() => hub.dispatcher.registry.get(childID)?.state === "running", {
         message: "child never started",
       })
@@ -2438,7 +2461,7 @@ describe("W4 cancelWithReport", () => {
       hub.jobs.start({ id: childID, type: "task", parentID })
       hub.jobs.linkChild(parentID, childID)
 
-      const parent = settleOf(hub.dispatcher.dispatch({ sessionID: parentID, depth: 0 }))
+      const parent = rejectionOf(hub.dispatcher.dispatch({ sessionID: parentID, depth: 0 }))
       await pollUntil(() => hub.dispatcher.registry.get(parentID)?.state === "running", {
         message: "parent never started",
       })
@@ -2472,7 +2495,7 @@ describe("W4 cancelWithReport", () => {
       hub.jobs.start({ id: childID, type: "task", parentID })
       hub.jobs.linkChild(parentID, childID)
 
-      const parent = settleOf(hub.dispatcher.dispatch({ sessionID: parentID, depth: 0 }))
+      const parent = rejectionOf(hub.dispatcher.dispatch({ sessionID: parentID, depth: 0 }))
       await pollUntil(() => hub.dispatcher.registry.get(parentID)?.state === "running", {
         message: "parent never started",
       })
@@ -2619,16 +2642,15 @@ describe("W12 observability — rebind and ports", () => {
 
 describe("dbwal-12-07 hub wiring — B1/D2 forward log through production paths", () => {
   test("B1 spawnBunExecutorWorker forwards log into createExecutorWorker", async () => {
-    const original = (globalThis as { Worker?: unknown }).Worker
-    ;(globalThis as { Worker?: unknown }).Worker = FakeWorker
-    const { log, lines } = recordingLog()
-    const worker = spawnBunExecutorWorker(7, { k: 1, entry: "fake://spawn", workKind: "slow", log })
-    try {
-      expect(lineFor(lines, "worker spawning").fields).toEqual({ workerID: 7, kind: "slow", reason: "initial" })
-    } finally {
-      ;(globalThis as { Worker?: unknown }).Worker = original
-      await worker.terminate()
-    }
+    await withGlobalFakeWorker(async () => {
+      const { log, lines } = recordingLog()
+      const worker = spawnBunExecutorWorker(7, { k: 1, entry: "fake://spawn", workKind: "slow", log })
+      try {
+        expect(lineFor(lines, "worker spawning").fields).toEqual({ workerID: 7, kind: "slow", reason: "initial" })
+      } finally {
+        await worker.terminate()
+      }
+    })
   })
 
   test("D2 createSessionBoundExecutorWorker forwards log into its cancel port", async () => {
@@ -2702,52 +2724,50 @@ describe("liveness watchdog wiring", () => {
   })
 
   test("createProductionWorkerPool threads runIdleTimeoutMs into the spawned worker", async () => {
-    const original = (globalThis as { Worker?: unknown }).Worker
-    ;(globalThis as { Worker?: unknown }).Worker = FakeWorker
-    const pool = createProductionWorkerPool({
-      init: () => sessionWorkerInit(),
-      count: 1,
-      entry: "fake://idle-timeout",
-      workKind: "instant",
-      runIdleTimeoutMs: 25,
+    await withGlobalFakeWorker(async () => {
+      const pool = createProductionWorkerPool({
+        init: () => sessionWorkerInit(),
+        count: 1,
+        entry: "fake://idle-timeout",
+        workKind: "instant",
+        runIdleTimeoutMs: 25,
+      })
+      try {
+        // The fake isolate never replies, so only a watchdog that actually reached
+        // the worker can reject this instead of hanging.
+        await expect(pool.workers[0].execute({ sessionID: sid("ses_idle"), depth: 0 })).rejects.toBeInstanceOf(
+          SessionWorkerReplyTimeoutError,
+        )
+      } finally {
+        await pool.terminateAll()
+      }
     })
-    try {
-      // The fake isolate never replies, so only a watchdog that actually reached
-      // the worker can reject this instead of hanging.
-      await expect(pool.workers[0].execute({ sessionID: sid("ses_idle"), depth: 0 })).rejects.toBeInstanceOf(
-        SessionWorkerReplyTimeoutError,
-      )
-    } finally {
-      ;(globalThis as { Worker?: unknown }).Worker = original
-      await pool.terminateAll()
-    }
   })
 
   test("createProductionSessionHub resolves the env override and reaches the worker", async () => {
-    const original = (globalThis as { Worker?: unknown }).Worker
-    ;(globalThis as { Worker?: unknown }).Worker = FakeWorker
-    const hub = createProductionSessionHub({
-      init: () => sessionWorkerInit(),
-      count: 1,
-      entry: "fake://idle-env",
-      workKind: "instant",
-      env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "25" },
+    await withGlobalFakeWorker(async () => {
+      const hub = createProductionSessionHub({
+        init: () => sessionWorkerInit(),
+        count: 1,
+        entry: "fake://idle-env",
+        workKind: "instant",
+        env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "25" },
+      })
+      try {
+        // Resolved from the env override: the dispatch must settle (the watchdog
+        // fired) rather than hang forever. The exact rejection is the dispatcher's
+        // concern (it may terminate the worker), so only settlement is asserted.
+        const outcome = await Promise.race([
+          hub.ensureRunning(sid("ses_idle_env")).then(
+            () => "resolved" as const,
+            (error: unknown) => error,
+          ),
+          new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 3_000)),
+        ])
+        expect(outcome).not.toBe("hung")
+      } finally {
+        await hub.terminateAll()
+      }
     })
-    try {
-      // Resolved from the env override: the dispatch must settle (the watchdog
-      // fired) rather than hang forever. The exact rejection is the dispatcher's
-      // concern (it may terminate the worker), so only settlement is asserted.
-      const outcome = await Promise.race([
-        hub.ensureRunning(sid("ses_idle_env")).then(
-          () => "resolved" as const,
-          (error: unknown) => error,
-        ),
-        new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 3_000)),
-      ])
-      expect(outcome).not.toBe("hung")
-    } finally {
-      ;(globalThis as { Worker?: unknown }).Worker = original
-      await hub.terminateAll()
-    }
   })
 })

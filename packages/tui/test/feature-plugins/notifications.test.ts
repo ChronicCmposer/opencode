@@ -62,8 +62,9 @@ function harness() {
     bus.emit("session.status", { properties: { sessionID, status: value } })
   const cancelled = (sessionID: string, mode: "cooperative" | "terminated" | "completed") =>
     bus.emit("session.cancelled", { properties: { sessionID, mode, durationMs: 1, acknowledged: true } })
+  const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
 
-  return { notifications: notifications_, toasts, sessions, status, cancelled }
+  return { notifications: notifications_, toasts, sessions, status, cancelled, flush }
 }
 
 const session = "ses_1"
@@ -81,11 +82,12 @@ const pluginMeta = {
   state: "same",
 } satisfies TuiPluginMeta
 
-test("a cooperative cancel surfaces its mode and suppresses the terminal idle", () => {
+test("a cooperative cancel surfaces its mode and suppresses the terminal idle", async () => {
   const h = harness()
   h.status(session, { type: "busy" })
   h.cancelled(session, "cooperative")
   h.status(session, { type: "idle" })
+  await h.flush()
 
   expect(h.toasts).toEqual([{ message: "Session cancelled", variant: "warning" }])
   expect(h.notifications).toEqual([])
@@ -108,23 +110,38 @@ test("a subagent cancel stays silent", () => {
   expect(h.notifications).toEqual([])
 })
 
-test("an ordinary idle still announces completion", () => {
+test("an ordinary idle still announces completion", async () => {
   const h = harness()
   h.status(session, { type: "busy" })
   h.status(session, { type: "idle" })
+  await h.flush()
 
   expect(h.notifications).toEqual([{ message: "Session done", sound: "done" }])
   expect(h.toasts).toEqual([])
 })
 
-test("a cancel resting on an earlier idle still surfaces its mode", () => {
-  // The hub can publish the terminal idle before `session.cancelled`; the cancel
-  // outcome must still reach the user, not be swallowed by the idle's "done".
+test("a cancel after the terminal idle supersedes the pending completion", async () => {
+  // The hub publishes the terminal idle before `session.cancelled` for a
+  // cooperative cancel. The completion announcement is deferred so the cancel
+  // outcome is the only thing the user hears.
   const h = harness()
   h.status(session, { type: "busy" })
   h.status(session, { type: "idle" })
   h.cancelled(session, "cooperative")
+  await h.flush()
 
-  expect(h.notifications).toEqual([{ message: "Session done", sound: "done" }])
+  expect(h.notifications).toEqual([])
+  expect(h.toasts).toEqual([{ message: "Session cancelled", variant: "warning" }])
+})
+
+test("a later idle after a cancel does not re-announce completion", async () => {
+  const h = harness()
+  h.status(session, { type: "busy" })
+  h.cancelled(session, "cooperative")
+  h.status(session, { type: "idle" })
+  h.status(session, { type: "idle" })
+  await h.flush()
+
+  expect(h.notifications).toEqual([])
   expect(h.toasts).toEqual([{ message: "Session cancelled", variant: "warning" }])
 })

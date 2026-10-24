@@ -24,11 +24,24 @@ import { runParallelSessions } from "./session-parallelism"
 /** The default per-run owner fencing every durable row in a rollout capture. */
 export const DEFAULT_OWNER = "run-rollout"
 
-/** The observable chat result both paths produce from the same mock SSE stream. */
+/**
+ * The observable chat result both paths produce from the same mock SSE stream.
+ * `hash` is the deterministic CPU-burn fingerprint (see `burnCpu`): it proves
+ * each path actually performed the same synchronous work, so it is parsed and
+ * validated rather than discarded.
+ */
 export interface SessionChatResult {
   readonly text: string
   readonly chunks: number
+  readonly hash: number
 }
+
+/**
+ * The SPEC inputs: the observable chat content without the host-dependent burn
+ * fingerprint. The durable transcript is a pure function of this content, so the
+ * golden spec stays stable across burn budgets.
+ */
+export type SessionSpecChat = Omit<SessionChatResult, "hash">
 
 /** A full durable row as the golden helper compares it (the canonical shape). */
 export type SessionDurableRow = GoldenRow
@@ -58,7 +71,20 @@ function parseChatResult(result: SessionExecutionResult): SessionChatResult {
   if (typeof chunks !== "number" || !Number.isInteger(chunks) || chunks < 0) {
     throw new Error(`session result chunks must be a non-negative integer (got ${JSON.stringify(chunks)})`)
   }
-  return { text, chunks }
+  const hash = record["hash"]
+  if (typeof hash !== "number" || !Number.isInteger(hash) || hash < 0) {
+    throw new Error(`session result hash must be a non-negative integer (got ${JSON.stringify(hash)})`)
+  }
+  return { text, chunks, hash }
+}
+
+/**
+ * Parse the CPU-burn fingerprint out of a run's result. Fails loudly when the
+ * value carries no valid hash, so a path that skipped the synchronous burn can
+ * never be recorded as equivalent.
+ */
+export function sessionBurnHash(result: SessionExecutionResult): number {
+  return parseChatResult(result).hash
 }
 
 // --- The durable transcript (the spec) --------------------------------------
@@ -70,7 +96,7 @@ function parseChatResult(result: SessionExecutionResult): SessionChatResult {
  */
 export function projectSessionDurable(
   sessionID: SessionID,
-  chat: SessionChatResult,
+  chat: SessionSpecChat,
   ownerID: string = DEFAULT_OWNER,
 ): ReadonlyArray<SessionDurableRow> {
   const events: ReadonlyArray<{ readonly type: string; readonly data: unknown }> = [
@@ -101,7 +127,7 @@ export function recordSessionDurable(
 /** The golden capture of the SPEC transcript for a known chat result. */
 export function specCapture(
   sessionID: SessionID,
-  chat: SessionChatResult,
+  chat: SessionSpecChat,
   ownerID: string = DEFAULT_OWNER,
 ): GoldenCapture {
   const golden = createGoldenCapture()

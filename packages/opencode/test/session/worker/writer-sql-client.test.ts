@@ -20,6 +20,7 @@ import { EffectDrizzleSqlite } from "../../../../effect-drizzle-sqlite/src/index
 import { createBunSqliteConnection } from "@/session/writer/connection"
 import { createWriterCore, type WriterCore } from "@/session/writer/core"
 import { writerSqlClient, type WriterSqlHandle } from "@/session/worker/writer-sql-client"
+import { WorkerWriterError } from "@/session/worker/writer-client"
 
 const widget = sqliteTable("widget", {
   id: integer("id").primaryKey(),
@@ -240,6 +241,70 @@ describe("writerSqlClient", () => {
     const error = await run(
       Effect.gen(function* () {
         const client = yield* writerSqlClient(failingWriter())
+        return yield* client.unsafe("SELECT 1").withoutTransform.pipe(Effect.flip)
+      }),
+    )
+
+    expect(error).toBeInstanceOf(SqlError)
+  })
+
+  test("a malformed writer reply is rejected as a typed SqlError, not blindly trusted", async () => {
+    const malformed: WriterSqlHandle = {
+      query: async () => ({ rows: "not-an-array" }),
+      begin: async () => "tx-1",
+      txQuery: async () => ({ rows: "not-an-array" }),
+      commit: async () => {},
+      rollback: async () => {},
+    }
+    const result = await run(
+      Effect.gen(function* () {
+        const client = yield* writerSqlClient(malformed)
+        const rowQuery = yield* client.unsafe("SELECT 1").withoutTransform.pipe(Effect.flip)
+        const valueQuery = yield* client.unsafe("SELECT 1").values.pipe(Effect.flip)
+        return { rowQuery, valueQuery }
+      }),
+    )
+
+    expect(result.rowQuery).toBeInstanceOf(SqlError)
+    expect(result.valueQuery).toBeInstanceOf(SqlError)
+  })
+
+  test("a non-object row element is rejected as a typed SqlError", async () => {
+    const malformed: WriterSqlHandle = {
+      query: async () => [1, 2, 3],
+      begin: async () => "tx-1",
+      txQuery: async () => [1, 2, 3],
+      commit: async () => {},
+      rollback: async () => {},
+    }
+    const error = await run(
+      Effect.gen(function* () {
+        const client = yield* writerSqlClient(malformed)
+        return yield* client.unsafe("SELECT 1").withoutTransform.pipe(Effect.flip)
+      }),
+    )
+
+    expect(error).toBeInstanceOf(SqlError)
+  })
+
+  test("a disposed writer rejection is surfaced as a typed SqlError, not a defect", async () => {
+    // The worker writer client rejects a disposed request with a tagged
+    // `WorkerWriterError("DISPOSED")`; the SQL boundary must route that into the
+    // `SqlError` channel Drizzle callers handle (never an untyped defect).
+    const disposed: WriterSqlHandle = {
+      query: async () => {
+        throw new WorkerWriterError("DISPOSED", "worker writer client disposed")
+      },
+      begin: async () => "tx-1",
+      txQuery: async () => {
+        throw new WorkerWriterError("DISPOSED", "worker writer client disposed")
+      },
+      commit: async () => {},
+      rollback: async () => {},
+    }
+    const error = await run(
+      Effect.gen(function* () {
+        const client = yield* writerSqlClient(disposed)
         return yield* client.unsafe("SELECT 1").withoutTransform.pipe(Effect.flip)
       }),
     )

@@ -13,6 +13,7 @@ import { LockTimeoutError, SqlError } from "effect/unstable/sql/SqlError"
 import {
   BusyRetriesExhaustedError,
   isBusySqlError,
+  isNativeSqliteError,
   resolveBusyRetryConfig,
   withBusyRetry,
 } from "@opencode-ai/core/database/busy"
@@ -60,6 +61,20 @@ describe("busy classifier", () => {
     expect(isBusySqlError({ code: "SQLITE_CONSTRAINT" })).toBe(false)
     expect(isBusySqlError(undefined)).toBe(false)
     expect(isBusySqlError("SQLITE_BUSY")).toBe(false)
+  })
+})
+
+describe("isNativeSqliteError", () => {
+  test("narrows exactly the driver shapes the classifier may trust", () => {
+    expect(isNativeSqliteError({ name: "SQLiteError" })).toBe(true)
+    expect(isNativeSqliteError({ code: "SQLITE_BUSY" })).toBe(true)
+    expect(isNativeSqliteError({ code: 5 })).toBe(true)
+    expect(isNativeSqliteError({ errno: 5 })).toBe(true)
+    expect(isNativeSqliteError({ sqliteCode: "SQLITE_BUSY" })).toBe(true)
+    // An arbitrary error whose only claim is its message is not a driver error.
+    expect(isNativeSqliteError(new Error("database is locked"))).toBe(false)
+    expect(isNativeSqliteError("SQLITE_BUSY")).toBe(false)
+    expect(isNativeSqliteError(null)).toBe(false)
   })
 })
 

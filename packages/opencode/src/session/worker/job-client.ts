@@ -20,7 +20,7 @@
 import { defined } from "@/util/object"
 import type { JobInfo, JobRegistry, JobWaitResult, StartJobInput } from "./job-registry"
 import type { BackgroundJobClientHandle } from "./layer"
-import { createRequestChannel, messageOf, portFromMessagePort } from "./port"
+import { createRequestChannel, messageOf, workerFrameChannel } from "./port"
 
 /**
  * Every frame carries a `kind` discriminant, so both ends switch exhaustively
@@ -74,7 +74,9 @@ export interface JobPort {
  * drive the client.
  */
 export function jobPortFromMessagePort(port: MessagePort): JobPort {
-  const channel = portFromMessagePort<JobFrame>(port)
+  // Job frames share the versioned worker envelope, so the wire is validated
+  // (version + port + payload discriminant) before the client trusts a frame.
+  const channel = workerFrameChannel<JobFrame>(port, "job")
   return { post: channel.post, onMessage: channel.onMessage }
 }
 

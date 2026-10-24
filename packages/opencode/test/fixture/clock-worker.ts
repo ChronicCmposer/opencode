@@ -7,23 +7,23 @@
 
 import { Effect } from "effect"
 import { attachClock, type ClockWorkerInbound } from "../lib/worker-clock"
+import { onMessage, postToParent } from "./worker-scope"
 
-interface ClockWorkerScope {
-  postMessage(message: unknown, transfer?: readonly Transferable[]): void
-  onmessage: ((event: { data: unknown }) => void) | null
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
-const scope = globalThis as unknown as ClockWorkerScope
 const channel = new MessageChannel()
 const clock = attachClock(channel.port1)
 
-scope.onmessage = (event) => {
-  const message = event.data as ClockWorkerInbound
+onMessage<ClockWorkerInbound>((message) => {
   if (!message || message.type !== "sleep") return
   Effect.gen(function* () {
     yield* Effect.sleep(message.ms)
-    scope.postMessage({ type: "slept", id: message.id, at: clock.currentTimeMillis() })
-  }).pipe(Effect.provide(clock.layer), Effect.runFork)
-}
+    postToParent({ type: "slept", id: message.id, at: clock.currentTimeMillis() })
+  })
+    .pipe(Effect.provide(clock.layer), Effect.runPromise)
+    .catch((error) => postToParent({ type: "error", id: message.id, message: messageOf(error) }))
+})
 
-scope.postMessage(channel.port2, [channel.port2])
+postToParent(channel.port2, [channel.port2])

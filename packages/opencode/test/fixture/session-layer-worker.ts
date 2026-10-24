@@ -23,6 +23,7 @@ import {
   type WorkerSnapshot,
 } from "@/session/worker/layer"
 import { readSseStream } from "../lib/sse"
+import { onMessage, postToParent } from "./worker-scope"
 
 interface MockModelBootstrap {
   readonly baseUrl: string
@@ -51,15 +52,14 @@ interface SnapshotMessage {
 
 type Inbound = InitMessage | RunMessage | SnapshotMessage
 
-interface WorkerScope {
-  postMessage(message: unknown): void
-  onmessage: ((event: { data: unknown }) => void) | null
-}
-
-const scope = globalThis as unknown as WorkerScope
+type SessionRuntime = ReturnType<typeof buildSessionWorkerLayer>
 
 const published: Array<{ seq: number; committed: boolean }> = []
 const emitted: string[] = []
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
 
 /** Parse one SSE body into the assistant text (the mock provider only emits JSON frames). */
 async function consumeChat(bootstrap: MockModelBootstrap, messages: readonly PipelineMessage[]): Promise<string> {
@@ -80,13 +80,21 @@ function modelLayer(bootstrap: MockModelBootstrap): Layer.Layer<ModelClient> {
     complete: (input) =>
       Effect.tryPromise({
         try: () => consumeChat(bootstrap, input.messages).then((text) => ({ text })),
-        catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+        catch: (error) => new Error(errorMessage(error)),
       }),
   }
   return Layer.succeed(ModelClient, service)
 }
 
-let runtime: ReturnType<typeof buildSessionWorkerLayer> | undefined
+let runtime: SessionRuntime | undefined
+
+/**
+ * Bumped whenever the active runtime is replaced or closed. A `run`/`snapshot`
+ * captures the value when it starts and drops its reply if the runtime moved on
+ * meanwhile, so a fiber from a superseded `init` can never post into the stream
+ * of the worker that replaced it.
+ */
+let generation = 0
 
 /**
  * Tear down the layer built by a previous `init`.
@@ -94,13 +102,25 @@ let runtime: ReturnType<typeof buildSessionWorkerLayer> | undefined
  * `buildSessionWorkerLayer` returns a compiled layer descriptor; every run
  * builds and releases its own services through `Effect.provide(runtime.layer)`,
  * so there is no long-lived scope to interrupt. Closing therefore drops the
- * handle so a restarted worker can never reuse the stale layer.
+ * handle (and advances the generation) so a restarted worker can never reuse the
+ * stale layer.
  */
-async function close(layer: ReturnType<typeof buildSessionWorkerLayer>): Promise<void> {
-  if (layer === runtime) runtime = undefined
+async function close(layer: SessionRuntime): Promise<void> {
+  if (layer !== runtime) return
+  runtime = undefined
+  generation += 1
 }
 
 async function handleInit(message: InitMessage): Promise<void> {
+  try {
+    await initialize(message)
+    postToParent({ type: "ready" })
+  } catch (error) {
+    postToParent({ type: "error", message: errorMessage(error) })
+  }
+}
+
+async function initialize(message: InitMessage): Promise<void> {
   if (runtime !== undefined) await close(runtime)
   // A restart must start from a clean slate: the previous init's publishes and
   // emitted events must not leak into the new worker.
@@ -124,48 +144,55 @@ async function handleInit(message: InitMessage): Promise<void> {
     },
     modelClient: modelLayer(message.model),
   })
-  scope.postMessage({ type: "ready" })
+  generation += 1
 }
 
 async function handleRun(message: RunMessage): Promise<void> {
-  if (runtime === undefined) {
-    scope.postMessage({ type: "error", id: message.id, message: "worker received run before init" })
+  const active = runtime
+  if (active === undefined) {
+    postToParent({ type: "error", id: message.id, message: "worker received run before init" })
     return
   }
+  const startedAt = generation
   try {
     const value = await Effect.runPromise(
       Effect.gen(function* () {
         const pipeline = yield* SessionPipeline
         return yield* pipeline.run({ sessionID: message.sessionID, messages: message.messages })
-      }).pipe(Effect.provide(runtime.layer)),
+      }).pipe(Effect.provide(active.layer)),
     )
-    scope.postMessage({ type: "result", id: message.id, value })
+    if (startedAt !== generation) return
+    postToParent({ type: "result", id: message.id, value })
   } catch (error) {
-    scope.postMessage({ type: "error", id: message.id, message: error instanceof Error ? error.message : String(error) })
+    if (startedAt !== generation) return
+    postToParent({ type: "error", id: message.id, message: errorMessage(error) })
   }
 }
 
 async function handleSnapshot(message: SnapshotMessage): Promise<void> {
-  if (runtime === undefined) {
-    scope.postMessage({ type: "error", id: message.id, message: "worker received snapshot before init" })
+  const active = runtime
+  if (active === undefined) {
+    postToParent({ type: "error", id: message.id, message: "worker received snapshot before init" })
     return
   }
+  const startedAt = generation
   try {
     const value = await Effect.runPromise(
       Effect.gen(function* () {
         const snapshot = yield* WorkerSnapshotService
         const env = yield* WorkerEnvService
         return { epoch: snapshot.epoch, directory: snapshot.directory, env: env.values }
-      }).pipe(Effect.provide(runtime.layer)),
+      }).pipe(Effect.provide(active.layer)),
     )
-    scope.postMessage({ type: "snapshot-result", id: message.id, value })
+    if (startedAt !== generation) return
+    postToParent({ type: "snapshot-result", id: message.id, value })
   } catch (error) {
-    scope.postMessage({ type: "error", id: message.id, message: error instanceof Error ? error.message : String(error) })
+    if (startedAt !== generation) return
+    postToParent({ type: "error", id: message.id, message: errorMessage(error) })
   }
 }
 
-scope.onmessage = (event) => {
-  const message = event.data as Inbound | undefined
+onMessage<Inbound | undefined>((message) => {
   if (message === undefined) return
   if (message.type === "init") {
     void handleInit(message)
@@ -178,4 +205,4 @@ scope.onmessage = (event) => {
   if (message.type === "snapshot") {
     void handleSnapshot(message)
   }
-}
+})

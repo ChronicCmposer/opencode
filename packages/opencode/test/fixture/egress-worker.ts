@@ -19,11 +19,7 @@
 import { createControlLink } from "../../src/session/egress/control"
 import { createMeshWorkerClient } from "../../src/session/egress/mesh"
 import { createEgressSender } from "../../src/session/egress/sender"
-
-interface WorkerScope {
-  postMessage(message: unknown, transfer?: readonly Transferable[]): void
-  onmessage: ((event: { data: unknown }) => void) | null
-}
+import { onMessage, postToParent } from "./worker-scope"
 
 interface Command {
   readonly type: string
@@ -33,7 +29,9 @@ interface Command {
   readonly pattern?: string
 }
 
-const scope = globalThis as unknown as WorkerScope
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
 
 const egressChannel = new MessageChannel()
 const controlChannel = new MessageChannel()
@@ -49,10 +47,10 @@ control.onMessage((frame) => {
 })
 
 mesh.onDurable((commit) => {
-  scope.postMessage({ type: "mesh.durable", id: commit.event.id })
+  postToParent({ type: "mesh.durable", id: commit.event.id })
 })
 mesh.onResync((pattern) => {
-  scope.postMessage({ type: "mesh.resync", pattern })
+  postToParent({ type: "mesh.resync", pattern })
 })
 
 const handleCommand = (message: Command): void => {
@@ -77,7 +75,10 @@ const handleCommand = (message: Command): void => {
     }
     case "mesh.listen": {
       const pattern = message.pattern ?? "*"
-      void mesh.listen(pattern).then(() => scope.postMessage({ type: "mesh.listen.ok", pattern }))
+      void mesh.listen(pattern).then(
+        () => postToParent({ type: "mesh.listen.ok", pattern }),
+        (error) => postToParent({ type: "mesh.listen.error", pattern, message: messageOf(error) }),
+      )
       return
     }
     case "mesh.ack":
@@ -92,9 +93,9 @@ const handleCommand = (message: Command): void => {
   }
 }
 
-scope.onmessage = (event) => handleCommand(event.data as Command)
+onMessage<Command>(handleCommand)
 
-scope.postMessage(
+postToParent(
   {
     type: "ports",
     egress: egressChannel.port2,

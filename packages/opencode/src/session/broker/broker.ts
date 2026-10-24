@@ -14,26 +14,35 @@
 
 import {
   BrokerFailure,
-  BrokerProtocolError,
   DEFAULT_MCP_TIMEOUT_MS,
   parseAcquireResult,
+  parseBrokerFrame,
   parseBrokerRequest,
   parseOAuthResult,
   parsePingResult,
+  parseWorkerHandshake,
+  toBrokerError,
 } from "./protocol"
 import type {
   AcquireResult,
-  BrokerError,
   BrokerErrorCode,
   BrokerFrame,
   BrokerRequest,
+  BrokerWorkerOutbound,
   OAuthResult,
   PingResult,
   ResponseFrame,
   ServerSpec,
 } from "./protocol"
 import { mergeEnv } from "./env"
-import { portFromMessagePort } from "../worker/port"
+import {
+  createRequestChannel,
+  portFromMessagePort,
+  rawRequestId,
+  resolveWorkerEntry,
+  servePort,
+  type FrameChannel,
+} from "../worker/port"
 
 export interface WorkerLike {
   readonly generation: number
@@ -77,6 +86,12 @@ export interface BrokerOptions {
   readonly env?: Record<string, string | undefined>
   /** Hub-side request timeout in ms; defaults to the broker `mcp_timeout`. */
   readonly timeoutMs?: number
+  /**
+   * Deadline for the initial `ready` handshake in ms; defaults to the broker
+   * `mcp_timeout`. Kept independent of `timeoutMs` so a short per-request timeout
+   * cannot make startup look like a crash.
+   */
+  readonly readyTimeoutMs?: number
   /** Override orphan reaping (defaults to a POSIX process-group kill). */
   readonly reaper?: ProcessReaper
 }
@@ -144,16 +159,15 @@ declare global {
 export function resolveBrokerWorkerEntry(
   options: { readonly env?: Record<string, string | undefined>; readonly definedPath?: string } = {},
 ): string | URL {
-  const defined =
-    options.definedPath ??
-    (typeof OPENCODE_BROKER_WORKER_PATH !== "undefined" ? OPENCODE_BROKER_WORKER_PATH : undefined)
-  const fromEnv = (options.env ?? process.env).OPENCODE_BROKER_WORKER_PATH
-  const resolved = fromEnv ?? defined
-  if (resolved === undefined || resolved === "") return new URL("./broker-worker.ts", import.meta.url)
-  return resolved
+  return resolveWorkerEntry({
+    env: options.env,
+    definedPath:
+      options.definedPath ??
+      (typeof OPENCODE_BROKER_WORKER_PATH !== "undefined" ? OPENCODE_BROKER_WORKER_PATH : undefined),
+    envVar: "OPENCODE_BROKER_WORKER_PATH",
+    fallback: new URL("./broker-worker.ts", import.meta.url),
+  })
 }
-
-const DEFAULT_ENTRY = resolveBrokerWorkerEntry()
 
 const defaultReaper: ProcessReaper = {
   reap(pgid: number): void {
@@ -174,21 +188,25 @@ interface BrokerWorkerHandle {
   terminate(): Promise<number> | number
 }
 
-interface PendingRequest {
-  readonly resolve: (value: unknown) => void
-  readonly reject: (error: Error) => void
-  readonly timer: ReturnType<typeof setTimeout>
-}
-
 function keyOf(directory: string, server: string): string {
   return `${directory}\u0000${server}`
 }
 
 export function createBroker(options: BrokerOptions = {}): BrokerClient {
-  const entry = options.entry ?? DEFAULT_ENTRY
+  // Resolve against the caller's env overlay: a spawn must honour the same
+  // override the caller passed, not whatever `process.env` held at import time.
+  const entry = options.entry ?? resolveBrokerWorkerEntry({ env: options.env })
   const env = mergeEnv(options.env)
   const reaper = options.reaper ?? defaultReaper
   const requestTimeoutMs = options.timeoutMs ?? DEFAULT_MCP_TIMEOUT_MS
+  const readyTimeoutMs = options.readyTimeoutMs ?? DEFAULT_MCP_TIMEOUT_MS
+  /** Upper bound on any per-call timeout override (10 minutes). */
+  const MAX_REQUEST_TIMEOUT_MS = 10 * 60_000
+
+  /** Respawn backoff bounds: a crash loop must not spawn workers without limit. */
+  const RESPAWN_BASE_MS = 50
+  const RESPAWN_MAX_MS = 2_000
+  const MAX_CONSECUTIVE_CRASHES = 6
 
   let generation = 1
   let threadId = 0
@@ -196,16 +214,22 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
   let disposed = false
   let currentWorkerId = 0
   let nextRequestId = 0
+  let consecutiveCrashes = 0
+  /** True once this generation has been torn down, so duplicate events are ignored. */
+  let workerGone = false
 
   const handshake: string[] = []
   const mirror = new Map<string, BrokerChild>()
-  const pending = new Map<string, PendingRequest>()
+  /** Inbound-frame subscribers, stable across generations (the port is per-generation). */
+  const inbound = new Set<(frame: BrokerRequest | BrokerFrame) => void>()
   const notificationHandlers = new Set<(notification: NotificationLike) => void>()
   const supervisionHandlers = new Set<(event: SupervisionEvent) => void>()
 
   let worker: BrokerWorkerHandle | undefined
   let port: MessagePort | undefined
   let readySettled = false
+  let readyTimer: ReturnType<typeof setTimeout> | undefined
+  let respawnTimer: ReturnType<typeof setTimeout> | undefined
 
   let resolveTransport: (() => void) | undefined
   let rejectTransport: ((error: Error) => void) | undefined
@@ -226,10 +250,65 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
 
   let transportReady = newTransportReady()
 
-  let settleReady!: () => void
-  const ready = new Promise<void>((resolve) => {
-    settleReady = resolve
+  /**
+   * The RPC channel facade. Outbound requests post to the current generation's
+   * `port`; inbound frames are fanned out to subscribers (the request channel's
+   * reply resolver plus the mirror/notification push handler). The port arrives
+   * after the handshake, so requests are gated on `transportReady` — and the
+   * shared request channel arms their timeout around that wait.
+   */
+  const rpcChannel: FrameChannel<BrokerRequest | BrokerFrame> = {
+    post: (frame) => {
+      if (port === undefined) throw new BrokerRequestError("crashed", "broker is not available")
+      port.postMessage(frame)
+    },
+    onMessage: (handler) => {
+      inbound.add(handler)
+      return () => inbound.delete(handler)
+    },
+  }
+
+  const requests = createRequestChannel<BrokerRequest | BrokerFrame, ResponseFrame, string>(rpcChannel, {
+    isReply: (frame): frame is ResponseFrame => frame.kind === "response",
+    idOf: (reply) => reply.requestId,
+    nextId,
+    duplicateError: (id) => new BrokerRequestError("invalid-request", `duplicate request id ${id}`),
+    disposedError: () => new BrokerRequestError("crashed", "broker torn down"),
+    timeoutError: (id, timeoutMs) => new BrokerRequestError("timeout", `request ${id} timed out after ${timeoutMs}ms`),
+    awaitPost: () => transportReady,
   })
+  // Non-response frames are pushes (notifications / child mirror), never replies;
+  // narrow by kind so a request-kind frame can never reach the push handler.
+  requests.onFrame((frame) => {
+    if (frame.kind === "notification" || frame.kind === "child" || frame.kind === "child-exit") handlePush(frame)
+  })
+
+  /** Fan one parsed inbound frame out to the channel's subscribers. */
+  function dispatchInbound(frame: BrokerFrame): void {
+    for (const handler of Array.from(inbound)) handler(frame)
+  }
+
+  let settleReady!: () => void
+  let rejectReady!: (error: Error) => void
+  const ready = new Promise<void>((resolve, reject) => {
+    settleReady = resolve
+    rejectReady = reject
+  })
+  // An observer may never await `ready`; a rejection must not go unhandled.
+  void ready.catch(() => {})
+
+  /** Settle `ready` as failed at most once (a later generation cannot revive it). */
+  function failReady(error: Error): void {
+    if (readySettled) return
+    readySettled = true
+    rejectReady(error)
+  }
+
+  function clearReadyTimer(): void {
+    if (readyTimer === undefined) return
+    clearTimeout(readyTimer)
+    readyTimer = undefined
+  }
 
   const workerHandle: WorkerLike = {
     get generation() {
@@ -247,17 +326,11 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
     for (const handler of [...supervisionHandlers]) handler(event)
   }
 
-  function handleFrame(frame: BrokerFrame): void {
+  /** Handle a non-reply frame: fan out notifications, mirror child lifecycle. */
+  function handlePush(frame: BrokerFrame): void {
     switch (frame.kind) {
-      case "response": {
-        const request = pending.get(frame.requestId)
-        if (!request) return
-        pending.delete(frame.requestId)
-        clearTimeout(request.timer)
-        if (frame.ok) request.resolve(frame.value)
-        else request.reject(new BrokerRequestError(frame.error.code, frame.error.message))
+      case "response":
         return
-      }
       case "notification": {
         for (const handler of [...notificationHandlers]) handler(frame)
         return
@@ -279,58 +352,44 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
   }
 
   function nextId(): string {
-    return `r${++nextRequestId}`
+    // Internal ids are namespaced so a caller-supplied `requestId` cannot collide
+    // with (and silently steal) an internal request's correlation id.
+    return `internal:${++nextRequestId}`
   }
 
-  function request(frame: BrokerRequest): Promise<unknown> {
-    return new Promise<unknown>((resolve, reject) => {
-      let settled = false
-      // Declared before `finish` (no TDZ) and definitely assigned before any
-      // settle path can run, since all paths are asynchronous.
-      let timer!: ReturnType<typeof setTimeout>
-      const finish = (action: () => void) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        action()
-      }
-      // Arm the timeout around the whole request, including the wait for the
-      // transport: a worker that crashes (or never becomes ready) before the
-      // port is live must not hang the caller forever.
-      timer = setTimeout(() => {
-        pending.delete(frame.requestId)
-        finish(() =>
-          reject(new BrokerRequestError("timeout", `request ${frame.requestId} timed out after ${requestTimeoutMs}ms`)),
-        )
-      }, requestTimeoutMs)
-      const send = () => {
-        // The timeout may have already settled this request while it waited for
-        // the transport; posting now would register a waiter that is never
-        // settled and leak a frame.
-        if (settled) return
-        if (!alive || !port) {
-          finish(() => reject(new BrokerRequestError("crashed", "broker is not available")))
-          return
-        }
-        pending.set(frame.requestId, { resolve, reject, timer })
-        port.postMessage(frame)
-      }
-      transportReady.then(send, (error) => finish(() => reject(error)))
+  /**
+   * Issue one broker request. The timeout is clamped to the max and armed by the
+   * shared channel around both the wait for transport and the reply; the reply's
+   * `ok`/`error` is mapped onto the caller-facing `BrokerRequestError`.
+   */
+  function request(frame: BrokerRequest, timeoutMs: number = requestTimeoutMs): Promise<unknown> {
+    const effectiveTimeout = Math.min(timeoutMs, MAX_REQUEST_TIMEOUT_MS)
+    return requests.request(() => frame, effectiveTimeout, frame.requestId).then((reply) => {
+      if (!reply.ok) throw new BrokerRequestError(reply.error.code, reply.error.message)
+      return reply.value
     })
   }
 
-  function rejectPending(error: Error): void {
-    for (const request of pending.values()) {
-      clearTimeout(request.timer)
-      request.reject(error)
-    }
-    pending.clear()
+  function scheduleRespawn(): void {
+    if (respawnTimer !== undefined) clearTimeout(respawnTimer)
+    // Exponential backoff, capped: a crash loop must not spawn workers without bound.
+    const delay = Math.min(RESPAWN_BASE_MS * 2 ** (consecutiveCrashes - 1), RESPAWN_MAX_MS)
+    respawnTimer = setTimeout(() => {
+      respawnTimer = undefined
+      if (!disposed) startWorker()
+    }, delay)
+    ;(respawnTimer as { unref?: () => void }).unref?.()
   }
 
   function handleCrash(): void {
+    // `error` and `close` (or a parse failure plus `close`) can fire for the same
+    // generation; handle it exactly once.
+    if (workerGone) return
+    workerGone = true
+    clearReadyTimer()
     const orphans = [...mirror.values()]
     mirror.clear()
-    rejectPending(new BrokerRequestError("crashed", `broker worker exited (generation ${generation})`))
+    requests.fail(new BrokerRequestError("crashed", `broker worker exited (generation ${generation})`))
     alive = false
     threadId = 0
     port?.close()
@@ -338,15 +397,24 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
     // Settle the outgoing transport before reassigning it, so any request caught
     // waiting for the port fails fast instead of dangling on the old promise.
     rejectTransport?.(new BrokerRequestError("crashed", `broker worker exited before ready (generation ${generation})`))
+    rejectTransport = undefined
+    resolveTransport = undefined
     emitSupervision({ type: "crashed", generation, orphans: orphans.length })
     for (const child of orphans) reaper.reap(child.pgid)
     generation += 1
+    consecutiveCrashes += 1
+    if (consecutiveCrashes > MAX_CONSECUTIVE_CRASHES) {
+      // Give up: leave the rejected transport in place so requests fail fast
+      // rather than wait on a worker we will never spawn again.
+      return
+    }
     transportReady = newTransportReady()
-    startWorker()
+    scheduleRespawn()
   }
 
   function startWorker(): void {
     const myId = ++currentWorkerId
+    workerGone = false
     // Each generation gets its own handshake trace; reset before it re-runs.
     handshake.length = 0
     // Born named `ocb` so the isolate is observable from creation, not only once
@@ -354,21 +422,59 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
     const handle = new Worker(entry, { env, name: "ocb" }) as unknown as BrokerWorkerHandle
     worker = handle
 
+    // Readiness deadline: a worker that never completes the handshake must not
+    // leave `ready` (and anyone awaiting it) hanging forever.
+    clearReadyTimer()
+    readyTimer = setTimeout(() => {
+      if (myId !== currentWorkerId || readySettled) return
+      failReady(
+        new BrokerRequestError("timeout", `broker worker did not become ready within ${readyTimeoutMs}ms`),
+      )
+      void handle.terminate()
+      if (!disposed) handleCrash()
+    }, readyTimeoutMs)
+    ;(readyTimer as { unref?: () => void }).unref?.()
+
     handle.onmessage = (event) => {
-      if (myId !== currentWorkerId) return
-      const data = event.data as { type?: string; threadId?: number; port?: MessagePort }
-      if (data?.type === "ready") {
-        threadId = data.threadId ?? 0
+      // A frame from a superseded generation is stale: terminate it, don't route it.
+      if (myId !== currentWorkerId) {
+        void handle.terminate()
+        return
+      }
+      let handshakeFrame: BrokerWorkerOutbound
+      try {
+        handshakeFrame = parseWorkerHandshake(event.data)
+      } catch {
+        void handle.terminate()
+        if (!disposed) handleCrash()
+        return
+      }
+      if (handshakeFrame.type === "ready") {
+        threadId = handshakeFrame.threadId
         handshake.push("ready")
         const channel = new MessageChannel()
         port = channel.port1
-        port.onmessage = (message) => handleFrame(message.data as BrokerFrame)
+        port.onmessage = (message) => {
+          let frame: BrokerFrame
+          try {
+            frame = parseBrokerFrame(message.data)
+          } catch {
+            // A broker that emits a malformed frame is unusable: drop the
+            // generation rather than letting a half-formed frame into the mirror.
+            if (!disposed) handleCrash()
+            return
+          }
+          dispatchInbound(frame)
+        }
         port.start?.()
         handle.postMessage({ type: "attach", port: channel.port2 }, [channel.port2 as unknown as Transferable])
         handshake.push("attach")
         return
       }
-      if (data?.type === "attached") {
+      if (handshakeFrame.type === "attached") {
+        clearReadyTimer()
+        // A generation reached `attached`, so the crash loop (if any) is over.
+        consecutiveCrashes = 0
         handshake.push("attached")
         alive = true
         resolveTransport?.()
@@ -384,6 +490,9 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
 
     const onGone = () => {
       if (disposed || myId !== currentWorkerId) return
+      // Terminate the handle even on an `error` event: a worker that errored but
+      // did not close must not linger alongside its replacement.
+      void handle.terminate()
       handleCrash()
     }
     handle.addEventListener("close", onGone)
@@ -400,15 +509,19 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
     requestAs({ kind: "acquire", requestId: nextId(), directory: input.directory, servers: input.servers }, parseAcquireResult)
 
   const call = (input: CallInput): Promise<unknown> =>
-    request({
-      kind: "call",
-      requestId: input.requestId ?? nextId(),
-      directory: input.directory,
-      server: input.server,
-      method: input.method,
-      ...(input.params === undefined ? {} : { params: input.params }),
-      ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
-    })
+    request(
+      {
+        kind: "call",
+        requestId: input.requestId ?? nextId(),
+        directory: input.directory,
+        server: input.server,
+        method: input.method,
+        ...(input.params === undefined ? {} : { params: input.params }),
+        ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+      },
+      // The per-call override bounds the hub-side wait too, clamped to the max.
+      input.timeoutMs,
+    )
 
   const cancel = (targetId: string): Promise<void> =>
     request({ kind: "cancel", requestId: nextId(), targetId }).then(() => undefined)
@@ -424,22 +537,21 @@ export function createBroker(options: BrokerOptions = {}): BrokerClient {
   async function teardown(): Promise<void> {
     if (disposed) return
     disposed = true
+    if (respawnTimer !== undefined) {
+      clearTimeout(respawnTimer)
+      respawnTimer = undefined
+    }
+    clearReadyTimer()
+    // A caller awaiting `ready` must not hang when teardown wins the race.
+    failReady(new BrokerRequestError("crashed", "broker torn down"))
     if (alive && port) {
-      const activePort = port
-      await new Promise<void>((resolve) => {
-        const id = nextId()
-        const finish = () => {
-          clearTimeout(timer)
-          pending.delete(id)
-          resolve()
-        }
-        const timer = setTimeout(finish, 1500)
-        pending.set(id, { resolve: () => finish(), reject: () => finish(), timer })
-        activePort.postMessage({ kind: "teardown", requestId: id } satisfies BrokerRequest)
-      })
+      // Best-effort graceful teardown frame, bounded at 1.5s; a missing reply is
+      // not fatal because the worker is terminated below either way.
+      await requests.request(() => ({ kind: "teardown", requestId: nextId() }), 1500).catch(() => undefined)
     }
     alive = false
-    rejectPending(new BrokerRequestError("crashed", "broker torn down"))
+    // Reject every remaining in-flight request and refuse later ones.
+    requests.dispose()
     for (const child of mirror.values()) reaper.reap(child.pgid)
     mirror.clear()
     port?.close()
@@ -511,15 +623,6 @@ export interface BrokerBackend {
   teardown(): Promise<void>
 }
 
-/** Map any backend/parse failure onto the wire error taxonomy. */
-function brokerErrorFrom(reason: unknown): BrokerError {
-  if (reason instanceof BrokerFailure) return { code: reason.code, message: reason.message }
-  if (reason instanceof BrokerProtocolError) return { code: "invalid-request", message: reason.message }
-  if (reason instanceof BrokerRequestError) return { code: reason.code, message: reason.message }
-  if (reason instanceof Error) return { code: "protocol", message: reason.message }
-  return { code: "protocol", message: String(reason) }
-}
-
 /** Dispatch one parsed request to the hub broker; results are re-parsed so the
  * wire value is always the trusted protocol shape. */
 function executeBrokerRequest(broker: BrokerBackend, request: BrokerRequest): unknown {
@@ -570,26 +673,17 @@ export function serveBrokerPort(broker: BrokerBackend, port: MessagePort): () =>
     }
   }
 
-  return channel.onMessage((frame) => {
-    let request: BrokerRequest
-    try {
-      request = parseBrokerRequest(frame)
-    } catch (error) {
-      const requestId = (frame as { requestId?: unknown } | null)?.requestId
-      reply({
-        kind: "response",
-        requestId: typeof requestId === "string" ? requestId : "unknown",
-        ok: false,
-        error: brokerErrorFrom(error),
-      })
-      return
-    }
-
-    void Promise.resolve(executeBrokerRequest(broker, request)).then(
-      (value) => reply({ kind: "response", requestId: request.requestId, ok: true, value: value ?? null }),
-      (reason) => reply({ kind: "response", requestId: request.requestId, ok: false, error: brokerErrorFrom(reason) }),
-    )
-  })
+  return servePort(
+    channel,
+    parseBrokerRequest,
+    (request) => executeBrokerRequest(broker, request),
+    (raw, outcome) => {
+      // An unparseable frame still carries its own `requestId` when it has one.
+      const requestId = outcome.request?.requestId ?? rawRequestId(raw)
+      if (outcome.ok) reply({ kind: "response", requestId, ok: true, value: outcome.value ?? null })
+      else reply({ kind: "response", requestId, ok: false, error: toBrokerError(outcome.error) })
+    },
+  )
 }
 
 export * as Broker from "./broker"

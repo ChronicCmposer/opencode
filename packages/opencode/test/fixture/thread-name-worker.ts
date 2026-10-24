@@ -1,4 +1,4 @@
-// WS5 — session-worker thread-name lifecycle fixture.
+// WS5 — session-worker thread-name lifecycle worker.
 //
 // Boots the frozen Phase 5 executor with a trivial work kind and mirrors the
 // production entry's dynamic thread naming:
@@ -25,13 +25,7 @@ import {
 import { sessionThreadName } from "@/session/worker/thread-name"
 import { setThreadName } from "@/util/thread-name"
 import { currentThreadId } from "../lib/loop-gap"
-
-interface WorkerScope {
-  onmessage: ((event: { data: unknown }) => void) | null
-  postMessage(message: unknown, transfer?: readonly Transferable[]): void
-}
-
-const scope = globalThis as unknown as WorkerScope
+import { scope } from "./worker-scope"
 
 /** The pool slot this worker serves; `workerData.workerID` when the pool shipped one. */
 const slot = (workerData as { readonly workerID?: number } | null | undefined)?.workerID ?? 1

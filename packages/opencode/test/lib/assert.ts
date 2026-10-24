@@ -6,9 +6,22 @@
 // Law of "Fail Fast, Fail Loud" — an invalid input halts immediately with a
 // message that names the offending field and value).
 
-function describe(value: unknown): string {
-  return JSON.stringify(value) ?? String(value)
+/**
+ * A compact, total string form of an arbitrary value for error messages.
+ *
+ * `JSON.stringify` throws on cycles and returns `undefined` for `undefined`; both
+ * are handled so a diagnostic never throws while reporting a failure.
+ */
+export function stringify(value: unknown): string {
+  if (value === undefined) return "undefined"
+  try {
+    return JSON.stringify(value) ?? String(value)
+  } catch {
+    return String(value)
+  }
 }
+
+const describe = stringify
 
 /** Assert `value` is a non-empty string; narrows the type on return. */
 export function assertNonEmptyString(value: unknown, name = "value"): asserts value is string {

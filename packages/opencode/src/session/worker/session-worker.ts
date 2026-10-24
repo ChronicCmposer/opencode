@@ -27,7 +27,6 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { isRole, setProcessRole } from "@/effect/process-role"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { AppProcess } from "@opencode-ai/core/process"
-import { Project } from "@opencode-ai/schema/project"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRunState } from "@/session/run-state"
 import { Snapshot } from "@/snapshot"
@@ -39,7 +38,13 @@ import { Provider } from "@/provider/provider"
 import { createWorkerWriterClient, type WorkerWriterClient } from "./writer-client"
 import { createWorkerEgressClient, type WorkerEgressClient } from "./egress-client"
 import { createWorkerBrokerClient } from "./broker-client"
-import { createBackgroundJobClient, createJobClient, jobPortFromMessagePort, type JobClient } from "./job-client"
+import {
+  createBackgroundJobClient,
+  createJobClient,
+  jobPortFromMessagePort,
+  type JobClient,
+  type JobPort,
+} from "./job-client"
 import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
 import { workerLoggingLayer } from "./worker-logging"
 import { messageOf } from "./port"
@@ -79,7 +84,7 @@ import {
   type WorkerSnapshot,
   type WriterClientHandle,
 } from "./layer"
-import { workerSnapshotBoundaryLayer } from "./snapshot"
+import { makeInstanceContext, workerSnapshotBoundaryLayer } from "./snapshot"
 import { workerAppProcessNode } from "./app-process-report"
 import { PidReporter, type PidReport, type PidReporterInterface } from "./pid-registry"
 import type { Role } from "./node-table"
@@ -176,35 +181,70 @@ export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
     throw new Error(`session worker requires a SessionWorkerInit workerData, received ${typeof data}`)
   }
   const candidate = data as Partial<SessionWorkerInit>
-  if (typeof candidate.snapshot !== "object" || candidate.snapshot === null) {
+
+  const snapshot = candidate.snapshot
+  if (typeof snapshot !== "object" || snapshot === null) {
     throw new Error("session worker workerData.snapshot is required")
   }
-  if (typeof candidate.snapshot.flags !== "object" || candidate.snapshot.flags === null) {
+  if (typeof snapshot.flags !== "object" || snapshot.flags === null) {
     throw new Error("session worker workerData.snapshot.flags is required")
   }
-  if (typeof candidate.env !== "object" || candidate.env === null) {
+
+  const env = candidate.env
+  if (typeof env !== "object" || env === null) {
     throw new Error("session worker workerData.env is required")
   }
-  if (candidate.model === undefined || typeof candidate.model.baseUrl !== "string") {
-    throw new Error("session worker workerData.model.baseUrl is required")
+  if (typeof env.values !== "object" || env.values === null) {
+    throw new Error("session worker workerData.env.values is required")
   }
-  if (!isRole(candidate.role)) {
-    throw new Error(`session worker workerData.role must be a valid process role, received ${JSON.stringify(candidate.role)}`)
+
+  const model = candidate.model
+  if (typeof model !== "object" || model === null) {
+    throw new Error("session worker workerData.model is required")
   }
+  for (const field of ["providerID", "modelID", "apiId", "baseUrl", "apiKey"] as const) {
+    if (typeof model[field] !== "string") {
+      throw new Error(`session worker workerData.model.${field} is required`)
+    }
+  }
+  if (typeof model.capabilities !== "object" || model.capabilities === null) {
+    throw new Error("session worker workerData.model.capabilities is required")
+  }
+  if (typeof model.limit !== "object" || model.limit === null) {
+    throw new Error("session worker workerData.model.limit is required")
+  }
+
+  const role = candidate.role
+  if (!isRole(role)) {
+    throw new Error(`session worker workerData.role must be a valid process role, received ${JSON.stringify(role)}`)
+  }
+
+  const workerID = candidate.workerID
   if (
-    candidate.workerID !== undefined &&
-    (typeof candidate.workerID !== "number" || !Number.isInteger(candidate.workerID) || candidate.workerID < 0)
+    workerID !== undefined &&
+    (typeof workerID !== "number" || !Number.isInteger(workerID) || workerID < 0)
   ) {
-    throw new Error(`session worker workerData.workerID must be a non-negative integer, received ${candidate.workerID}`)
+    throw new Error(`session worker workerData.workerID must be a non-negative integer, received ${workerID}`)
   }
-  // Parse the hub-resolved flags into a trusted `RuntimeFlags.Info` at the isolate
-  // boundary. The worker never re-reads its own `process.env` for flags; the
-  // snapshot is the single source of truth, so a hub-only override reaches the
-  // session loop.
+
+  const plugins = candidate.plugins
+  if (plugins !== undefined && !Array.isArray(plugins)) {
+    throw new Error("session worker workerData.plugins must be an array when present")
+  }
+
+  // Build the typed init field-by-field from the validated values, so the
+  // boundary result is trusted without a broad `as` cast. Flags are parsed into
+  // a trusted `RuntimeFlags.Info`: the worker never re-reads its own
+  // `process.env`, so the snapshot is the single source of truth.
   return {
-    ...candidate,
-    snapshot: { ...candidate.snapshot, flags: RuntimeFlags.parseInfo(candidate.snapshot.flags) },
-  } as SessionWorkerInit
+    snapshot: { ...snapshot, flags: RuntimeFlags.parseInfo(snapshot.flags) },
+    env,
+    model,
+    role,
+    ...(candidate.capabilities === undefined ? {} : { capabilities: candidate.capabilities }),
+    ...(workerID === undefined ? {} : { workerID }),
+    ...(plugins === undefined ? {} : { plugins }),
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +273,12 @@ function requirePort(port: MessagePort | undefined, field: string): MessagePort 
   if (port === undefined) throw new MissingWorkerPortError(field)
   return port
 }
+
+/**
+ * A `MessagePort` is structurally a `Transferable`; this narrows the double cast
+ * to one place so every `postMessage` transfer list reads intent, not `unknown`.
+ */
+const transferable = (port: MessagePort): Transferable => port as unknown as Transferable
 
 /**
  * The four client handles the reduced session layer installs. The writer is the
@@ -713,6 +759,12 @@ export interface BootstrapSessionWorkerOptions {
    * `log` reaches the reporter's E4 `pid report failed` line.
    */
   readonly pidReporterFactory?: ControlPidReporterFactory
+  /**
+   * Test seam: build the job control client. Defaults to `createJobClient`, so
+   * production is unchanged; a test can wrap the client to observe the
+   * child-result subscription lifecycle.
+   */
+  readonly jobClientFactory?: (port: JobPort) => JobClient
 }
 
 /**
@@ -758,11 +810,11 @@ export function bootstrapSessionWorker(
     ((port: MessagePort, workerID: number, forwarded: WorkerLogger) =>
       createControlPidReporter(port, workerID, { log: forwarded }))
   const jobChannel = new MessageChannel()
-  scope.postMessage({ type: "job-port", port: jobChannel.port2 }, [jobChannel.port2 as unknown as Transferable])
+  scope.postMessage({ type: "job-port", port: jobChannel.port2 }, [transferable(jobChannel.port2)])
   // One full job client backs both the reduced `BackgroundJobClientHandle` seam
   // and the real `BackgroundJob` node (a second client on the same port would
   // steal replies).
-  const jobClient = createJobClient(jobPortFromMessagePort(jobChannel.port1))
+  const jobClient = (options.jobClientFactory ?? createJobClient)(jobPortFromMessagePort(jobChannel.port1))
   // The hub registry routes a settled child to the worker hosting its
   // `parentID`; subscribe at boot so the push reaches consumers. The sink set is
   // the registration handshake returned to the caller.
@@ -794,7 +846,7 @@ export function bootstrapSessionWorker(
         broker: brokerChannel.port2,
       },
       [writerChannel.port2, egressChannel.port2, egressControlChannel.port2, brokerChannel.port2].map(
-        (port) => port as unknown as Transferable,
+        transferable,
       ),
     )
     clients = buildWorkerClients(
@@ -811,7 +863,7 @@ export function bootstrapSessionWorker(
     // three proxies (each call is correlated by the client's own request id).
     const hubProxyChannel = new MessageChannel()
     scope.postMessage({ type: "hub-proxy", port: hubProxyChannel.port2 }, [
-      hubProxyChannel.port2 as unknown as Transferable,
+      transferable(hubProxyChannel.port2),
     ])
     const hubProxyClient = createHubProxyClient(hubProxyChannel.port1)
     hubProxies = { sessionStatus: hubProxyClient, permission: hubProxyClient, question: hubProxyClient }
@@ -934,20 +986,12 @@ export function bootstrapSessionWorker(
  * so the worker still boots instead of crashing on a missing id.
  */
 export function workerInstanceContext(snapshot: WorkerSnapshot): InstanceContext {
-  const worktree = snapshot.worktree ?? snapshot.directory
-  return {
+  return makeInstanceContext({
     directory: snapshot.directory,
-    worktree,
-    project: {
-      id: Project.ID.make(snapshot.projectId ?? snapshot.directory),
-      worktree,
-      ...(snapshot.projectVcs === undefined ? {} : { vcs: snapshot.projectVcs }),
-      // `Project.Info` requires a time span and sandboxes; the readers only touch
-      // `id`/`vcs`, so a zero span and no sandboxes is a faithful minimum.
-      time: { created: 0, updated: 0 },
-      sandboxes: [],
-    },
-  }
+    ...(snapshot.worktree === undefined ? {} : { worktree: snapshot.worktree }),
+    projectID: snapshot.projectId ?? snapshot.directory,
+    ...(snapshot.projectVcs === undefined ? {} : { projectVcs: snapshot.projectVcs }),
+  })
 }
 
 if (workerData !== null && workerData !== undefined) {

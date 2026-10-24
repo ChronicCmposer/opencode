@@ -163,11 +163,15 @@ describe("delta coalescer over event frames", () => {
     expect(batches).toEqual([[eventFrame({ event: deltaEvent("a") })], [endFrame()]])
   })
 
-  test("pushing after end fails loud", () => {
-    const { coalescer } = setup()
-    coalescer.end()
-    expect(() => coalescer.pushDelta(deltaEvent("a"))).toThrow(/ended/)
-    expect(() => coalescer.pushDurable(deltaEvent("d"), durableMeta)).toThrow(/ended/)
+  test("a zero window flushes buffered deltas on the next tick (immediate)", () => {
+    const { batches, fake, coalescer } = setup({ windowMs: 0 })
+    coalescer.pushDelta(deltaEvent("a"))
+    // Scheduled, not synchronous — but fires with no window delay.
+    expect(batches).toEqual([])
+    expect(fake.pending).toBe(1)
+    fake.advance(0)
+    expect(batches).toEqual([[eventFrame({ event: deltaEvent("a") })]])
+    expect(fake.pending).toBe(0)
   })
 
   test("an explicit flush cancels the idle timer and a later push reschedules", () => {

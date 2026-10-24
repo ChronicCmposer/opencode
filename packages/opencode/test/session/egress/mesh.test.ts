@@ -19,6 +19,7 @@ import {
   type MeshSink,
 } from "@/session/egress/mesh"
 import { durable } from "../../lib/egress-fixtures"
+import { pollUntil } from "../../lib/poll"
 
 const commit = (id: string, type: string, ordinal: number): DurableCommit => ({
   meta: { generation: 1, ordinal },
@@ -31,15 +32,6 @@ function recordingSink(sent: string[], resyncs: string[] = []): MeshSink {
     sendDurable: (c) => sent.push(`durable:${c.event.id}`),
     sendResync: (pattern) => resyncs.push(pattern),
   }
-}
-
-async function pollUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (predicate()) return
-    await new Promise((resolve) => setTimeout(resolve, 5))
-  }
-  throw new Error(`pollUntil timed out after ${timeoutMs}ms`)
 }
 
 describe("event mesh registry", () => {
@@ -274,5 +266,70 @@ describe("mesh durable.ack count validation", () => {
     await pollUntil(() => mesh.outstanding("w1") === 0)
 
     attachment.dispose()
+  })
+})
+
+describe("mesh delivery failure handling", () => {
+  const closedSink: MeshSink = {
+    sendDurable: () => {
+      throw new Error("port closed")
+    },
+    sendResync: () => {},
+  }
+
+  test("a failed durable push does not inflate outstanding or claim a delivery", () => {
+    const mesh = createEgressMesh()
+    mesh.attach("w1", closedSink)
+    mesh.listen("w1", "*")
+    const result = mesh.publish(commit("e1", "session.message", 1))
+    expect(result).toEqual({ delivered: [], dropped: [] })
+    expect(mesh.outstanding("w1")).toBe(0)
+  })
+
+  test("a failing sink does not block delivery to healthy sinks", () => {
+    const mesh = createEgressMesh()
+    const sent: string[] = []
+    mesh.attach("w1", closedSink)
+    mesh.attach("w2", recordingSink(sent))
+    mesh.listen("w1", "*")
+    mesh.listen("w2", "*")
+    const result = mesh.publish(commit("e1", "session.message", 1))
+    expect(result.delivered).toEqual(["w2"])
+    expect(mesh.outstanding("w1")).toBe(0)
+    expect(mesh.outstanding("w2")).toBe(1)
+    expect(sent).toEqual(["durable:e1"])
+  })
+
+  test("a failed resync push still flags the pending resync without throwing", () => {
+    const mesh = createEgressMesh({ bound: 1 })
+    mesh.attach("w1", {
+      sendDurable: () => {},
+      sendResync: () => {
+        throw new Error("port closed")
+      },
+    })
+    mesh.listen("w1", "*")
+    mesh.publish(commit("e1", "session.message", 1))
+    expect(() => mesh.publish(commit("e2", "session.message", 2))).not.toThrow()
+    expect(mesh.resyncPending).toEqual(["w1"])
+  })
+})
+
+describe("control link notify guard", () => {
+  test("notify surfaces a closed-port failure and records it as the last error", () => {
+    const throwingPort = {
+      onmessage: null,
+      start: () => {},
+      close: () => {},
+      postMessage: () => {
+        throw new Error("port closed")
+      },
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as unknown as MessagePort
+    const link = createControlLink(throwingPort)
+    expect(() => link.notify({ type: "resync", pattern: "*" })).toThrow(/port closed/)
+    expect(link.lastError?.message).toMatch(/port closed/)
+    link.dispose()
   })
 })

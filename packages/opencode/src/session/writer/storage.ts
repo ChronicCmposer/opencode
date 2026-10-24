@@ -8,12 +8,39 @@
 // Paths mirror `src/storage/storage.ts` (`path.join(dir, ...key) + ".json"`), so
 // the writer and the direct-FS path address the same files.
 
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
+import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { WriterError, type StorageReadResult, type WriterStorage } from "./core"
 import { isEnoent } from "./protocol"
 
 const JSON_SUFFIX = ".json"
+
+/**
+ * Serialize file-KV content. `JSON.stringify(undefined)` yields `undefined`
+ * (not a string), which `writeFile` rejects; persist an explicit `null` instead
+ * so a stored `undefined` is a defined value rather than a failed write.
+ */
+function encode(content: unknown): string {
+  return JSON.stringify(content, null, 2) ?? "null"
+}
+
+/**
+ * Write `text` to `file` atomically: a crash between truncate and write would
+ * otherwise leave a partial/corrupt JSON file. The value is fully written to a
+ * sibling temp file (deliberately not `*.json`, so it is never read or listed)
+ * and only then renamed over the target.
+ */
+async function writeAtomic(file: string, text: string): Promise<void> {
+  const temp = `${file}.${randomUUID()}.tmp`
+  try {
+    await writeFile(temp, text)
+    await rename(temp, file)
+  } catch (error) {
+    await rm(temp, { force: true })
+    throw error
+  }
+}
 
 /**
  * Resolve `segments` under `dir`, rejecting any segment that could escape the
@@ -70,7 +97,7 @@ export function createFileStorage(dir: string): WriterStorage {
     async write(key, content): Promise<void> {
       const file = target(dir, key)
       await mkdir(path.dirname(file), { recursive: true })
-      await writeFile(file, JSON.stringify(content, null, 2))
+      await writeAtomic(file, encode(content))
     },
     async update(key, fn): Promise<StorageReadResult> {
       const file = target(dir, key)
@@ -83,7 +110,7 @@ export function createFileStorage(dir: string): WriterStorage {
       }
       const content = parseJson(text, file)
       fn(content)
-      await writeFile(file, JSON.stringify(content, null, 2))
+      await writeAtomic(file, encode(content))
       return { found: true, content }
     },
     async remove(key): Promise<void> {

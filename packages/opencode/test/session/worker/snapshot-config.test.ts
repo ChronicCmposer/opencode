@@ -9,6 +9,7 @@
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Project } from "@opencode-ai/schema/project"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import {
@@ -17,6 +18,9 @@ import {
   snapshotRuntimeFlagsLayer,
   type WorkerSnapshot,
 } from "@/session/worker/layer"
+import { makeInstanceContext } from "@/session/worker/snapshot"
+import { workerInstanceContext } from "@/session/worker/session-worker"
+import { fallbackInstanceContext, instanceFromSession } from "@/session/worker/hub"
 
 /** Minimal dependency-free snapshot; only the directories seam is under test. */
 const snapshot = (
@@ -97,5 +101,36 @@ describe("worker runtime flags cross the snapshot boundary", () => {
     // Optional numeric flags pass through when finite, recover otherwise.
     expect(RuntimeFlags.parseInfo({ outputTokenMax: 4096 }).outputTokenMax).toBe(4096)
     expect(RuntimeFlags.parseInfo({ outputTokenMax: "nope" }).outputTokenMax).toBeUndefined()
+  })
+})
+
+describe("makeInstanceContext equivalence", () => {
+  test("the snapshot-derived context equals the shared builder's output", () => {
+    const built = workerInstanceContext({
+      directory: "/work/a",
+      worktree: "/work/a",
+      projectId: "proj_a",
+      projectVcs: "git",
+    } as WorkerSnapshot)
+    expect(built).toEqual(
+      makeInstanceContext({ directory: "/work/a", projectID: "proj_a", projectVcs: "git" }),
+    )
+  })
+
+  test("the session-derived and fallback contexts share one project shape", () => {
+    expect(instanceFromSession({ directory: "/work/b", projectID: "proj_b" })).toEqual(
+      makeInstanceContext({ directory: "/work/b", projectID: "proj_b" }),
+    )
+    expect(fallbackInstanceContext()).toEqual(
+      makeInstanceContext({ directory: process.cwd(), projectID: Project.ID.global }),
+    )
+  })
+
+  test("worktree defaults to the directory and the project carries a zero time span", () => {
+    const ctx = makeInstanceContext({ directory: "/work/c", projectID: Project.ID.global })
+    expect(ctx.worktree).toBe("/work/c")
+    expect(ctx.project.worktree).toBe("/work/c")
+    expect(ctx.project.time).toEqual({ created: 0, updated: 0 })
+    expect(ctx.project.sandboxes).toEqual([])
   })
 })

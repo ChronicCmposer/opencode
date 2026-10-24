@@ -44,6 +44,23 @@ describe("shared SSE parsing", () => {
     expect(parseSseFrame(frame)).toEqual([{ a: 1 }, { b: 2 }])
   })
 
+  test("accepts CRLF frame boundaries", async () => {
+    const acc = await readSseStream(streamOf("data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\r\n\r\n"))
+    expect(acc.text).toBe("Hi!")
+  })
+
+  test("releases the reader lock when the callback throws", async () => {
+    const stream = streamOf('data: {"n":1}\n\n')
+    await expect(
+      readSsePayloads(stream, () => {
+        throw new Error("boom")
+      }),
+    ).rejects.toThrow("boom")
+    const reader = stream.getReader()
+    await reader.read()
+    reader.releaseLock()
+  })
+
   test("readSsePayloads streams each decoded payload to the callback", async () => {
     const seen: unknown[] = []
     await readSsePayloads(streamOf('data: {"n":1}\n\ndata: {"n":2}\n\ndata: [DONE]\n\n'), (payload) => seen.push(payload))

@@ -13,6 +13,13 @@
 // additionally use the structured logger, which is a leaf module.
 
 import { workerLogMessage, type WorkerLogger } from "./log"
+import {
+  ProtocolError,
+  WORKER_FRAME_VERSION,
+  isRecord,
+  parseWorkerFrame,
+  type WorkerFramePort,
+} from "./frame"
 
 /** Timer seam shared by dispatch, cancel, and the job registry; unref'd. */
 export type PortScheduler = (delayMs: number, run: () => void) => () => void
@@ -25,6 +32,42 @@ export const defaultSchedule: PortScheduler = (delayMs, run) => {
 
 /** Coerce an unknown thrown value to a message, for error frames. */
 export const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error))
+
+/**
+ * The `_tag` (or a non-generic `name`) of a thrown tagged error, when it carries
+ * one. The executor frame and the hub-proxy wire both stamp a tagged error with
+ * its tag, so this is the single reader they share rather than re-deriving it.
+ * A plain `Error` has `name === "Error"`, which is not a domain tag, so it is
+ * reported as untagged.
+ */
+export function errorTagOf(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined
+  const tag = (error as { _tag?: unknown })._tag
+  if (typeof tag === "string") return tag
+  const name = (error as { name?: unknown }).name
+  return typeof name === "string" && name !== "Error" ? name : undefined
+}
+
+/**
+ * Resolve a worker isolate entry: a runtime env override first, then the
+ * build-time define, then the caller's source-relative fallback. The packaged
+ * binary cannot resolve a source path (`new URL("./x.ts", import.meta.url)`
+ * becomes `/$bunfs/root/x.ts`), so the build injects a define; this is the one
+ * resolution order every worker (session, writer, broker) shares.
+ *
+ * `fallback` is passed in rather than constructed here so it resolves against the
+ * caller's `import.meta.url`.
+ */
+export function resolveWorkerEntry(input: {
+  readonly env?: Record<string, string | undefined>
+  readonly definedPath?: string
+  readonly envVar: string
+  readonly fallback: string | URL
+}): string | URL {
+  const fromEnv = (input.env ?? process.env)[input.envVar]
+  const resolved = fromEnv ?? input.definedPath
+  return resolved === undefined || resolved === "" ? input.fallback : resolved
+}
 
 /** The frame-agnostic channel shape a `MessagePort` is adapted to. */
 export interface FrameChannel<Frame> {
@@ -45,6 +88,48 @@ export function portFromMessagePort<Frame>(port: MessagePort): FrameChannel<Fram
       port.start()
       return () => port.removeEventListener("message", listener)
     },
+  }
+}
+
+/** The minimum shape every enveloped frame carries for correlation. */
+export interface WorkerFrameCarrier {
+  readonly kind: string
+  readonly id?: number
+}
+
+/**
+ * Adapt a `MessagePort` whose frames share the versioned worker envelope. Outbound
+ * frames are wrapped as `{ v, port, kind, id?, payload }`; inbound messages are
+ * parsed once by `parseWorkerFrame`, so a frame from another port or with a
+ * mismatched payload discriminant fails loud instead of being blindly cast.
+ */
+export function workerFrameChannel<Frame extends WorkerFrameCarrier>(
+  port: MessagePort,
+  portName: WorkerFramePort,
+): FrameChannel<Frame> {
+  const channel = portFromMessagePort<unknown>(port)
+  return {
+    post: (frame) => {
+      channel.post({
+        v: WORKER_FRAME_VERSION,
+        port: portName,
+        kind: frame.kind,
+        ...(frame.id === undefined ? {} : { id: frame.id }),
+        payload: frame,
+      })
+    },
+    onMessage: (handler) =>
+      channel.onMessage((data) => {
+        const envelope = parseWorkerFrame(data)
+        if (envelope.port !== portName) {
+          throw new ProtocolError(`expected worker port "${portName}" (got ${JSON.stringify(envelope.port)})`)
+        }
+        const payload = envelope.payload
+        if (!isRecord(payload) || payload["kind"] !== envelope.kind) {
+          throw new ProtocolError(`frame "${envelope.kind}" is missing a matching payload`)
+        }
+        handler(payload as Frame)
+      }),
   }
 }
 
@@ -77,17 +162,34 @@ export interface RequestChannelOptions<Frame, Reply extends Frame, Id> {
   readonly mapPostError?: (error: unknown) => unknown
   /** Timer seam; defaults to the unref'd {@link defaultSchedule}. */
   readonly schedule?: PortScheduler
+  /**
+   * Reject a request whose id is already in flight, instead of silently
+   * overwriting its waiter. Omitted callers keep the historical overwrite
+   * behaviour; a caller with caller-supplied ids (the broker) supplies it.
+   */
+  readonly duplicateError?: (id: Id) => unknown
+  /**
+   * Gate the actual `post` behind a transport becoming ready, so the timeout
+   * armed at `request` time also covers the wait for the transport. The frame is
+   * built and registered immediately; `post` runs once this resolves, or the
+   * request rejects with the transport's failure. Omitted callers post inline.
+   */
+  readonly awaitPost?: () => Promise<void>
 }
 
 /**
  * A framed request/response channel: `request` correlates a reply by id,
- * `onFrame` observes every inbound frame (for unsolicited pushes), and `dispose`
- * rejects every in-flight request. Timers are armed through `PortScheduler`, so
- * the default is unref'd and never keeps the process alive.
+ * `onFrame` observes every inbound frame (for unsolicited pushes), `fail`
+ * rejects every in-flight request without tearing the channel down, and
+ * `dispose` rejects every in-flight request permanently. Timers are armed
+ * through `PortScheduler`, so the default is unref'd and never keeps the
+ * process alive.
  */
 export interface RequestChannel<Frame, Reply extends Frame, Id> {
-  request(build: (id: Id) => Frame, timeoutMs?: number): Promise<Reply>
+  request(build: (id: Id) => Frame, timeoutMs?: number, id?: Id): Promise<Reply>
   onFrame(handler: (frame: Frame) => void): () => void
+  /** Reject every in-flight request with `error`, leaving the channel usable. */
+  fail(error: unknown): void
   dispose(): void
 }
 
@@ -118,10 +220,23 @@ export function createRequestChannel<Frame, Reply extends Frame, Id>(
     waiter.resolve(frame)
   })
 
+  const mapPostError = options.mapPostError ?? ((error: unknown) => error)
+
+  /** Reject `id`'s waiter (if still registered) after cancelling its timer. */
+  const rejectWaiter = (id: Id, error: unknown): void => {
+    const waiter = pending.get(id)
+    if (waiter === undefined) return
+    pending.delete(id)
+    waiter.cancelTimeout?.()
+    waiter.reject(error)
+  }
+
   return {
-    request(build, timeoutMs = options.timeoutMs) {
+    request(build, timeoutMs = options.timeoutMs, id = options.nextId()) {
       if (disposed) return Promise.reject(options.disposedError())
-      const id = options.nextId()
+      if (options.duplicateError !== undefined && pending.has(id)) {
+        return Promise.reject(options.duplicateError(id))
+      }
       return new Promise<Reply>((resolve, reject) => {
         const cancelTimeout =
           timeoutMs === undefined
@@ -131,19 +246,47 @@ export function createRequestChannel<Frame, Reply extends Frame, Id>(
                 reject(options.timeoutError(id, timeoutMs))
               })
         pending.set(id, { resolve, reject, cancelTimeout })
+        let frame: Frame
         try {
-          channel.post(build(id))
+          frame = build(id)
         } catch (error) {
           pending.delete(id)
           cancelTimeout?.()
-          reject(options.mapPostError === undefined ? error : options.mapPostError(error))
+          reject(mapPostError(error))
+          return
         }
+        // A send only fires while this request is still registered: a timeout
+        // (or dispose) that won the race must not post a frame no one waits on.
+        const send = () => {
+          if (!pending.has(id)) return
+          try {
+            channel.post(frame)
+          } catch (error) {
+            pending.delete(id)
+            cancelTimeout?.()
+            reject(mapPostError(error))
+          }
+        }
+        // Without a transport gate the frame posts inline; with one, the post is
+        // deferred until the transport is live, so the timeout above covers it.
+        if (options.awaitPost === undefined) {
+          send()
+          return
+        }
+        Promise.resolve().then(options.awaitPost).then(send, (error) => rejectWaiter(id, mapPostError(error)))
       })
     },
     onFrame(handler) {
       if (disposed) return () => {}
       observers.add(handler)
       return () => observers.delete(handler)
+    },
+    fail(error) {
+      for (const waiter of pending.values()) {
+        waiter.cancelTimeout?.()
+        waiter.reject(error)
+      }
+      pending.clear()
     },
     dispose() {
       if (disposed) return
@@ -157,6 +300,51 @@ export function createRequestChannel<Frame, Reply extends Frame, Id>(
       observers.clear()
     },
   }
+}
+
+// ---------------------------------------------------------------------------
+// Request/reply server loop
+// ---------------------------------------------------------------------------
+
+/** The outcome of serving one inbound frame: its value, or the error it failed with. */
+export type ServeOutcome<Request, Value> =
+  | { readonly ok: true; readonly request: Request; readonly value: Value }
+  | { readonly ok: false; readonly request: Request | undefined; readonly error: unknown }
+
+/**
+ * Serve a request/reply loop over `channel`: parse each raw frame, execute the
+ * trusted request, and hand the outcome to `respond`. A parse failure is
+ * delivered with `request: undefined`, so the caller correlates the error reply
+ * from the raw frame instead. `respond` runs only after the execute promise
+ * settles, so a rejected execute is answered — never an unhandled rejection.
+ */
+export function servePort<Request, Value>(
+  channel: FrameChannel<unknown>,
+  parse: (raw: unknown) => Request,
+  execute: (request: Request) => Value | Promise<Value>,
+  respond: (raw: unknown, outcome: ServeOutcome<Request, Value>) => void,
+): () => void {
+  return channel.onMessage((raw) => {
+    let request: Request
+    try {
+      request = parse(raw)
+    } catch (error) {
+      respond(raw, { ok: false, request: undefined, error })
+      return
+    }
+    void Promise.resolve()
+      .then(() => execute(request))
+      .then(
+        (value) => respond(raw, { ok: true, request, value }),
+        (error: unknown) => respond(raw, { ok: false, request, error }),
+      )
+  })
+}
+
+/** Read a string `requestId` from a raw frame, or `"unknown"` when it is absent. */
+export function rawRequestId(raw: unknown): string {
+  const requestId = (raw as { requestId?: unknown } | null)?.requestId
+  return typeof requestId === "string" ? requestId : "unknown"
 }
 
 // ---------------------------------------------------------------------------

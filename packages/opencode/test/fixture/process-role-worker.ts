@@ -10,12 +10,7 @@ import { Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { processRole, setProcessRole } from "@/effect/process-role"
 import { sessionWorkerNodes } from "@/session/worker/nodes"
-
-interface WorkerScope {
-  postMessage(message: unknown): void
-}
-
-const scope = globalThis as unknown as WorkerScope
+import { postToParent } from "./worker-scope"
 
 const hubNode = LayerNode.make({
   name: "@opencode/SessionHub",
@@ -44,4 +39,7 @@ const nodesAfter = sessionWorkerNodes({ hubNode, enabled: true }).length
 const conflict = capture(() => setProcessRole("writer"))
 const sameRole = capture(() => setProcessRole("session"))
 
-scope.postMessage({ type: "result", defaultRole, nodesBefore, roleAfter, nodesAfter, conflict, sameRole })
+// Protocol uniformity: announce readiness before the one-shot result so every
+// worker fixture shares the same `ready` -> payload shape.
+postToParent({ type: "ready" })
+postToParent({ type: "result", defaultRole, nodesBefore, roleAfter, nodesAfter, conflict, sameRole })

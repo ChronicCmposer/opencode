@@ -12,7 +12,7 @@ import {
   decodeFrame,
   decodeFrames,
   encodeFrame,
-  type EgressFrame,
+  type EventsFrame,
 } from "@/session/egress/frame"
 import {
   ProtocolError,
@@ -25,7 +25,7 @@ import {
 
 const event = { id: "evt_1", type: "message.part.delta", properties: { sessionID: "s1", delta: "héllo 🌍" } }
 
-function asEventFrame(frame: EgressFrame): Extract<EgressFrame, { readonly kind: "event" }> {
+function asEventFrame(frame: EventsFrame): Extract<EventsFrame, { readonly kind: "event" }> {
   if (frame.kind !== "event") throw new Error(`expected an event frame, got ${frame.kind}`)
   return frame
 }

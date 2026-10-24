@@ -20,7 +20,6 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { InstanceState } from "@/effect/instance-state"
 import { Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
 import { HttpClient, HttpClientRequest } from "effect/unstable/http"
-import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { containsPath, type InstanceContext } from "../project/instance-context"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { RemoteAuthError } from "@opencode-ai/core/v1/config/error"
@@ -148,9 +147,9 @@ function globalConfigFile() {
   return candidates[0]
 }
 
-function patchJsonc(input: string, patch: unknown, path: string[] = []): string {
+function patchJsonc(input: string, patch: unknown, segments: string[] = []): string {
   if (!isRecord(patch)) {
-    const edits = modify(input, path, patch, {
+    const edits = modify(input, segments, patch, {
       formattingOptions: {
         insertSpaces: true,
         tabSize: 2,
@@ -159,7 +158,7 @@ function patchJsonc(input: string, patch: unknown, path: string[] = []): string 
     return applyEdits(input, edits)
   }
 
-  return Object.entries(patch).reduce((result, [key, value]) => patchJsonc(result, value, [...path, key]), input)
+  return Object.entries(patch).reduce((result, [key, value]) => patchJsonc(result, value, [...segments, key]), input)
 }
 
 function writable(info: Info) {
@@ -169,7 +168,10 @@ function writable(info: Info) {
 
 function writableGlobal(info: Info) {
   const next = writable(info)
-  // When a user changes config from a value back to default in the Desktop app, we don't want to leave a blank `"shell": "",` key
+  // A blank `"shell": ""` is written as an explicit `undefined` tombstone: remeda's
+  // `mergeDeep` treats a present-but-undefined source key as a deletion, so the
+  // key disappears from the merged JSON. Removing the key here instead would
+  // leave the previously-saved shell value in place.
   if ("shell" in next && next.shell === "") return { ...next, shell: undefined }
   return next
 }
@@ -333,7 +335,6 @@ const layer = Layer.effect(
         let result: Info = {}
         const authEnv: Record<string, string> = {}
         const consoleManagedProviders = new Set<string>()
-        let activeOrgName: string | undefined
 
         const pluginScopeForSource = Effect.fnUntraced(function* (source: string) {
           if (source.startsWith("http://") || source.startsWith("https://")) return "global"
@@ -481,8 +482,10 @@ const layer = Layer.effect(
           deps.push(dep)
 
           result.command = mergeDeep(result.command ?? {}, yield* Effect.promise(() => ConfigCommand.load(dir)))
-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
-          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.loadMode(dir)))
+          const [dirAgents, dirModes] = yield* Effect.promise(() =>
+            Promise.all([ConfigAgent.load(dir), ConfigAgent.loadMode(dir)]),
+          )
+          result.agent = mergeDeep(mergeDeep(result.agent ?? {}, dirAgents), dirModes)
           // Auto-discovered plugins under `.opencode/plugin(s)` are already local files, so ConfigPlugin.load
           // returns normalized Specs and we only need to attach origin metadata here.
           const list = yield* Effect.promise(() => ConfigPlugin.load(dir))
@@ -502,6 +505,9 @@ const layer = Layer.effect(
         const activeAccount = Option.getOrUndefined(
           yield* accountSvc.active().pipe(Effect.catch(() => Effect.succeed(Option.none()))),
         )
+        const activeOrgName = Option.getOrUndefined(
+          yield* accountSvc.activeOrg().pipe(Effect.catch(() => Effect.succeed(Option.none()))),
+        )?.org.name
         if (activeAccount?.active_org_id) {
           const accountID = activeAccount.id
           const orgID = activeAccount.active_org_id
@@ -557,14 +563,10 @@ const layer = Layer.effect(
           )
         }
 
-        for (const [name, mode] of Object.entries(result.mode ?? {})) {
-          result.agent = mergeDeep(result.agent ?? {}, {
-            [name]: {
-              ...mode,
-              mode: "primary" as const,
-            },
-          })
-        }
+        const modeAgents = Object.fromEntries(
+          Object.entries(result.mode ?? {}).map(([name, mode]) => [name, { ...mode, mode: "primary" as const }]),
+        )
+        if (Object.keys(modeAgents).length > 0) result.agent = mergeDeep(result.agent ?? {}, modeAgents)
 
         if (Flag.OPENCODE_PERMISSION) {
           try {

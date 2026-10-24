@@ -76,7 +76,7 @@ export interface LeakDetector {
 
 export function createLeakDetector(options: LeakDetectorOptions = {}): LeakDetector {
   const posix = options.posix ?? posixSupport().supported
-  const isGroupAlive = options.isProcessGroupAlive ?? (posix ? defaultGroupProbe : undefined)
+  const groupAliveProbe = options.isProcessGroupAlive ?? (posix ? defaultGroupProbe : undefined)
 
   const registeredWorkers: WorkerLike[] = []
   const registeredPorts: TrackedPort[] = []
@@ -111,7 +111,7 @@ export function createLeakDetector(options: LeakDetectorOptions = {}): LeakDetec
     if (!Number.isInteger(pgid) || pgid <= 0) {
       throw new Error(`invalid process group: ${pgid} (expected a positive integer)`)
     }
-    if (!isGroupAlive) {
+    if (!groupAliveProbe) {
       throw new Error(`process group tracking requires POSIX; ${posixSupport().reason}`)
     }
     if (!registeredGroups.includes(pgid)) registeredGroups.push(pgid)
@@ -125,7 +125,9 @@ export function createLeakDetector(options: LeakDetectorOptions = {}): LeakDetec
     }
 
     const openPorts = registeredPorts.filter((port) => !port.closed).map((port) => port.id)
-    const liveGroups = registeredGroups.filter((pgid) => isGroupAlive!(pgid))
+    // Groups can only be registered when a probe exists (`trackProcessGroup`
+    // fails loudly otherwise), so `undefined` here simply means "none tracked".
+    const liveGroups = groupAliveProbe === undefined ? [] : registeredGroups.filter((pgid) => groupAliveProbe(pgid))
 
     const leaks: Leak[] = [
       ...[...liveWorkers].map((id): Leak => ({ kind: "worker", id, detail: `worker ${id} is still alive` })),

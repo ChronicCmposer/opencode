@@ -38,24 +38,39 @@ const emptyConsoleState: ConsoleState = {
   switchableOrgCount: 0,
 }
 
-function search<T>(items: T[], target: string, key: (item: T) => string) {
+/**
+ * Binary search over an ascending array. The comparator must impose the same
+ * total order that keeps `items` sorted, so the returned `index` is also the
+ * insertion point when the target is absent.
+ */
+function search<T, K>(items: T[], target: K, compare: (item: T, target: K) => number) {
   let left = 0
   let right = items.length - 1
   while (left <= right) {
     const middle = Math.floor((left + right) / 2)
-    const value = key(items[middle])
-    if (value === target) return { found: true, index: middle }
-    if (value < target) left = middle + 1
+    const order = compare(items[middle], target)
+    if (order === 0) return { found: true, index: middle }
+    if (order < 0) left = middle + 1
     else right = middle - 1
   }
   return { found: false, index: left }
 }
 
-function compareMessage(a: Message, b: Message) {
-  return a.time.created - b.time.created || a.id.localeCompare(b.id)
+/** Total order for ids, shared by every id-keyed cache (sessions, parts, requests). */
+function compareIds(candidate: string, target: string) {
+  if (candidate === target) return 0
+  return candidate < target ? -1 : 1
 }
 
-const messageKey = (message: Message) => message.time.created + message.id
+/** Locate an entity by id; the ascending invariant for every id-keyed cache. */
+function byId<T extends { id: string }>(item: T, target: string) {
+  return compareIds(item.id, target)
+}
+
+/** Creation time, then id. The single ordering for live inserts and hydration alike. */
+function compareMessage(a: Message, b: Message) {
+  return a.time.created - b.time.created || compareIds(a.id, b.id)
+}
 
 export const {
   context: SyncContext,
@@ -181,7 +196,7 @@ export const {
         case "permission.replied": {
           const requests = store.permission[event.properties.sessionID]
           if (!requests) break
-          const match = search(requests, event.properties.requestID, (r) => r.id)
+          const match = search(requests, event.properties.requestID, byId)
           if (!match.found) break
           setStore(
             "permission",
@@ -209,7 +224,7 @@ export const {
             setStore("permission", request.sessionID, [request])
             break
           }
-          const match = search(requests, request.id, (r) => r.id)
+          const match = search(requests, request.id, byId)
           if (match.found) {
             setStore("permission", request.sessionID, match.index, reconcile(request))
             break
@@ -228,7 +243,7 @@ export const {
         case "question.rejected": {
           const requests = store.question[event.properties.sessionID]
           if (!requests) break
-          const match = search(requests, event.properties.requestID, (r) => r.id)
+          const match = search(requests, event.properties.requestID, byId)
           if (!match.found) break
           setStore(
             "question",
@@ -247,7 +262,7 @@ export const {
             setStore("question", request.sessionID, [request])
             break
           }
-          const match = search(requests, request.id, (r) => r.id)
+          const match = search(requests, request.id, byId)
           if (match.found) {
             setStore("question", request.sessionID, match.index, reconcile(request))
             break
@@ -271,7 +286,7 @@ export const {
           break
 
         case "session.deleted": {
-          const result = search(store.session, event.properties.info.id, (s) => s.id)
+          const result = search(store.session, event.properties.info.id, byId)
           if (result.found) {
             setStore(
               "session",
@@ -283,7 +298,7 @@ export const {
           break
         }
         case "session.updated": {
-          const result = search(store.session, event.properties.info.id, (s) => s.id)
+          const result = search(store.session, event.properties.info.id, byId)
           if (result.found) {
             setStore("session", result.index, reconcile(event.properties.info))
             break
@@ -298,7 +313,7 @@ export const {
         }
 
         case "session.next.moved": {
-          const result = search(store.session, event.properties.sessionID, (s) => s.id)
+          const result = search(store.session, event.properties.sessionID, byId)
           if (!result.found) break
           setStore(
             "session",
@@ -334,7 +349,7 @@ export const {
             setStore("message", event.properties.info.sessionID, [event.properties.info])
             break
           }
-          const result = search(messages, messageKey(event.properties.info), messageKey)
+          const result = search(messages, event.properties.info, compareMessage)
           if (result.found) {
             setStore("message", event.properties.info.sessionID, result.index, reconcile(event.properties.info))
             break
@@ -389,7 +404,7 @@ export const {
             setStore("part", event.properties.part.messageID, [event.properties.part])
             break
           }
-          const result = search(parts, event.properties.part.id, (part) => part.id)
+          const result = search(parts, event.properties.part.id, byId)
           if (result.found) {
             setStore("part", event.properties.part.messageID, result.index, reconcile(event.properties.part))
             break
@@ -407,7 +422,7 @@ export const {
         case "message.part.delta": {
           const parts = store.part[event.properties.messageID]
           if (!parts) break
-          const result = search(parts, event.properties.partID, (part) => part.id)
+          const result = search(parts, event.properties.partID, byId)
           if (!result.found) break
           touchPart(event.properties.sessionID, event.properties.partID)
           setStore(
@@ -426,7 +441,7 @@ export const {
         case "message.part.removed": {
           touchPart(event.properties.sessionID, event.properties.partID)
           const parts = store.part[event.properties.messageID]
-          const result = search(parts, event.properties.partID, (part) => part.id)
+          const result = search(parts, event.properties.partID, byId)
           if (result.found) {
             setStore(
               "part",
@@ -579,7 +594,7 @@ export const {
       },
       session: {
         get(sessionID: string) {
-          const match = search(store.session, sessionID, (s) => s.id)
+          const match = search(store.session, sessionID, byId)
           if (match.found) return store.session[match.index]
           return undefined
         },
@@ -615,7 +630,7 @@ export const {
             ])
             setStore(
               produce((draft) => {
-                const match = search(draft.session, sessionID, (s) => s.id)
+                const match = search(draft.session, sessionID, byId)
                 if (match.found) draft.session[match.index] = session.data!
                 if (!match.found) draft.session.splice(match.index, 0, session.data!)
                 draft.todo[sessionID] = todo.data ?? []

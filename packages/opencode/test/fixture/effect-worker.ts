@@ -12,6 +12,7 @@ import { threadId } from "node:worker_threads"
 import { Effect } from "effect"
 import { decodeDataUrl } from "@/util/data-url"
 import { iife } from "@/util/iife"
+import { onMessage, postToParent } from "./worker-scope"
 
 export interface EffectWorkerReady {
   readonly type: "ready"
@@ -36,18 +37,11 @@ export type EffectWorkerInbound =
   | { readonly type: "compute"; readonly value: number }
   | { readonly type: "fail"; readonly message: string }
 
-interface WorkerScope {
-  postMessage(message: EffectWorkerOutbound): void
-  onmessage: ((event: { data: unknown }) => void) | null
-}
-
 interface ComputeResult {
   readonly value: number
   readonly alias: string
   readonly marker: string
 }
-
-const scope = globalThis as unknown as WorkerScope
 
 const ALIAS_SENTINEL = "alias-resolved"
 const ALIAS_DATA_URL = `data:text/plain;base64,${Buffer.from(ALIAS_SENTINEL).toString("base64")}`
@@ -77,24 +71,24 @@ const runFail = (message: string): Promise<EffectWorkerOutbound> =>
     Effect.runPromise,
   )
 
-scope.onmessage = (event) => {
-  const message = (event.data ?? {}) as Partial<EffectWorkerInbound>
+onMessage<Partial<EffectWorkerInbound>>((raw) => {
+  const message: Partial<EffectWorkerInbound> = raw ?? {}
 
   if (message.type === "compute") {
     if (typeof message.value !== "number") {
-      scope.postMessage({ type: "failed", message: `compute requires a numeric value, received ${typeof message.value}` })
+      postToParent({ type: "failed", message: `compute requires a numeric value, received ${typeof message.value}` })
       return
     }
-    void runCompute(message.value).then((out) => scope.postMessage(out))
+    void runCompute(message.value).then((out) => postToParent(out))
     return
   }
 
   if (message.type === "fail") {
-    void runFail(message.message ?? "worker failure").then((out) => scope.postMessage(out))
+    void runFail(message.message ?? "worker failure").then((out) => postToParent(out))
     return
   }
 
-  scope.postMessage({ type: "failed", message: `unknown message: ${String(message.type)}` })
-}
+  postToParent({ type: "failed", message: `unknown message: ${String(message.type)}` })
+})
 
-scope.postMessage({ type: "ready", threadId })
+postToParent({ type: "ready", threadId })

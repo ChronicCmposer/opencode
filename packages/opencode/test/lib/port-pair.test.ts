@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { createListenerPair } from "./port-pair"
+import { createListenerPair, type ListenerPort } from "./port-pair"
 
 interface Frame {
   readonly type: string
@@ -78,5 +78,19 @@ describe("createListenerPair", () => {
 
     expect(posted).toEqual(["hooked"])
     expect(pair.worker.received).toEqual([])
+  })
+
+  test("endpoints are immutable and hooks receive the real endpoint", () => {
+    const seen: ListenerPort<Frame>[] = []
+    const pair = createListenerPair<Frame>((port) => {
+      seen.push(port)
+    })
+
+    expect(Object.isFrozen(pair.hub)).toBe(true)
+    expect(Object.isFrozen(pair.worker)).toBe(true)
+
+    pair.worker.post({ type: "from-worker" })
+
+    expect(seen).toEqual([pair.worker])
   })
 })

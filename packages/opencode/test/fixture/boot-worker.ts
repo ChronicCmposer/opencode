@@ -7,14 +7,9 @@
 // out: { type: "ready", workerId, rssBytes }
 
 import { threadId } from "node:worker_threads"
+import { postToParent } from "./worker-scope"
 
-interface WorkerScope {
-  postMessage(message: unknown): void
-}
-
-const scope = globalThis as unknown as WorkerScope
-
-scope.postMessage({
+postToParent({
   type: "ready",
   workerId: threadId,
   rssBytes: process.memoryUsage().rss,

@@ -32,100 +32,26 @@ import {
   type CallRequest,
   type ServerSpec,
 } from "./protocol"
-import { BrokerFailure, parseBrokerRequest, rememberBounded, resolveRequestTimeout } from "./protocol"
+import {
+  BrokerFailure,
+  parseBrokerRequest,
+  parseWorkerAttach,
+  rememberBounded,
+  resolveRequestTimeout,
+  toBrokerError,
+} from "./protocol"
 import { mergeEnv } from "./env"
+import { type Framer, framerFor } from "./framer"
+import { isRecord } from "@/session/worker/frame"
+import { portFromMessagePort, rawRequestId, servePort } from "@/session/worker/port"
 import { setThreadName } from "@/util/thread-name"
 
 // Name this isolate's OS thread for human observability (Linux-only, fail-soft).
 setThreadName("ocb")
 
 // ---------------------------------------------------------------------------
-// Framing
-// ---------------------------------------------------------------------------
-
-interface Framer {
-  /** Encode one JSON-RPC message into the child's stdin wire format. */
-  encode(message: unknown): string
-  /** Feed a chunk of the child's stdout, returning any complete messages. */
-  push(chunk: Uint8Array): unknown[]
-}
-
-/** Newline-delimited JSON-RPC (MCP stdio). */
-class McpFramer implements Framer {
-  private buffer = ""
-  private readonly decoder = new TextDecoder()
-
-  encode(message: unknown): string {
-    return `${JSON.stringify(message)}\n`
-  }
-
-  push(chunk: Uint8Array): unknown[] {
-    this.buffer += this.decoder.decode(chunk, { stream: true })
-    const messages: unknown[] = []
-    let newline: number
-    while ((newline = this.buffer.indexOf("\n")) >= 0) {
-      const line = this.buffer.slice(0, newline).trim()
-      this.buffer = this.buffer.slice(newline + 1)
-      if (!line) continue
-      try {
-        messages.push(JSON.parse(line))
-      } catch {
-        /* ignore malformed child output */
-      }
-    }
-    return messages
-  }
-}
-
-/** LSP-style `Content-Length` framing. */
-class LspFramer implements Framer {
-  private buffer = Buffer.alloc(0)
-
-  encode(message: unknown): string {
-    const json = JSON.stringify(message)
-    return `Content-Length: ${Buffer.byteLength(json, "utf8")}\r\n\r\n${json}`
-  }
-
-  push(chunk: Uint8Array): unknown[] {
-    this.buffer = Buffer.concat([this.buffer, Buffer.from(chunk)])
-    const messages: unknown[] = []
-    for (;;) {
-      const headerEnd = this.buffer.indexOf("\r\n\r\n")
-      if (headerEnd < 0) break
-      const header = this.buffer.slice(0, headerEnd).toString("utf8")
-      const match = /Content-Length:\s*(\d+)/i.exec(header)
-      if (!match) {
-        this.buffer = this.buffer.slice(headerEnd + 4)
-        continue
-      }
-      const length = Number.parseInt(match[1]!, 10)
-      const bodyStart = headerEnd + 4
-      if (this.buffer.length < bodyStart + length) break
-      const body = this.buffer.slice(bodyStart, bodyStart + length).toString("utf8")
-      this.buffer = this.buffer.slice(bodyStart + length)
-      try {
-        messages.push(JSON.parse(body))
-      } catch {
-        /* ignore malformed child output */
-      }
-    }
-    return messages
-  }
-}
-
-function framerFor(kind: ServerSpec["kind"]): Framer {
-  return kind === "lsp" ? new LspFramer() : new McpFramer()
-}
-
-// ---------------------------------------------------------------------------
 // Failures
 // ---------------------------------------------------------------------------
-
-function toBrokerError(reason: unknown): BrokerError {
-  if (reason instanceof BrokerFailure) return { code: reason.code, message: reason.message }
-  if (reason instanceof Error) return { code: "protocol", message: reason.message }
-  return { code: "protocol", message: String(reason) }
-}
 
 function reapGroup(pgid: number, signal: NodeJS.Signals = "SIGTERM"): void {
   try {
@@ -184,6 +110,8 @@ const activeCalls = new Map<string, ActiveCall>()
 const cancelled = new Set<string>()
 
 let rpc: MessagePort | null = null
+/** Set once teardown starts; queued work must not spawn/dispatch after it. */
+let shuttingDown = false
 
 function postFrame(frame: BrokerFrame): void {
   rpc?.postMessage(frame)
@@ -243,24 +171,60 @@ async function awaitExit(child: ChildHandle, timeoutMs = 2000): Promise<void> {
   await settleWithin([child.exited], timeoutMs)
 }
 
+/** A decoded child message: a JSON-RPC reply (numeric `id`) or a notification/request (string `method`). */
+type ChildMessage =
+  | { readonly kind: "reply"; readonly id: number; readonly result: unknown; readonly error: unknown }
+  | { readonly kind: "request"; readonly method: string; readonly params?: unknown }
+
+/**
+ * Guard-parse one decoded child message. A reply is identified by a numeric `id`,
+ * a notification/request by a string `method`; anything else is not JSON-RPC and
+ * is ignored. Parsing once keeps the dispatch below free of repeated `typeof`
+ * checks and unsafe casts.
+ */
+function parseChildMessage(value: unknown): ChildMessage | undefined {
+  if (!isRecord(value)) return undefined
+  const id = value["id"]
+  if (typeof id === "number") {
+    return { kind: "reply", id, result: value["result"], error: value["error"] }
+  }
+  const method = value["method"]
+  if (typeof method === "string") {
+    return { kind: "request", method, ...(value["params"] === undefined ? {} : { params: value["params"] }) }
+  }
+  return undefined
+}
+
 function dispatchChildMessage(child: ChildHandle, message: unknown): void {
-  if (typeof message !== "object" || message === null) return
-  const parsed = message as { id?: unknown; method?: unknown; result?: unknown; error?: unknown; params?: unknown }
-  if (typeof parsed.id === "number" && child.pending.has(parsed.id)) {
-    const pending = child.pending.get(parsed.id)!
+  const parsed = parseChildMessage(message)
+  if (parsed === undefined) return
+  if (parsed.kind === "reply") {
+    // One lookup: a reply for a request we never sent (or already settled) is
+    // dropped without a second `has`/`get` pair or a non-null assertion.
+    const pending = child.pending.get(parsed.id)
+    if (pending === undefined) return
     if (parsed.error !== undefined) pending.settleReject(new BrokerFailure("protocol", JSON.stringify(parsed.error)))
     else pending.settleResolve(parsed.result)
     return
   }
-  if (typeof parsed.method === "string") {
-    postFrame({
-      kind: "notification",
-      directory: child.directory,
-      server: child.spec.name,
-      method: parsed.method,
-      ...(parsed.params === undefined ? {} : { params: parsed.params }),
-    })
-  }
+  postFrame({
+    kind: "notification",
+    directory: child.directory,
+    server: child.spec.name,
+    method: parsed.method,
+    ...(parsed.params === undefined ? {} : { params: parsed.params }),
+  })
+}
+
+/** Surface a framing/JSON error from a child's stdout as a broker notification. */
+function surfaceFramerError(child: ChildHandle, error: string): void {
+  postFrame({
+    kind: "notification",
+    directory: child.directory,
+    server: child.spec.name,
+    method: "notifications/broker",
+    params: { level: "error", data: error },
+  })
 }
 
 function pumpChild(child: ChildHandle): void {
@@ -271,7 +235,9 @@ function pumpChild(child: ChildHandle): void {
       for (;;) {
         const { done, value } = await reader.read()
         if (done) break
-        for (const message of child.framer.push(value)) dispatchChildMessage(child, message)
+        const { messages, errors } = child.framer.push(value)
+        for (const message of messages) dispatchChildMessage(child, message)
+        for (const error of errors) surfaceFramerError(child, error)
       }
     } catch {
       /* the child is gone; exit handling owns cleanup */
@@ -280,7 +246,12 @@ function pumpChild(child: ChildHandle): void {
 }
 
 function spawnChild(directory: string, spec: ServerSpec): ChildHandle {
-  const cwd = existsDirectory(directory) ? directory : process.cwd()
+  // A missing directory is a caller error, not a reason to spawn the child in the
+  // hub's working directory (which would silently run it in the wrong place).
+  if (!existsDirectory(directory)) {
+    throw new BrokerFailure("unknown-directory", `no directory ${directory}`)
+  }
+  const cwd = directory
   let process_: Bun.Subprocess
   try {
     process_ = Bun.spawn(spec.command as string[], {
@@ -319,6 +290,10 @@ function spawnChild(directory: string, spec: ServerSpec): ChildHandle {
     const error = new BrokerFailure("child-exited", `${spec.name} exited with code ${code}`)
     for (const pending of child.pending.values()) pending.settleReject(error)
     child.pending.clear()
+    // A naturally-exited child is dead: drop it from its directory so the next
+    // acquire spawns a fresh one, and reap any descendants that outlived it.
+    directories.get(directory)?.children.delete(spec.name)
+    reapGroup(child.pgid)
     emitChildExit(child, code)
   })
 
@@ -464,15 +439,26 @@ async function handleCall(request: CallRequest): Promise<unknown> {
 
   const state = directories.get(request.directory)
   if (!state) throw new BrokerFailure("unknown-directory", `no directory ${request.directory}`)
-  const child = state.children.get(request.server)
-  if (!child) throw new BrokerFailure("unknown-server", `no server ${request.server} in ${request.directory}`)
+  if (!state.children.has(request.server)) {
+    throw new BrokerFailure("unknown-server", `no server ${request.server} in ${request.directory}`)
+  }
 
-  const timeoutMs = resolveRequestTimeout(request.timeoutMs, child.spec.timeoutMs)
   return runSerial(state, () => {
+    // Re-resolve inside the serialized task: a release/teardown or a child exit
+    // may have removed the directory or child while this call waited in the queue.
+    if (shuttingDown) return Promise.reject(new BrokerFailure("crashed", "broker is shutting down"))
+    const current = directories.get(request.directory)
+    if (!current) return Promise.reject(new BrokerFailure("unknown-directory", `no directory ${request.directory}`))
+    const child = current.children.get(request.server)
+    if (!child) {
+      return Promise.reject(
+        new BrokerFailure("unknown-server", `no server ${request.server} in ${request.directory}`),
+      )
+    }
     if (cancelled.delete(request.requestId)) {
       return Promise.reject(new BrokerFailure("cancelled", `call ${request.requestId} cancelled before dispatch`))
     }
-    return dispatchCall(request, child, timeoutMs)
+    return dispatchCall(request, child, resolveRequestTimeout(request.timeoutMs, child.spec.timeoutMs))
   })
 }
 
@@ -507,6 +493,7 @@ function handleOAuth(request: BrokerRequest & { kind: "oauth" }) {
 }
 
 async function handleTeardown(): Promise<void> {
+  shuttingDown = true
   const exits: Array<Promise<number>> = []
   for (const state of directories.values()) {
     for (const child of state.children.values()) {
@@ -553,19 +540,17 @@ function respondError(requestId: string, error: BrokerError): void {
   postFrame({ kind: "response", requestId, ok: false, error })
 }
 
-function onRpcMessage(event: { data: unknown }): void {
-  let request: BrokerRequest
-  try {
-    request = parseBrokerRequest(event.data)
-  } catch (error) {
-    const requestId = (event.data as { requestId?: unknown } | null)?.requestId
-    respondError(typeof requestId === "string" ? requestId : "unknown", toBrokerError(error))
-    return
-  }
-
-  void Promise.resolve(execute(request)).then(
-    (value) => respond(request.requestId, value ?? null),
-    (reason) => respondError(request.requestId, toBrokerError(reason)),
+/** Serve the RPC port: one generic request/reply loop shared with the hub side. */
+function serveRpc(port: MessagePort): void {
+  servePort(
+    portFromMessagePort<unknown>(port),
+    parseBrokerRequest,
+    execute,
+    (raw, outcome) => {
+      const requestId = outcome.request?.requestId ?? rawRequestId(raw)
+      if (outcome.ok) respond(requestId, outcome.value ?? null)
+      else respondError(requestId, toBrokerError(outcome.error))
+    },
   )
 }
 
@@ -581,13 +566,16 @@ interface WorkerScope {
 const scope = globalThis as unknown as WorkerScope
 
 scope.onmessage = (event) => {
-  const message = event.data as Partial<BrokerWorkerInbound>
-  if (message?.type === "attach" && message.port instanceof MessagePort) {
-    rpc = message.port
-    rpc.onmessage = onRpcMessage
-    rpc.start?.()
-    scope.postMessage({ type: "attached", threadId })
+  let message: BrokerWorkerInbound
+  try {
+    message = parseWorkerAttach(event.data)
+  } catch {
+    // The only inbound handshake frame is `attach`; anything else is a hub bug.
+    return
   }
+  rpc = message.port
+  serveRpc(message.port)
+  scope.postMessage({ type: "attached", threadId })
 }
 
 scope.postMessage({ type: "ready", threadId })

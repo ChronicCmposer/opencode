@@ -22,13 +22,7 @@ import {
 } from "@/session/worker/execute"
 import { currentThreadId } from "../lib/loop-gap"
 import { MOCK_SSE_WORK_KIND, burnCpu, consumeMockSse, readMockSseConfig } from "../lib/mock-sse-worker"
-
-interface WorkerScope {
-  onmessage: ((event: { data: unknown }) => void) | null
-  postMessage(message: unknown, transfer?: readonly Transferable[]): void
-}
-
-const scope = globalThis as unknown as WorkerScope
+import { postToParent, scope } from "./worker-scope"
 
 const egressChannel = new MessageChannel()
 
@@ -51,4 +45,4 @@ const work: SessionWorkFactory = (kind) => {
 
 installSessionExecutor(scope, { work, threadId: currentThreadId() ?? 0 })
 
-scope.postMessage({ type: "ports", egress: egressChannel.port2 }, [egressChannel.port2])
+postToParent({ type: "ports", egress: egressChannel.port2 }, [egressChannel.port2])

@@ -4,7 +4,7 @@ import { LegacyEvent } from "../src/legacy-event"
 import { PermissionV1 } from "../src/permission-v1"
 import { QuestionV1 } from "../src/question-v1"
 import { Project } from "../src/project"
-import type { SessionID } from "../src/session-id"
+import { SessionID } from "../src/session-id"
 import { SessionV1 } from "../src/session-v1"
 
 describe("legacy public event schemas", () => {
@@ -29,14 +29,17 @@ describe("legacy public event schemas", () => {
   })
 
   test("owns the transient session.cancelled outcome payload", () => {
+    // Construct the ID through its schema instead of casting a bare string: the
+    // brand is the decoded value the event payload accepts.
+    const sessionID = SessionID.make("ses_1")
     const decoded = Schema.decodeUnknownSync(SessionV1.Event.Cancelled.data)({
-      sessionID: "ses_1" as SessionID,
+      sessionID,
       mode: "cooperative",
       durationMs: 12,
       acknowledged: true,
     })
     expect(decoded).toEqual({
-      sessionID: "ses_1" as SessionID,
+      sessionID,
       mode: "cooperative",
       durationMs: 12,
       acknowledged: true,

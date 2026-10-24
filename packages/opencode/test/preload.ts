@@ -48,26 +48,33 @@ for (const key of HOST_CONFIG_VARS) {
 // Set XDG env vars FIRST, before any src/ imports
 const dir = path.join(os.tmpdir(), "opencode-test-data-" + process.pid)
 await fs.mkdir(dir, { recursive: true })
+const isBusy = (error: unknown): boolean =>
+  typeof error === "object" && error !== null && "code" in error && error.code === "EBUSY"
+
+/**
+ * Remove the per-run temp directory. The caller awaits `AppRuntime.dispose()`
+ * first — that is the disposal signal that releases the instances' SQLite
+ * handles — so on POSIX the first `rm` succeeds. Windows can still hold WAL
+ * handles until GC finalizers run, so there we retry a bounded number of times
+ * instead of a fixed-sleep loop.
+ */
+async function removeDirectory(target: string, attempts = 10): Promise<void> {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await fs.rm(target, { recursive: true, force: true })
+      return
+    } catch (error) {
+      if (!isBusy(error) || process.platform !== "win32" || attempt === attempts) throw error
+      Bun.gc(true)
+      await sleep(50 * attempt)
+    }
+  }
+}
+
 afterAll(async () => {
   const { AppRuntime } = await import("../src/effect/app-runtime")
   await AppRuntime.dispose()
-
-  const busy = (error: unknown) =>
-    typeof error === "object" && error !== null && "code" in error && error.code === "EBUSY"
-  const rm = async (left: number): Promise<void> => {
-    Bun.gc(true)
-    await sleep(100)
-    return fs.rm(dir, { recursive: true, force: true }).catch((error) => {
-      if (!busy(error)) throw error
-      if (left <= 1 && process.platform !== "win32") throw error
-      if (left <= 1) return
-      return rm(left - 1)
-    })
-  }
-
-  // Windows can keep SQLite WAL handles alive until GC finalizers run, so we
-  // force GC and retry teardown to avoid flaky EBUSY in test cleanup.
-  await rm(30)
+  await removeDirectory(dir)
 })
 
 process.env["XDG_DATA_HOME"] = path.join(dir, "share")
@@ -93,34 +100,38 @@ const cacheDir = path.join(dir, "cache", "opencode")
 await fs.mkdir(cacheDir, { recursive: true })
 await fs.writeFile(path.join(cacheDir, "version"), "14")
 
-// Clear provider and server auth env vars to ensure clean test state
-delete process.env["ANTHROPIC_API_KEY"]
-delete process.env["OPENAI_API_KEY"]
-delete process.env["GOOGLE_API_KEY"]
-delete process.env["GOOGLE_GENERATIVE_AI_API_KEY"]
-delete process.env["AZURE_OPENAI_API_KEY"]
-delete process.env["AWS_ACCESS_KEY_ID"]
-delete process.env["AWS_PROFILE"]
-delete process.env["AWS_REGION"]
-delete process.env["AWS_BEARER_TOKEN_BEDROCK"]
-delete process.env["OPENROUTER_API_KEY"]
-delete process.env["LLM_GATEWAY_API_KEY"]
-delete process.env["GROQ_API_KEY"]
-delete process.env["MISTRAL_API_KEY"]
-delete process.env["PERPLEXITY_API_KEY"]
-delete process.env["TOGETHER_API_KEY"]
-delete process.env["XAI_API_KEY"]
-delete process.env["DEEPSEEK_API_KEY"]
-delete process.env["FIREWORKS_API_KEY"]
-delete process.env["CEREBRAS_API_KEY"]
-delete process.env["SAMBANOVA_API_KEY"]
-delete process.env["OPENCODE_SERVER_PASSWORD"]
-delete process.env["OPENCODE_SERVER_USERNAME"]
-delete process.env["OPENCODE_EXPERIMENTAL"]
-delete process.env["OPENCODE_ENABLE_EXPERIMENTAL_MODELS"]
-delete process.env["OTEL_EXPORTER_OTLP_ENDPOINT"]
-delete process.env["OTEL_EXPORTER_OTLP_HEADERS"]
-delete process.env["OTEL_RESOURCE_ATTRIBUTES"]
+// Provider/server credentials and OTLP wiring from the ambient shell must not
+// leak into the suite either; clear the whole set from one table.
+const HOST_SECRET_VARS = [
+  "ANTHROPIC_API_KEY",
+  "OPENAI_API_KEY",
+  "GOOGLE_API_KEY",
+  "GOOGLE_GENERATIVE_AI_API_KEY",
+  "AZURE_OPENAI_API_KEY",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_PROFILE",
+  "AWS_REGION",
+  "AWS_BEARER_TOKEN_BEDROCK",
+  "OPENROUTER_API_KEY",
+  "LLM_GATEWAY_API_KEY",
+  "GROQ_API_KEY",
+  "MISTRAL_API_KEY",
+  "PERPLEXITY_API_KEY",
+  "TOGETHER_API_KEY",
+  "XAI_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "FIREWORKS_API_KEY",
+  "CEREBRAS_API_KEY",
+  "SAMBANOVA_API_KEY",
+  "OPENCODE_SERVER_PASSWORD",
+  "OPENCODE_SERVER_USERNAME",
+  "OPENCODE_EXPERIMENTAL",
+  "OPENCODE_ENABLE_EXPERIMENTAL_MODELS",
+  "OTEL_EXPORTER_OTLP_ENDPOINT",
+  "OTEL_EXPORTER_OTLP_HEADERS",
+  "OTEL_RESOURCE_ATTRIBUTES",
+] as const
+for (const key of HOST_SECRET_VARS) delete process.env[key]
 
 // One shared database for the hub and the session worker's writer isolate.
 //
@@ -138,7 +149,11 @@ delete process.env["OTEL_RESOURCE_ATTRIBUTES"]
 // does); preload only chooses the default.
 process.env["OPENCODE_DB"] = hostIsolationDisabled ? path.join(dir, "opencode-test.db") : ":memory:"
 
-// Now safe to import from src/
+// Now safe to import from src/.
+//
+// Projector-wiring seam: `initProjectors` is currently a synchronous no-op stub
+// (`src/server/projectors.ts`), so it is called, not awaited. Keep it here,
+// above the fail-fast tripwire, so the tripwire stays the last statement.
 const { initProjectors } = await import("../src/server/projectors")
 
 initProjectors()

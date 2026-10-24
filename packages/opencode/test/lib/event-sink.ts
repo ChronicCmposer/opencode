@@ -47,15 +47,21 @@ export interface EventSink extends AsyncDisposable {
   types(): ReadonlyArray<string>
   /** Drop all captured events (leaving the subscription active). */
   clear(): void
-  /** Resolves once the subscription is active (the sink is always ready on return). */
-  readonly ready: Promise<void>
   /** Unsubscribe and, when the sink assembled the runtime, dispose it. */
   dispose(): Promise<void>
 }
 
-/** A runtime exposes `runFork`/`runSync`; a layer does not. */
+/** A runtime exposes `runFork`; a layer does not. */
 function isRuntime(source: EventSinkSource): source is ManagedRuntime.ManagedRuntime<EventV2.Service, never> {
-  return typeof (source as { readonly runFork?: unknown }).runFork === "function"
+  return "runFork" in source
+}
+
+/** Parse an untrusted `GlobalBus` payload into the normalized sink envelope. */
+function parseGlobalPayload(payload: unknown): SinkEvent | undefined {
+  if (payload === null || typeof payload !== "object") return undefined
+  const record = payload as Record<string, unknown>
+  if (typeof record.id !== "string" || typeof record.type !== "string") return undefined
+  return { id: record.id, type: record.type, properties: record.properties }
 }
 
 /** Register a listener on the event service, synchronously, and return its removal effect. */
@@ -77,10 +83,8 @@ function subscribeEventV2(
 /** Register a `GlobalBus` listener and return its removal effect. */
 function subscribeGlobalBus(push: (event: SinkEvent) => void): Effect.Effect<void> {
   const handler = (event: GlobalEvent) => {
-    const payload = event.payload as { readonly id?: unknown; readonly type?: unknown; readonly properties?: unknown } | undefined
-    if (payload === undefined || payload === null || typeof payload !== "object") return
-    if (typeof payload.id !== "string" || typeof payload.type !== "string") return
-    push({ id: payload.id, type: payload.type, properties: payload.properties })
+    const sinkEvent = parseGlobalPayload(event.payload)
+    if (sinkEvent !== undefined) push(sinkEvent)
   }
   GlobalBus.on("event", handler)
   return Effect.sync(() => {
@@ -90,12 +94,14 @@ function subscribeGlobalBus(push: (event: SinkEvent) => void): Effect.Effect<voi
 
 /**
  * Subscribe to a real event source and capture its emissions. The subscription is
- * active before this returns (the returned `ready` promise is already resolved),
- * so no readiness handshake is needed.
+ * active before this returns, so no readiness handshake is needed.
  */
 export function createEventSink(source: EventSinkSource, options: EventSinkOptions = {}): EventSink {
-  const ownsRuntime = !isRuntime(source)
-  const runtime = ownsRuntime ? ManagedRuntime.make(source as Layer.Layer<EventV2.Service, never, never>) : source
+  // Narrow once: a supplied runtime is observed in place, a layer is assembled
+  // into a runtime this sink owns and must dispose.
+  const { runtime, ownsRuntime } = isRuntime(source)
+    ? { runtime: source, ownsRuntime: false }
+    : { runtime: ManagedRuntime.make(source), ownsRuntime: true }
   const records: SinkEvent[] = []
   const push = (event: SinkEvent): void => {
     records.push(event)
@@ -109,8 +115,13 @@ export function createEventSink(source: EventSinkSource, options: EventSinkOptio
   const dispose = async (): Promise<void> => {
     if (disposed) return
     disposed = true
-    await runtime.runPromise(unsubscribe).catch(() => undefined)
-    if (ownsRuntime) await runtime.dispose().catch(() => undefined)
+    const failures: unknown[] = []
+    // Attempt every teardown step, then fail loudly: a swallowed teardown error
+    // hides a leaked subscription or an un-disposed runtime.
+    await runtime.runPromise(unsubscribe).catch((error: unknown) => failures.push(error))
+    if (ownsRuntime) await runtime.dispose().catch((error: unknown) => failures.push(error))
+    if (failures.length === 1) throw failures[0]
+    if (failures.length > 1) throw new AggregateError(failures, "event sink teardown failed")
   }
 
   return {
@@ -120,7 +131,6 @@ export function createEventSink(source: EventSinkSource, options: EventSinkOptio
     clear: () => {
       records.length = 0
     },
-    ready: Promise.resolve(),
     dispose,
     [Symbol.asyncDispose]: dispose,
   }

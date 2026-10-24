@@ -31,7 +31,7 @@ import {
   resolveWorkerCount,
 } from "@/session/worker/pool"
 import { createProductionWorkerPool } from "@/session/worker/hub"
-import { buildWorkerSnapshot, nextEpoch } from "@/session/worker/snapshot"
+import { buildWorkerSnapshot, createEpochSequence, nextEpoch } from "@/session/worker/snapshot"
 import { assertStructuredCloneable, sessionWorkerInit } from "../../lib/session-worker-init"
 import { bootSessionWorker } from "../../lib/session-worker-harness"
 import { sid } from "../../lib/async"
@@ -122,7 +122,12 @@ const snapshotLayers = Layer.mergeAll(
   RuntimeFlags.layer({ experimentalSessionWorkers: true }),
 )
 
-const buildSnapshot = (options: { workerCount?: number; clock?: () => number }) =>
+const buildSnapshot = (options: {
+  workerCount?: number
+  clock?: () => number
+  epoch?: number
+  epochSequence?: ReturnType<typeof createEpochSequence>
+}) =>
   buildWorkerSnapshot(options).pipe(Effect.provide(snapshotLayers), Effect.provideService(InstanceRef, instanceCtx))
 
 describe("buildWorkerSnapshot", () => {
@@ -153,13 +158,44 @@ describe("snapshot epoch", () => {
     expect(nextEpoch(5, 1)).toBe(6)
   })
 
-  test("successive builds are strictly monotonic with an injectable clock", async () => {
-    const first = await Effect.runPromise(buildSnapshot({ workerCount: 1, clock: () => 1_000 }))
-    const second = await Effect.runPromise(buildSnapshot({ workerCount: 1, clock: () => 10 }))
-    const third = await Effect.runPromise(buildSnapshot({ workerCount: 1, clock: () => 5 }))
+  test("successive builds are strictly monotonic through one explicit holder", async () => {
+    const epochSequence = createEpochSequence()
+    const first = await Effect.runPromise(buildSnapshot({ workerCount: 1, clock: () => 1_000, epochSequence }))
+    const second = await Effect.runPromise(buildSnapshot({ workerCount: 1, clock: () => 10, epochSequence }))
+    const third = await Effect.runPromise(buildSnapshot({ workerCount: 1, clock: () => 5, epochSequence }))
 
     expect(second.epoch).toBeGreaterThan(first.epoch)
     expect(third.epoch).toBeGreaterThan(second.epoch)
+  })
+
+  test("an explicit holder makes the epoch deterministic regardless of build order", async () => {
+    const ascending = async () => {
+      const sequence = createEpochSequence()
+      return [
+        (await Effect.runPromise(buildSnapshot({ clock: () => 100, epochSequence: sequence }))).epoch,
+        (await Effect.runPromise(buildSnapshot({ clock: () => 200, epochSequence: sequence }))).epoch,
+      ]
+    }
+    const descending = async () => {
+      const sequence = createEpochSequence()
+      return [
+        (await Effect.runPromise(buildSnapshot({ clock: () => 200, epochSequence: sequence }))).epoch,
+        (await Effect.runPromise(buildSnapshot({ clock: () => 100, epochSequence: sequence }))).epoch,
+      ]
+    }
+
+    // Same clock readings => same epochs on each independently-owned holder,
+    // regardless of the order in which they were produced.
+    expect(await ascending()).toEqual([100, 200])
+    expect(await descending()).toEqual([200, 201])
+  })
+
+  test("an explicit epoch wins over the holder and is order-independent", async () => {
+    const first = await Effect.runPromise(buildSnapshot({ clock: () => 999, epoch: 7 }))
+    const second = await Effect.runPromise(buildSnapshot({ clock: () => 1, epoch: 7 }))
+
+    expect(first.epoch).toBe(7)
+    expect(second.epoch).toBe(7)
   })
 })
 

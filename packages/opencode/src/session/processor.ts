@@ -24,10 +24,25 @@ import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
-import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import { LLMError, UnknownProviderReason, Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
+
+/**
+ * A tool call arrived while the assistant message was a summary. Summaries are
+ * generated without tools, so a tool call here is a protocol violation rather
+ * than a user-recoverable error. Typed so it flows through the process error
+ * channel and the existing retry/halt pipeline instead of becoming a defect.
+ */
+export class ToolCallDuringSummaryError extends Schema.TaggedErrorClass<ToolCallDuringSummaryError>()(
+  "SessionProcessor.ToolCallDuringSummaryError",
+  { tool: Schema.String },
+) {
+  override get message() {
+    return `Tool call not allowed while generating summary: ${this.tool}`
+  }
+}
 
 export interface Handle {
   readonly message: SessionV1.Assistant
@@ -314,7 +329,7 @@ const layer = Layer.effect(
 
           case "tool-input-start":
             if (ctx.assistantMessage.summary) {
-              throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
+              return yield* new ToolCallDuringSummaryError({ tool: value.name })
             }
             yield* ensureToolCall(value)
             return
@@ -330,7 +345,7 @@ const layer = Layer.effect(
 
           case "tool-call": {
             if (ctx.assistantMessage.summary) {
-              throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
+              return yield* new ToolCallDuringSummaryError({ tool: value.name })
             }
             yield* ensureToolCall(value)
             const input = isRecord(value.input) ? value.input : { value: value.input }
@@ -419,7 +434,11 @@ const layer = Layer.effect(
           }
 
           case "provider-error":
-            throw new Error(value.message)
+            return yield* new LLMError({
+              module: "SessionProcessor",
+              method: "handleEvent",
+              reason: new UnknownProviderReason({ message: value.message }),
+            })
 
           case "step-start":
             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
@@ -555,6 +574,11 @@ const layer = Layer.effect(
             ctx.assistantMessage.finish = finish
             yield* session.updateMessage(ctx.assistantMessage)
             return
+          }
+
+          default: {
+            const _exhaustive: never = value
+            return void _exhaustive
           }
         }
       })

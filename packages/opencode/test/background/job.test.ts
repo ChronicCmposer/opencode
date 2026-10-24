@@ -236,8 +236,19 @@ describe("background.job", () => {
         run: Effect.succeed("done"),
       })
 
-      if (job.metadata) job.metadata.value = "changed"
+      expect(job.metadata?.value).toBe("initial")
+      // Metadata is deep-frozen and cloned at the registry boundary, so an
+      // in-place mutation of a returned snapshot is rejected (strict mode)
+      // rather than silently corrupting the registry's copy.
+      expect(() => {
+        if (job.metadata) job.metadata.value = "changed"
+      }).toThrow()
 
+      const read = yield* jobs.get(job.id)
+      expect(read?.metadata?.value).toBe("initial")
+      expect(() => {
+        if (read?.metadata) read.metadata.value = "changed"
+      }).toThrow()
       expect((yield* jobs.get(job.id))?.metadata?.value).toBe("initial")
     }),
   )

@@ -8,7 +8,8 @@
 
 import { describe, expect, test } from "bun:test"
 import { SUBSCRIBER_BOUND, SubscriberOverflowError, createFanout } from "./fanout"
-import { encodeFrame } from "@/session/egress/frame"
+import { decodeFrame, encodeFrame } from "@/session/egress/frame"
+import { endFrame } from "@/session/worker/frame"
 import { deltasFrame, durableFrame } from "../../lib/egress-fixtures"
 
 describe("egress fan-out", () => {
@@ -174,5 +175,61 @@ describe("egress fan-out", () => {
     const error = new SubscriberOverflowError("client-7")
     expect(error.subscriberId).toBe("client-7")
     expect(error.message).toContain("client-7")
+  })
+})
+
+describe("egress fan-out terminal and bounded-drain APIs", () => {
+  test("dropNonDurable keeps durable frames and drops every delta", () => {
+    const fanout = createFanout()
+    const sub = fanout.subscribe("s")
+    fanout.publish(deltasFrame("a"))
+    fanout.publish(durableFrame("d1", 1))
+    fanout.publish(deltasFrame("b"))
+    sub.dropNonDurable()
+    expect(sub.drain()).toEqual([durableFrame("d1", 1)])
+  })
+
+  test("finalize drops non-durable, keeps durable, and always queues the terminal frame", () => {
+    const fanout = createFanout({ bound: 1 })
+    const sub = fanout.subscribe("s")
+    fanout.publish(deltasFrame("a")) // occupies the only slot
+    fanout.publish(durableFrame("d1", 1)) // durable survives; the delta is dropped
+    fanout.finalize(endFrame())
+    expect(sub.drain()).toEqual([durableFrame("d1", 1), endFrame()])
+  })
+
+  test("finalize bypasses the bound so a saturated queue still gets the end frame", () => {
+    const fanout = createFanout({ bound: 1 })
+    const sub = fanout.subscribe("s")
+    fanout.publish(durableFrame("d1", 1))
+    fanout.publish(durableFrame("d2", 2)) // overflow: the queue stays saturated
+    expect(sub.overflowed).toBe(true)
+    fanout.finalize(endFrame())
+    expect(sub.drain()).toEqual([durableFrame("d1", 1), endFrame()])
+  })
+
+  test("drain returns at most `limit` frames, oldest first", () => {
+    const fanout = createFanout()
+    const sub = fanout.subscribe("s")
+    for (const id of ["1", "2", "3"]) fanout.publish(deltasFrame(id))
+    expect(sub.drain(2)).toEqual([deltasFrame("1"), deltasFrame("2")])
+    expect(sub.depth).toBe(1)
+    expect(sub.drain(5)).toEqual([deltasFrame("3")])
+  })
+
+  test("drainBytes returns at most `limit` buffers, oldest first", () => {
+    const fanout = createFanout()
+    const sub = fanout.subscribe("s")
+    for (const id of ["1", "2", "3"]) fanout.publish(deltasFrame(id))
+    const first = sub.drainBytes(2)
+    expect(first).toHaveLength(2)
+    expect(first.map((bytes) => decodeFrame(bytes))).toEqual([deltasFrame("1"), deltasFrame("2")])
+    expect(sub.drainBytes(5)).toHaveLength(1)
+  })
+
+  test("rejects a non-positive subscriber bound", () => {
+    for (const bound of [0, -1, 1.5, Number.NaN]) {
+      expect(() => createFanout({ bound })).toThrow(/invalid subscriber bound/)
+    }
   })
 })

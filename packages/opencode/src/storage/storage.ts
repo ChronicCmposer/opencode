@@ -347,7 +347,7 @@ const layer = Layer.effect(
           })
           .pipe(Effect.catch(() => Effect.succeed<string[]>([])))
         return result
-          .map((x) => [...prefix, ...x.slice(0, -5).split(path.sep)])
+          .map((x) => [...prefix, ...x.split(path.sep).slice(0, -1), path.basename(x, ".json")])
           .toSorted((a, b) => a.join("/").localeCompare(b.join("/")))
       }),
     })

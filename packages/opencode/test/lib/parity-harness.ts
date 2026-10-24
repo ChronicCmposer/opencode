@@ -36,6 +36,8 @@ import {
   type WorkerSnapshot,
 } from "@/session/worker/layer"
 import { buildHubProxyHandlers, type HubProxyAuthorities } from "@/session/worker/hub"
+import { instantRunner } from "./hub-proxy"
+import { parityProject } from "./parity-project"
 
 /** One `session.status` the worker set through the hub proxy. */
 export interface E2EStatusRecord {
@@ -97,16 +99,32 @@ export interface E2EContext {
   dispose(): Promise<void>
 }
 
+/**
+ * The one capability `schema.up` uses from its Drizzle transaction: run a SQL
+ * string. The generated migration is typed against the full Drizzle transaction,
+ * so this isolates that boundary into a single, named assertion rather than
+ * forcing an arbitrary value past the compiler.
+ */
+type MigrationTx = { run(sql: string): Effect.Effect<unknown> }
+
+/**
+ * `schema.up` restricted to the SQL-recording transaction it is called with here.
+ * The assertion is confined to this boundary: the generated migration only ever
+ * calls `tx.run(sql)`, so the real Drizzle transaction type is not reconstructible
+ * and is bridged through `unknown` rather than forcing the value to `never`.
+ */
+const upBaseSchema = schema.up as unknown as (tx: MigrationTx) => Effect.Effect<void>
+
 /** Apply the generated base schema to a raw connection (no migrations needed). */
 export function applyBaseSchema(connection: { exec(sql: string): void }): void {
   const statements: string[] = []
   Effect.runSync(
-    schema.up({
-      run: (statement: string) => {
-        statements.push(statement)
+    upBaseSchema({
+      run: (sql) => {
+        statements.push(sql)
         return Effect.void
       },
-    } as never),
+    }),
   )
   connection.exec(statements.join(";\n"))
 }
@@ -165,7 +183,7 @@ function createLocalHubProxies(): LocalHubProxies {
 
   const channel = new MessageChannel()
   const disposeProxy = serveHubProxy(
-    buildHubProxyHandlers(authorities, (effect) => Effect.runPromise(effect)),
+    buildHubProxyHandlers(authorities, instantRunner),
     channel.port2,
   )
   const client: HubProxyClient = createHubProxyClient(channel.port1)
@@ -190,6 +208,9 @@ function hubProxiesFor(
   if (mode === undefined || mode === "local") return local.clients
   return mode
 }
+
+/** The tables the E2E context exposes to {@link E2EContext.rows}; anything else fails loud. */
+const E2E_TABLES: ReadonlySet<string> = new Set(["session", "message", "part", "event"])
 
 /**
  * Assemble the in-process worker E2E context. The worker graph is the production
@@ -262,7 +283,7 @@ export function createE2EContext(options: E2EContextOptions): E2EContext {
   const instance: InstanceContext = {
     directory: snapshot.directory,
     worktree: snapshot.directory,
-    project: { id: "e2e" } as never,
+    project: parityProject("e2e"),
   }
 
   let disposed = false
@@ -283,8 +304,12 @@ export function createE2EContext(options: E2EContextOptions): E2EContext {
     instance,
     statusLog: local.statusLog,
     writerOps,
-    rows: (table) =>
-      connection.all(`SELECT * FROM ${table} ORDER BY rowid`, []) as ReadonlyArray<Record<string, unknown>>,
+    rows: (table) => {
+      if (!E2E_TABLES.has(table)) {
+        throw new Error(`unknown E2E table "${table}" (expected one of ${[...E2E_TABLES].join(", ")})`)
+      }
+      return connection.all(`SELECT * FROM ${table} ORDER BY rowid`, [])
+    },
     dispose,
   }
 }

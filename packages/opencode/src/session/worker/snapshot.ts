@@ -13,15 +13,51 @@
 import { Effect, Layer, Option } from "effect"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { RipgrepBinary } from "@opencode-ai/core/ripgrep/binary"
+import { Project } from "@opencode-ai/schema/project"
 
 import { Auth } from "@/auth"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceState } from "@/effect/instance-state"
+import type { InstanceContext } from "@/project/instance-context"
 import { Snapshot } from "@/snapshot"
 
 import type { WorkerSnapshot } from "./layer"
 import { resolveWorkerCount } from "./pool"
+
+/**
+ * Build an {@link InstanceContext} from the minimum identity an isolate or a hub
+ * can supply. Every worker/hub instance-context builder funnels through here, so
+ * the `project` shape (id, worktree, zero time span, no sandboxes) has exactly
+ * one definition instead of three drifting copies.
+ */
+export interface InstanceContextInput {
+  /** The instance working directory (required). */
+  readonly directory: string
+  /** The worktree; defaults to `directory` when absent (never persisted). */
+  readonly worktree?: string
+  /** The project id; callers pass their own fallback (e.g. the global project). */
+  readonly projectID: string
+  /** The project's VCS, when known. */
+  readonly projectVcs?: "git"
+}
+
+export function makeInstanceContext(input: InstanceContextInput): InstanceContext {
+  const worktree = input.worktree ?? input.directory
+  return {
+    directory: input.directory,
+    worktree,
+    project: {
+      id: Project.ID.make(input.projectID),
+      worktree,
+      ...(input.projectVcs === undefined ? {} : { vcs: input.projectVcs }),
+      // `Project.Info` requires a time span and sandboxes; the readers only touch
+      // `id`/`vcs`, so a zero span and no sandboxes is a faithful minimum.
+      time: { created: 0, updated: 0 },
+      sandboxes: [],
+    },
+  }
+}
 
 /**
  * Monotonic epoch step. Given the previously emitted epoch and the current
@@ -29,6 +65,28 @@ import { resolveWorkerCount } from "./pool"
  * regresses even if the clock does.
  */
 export const nextEpoch = (previous: number, now: number): number => Math.max(previous + 1, now)
+
+/**
+ * An explicit holder for a snapshot's epoch sequence. The holder owns the last
+ * emitted epoch, so two callers that use different holders never interfere:
+ * passing one makes the sequence deterministic and testable, rather than relying
+ * on hidden process-wide state.
+ */
+export interface EpochSequence {
+  /** The next epoch for clock reading `now`, strictly greater than the last. */
+  next(now: number): number
+}
+
+/** Create an independent epoch sequence, starting after `initial` (default 0). */
+export const createEpochSequence = (initial = 0): EpochSequence => {
+  let current = initial
+  return {
+    next(now) {
+      current = nextEpoch(current, now)
+      return current
+    },
+  }
+}
 
 export interface BuildWorkerSnapshotOptions {
   /** Explicit pool size; defaults to {@link resolveWorkerCount}. */
@@ -38,14 +96,18 @@ export interface BuildWorkerSnapshotOptions {
   /**
    * Explicit snapshot epoch. When supplied the build is pure/idempotent for that
    * input (same options => same epoch), which lets a caller own the sequence.
-   * When absent the epoch is derived monotonically from the previous build and
-   * the clock, so a generation never regresses.
+   * When absent the epoch comes from `epochSequence`, or from the clock alone so
+   * no hidden process-wide state leaks between builds.
    */
   readonly epoch?: number
+  /**
+   * The epoch holder to advance. A hub that builds one snapshot per generation
+   * owns a sequence here, so its epochs stay strictly monotonic; a caller that
+   * omits both `epoch` and `epochSequence` gets a clock-derived, memoryless
+   * epoch.
+   */
+  readonly epochSequence?: EpochSequence
 }
-
-/** The last derived epoch, so the default sequence stays strictly monotonic. */
-let lastEpoch = 0
 
 /**
  * Build the immutable snapshot the hub ships to its workers.
@@ -67,9 +129,7 @@ export const buildWorkerSnapshot = Effect.fn("WorkerSnapshot.build")(function* (
   const directories = yield* config.directories()
 
   const now = (options.clock ?? (() => Date.now()))()
-  const epoch = options.epoch ?? nextEpoch(lastEpoch, now)
-  // Keep the derived sequence monotonic even after an explicit epoch is used.
-  lastEpoch = Math.max(lastEpoch, epoch)
+  const epoch = options.epoch ?? (options.epochSequence ?? { next: (reading) => nextEpoch(0, reading) }).next(now)
 
   // Freeze the hub's resolved ripgrep path so the worker runs the same binary
   // instead of locating/downloading its own. Resolution is best-effort: a hub

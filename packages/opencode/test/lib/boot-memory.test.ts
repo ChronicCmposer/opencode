@@ -51,7 +51,10 @@ describe("boot/memory measurement harness", () => {
     expect(report.atK.rssBytes).toBeGreaterThan(0)
     expect(report.atKPlusExtra.rssBytes).toBeGreaterThan(0)
     expect(report.baselineRssBytes).toBeGreaterThan(0)
-    expect(report.totalBootMs).toBeGreaterThan(0)
+    expect(report.sumWorkerBootMs).toBeGreaterThan(0)
+    expect(report.sumWorkerBootMs).toBe(
+      report.atKPlusExtra.samples.reduce((sum, sample) => sum + sample.bootMs, 0),
+    )
     expect(report.atK.maxBootMs).toBeGreaterThanOrEqual(report.atK.medianBootMs)
   })
 

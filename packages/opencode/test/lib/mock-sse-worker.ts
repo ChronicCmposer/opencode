@@ -116,7 +116,9 @@ export async function consumeMockSse(
   if (response.body === null) throw new Error("mock SSE provider returned an empty body")
 
   const accumulator = await readSseStream(response.body)
-  return accumulator.usage === undefined
-    ? { text: accumulator.text, chunks: accumulator.chunks }
-    : { text: accumulator.text, chunks: accumulator.chunks, usage: accumulator.usage }
+  return {
+    text: accumulator.text,
+    chunks: accumulator.chunks,
+    ...(accumulator.usage === undefined ? {} : { usage: accumulator.usage }),
+  }
 }

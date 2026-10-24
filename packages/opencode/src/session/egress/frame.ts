@@ -47,18 +47,6 @@ export const FRAME_VERSION = WORKER_FRAME_VERSION
 export type DurableMeta = WriterOrdinal
 
 /**
- * @deprecated The channel now carries EventV2 events. Use {@link EventV2Event}.
- * Retained only so opaque carriers (`control.ts`, `mesh.ts`) keep compiling.
- */
-export type EgressEvent = EventV2Event
-
-/**
- * @deprecated The channel now carries events frames. Use {@link EventsFrame}.
- * Retained only as a stable name for existing imports.
- */
-export type EgressFrame = EventsFrame
-
-/**
  * The writer-stamped `(generation, ordinal)` a durable `event` frame carries, or
  * `undefined` for a non-durable delta / a non-`event` frame. This is the single
  * durability test the fan-out (backpressure) and receiver (ordering) share, so
@@ -168,6 +156,71 @@ export function decodeFrameChunks(bytes: Uint8Array): DecodedFrameChunks {
 export function decodeFrames(bytes: Uint8Array): DecodedFrames {
   const { frames, rest } = decodeFrameChunks(bytes)
   return { frames: frames.map((chunk) => chunk.frame), rest }
+}
+
+/**
+ * Incremental reassembly buffer for the length-prefixed codec.
+ *
+ * A frame may be split across deliveries and one delivery may carry several
+ * frames; a caller appends each chunk and receives the frames completed so far.
+ * Bytes accumulate in one preallocated, geometrically-grown buffer rather than a
+ * fresh concatenation per chunk, so a large frame delivered in many small pieces
+ * reassembles in linear time instead of quadratic. Each completed frame's wire
+ * bytes are copied out, because the internal buffer is reused for later chunks.
+ */
+export interface FrameDecoder {
+  /** Append `chunk` and return the frames it completed, in order. */
+  push(chunk: Uint8Array): readonly FrameChunk[]
+  /** Bytes buffered for an as-yet incomplete frame. */
+  readonly pending: number
+  /** Discard every buffered byte (after a fatal error). */
+  reset(): void
+}
+
+export function createFrameDecoder(initialCapacity = 1024): FrameDecoder {
+  let buffer = new Uint8Array(initialCapacity < HEADER_BYTES ? HEADER_BYTES : initialCapacity)
+  let used = 0
+
+  const grow = (needed: number): void => {
+    let capacity = buffer.byteLength
+    while (capacity < needed) capacity *= 2
+    const grown = new Uint8Array(capacity)
+    grown.set(buffer.subarray(0, used))
+    buffer = grown
+  }
+
+  return {
+    push(chunk) {
+      if (used + chunk.byteLength > buffer.byteLength) grow(used + chunk.byteLength)
+      buffer.set(chunk, used)
+      used += chunk.byteLength
+
+      const frames: FrameChunk[] = []
+      let offset = 0
+      while (used - offset >= HEADER_BYTES) {
+        const length = readFrameLength(buffer, offset)
+        const total = HEADER_BYTES + length
+        if (used - offset < total) break
+        frames.push({
+          frame: parseBody(buffer.subarray(offset + HEADER_BYTES, offset + total)),
+          // Copy out: the buffer region is reclaimed for the next frame.
+          bytes: buffer.slice(offset, offset + total),
+        })
+        offset += total
+      }
+      if (offset > 0) {
+        buffer.copyWithin(0, offset, used)
+        used -= offset
+      }
+      return frames
+    },
+    get pending() {
+      return used
+    },
+    reset() {
+      used = 0
+    },
+  }
 }
 
 /** Read the big-endian body length at `offset`, failing loud past {@link MAX_FRAME_BYTES}. */

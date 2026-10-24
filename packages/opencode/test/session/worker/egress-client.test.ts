@@ -6,12 +6,11 @@
 // `{ id, type, properties }`; durable events bypass the coalescing window.
 
 import { describe, expect, test } from "bun:test"
-import { type EgressFrame } from "@/session/egress/frame"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { attachMeshWorker, createEgressMesh, type DurableCommit } from "@/session/egress/mesh"
 import { createWorkerEgressClient } from "@/session/worker/egress-client"
 import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
-import { type EventV2Event, eventFrame } from "@/session/worker/frame"
+import { type EventsFrame, type EventV2Event, eventFrame } from "@/session/worker/frame"
 
 async function pollUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -33,7 +32,7 @@ const durable = (id: string): EventV2Event => ({ id, type: "message.updated", pr
 describe("worker egress client framing round-trip", () => {
   test("emit is transported as an event frame with verbatim {id,type,properties}", async () => {
     const channel = new MessageChannel()
-    const frames: EgressFrame[] = []
+    const frames: EventsFrame[] = []
     const receiver = createEgressReceiver({ port: channel.port2, onFrame: (frame) => frames.push(frame) })
     const client = createWorkerEgressClient(channel.port1, { maxBatch: 1 })
 
@@ -48,7 +47,7 @@ describe("worker egress client framing round-trip", () => {
 
   test("end flushes buffered deltas then terminates the stream", async () => {
     const channel = new MessageChannel()
-    const frames: EgressFrame[] = []
+    const frames: EventsFrame[] = []
     let ended = false
     createEgressReceiver({ port: channel.port2, onFrame: (frame) => frames.push(frame), onEnd: () => (ended = true) })
     // Default 16ms window: nothing flushes until `end()`.
@@ -65,7 +64,7 @@ describe("worker egress client framing round-trip", () => {
 
   test("emitDurable carries writer meta and preserves commit order", async () => {
     const channel = new MessageChannel()
-    const frames: EgressFrame[] = []
+    const frames: EventsFrame[] = []
     createEgressReceiver({ port: channel.port2, onFrame: (frame) => frames.push(frame) })
     const client = createWorkerEgressClient(channel.port1)
 

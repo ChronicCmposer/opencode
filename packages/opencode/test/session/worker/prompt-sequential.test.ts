@@ -271,11 +271,14 @@ describe("Gate 7 — sequential prompts in one session over the writer-backed wo
       // The failed commit must not leave the writer pinned: a queued read settles
       // promptly, and a fresh transaction can open on the recovered connection.
       const read = await settlesWithin(
-        ctx.writer.query("all", "SELECT COUNT(*) AS n FROM event", []),
+        ctx.writer.query("all", "SELECT COUNT(*) AS n FROM event", []) as Promise<ReadonlyArray<{ n: number }>>,
         PIN_RELEASE_BUDGET_MS,
         "writer stayed pinned after a failed COMMIT",
       )
-      expect(read).toBeDefined()
+      // Assert the queued read actually returned its row, not merely that the
+      // promise settled: a starved query must not pass on `undefined`.
+      expect(read).toHaveLength(1)
+      expect(read[0]).toEqual({ n: expect.any(Number) })
       const next = await settlesWithin(
         ctx.writer.begin(),
         PIN_RELEASE_BUDGET_MS,

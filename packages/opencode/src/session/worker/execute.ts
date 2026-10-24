@@ -19,6 +19,7 @@ import type { SessionID } from "@/session/schema"
 import type { PromptInput, ShellInput } from "@/session/prompt"
 import type { CancelFrame, CancelPort } from "./cancel"
 import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
+import { errorTagOf, messageOf } from "./port"
 
 /** JSON-safe result of one session run (the full message crosses via egress). */
 export interface SessionExecutionResult {
@@ -196,21 +197,15 @@ export type SessionEffectRunner = <A, E>(effect: Effect.Effect<A, E>) => Promise
 
 const runEffect: SessionEffectRunner = (effect) => Effect.runPromise(effect)
 
-const tagOf = (error: unknown): string | undefined =>
-  error !== null &&
-  typeof error === "object" &&
-  "_tag" in error &&
-  typeof (error as { _tag: unknown })._tag === "string"
-    ? (error as { _tag: string })._tag
-    : undefined
-
-const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error))
-
 const isAddressed = (message: SessionExecutorOutbound, id: number): boolean => "id" in message && message.id === id
+
+/** The correlation id an unrecognised inbound frame carries, else `0`. */
+const requestIdOf = (message: unknown): number =>
+  typeof (message as { readonly id?: unknown }).id === "number" ? (message as { readonly id: number }).id : 0
 
 /** Shape any thrown/rejected value into a failed reply, preserving its `_tag`. */
 const failed = (id: number, error: unknown): SessionExecutorFailed => {
-  const tag = tagOf(error)
+  const tag = errorTagOf(error)
   return { type: "error", id, ...(tag === undefined ? {} : { tag }), message: messageOf(error) }
 }
 
@@ -303,7 +298,9 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
       case "startShell":
         return runWork(message.id, message.sessionID, message.kind, "startShell", undefined, message.shell)
       default:
-        return { type: "error", id: 0, message: "unknown executor request" }
+        // An unrecognised frame still carries the caller's correlation id; echo
+        // it so the sender can match the failure instead of waiting on id 0.
+        return { type: "error", id: requestIdOf(message), message: "unknown executor request" }
     }
   }
 
@@ -419,7 +416,7 @@ export interface ExecutorTransport {
    */
   waitFor(
     match: (message: SessionExecutorOutbound) => boolean,
-    options?: { timeoutMs?: number },
+    options?: { timeoutMs?: number; signal?: AbortSignal },
   ): Promise<SessionExecutorOutbound>
   readonly alive: boolean
   terminate(code?: number): Promise<number>
@@ -527,6 +524,101 @@ export interface ExecutorWorkerOptions {
 /** Cap on retained per-session run results; oldest distinct session evicted first. */
 export const RESULTS_CAP = 256
 
+/**
+ * Record a run result under its session, keeping the map bounded to
+ * {@link RESULTS_CAP}. Re-dispatching a session moves it to the end, so the
+ * insertion order makes the oldest distinct session the eviction victim.
+ */
+export function recordCappedResult(
+  results: Map<SessionID, SessionExecutionResult>,
+  sessionID: SessionID,
+  result: SessionExecutionResult,
+): void {
+  results.delete(sessionID)
+  results.set(sessionID, result)
+  if (results.size <= RESULTS_CAP) return
+  const oldest = results.keys().next().value
+  if (oldest !== undefined) results.delete(oldest)
+}
+
+/**
+ * Post `build(id)` and await the first frame addressed to that id and accepted by
+ * `accept`. The id comes from the caller's monotonic counter so every request is
+ * correlated without a shared mutable field.
+ */
+async function requestOn(
+  transport: ExecutorTransport,
+  nextId: () => number,
+  build: (id: number) => SessionExecutorInbound,
+  accept: (message: SessionExecutorOutbound) => boolean,
+  wait: { timeoutMs?: number } | undefined,
+): Promise<SessionExecutorOutbound> {
+  const id = nextId()
+  transport.post(build(id))
+  return transport.waitFor((message) => isAddressed(message, id) && accept(message), wait)
+}
+
+/**
+ * Await the run reply while probing the worker's liveness. Every `intervalMs`
+ * the watchdog posts a `ping` and requires the matching `pong` within the same
+ * window. A worker whose event loop is wedged cannot answer, so the probe
+ * rejects with `SessionWorkerReplyTimeoutError` (the dispatcher then terminates
+ * the isolate); a healthy worker answers each ping promptly, so a long run
+ * resolves however many intervals it spans.
+ *
+ * The pong waiter and the run waiter coexist: the transport matches each frame
+ * by predicate and consumes it for exactly one waiter, and the two predicates
+ * (`pong` vs `done`/`error`) are disjoint.
+ */
+export async function awaitReplyWithLiveness(
+  transport: ExecutorTransport,
+  reply: Promise<SessionExecutorOutbound>,
+  intervalMs: number,
+  nextId: () => number,
+): Promise<SessionExecutorOutbound> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let stopped = false
+  // Abort the in-flight probe's `waitFor` when the run settles, so the ping
+  // waiter is removed immediately instead of lingering until its own deadline.
+  const probes = new AbortController()
+  const wedged = new Promise<never>((_resolve, reject) => {
+    const probe = (): void => {
+      if (stopped) return
+      const pingId = nextId()
+      try {
+        transport.post({ type: "ping", id: pingId })
+        transport
+          .waitFor((message) => message.type === "pong" && message.id === pingId, {
+            timeoutMs: intervalMs,
+            signal: probes.signal,
+          })
+          .then(
+            () => {
+              if (!stopped) timer = setTimeout(probe, intervalMs)
+            },
+            () => {
+              if (!stopped) reject(new SessionWorkerReplyTimeoutError(intervalMs))
+            },
+          )
+      } catch (error) {
+        // `post` throws once the isolate is gone; surface it the same way a
+        // dead worker is surfaced rather than escaping the timer callback.
+        if (!stopped) reject(error instanceof Error ? error : new Error(String(error)))
+      }
+    }
+    timer = setTimeout(probe, intervalMs)
+  })
+  try {
+    return await Promise.race([reply, wedged])
+  } finally {
+    // Settle the watchdog the moment the run does, so no timer outlives it and
+    // no probe waiter is left registered on the transport.
+    stopped = true
+    probes.abort()
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWorker {
   const { transport } = options
   const log = options.log ?? noopWorkerLogger
@@ -535,18 +627,11 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
   const runIdleTimeoutMs = options.runIdleTimeoutMs ?? 0
   const results = new Map<SessionID, SessionExecutionResult>()
   let nextRequestId = 1
-
-  // Re-dispatch for a session evicts its prior result, so the Map only ever
-  // holds the newest per session; the insertion order then makes the oldest
-  // distinct session the victim once the cap is exceeded. This bounds a
-  // long-lived pool's memory without an unbounded key set.
-  const recordResult = (sessionID: SessionID, result: SessionExecutionResult): void => {
-    results.delete(sessionID)
-    results.set(sessionID, result)
-    if (results.size <= RESULTS_CAP) return
-    const oldest = results.keys().next().value
-    if (oldest !== undefined) results.delete(oldest)
-  }
+  // One monotonic id source shared by every request and the liveness probe, so a
+  // late reply can never be matched by a later request.
+  const nextId = (): number => nextRequestId++
+  const recordResult = (sessionID: SessionID, result: SessionExecutionResult): void =>
+    recordCappedResult(results, sessionID, result)
 
   log(workerLogMessage("worker spawning"), {
     workerID: options.id,
@@ -555,75 +640,20 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     reason: options.reason ?? "initial",
   })
 
-  const request = async (
+  const request = (
     build: (id: number) => SessionExecutorInbound,
     accept: (message: SessionExecutorOutbound) => boolean,
     wait: { timeoutMs?: number } | undefined,
-  ): Promise<SessionExecutorOutbound> => {
-    const id = nextRequestId++
-    transport.post(build(id))
-    return transport.waitFor((message) => isAddressed(message, id) && accept(message), wait)
-  }
+  ): Promise<SessionExecutorOutbound> => requestOn(transport, nextId, build, accept, wait)
 
   // A `run`/`startShell` reply is a whole `SessionPrompt.loop` including a full
   // LLM turn, so it must never be bounded by the short control-frame deadline.
   // `timeoutMs: 0` is the transport's "no deadline" sentinel.
   const NO_REPLY_DEADLINE = { timeoutMs: 0 } as const
 
-  /**
-   * Await the run reply while probing the worker's liveness. Every `intervalMs`
-   * the watchdog posts a `ping` and requires the matching `pong` within the same
-   * window. A worker whose event loop is wedged cannot answer, so the probe
-   * rejects with `SessionWorkerReplyTimeoutError` (the dispatcher then terminates
-   * the isolate); a healthy worker answers each ping promptly, so a long run
-   * resolves however many intervals it spans.
-   *
-   * The pong waiter and the run waiter coexist: the transport matches each frame
-   * by predicate and consumes it for exactly one waiter, and the two predicates
-   * (`pong` vs `done`/`error`) are disjoint.
-   */
-  const awaitReplyWithLiveness = async (
-    reply: Promise<SessionExecutorOutbound>,
-    intervalMs: number,
-  ): Promise<SessionExecutorOutbound> => {
-    let timer: ReturnType<typeof setTimeout> | undefined
-    let stopped = false
-    const wedged = new Promise<never>((_resolve, reject) => {
-      const probe = (): void => {
-        if (stopped) return
-        const pingId = nextRequestId++
-        try {
-          transport.post({ type: "ping", id: pingId })
-          transport
-            .waitFor((message) => message.type === "pong" && message.id === pingId, { timeoutMs: intervalMs })
-            .then(
-              () => {
-                if (!stopped) timer = setTimeout(probe, intervalMs)
-              },
-              () => {
-                if (!stopped) reject(new SessionWorkerReplyTimeoutError(intervalMs))
-              },
-            )
-        } catch (error) {
-          // `post` throws once the isolate is gone; surface it the same way a
-          // dead worker is surfaced rather than escaping the timer callback.
-          if (!stopped) reject(error instanceof Error ? error : new Error(String(error)))
-        }
-      }
-      timer = setTimeout(probe, intervalMs)
-    })
-    try {
-      return await Promise.race([reply, wedged])
-    } finally {
-      // Settle the watchdog the moment the run does, so no timer outlives it.
-      stopped = true
-      if (timer !== undefined) clearTimeout(timer)
-    }
-  }
-
   const execute = async (run: ExecutorRun): Promise<void> => {
     const type: SessionRunMode = run.mode ?? "run"
-    const id = nextRequestId++
+    const id = nextId()
     // Carry the prompt only when present, so a plain run keeps its minimal
     // `{type, id, sessionID, kind}` frame.
     transport.post({
@@ -638,7 +668,7 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
       (message) => isAddressed(message, id) && (message.type === "done" || message.type === "error"),
       NO_REPLY_DEADLINE,
     )
-    const message = runIdleTimeoutMs > 0 ? await awaitReplyWithLiveness(reply, runIdleTimeoutMs) : await reply
+    const message = runIdleTimeoutMs > 0 ? await awaitReplyWithLiveness(transport, reply, runIdleTimeoutMs, nextId) : await reply
     if (message.type === "error") throw new Error(message.message)
     if (message.type !== "done") throw new Error(`unexpected executor reply: ${message.type}`)
     // R4#16: do not resolve the run until its durable egress write is acked, so
@@ -721,31 +751,25 @@ export function createExecutorWorkerPool(options: ExecutorWorkerPoolOptions): Ex
     spawn() {
       const worker = options.spawn(nextId++)
       extra.push(worker)
-      const wrapped: ExecutorWorker = {
-        get id() {
-          return worker.id
+      // Forward the inner worker wholesale and override only `terminate`, so a
+      // newly added control-surface field never has to be re-copied by hand. A
+      // proxy (not a spread) preserves prototype methods and live accessors, so
+      // the production plain object and a class-based test double behave alike.
+      const wrapped: ExecutorWorker = new Proxy(worker, {
+        get(target, property, receiver) {
+          if (property !== "terminate") {
+            const value = Reflect.get(target, property, receiver)
+            return typeof value === "function" ? value.bind(target) : value
+          }
+          return async () => {
+            // Drop the terminated worker from the headroom set so the pool's
+            // bookkeeping tracks live workers only.
+            const index = extra.indexOf(worker)
+            if (index >= 0) extra.splice(index, 1)
+            await worker.terminate()
+          }
         },
-        get alive() {
-          return worker.alive
-        },
-        execute: (run) => worker.execute(run),
-        cancel: (sessionID) => worker.cancel(sessionID),
-        assertNotBusy: (sessionID) => worker.assertNotBusy(sessionID),
-        resultFor: (sessionID) => worker.resultFor(sessionID),
-        // A spawned headroom worker must expose the same control surface as a
-        // foreground one: without the cancel port, `portFor` cannot notify it.
-        ...(worker.cancelPort === undefined ? {} : { cancelPort: worker.cancelPort }),
-        ...(worker.awaitEgress === undefined
-          ? {}
-          : { awaitEgress: (sessionID: SessionID) => worker.awaitEgress!(sessionID) }),
-        terminate: async () => {
-          // Drop the terminated worker from the headroom set so the pool's
-          // bookkeeping tracks live workers only.
-          const index = extra.indexOf(worker)
-          if (index >= 0) extra.splice(index, 1)
-          await worker.terminate()
-        },
-      }
+      })
       return wrapped
     },
     async terminateAll() {

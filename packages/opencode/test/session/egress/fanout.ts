@@ -15,8 +15,8 @@
 // drains. A durable boundary is therefore never dropped silently; an overflow
 // surfaces `EgressStreamOverflowError` to the subscriber's stream.
 
-import { decodeFrame, encodeFrame, type EgressFrame } from "@/session/egress/frame"
-import { durableMetaOf } from "@/session/worker/frame"
+import { decodeFrame, encodeFrame } from "@/session/egress/frame"
+import { type EventsFrame, durableMetaOf } from "@/session/worker/frame"
 
 /** Per-client egress bound. */
 export const SUBSCRIBER_BOUND = 256
@@ -39,7 +39,7 @@ interface QueuedFrame {
  * Shares the receiver's {@link durableMetaOf} test so backpressure and commit
  * ordering agree on exactly which frames may be dropped.
  */
-function isDurable(frame: EgressFrame): boolean {
+function isDurable(frame: EventsFrame): boolean {
   return durableMetaOf(frame) !== undefined
 }
 
@@ -49,7 +49,7 @@ export interface FanoutSubscriber {
   /** Whether this subscriber has overflowed its durable-saturated bound since last drained. */
   readonly overflowed: boolean
   /** Remove and decode up to `limit` frames, oldest first. Default: all. */
-  drain(limit?: number): readonly EgressFrame[]
+  drain(limit?: number): readonly EventsFrame[]
   /** Remove and return up to `limit` raw frame buffers, oldest first. Default: all. */
   drainBytes(limit?: number): readonly Uint8Array[]
   /** Drop every queued non-durable frame, keeping durable boundaries (terminate). */
@@ -69,19 +69,19 @@ export interface PublishResult {
 export interface Fanout {
   subscribe(id: string): FanoutSubscriber
   unsubscribe(id: string): void
-  publish(frame: EgressFrame): PublishResult
+  publish(frame: EventsFrame): PublishResult
   /**
    * Fan out ALREADY-ENCODED frame bytes: the bytes received from a worker are
    * handed to every subscriber verbatim, with no hub re-encode. `frame` is only
    * consulted to classify durables for backpressure.
    */
-  publishBytes(bytes: Uint8Array, frame: EgressFrame): PublishResult
+  publishBytes(bytes: Uint8Array, frame: EventsFrame): PublishResult
   /**
    * Terminal broadcast: drop every subscriber's non-durable frames, then deliver
    * `frame` to all of them unconditionally (bypassing the bound, so an `end`
    * marker is never lost). Durable frames are kept.
    */
-  finalize(frame: EgressFrame): void
+  finalize(frame: EventsFrame): void
   readonly subscribers: readonly FanoutSubscriber[]
   /** Count of `encodeFrame` calls — proves a single encode fans out to N clients. */
   readonly encodeCount: number
@@ -89,7 +89,7 @@ export interface Fanout {
 
 export interface FanoutOptions {
   readonly bound?: number
-  readonly encode?: (frame: EgressFrame) => Uint8Array
+  readonly encode?: (frame: EventsFrame) => Uint8Array
 }
 
 interface SubscriberState {
@@ -161,7 +161,7 @@ export function createFanout(options: FanoutOptions = {}): Fanout {
     return created
   }
 
-  const publishBytes = (bytes: Uint8Array, frame: EgressFrame): PublishResult => {
+  const publishBytes = (bytes: Uint8Array, frame: EventsFrame): PublishResult => {
     const durable = isDurable(frame)
     const overflowed: string[] = []
     const droppedDeltas: string[] = []

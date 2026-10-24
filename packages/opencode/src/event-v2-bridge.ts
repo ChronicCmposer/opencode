@@ -11,7 +11,9 @@ import type { InstanceContext } from "@/project/instance-context"
 import type { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { Context, Effect, Layer } from "effect"
 
-export class Service extends Context.Service<Service, EventV2.Interface>()("@opencode/EventV2Bridge") {}
+export type Interface = EventV2.Interface
+
+export class Service extends Context.Service<Service, Interface>()("@opencode/EventV2Bridge") {}
 
 /**
  * Build the `Location.Ref` an event must carry to reach an instance `/event` SSE
@@ -109,18 +111,17 @@ const layer = Layer.effect(
       Effect.gen(function* () {
         const ctx = yield* InstanceRef
         const workspaceID = (yield* WorkspaceRef) ?? event.location?.workspaceID
-        GlobalBus.emit("event", {
+        const envelope = (payload: unknown) => ({
           directory: event.location?.directory ?? ctx?.directory,
           project: ctx?.project?.id,
           workspace: workspaceID,
-          payload: { id: event.id, type: event.type, properties: event.data },
+          payload,
         })
+        GlobalBus.emit("event", envelope({ id: event.id, type: event.type, properties: event.data }))
         if (event.durable === undefined) return
-        GlobalBus.emit("event", {
-          directory: event.location?.directory ?? ctx?.directory,
-          project: ctx?.project?.id,
-          workspace: workspaceID,
-          payload: {
+        GlobalBus.emit(
+          "event",
+          envelope({
             type: "sync",
             syncEvent: {
               id: event.id,
@@ -129,8 +130,8 @@ const layer = Layer.effect(
               aggregateID: event.durable.aggregateID,
               data: event.data,
             },
-          },
-        })
+          }),
+        )
       }),
     )
     yield* Effect.addFinalizer(() => unsubscribe)

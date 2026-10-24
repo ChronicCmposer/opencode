@@ -5,7 +5,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { expect } from "bun:test"
+import { afterAll, beforeAll, expect } from "bun:test"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
@@ -68,10 +68,32 @@ import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/l
 // Test isolation: the ambient harness may export a global config
 // (`OPENCODE_CONFIG_CONTENT`), point at a shared config dir, or disable project
 // config loading entirely. These tests own their project `opencode.json`, so
-// drop the ambient overrides before any layer resolves.
-delete process.env.OPENCODE_DISABLE_PROJECT_CONFIG
-delete process.env.OPENCODE_CONFIG_CONTENT
-delete process.env.OPENCODE_CONFIG_DIR
+// drop the ambient overrides for the duration of the file and restore whatever
+// the harness had set afterwards (so sibling test files sharing the process are
+// unaffected).
+const AMBIENT_CONFIG_ENV_KEYS = [
+  "OPENCODE_DISABLE_PROJECT_CONFIG",
+  "OPENCODE_CONFIG_CONTENT",
+  "OPENCODE_CONFIG_DIR",
+] as const
+
+let savedAmbientConfigEnv: Record<string, string | undefined> = {}
+
+beforeAll(() => {
+  savedAmbientConfigEnv = {}
+  for (const key of AMBIENT_CONFIG_ENV_KEYS) {
+    savedAmbientConfigEnv[key] = process.env[key]
+    delete process.env[key]
+  }
+})
+
+afterAll(() => {
+  for (const key of AMBIENT_CONFIG_ENV_KEYS) {
+    const previous = savedAmbientConfigEnv[key]
+    if (previous === undefined) delete process.env[key]
+    else process.env[key] = previous
+  }
+})
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -450,21 +472,7 @@ const waitForBusy = (sessionID: SessionID, duration: Duration.Input = "2 seconds
 const hasBash = Effect.sync(() => Bun.which("bash") !== null)
 
 const deferredAsPromise = <A>(deferred: Deferred.Deferred<A>): PromiseLike<A> => ({
-  then: (onfulfilled, onrejected) => {
-    Effect.runFork(
-      Deferred.await(deferred).pipe(
-        Effect.match({
-          onFailure: (error) => {
-            onrejected?.(error)
-          },
-          onSuccess: (value) => {
-            onfulfilled?.(value)
-          },
-        }),
-      ),
-    )
-    return deferredAsPromise(deferred) as PromiseLike<never>
-  },
+  then: (onfulfilled, onrejected) => Effect.runPromise(Deferred.await(deferred)).then(onfulfilled, onrejected),
 })
 
 function defer<T>() {

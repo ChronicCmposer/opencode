@@ -16,7 +16,7 @@ const DEFAULT_CHUNK_ID = "chatcmpl-test"
 
 /** Serialize one payload as an SSE frame. */
 export function sseData(payload: unknown): string {
-  return "data: " + JSON.stringify(payload) + String.fromCharCode(10, 10)
+  return "data: " + JSON.stringify(payload) + "\n\n"
 }
 
 /** OpenAI `usage` shape from an input/output pair. */

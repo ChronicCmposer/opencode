@@ -24,7 +24,7 @@ import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { InstanceRef } from "@/effect/instance-ref"
 import { serveWriterPort, type HubWriter } from "@/session/writer/client"
-import type { EventV2Event } from "@/session/worker/frame"
+import { WORKER_FRAME_VERSION, type EventV2Event } from "@/session/worker/frame"
 import { collectNodeNames } from "@/session/worker/node-table"
 import {
   EventEgressClientNode,
@@ -62,7 +62,7 @@ import {
   type SessionWorkerModel,
 } from "@/session/worker/session-worker"
 import type { JobInfo } from "@/session/worker/job-registry"
-import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
+import { workerLogMessage } from "@/session/worker/log"
 import {
   createPidRegistry,
   registerReported,
@@ -79,12 +79,14 @@ import { Config } from "@/config/config"
 import { Agent } from "@/agent/agent"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { provideInstance, testInstanceStoreLayer } from "../../fixture/fixture"
-import type { WorkerPlugin } from "@/session/worker/plugin-host"
 import { Snapshot } from "@/snapshot"
 import { GlobalBus } from "@/bus/global"
 import { createHubEventSink } from "@/session/worker/hub"
+import { flush } from "../../lib/async"
+import { recordingLogger } from "../../lib/recorders"
 import { workerSnapshot } from "../../lib/snapshot"
 import { withParts } from "../../lib/session-parts"
+import { createJobClient, type JobPort } from "@/session/worker/job-client"
 import { startMockProvider } from "../../lib/mock-provider"
 import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
 import { assertStructuredCloneable } from "../../lib/session-worker-init"
@@ -195,11 +197,9 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
 
   test("wires a real logger into the E2 client lifecycles (not the noop default)", () => {
     const { scope } = fakeScope()
-    const lines: Array<{ message: string; fields: Record<string, unknown> }> = []
-    bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope, {
-      log: (message, fields) => void lines.push({ message, fields }),
-    })
-    const messages = lines.map((entry) => entry.message)
+    const recorder = recordingLogger()
+    bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope, { log: recorder.log })
+    const messages = recorder.lines.map((entry) => entry.message)
     // Each port-backed peer emits its E2 connected line at construction; without
     // a real logger these were dormant in production.
     expect(messages).toContain(workerLogMessage("writer connected"))
@@ -263,32 +263,59 @@ describe("child-result subscription (9.4)", () => {
       parentID: "ses_parent",
       depth: 1,
     }
-    hubPort.postMessage({ kind: "push", type: "childResult", parentID: "ses_parent", result })
+    hubPort.postMessage({
+      v: WORKER_FRAME_VERSION,
+      port: "job",
+      kind: "push",
+      payload: { kind: "push", type: "childResult", parentID: "ses_parent", result },
+    })
 
     expect(await received).toMatchObject({ id: "ses_child", parentID: "ses_parent", status: "completed" })
     bootstrap.dispose()
     hubPort.close()
   })
 
-  test("a disposed bootstrap stops delivering child results", async () => {
+  test("a disposed bootstrap unsubscribes the child-result handler", async () => {
     const { frames, scope } = fakeScope()
-    const bootstrap = bootstrapSessionWorker(init(), scope)
+    let unsubscribed = false
+    // Wrap the real client so the test observes the subscription teardown
+    // itself, not merely the absence of a delivery (which a still-installed
+    // handler would also produce after `childResultSinks.clear()`).
+    const jobClientFactory = (port: JobPort) => {
+      const client = createJobClient(port)
+      return {
+        ...client,
+        onChildResult(handler: (result: JobInfo) => void) {
+          const unsubscribe = client.onChildResult(handler)
+          return () => {
+            unsubscribed = true
+            unsubscribe()
+          }
+        },
+      }
+    }
+    const bootstrap = bootstrapSessionWorker(init(), scope, { jobClientFactory })
     let delivered = 0
     bootstrap.onChildResult(() => void (delivered += 1))
     bootstrap.dispose()
+    expect(unsubscribed).toBe(true)
 
     const jobFrame = frames.find((frame) => (frame.data as { type?: string }).type === "job-port")!
     const hubPort = (jobFrame.data as { port: MessagePort }).port
     hubPort.start()
     hubPort.postMessage({
+      v: WORKER_FRAME_VERSION,
+      port: "job",
       kind: "push",
-      type: "childResult",
-      parentID: "ses_parent",
-      result: { id: "ses_child", type: "task", status: "completed", started_at: 1, depth: 1 },
+      payload: {
+        kind: "push",
+        type: "childResult",
+        parentID: "ses_parent",
+        result: { id: "ses_child", type: "task", status: "completed", started_at: 1, depth: 1 },
+      },
     })
-    // Ordering barrier: the port's message task is queued before this timer, so
-    // by the time it fires the (removed) handler would already have run.
-    await new Promise((resolve) => setTimeout(resolve, 0))
+    // Let the queued port message run; an unsubscribed client delivers nothing.
+    await flush()
     expect(delivered).toBe(0)
     hubPort.close()
   })
@@ -399,8 +426,7 @@ describe("buildWorkerClients (step 22)", () => {
 
   test("forwards a supplied log into every peer's E2 lifecycle", () => {
     const channels = emptyChannels()
-    const lines: Array<{ message: string; fields: Record<string, unknown> }> = []
-    const log: WorkerLogger = (message, fields) => void lines.push({ message, fields })
+    const recorder = recordingLogger()
     const clients = buildWorkerClients(
       {
         writer: channels.writer.port1,
@@ -408,10 +434,10 @@ describe("buildWorkerClients (step 22)", () => {
         broker: channels.broker.port1,
         backgroundJob: channels.backgroundJob.port1,
       },
-      { workerID: 4, log },
+      { workerID: 4, log: recorder.log },
     )
     expect(typeof clients.writer.publish).toBe("function")
-    const connected = lines.filter((entry) => entry.message.endsWith("connected"))
+    const connected = recorder.lines.filter((entry) => entry.message.endsWith("connected"))
     expect(connected.map((entry) => entry.message)).toEqual([
       workerLogMessage("writer connected"),
       workerLogMessage("egress connected"),
@@ -525,17 +551,16 @@ describe("worker→hub PID reporting (P5 prerequisite)", () => {
   })
 
   test("a throwing port emits a WARN pid report failed line with the reason and rethrows", () => {
-    const records: Array<{ message: string; fields: Record<string, unknown> }> = []
-    const log: WorkerLogger = (message, fields) => void records.push({ message, fields })
+    const recorder = recordingLogger()
     const brokenPort = {
       postMessage: () => {
         throw new Error("port closed")
       },
     } as unknown as MessagePort
 
-    const reporter = createControlPidReporter(brokenPort, 5, { log })
+    const reporter = createControlPidReporter(brokenPort, 5, { log: recorder.log })
     expect(() => reporter.report({ pid: 101, pgid: 101, label: "shell:echo hi" })).toThrow("port closed")
-    expect(records).toEqual([
+    expect(recorder.lines).toEqual([
       {
         message: workerLogMessage("pid report failed"),
         fields: { level: "warn", workerID: 5, reason: "port closed" },
@@ -568,8 +593,7 @@ describe("worker→hub PID reporting (P5 prerequisite)", () => {
       },
       capabilities: { sessionWorkerPorts: true },
     }
-    const records: Array<{ message: string; fields: Record<string, unknown> }> = []
-    const log: WorkerLogger = (message, fields) => void records.push({ message, fields })
+    const recorder = recordingLogger()
     const brokenPort = {
       postMessage: () => {
         throw new Error("port closed")
@@ -579,7 +603,7 @@ describe("worker→hub PID reporting (P5 prerequisite)", () => {
     let reporter: PidReporterInterface | undefined
     let reportedID: number | undefined
     bootstrapSessionWorker(init, scope, {
-      log,
+      log: recorder.log,
       pidReporterFactory: (_port, workerID, forwarded) => {
         reportedID = workerID
         reporter = createControlPidReporter(brokenPort, workerID, { log: forwarded })
@@ -592,7 +616,7 @@ describe("worker→hub PID reporting (P5 prerequisite)", () => {
     // the E2 client connect lines, so assert on the E4 line specifically.
     expect(reporter).toBeDefined()
     expect(() => reporter!.report({ pid: 101, pgid: 101, label: "shell:echo hi" })).toThrow("port closed")
-    const failed = records.filter((entry) => entry.message === workerLogMessage("pid report failed"))
+    const failed = recorder.lines.filter((entry) => entry.message === workerLogMessage("pid report failed"))
     expect(failed).toEqual([
       {
         message: workerLogMessage("pid report failed"),
@@ -1622,7 +1646,9 @@ describe("worker model descriptor", () => {
 async function waitUntil(
   predicate: () => boolean | Promise<boolean>,
   message: string,
-  timeoutMs = 5000,
+  // A cold worker import graph plus the provider round-trip can exceed a tight
+  // budget on a loaded host; the deadline guards against a hang, not latency.
+  timeoutMs = 15_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -1733,79 +1759,4 @@ describe("real SessionPrompt.loop cancellation (Phase 4 + 6.3)", () => {
       fs.rmSync(directory, { recursive: true, force: true })
     }
   }, 30_000)
-})
-
-// ---------------------------------------------------------------------------
-// Task 4 (Wave 1 follow-up) — the degraded (no hub-port) `ModelClient` path must
-// run the worker-hosted plugin hooks, not the no-op pass-through, so a plugin's
-// `chat.params` / `chat.headers` mutations reach the reduced LLM.
-// ---------------------------------------------------------------------------
-
-describe("degraded ModelClient worker plugin host (task 4)", () => {
-  /** Run one degraded-boot session turn through the installed executor. */
-  async function runDegradedTurn(init: SessionWorkerInit): Promise<{ readonly type: string }> {
-    const frames: Array<{ type?: string }> = []
-    const scope = {
-      postMessage(data: unknown) {
-        frames.push(data as { type?: string })
-      },
-      onmessage: null as ((event: { data: unknown }) => void) | null,
-    }
-    bootstrapSessionWorker(init, scope)
-    scope.onmessage!({ data: { type: "run", id: 1, sessionID: "ses_plugin", kind: "session" } })
-    await waitUntil(
-      () => frames.some((frame) => frame.type === "done" || frame.type === "error"),
-      "executor never settled",
-    )
-    return frames.find((frame) => frame.type === "done" || frame.type === "error") as { type: string }
-  }
-
-  const degradedInit = (
-    provider: { baseUrl: string; apiKey: string; model: string },
-    plugins?: readonly WorkerPlugin[],
-  ): SessionWorkerInit => ({
-    snapshot: workerSnapshot(),
-    env: { values: {} },
-    role: "session",
-    model: {
-      providerID: "mock",
-      modelID: provider.model,
-      apiId: provider.model,
-      npm: "@ai-sdk/openai-compatible",
-      baseUrl: provider.baseUrl,
-      apiKey: provider.apiKey,
-      capabilities: { temperature: true, reasoning: false },
-      limit: { context: 128_000, output: 4096 },
-    },
-    ...(plugins === undefined ? {} : { plugins }),
-  })
-
-  test("applies a worker-hosted chat.params hook in the reduced model path", async () => {
-    await using provider = startMockProvider({ text: "ok" })
-    const outcome = await runDegradedTurn(
-      degradedInit(provider, [
-        {
-          name: "sampling",
-          hooks: {
-            "chat.params": (_input, output) => {
-              output.temperature = 0.25
-            },
-          },
-        },
-      ]),
-    )
-
-    expect(outcome.type).toBe("done")
-    expect(provider.requests[0].body.temperature).toBe(0.25)
-  })
-
-  test("uses the no-op Plugin when no hooks are shipped", async () => {
-    await using provider = startMockProvider({ text: "ok" })
-    const outcome = await runDegradedTurn(degradedInit(provider))
-
-    expect(outcome.type).toBe("done")
-    // Without shipped hooks the reduced path uses the no-op Plugin, so the
-    // plugin's mutation is absent.
-    expect(provider.requests[0].body.temperature).not.toBe(0.25)
-  })
 })

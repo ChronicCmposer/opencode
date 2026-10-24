@@ -2,6 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { BackgroundJob as CoreBackgroundJob } from "@opencode-ai/core/background-job"
 import { Identifier } from "@opencode-ai/core/id/id"
 import { InstanceState } from "@/effect/instance-state"
+import { ObjectUtil } from "@/util/object"
 import type { JobClient } from "@/session/worker/job-client"
 import { Cause, Effect, Layer, Scope } from "effect"
 
@@ -94,9 +95,7 @@ export function clientLayer(client: JobClient): Layer.Layer<CoreBackgroundJob.Se
               client.start({
                 id,
                 type: input.type,
-                ...(input.title === undefined ? {} : { title: input.title }),
-                ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
-                ...(input.parentID === undefined ? {} : { parentID: input.parentID }),
+                ...ObjectUtil.defined({ title: input.title, metadata: input.metadata, parentID: input.parentID }),
               }),
             )
             if (input.onPromote !== undefined) onPromoteCallbacks.set(id, input.onPromote)
@@ -116,7 +115,7 @@ export function clientLayer(client: JobClient): Layer.Layer<CoreBackgroundJob.Se
         wait: (input) =>
           Effect.promise(() =>
             client.wait(input.id, input.timeout).then((result) => ({
-              ...(result.info === undefined ? {} : { info: result.info }),
+              ...ObjectUtil.defined({ info: result.info }),
               timedOut: result.timedOut,
             })),
           ),

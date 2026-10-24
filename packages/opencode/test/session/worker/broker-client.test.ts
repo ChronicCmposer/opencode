@@ -178,6 +178,27 @@ describe("createWorkerBrokerClient (step 18)", () => {
     stop()
   })
 
+  test("release, cancel and teardown send their matching frames", async () => {
+    const { port1, port2 } = channel()
+    const seen: BrokerRequest[] = []
+    const stop = serve(port1, (frame) => {
+      seen.push(frame)
+      return { kind: "response", requestId: frame.requestId, ok: true, value: null }
+    })
+
+    const client = createWorkerBrokerClient(port2)
+    await client.release("/work/a")
+    await client.cancel("r1")
+    await client.teardown()
+
+    expect(seen.map((frame) => frame.kind)).toEqual(["release", "cancel", "teardown"])
+    expect(seen[0]).toMatchObject({ kind: "release", directory: "/work/a" })
+    expect(seen[1]).toMatchObject({ kind: "cancel", targetId: "r1" })
+
+    client.dispose()
+    stop()
+  })
+
   test("times out an unanswered request when a timeout is configured", async () => {
     const { port1, port2 } = channel()
     const stop = serve(port1, () => new Promise<ResponseFrame>(() => {}))
@@ -239,6 +260,16 @@ describe("worker broker client lifecycle logging (E2)", () => {
 
     expect(records[0]?.fields).toEqual({ peer: "broker", level: "info" })
     client.dispose()
+  })
+
+  test("dispose is idempotent: one close line and no throw on a second call", () => {
+    const { port2 } = channel()
+    const records: RecordedLog[] = []
+    const client = createWorkerBrokerClient(port2, { log: recordingLogger(records), workerID: 1 })
+
+    client.dispose()
+    expect(() => client.dispose()).not.toThrow()
+    expect(records.filter((record) => record.message === workerLogMessage("broker closed"))).toHaveLength(1)
   })
 
   test("a failed connect emits a WARN line with the reason and rethrows", () => {

@@ -262,12 +262,17 @@ function responseToolDone(tool: { id: string; item: string; name: string; args: 
   }
 }
 
-function choices(part: unknown) {
-  if (!part || typeof part !== "object") return
-  if (!("choices" in part) || !Array.isArray(part.choices)) return
-  const choice = part.choices[0]
-  if (!choice || typeof choice !== "object") return
-  return choice
+/** The subset of an OpenAI `chat.completion.chunk` this server reads. */
+interface ChatChoice {
+  readonly delta?: unknown
+}
+
+function choices(part: unknown): ChatChoice | undefined {
+  if (part === null || typeof part !== "object") return undefined
+  if (!("choices" in part) || !Array.isArray(part.choices)) return undefined
+  const choice: unknown = part.choices[0]
+  if (choice === null || typeof choice !== "object") return undefined
+  return "delta" in choice ? { delta: choice.delta } : {}
 }
 
 function flow(item: Sse) {
@@ -591,32 +596,35 @@ function isTitleRequest(body: unknown): boolean {
   return JSON.stringify(body).includes("Generate a title for this conversation")
 }
 
-namespace TestLLMServer {
-  export interface Service {
-    readonly url: string
-    readonly push: (...input: (Item | Reply)[]) => Effect.Effect<void>
-    readonly pushMatch: (match: Match, ...input: (Item | Reply)[]) => Effect.Effect<void>
-    readonly textMatch: (match: Match, value: string, opts?: { usage?: Usage }) => Effect.Effect<void>
-    readonly toolMatch: (match: Match, name: string, input: unknown) => Effect.Effect<void>
-    readonly text: (value: string, opts?: { usage?: Usage }) => Effect.Effect<void>
-    readonly tool: (name: string, input: unknown) => Effect.Effect<void>
-    readonly toolHang: (name: string, input: unknown) => Effect.Effect<void>
-    readonly reason: (value: string, opts?: { text?: string; usage?: Usage }) => Effect.Effect<void>
-    readonly fail: (message?: unknown) => Effect.Effect<void>
-    readonly error: (status: number, body: unknown) => Effect.Effect<void>
-    readonly hang: Effect.Effect<void>
-    readonly hold: (value: string, wait: PromiseLike<unknown>) => Effect.Effect<void>
-    readonly reset: Effect.Effect<void>
-    readonly hits: Effect.Effect<Hit[]>
-    readonly calls: Effect.Effect<number>
-    readonly wait: (count: number) => Effect.Effect<void>
-    readonly inputs: Effect.Effect<Record<string, unknown>[]>
-    readonly pending: Effect.Effect<number>
-    readonly misses: Effect.Effect<Hit[]>
-  }
+/** The test LLM server's service shape. */
+export interface TestLLMServerService {
+  readonly url: string
+  readonly push: (...input: (Item | Reply)[]) => Effect.Effect<void>
+  readonly pushMatch: (match: Match, ...input: (Item | Reply)[]) => Effect.Effect<void>
+  readonly textMatch: (match: Match, value: string, opts?: { usage?: Usage }) => Effect.Effect<void>
+  readonly toolMatch: (match: Match, name: string, input: unknown) => Effect.Effect<void>
+  readonly text: (value: string, opts?: { usage?: Usage }) => Effect.Effect<void>
+  readonly tool: (name: string, input: unknown) => Effect.Effect<void>
+  readonly toolHang: (name: string, input: unknown) => Effect.Effect<void>
+  readonly reason: (value: string, opts?: { text?: string; usage?: Usage }) => Effect.Effect<void>
+  readonly fail: (message?: unknown) => Effect.Effect<void>
+  readonly error: (status: number, body: unknown) => Effect.Effect<void>
+  readonly hang: Effect.Effect<void>
+  readonly hold: (value: string, wait: PromiseLike<unknown>) => Effect.Effect<void>
+  readonly reset: Effect.Effect<void>
+  readonly hits: Effect.Effect<Hit[]>
+  readonly calls: Effect.Effect<number>
+  readonly wait: (count: number) => Effect.Effect<void>
+  readonly inputs: Effect.Effect<Record<string, unknown>[]>
+  readonly pending: Effect.Effect<number>
 }
 
-export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.Service>()("@test/LLMServer") {
+export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServerService>()("@test/LLMServer") {
+  /**
+   * Type-level alias so existing `TestLLMServer["Service"]` / `TestLLMServer.Service`
+   * annotations keep naming the shape. It is `declare`d: no runtime field is emitted.
+   */
+  declare static readonly Service: TestLLMServerService
   static readonly layer = Layer.effect(
     TestLLMServer,
     Effect.gen(function* () {
@@ -626,7 +634,6 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
       let hits: Hit[] = []
       let list: Queue[] = []
       let waits: Wait[] = []
-      let misses: Hit[] = []
 
       const queue = (...input: (Item | Reply)[]) => {
         list = [...list, ...input.map((value) => ({ item: item(value) }))]
@@ -742,7 +749,6 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
           hits = []
           list = []
           waits = []
-          misses = []
         }),
         hits: Effect.sync(() => [...hits]),
         calls: Effect.sync(() => hits.length),
@@ -754,7 +760,6 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         }),
         inputs: Effect.sync(() => hits.map((hit) => hit.body)),
         pending: Effect.sync(() => list.length),
-        misses: Effect.sync(() => [...misses]),
       })
     }),
   ).pipe(Layer.provide(HttpRouter.layer), Layer.provide(NodeHttpServer.layer(() => Http.createServer(), { port: 0 })))

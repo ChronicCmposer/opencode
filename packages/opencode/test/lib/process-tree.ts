@@ -177,6 +177,13 @@ export interface WaitForOptions {
   readonly message: string
 }
 
+/** Options for {@link waitForDeath}; `message` is derived from the pids when omitted. */
+export interface WaitForDeathOptions {
+  readonly timeoutMs?: number
+  readonly intervalMs?: number
+  readonly message?: string
+}
+
 /** Poll `probe` until it returns a non-`undefined` value, or fail loudly. */
 export async function waitFor<T>(
   probe: () => T | undefined | Promise<T | undefined>,
@@ -194,8 +201,8 @@ export async function waitFor<T>(
 }
 
 /** Resolve `true` once every pid has exited; `false` on timeout. */
-export async function waitForDeath(pids: ReadonlyArray<number>, options: WaitForOptions | { timeoutMs?: number } = {}): Promise<boolean> {
-  const message = "message" in options ? options.message : `processes did not exit: ${pids.join(",")}`
+export async function waitForDeath(pids: ReadonlyArray<number>, options: WaitForDeathOptions = {}): Promise<boolean> {
+  const message = options.message ?? `processes did not exit: ${pids.join(",")}`
   try {
     await waitFor(
       () => (pids.every((pid) => !isAlive(pid)) ? true : undefined),
@@ -206,6 +213,9 @@ export async function waitForDeath(pids: ReadonlyArray<number>, options: WaitFor
     return false
   }
 }
+
+/** Default per-read deadline for {@link StreamReader}. */
+export const DEFAULT_READ_TIMEOUT_MS = 5000
 
 export interface StreamReader {
   /** Read one line; `signal` aborts the wait and cancels the underlying stream. */
@@ -297,7 +307,7 @@ function createReader(stream: ReadableStream<Uint8Array>): StreamReader {
   }
 
   return {
-    readLine: async (timeoutMs = 5000, signal?: AbortSignal) => {
+    readLine: async (timeoutMs = DEFAULT_READ_TIMEOUT_MS, signal?: AbortSignal) => {
       const deadline = Date.now() + timeoutMs
       for (;;) {
         signal?.throwIfAborted()
@@ -310,7 +320,7 @@ function createReader(stream: ReadableStream<Uint8Array>): StreamReader {
         await fill(deadline, signal)
       }
     },
-    readExact: async (length, timeoutMs = 5000, signal?: AbortSignal) => {
+    readExact: async (length, timeoutMs = DEFAULT_READ_TIMEOUT_MS, signal?: AbortSignal) => {
       const deadline = Date.now() + timeoutMs
       while (buffer.length < length) await fill(deadline, signal)
       const value = decoder.decode(buffer.slice(0, length))

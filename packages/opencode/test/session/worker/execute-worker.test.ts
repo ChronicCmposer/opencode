@@ -6,7 +6,6 @@
 // a worker runs a session.
 
 import { describe, expect, test } from "bun:test"
-import type { SessionID } from "@/session/schema"
 import { createDispatcher, SessionCancelledError } from "@/session/worker/dispatch"
 import {
   createExecutorWorker,
@@ -18,29 +17,9 @@ import {
 } from "@/session/worker/execute"
 import { createWorkerHarness, type WorkerHarness } from "../../lib/worker-harness"
 import { spawnTransport } from "../../lib/transport"
+import { capture, sid } from "../../lib/async"
+import { pollUntil } from "../../lib/poll"
 import type { WorkerLogger } from "@/session/worker/log"
-
-const sid = (value: string) => value as SessionID
-
-async function waitUntil(
-  predicate: () => boolean | Promise<boolean>,
-  message: string,
-  timeoutMs = 5000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (await predicate()) return
-    await new Promise((resolve) => setTimeout(resolve, 5))
-  }
-  throw new Error(`timed out: ${message}`)
-}
-
-/** Settle a promise into its value-or-error so it can be asserted on. */
-const capture = (promise: Promise<unknown>): Promise<unknown> =>
-  promise.then(
-    () => undefined,
-    (error: unknown) => error,
-  )
 
 interface Rig extends AsyncDisposable {
   readonly harness: WorkerHarness
@@ -103,9 +82,11 @@ describe("5.4 RunnerBusy / assertNotBusy hold worker-local; the hub forwards con
   test("assertNotBusy answers from the worker and startShell rejects while running", async () => {
     await using rig = makeRig(1)
     const running = rig.dispatch.ensureRunning(sid("ses_a"))
-    await waitUntil(() => rig.dispatch.assertNotBusy(sid("ses_a")), "worker never became busy")
+    await pollUntil(() => rig.dispatch.assertNotBusy(sid("ses_a")), { message: "worker never became busy" })
 
-    expect(await capture(rig.dispatch.startShell(sid("ses_a")))).toBeInstanceOf(SessionBusyError)
+    const busy = await capture(rig.dispatch.startShell(sid("ses_a")))
+    expect(busy.ok).toBe(false)
+    if (!busy.ok) expect(busy.error).toBeInstanceOf(SessionBusyError)
 
     await running
     expect(await rig.dispatch.assertNotBusy(sid("ses_a"))).toBe(false)
@@ -118,9 +99,9 @@ describe("5.5 different sessions run concurrently on different workers", () => {
     const a = rig.dispatch.ensureRunning(sid("ses_a"))
     const b = rig.dispatch.ensureRunning(sid("ses_b"))
 
-    await waitUntil(
+    await pollUntil(
       async () => (await rig.dispatch.assertNotBusy(sid("ses_a"))) && (await rig.dispatch.assertNotBusy(sid("ses_b"))),
-      "both sessions were never concurrently busy",
+      { message: "both sessions were never concurrently busy" },
     )
 
     const [ra, rb] = await Promise.all([a, b])
@@ -133,7 +114,7 @@ describe("5.4 hub forwards cancellation", () => {
   test("cancelling a running session rejects the caller", async () => {
     await using rig = makeRig(1)
     const running = rig.dispatch.ensureRunning(sid("ses_a"))
-    await waitUntil(() => rig.dispatch.assertNotBusy(sid("ses_a")), "worker never became busy")
+    await pollUntil(() => rig.dispatch.assertNotBusy(sid("ses_a")), { message: "worker never became busy" })
 
     await rig.dispatch.cancel(sid("ses_a"))
     await expect(running).rejects.toBeInstanceOf(SessionCancelledError)
@@ -142,7 +123,7 @@ describe("5.4 hub forwards cancellation", () => {
   test("a cancelled worker session leaves the worker run-state clean and reusable", async () => {
     await using rig = makeRig(1)
     const running = rig.dispatch.ensureRunning(sid("ses_a"))
-    await waitUntil(() => rig.dispatch.assertNotBusy(sid("ses_a")), "worker never became busy")
+    await pollUntil(() => rig.dispatch.assertNotBusy(sid("ses_a")), { message: "worker never became busy" })
 
     await rig.dispatch.cancel(sid("ses_a"))
     await expect(running).rejects.toBeInstanceOf(SessionCancelledError)
@@ -272,9 +253,9 @@ describe("liveness watchdog: a wedged run is surfaced, a healthy one is not", ()
   test("a run whose worker never answers a ping rejects with SessionWorkerReplyTimeoutError", async () => {
     const worker = createExecutorWorker({ id: 1, transport: wedgedTransport(), workKind: "slow", runIdleTimeoutMs: 25 })
 
-    expect(await capture(worker.execute({ sessionID: sid("ses_wedged"), depth: 0 }))).toBeInstanceOf(
-      SessionWorkerReplyTimeoutError,
-    )
+    const outcome = await capture(worker.execute({ sessionID: sid("ses_wedged"), depth: 0 }))
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) expect(outcome.error).toBeInstanceOf(SessionWorkerReplyTimeoutError)
   })
 
   test("a healthy slow run is kept alive by the worker's pongs", async () => {

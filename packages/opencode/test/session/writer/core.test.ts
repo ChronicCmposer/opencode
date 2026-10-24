@@ -5,7 +5,6 @@
 // transaction and sequence semantics are exercised for real, without a Worker.
 
 import { afterEach, describe, expect, test } from "bun:test"
-import { createBunSqliteConnection, type WriterConnection } from "@/session/writer/connection"
 import {
   AbortedWriteError,
   ConnectionPoisonedError,
@@ -14,15 +13,13 @@ import {
   TransactionError,
   WriterBusyExhaustedError,
   WriterClosedError,
-  createWriterCore,
   writerErrorInfo,
   type WriterCore,
-  type WriterCoreOptions,
 } from "@/session/writer/core"
 import { FAULTS_ENV } from "@/testing/faults"
 import { capture, flush } from "../../lib/async"
 import { pollUntil } from "../../lib/poll"
-import { SCHEMA_SQL, ev } from "./fixtures"
+import { ev, settlesWithin, writerHarness, type Harness } from "./fixtures"
 
 const originalGate = process.env[FAULTS_ENV]
 afterEach(() => {
@@ -30,50 +27,23 @@ afterEach(() => {
   else process.env[FAULTS_ENV] = originalGate
 })
 
-interface Harness {
-  readonly core: WriterCore
-  readonly rows: (sql: string, params?: ReadonlyArray<unknown>) => ReadonlyArray<Record<string, unknown>>
-}
-
-function harness(options: Omit<WriterCoreOptions, "connection"> = {}): Harness {
-  const connection = createBunSqliteConnection({ filename: ":memory:" })
-  connection.exec(SCHEMA_SQL)
-  const core = createWriterCore({ connection, sleep: async () => {}, ...options })
-  return { core, rows: (sql, params = []) => connection.all(sql, params) }
-}
-
-/**
- * Settle `promise` within `ms` or fail with `message`. A pinned transaction that
- * never releases surfaces as a bounded, descriptive failure instead of a hang.
- */
-async function settlesWithin<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), ms)
-  })
-  try {
-    return await Promise.race([promise, deadline])
-  } finally {
-    if (timer !== undefined) clearTimeout(timer)
-  }
-}
+/** The common harness: a fresh in-memory writer core (see {@link writerHarness}). */
+const harness = writerHarness
 
 /**
  * A harness whose connection can fail the COMMIT statement on demand, so the
  * writer's release path is exercised when the transaction's finalization throws.
  */
 function guardedHarness(failCommit: () => boolean): Harness {
-  const connection = createBunSqliteConnection({ filename: ":memory:" })
-  connection.exec(SCHEMA_SQL)
-  const guarded: WriterConnection = {
-    ...connection,
-    run: (sql, params = []) => {
-      if (/^\s*commit\b/i.test(sql) && failCommit()) throw new Error("injected COMMIT failure")
-      return connection.run(sql, params)
-    },
-  }
-  const core = createWriterCore({ connection: guarded, sleep: async () => {} })
-  return { core, rows: (sql, params = []) => connection.all(sql, params) }
+  return writerHarness({
+    guard: (connection) => ({
+      ...connection,
+      run: (sql, params = []) => {
+        if (/^\s*commit\b/i.test(sql) && failCommit()) throw new Error("injected COMMIT failure")
+        return connection.run(sql, params)
+      },
+    }),
+  })
 }
 
 /**
@@ -82,21 +52,19 @@ function guardedHarness(failCommit: () => boolean): Harness {
  * the transaction is still open on the native handle.
  */
 function busyCommitHarness(): Harness {
-  const connection = createBunSqliteConnection({ filename: ":memory:" })
-  connection.exec(SCHEMA_SQL)
   let busy = true
-  const guarded: WriterConnection = {
-    ...connection,
-    run: (sql, params = []) => {
-      if (/^\s*commit\b/i.test(sql) && busy) {
-        busy = false
-        throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY", errno: 5 })
-      }
-      return connection.run(sql, params)
-    },
-  }
-  const core = createWriterCore({ connection: guarded, sleep: async () => {} })
-  return { core, rows: (sql, params = []) => connection.all(sql, params) }
+  return writerHarness({
+    guard: (connection) => ({
+      ...connection,
+      run: (sql, params = []) => {
+        if (/^\s*commit\b/i.test(sql) && busy) {
+          busy = false
+          throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY", errno: 5 })
+        }
+        return connection.run(sql, params)
+      },
+    }),
+  })
 }
 
 const sequenceOf = (rows: ReadonlyArray<Record<string, unknown>>): number[] => rows.map((row) => Number(row.seq))
@@ -229,10 +197,7 @@ describe("writer core: SQLITE_BUSY retry (7.8)", () => {
   test("a forced busy at commit retries with exponential backoff then rejects typed", async () => {
     process.env[FAULTS_ENV] = "failCommitAt@writer:commit"
     const delays: number[] = []
-    const connection = createBunSqliteConnection({ filename: ":memory:" })
-    connection.exec(SCHEMA_SQL)
-    const core = createWriterCore({
-      connection,
+    const { core } = writerHarness({
       sleep: async (ms) => {
         delays.push(ms)
       },
@@ -246,11 +211,8 @@ describe("writer core: SQLITE_BUSY retry (7.8)", () => {
 
   test("a busy that clears before exhaustion succeeds and consumes one sequence", async () => {
     process.env[FAULTS_ENV] = "failCommitAt@writer:commit"
-    const connection = createBunSqliteConnection({ filename: ":memory:" })
-    connection.exec(SCHEMA_SQL)
     let attempts = 0
-    const core = createWriterCore({
-      connection,
+    const { core } = writerHarness({
       sleep: async () => {
         attempts += 1
         // clear the fault after the first backoff so the retry can commit
@@ -327,17 +289,15 @@ describe("writer core: busy COMMIT retry (R1#1, R5#4)", () => {
 
 describe("writer core: failed rollback poisons the connection (R1#3)", () => {
   function uninvertibleHarness(): Harness {
-    const connection = createBunSqliteConnection({ filename: ":memory:" })
-    connection.exec(SCHEMA_SQL)
-    const guarded: WriterConnection = {
-      ...connection,
-      run: (sql, params = []) => {
-        if (/^\s*rollback\b/i.test(sql)) throw new Error("injected ROLLBACK failure")
-        return connection.run(sql, params)
-      },
-    }
-    const core = createWriterCore({ connection: guarded, sleep: async () => {} })
-    return { core, rows: (sql, params = []) => connection.all(sql, params) }
+    return writerHarness({
+      guard: (connection) => ({
+        ...connection,
+        run: (sql, params = []) => {
+          if (/^\s*rollback\b/i.test(sql)) throw new Error("injected ROLLBACK failure")
+          return connection.run(sql, params)
+        },
+      }),
+    })
   }
 
   test("an untracked rollback that fails poisons the writer and later ops fail loud", async () => {
@@ -614,6 +574,88 @@ describe("writer core: write-through read cache (7.18)", () => {
     await core.query("all", sql, [], { cache: false })
     await core.query("all", sql, [], { cache: false })
     expect(core.cacheStats().hits).toBe(0)
+  })
+})
+
+describe("writer core: egress ordinal is not consumed by failed attempts (106)", () => {
+  test("a busy COMMIT retry does not leave an ordinal gap", async () => {
+    const { core } = busyCommitHarness()
+    const first = await core.publish({ event: ev("t", "a"), durable: true })
+    const second = await core.publish({ event: ev("t", "b"), durable: true })
+
+    expect([first.ordinal, second.ordinal]).toEqual([1, 2])
+  })
+
+  test("a commit that fails outright consumes no ordinal", async () => {
+    let armed = true
+    const { core } = guardedHarness(() => {
+      const fail = armed
+      armed = false
+      return fail
+    })
+
+    await expect(core.publish({ event: ev("t", "a"), durable: true })).rejects.toThrow("injected COMMIT failure")
+
+    const next = await core.publish({ event: ev("t", "b"), durable: true })
+    expect(next.ordinal).toBe(1)
+  })
+})
+
+describe("writer core: cache key stability and table attribution (107)", () => {
+  test("undefined and null params do not collide in the cache", async () => {
+    const { core } = harness()
+    const sql = "SELECT ? AS v"
+
+    await core.query("all", sql, [null])
+    await core.query("all", sql, [undefined])
+
+    expect(core.cacheStats().hits).toBe(0)
+  })
+
+  test("a BigInt param neither throws nor collides with a number", async () => {
+    const { core } = harness()
+    const sql = "SELECT ? AS v"
+
+    await core.query("all", sql, [1n])
+    await core.query("all", sql, [1])
+
+    expect(core.cacheStats().hits).toBe(0)
+  })
+
+  test("a schema-qualified read is invalidated by a table mutation", async () => {
+    const { core } = harness()
+    const sql = 'SELECT seq FROM "main"."event_sequence" WHERE aggregate_id = ?'
+
+    expect(await core.query("all", sql, ["a"])).toEqual([])
+    await core.publish({ event: ev("t", "a"), durable: true })
+    expect(await core.query("all", sql, ["a"])).toEqual([{ seq: 0 }])
+  })
+
+  test("a mutation on a schema-qualified table invalidates the cached read", async () => {
+    const { core } = harness()
+    await core.publish({ event: ev("t", "a"), durable: true })
+    const sql = "SELECT owner_id FROM event_sequence WHERE aggregate_id = ?"
+
+    expect(await core.query("all", sql, ["a"])).toEqual([{ owner_id: null }])
+    await core.query("run", 'UPDATE "main"."event_sequence" SET owner_id = ? WHERE aggregate_id = ?', ["o1", "a"])
+    expect(await core.query("all", sql, ["a"])).toEqual([{ owner_id: "o1" }])
+  })
+
+  test("a read whose tables cannot be attributed is never cached", async () => {
+    const { core } = harness()
+
+    await core.query("all", "SELECT seq FROM (SELECT 1 AS seq) AS t", [])
+
+    expect(core.cacheStats().entries).toBe(0)
+  })
+})
+
+describe("writer core: steal is symmetric with claim (108)", () => {
+  test("steal on an absent aggregate is rejected and creates no row", async () => {
+    const { core, rows } = harness()
+
+    await expect(core.steal("absent", "o1")).rejects.toBeInstanceOf(OwnerMismatchError)
+    expect(rows("SELECT owner_id FROM event_sequence WHERE aggregate_id = 'absent'")).toEqual([])
   })
 })
 

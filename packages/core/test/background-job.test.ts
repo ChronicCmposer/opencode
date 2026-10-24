@@ -86,6 +86,25 @@ describe("BackgroundJob", () => {
     }).pipe(Effect.provide(jobsLayer)),
   )
 
+  it.live("deep-clones and freezes metadata across the registry boundary", () =>
+    Effect.gen(function* () {
+      const scope = yield* Scope.make()
+      const jobs = yield* BackgroundJob.make.pipe(Scope.provide(scope))
+      const metadata = { nested: { value: 1 } }
+      const job = yield* jobs.start({ type: "test", metadata, run: Effect.never })
+
+      // Mutating the caller's object after `start` must not reach the registry.
+      metadata.nested.value = 2
+
+      const observed = yield* jobs.get(job.id)
+      expect(observed?.metadata).toEqual({ nested: { value: 1 } })
+      expect(Object.isFrozen(observed?.metadata)).toBe(true)
+      expect(Object.isFrozen(observed?.metadata?.nested)).toBe(true)
+
+      yield* Scope.close(scope, Exit.void)
+    }),
+  )
+
   it.live("interrupts live work without promising settlement after the owning process-local scope closes", () =>
     Effect.gen(function* () {
       const scope = yield* Scope.make()

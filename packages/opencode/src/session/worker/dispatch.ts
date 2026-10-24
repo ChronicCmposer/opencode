@@ -91,7 +91,7 @@ export function workerKindForDepth(depth: number): WorkerKind {
 export type SessionRun = ExecutorRun
 
 /** A worker that executes exactly one session run at a time. */
-export interface SessionWorker extends ExecutorSessionWorker {}
+export type SessionWorker = ExecutorSessionWorker
 
 /** The scheduling seam (task 4.9): supplies and replaces workers. */
 export interface WorkerPool {
@@ -888,18 +888,27 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     return pending.promise
   }
 
-  const cancel = async (sessionID: SessionID): Promise<void> => {
-    const error = cancelled(sessionID)
+  /**
+   * Remove a still-queued session (admission FIFO or child FIFO) and settle it as
+   * cancelled. Shared by `cancel` and `cancelWithGrace` so the queued path has one
+   * implementation; returns whether a queued entry was found.
+   */
+  const removeQueued = (sessionID: SessionID): boolean => {
     const queued =
       admission.remove((pending) => pending.sessionID === sessionID) ??
       children.remove((pending) => pending.sessionID === sessionID)
-    if (queued !== undefined) {
-      queued.gate.claim("cancel")
-      byKey.delete(sessionID)
-      queued.reject(error)
-      rejectWaiters(sessionID, error)
-      return
-    }
+    if (queued === undefined) return false
+    const error = cancelled(sessionID)
+    queued.gate.claim("cancel")
+    byKey.delete(sessionID)
+    queued.reject(error)
+    rejectWaiters(sessionID, error)
+    return true
+  }
+
+  const cancel = async (sessionID: SessionID): Promise<void> => {
+    const error = cancelled(sessionID)
+    if (removeQueued(sessionID)) return
 
     const admitted = byKey.get(sessionID)
     if (admitted === undefined) {
@@ -923,7 +932,15 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     nextWaiter(sessionID)
   }
 
-  const cancelWithGrace = async (sessionID: SessionID): Promise<CancelOutcome | undefined> => {
+  const cancelWithGrace = async (
+    sessionID: SessionID,
+    visited: ReadonlySet<SessionID> = new Set<SessionID>(),
+  ): Promise<CancelOutcome | undefined> => {
+    // A malformed `childrenOf` graph could report a cycle; never visit a session
+    // twice so the children-first cascade always terminates.
+    if (visited.has(sessionID)) return undefined
+    const seen = new Set(visited).add(sessionID)
+
     const config = cancellation
     if (config === undefined) {
       await cancel(sessionID)
@@ -931,17 +948,10 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     }
 
     // 11.8: cascade to subagents first, each bounded by the same grace window.
-    for (const child of config.childrenOf?.(sessionID) ?? []) await cancelWithGrace(child)
+    for (const child of config.childrenOf?.(sessionID) ?? []) await cancelWithGrace(child, seen)
 
     // 11.10: a queued session is removed from the FIFO and terminated in place.
-    const queued =
-      admission.remove((pending) => pending.sessionID === sessionID) ??
-      children.remove((pending) => pending.sessionID === sessionID)
-    if (queued !== undefined) {
-      queued.gate.claim("cancel")
-      byKey.delete(sessionID)
-      queued.reject(cancelled(sessionID))
-      rejectWaiters(sessionID, cancelled(sessionID))
+    if (removeQueued(sessionID)) {
       config.onCancelled?.({ sessionID, mode: "queued", workerID: undefined, resumeFromDb: true })
       return { sessionID, mode: "terminated", winner: "cancel", acknowledged: false, durationMs: 0 }
     }

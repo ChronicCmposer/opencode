@@ -75,7 +75,7 @@ function runChild(scratch: string, overrides: Record<string, string>): ChildResu
   writeFileSync(path.join(scratch, "trivial.test.ts"), TRIVIAL_TEST)
 
   const proc = Bun.spawnSync(
-    ["bun", "test", "--preload", probePath, "--preload", preloadPath, scratch],
+    [process.execPath, "test", "--preload", probePath, "--preload", preloadPath, scratch],
     {
       cwd: scratch,
       env: isolatedChildEnv(overrides),

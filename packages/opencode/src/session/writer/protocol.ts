@@ -21,7 +21,12 @@
 // port as DATA — a registered SQL statement — never as closures (plan line 31).
 
 import { defined } from "@/util/object"
-import { createFramePrimitives } from "@/session/worker/frame"
+import { ProtocolError, createFramePrimitives } from "@/session/worker/frame"
+
+// The frame module owns the one `ProtocolError`; re-exported here so the writer
+// protocol's public surface (and its callers) are unchanged, without a second
+// class identity that `instanceof` checks would not recognize.
+export { ProtocolError }
 
 /** The four execution shapes the Effect SQL connection reduces to. */
 export type QueryMethod = "all" | "values" | "run" | "exec"
@@ -136,6 +141,21 @@ export function errorCode(error: unknown): string | number | undefined {
   return undefined
 }
 
+/**
+ * Map any thrown failure onto the writer wire error shape. The single mapping for
+ * the writer protocol, shared by the worker entry (`writer/worker.ts`) and the hub
+ * port server (`writer/client.ts`): a tagged error keeps its `tag` and native
+ * `code`; anything else is reported as `UNKNOWN` with its message and any code it
+ * carried. Reused verbatim by the worker-side core so both directions agree.
+ */
+export function writerErrorInfo(error: unknown): WriterErrorInfo {
+  const code = errorCode(error)
+  const tagged = typeof error === "object" && error !== null && "tag" in error ? (error as { tag?: unknown }).tag : undefined
+  const tag = typeof tagged === "string" ? tagged : "UNKNOWN"
+  const message = error instanceof Error ? error.message : String(error)
+  return { tag, message, ...defined({ code }) }
+}
+
 export interface WriterFailure {
   readonly type: "failure"
   readonly id: number
@@ -144,16 +164,16 @@ export interface WriterFailure {
 
 export type WriterResponse = WriterReady | WriterResult | WriterFailure
 
-/** Raised when a frame does not match the protocol; a caller bug, so fail loud. */
-export class ProtocolError extends Error {
-  readonly tag = "PROTOCOL"
-  constructor(message: string) {
-    super(message)
-    this.name = "ProtocolError"
-  }
-}
+/** The query methods the wire may carry; exported so both boundaries validate identically. */
+export const QUERY_METHODS: ReadonlySet<string> = new Set<QueryMethod>(["all", "values", "run", "exec"])
 
-const QUERY_METHODS: ReadonlySet<string> = new Set<QueryMethod>(["all", "values", "run", "exec"])
+/** Parse an untrusted wire method into the trusted `QueryMethod`; fail loud otherwise. */
+export function parseQueryMethod(value: unknown): QueryMethod {
+  if (typeof value !== "string" || !QUERY_METHODS.has(value)) {
+    throw new ProtocolError(`field "method" must be one of all, values, run, exec (got ${JSON.stringify(value)})`)
+  }
+  return value as QueryMethod
+}
 
 /**
  * True when `error` is a Node-style ENOENT (missing file or directory). Declared in
@@ -178,12 +198,23 @@ const { isRecord, requireString, requireNumber, optionalString, optionalBoolean 
   },
 )
 
+/** Parse a required object field; fail loud through this module's `ProtocolError`. */
+function requireRecord(record: Record<string, unknown>, field: string): Record<string, unknown> {
+  const value = record[field]
+  if (!isRecord(value)) throw new ProtocolError(`field "${field}" must be an object (got ${JSON.stringify(value)})`)
+  return value
+}
+
 function requireStringArray(record: Record<string, unknown>, field: string): string[] {
   const value = record[field]
-  if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) {
+  if (!Array.isArray(value)) throw new ProtocolError(`field "${field}" must be a string array (got ${JSON.stringify(value)})`)
+  // Narrow with a predicate rather than a blind cast: a single non-string element
+  // fails the whole field loud instead of leaking an untyped value to the caller.
+  const strings = value.filter((item): item is string => typeof item === "string")
+  if (strings.length !== value.length) {
     throw new ProtocolError(`field "${field}" must be a string array (got ${JSON.stringify(value)})`)
   }
-  return value as string[]
+  return strings
 }
 
 function optionalParams(record: Record<string, unknown>): ReadonlyArray<unknown> | undefined {
@@ -194,24 +225,26 @@ function optionalParams(record: Record<string, unknown>): ReadonlyArray<unknown>
 }
 
 function parseMethod(record: Record<string, unknown>): QueryMethod {
-  const method = record["method"]
-  if (typeof method !== "string" || !QUERY_METHODS.has(method)) {
-    throw new ProtocolError(`field "method" must be one of all, values, run, exec (got ${JSON.stringify(method)})`)
+  return parseQueryMethod(record["method"])
+}
+
+/**
+ * Parse a wire event value into a trusted `WriterEvent`. Shared by the request
+ * boundary (the `event` field) and the writer port server, so the validation has
+ * exactly one implementation instead of a per-boundary duplicate.
+ */
+export function parseWriterEventValue(value: unknown): WriterEvent {
+  if (!isRecord(value)) throw new ProtocolError(`field "event" must be an object (got ${JSON.stringify(value)})`)
+  return {
+    id: requireString(value, "id"),
+    type: requireString(value, "type"),
+    aggregateID: requireString(value, "aggregateID"),
+    data: requireRecord(value, "data"),
   }
-  return method as QueryMethod
 }
 
 function parseEvent(record: Record<string, unknown>): WriterEvent {
-  const event = record["event"]
-  if (!isRecord(event)) throw new ProtocolError(`field "event" must be an object (got ${JSON.stringify(event)})`)
-  const data = event["data"]
-  if (!isRecord(data)) throw new ProtocolError(`field "event.data" must be an object (got ${JSON.stringify(data)})`)
-  return {
-    id: requireString(event, "id"),
-    type: requireString(event, "type"),
-    aggregateID: requireString(event, "aggregateID"),
-    data: data as Record<string, unknown>,
-  }
+  return parseWriterEventValue(requireRecord(record, "event"))
 }
 
 function optionalCode(record: Record<string, unknown>, field: string): string | number | undefined {
@@ -238,13 +271,8 @@ export function parseWriterRequest(input: unknown): WriterRequest {
       return { type, id, filename: requireString(input, "filename") }
     case "admin.pragma":
       return { type, id, sql: requireString(input, "sql") }
-    case "admin.migrate": {
-      const statements = input["statements"]
-      if (!Array.isArray(statements) || !statements.every((s) => typeof s === "string")) {
-        throw new ProtocolError(`field "statements" must be a string array (got ${JSON.stringify(statements)})`)
-      }
-      return { type, id, statements: statements as string[] }
-    }
+    case "admin.migrate":
+      return { type, id, statements: requireStringArray(input, "statements") }
     case "admin.checkpoint":
       return { type, id }
     case "query": {

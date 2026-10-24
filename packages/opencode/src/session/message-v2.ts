@@ -21,12 +21,7 @@ import { APICallError, convertToModelMessages, LoadAPIKeyError, type ModelMessag
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { NotFoundError } from "@/storage/storage"
-import { and } from "drizzle-orm"
-import { desc } from "drizzle-orm"
-import { eq } from "drizzle-orm"
-import { inArray } from "drizzle-orm"
-import { lt } from "drizzle-orm"
-import { or } from "drizzle-orm"
+import { and, desc, eq, inArray, lt, or } from "drizzle-orm"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
@@ -77,20 +72,27 @@ export const cursor = {
   },
 }
 
-const info = (row: typeof MessageTable.$inferSelect) =>
-  ({
+// Storage rows carry JSON typed as the mutable message/part shape. Decoding
+// through the schema validates the payload at the boundary; the schema's
+// inferred type is `readonly`, so narrow once here back to the public mutable
+// types (`Info`/`Part`) that the rest of the module consumes.
+const decodeInfo = Schema.decodeUnknownSync(Info) as (input: unknown) => Info
+const decodePart = Schema.decodeUnknownSync(Part) as (input: unknown) => Part
+
+const info = (row: typeof MessageTable.$inferSelect): Info =>
+  decodeInfo({
     ...row.data,
     id: row.id,
     sessionID: row.session_id,
-  }) as Info
+  })
 
-const part = (row: typeof PartTable.$inferSelect) =>
-  ({
+const part = (row: typeof PartTable.$inferSelect): Part =>
+  decodePart({
     ...row.data,
     id: row.id,
     sessionID: row.session_id,
     messageID: row.message_id,
-  }) as Part
+  })
 
 const older = (row: Cursor) =>
   or(lt(MessageTable.time_created, row.time), and(eq(MessageTable.time_created, row.time), lt(MessageTable.id, row.id)))
@@ -549,8 +551,6 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
       if (msg.info.id === retain) break
       continue
     }
-    if (msg.info.role === "user" && completed.has(msg.info.id) && msg.parts.some((part) => part.type === "compaction"))
-      break
     if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
       completed.add(msg.info.parentID)
   }
@@ -642,19 +642,21 @@ export function fromError(
         },
         { cause: e },
       ).toObject()
-    case (e as SystemError)?.code === "ECONNRESET":
+    case (e as SystemError)?.code === "ECONNRESET": {
+      const systemError = e as SystemError
       return new APIError(
         {
           message: "Connection reset by server",
           isRetryable: true,
           metadata: {
-            code: (e as SystemError).code ?? "",
-            syscall: (e as SystemError).syscall ?? "",
-            message: (e as SystemError).message ?? "",
+            code: systemError.code ?? "",
+            syscall: systemError.syscall ?? "",
+            message: systemError.message ?? "",
           },
         },
         { cause: e },
       ).toObject()
+    }
     case e instanceof Error && (e as FetchDecompressionError).code === "ZlibError":
       if (ctx.aborted) {
         return new AbortedError({ message: e.message }, { cause: e }).toObject()

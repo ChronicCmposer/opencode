@@ -120,4 +120,17 @@ describe("event-sink", () => {
       await runtime.dispose()
     }
   })
+
+  it("surfaces teardown errors instead of swallowing them", async () => {
+    // A runtime-shaped double whose unsubscribe path rejects.
+    const failingRuntime = {
+      runSync: () => Effect.void,
+      runPromise: () => Promise.reject(new Error("teardown boom")),
+      runFork: () => undefined,
+    } as unknown as ManagedRuntime.ManagedRuntime<EventV2.Service, never>
+
+    const sink = createEventSink(failingRuntime)
+
+    await expect(sink.dispose()).rejects.toThrow("teardown boom")
+  })
 })

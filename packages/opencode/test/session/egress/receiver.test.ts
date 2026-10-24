@@ -7,25 +7,18 @@
 // drops non-durable deltas (never durables) while emitting a resync.
 
 import { describe, expect, test } from "bun:test"
-import { encodeFrame, type EgressFrame } from "@/session/egress/frame"
+import { type FrameChunk, createFrameDecoder, encodeFrame } from "@/session/egress/frame"
 import { createEgressReceiver, DurableOrderError } from "@/session/egress/receiver"
 import { type EventsFrame, ackFrame, endFrame, eventFrame, resyncFrame } from "@/session/worker/frame"
-
-async function pollUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (predicate()) return
-    await new Promise((resolve) => setTimeout(resolve, 5))
-  }
-  throw new Error(`pollUntil timed out after ${timeoutMs}ms`)
-}
+import { deltasFrame, durableFrame } from "../../lib/egress-fixtures"
+import { pollUntil } from "../../lib/poll"
 
 const deltaEvent = (id: string) => ({ id, type: "message.part.delta", properties: { id } })
 const durableEvent = (id: string) => ({ id, type: "message.updated", properties: { id } })
 
 interface ReceiverHarness {
   readonly port1: MessagePort
-  readonly frames: EgressFrame[]
+  readonly frames: EventsFrame[]
   readonly ends: number
   readonly resyncs: (EventsFrame & { readonly kind: "resync" })["payload"][]
   readonly acks: (EventsFrame & { readonly kind: "ack" })["payload"][]
@@ -36,7 +29,7 @@ interface ReceiverHarness {
 
 function setup(options: { pressure?: () => boolean } = {}): ReceiverHarness {
   const channel = new MessageChannel()
-  const frames: EgressFrame[] = []
+  const frames: EventsFrame[] = []
   const errors: Error[] = []
   const resyncs: ReceiverHarness["resyncs"] = []
   const acks: ReceiverHarness["acks"] = []
@@ -178,5 +171,125 @@ describe("egress receiver over event frames", () => {
     expect(harness.receiver.lastError).toBeDefined()
     expect(harness.receiver.pendingBytes).toBe(0)
     harness.close()
+  })
+})
+
+describe("egress receiver pressure-resync contract", () => {
+  test("every dropped delta yields exactly one resync and durables are never dropped", async () => {
+    let underPressure = true
+    const harness = setup({ pressure: () => underPressure })
+
+    harness.port1.postMessage(encodeFrame(eventFrame({ event: deltaEvent("d1") })))
+    harness.port1.postMessage(encodeFrame(eventFrame({ event: deltaEvent("d2") })))
+    harness.port1.postMessage(encodeFrame(eventFrame({ event: durableEvent("keep"), generation: 1, ordinal: 1 })))
+    await pollUntil(() => harness.receiver.dropped === 2 && harness.frames.length === 1)
+
+    // Under sustained pressure each dropped delta surfaces exactly one overflow
+    // resync, while the durable is delivered and never counted as dropped.
+    expect(harness.receiver.dropped).toBe(2)
+    expect(harness.receiver.resyncs).toBe(2)
+    expect(harness.resyncs).toEqual([undefined, undefined])
+    expect(harness.frames).toEqual([eventFrame({ event: durableEvent("keep"), generation: 1, ordinal: 1 })])
+
+    // Once pressure clears, deltas flow again with no further drop or resync.
+    underPressure = false
+    harness.port1.postMessage(encodeFrame(eventFrame({ event: deltaEvent("d3") })))
+    await pollUntil(() => harness.frames.length === 2)
+    expect(harness.receiver.dropped).toBe(2)
+    expect(harness.receiver.resyncs).toBe(2)
+    harness.close()
+  })
+})
+
+describe("egress receiver framing boundaries", () => {
+  test("accepts an ArrayBuffer chunk", async () => {
+    const channel = new MessageChannel()
+    const receiver = createEgressReceiver({ port: channel.port2, onFrame: () => {} })
+    const bytes = encodeFrame(endFrame())
+    channel.port1.postMessage(bytes.buffer)
+    await pollUntil(() => receiver.ended)
+    expect(receiver.lastError).toBeUndefined()
+    receiver.close()
+    channel.port1.close()
+  })
+
+  test("accepts a typed-array view over a larger buffer", async () => {
+    const channel = new MessageChannel()
+    const frames: EventsFrame[] = []
+    const receiver = createEgressReceiver({ port: channel.port2, onFrame: (frame) => frames.push(frame) })
+    const framed = encodeFrame(deltasFrame("v1"))
+    const padded = new Uint8Array(framed.byteLength + 8)
+    padded.set(framed, 4)
+    const view = padded.subarray(4, 4 + framed.byteLength)
+    channel.port1.postMessage(view)
+    await pollUntil(() => frames.length === 1)
+    expect(receiver.lastError).toBeUndefined()
+    expect(frames[0]).toEqual(deltasFrame("v1"))
+    receiver.close()
+    channel.port1.close()
+  })
+
+  test("does not commit trailing bytes when a batch fails mid-way", async () => {
+    const channel = new MessageChannel()
+    const receiver = createEgressReceiver({ port: channel.port2, onFrame: () => {} })
+    const first = encodeFrame(durableFrame("d2", 2))
+    const stale = encodeFrame(durableFrame("d1", 1))
+    const partial = first.subarray(0, first.byteLength - 2)
+    channel.port1.postMessage(new Uint8Array([...first, ...stale, ...partial]))
+    await pollUntil(() => receiver.lastError !== undefined)
+    expect(receiver.pendingBytes).toBe(0)
+    receiver.close()
+    channel.port1.close()
+  })
+
+  test("reassembles a frame delivered one byte at a time", async () => {
+    const harness = setup()
+    const frame = eventFrame({ event: deltaEvent("tiny") })
+    const bytes = encodeFrame(frame)
+    for (let offset = 0; offset < bytes.byteLength; offset++) {
+      harness.port1.postMessage(bytes.subarray(offset, offset + 1))
+    }
+    await pollUntil(() => harness.frames.length === 1)
+    expect(harness.frames[0]).toEqual(frame)
+    expect(harness.receiver.pendingBytes).toBe(0)
+    harness.close()
+  })
+})
+
+describe("egress frame decoder buffering", () => {
+  test("accumulates an incomplete frame until its remainder arrives", () => {
+    const decoder = createFrameDecoder(8)
+    const bytes = encodeFrame(eventFrame({ event: { id: "big", type: "t", properties: { text: "x".repeat(2048) } } }))
+    const split = bytes.byteLength - 3
+
+    expect(decoder.push(bytes.subarray(0, split))).toEqual([])
+    expect(decoder.pending).toBe(split)
+
+    const [chunk] = decoder.push(bytes.subarray(split))
+    expect(chunk?.bytes).toEqual(bytes)
+    expect(decoder.pending).toBe(0)
+  })
+
+  test("reassembles a frame split into single bytes from a preallocated buffer", () => {
+    const decoder = createFrameDecoder(8)
+    const frame = eventFrame({ event: { id: "byte", type: "t", properties: { text: "y".repeat(4096) } } })
+    const bytes = encodeFrame(frame)
+
+    const chunks: FrameChunk[] = []
+    for (let offset = 0; offset < bytes.byteLength; offset++) {
+      chunks.push(...decoder.push(bytes.subarray(offset, offset + 1)))
+    }
+    expect(chunks).toHaveLength(1)
+    expect(chunks[0]?.frame).toEqual(frame)
+    expect(chunks[0]?.bytes).toEqual(bytes)
+    expect(decoder.pending).toBe(0)
+  })
+
+  test("reset discards buffered bytes", () => {
+    const decoder = createFrameDecoder(8)
+    decoder.push(encodeFrame(endFrame()).subarray(0, 2))
+    expect(decoder.pending).toBe(2)
+    decoder.reset()
+    expect(decoder.pending).toBe(0)
   })
 })

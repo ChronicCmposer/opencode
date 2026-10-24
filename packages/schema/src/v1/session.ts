@@ -27,10 +27,13 @@ export const PartID = Schema.String.check(Schema.isStartsWith("prt")).pipe(
 export type PartID = typeof PartID.Type
 
 const namedError = <Name extends string, Fields extends Schema.Struct.Fields>(name: Name, fields: Fields) => {
-  const schema = Schema.Struct({ name: Schema.Literal(name), data: Schema.Struct(fields) }).annotate({
+  const data = Schema.Struct(fields)
+  const schema = Schema.Struct({ name: Schema.Literal(name), data }).annotate({
     identifier: name,
   })
-  return { Schema: schema, EffectSchema: schema }
+  // `data` is the canonical field contract; runtime owners derive their error
+  // class from it instead of restating the fields.
+  return { Schema: schema, EffectSchema: schema, data }
 }
 
 export const OutputLengthError = namedError("MessageOutputLengthError", {})

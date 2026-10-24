@@ -6,7 +6,7 @@
 // notification plumbing both ends use; the concrete EventV2 mesh protocol lives
 // in `mesh.ts`.
 
-import type { EgressEvent } from "./frame"
+import type { EventV2Event } from "./frame"
 import type { WriterOrdinal } from "./ordinal"
 
 /**
@@ -34,7 +34,7 @@ export type ControlFrame =
   | { readonly type: "listen"; readonly id: number; readonly pattern: string }
   | { readonly type: "unlisten"; readonly id: number; readonly pattern: string }
   | { readonly type: "listen.ok"; readonly id: number }
-  | { readonly type: "durable"; readonly meta: WriterOrdinal; readonly event: EgressEvent }
+  | { readonly type: "durable"; readonly meta: WriterOrdinal; readonly event: EventV2Event }
   | { readonly type: "resync"; readonly pattern: string }
   | { readonly type: "durable.ack"; readonly count: number }
   | { readonly type: "resync.ack"; readonly pattern?: string }
@@ -85,18 +85,96 @@ interface PendingRequest {
   readonly timer: ReturnType<typeof setTimeout> | undefined
 }
 
+/** The `type` discriminants the typed {@link ControlFrame} union understands. */
+const KNOWN_CONTROL_TYPES: ReadonlySet<string> = new Set([
+  "ping",
+  "pong",
+  "listen",
+  "unlisten",
+  "listen.ok",
+  "durable",
+  "resync",
+  "durable.ack",
+  "resync.ack",
+])
+
+function isControlRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+/** A numeric correlation id — the only id shape a request/reply frame carries. */
+function controlId(record: Record<string, unknown>): number | undefined {
+  const id = record.id
+  return typeof id === "number" && Number.isInteger(id) ? id : undefined
+}
+
+/** The EventV2 event `{ id, type, properties }` a `durable` frame must carry. */
+function isEventV2(value: unknown): value is EventV2Event {
+  return isControlRecord(value) && typeof value.id === "string" && typeof value.type === "string" && "properties" in value
+}
+
+/** The writer-stamped `{ generation, ordinal }` a `durable` frame must carry. */
+function isWriterOrdinalShape(value: unknown): value is WriterOrdinal {
+  return isControlRecord(value) && Number.isInteger(value.generation) && Number.isInteger(value.ordinal)
+}
+
+/** True when `data` carries one of the typed frame discriminants. */
+function isKnownControlType(data: unknown): boolean {
+  return isControlRecord(data) && typeof data.type === "string" && KNOWN_CONTROL_TYPES.has(data.type)
+}
+
 /**
- * Shape check for the port boundary: accepts any object carrying a string
- * `type`, so unknown / forward-compatible frames are still forwarded to
- * `onMessage` rather than dropped. A KNOWN frame with a malformed body (an ack
- * whose `count` is not a non-negative integer) is rejected here so it never
- * enters internal logic as a trusted {@link ControlFrame}.
+ * Parse an untrusted port message into a trusted {@link ControlFrame}.
+ *
+ * Every KNOWN variant is validated field-by-field — a numeric `id`, a string
+ * `pattern`, a `{ generation, ordinal }` / EventV2 `{ id, type, properties }`
+ * body, a non-negative-integer ack `count` — and rebuilt as a correctly-typed
+ * union member, so a frame with a malformed body never enters internal logic as a
+ * trusted frame: it returns `undefined` and the caller surfaces it loudly. An
+ * UNKNOWN `type` is passed through so forward-compatible frames still reach
+ * `onMessage`.
  */
-function isControlFrame(data: unknown): data is ControlFrame {
-  if (typeof data !== "object" || data === null || !("type" in data)) return false
-  if (typeof data.type !== "string") return false
-  if (data.type === "durable.ack") return isNonNegativeInteger((data as { readonly count?: unknown }).count)
-  return true
+function parseControlFrame(data: unknown): ControlFrame | undefined {
+  if (!isControlRecord(data) || typeof data.type !== "string") return undefined
+  switch (data.type) {
+    case "ping": {
+      const id = controlId(data)
+      return id === undefined ? undefined : { type: "ping", id }
+    }
+    case "pong": {
+      const id = controlId(data)
+      return id === undefined ? undefined : { type: "pong", id }
+    }
+    case "listen.ok": {
+      const id = controlId(data)
+      return id === undefined ? undefined : { type: "listen.ok", id }
+    }
+    case "listen": {
+      const id = controlId(data)
+      return id === undefined || typeof data.pattern !== "string"
+        ? undefined
+        : { type: "listen", id, pattern: data.pattern }
+    }
+    case "unlisten": {
+      const id = controlId(data)
+      return id === undefined || typeof data.pattern !== "string"
+        ? undefined
+        : { type: "unlisten", id, pattern: data.pattern }
+    }
+    case "durable":
+      return isWriterOrdinalShape(data.meta) && isEventV2(data.event)
+        ? { type: "durable", meta: data.meta, event: data.event }
+        : undefined
+    case "resync":
+      return typeof data.pattern === "string" ? { type: "resync", pattern: data.pattern } : undefined
+    case "durable.ack":
+      return isNonNegativeInteger(data.count) ? { type: "durable.ack", count: data.count } : undefined
+    case "resync.ack":
+      if (data.pattern === undefined) return { type: "resync.ack" }
+      return typeof data.pattern === "string" ? { type: "resync.ack", pattern: data.pattern } : undefined
+    default:
+      return data as unknown as ControlFrame
+  }
 }
 
 export function createControlLink(port: MessagePort, options: ControlLinkOptions = {}): ControlLink {
@@ -116,27 +194,27 @@ export function createControlLink(port: MessagePort, options: ControlLinkOptions
   }
 
   port.onmessage = (event: MessageEvent) => {
-    const data: unknown = event.data
-    if (!isControlFrame(data)) {
+    const frame = parseControlFrame(event.data)
+    if (frame === undefined) {
       // A malformed KNOWN frame is a protocol violation: surface it loudly
       // instead of dropping it. Unknown / forward-compatible frames are ignored.
-      if (typeof data === "object" && data !== null && "type" in data && typeof data.type === "string") {
-        lastError = new Error(`invalid control frame: ${JSON.stringify(data)}`)
+      if (isKnownControlType(event.data)) {
+        lastError = new Error(`invalid control frame: ${JSON.stringify(event.data)}`)
       }
       return
     }
-    if ("id" in data && typeof data.id === "number") {
-      const waiter = pending.get(data.id)
+    if ("id" in frame && typeof frame.id === "number") {
+      const waiter = pending.get(frame.id)
       if (waiter) {
-        pending.delete(data.id)
+        pending.delete(frame.id)
         if (waiter.timer !== undefined) clearTimeout(waiter.timer)
-        waiter.resolve(data)
+        waiter.resolve(frame)
         return
       }
     }
     if (!handler) return
     try {
-      handler(data)
+      handler(frame)
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error))
     }
@@ -166,7 +244,17 @@ export function createControlLink(port: MessagePort, options: ControlLinkOptions
       })
     },
     notify: (frame) => {
-      if (!disposed) port.postMessage(frame)
+      if (disposed) return
+      try {
+        port.postMessage(frame)
+      } catch (error) {
+        // A closed or hostile port must not escape as an opaque throw: record it
+        // as the link's last error and let the caller decide (the mesh rolls back
+        // the delivery it was accounting for).
+        const failure = error instanceof Error ? error : new Error(String(error))
+        lastError = failure
+        throw failure
+      }
     },
     onMessage: (next) => {
       handler = next

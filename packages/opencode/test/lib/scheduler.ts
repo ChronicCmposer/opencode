@@ -17,6 +17,13 @@ export interface RecordingTimer {
   readonly cancelled: boolean
 }
 
+/** The scheduler's internal, mutable view of a recorded timer. */
+interface TimerRecord {
+  readonly delayMs: number
+  readonly run: () => void
+  cancelled: boolean
+}
+
 /** The signature a recording scheduler's `schedule` exposes. */
 export type SchedulerFn = (delayMs: number, run: () => void) => unknown
 
@@ -37,22 +44,21 @@ export interface RecordingScheduler<S extends SchedulerFn = (delayMs: number, ru
 
 /** Create a recording scheduler parameterised by the schedule function type `S`. */
 export function createRecordingScheduler<S extends SchedulerFn = (delayMs: number, run: () => void) => () => void>(): RecordingScheduler<S> {
-  const timers: RecordingTimer[] = []
+  const timers: TimerRecord[] = []
 
   const schedule = ((delayMs: number, run: () => void) => {
-    const timer: RecordingTimer = { delayMs, run, cancelled: false }
+    const timer: TimerRecord = { delayMs, run, cancelled: false }
     timers.push(timer)
     return () => {
-      // `RecordingTimer.cancelled` is readonly to consumers; this is the sole writer.
-      ;(timer as { cancelled: boolean }).cancelled = true
+      timer.cancelled = true
     }
   }) as unknown as S
 
-  const runPending = (shouldRun: (timer: RecordingTimer) => boolean): number => {
+  const runPending = (shouldRun: (timer: TimerRecord) => boolean): number => {
     let ran = 0
     for (const timer of timers) {
       if (timer.cancelled || !shouldRun(timer)) continue
-      ;(timer as { cancelled: boolean }).cancelled = true
+      timer.cancelled = true
       timer.run()
       ran++
     }
@@ -68,7 +74,7 @@ export function createRecordingScheduler<S extends SchedulerFn = (delayMs: numbe
     fire: () => runPending(() => true),
     fireDue: (delayMs) => runPending((timer) => timer.delayMs <= delayMs),
     cancelAll: () => {
-      for (const timer of timers) (timer as { cancelled: boolean }).cancelled = true
+      for (const timer of timers) timer.cancelled = true
     },
   }
 }

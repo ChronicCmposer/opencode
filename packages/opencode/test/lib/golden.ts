@@ -11,6 +11,7 @@
 // order and interleaving differences between runs do not create false mismatches.
 
 import { isDeepStrictEqual } from "node:util"
+import { assertNonEmptyString, assertNonNegativeInteger, stringify } from "./assert"
 import { createCapture, type CaptureHarness } from "./capture"
 import { deepFreeze } from "./deep-freeze"
 
@@ -85,28 +86,27 @@ const DURABLE_KIND = "durable"
 const COMPARED_FIELDS = ["type", "data", "owner_id"] as const
 
 /** Parse an untrusted durable row into a trusted `GoldenRow`, failing loudly. */
-function parseDurableRow(row: DurableRow): GoldenRow {
-  if (typeof row.aggregate_id !== "string" || row.aggregate_id.length === 0) {
-    throw new Error(`invalid durable row: aggregate_id must be a non-empty string (got ${JSON.stringify(row.aggregate_id)})`)
+function parseDurableRow(input: unknown): GoldenRow {
+  if (input === null || typeof input !== "object") {
+    throw new Error(`invalid durable row: expected an object (got ${stringify(input)})`)
   }
-  if (!Number.isInteger(row.seq) || row.seq < 0) {
-    throw new Error(`invalid durable row: seq must be a non-negative integer (got ${JSON.stringify(row.seq)})`)
-  }
-  if (typeof row.type !== "string" || row.type.length === 0) {
-    throw new Error(`invalid durable row: type must be a non-empty string (got ${JSON.stringify(row.type)})`)
-  }
-  if (row.data === undefined) {
+  const row = input as Record<string, unknown>
+  assertNonEmptyString(row.aggregate_id, "aggregate_id")
+  assertNonNegativeInteger(row.seq, "seq")
+  assertNonEmptyString(row.type, "type")
+  if (!("data" in row) || row.data === undefined) {
     throw new Error("invalid durable row: data is required")
   }
-  if (row.owner_id !== undefined && row.owner_id !== null && typeof row.owner_id !== "string") {
-    throw new Error(`invalid durable row: owner_id must be a string or null (got ${JSON.stringify(row.owner_id)})`)
+  const ownerID = row.owner_id
+  if (ownerID !== undefined && ownerID !== null && typeof ownerID !== "string") {
+    throw new Error(`invalid durable row: owner_id must be a string or null (got ${stringify(ownerID)})`)
   }
   return {
     aggregate_id: row.aggregate_id,
     seq: row.seq,
     type: row.type,
     data: row.data,
-    owner_id: row.owner_id ?? null,
+    owner_id: typeof ownerID === "string" ? ownerID : null,
   }
 }
 
@@ -148,7 +148,7 @@ export function createGoldenCapture(options: GoldenCaptureOptions = {}): GoldenC
       .filter((record) => record.kind === DURABLE_KIND)
       // Records are parsed, not cast: a raw `db` record written directly onto
       // the shared timeline cannot smuggle an invalid row past `rows`/`snapshot`.
-      .map((record) => parseDurableRow(record.data as DurableRow))
+      .map((record) => parseDurableRow(record.data))
 
   return {
     capture,
@@ -207,15 +207,6 @@ export function diffGolden(expected: GoldenSnapshot, actual: GoldenSnapshot): Go
   }
 
   return differences
-}
-
-function stringify(value: unknown): string {
-  if (value === undefined) return "undefined"
-  try {
-    return JSON.stringify(value) ?? String(value)
-  } catch {
-    return String(value)
-  }
 }
 
 export function formatGoldenDiff(differences: ReadonlyArray<GoldenDifference>, context?: string): string {

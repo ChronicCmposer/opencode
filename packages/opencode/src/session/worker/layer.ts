@@ -1323,22 +1323,18 @@ export function reducedModelProviderLayer(config: WorkerModelConfig): Layer.Laye
 }
 
 /**
- * The boundary `Plugin` for a worker: the hub owns plugin *loading* (decision
- * 70), but the model-facing hooks run in the isolate. Without a host the worker
- * uses this no-op pass-through; when a worker-hosted {@link WorkerPluginHost} is
- * supplied, {@link workerPluginLayer} runs its `chat.params` / `chat.headers`
- * (and tool) hooks so plugin-set sampling/headers match flag-off.
+ * The boundary `Plugin.trigger`, erased to its runtime shape so the no-op and
+ * host-backed layers share one signature.
  */
-function noopPluginLayer(): Layer.Layer<Plugin.Service> {
-  const plugin = {
-    trigger: (_name: string, _input: unknown, output: unknown) => Effect.succeed(output),
-    list: () => Effect.succeed([]),
-    init: () => Effect.void,
-  } as unknown as Plugin.Interface
-  return Layer.succeed(Plugin.Service, plugin)
-}
+type PluginTrigger = Plugin.Interface["trigger"]
 
-/** Dispatch one `Plugin.trigger` to the matching worker-hosted hook. */
+/** No-op pass-through trigger: the hook leaves the output untouched. */
+const noopPluginTrigger = ((_name: string, _input: unknown, output: unknown) =>
+  Effect.succeed(output)) as PluginTrigger
+
+/**
+ * Dispatch one `Plugin.trigger` to the matching worker-hosted hook.
+ */
 function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknown, output: unknown): Promise<unknown> {
   switch (name) {
     case "chat.params":
@@ -1357,15 +1353,15 @@ function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknow
 }
 
 /**
- * The worker `Plugin` over a worker-hosted hook host: `chat.params` /
- * `chat.headers` (and the tool hooks) run in the isolate, so plugin-set
- * sampling/headers are applied to the worker's outgoing request exactly as
- * flag-off. Unknown triggers pass through unchanged.
+ * The boundary `Plugin` for a worker, parameterised by its `trigger` (decision
+ * 70): the hub owns plugin *loading*, but the model-facing hooks run in the
+ * isolate. A no-op trigger yields the pass-through; a host-backed trigger runs
+ * `chat.params` / `chat.headers` (and the tool hooks) in-worker, so plugin-set
+ * sampling/headers match flag-off. One layer covers both cases.
  */
-function workerPluginLayer(host: WorkerPluginHost): Layer.Layer<Plugin.Service> {
+function workerPluginLayer(trigger: PluginTrigger): Layer.Layer<Plugin.Service> {
   const plugin = {
-    trigger: (name: string, input: unknown, output: unknown) =>
-      Effect.promise(() => runWorkerPluginHook(host, name, input, output)),
+    trigger,
     list: () => Effect.succeed([]),
     init: () => Effect.void,
   } as unknown as Plugin.Interface
@@ -1380,7 +1376,12 @@ function workerPluginLayer(host: WorkerPluginHost): Layer.Layer<Plugin.Service> 
  * ({@link reducedLlmLayer}), so neither ever builds the global `Plugin` layer.
  */
 function workerPluginReplacement(plugins?: WorkerPluginHost): LayerNode.Replacement {
-  return [Plugin.node, plugins === undefined ? noopPluginLayer() : workerPluginLayer(plugins)]
+  const trigger: PluginTrigger =
+    plugins === undefined
+      ? noopPluginTrigger
+      : (((name: string, input: unknown, output: unknown) =>
+          Effect.promise(() => runWorkerPluginHook(plugins, name, input, output))) as PluginTrigger)
+  return [Plugin.node, workerPluginLayer(trigger)]
 }
 
 /** Build the minimal `LLM.StreamInput` for a worker pipeline call. */

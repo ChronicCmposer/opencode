@@ -3,7 +3,6 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError } from "ai"
-import { setTimeout as sleep } from "node:timers/promises"
 import { Effect, Schedule, Schema } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionRetry } from "../../src/session/retry"
@@ -18,12 +17,28 @@ const providerID = ProviderV2.ID.make("test")
 const retryProvider = "test"
 const it = testEffect(LayerNode.compile(LayerNode.group([SessionStatus.node, CrossSpawnSpawner.node])))
 
-function apiError(headers?: Record<string, string>): SessionV1.APIError {
+interface ApiErrorOptions {
+  readonly message?: string
+  readonly isRetryable?: boolean
+  readonly statusCode?: number
+  readonly responseBody?: string
+  readonly metadata?: Record<string, string>
+}
+
+/**
+ * Build a decoded `APIError` fixture. `headers` is kept as the first argument so
+ * retry-hint tests stay terse; the options bag covers the status/body/metadata
+ * variants without repeating the schema round-trip at each call site.
+ */
+function apiError(headers?: Record<string, string>, options: ApiErrorOptions = {}): SessionV1.APIError {
   return Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
     new SessionV1.APIError({
-      message: "boom",
-      isRetryable: true,
+      message: options.message ?? "boom",
+      isRetryable: options.isRetryable ?? true,
       responseHeaders: headers,
+      statusCode: options.statusCode,
+      responseBody: options.responseBody,
+      metadata: options.metadata,
     }).toObject(),
   )
 }
@@ -233,14 +248,12 @@ describe("session.retry.retryable", () => {
   })
 
   test("matches retryable API response bodies", () => {
-    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
-      new SessionV1.APIError({
-        message: "Request failed",
-        isRetryable: false,
-        statusCode: 400,
-        responseBody: JSON.stringify({ error: { message: "upstream connection refused" } }),
-      }).toObject(),
-    )
+    const error = apiError(undefined, {
+      message: "Request failed",
+      isRetryable: false,
+      statusCode: 400,
+      responseBody: JSON.stringify({ error: { message: "upstream connection refused" } }),
+    })
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Request failed" })
   })
 
@@ -312,62 +325,40 @@ describe("session.retry.retryable", () => {
   })
 
   test("retries 500 errors even when isRetryable is false", () => {
-    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
-      new SessionV1.APIError({
-        message: "Internal server error",
-        isRetryable: false,
-        statusCode: 500,
-        responseBody: '{"type":"api_error","message":"Internal server error"}',
-      }).toObject(),
-    )
+    const error = apiError(undefined, {
+      message: "Internal server error",
+      isRetryable: false,
+      statusCode: 500,
+      responseBody: '{"type":"api_error","message":"Internal server error"}',
+    })
 
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Internal server error" })
   })
 
   test("retries 502 bad gateway errors", () => {
-    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
-      new SessionV1.APIError({
-        message: "Bad gateway",
-        isRetryable: false,
-        statusCode: 502,
-      }).toObject(),
-    )
+    const error = apiError(undefined, { message: "Bad gateway", isRetryable: false, statusCode: 502 })
 
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Bad gateway" })
   })
 
   test("retries 503 service unavailable errors", () => {
-    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
-      new SessionV1.APIError({
-        message: "Service unavailable",
-        isRetryable: false,
-        statusCode: 503,
-      }).toObject(),
-    )
+    const error = apiError(undefined, { message: "Service unavailable", isRetryable: false, statusCode: 503 })
 
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Service unavailable" })
   })
 
   test("does not retry 4xx errors when isRetryable is false", () => {
-    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
-      new SessionV1.APIError({
-        message: "Bad request",
-        isRetryable: false,
-        statusCode: 400,
-      }).toObject(),
-    )
+    const error = apiError(undefined, { message: "Bad request", isRetryable: false, statusCode: 400 })
 
     expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
   })
 
   test("retries ZlibError decompression failures", () => {
-    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
-      new SessionV1.APIError({
-        message: "Response decompression failed",
-        isRetryable: true,
-        metadata: { code: "ZlibError" },
-      }).toObject(),
-    )
+    const error = apiError(undefined, {
+      message: "Response decompression failed",
+      isRetryable: true,
+      metadata: { code: "ZlibError" },
+    })
 
     const retryable = SessionRetry.retryable(error, retryProvider)
     expect(retryable).toBeDefined()
@@ -375,17 +366,15 @@ describe("session.retry.retryable", () => {
   })
 
   test("maps free limits to Go upsell action", () => {
-    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
-      new SessionV1.APIError({
-        message: "Free usage exceeded",
-        isRetryable: true,
-        statusCode: 429,
-        responseBody: JSON.stringify({
-          type: "error",
-          error: { type: "FreeUsageLimitError", message: "Free usage exceeded" },
-        }),
-      }).toObject(),
-    )
+    const error = apiError(undefined, {
+      message: "Free usage exceeded",
+      isRetryable: true,
+      statusCode: 429,
+      responseBody: JSON.stringify({
+        type: "error",
+        error: { type: "FreeUsageLimitError", message: "Free usage exceeded" },
+      }),
+    })
 
     expect(SessionRetry.retryable(error, "opencode")).toEqual({
       message: SessionRetry.GO_UPSELL_MESSAGE,
@@ -401,14 +390,12 @@ describe("session.retry.retryable", () => {
   })
 
   test("maps Go subscription limits to workspace PAYG upsell", () => {
-    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
-      new SessionV1.APIError({
+    const error = apiError(
+      { "retry-after": "19380" },
+      {
         message: "Subscription quota exceeded. You can continue using free models.",
         isRetryable: true,
         statusCode: 429,
-        responseHeaders: {
-          "retry-after": "19380",
-        },
         responseBody: JSON.stringify({
           type: "error",
           error: {
@@ -420,7 +407,7 @@ describe("session.retry.retryable", () => {
             limitName: "5 hour",
           },
         }),
-      }).toObject(),
+      },
     )
 
     expect(SessionRetry.retryable(error, "opencode-go")).toEqual({
@@ -439,14 +426,12 @@ describe("session.retry.retryable", () => {
   })
 
   test("maps Go subscription limits without limit metadata", () => {
-    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
-      new SessionV1.APIError({
+    const error = apiError(
+      { "retry-after": "900" },
+      {
         message: "Subscription quota exceeded. You can continue using free models.",
         isRetryable: true,
         statusCode: 429,
-        responseHeaders: {
-          "retry-after": "900",
-        },
         responseBody: JSON.stringify({
           type: "error",
           error: {
@@ -457,7 +442,7 @@ describe("session.retry.retryable", () => {
             workspace: "wrk_01K6XGM22R6FM8JVABE9XDQXGH",
           },
         }),
-      }).toObject(),
+      },
     )
 
     expect(SessionRetry.retryable(error, "opencode-go")?.action?.message).toBe(
@@ -467,20 +452,22 @@ describe("session.retry.retryable", () => {
 })
 
 describe("session.message-v2.fromError", () => {
-  test.concurrent(
+  test(
     "converts ECONNRESET socket errors to retryable APIError",
     async () => {
+      // Deterministic reset: the server writes one chunk, then closes the active
+      // connection while the client is mid-body read. That rejects `res.text()`
+      // with ECONNRESET immediately instead of waiting out a multi-second idle
+      // timeout. Sequential (no `test.concurrent`) so the real socket reset
+      // cannot race another test's server work.
       using server = Bun.serve({
         port: 0,
-        idleTimeout: 8,
-        async fetch(_req) {
+        fetch(_req) {
           return new Response(
             new ReadableStream({
-              async pull(controller) {
+              start(controller) {
                 controller.enqueue("Hello,")
-                await sleep(10000)
-                controller.enqueue(" World!")
-                controller.close()
+                setTimeout(() => server.stop(true), 10)
               },
             }),
             { headers: { "Content-Type": "text/plain" } },
@@ -501,17 +488,15 @@ describe("session.message-v2.fromError", () => {
       expect(result.data.metadata?.code).toBe("ECONNRESET")
       expect(result.data.metadata?.message).toInclude("socket connection")
     },
-    15_000,
+    5_000,
   )
 
   test("ECONNRESET socket error is retryable", () => {
-    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
-      new SessionV1.APIError({
-        message: "Connection reset by server",
-        isRetryable: true,
-        metadata: { code: "ECONNRESET", message: "The socket connection was closed unexpectedly" },
-      }).toObject(),
-    )
+    const error = apiError(undefined, {
+      message: "Connection reset by server",
+      isRetryable: true,
+      metadata: { code: "ECONNRESET", message: "The socket connection was closed unexpectedly" },
+    })
 
     const retryable = SessionRetry.retryable(error, retryProvider)
     expect(retryable).toBeDefined()

@@ -289,7 +289,6 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
 
     return Effect.all([flagOn, flagOff]).pipe(
       Effect.map(() => {
-        const idleOf = (calls: StatusCall[]) => calls.filter((call) => call.status.type === "idle")
         expect(idleOf(flagOnCalls)).toEqual([{ sessionID: sid("ses_parity"), status: { type: "idle" } }])
         expect(idleOf(flagOnCalls)).toEqual(idleOf(flagOffCalls))
       }),
@@ -319,6 +318,10 @@ const recordingPublisher = () => {
 }
 
 const idleOf = (calls: StatusCall[]) => calls.filter((call) => call.status.type === "idle")
+
+/** Whether the hub currently hosts `sessionID` on a running worker. */
+const runningState = (hub: SessionHub, sessionID: SessionID) => (): true | undefined =>
+  hub.dispatcher.registry.get(sessionID)?.state === "running" ? true : undefined
 
 describe("12 — integrated flag-on cancel (outcome + idle + session.cancelled)", () => {
   it.live("one flag-on cancel observes the hub outcome, exactly one idle, and session.cancelled", () => {
@@ -479,10 +482,6 @@ describe("12 — integrated flag-on cancel (outcome + idle + session.cancelled)"
 // ---------------------------------------------------------------------------
 
 describe("12 — exactly one flag-on cancel idle per case (ON ≡ OFF)", () => {
-  /** Whether the hub currently hosts `sessionID` on a running worker. */
-  const runningState = (hub: SessionHub, sessionID: SessionID) => (): true | undefined =>
-    hub.dispatcher.registry.get(sessionID)?.state === "running" ? true : undefined
-
   it.live("busy/dispatched: the worker publishes the idle, the hub does not double-emit", () => {
     const sessionID = sid("ses_busy_one")
     const onCalls: StatusCall[] = []
