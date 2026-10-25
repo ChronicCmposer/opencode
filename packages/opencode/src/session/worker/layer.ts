@@ -109,6 +109,8 @@ import type { JobClient } from "./job-client"
 import type {
   ChatHeadersOutput,
   ChatParamsOutput,
+  MessagesTransformInput,
+  MessagesTransformOutput,
   SystemTransformInput,
   SystemTransformOutput,
   ToolAfterOutput,
@@ -1347,6 +1349,8 @@ function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknow
       return host.toolAfter(input, output as ToolAfterOutput)
     case "experimental.chat.system.transform":
       return host.systemTransform(input as SystemTransformInput, output as SystemTransformOutput)
+    case "experimental.chat.messages.transform":
+      return host.messagesTransform(input as MessagesTransformInput, output as MessagesTransformOutput)
     default:
       return Promise.resolve(output)
   }
@@ -1356,8 +1360,9 @@ function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknow
  * The boundary `Plugin` for a worker, parameterised by its `trigger` (decision
  * 70): the hub owns plugin *loading*, but the model-facing hooks run in the
  * isolate. A no-op trigger yields the pass-through; a host-backed trigger runs
- * `chat.params` / `chat.headers` (and the tool hooks) in-worker, so plugin-set
- * sampling/headers match flag-off. One layer covers both cases.
+ * `chat.params` / `chat.headers`, the tool hooks, and the system/messages
+ * transforms in-worker, so plugin-set sampling/headers and pruning match
+ * flag-off. One layer covers both cases.
  */
 function workerPluginLayer(trigger: PluginTrigger): Layer.Layer<Plugin.Service> {
   const plugin = {

@@ -1,5 +1,11 @@
 # V2 Schema Changelog
 
+## 2026-10-25: Worker-Safe Plugin Message Transform
+
+- Route the plugin-facing `experimental.chat.messages.transform` hook through the hub proxy in session workers, like `experimental.chat.system.transform`, so plugin-driven pruning (such as DCP-style old tool-result pruning) applies under `OPENCODE_EXPERIMENTAL_SESSION_WORKERS`.
+- Fail loud on a hub-proxy reply whose success value is not structured-cloneable by posting one clone-safe `ok:false` frame, so the worker surfaces a descriptive error instead of hanging or timing out.
+- Add no migration or durable-event version; the transform rewrites only the outbound provider request and leaves persisted history unchanged.
+
 ## 2026-06-26: Add Finite Session History
 
 - Add `GET /api/session/:sessionID/history` and generated Promise, Effect, and legacy JavaScript client methods.

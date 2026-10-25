@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
+import { buildHubProxyHandlers } from "@/session/worker/hub"
+import type { MessagesTransformInput, MessagesTransformOutput } from "@/session/worker/plugin-host"
 import { sid } from "./async"
 import { instantRunner, recordingHubAuthorities, serveHubProxyFor } from "./hub-proxy"
 
@@ -47,5 +49,31 @@ describe("recordingHubAuthorities", () => {
 
     await expect(Effect.runPromise(authorities.sessionStatus.get(sid("ses_1")))).resolves.toEqual({ type: "busy" })
     expect(calls).toEqual([{ method: "sessionStatus.get", args: [sid("ses_1")] }])
+  })
+
+  test("records a messagesTransform override and returns its value across the port", async () => {
+    const { authorities, calls } = recordingHubAuthorities({
+      messagesTransform: async (_input, output) => ({ messages: output.messages }),
+    })
+    const served = serveHubProxyFor(buildHubProxyHandlers(authorities, instantRunner))
+    const input: MessagesTransformInput = { sessionID: "ses_1" }
+    const output: MessagesTransformOutput = { messages: ["base"] }
+    try {
+      await expect(served.client.call("messagesTransform", [input, output])).resolves.toEqual({ messages: ["base"] })
+      expect(calls).toEqual([{ method: "messagesTransform", args: [input, output] }])
+    } finally {
+      served.dispose()
+    }
+  })
+
+  test("absent an override messagesTransform records and returns the output by identity", async () => {
+    const { authorities, calls } = recordingHubAuthorities()
+    const input: MessagesTransformInput = { sessionID: "ses_1" }
+    const output: MessagesTransformOutput = { messages: ["base"] }
+
+    const returned = await authorities.messagesTransform!(input, output)
+
+    expect(returned).toBe(output)
+    expect(calls).toEqual([{ method: "messagesTransform", args: [input, output] }])
   })
 })

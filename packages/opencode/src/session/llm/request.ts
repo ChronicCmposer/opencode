@@ -13,6 +13,7 @@ import { Effect, Record } from "effect"
 import { jsonSchema, tool as aiTool, type ModelMessage, type Tool } from "ai"
 import type { Plugin } from "@/plugin"
 import { mergeDeep } from "remeda"
+import { reconcileInPlace } from "@/util/reconcile"
 
 const USER_AGENT = `opencode/${InstallationVersion}`
 
@@ -71,9 +72,9 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     { system },
   )
   // The in-process hub trigger mutates and returns `system` itself; a
-  // hub-proxied worker trigger returns a fresh `{ system }` (the rewrite cannot
-  // cross the control port in place). Reconcile whichever array came back.
-  if (transformed.system !== system) system.splice(0, system.length, ...transformed.system)
+  // hub-proxied worker trigger returns a fresh `{ system }`. `reconcileInPlace`
+  // copies the fresh array back into `system`, and is a no-op for the same array.
+  reconcileInPlace(system, transformed.system)
   if (system.length > 2 && system[0] === header) {
     const rest = system.slice(1)
     system.length = 0

@@ -100,7 +100,13 @@ import {
   type PidReportEntry,
 } from "./pid-registry"
 import { Plugin } from "@/plugin"
-import type { SystemTransformInput, SystemTransformOutput, WorkerPluginHooks } from "./plugin-host"
+import type {
+  MessagesTransformInput,
+  MessagesTransformOutput,
+  SystemTransformInput,
+  SystemTransformOutput,
+  WorkerPluginHooks,
+} from "./plugin-host"
 import type { HubProxyHandlers } from "./hub-proxy-wire"
 import { serveHubProxy } from "./hub-proxy-wire"
 import { portFromMessagePort } from "./port"
@@ -497,6 +503,16 @@ export interface HubProxyAuthorities {
    * handler returns `output` unchanged (flag-off / no plugin).
    */
   readonly systemTransform?: (input: SystemTransformInput, output: SystemTransformOutput) => Promise<SystemTransformOutput>
+  /**
+   * Optional message-list transform authority. The worker cannot run
+   * `experimental.chat.messages.transform` itself (plugins are loaded on the hub),
+   * so it calls the hub, which mutates and returns `output`. Absent means the
+   * handler returns `output` unchanged (flag-off / no plugin).
+   */
+  readonly messagesTransform?: (
+    input: MessagesTransformInput,
+    output: MessagesTransformOutput,
+  ) => Promise<MessagesTransformOutput>
 }
 
 /**
@@ -533,11 +549,39 @@ export function buildHubProxyHandlers(authorities: HubProxyAuthorities, run: Hub
       authorities.systemTransform === undefined
         ? (output as SystemTransformOutput)
         : authorities.systemTransform(input as SystemTransformInput, output as SystemTransformOutput),
+    // Always served: a worker's `experimental.chat.messages.transform` reaches the
+    // hub, which runs the plugin hook and returns the mutated `{messages}`. Absent
+    // an authority the output passes through unchanged (never an unknown method).
+    messagesTransform: (input, output) =>
+      authorities.messagesTransform === undefined
+        ? (output as MessagesTransformOutput)
+        : authorities.messagesTransform(input as MessagesTransformInput, output as MessagesTransformOutput),
     ...(authorities.dispatchSubagent === undefined
       ? {}
       : {
           dispatchSubagent: (request) => authorities.dispatchSubagent!(request as SubagentDispatchRequest),
         }),
+  }
+}
+
+/**
+ * Build the hub-resident `experimental.chat.messages.transform` authority for a
+ * worker. The hub owns plugin loading (decision 70), so resolution is deferred
+ * through `plugin`, letting the caller read `Plugin.Service` from the worker's
+ * session context. When no plugin is reachable the worker's payload passes
+ * through by identity and `run` is never invoked; otherwise the plugin hook runs
+ * under `run` (which provides the emitting instance's context) and its resolved
+ * value is returned.
+ */
+export function messagesTransformAuthority(options: {
+  readonly plugin: () => Option.Option<Plugin.Interface>
+  readonly run: HubProxyRunner
+}): NonNullable<HubProxyAuthorities["messagesTransform"]> {
+  return (input, output) => {
+    const plugin = options.plugin()
+    return Option.isNone(plugin)
+      ? Promise.resolve(output)
+      : options.run(plugin.value.trigger("experimental.chat.messages.transform", input, output))
   }
 }
 
@@ -2260,9 +2304,21 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
         ? Promise.resolve(output)
         : runHubProxyFor(context)(plugin.value.trigger("experimental.chat.system.transform", input, output))
     }
+  // The worker cannot run `experimental.chat.messages.transform` itself: the hub
+  // owns plugin loading (decision 70). Read `Plugin` from the worker's session
+  // context and run the trigger under it, so the per-directory `InstanceState`
+  // the plugin layer keys on is the emitting instance's.
+  const messagesTransformFor = (
+    context: Context.Context<never> | undefined,
+  ): NonNullable<HubProxyAuthorities["messagesTransform"]> =>
+    messagesTransformAuthority({
+      plugin: () => (context === undefined ? Option.none() : Context.getOption(context, Plugin.Service)),
+      run: runHubProxyFor(context),
+    })
   // Build the handler map per worker under THAT worker's session context. A
   // worker is bound to exactly one session, so its control port reaches the
-  // right `SessionStatus`/`Permission`/`Question`/`systemTransform` instance.
+  // right `SessionStatus`/`Permission`/`Question`/`systemTransform`/
+  // `messagesTransform` instance.
   const hubProxyFor = (workerID: number): HubProxyHandlers => {
     const context = contextOfWorker(workerID)
     return buildHubProxyHandlers(
@@ -2271,6 +2327,7 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
         permission: authorities.permission,
         question: authorities.question,
         systemTransform: systemTransformFor(context),
+        messagesTransform: messagesTransformFor(context),
       },
       runHubProxyFor(context),
     )

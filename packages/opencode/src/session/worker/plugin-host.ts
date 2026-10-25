@@ -6,6 +6,14 @@
 // in the worker isolate so it can see worker-local state (provider context,
 // tool args) without an RPC per call.
 //
+// Two further hooks, `experimental.chat.system.transform` and
+// `experimental.chat.messages.transform`, are HUB PROXIES rather than
+// hub-resolved effects: the worker runs any worker-local function hooks, then
+// forwards the structuredClone-safe payload to a hub-resident handler (the
+// injected `options.systemTransform` / `options.messagesTransform`) that owns
+// plugin loading. They cross the isolate as data by RPC, not as a serialized
+// effect, because the real plugin function lives on the hub.
+//
 // Contract mirrors `@opencode-ai/plugin` `Hooks`: each hook receives an `input`
 // and a mutable `output`; hooks run in registration order and each observes the
 // previous hook's mutations. A throwing hook aborts the chain (fail loud).
@@ -48,6 +56,16 @@ export interface SystemTransformOutput {
   system: string[]
 }
 
+export interface MessagesTransformInput {
+  readonly sessionID?: string
+  readonly model?: unknown
+}
+
+/** Mutable message list the `experimental.chat.messages.transform` hook rewrites. */
+export interface MessagesTransformOutput {
+  messages: unknown[]
+}
+
 export interface WorkerPluginHooks {
   readonly "chat.params"?: (input: unknown, output: ChatParamsOutput) => void | Promise<void>
   readonly "chat.headers"?: (input: unknown, output: ChatHeadersOutput) => void | Promise<void>
@@ -56,6 +74,10 @@ export interface WorkerPluginHooks {
   readonly "experimental.chat.system.transform"?: (
     input: SystemTransformInput,
     output: SystemTransformOutput,
+  ) => void | Promise<void>
+  readonly "experimental.chat.messages.transform"?: (
+    input: MessagesTransformInput,
+    output: MessagesTransformOutput,
   ) => void | Promise<void>
 }
 
@@ -105,6 +127,7 @@ export interface WorkerPluginHost {
   toolBefore(input: unknown, output: ToolBeforeOutput): Promise<ToolBeforeOutput>
   toolAfter(input: unknown, output: ToolAfterOutput): Promise<ToolAfterOutput>
   systemTransform(input: SystemTransformInput, output: SystemTransformOutput): Promise<SystemTransformOutput>
+  messagesTransform(input: MessagesTransformInput, output: MessagesTransformOutput): Promise<MessagesTransformOutput>
 }
 
 /** Raised when two plugins share a name (fail loud). */
@@ -180,6 +203,10 @@ export function createWorkerPluginHost(
       input: SystemTransformInput,
       output: SystemTransformOutput,
     ) => Promise<SystemTransformOutput>
+    readonly messagesTransform?: (
+      input: MessagesTransformInput,
+      output: MessagesTransformOutput,
+    ) => Promise<MessagesTransformOutput>
   },
 ): WorkerPluginHost {
   const names = plugins.map((plugin) => plugin.name)
@@ -208,6 +235,19 @@ export function createWorkerPluginHost(
       )
       if (options?.systemTransform === undefined) return transformed
       return options.systemTransform(input, transformed)
+    },
+    // Same composition as `systemTransform`: worker-local function hooks first,
+    // then the injected hub-resolved transform; absent both, the output passes
+    // through by identity.
+    messagesTransform: async (input, output) => {
+      const transformed = await runHook(
+        plugins,
+        (hooks) => hooks["experimental.chat.messages.transform"],
+        input,
+        output,
+      )
+      if (options?.messagesTransform === undefined) return transformed
+      return options.messagesTransform(input, transformed)
     },
   }
 }

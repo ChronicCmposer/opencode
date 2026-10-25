@@ -6,6 +6,7 @@ import { SessionID, MessageID, PartID } from "./schema"
 import { Provider } from "@/provider/provider"
 import { MessageV2 } from "./message-v2"
 import { Token } from "@/util/token"
+import { reconcileInPlace } from "@/util/reconcile"
 import { SessionProcessor } from "./processor"
 import { Agent } from "@/agent/agent"
 import { Plugin } from "@/plugin"
@@ -376,7 +377,12 @@ const layer = Layer.effect(
         { context: [], prompt: undefined },
       )
       const msgs = structuredClone(selected.head)
-      yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+      // The in-process trigger mutates and returns `msgs` itself; a hub-proxied
+      // worker trigger returns a fresh `{ messages }`. `reconcileInPlace` copies
+      // it back so the transform reaches the summary prompt below, and is a
+      // no-op for the same array.
+      const transformed = yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+      reconcileInPlace(msgs, transformed.messages)
       const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
       const nextPrompt =
         compacting.prompt ??

@@ -61,6 +61,8 @@ import {
 } from "./execute"
 import {
   createWorkerPluginHost,
+  type MessagesTransformInput,
+  type MessagesTransformOutput,
   type SystemTransformInput,
   type SystemTransformOutput,
   type WorkerPlugin,
@@ -739,6 +741,22 @@ export function hubProxySystemTransform(
   return (input, output) => hubProxy.call("systemTransform", [input, output]) as Promise<SystemTransformOutput>
 }
 
+/**
+ * The hub-proxied `experimental.chat.messages.transform` bridge: forwards the
+ * worker's message array to the hub authority over the control port, where the
+ * loaded plugins run and return the mutated `{ messages }`. Every hub authority
+ * multiplexes one port, so the caller hands the shared client.
+ *
+ * Returns `undefined` when the worker has no hub client (degraded boot), so the
+ * plugin host omits the transform and the message array passes through unchanged.
+ */
+export function hubProxyMessagesTransform(
+  hubProxy: HubProxyClient | undefined,
+): ((input: MessagesTransformInput, output: MessagesTransformOutput) => Promise<MessagesTransformOutput>) | undefined {
+  if (hubProxy === undefined) return undefined
+  return (input, output) => hubProxy.call("messagesTransform", [input, output]) as Promise<MessagesTransformOutput>
+}
+
 /** Options for {@link bootstrapSessionWorker}; every field is additive. */
 export interface BootstrapSessionWorkerOptions {
   /**
@@ -878,14 +896,19 @@ export function bootstrapSessionWorker(
   const config = modelConfig(init.model)
   // The worker runs the model-facing plugin hooks in its own isolate; build the
   // host from the shipped hooks so their `chat.params`/`chat.headers` mutations
-  // reach the reduced LLM exactly as flag-off. The system transform is a hub
-  // proxy (the hub owns plugin loading and returns the mutated system): with no
-  // hub client (degraded boot) it is omitted and the system passes through.
+  // reach the reduced LLM exactly as flag-off. Both the system and messages
+  // transforms are hub proxies (the hub owns plugin loading and returns the
+  // mutated arrays): with no hub client (degraded boot) each is omitted and its
+  // array passes through unchanged.
   const systemTransform = hubProxySystemTransform(hubProxies?.sessionStatus)
+  const messagesTransform = hubProxyMessagesTransform(hubProxies?.sessionStatus)
   const plugins =
     init.plugins === undefined
       ? undefined
-      : createWorkerPluginHost(init.plugins, systemTransform === undefined ? undefined : { systemTransform })
+      : createWorkerPluginHost(init.plugins, {
+          ...(systemTransform === undefined ? {} : { systemTransform }),
+          ...(messagesTransform === undefined ? {} : { messagesTransform }),
+        })
   // Pass the real hub-proxy clients so the reduced LLM sub-graph routes
   // `Permission` over the hub control port (never a silent mock); absent
   // (degraded boot) the sub-graph uses a fail-loud boundary.

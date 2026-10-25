@@ -56,6 +56,7 @@ export type HubProxyMethod =
   | "question.reject"
   | "question.list"
   | "systemTransform"
+  | "messagesTransform"
   | "dispatchSubagent"
 
 /** A typed failure returned by a hub authority across the port. */
@@ -154,7 +155,18 @@ function errorDataOf(error: unknown): unknown {
   }
 }
 
-/** Hub side: serve hub-proxy requests against `handlers`; returns a disposer. */
+/**
+ * Hub side: serve hub-proxy requests against `handlers`; returns a disposer.
+ *
+ * Replying can fail two ways. A genuinely dead peer (the port is gone) drops the
+ * reply silently — nothing can be done. But `channel.post` also throws
+ * `DataCloneError` synchronously when a SUCCESS reply's `value` is not
+ * structured-cloneable (e.g. a plugin hook leaked a function). That case is
+ * recoverable: post ONE clone-safe `ok:false` frame with the same `id`, so the
+ * worker fails loud with a descriptive error instead of hanging or timing out.
+ * Error replies are already clone-safe (`errorDataOf` drops non-cloneable
+ * fields), so only a success reply needs the fallback.
+ */
 export function serveHubProxy(handlers: HubProxyHandlers, port: MessagePort): () => void {
   const channel = workerFrameChannel<HubProxyFrame>(port, "hub-proxy")
   return channel.onMessage((frame) => {
@@ -163,10 +175,26 @@ export function serveHubProxy(handlers: HubProxyHandlers, port: MessagePort): ()
       try {
         channel.post(payload)
       } catch {
-        // Drop the reply: the worker is gone.
+        // Either the peer is gone or `payload.value` is not structured-cloneable.
+        // A clone-safe `ok:false` fallback distinguishes the latter for the
+        // worker; on a detached port this second post may throw or silently
+        // no-op, and either way there is nobody left to hear the fallback.
+        if (!payload.ok) return
+        try {
+          channel.post({
+            kind: "reply",
+            id: payload.id,
+            ok: false,
+            message: `hub-proxy reply value for id ${payload.id} is not structured-cloneable`,
+          })
+        } catch {
+          // Peer gone: nothing to do.
+        }
       }
     }
-    const handler = handlers[frame.method as HubProxyMethod]
+    // Own-property guard: a bare lookup would resolve inherited `Object.prototype`
+    // members (`toString`, `valueOf`, ...) to functions and bypass the miss below.
+    const handler = Object.hasOwn(handlers, frame.method) ? handlers[frame.method as HubProxyMethod] : undefined
     if (handler === undefined) {
       reply({ kind: "reply", id: frame.id, ok: false, message: `unknown hub-proxy method "${frame.method}"` })
       return

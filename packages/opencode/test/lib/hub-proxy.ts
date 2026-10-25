@@ -61,6 +61,7 @@ export interface RecordingHubAuthorityOverrides {
   readonly question?: Partial<Question.Interface>
   readonly dispatchSubagent?: HubProxyAuthorities["dispatchSubagent"]
   readonly systemTransform?: HubProxyAuthorities["systemTransform"]
+  readonly messagesTransform?: HubProxyAuthorities["messagesTransform"]
 }
 
 export interface RecordingHubAuthorities {
@@ -152,6 +153,7 @@ export function recordingHubAuthorities(
 
   const dispatchSubagent = overrides.dispatchSubagent
   const systemTransform = overrides.systemTransform
+  const messagesTransform = overrides.messagesTransform
   const authorities: HubProxyAuthorities = {
     sessionStatus,
     permission,
@@ -175,6 +177,15 @@ export function recordingHubAuthorities(
             return systemTransform(input, output)
           },
         }),
+    // Always present: absent an override it records the call and returns `output`
+    // unchanged, so tests need no `buildHubProxyHandlers` pass-through special case.
+    messagesTransform: (
+      input: Parameters<NonNullable<typeof messagesTransform>>[0],
+      output: Parameters<NonNullable<typeof messagesTransform>>[1],
+    ) => {
+      calls.push({ method: "messagesTransform", args: [input, output] })
+      return messagesTransform === undefined ? Promise.resolve(output) : messagesTransform(input, output)
+    },
   }
 
   return { authorities, calls }

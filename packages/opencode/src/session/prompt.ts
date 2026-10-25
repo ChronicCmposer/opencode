@@ -48,6 +48,7 @@ import {
   SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES,
 } from "@/util/mcp-resource"
 import { Process } from "@/util/process"
+import { reconcileInPlace } from "@/util/reconcile"
 import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps, type TaskSubagentDispatch } from "@/tool/task"
@@ -1209,7 +1210,12 @@ const layer = Layer.effect(
             if (step === 1)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+            const transformed = yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+            // The in-process trigger mutates and returns `msgs` itself; a
+            // hub-proxied worker trigger returns a fresh `{ messages }`.
+            // `reconcileInPlace` copies it back so the pruning reaches the model
+            // request below, and is a no-op for the same array.
+            reconcileInPlace(msgs, transformed.messages)
 
             const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
