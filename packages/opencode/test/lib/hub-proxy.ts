@@ -62,6 +62,7 @@ export interface RecordingHubAuthorityOverrides {
   readonly dispatchSubagent?: HubProxyAuthorities["dispatchSubagent"]
   readonly systemTransform?: HubProxyAuthorities["systemTransform"]
   readonly messagesTransform?: HubProxyAuthorities["messagesTransform"]
+  readonly pluginTool?: HubProxyAuthorities["pluginTool"]
 }
 
 export interface RecordingHubAuthorities {
@@ -154,6 +155,7 @@ export function recordingHubAuthorities(
   const dispatchSubagent = overrides.dispatchSubagent
   const systemTransform = overrides.systemTransform
   const messagesTransform = overrides.messagesTransform
+  const pluginTool = overrides.pluginTool
   const authorities: HubProxyAuthorities = {
     sessionStatus,
     permission,
@@ -186,6 +188,16 @@ export function recordingHubAuthorities(
       calls.push({ method: "messagesTransform", args: [input, output] })
       return messagesTransform === undefined ? Promise.resolve(output) : messagesTransform(input, output)
     },
+    // Unlike the transforms there is no identity fallback: an execute with no
+    // authority must reject, so this key is only present when an override is.
+    ...(pluginTool === undefined
+      ? {}
+      : {
+          pluginTool: (input: Parameters<NonNullable<typeof pluginTool>>[0]) => {
+            calls.push({ method: "pluginTool.execute", args: [input] })
+            return pluginTool(input)
+          },
+        }),
   }
 
   return { authorities, calls }

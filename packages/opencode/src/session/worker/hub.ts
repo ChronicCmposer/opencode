@@ -15,6 +15,7 @@
 
 import { Context, Effect, Fiber, Layer, Option } from "effect"
 import os from "node:os"
+import type { Hooks, ToolContext as PluginToolContext, ToolDefinition } from "@opencode-ai/plugin"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Database } from "@opencode-ai/core/database/database"
@@ -109,11 +110,19 @@ import type {
 } from "./plugin-host"
 import type { HubProxyHandlers } from "./hub-proxy-wire"
 import { serveHubProxy } from "./hub-proxy-wire"
+import type {
+  PluginToolDescriptor,
+  PluginToolExecuteInput,
+  PluginToolExecuteResult,
+} from "./plugin-tool-wire"
 import { portFromMessagePort } from "./port"
 import type { SessionWorkerInit } from "./session-worker"
 import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
 import { sessionThreadName } from "@/session/worker/thread-name"
 import { Session } from "@/session/session"
+import { Truncate } from "@/tool/truncate"
+import { pluginToolJsonSchema } from "@/tool/registry"
+import { Agent } from "@/agent/agent"
 import type { ShellInput } from "@/session/prompt"
 
 /** A descendant cancelled by the subagent cascade, and whether it needs a fallback idle. */
@@ -513,6 +522,14 @@ export interface HubProxyAuthorities {
     input: MessagesTransformInput,
     output: MessagesTransformOutput,
   ) => Promise<MessagesTransformOutput>
+  /**
+   * Optional plugin-tool execute authority. The worker cannot run a plugin tool's
+   * `execute` (the plugin instance lives on the hub), so it forwards the call
+   * here, where the hub-owned definition runs and a clone-safe result returns.
+   * Unlike the transforms there is no identity pass-through: absent means the
+   * handler rejects.
+   */
+  readonly pluginTool?: (input: PluginToolExecuteInput) => Promise<PluginToolExecuteResult>
 }
 
 /**
@@ -556,6 +573,15 @@ export function buildHubProxyHandlers(authorities: HubProxyAuthorities, run: Hub
       authorities.messagesTransform === undefined
         ? (output as MessagesTransformOutput)
         : authorities.messagesTransform(input as MessagesTransformInput, output as MessagesTransformOutput),
+    // Always served, but with no identity fallback: an execute has no result to
+    // hand back, so an absent authority is a descriptive rejection — never an
+    // "unknown hub-proxy method" (that would mask a missing wiring, not a typo).
+    "pluginTool.execute": (input) =>
+      authorities.pluginTool === undefined
+        ? Promise.reject(
+            new Error('the hub has no "pluginTool" authority wired; cannot execute a plugin-provided tool'),
+          )
+        : authorities.pluginTool(input as PluginToolExecuteInput),
     ...(authorities.dispatchSubagent === undefined
       ? {}
       : {
@@ -583,6 +609,117 @@ export function messagesTransformAuthority(options: {
       ? Promise.resolve(output)
       : options.run(plugin.value.trigger("experimental.chat.messages.transform", input, output))
   }
+}
+
+/**
+ * Raised when a worker asks the hub to run a plugin tool id that no loaded plugin
+ * currently exposes — a stale descriptor, or a plugin reloaded mid-generation.
+ * Fail loud: an empty success would silently hide the config/version skew.
+ */
+export class UnknownPluginToolError extends Error {
+  readonly _tag = "UnknownPluginToolError"
+  constructor(readonly toolID: string) {
+    super(`unknown plugin tool "${toolID}": no loaded plugin exposes that tool id`)
+    this.name = "UnknownPluginToolError"
+  }
+}
+
+/** The hub-resident services the plugin-tool authority reads from context. */
+type PluginToolServices = Permission.Service | Truncate.Service | Agent.Service | Session.Service
+
+/** The first plugin tool definition exposing `toolID`, or `undefined`. */
+function findPluginToolDefinition(hooks: readonly Hooks[], toolID: string): ToolDefinition | undefined {
+  for (const hook of hooks) {
+    const definition = hook.tool?.[toolID]
+    if (definition !== undefined) return definition
+  }
+  return undefined
+}
+
+/**
+ * Run one plugin tool on the hub: locate its definition, reconstruct the
+ * `PluginToolContext` the plugin expects, execute, then normalize and bound the
+ * result exactly like the registry's local `fromPlugin` path.
+ */
+function pluginToolExecute(
+  plugin: () => Option.Option<Plugin.Interface>,
+  input: PluginToolExecuteInput,
+): Effect.Effect<PluginToolExecuteResult, UnknownPluginToolError, PluginToolServices> {
+  return Effect.gen(function* () {
+    const current = plugin()
+    const definition =
+      Option.isNone(current) ? undefined : findPluginToolDefinition(yield* current.value.list(), input.toolID)
+    if (definition === undefined) {
+      return yield* Effect.fail(new UnknownPluginToolError(input.toolID))
+    }
+    const bridge = yield* EffectBridge.make()
+    const permission = yield* Permission.Service
+    const truncate = yield* Truncate.Service
+    const agents = yield* Agent.Service
+    const sessions = yield* Session.Service
+    const instance = yield* InstanceRef
+    const agentInfo = yield* agents.get(input.agent)
+    const sessionInfo = yield* sessions.get(input.sessionID as SessionID).pipe(Effect.orDie)
+    const controller = new AbortController()
+    const pluginCtx: PluginToolContext = {
+      sessionID: input.sessionID,
+      messageID: input.messageID,
+      agent: input.agent,
+      directory: instance?.directory ?? process.cwd(),
+      worktree: instance?.worktree ?? process.cwd(),
+      // Per-call so a hub cancel can unwind an in-flight plugin tool.
+      abort: controller.signal,
+      // v1: mid-execute progress updates are dropped (no live hub→worker channel).
+      metadata: () => {},
+      // Bound to the HUB-RESIDENT permission service. Routing this back over the
+      // control port would deadlock: we are already inside that port's request.
+      ask: (request) =>
+        bridge.promise(
+          permission
+            .ask({
+              ...request,
+              sessionID: input.sessionID as SessionID,
+              tool: { messageID: input.messageID, callID: input.callID },
+              ruleset: Permission.merge(agentInfo.permission, sessionInfo.permission ?? []),
+            })
+            .pipe(Effect.orDie),
+        ),
+    }
+    const result = yield* Effect.promise(() => definition.execute(input.args as never, pluginCtx))
+    const output = typeof result === "string" ? result : result.output
+    const metadata = typeof result === "string" ? {} : (result.metadata ?? {})
+    const attachments = typeof result === "string" ? undefined : result.attachments
+    const bounded = yield* Truncate.boundResult(truncate, { output, metadata }, agentInfo)
+    return {
+      title: typeof result === "string" ? "" : (result.title ?? ""),
+      output: bounded.output,
+      metadata: bounded.metadata,
+      ...(attachments === undefined ? {} : { attachments }),
+    }
+  })
+}
+
+/**
+ * Build the hub-resident plugin-tool authority for a worker. The hub owns plugin
+ * loading (decision 70), so resolution is deferred through `plugin`, letting the
+ * caller read `Plugin.Service` (and the other hub authorities) from the worker's
+ * captured session context.
+ */
+export function pluginToolAuthority(options: {
+  readonly plugin: () => Option.Option<Plugin.Interface>
+  readonly run: HubProxyRunner
+}): NonNullable<HubProxyAuthorities["pluginTool"]> {
+  return (input) =>
+    // The effect needs the hub-resident services (Permission / Truncate / Agent /
+    // Session). `run` provides the dispatching session's captured context, but
+    // `HubProxyRunner` erases `R`, so the requirement is asserted at this single
+    // boundary rather than threaded through the frozen signature.
+    options.run(
+      pluginToolExecute(options.plugin, input) as unknown as Effect.Effect<
+        PluginToolExecuteResult,
+        UnknownPluginToolError
+      >,
+    )
 }
 
 /**
@@ -1720,6 +1857,37 @@ async function resolveContextPluginSources(
   return hooks.map((hook, index) => ({ name: `plugin-${index}`, hooks: hook as WorkerPluginHooks }))
 }
 
+/**
+ * Resolve the clone-safe plugin-tool descriptors for a dispatch context. The real
+ * plugin tools live on the hub (`Plugin.list()` → `Hooks.tool`); only their
+ * clone-safe `{ id, description, jsonSchema }` projection crosses into the worker
+ * init. Absent context/plugin resolves to no descriptors — a degraded boot simply
+ * lists no plugin tools, never a failure.
+ *
+ * The `jsonSchema` is computed by the registry's exported `pluginToolJsonSchema`,
+ * the single shared implementation the hub registry itself uses, so a shipped
+ * descriptor can never drift from what `fromPlugin` would advertise. `hub.ts` may
+ * import `@/tool/registry` here without a module cycle: the registry's only
+ * `session/worker` dependency is the dependency-light `plugin-tool-wire` leaf.
+ */
+export async function resolveContextPluginToolDescriptors(
+  context: Context.Context<never> | undefined,
+): Promise<readonly PluginToolDescriptor[]> {
+  if (context === undefined) return []
+  const plugin = Context.getOption(context, Plugin.Service)
+  if (Option.isNone(plugin)) return []
+  // `Plugin.list` resolves the per-directory `InstanceState`, so run it under the
+  // dispatching instance's captured context.
+  const hooks = await Effect.runPromise(Effect.provide(plugin.value.list(), context))
+  const descriptors: PluginToolDescriptor[] = []
+  for (const hook of hooks) {
+    for (const [id, definition] of Object.entries(hook.tool ?? {})) {
+      descriptors.push({ id, description: definition.description, jsonSchema: pluginToolJsonSchema(definition) })
+    }
+  }
+  return descriptors
+}
+
 export interface WorkerCancellationOptions {
   readonly graceMs?: number
   readonly schedule?: CancellationConfig["schedule"]
@@ -2318,7 +2486,7 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
   // Build the handler map per worker under THAT worker's session context. A
   // worker is bound to exactly one session, so its control port reaches the
   // right `SessionStatus`/`Permission`/`Question`/`systemTransform`/
-  // `messagesTransform` instance.
+  // `messagesTransform`/`pluginTool` instance.
   const hubProxyFor = (workerID: number): HubProxyHandlers => {
     const context = contextOfWorker(workerID)
     return buildHubProxyHandlers(
@@ -2328,6 +2496,12 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
         question: authorities.question,
         systemTransform: systemTransformFor(context),
         messagesTransform: messagesTransformFor(context),
+        // The worker forwards plugin-tool executes here; the definition (and its
+        // plugin instance) stays on the hub.
+        pluginTool: pluginToolAuthority({
+          plugin: () => (context === undefined ? Option.none() : Context.getOption(context, Plugin.Service)),
+          run: runHubProxyFor(context),
+        }),
       },
       runHubProxyFor(context),
     )
@@ -2350,27 +2524,33 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
     const model = dispatched?.model
     const request = dispatched?.request
     const pluginSources = deps.plugins !== undefined ? await deps.plugins() : await resolveContextPluginSources(context)
+    // The clone-safe projection of every plugin tool the worker may call. The
+    // `execute` stays on the hub (this worker's control port reaches the
+    // `pluginTool.execute` authority above); only the descriptor crosses.
+    const pluginTools = await resolveContextPluginToolDescriptors(context)
+    const initOptions: BuildSessionWorkerInitOptions = {
+      ...deps.initOptions,
+      // The session's persisted model is authoritative; config/default only
+      // applies when the dispatch carried no session model.
+      model: model === undefined ? deps.initOptions?.model : { ...deps.initOptions?.model, session: model },
+      snapshot: { ...deps.initOptions?.snapshot, workerCount: deps.count, epochSequence: deps.epochSequence },
+      plugins:
+        pluginSources === undefined
+          ? deps.initOptions?.plugins
+          : (resolvedModel) =>
+              resolveWorkerPlugins({
+                model: resolvedModel,
+                sources: pluginSources,
+                sessionID: session,
+                ...(request ?? {}),
+              }),
+      pluginTools,
+    }
     // A non-serializable provider option or plugin hook is a configuration
     // defect: die loud rather than widen every graph's error channel with the
     // typed failure.
     return Effect.runPromise(
-      buildSessionWorkerInit({
-        ...deps.initOptions,
-        // The session's persisted model is authoritative; config/default only
-        // applies when the dispatch carried no session model.
-        model: model === undefined ? deps.initOptions?.model : { ...deps.initOptions?.model, session: model },
-        snapshot: { ...deps.initOptions?.snapshot, workerCount: deps.count, epochSequence: deps.epochSequence },
-        plugins:
-          pluginSources === undefined
-            ? deps.initOptions?.plugins
-            : (resolvedModel) =>
-                resolveWorkerPlugins({
-                  model: resolvedModel,
-                  sources: pluginSources,
-                  sessionID: session,
-                  ...(request ?? {}),
-                }),
-      }).pipe(
+      buildSessionWorkerInit(initOptions).pipe(
         Effect.provideService(Config.Service, services.config),
         Effect.provideService(Auth.Service, services.auth),
         Effect.provideService(ModelsDev.Service, services.modelsDev),

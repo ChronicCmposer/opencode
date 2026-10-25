@@ -40,6 +40,7 @@ import type {
 } from "./plugin-host"
 import { buildWorkerSnapshot, type BuildWorkerSnapshotOptions } from "./snapshot"
 import { stringHeaders } from "./headers"
+import type { PluginToolDescriptor } from "./plugin-tool-wire"
 
 // ---------------------------------------------------------------------------
 // Environment overlay (step 7)
@@ -484,6 +485,14 @@ export interface BuildSessionWorkerInitOptions {
   readonly plugins?:
     | readonly WorkerPlugin[]
     | ((model: WorkerModel) => Effect.Effect<readonly WorkerPlugin[], WorkerPluginNotSerializableError>)
+  /**
+   * Clone-safe descriptors for hub-executed plugin tools. A plugin tool's
+   * `execute` closes over hub plugin state and cannot cross the isolate, so the
+   * hub ships only `{id, description, jsonSchema}`; the worker registers a stub
+   * that proxies execution back over the hub control port. Absent means the
+   * worker lists no plugin tools.
+   */
+  readonly pluginTools?: readonly PluginToolDescriptor[]
 }
 
 /**
@@ -511,6 +520,7 @@ export const buildSessionWorkerInit = Effect.fn("SessionWorkerInit.build")(funct
     ...(options.workerID === undefined ? {} : { workerID: options.workerID }),
     ...(options.capabilities === undefined ? {} : { capabilities: options.capabilities }),
     ...(plugins === undefined ? {} : { plugins }),
+    ...(options.pluginTools === undefined ? {} : { pluginTools: options.pluginTools }),
   } satisfies SessionWorkerInit
 })
 

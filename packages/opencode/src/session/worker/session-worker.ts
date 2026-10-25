@@ -90,6 +90,11 @@ import { makeInstanceContext, workerSnapshotBoundaryLayer } from "./snapshot"
 import { workerAppProcessNode } from "./app-process-report"
 import { PidReporter, type PidReport, type PidReporterInterface } from "./pid-registry"
 import type { Role } from "./node-table"
+import type {
+  PluginToolDescriptor,
+  PluginToolExecuteResult,
+  PluginToolExecutor,
+} from "./plugin-tool-wire"
 
 /** The real model capabilities, serialized for the isolate boundary. */
 export interface SerializedModelCapabilities {
@@ -166,6 +171,14 @@ export interface SessionWorkerInit {
    * tests today); absent means the reduced LLM uses its no-op pass-through.
    */
   readonly plugins?: readonly WorkerPlugin[]
+  /**
+   * Clone-safe descriptors for hub-executed plugin tools. The plugin instance
+   * lives on the hub, so a plugin tool's `execute` cannot cross the isolate; the
+   * hub ships only `{ id, description, jsonSchema }`, and the worker's reduced
+   * `Plugin.Service.list()` exposes one proxy stub per descriptor. Absent (or
+   * paired with no hub client) means the worker lists no plugin tools.
+   */
+  readonly pluginTools?: readonly PluginToolDescriptor[]
 }
 
 interface WorkerScope {
@@ -234,6 +247,11 @@ export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
     throw new Error("session worker workerData.plugins must be an array when present")
   }
 
+  const pluginTools = candidate.pluginTools
+  if (pluginTools !== undefined && !Array.isArray(pluginTools)) {
+    throw new Error("session worker workerData.pluginTools must be an array when present")
+  }
+
   // Build the typed init field-by-field from the validated values, so the
   // boundary result is trusted without a broad `as` cast. Flags are parsed into
   // a trusted `RuntimeFlags.Info`: the worker never re-reads its own
@@ -246,6 +264,7 @@ export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
     ...(candidate.capabilities === undefined ? {} : { capabilities: candidate.capabilities }),
     ...(workerID === undefined ? {} : { workerID }),
     ...(plugins === undefined ? {} : { plugins }),
+    ...(pluginTools === undefined ? {} : { pluginTools }),
   }
 }
 
@@ -757,6 +776,23 @@ export function hubProxyMessagesTransform(
   return (input, output) => hubProxy.call("messagesTransform", [input, output]) as Promise<MessagesTransformOutput>
 }
 
+/**
+ * The hub-proxied plugin-tool executor: forwards a worker tool call to the hub
+ * authority over the same multiplexed control port, where the plugin's real
+ * `execute` runs and returns a clone-safe result. Every hub authority
+ * multiplexes one port, so the caller hands the shared client.
+ *
+ * Returns `undefined` when the worker has no hub client (degraded boot), so the
+ * caller wires no plugin tools and the worker's `Plugin.Service.list()` stays
+ * empty.
+ */
+export function hubProxyPluginTool(hubProxy: HubProxyClient | undefined): PluginToolExecutor | undefined {
+  if (hubProxy === undefined) return undefined
+  return {
+    execute: (input) => hubProxy.call("pluginTool.execute", [input]) as Promise<PluginToolExecuteResult>,
+  }
+}
+
 /** Options for {@link bootstrapSessionWorker}; every field is additive. */
 export interface BootstrapSessionWorkerOptions {
   /**
@@ -902,6 +938,7 @@ export function bootstrapSessionWorker(
   // array passes through unchanged.
   const systemTransform = hubProxySystemTransform(hubProxies?.sessionStatus)
   const messagesTransform = hubProxyMessagesTransform(hubProxies?.sessionStatus)
+  const pluginToolExecutor = hubProxyPluginTool(hubProxies?.sessionStatus)
   const plugins =
     init.plugins === undefined
       ? undefined
@@ -915,6 +952,14 @@ export function bootstrapSessionWorker(
   const modelClient = llmModelClientLayer(config).pipe(
     Layer.provide(reducedLlmLayer(init.snapshot, config, hubProxies, plugins)),
   )
+  // Hub-executed plugin tools need BOTH the clone-safe descriptors the hub
+  // shipped and the hub-port executor. A descriptor without an executor (or the
+  // reverse) cannot execute, so the option is omitted entirely: degraded boot
+  // lists no plugin tools rather than a stub that would fail on call.
+  const pluginTools =
+    pluginToolExecutor === undefined || init.pluginTools === undefined || init.pluginTools.length === 0
+      ? undefined
+      : { descriptors: init.pluginTools, executor: pluginToolExecutor }
 
   const runtime = buildSessionWorkerLayer({
     // The full runnable graph needs the writer-backed Database and the serialized
@@ -938,6 +983,7 @@ export function bootstrapSessionWorker(
     // not just the `ModelClient` sealed below, so plugin-set sampling/headers
     // apply identically in both. Absent keeps the graph's no-op pass-through.
     ...(plugins === undefined ? {} : { plugins }),
+    ...(pluginTools === undefined ? {} : { pluginTools }),
     ...(hubProxies === undefined ? {} : { hubProxies }),
     ...(pidReporter === undefined ? {} : { pidReporter }),
     // The worker's Effect logs reach the main `opencode.log` sink. Merged as a

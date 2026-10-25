@@ -57,6 +57,7 @@ export type HubProxyMethod =
   | "question.list"
   | "systemTransform"
   | "messagesTransform"
+  | "pluginTool.execute"
   | "dispatchSubagent"
 
 /** A typed failure returned by a hub authority across the port. */

@@ -105,6 +105,12 @@ import type { DurableCommit, MeshWorkerClient } from "@/session/egress/mesh"
 import type { EventV2Event } from "./frame"
 import { stringHeaders } from "./headers"
 import { HubProxyRemoteError, type HubProxyClient, type HubProxyMethod } from "./hub-proxy-wire"
+import {
+  remotePluginToolHooks,
+  type PluginToolDescriptor,
+  type PluginToolExecutor,
+} from "./plugin-tool-wire"
+import type { Hooks } from "@opencode-ai/plugin"
 import type { JobClient } from "./job-client"
 import type {
   ChatHeadersOutput,
@@ -1357,6 +1363,16 @@ function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknow
 }
 
 /**
+ * Hub-executed plugin tools as the worker sees them: the clone-safe descriptors
+ * plus the executor that proxies a call back over the hub control port. Bundled
+ * so a descriptor without an executor (an unexecutable stub) is unrepresentable.
+ */
+export interface RemotePluginTools {
+  readonly descriptors: readonly PluginToolDescriptor[]
+  readonly executor: PluginToolExecutor
+}
+
+/**
  * The boundary `Plugin` for a worker, parameterised by its `trigger` (decision
  * 70): the hub owns plugin *loading*, but the model-facing hooks run in the
  * isolate. A no-op trigger yields the pass-through; a host-backed trigger runs
@@ -1364,13 +1380,24 @@ function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknow
  * transforms in-worker, so plugin-set sampling/headers and pruning match
  * flag-off. One layer covers both cases.
  */
-function workerPluginLayer(trigger: PluginTrigger): Layer.Layer<Plugin.Service> {
+function workerPluginLayer(trigger: PluginTrigger, pluginTools?: RemotePluginTools): Layer.Layer<Plugin.Service> {
   const plugin = {
     trigger,
-    list: () => Effect.succeed([]),
+    list: () => Effect.succeed(remotePluginHooks(pluginTools)),
     init: () => Effect.void,
   } as unknown as Plugin.Interface
   return Layer.succeed(Plugin.Service, plugin)
+}
+
+/**
+ * The synthetic `Hooks` a worker lists for its hub-executed plugin tools.
+ * `remotePluginToolHooks` builds one remote definition per descriptor, so the
+ * real `ToolRegistry` registers a proxy stub. Absent the remote tools (degraded
+ * boot, or no plugin tools), the worker lists nothing.
+ */
+function remotePluginHooks(pluginTools?: RemotePluginTools): Hooks[] {
+  if (pluginTools === undefined) return []
+  return [remotePluginToolHooks(pluginTools.descriptors, pluginTools.executor) as unknown as Hooks]
 }
 
 /**
@@ -1380,13 +1407,13 @@ function workerPluginLayer(trigger: PluginTrigger): Layer.Layer<Plugin.Service> 
  * ({@link buildSessionWorkerLayer}) and the reduced `LLM` sub-graph
  * ({@link reducedLlmLayer}), so neither ever builds the global `Plugin` layer.
  */
-function workerPluginReplacement(plugins?: WorkerPluginHost): LayerNode.Replacement {
+function workerPluginReplacement(plugins?: WorkerPluginHost, pluginTools?: RemotePluginTools): LayerNode.Replacement {
   const trigger: PluginTrigger =
     plugins === undefined
       ? noopPluginTrigger
       : (((name: string, input: unknown, output: unknown) =>
           Effect.promise(() => runWorkerPluginHook(plugins, name, input, output))) as PluginTrigger)
-  return [Plugin.node, workerPluginLayer(trigger)]
+  return [Plugin.node, workerPluginLayer(trigger, pluginTools)]
 }
 
 /** Build the minimal `LLM.StreamInput` for a worker pipeline call. */
@@ -1651,6 +1678,14 @@ export interface SessionLayerOptions {
    */
   readonly plugins?: WorkerPluginHost
   /**
+   * Hub-executed plugin tools: clone-safe descriptors plus the hub-proxy
+   * executor. The worker's `Plugin.Service.list()` then exposes one remote stub
+   * per descriptor, which `ToolRegistry` registers and whose execution proxies
+   * to the hub. Absent (degraded boot, no hub client, or no plugin tools) the
+   * worker lists no plugin tools.
+   */
+  readonly pluginTools?: RemotePluginTools
+  /**
    * Non-graph worker logging layer (see `worker-logging.ts`). Merged beside the
    * non-graph seams so the worker's `Effect.log*` reaches the main sink; absent
    * keeps the graph byte-for-byte unchanged.
@@ -1685,7 +1720,7 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
     // The worker graph owns `Plugin`: the hub loads plugins (decision 70), but
     // the model-facing hooks run here. Replace the real node for the whole graph
     // so it is never built in the isolate.
-    workerPluginReplacement(options.plugins),
+    workerPluginReplacement(options.plugins, options.pluginTools),
     ...boundaryReplacements(options.snapshot, options.clients.writer, options.backgroundJob),
     ...(options.hubProxies === undefined ? [] : hubProxyReplacements(options.hubProxies)),
     ...(options.replacements ?? []),

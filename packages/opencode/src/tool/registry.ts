@@ -53,6 +53,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { MCP } from "@/mcp"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { McpCatalog } from "@/mcp/catalog"
+import { isRemotePluginToolDefinition, type RemotePluginToolDefinition } from "@/session/worker/plugin-tool-wire"
 
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
   return (
@@ -126,11 +127,7 @@ const layer = Layer.effect(
           // boxed at the registry boundary and give the LLM the original JSON Schema.
           // Normalize missing args to `{}` once — pre-1.14.49 the code was
           // `z.object(def.args)` and Zod silently tolerated undefined (#27451, #27630).
-          const args = def.args ?? {}
-          const entries = Object.entries(args)
-          const allZod = entries.every((entry) => isZodType(entry[1]))
-          const zodParams = allZod ? z.object(args) : undefined
-          const jsonSchema = zodParams ? zodJsonSchema(zodParams) : legacyJsonSchema(entries)
+          const { zodParams, jsonSchema } = pluginToolSchema(def)
           const parameters = zodParams
             ? Schema.declare<unknown>((u): u is unknown => zodParams.safeParse(u).success)
             : Schema.Unknown
@@ -196,6 +193,13 @@ const layer = Layer.effect(
         const plugins = yield* plugin.list()
         for (const p of plugins) {
           for (const [id, def] of Object.entries(p.tool ?? {})) {
+            // A worker ships hub-executed plugin tools as clone-safe remote
+            // definitions; `fromPlugin` would call a local `execute` and
+            // re-truncate, so those take the proxy-stub path instead.
+            if (isRemotePluginToolDefinition(def)) {
+              custom.push(fromRemotePluginTool(id, def))
+              continue
+            }
             custom.push(fromPlugin(id, def))
           }
         }
@@ -351,6 +355,66 @@ function isZodType(value: unknown): value is z.ZodType {
 
 function isPluginTool(value: unknown): value is ToolDefinition {
   return typeof value === "object" && value !== null && "args" in value && "description" in value && "execute" in value
+}
+
+/**
+ * The Zod decoder (when every arg is a Zod type) and the LLM-facing JSON Schema
+ * for a plugin tool's public args. Shared by {@link fromPlugin} (hub
+ * registration) and {@link pluginToolJsonSchema} (worker descriptor extraction),
+ * so the two paths can never compute a different schema.
+ */
+function pluginToolSchema(def: ToolDefinition): { zodParams: z.ZodType | undefined; jsonSchema: JSONSchema7 } {
+  const args = def.args ?? {}
+  const entries = Object.entries(args)
+  const zodParams = entries.every((entry) => isZodType(entry[1])) ? z.object(args) : undefined
+  return { zodParams, jsonSchema: zodParams ? zodJsonSchema(zodParams) : legacyJsonSchema(entries) }
+}
+
+/**
+ * The LLM-facing JSON Schema for a plugin tool. Exported so the hub ships a
+ * worker the exact `PluginToolDescriptor.jsonSchema` the hub registry would use,
+ * and the worker's remote-stub registration passes it through verbatim.
+ */
+export function pluginToolJsonSchema(def: ToolDefinition): JSONSchema7 {
+  return pluginToolSchema(def).jsonSchema
+}
+
+/**
+ * Register a hub-executed plugin tool as a worker-side stub. The hub ships only
+ * the clone-safe descriptor (`plugin-tool-wire.ts`); the plugin's real `execute`
+ * closes over hub state and cannot cross the isolate, so this stub forwards the
+ * call over the hub control port through the supplied executor.
+ *
+ * Args pass through verbatim (`Schema.Unknown`): the hub validates them against
+ * the same `jsonSchema` and already bounds the result with
+ * `Truncate.boundResult`, so this path must NOT re-truncate. A remote failure
+ * surfaces as a defect, exactly like `fromPlugin`'s rejected plugin promise.
+ */
+function fromRemotePluginTool(id: string, def: RemotePluginToolDefinition): Tool.Def {
+  return {
+    id,
+    description: def.description,
+    parameters: Schema.Unknown,
+    jsonSchema: def.jsonSchema as JSONSchema7,
+    execute: (args, toolCtx) =>
+      Effect.promise(() =>
+        def.execute(args, {
+          sessionID: toolCtx.sessionID,
+          messageID: toolCtx.messageID,
+          callID: toolCtx.callID,
+          agent: toolCtx.agent,
+        }),
+      ).pipe(
+        Effect.map(
+          (result): Tool.ExecuteResult => ({
+            title: result.title,
+            output: result.output,
+            metadata: (result.metadata ?? {}) as Tool.ExecuteResult["metadata"],
+            attachments: result.attachments as Tool.ExecuteResult["attachments"],
+          }),
+        ),
+      ),
+  }
 }
 
 function isJsonSchemaDefinition(value: unknown): value is JSONSchema7Definition {

@@ -4,7 +4,7 @@ import fs from "fs/promises"
 import { fileURLToPath, pathToFileURL } from "url"
 import { Effect, Layer, Result, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { ToolRegistry } from "@/tool/registry"
+import { ToolRegistry, pluginToolJsonSchema } from "@/tool/registry"
 import { Tool } from "@/tool/tool"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -21,6 +21,14 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { MCP } from "@/mcp"
 import type { Tool as MCPToolDef } from "@modelcontextprotocol/sdk/types.js"
+import type { Hooks } from "@opencode-ai/plugin"
+import {
+  remotePluginToolHooks,
+  type PluginToolDescriptor,
+  type PluginToolExecuteInput,
+  type PluginToolExecuteResult,
+  type PluginToolExecutor,
+} from "@/session/worker/plugin-tool-wire"
 
 const configLayer = TestConfig.layer({
   directories: () => InstanceState.directory.pipe(Effect.map((dir) => [path.join(dir, ".opencode")])),
@@ -29,24 +37,51 @@ const configLayer = TestConfig.layer({
 // Fake Plugin.Service that returns a single plugin whose `tool` map contains
 // one definition with `args: undefined`. Used to exercise the plugin entry
 // point of `fromPlugin` for the #27451 / #27630 regression.
+const brokenDef = {
+  description: "plugin tool with missing args",
+  args: undefined as unknown as Record<string, never>,
+  execute: async () => "ok",
+}
 const brokenPluginLayer = Layer.succeed(
   Plugin.Service,
   Plugin.Service.of({
     init: () => Effect.void,
     trigger: ((_name: unknown, _input: unknown, output: unknown) =>
       Effect.succeed(output)) as Plugin.Interface["trigger"],
-    list: () =>
-      Effect.succeed([
-        {
-          tool: {
-            broken_plugin_tool: {
-              description: "plugin tool with missing args",
-              args: undefined as unknown as Record<string, never>,
-              execute: async () => "ok",
-            },
-          },
-        },
-      ]),
+    list: () => Effect.succeed([{ tool: { broken_plugin_tool: brokenDef } }]),
+  }),
+)
+
+// PT-2: a fake hub-proxied plugin whose `Plugin.Service.list()` exposes a
+// synthetic `Hooks` built by `remotePluginToolHooks` — exactly the stub the
+// session worker ships. The worker `ToolRegistry` must register the id and route
+// its execution through the executor (never a local `fromPlugin` wrapper).
+const remoteToolCalls: PluginToolExecuteInput[] = []
+const remoteToolResult: PluginToolExecuteResult = {
+  title: "remote title",
+  output: "hub output",
+  metadata: { ranOnHub: true },
+}
+const remoteExecutor: PluginToolExecutor = {
+  execute: async (input) => {
+    remoteToolCalls.push(input)
+    return remoteToolResult
+  },
+}
+const remoteDescriptors: readonly PluginToolDescriptor[] = [
+  {
+    id: "remote_compress",
+    description: "remote compress tool",
+    jsonSchema: { type: "object", properties: { reason: { type: "string" } }, required: ["reason"] },
+  },
+]
+const remotePluginLayer = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    init: () => Effect.void,
+    trigger: ((_name: unknown, _input: unknown, output: unknown) =>
+      Effect.succeed(output)) as Plugin.Interface["trigger"],
+    list: () => Effect.succeed([remotePluginToolHooks(remoteDescriptors, remoteExecutor) as unknown as Hooks]),
   }),
 )
 
@@ -94,9 +129,11 @@ const withEmptyCodeMode = testEffect(
   ]),
 )
 const withBrokenPlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, brokenPluginLayer]]))
+const withRemotePlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, remotePluginLayer]]))
 
 afterEach(async () => {
   await disposeAllInstances()
+  remoteToolCalls.length = 0
 })
 
 describe("tool.registry", () => {
@@ -269,6 +306,65 @@ describe("tool.registry", () => {
       const ids = yield* registry.ids()
       expect(ids).toContain("read")
       expect(ids).toContain("broken_plugin_tool")
+      // Schema parity (PT-2): the registry's `fromPlugin` and the hub's descriptor
+      // extraction share `pluginToolJsonSchema`, so they cannot drift.
+      const loaded = (yield* registry.all()).find((tool) => tool.id === "broken_plugin_tool")
+      expect(loaded?.jsonSchema).toEqual(pluginToolJsonSchema(brokenDef))
+    }),
+  )
+
+  // PT-2: a hub-executed plugin tool ships only clone-safe descriptors; the
+  // worker's `Plugin.Service.list()` exposes a `RemotePluginToolDefinition`
+  // whose `execute` proxies to the hub. The registry must register it and route
+  // `execute` through the executor (never `fromPlugin`, which would call a local
+  // `def.execute` and re-truncate).
+  withRemotePlugin.instance("registers a remote plugin tool from a clone-safe descriptor", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const ids = yield* registry.ids()
+      expect(ids).toContain("remote_compress")
+
+      const loaded = (yield* registry.all()).find((tool) => tool.id === "remote_compress")
+      if (!loaded) throw new Error("remote_compress tool was not loaded")
+      expect(loaded.description).toBe("remote compress tool")
+      // The hub-computed schema passes through verbatim; no local decoder.
+      expect(loaded.jsonSchema).toEqual(remoteDescriptors[0].jsonSchema as Tool.Def["jsonSchema"])
+      expect(loaded.parameters).toBe(Schema.Unknown)
+    }),
+  )
+
+  withRemotePlugin.instance("a remote stub proxies execute to the hub executor and returns its result", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const loaded = (yield* registry.all()).find((tool) => tool.id === "remote_compress")
+      if (!loaded) throw new Error("remote_compress tool was not loaded")
+
+      const args = { reason: "compact the history" }
+      const result = yield* loaded.execute(args, {
+        sessionID: SessionID.make("ses_remote"),
+        messageID: MessageID.make("msg_remote"),
+        callID: "call_remote",
+        agent: (yield* agents.defaultInfo()).name,
+        abort: new AbortController().signal,
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      } satisfies Tool.Context)
+
+      expect(remoteToolCalls).toEqual([
+        {
+          toolID: "remote_compress",
+          sessionID: "ses_remote",
+          messageID: "msg_remote",
+          callID: "call_remote",
+          agent: (yield* agents.defaultInfo()).name,
+          args,
+        },
+      ])
+      expect(result.title).toBe(remoteToolResult.title)
+      expect(result.output).toBe(remoteToolResult.output)
+      expect(result.metadata).toEqual({ ranOnHub: true })
     }),
   )
 
