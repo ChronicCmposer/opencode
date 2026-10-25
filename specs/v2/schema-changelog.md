@@ -1,5 +1,15 @@
 # V2 Schema Changelog
 
+## 2026-10-25: Worker-Safe Plugin Tools
+
+- Route hub-owned plugin tools across the worker-safe hub proxy, so a worker lists descriptors and invokes calls while plugin code, credentials, and runtime state stay in the hub process.
+- Stream `ctx.metadata` progress to the worker over the reverse hub-to-worker `pluginTool.metadata` event frame; tool parts update live, while the final `result.metadata` remains authoritative for settlement and replay.
+- Abort a worker-side `Tool.Context.abort` through a best-effort `pluginTool.abort` RPC. The hub keeps a per-`(sessionID, callID)` abort registry and aborts the matching call on cancellation before the grace window elapses, so plugin work is not left running after the Session stops waiting.
+- Keep descriptors fresh: `pluginTool.list` is backed by `RefreshablePluginTools`, and on `UnknownPluginToolError` the registry calls `refresh()` and `InstanceState.invalidate` so the next tool build re-registers the current definition.
+- Validate call arguments against the descriptor schema in the hub, and fail loud with `PluginToolNotSerializableError` when a successful result is not structured-cloneable instead of crossing the boundary lossily or hanging.
+- Resolve plugin tool IDs deterministically and fail loud when a remote ID duplicates another remote ID or collides with a local or built-in tool ID, rather than shadowing another tool.
+- Add no database migration and no durable-event version change; these follow-ups change runtime and outbound-request behavior only and leave persisted history unchanged.
+
 ## 2026-10-25: Worker-Safe Plugin Message Transform
 
 - Route the plugin-facing `experimental.chat.messages.transform` hook through the hub proxy in session workers, like `experimental.chat.system.transform`, so plugin-driven pruning (such as DCP-style old tool-result pruning) applies under `OPENCODE_EXPERIMENTAL_SESSION_WORKERS`.

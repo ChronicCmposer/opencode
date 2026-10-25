@@ -107,6 +107,7 @@ import { stringHeaders } from "./headers"
 import { HubProxyRemoteError, type HubProxyClient, type HubProxyMethod } from "./hub-proxy-wire"
 import {
   remotePluginToolHooks,
+  type PluginToolAbort,
   type PluginToolDescriptor,
   type PluginToolExecutor,
 } from "./plugin-tool-wire"
@@ -358,9 +359,7 @@ const eventBridgeLayer = Layer.effect(
     const unsubscribeDurable = wireDurableWakeups(events, egress)
     // Both subscriptions live exactly as long as the layer scope; disposing the
     // scope (worker shutdown) unsubscribes.
-    yield* Effect.addFinalizer(() =>
-      Effect.sync(() => unsubscribeDurable()).pipe(Effect.andThen(bridge.dispose)),
-    )
+    yield* Effect.addFinalizer(() => Effect.sync(() => unsubscribeDurable()).pipe(Effect.andThen(bridge.dispose)))
     return WorkerEventBridge.of({ dispose: bridge.dispose })
   }),
 )
@@ -381,11 +380,7 @@ export const WorkerEventBridgeNode = LayerNode.make({
 
 // The wire itself lives in `hub-proxy-wire.ts` so neither the worker nor the hub
 // imports the other. Re-exported here so existing consumers keep the same path.
-export {
-  createHubProxyClient,
-  HubProxyRemoteError,
-  serveHubProxy,
-} from "./hub-proxy-wire"
+export { createHubProxyClient, HubProxyRemoteError, serveHubProxy } from "./hub-proxy-wire"
 export type {
   HubProxyClient,
   HubProxyFrame,
@@ -424,7 +419,11 @@ function restoreHubProxyError(error: unknown): Error {
 }
 
 /** Await a hub-proxy call inside Effect; a remote failure is a typed error. */
-function hubProxyCall<A>(client: HubProxyClient, method: HubProxyMethod, args: readonly unknown[]): Effect.Effect<A, Error> {
+function hubProxyCall<A>(
+  client: HubProxyClient,
+  method: HubProxyMethod,
+  args: readonly unknown[],
+): Effect.Effect<A, Error> {
   return Effect.tryPromise({
     try: () => client.call(method, args) as Promise<A>,
     catch: restoreHubProxyError,
@@ -1337,8 +1336,7 @@ export function reducedModelProviderLayer(config: WorkerModelConfig): Layer.Laye
 type PluginTrigger = Plugin.Interface["trigger"]
 
 /** No-op pass-through trigger: the hook leaves the output untouched. */
-const noopPluginTrigger = ((_name: string, _input: unknown, output: unknown) =>
-  Effect.succeed(output)) as PluginTrigger
+const noopPluginTrigger = ((_name: string, _input: unknown, output: unknown) => Effect.succeed(output)) as PluginTrigger
 
 /**
  * Dispatch one `Plugin.trigger` to the matching worker-hosted hook.
@@ -1370,6 +1368,108 @@ function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknow
 export interface RemotePluginTools {
   readonly descriptors: readonly PluginToolDescriptor[]
   readonly executor: PluginToolExecutor
+  /**
+   * The hub abort bridge, forwarded onto every rebuilt remote definition so the
+   * registry's `toolCtx.abort` subscription reaches the hub's in-flight call.
+   * Optional: a handle without a hub control port omits it.
+   */
+  readonly abort?: PluginToolAbort
+  /**
+   * Re-fetch the hub's descriptors and swap them into this handle — the lazy
+   * self-heal action attached to each remote definition as its `refresh` seam.
+   * Optional: present only when the handle can reach the hub's list authority.
+   */
+  readonly refreshFromHub?: () => Promise<void>
+}
+
+/**
+ * Raised when a remote plugin-tool id is ambiguous: it is declared twice, or it
+ * collides with a local/builtin tool the registry already owns. Plugin tool ids
+ * are bare plugin keys (`registry.ts:199`), so a collision would otherwise
+ * silently shadow a tool; fail loud instead.
+ */
+export class PluginToolIDCollisionError extends Error {
+  constructor(
+    readonly id: string,
+    readonly kind: "duplicate" | "reserved",
+  ) {
+    super(
+      kind === "duplicate"
+        ? `plugin tool id "${id}" is declared by more than one remote descriptor`
+        : `plugin tool id "${id}" collides with a locally registered tool`,
+    )
+    this.name = "PluginToolIDCollisionError"
+  }
+}
+
+/**
+ * The collision policy for remote plugin-tool descriptors, applied before
+ * registration. Fails loud when the same id is declared twice, or when an id is
+ * already reserved by a local/builtin tool (the `reservedIDs` the registry
+ * knows). Returns the descriptors unchanged so a caller can chain into
+ * registration; the registry passes its builtin ids here, and
+ * {@link refreshablePluginTools} applies the same policy at its boundary.
+ */
+export function assertPluginToolDescriptorsUnique(
+  descriptors: readonly PluginToolDescriptor[],
+  reservedIDs: Iterable<string> = [],
+): readonly PluginToolDescriptor[] {
+  const reserved = new Set(reservedIDs)
+  const seen = new Set<string>()
+  for (const descriptor of descriptors) {
+    if (seen.has(descriptor.id)) throw new PluginToolIDCollisionError(descriptor.id, "duplicate")
+    if (reserved.has(descriptor.id)) throw new PluginToolIDCollisionError(descriptor.id, "reserved")
+    seen.add(descriptor.id)
+  }
+  return descriptors
+}
+
+/**
+ * A {@link RemotePluginTools} whose descriptor set can be replaced in place
+ * after a hub-side plugin reload (design Q4). `descriptors` is a live getter, so
+ * the worker's `Plugin.Service.list()` reads whatever set is current at call
+ * time; a caller that captured the layer before a refresh still sees the new
+ * set. The registry (L2) owns re-registration; this seam only keeps the source
+ * live.
+ */
+export interface RefreshablePluginTools extends RemotePluginTools {
+  /** Replace the descriptor set; the next `list()` reflects it. Fails loud on a collision. */
+  refresh(descriptors: readonly PluginToolDescriptor[]): void
+}
+
+/**
+ * Build the live {@link RefreshablePluginTools} handle. The returned value IS
+ * the `RemotePluginTools` to pass as `SessionLayerOptions.pluginTools`; call
+ * `refresh` after a plugin reload to replace the descriptors. Both the initial
+ * set and every refresh apply {@link assertPluginToolDescriptorsUnique}, so an
+ * ambiguous remote id is rejected at the boundary rather than registered.
+ *
+ * `abort` and `list` (when supplied) are the hub seams: `abort` becomes each
+ * remote definition's abort bridge, and `list` backs `refreshFromHub`, the lazy
+ * re-fetch the registry triggers after an `UnknownPluginToolError`.
+ */
+export function refreshablePluginTools(
+  initialDescriptors: readonly PluginToolDescriptor[],
+  executor: PluginToolExecutor,
+  options: {
+    readonly abort?: PluginToolAbort
+    readonly list?: () => Promise<readonly PluginToolDescriptor[]>
+  } = {},
+): RefreshablePluginTools {
+  let current = assertPluginToolDescriptorsUnique(initialDescriptors)
+  const refresh = (descriptors: readonly PluginToolDescriptor[]): void => {
+    current = assertPluginToolDescriptorsUnique(descriptors)
+  }
+  const { abort, list } = options
+  return {
+    get descriptors() {
+      return current
+    },
+    executor,
+    refresh,
+    ...(abort === undefined ? {} : { abort }),
+    ...(list === undefined ? {} : { refreshFromHub: async () => refresh(await list()) }),
+  }
 }
 
 /**
@@ -1393,11 +1493,19 @@ function workerPluginLayer(trigger: PluginTrigger, pluginTools?: RemotePluginToo
  * The synthetic `Hooks` a worker lists for its hub-executed plugin tools.
  * `remotePluginToolHooks` builds one remote definition per descriptor, so the
  * real `ToolRegistry` registers a proxy stub. Absent the remote tools (degraded
- * boot, or no plugin tools), the worker lists nothing.
+ * boot, or no plugin tools), the worker lists nothing. The descriptor set is
+ * re-validated on every read so a colliding id fails loud before registration,
+ * whether the caller used {@link refreshablePluginTools} or a plain literal.
  */
 function remotePluginHooks(pluginTools?: RemotePluginTools): Hooks[] {
   if (pluginTools === undefined) return []
-  return [remotePluginToolHooks(pluginTools.descriptors, pluginTools.executor) as unknown as Hooks]
+  const descriptors = assertPluginToolDescriptorsUnique(pluginTools.descriptors)
+  if (descriptors.length === 0) return []
+  const callbacks = {
+    ...(pluginTools.abort === undefined ? {} : { abort: pluginTools.abort }),
+    ...(pluginTools.refreshFromHub === undefined ? {} : { refresh: pluginTools.refreshFromHub }),
+  }
+  return [remotePluginToolHooks(descriptors, pluginTools.executor, callbacks) as unknown as Hooks]
 }
 
 /**
@@ -1501,6 +1609,9 @@ function llmClientBoundaryLayer(): Layer.Layer<LLMClientService> {
  * compiles and never reaches them. `Plugin` is a worker-safe replacement here
  * (host when supplied, no-op otherwise); the full worker graph additionally
  * replaces `Plugin.node` at the top level ({@link buildSessionWorkerLayer}).
+ * `pluginTools`, when supplied, reaches this sub-graph's `Plugin` replacement
+ * too, so a tool-consuming reduced node sees the hub-executed remote tools
+ * exactly as the full graph does.
  *
  * Exported so a test can assert the per-node boundary wiring without resolving
  * the sub-graph's (single, `LLM`) output service.
@@ -1510,16 +1621,20 @@ export function llmBoundaryReplacements(
   config: WorkerModelConfig,
   hubProxies?: HubProxyClients,
   plugins?: WorkerPluginHost,
+  pluginTools?: RemotePluginTools,
 ): LayerNode.Replacements {
   return [
     [Auth.node, snapshotAuthLayer(snapshot)],
     [Config.node, snapshotConfigLayer(snapshot)],
     [Provider.node, reducedModelProviderLayer(config)],
-    workerPluginReplacement(plugins),
+    workerPluginReplacement(plugins, pluginTools),
     // `Permission` is a hub-resident authority: route it over the hub-proxy
     // control port when the worker has one, otherwise fail loud. Never a silent
     // mock, which would let a denied tool run in a degraded isolate.
-    [Permission.node, hubProxies === undefined ? permissionBoundaryLayer() : permissionProxyLayer(hubProxies.permission)],
+    [
+      Permission.node,
+      hubProxies === undefined ? permissionBoundaryLayer() : permissionProxyLayer(hubProxies.permission),
+    ],
     [EventV2Bridge.node, eventV2BridgeBoundaryLayer()],
     [llmClient, llmClientBoundaryLayer()],
     [RuntimeFlags.node, snapshotRuntimeFlagsLayer(snapshot)],
@@ -1536,8 +1651,9 @@ export function reducedLlmLayer(
   config: WorkerModelConfig,
   hubProxies?: HubProxyClients,
   plugins?: WorkerPluginHost,
+  pluginTools?: RemotePluginTools,
 ): Layer.Layer<LLM.Service> {
-  return AppNodeBuilderV1.build(LLM.node, llmBoundaryReplacements(snapshot, config, hubProxies, plugins))
+  return AppNodeBuilderV1.build(LLM.node, llmBoundaryReplacements(snapshot, config, hubProxies, plugins, pluginTools))
 }
 
 // ---------------------------------------------------------------------------
@@ -1682,7 +1798,8 @@ export interface SessionLayerOptions {
    * executor. The worker's `Plugin.Service.list()` then exposes one remote stub
    * per descriptor, which `ToolRegistry` registers and whose execution proxies
    * to the hub. Absent (degraded boot, no hub client, or no plugin tools) the
-   * worker lists no plugin tools.
+   * worker lists no plugin tools. Supply {@link refreshablePluginTools} to let a
+   * hub-side plugin reload replace the set after boot.
    */
   readonly pluginTools?: RemotePluginTools
   /**
@@ -1732,9 +1849,7 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
   // execution time, so merging it keeps degraded graphs (no reporter) building
   // unchanged while the production graph sees the control-port reporter.
   const withPid =
-    options.pidReporter === undefined
-      ? built
-      : Layer.merge(built, Layer.succeed(PidReporter, options.pidReporter))
+    options.pidReporter === undefined ? built : Layer.merge(built, Layer.succeed(PidReporter, options.pidReporter))
   // `SubagentDispatchProxy` is likewise not a graph node: `SessionPrompt.ops`
   // reads it optionally, so a hub-reaching worker gets `dispatchSubagent` while
   // a degraded/hub-less graph builds unchanged (and runs sub-agents inline).

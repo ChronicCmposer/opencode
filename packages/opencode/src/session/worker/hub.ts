@@ -14,6 +14,7 @@
 // down with the layer scope.
 
 import { Context, Effect, Fiber, Layer, Option } from "effect"
+import { z } from "zod"
 import os from "node:os"
 import type { Hooks, ToolContext as PluginToolContext, ToolDefinition } from "@opencode-ai/plugin"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -108,13 +109,16 @@ import type {
   SystemTransformOutput,
   WorkerPluginHooks,
 } from "./plugin-host"
-import type { HubProxyHandlers } from "./hub-proxy-wire"
+import type { HubProxyHandlers, HubProxyStreamHandler } from "./hub-proxy-wire"
 import { serveHubProxy } from "./hub-proxy-wire"
 import type {
   PluginToolDescriptor,
   PluginToolExecuteInput,
   PluginToolExecuteResult,
+  PluginToolProgress,
+  PluginToolProgressSink,
 } from "./plugin-tool-wire"
+import { PluginToolNotSerializableError } from "./plugin-tool-wire"
 import { portFromMessagePort } from "./port"
 import type { SessionWorkerInit } from "./session-worker"
 import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
@@ -258,6 +262,15 @@ export interface WorkerPortBackends {
    */
   readonly hubProxyFor?: (workerID: number) => HubProxyHandlers | undefined
   /**
+   * Per-worker streaming hub-proxy handlers: the methods that may push correlated
+   * events (e.g. `pluginTool.execute`'s metadata) to the awaiting worker before
+   * replying. Served alongside {@link hubProxyFor}; takes precedence over
+   * {@link hubProxyStreaming}.
+   */
+  readonly hubProxyStreamingFor?: (workerID: number) => Readonly<Record<string, HubProxyStreamHandler>> | undefined
+  /** Streaming hub-proxy handlers shared by every worker (fallback for {@link hubProxyStreamingFor}). */
+  readonly hubProxyStreaming?: Readonly<Record<string, HubProxyStreamHandler>>
+  /**
    * Tear down the backends' own resources (a writer/broker isolate). Called once
    * by `SessionHub.terminateAll`, only when the backends were actually built.
    */
@@ -337,6 +350,12 @@ export interface SessionHubOptions {
    * to {@link events} when absent.
    */
   readonly eventPublisherFor?: (sessionID: SessionID) => LiveEventPublisher | undefined
+  /**
+   * Invoked at the start of every cancel, before the grace window, for the session
+   * and each descendant. The production layer aborts in-flight hub-executed plugin
+   * tools here; a plain hub without it simply skips that best-effort unwind.
+   */
+  readonly onCancelRequested?: (sessionID: SessionID) => void
   /**
    * Pre-built job registry (tests). Defaults to one wired to route a settled
    * child's result to the worker hosting its `parentID` (plan 9.4).
@@ -526,10 +545,24 @@ export interface HubProxyAuthorities {
    * Optional plugin-tool execute authority. The worker cannot run a plugin tool's
    * `execute` (the plugin instance lives on the hub), so it forwards the call
    * here, where the hub-owned definition runs and a clone-safe result returns.
-   * Unlike the transforms there is no identity pass-through: absent means the
-   * handler rejects.
+   * `emit` is the streaming sink that `pluginTool.metadata` progress events are
+   * pushed through; a non-streaming caller supplies a no-op. Unlike the transforms
+   * there is no identity pass-through: absent means the handler rejects.
    */
-  readonly pluginTool?: (input: PluginToolExecuteInput) => Promise<PluginToolExecuteResult>
+  readonly pluginTool?: (input: PluginToolExecuteInput, emit: PluginToolProgressSink) => Promise<PluginToolExecuteResult>
+  /**
+   * Optional plugin-tool list authority: the clone-safe descriptor refresh. The
+   * worker ships descriptors at init; a plugin that reloads mid-generation leaves
+   * them stale, so the worker can re-fetch the current list here. Absent means the
+   * handler rejects (an empty list would silently hide a mis-wiring).
+   */
+  readonly pluginToolList?: () => Promise<readonly PluginToolDescriptor[]>
+  /**
+   * Optional plugin-tool abort authority: unwind an in-flight plugin tool's
+   * `ctx.abort` by `(sessionID, callID)`. Best-effort — absent means the handler
+   * resolves as a no-op rather than failing a cancel path.
+   */
+  readonly pluginToolAbort?: (input: { readonly sessionID: string; readonly callID: string }) => void | Promise<void>
 }
 
 /**
@@ -538,6 +571,11 @@ export interface HubProxyAuthorities {
  * the runner provides that instance's context (captured at dispatch).
  */
 export type HubProxyRunner = <A, E>(effect: Effect.Effect<A, E>) => Promise<A>
+
+/** The descriptive rejection an absent plugin-tool authority returns (fail loud). */
+function missingPluginToolAuthority(what: string): Error {
+  return new Error(`the hub has no "pluginTool" authority wired; cannot ${what}`)
+}
 
 /**
  * Build the hub-side handler map for the worker hub-proxy wire. Every method is
@@ -576,17 +614,54 @@ export function buildHubProxyHandlers(authorities: HubProxyAuthorities, run: Hub
     // Always served, but with no identity fallback: an execute has no result to
     // hand back, so an absent authority is a descriptive rejection — never an
     // "unknown hub-proxy method" (that would mask a missing wiring, not a typo).
+    // This non-streaming entry supplies a no-op emit; `buildHubProxyStreamHandlers`
+    // overrides it with the real sink when the port is served with streaming.
     "pluginTool.execute": (input) =>
       authorities.pluginTool === undefined
-        ? Promise.reject(
-            new Error('the hub has no "pluginTool" authority wired; cannot execute a plugin-provided tool'),
-          )
-        : authorities.pluginTool(input as PluginToolExecuteInput),
+        ? Promise.reject(missingPluginToolAuthority("execute a plugin-provided tool"))
+        : authorities.pluginTool(input as PluginToolExecuteInput, () => {}),
+    // The descriptor refresh RPC; absent a list authority there is no useful empty
+    // fallback, so a typo'd wiring fails loud rather than silently listing nothing.
+    "pluginTool.list": () =>
+      authorities.pluginToolList === undefined
+        ? Promise.reject(missingPluginToolAuthority("list plugin-provided tools"))
+        : authorities.pluginToolList(),
+    // Best-effort: no authority means nothing is in flight to abort, not an error.
+    // A cancel path must never turn an abort into a tool failure.
+    "pluginTool.abort": (input) =>
+      authorities.pluginToolAbort?.(input as { readonly sessionID: string; readonly callID: string }),
     ...(authorities.dispatchSubagent === undefined
       ? {}
       : {
           dispatchSubagent: (request) => authorities.dispatchSubagent!(request as SubagentDispatchRequest),
         }),
+  }
+}
+
+/**
+ * The streaming half of the hub-proxy handler map: the methods whose handler may
+ * push correlated events to the awaiting worker before it replies. A method here
+ * wins over a same-named plain handler ({@link buildHubProxyHandlers}).
+ *
+ * Today only `pluginTool.execute` streams: the hub plugin's mid-execute
+ * `ToolContext.metadata` updates are forwarded as `pluginTool.metadata` events,
+ * so a long-running plugin tool reports progress live instead of only in its
+ * final, authoritative result.
+ */
+export function buildHubProxyStreamHandlers(
+  authorities: HubProxyAuthorities,
+): Readonly<Record<string, HubProxyStreamHandler>> {
+  return {
+    "pluginTool.execute": (sink, args) => {
+      const input = args[0] as PluginToolExecuteInput
+      if (authorities.pluginTool === undefined) {
+        return Promise.reject(missingPluginToolAuthority("execute a plugin-provided tool"))
+      }
+      return authorities.pluginTool(input, (progress: PluginToolProgress) =>
+        // The event method the worker's `hubProxyPluginTool` onEvent filters for.
+        sink.emit("pluginTool.metadata", progress),
+      )
+    },
   }
 }
 
@@ -624,8 +699,77 @@ export class UnknownPluginToolError extends Error {
   }
 }
 
+/**
+ * Raised when the args a worker forwarded do not satisfy the plugin tool's own
+ * decoder. The worker ships args verbatim (`Schema.Unknown`), so the hub validates
+ * them at the boundary; a bad arg is a fail-loud caller error, not a tool result.
+ */
+export class InvalidPluginToolArgsError extends Error {
+  readonly _tag = "InvalidPluginToolArgsError"
+  constructor(
+    readonly toolID: string,
+    readonly detail: string,
+  ) {
+    super(`invalid args for plugin tool "${toolID}": ${detail}`)
+    this.name = "InvalidPluginToolArgsError"
+  }
+}
+
+/** A registered in-flight plugin-tool call: its abort signal and unregister fn. */
+export interface PluginToolAbortHandle {
+  readonly signal: AbortSignal
+  readonly dispose: () => void
+}
+
+/**
+ * The hub's in-flight plugin-tool abort registry. A plugin tool's `execute` runs
+ * on the hub under a per-call `AbortController`; keying those controllers by
+ * `(sessionID, callID)` lets the hub cancel path (and the worker's
+ * `pluginTool.abort` RPC) unwind exactly the calls it means to, and never a
+ * settled one.
+ */
+export interface PluginToolAbortRegistry {
+  readonly registerAbort: (sessionID: string, callID: string) => PluginToolAbortHandle
+  readonly abort: (sessionID: string, callID: string) => void
+  /** Abort every in-flight call of a session (the hub cancel cascade). */
+  readonly abortSession: (sessionID: string) => void
+}
+
+/** A fresh abort registry backed by a session → callID → controller map. */
+export function createPluginToolAbortRegistry(): PluginToolAbortRegistry {
+  const bySession = new Map<string, Map<string, AbortController>>()
+  return {
+    registerAbort: (sessionID, callID) => {
+      const controller = new AbortController()
+      const calls = bySession.get(sessionID) ?? new Map<string, AbortController>()
+      bySession.set(sessionID, calls)
+      calls.set(callID, controller)
+      return {
+        signal: controller.signal,
+        // Unregister on EVERY exit; the entry is dropped only when it is still the
+        // registered controller, so a later call reusing the callID is untouched.
+        dispose: () => {
+          const current = bySession.get(sessionID)
+          if (current === undefined) return
+          if (current.get(callID) === controller) current.delete(callID)
+          if (current.size === 0) bySession.delete(sessionID)
+        },
+      }
+    },
+    abort: (sessionID, callID) => {
+      bySession.get(sessionID)?.get(callID)?.abort()
+    },
+    abortSession: (sessionID) => {
+      for (const controller of bySession.get(sessionID)?.values() ?? []) controller.abort()
+    },
+  }
+}
+
 /** The hub-resident services the plugin-tool authority reads from context. */
 type PluginToolServices = Permission.Service | Truncate.Service | Agent.Service | Session.Service
+
+/** Every typed failure a plugin-tool execute can raise. */
+type PluginToolFailure = UnknownPluginToolError | InvalidPluginToolArgsError | PluginToolNotSerializableError
 
 /** The first plugin tool definition exposing `toolID`, or `undefined`. */
 function findPluginToolDefinition(hooks: readonly Hooks[], toolID: string): ToolDefinition | undefined {
@@ -636,15 +780,59 @@ function findPluginToolDefinition(hooks: readonly Hooks[], toolID: string): Tool
   return undefined
 }
 
+/** Whether a plugin tool arg entry is a Zod type (the registry's own predicate). */
+function isZodType(value: unknown): value is z.ZodType {
+  return typeof value === "object" && value !== null && "_zod" in value
+}
+
 /**
- * Run one plugin tool on the hub: locate its definition, reconstruct the
- * `PluginToolContext` the plugin expects, execute, then normalize and bound the
- * result exactly like the registry's local `fromPlugin` path.
+ * Validate forwarded args against the plugin tool's own decoder before `execute`.
+ * The registry only builds a decoder when every arg is a Zod type; a legacy
+ * JSON-schema map is `Schema.Unknown` there, so the hub passes it through rather
+ * than inventing stricter validation than the tool advertises.
+ */
+function validatePluginToolArgs(toolID: string, definition: ToolDefinition, args: unknown): void {
+  const raw = definition.args ?? {}
+  if (!Object.values(raw).every(isZodType)) return
+  const parsed = z.object(raw).safeParse(args ?? {})
+  if (!parsed.success) {
+    throw new InvalidPluginToolArgsError(toolID, parsed.error.message)
+  }
+}
+
+/**
+ * Fail loud on a result that cannot cross the control port, naming the tool and
+ * the offending field. Without this a leaked function would only surface as the
+ * generic `serveHubProxy` clone guard's cryptic message.
+ */
+export function sanitizePluginToolResult(toolID: string, result: PluginToolExecuteResult): PluginToolExecuteResult {
+  assertCloneable(toolID, "title", result.title)
+  assertCloneable(toolID, "output", result.output)
+  assertCloneable(toolID, "metadata", result.metadata)
+  if (result.attachments !== undefined) assertCloneable(toolID, "attachments", result.attachments)
+  return result
+}
+
+function assertCloneable(toolID: string, field: string, value: unknown): void {
+  try {
+    structuredClone(value)
+  } catch {
+    throw new PluginToolNotSerializableError(toolID, field)
+  }
+}
+
+/**
+ * Run one plugin tool on the hub: locate its definition, validate the forwarded
+ * args, reconstruct the `PluginToolContext` the plugin expects, execute, then
+ * normalize, bound (once) and sanitize the result exactly like the registry's
+ * local `fromPlugin` path.
  */
 function pluginToolExecute(
   plugin: () => Option.Option<Plugin.Interface>,
   input: PluginToolExecuteInput,
-): Effect.Effect<PluginToolExecuteResult, UnknownPluginToolError, PluginToolServices> {
+  emit: PluginToolProgressSink,
+  registerAbort: ((sessionID: string, callID: string) => PluginToolAbortHandle) | undefined,
+): Effect.Effect<PluginToolExecuteResult, PluginToolFailure, PluginToolServices> {
   return Effect.gen(function* () {
     const current = plugin()
     const definition =
@@ -652,6 +840,7 @@ function pluginToolExecute(
     if (definition === undefined) {
       return yield* Effect.fail(new UnknownPluginToolError(input.toolID))
     }
+    validatePluginToolArgs(input.toolID, definition, input.args)
     const bridge = yield* EffectBridge.make()
     const permission = yield* Permission.Service
     const truncate = yield* Truncate.Service
@@ -660,7 +849,12 @@ function pluginToolExecute(
     const instance = yield* InstanceRef
     const agentInfo = yield* agents.get(input.agent)
     const sessionInfo = yield* sessions.get(input.sessionID as SessionID).pipe(Effect.orDie)
-    const controller = new AbortController()
+    // Register only once we are committed to executing: an unknown tool or bad
+    // args must never leave an entry the cancel path could later abort.
+    const abort = registerAbort?.(input.sessionID, input.callID) ?? {
+      signal: new AbortController().signal,
+      dispose: () => {},
+    }
     const pluginCtx: PluginToolContext = {
       sessionID: input.sessionID,
       messageID: input.messageID,
@@ -668,9 +862,9 @@ function pluginToolExecute(
       directory: instance?.directory ?? process.cwd(),
       worktree: instance?.worktree ?? process.cwd(),
       // Per-call so a hub cancel can unwind an in-flight plugin tool.
-      abort: controller.signal,
-      // v1: mid-execute progress updates are dropped (no live hub→worker channel).
-      metadata: () => {},
+      abort: abort.signal,
+      // Mid-execute progress is streamed to the worker as `pluginTool.metadata`.
+      metadata: (update) => emit({ title: update.title, metadata: update.metadata }),
       // Bound to the HUB-RESIDENT permission service. Routing this back over the
       // control port would deadlock: we are already inside that port's request.
       ask: (request) =>
@@ -685,37 +879,51 @@ function pluginToolExecute(
             .pipe(Effect.orDie),
         ),
     }
-    const result = yield* Effect.promise(() => definition.execute(input.args as never, pluginCtx))
-    const output = typeof result === "string" ? result : result.output
-    const metadata = typeof result === "string" ? {} : (result.metadata ?? {})
-    const attachments = typeof result === "string" ? undefined : result.attachments
-    const bounded = yield* Truncate.boundResult(truncate, { output, metadata }, agentInfo)
-    return {
-      title: typeof result === "string" ? "" : (result.title ?? ""),
-      output: bounded.output,
-      metadata: bounded.metadata,
-      ...(attachments === undefined ? {} : { attachments }),
-    }
+    return yield* Effect.gen(function* () {
+      const result = yield* Effect.promise(() => definition.execute(input.args as never, pluginCtx))
+      const output = typeof result === "string" ? result : result.output
+      const metadata = typeof result === "string" ? {} : (result.metadata ?? {})
+      const attachments = typeof result === "string" ? undefined : result.attachments
+      const bounded = yield* Truncate.boundResult(truncate, { output, metadata }, agentInfo)
+      return sanitizePluginToolResult(input.toolID, {
+        title: typeof result === "string" ? "" : (result.title ?? ""),
+        output: bounded.output,
+        metadata: bounded.metadata,
+        ...(attachments === undefined ? {} : { attachments }),
+      })
+    }).pipe(Effect.ensuring(Effect.sync(() => abort.dispose())))
   })
 }
+
+/**
+ * The hub-resident plugin-tool execute authority. `emit` is optional so a
+ * non-streaming caller (or an existing single-argument consumer) still works; the
+ * server's streaming handler always supplies the real sink.
+ */
+export type PluginToolAuthority = (
+  input: PluginToolExecuteInput,
+  emit?: PluginToolProgressSink,
+) => Promise<PluginToolExecuteResult>
 
 /**
  * Build the hub-resident plugin-tool authority for a worker. The hub owns plugin
  * loading (decision 70), so resolution is deferred through `plugin`, letting the
  * caller read `Plugin.Service` (and the other hub authorities) from the worker's
- * captured session context.
+ * captured session context. `registerAbort` wires the per-call controller into the
+ * hub cancel path; absent, a throwaway controller is used (best-effort).
  */
 export function pluginToolAuthority(options: {
   readonly plugin: () => Option.Option<Plugin.Interface>
   readonly run: HubProxyRunner
-}): NonNullable<HubProxyAuthorities["pluginTool"]> {
-  return (input) =>
+  readonly registerAbort?: (sessionID: string, callID: string) => PluginToolAbortHandle
+}): PluginToolAuthority {
+  return (input, emit = () => {}) =>
     // The effect needs the hub-resident services (Permission / Truncate / Agent /
     // Session). `run` provides the dispatching session's captured context, but
     // `HubProxyRunner` erases `R`, so the requirement is asserted at this single
     // boundary rather than threaded through the frozen signature.
     options.run(
-      pluginToolExecute(options.plugin, input) as unknown as Effect.Effect<
+      pluginToolExecute(options.plugin, input, emit, options.registerAbort) as unknown as Effect.Effect<
         PluginToolExecuteResult,
         UnknownPluginToolError
       >,
@@ -735,6 +943,8 @@ interface WorkerPortRegistryOptions {
   readonly backends: () => WorkerPortBackends | undefined
   /** The handler map for one worker's control port (per-session context). */
   readonly hubProxyHandlersFor: (workerID: number) => HubProxyHandlers | undefined
+  /** The streaming half of one worker's control port (e.g. `pluginTool.metadata`). */
+  readonly hubProxyStreamingFor: (workerID: number) => Readonly<Record<string, HubProxyStreamHandler>> | undefined
   readonly onPidReport?: (workerID: number, report: PidReport) => void
 }
 
@@ -801,7 +1011,7 @@ function createWorkerPortRegistry(options: WorkerPortRegistryOptions): WorkerPor
     hubProxyDisposers.get(workerID)?.()
     const disposers: (() => void)[] = []
     const handlers = options.hubProxyHandlersFor(workerID)
-    if (handlers !== undefined) disposers.push(serveHubProxy(handlers, port))
+    if (handlers !== undefined) disposers.push(serveHubProxy(handlers, port, options.hubProxyStreamingFor(workerID)))
     const onPidReport = options.onPidReport
     if (onPidReport !== undefined) {
       // The port association is the authoritative owner: the worker only knows
@@ -837,6 +1047,13 @@ interface CancelReporterOptions {
   readonly events?: LiveEventPublisher
   /** Per-session publisher, so a cancel carries the cancelled session's location. */
   readonly eventPublisherFor?: (sessionID: SessionID) => LiveEventPublisher | undefined
+  /**
+   * Invoked at the START of a cancel, before the grace window begins, for the
+   * session and each descendant. The production layer aborts the session's
+   * in-flight plugin tools here, so a hub-executed tool unwinds immediately
+   * instead of only after the grace window has elapsed.
+   */
+  readonly onCancelRequested?: (sessionID: SessionID) => void
   readonly log: WorkerLogger
 }
 
@@ -882,6 +1099,12 @@ function createCancelReporter(options: CancelReporterOptions): CancelReporter {
     // Drop a prior request's recorded modes so its outcome is never reused.
     cancelledModes.delete(sessionID)
     for (const descendant of descendants) cancelledModes.delete(descendant)
+
+    // Signal BEFORE the grace window: an in-flight plugin tool must see its
+    // `ctx.abort` fire at the moment of the cancel, not only once the grace has
+    // elapsed. The cascade mirrors the dispatcher's children-first order.
+    options.onCancelRequested?.(sessionID)
+    for (const descendant of descendants) options.onCancelRequested?.(descendant)
 
     // The dispatcher cascades to the descendants itself (children-first); the
     // recorded modes below reconstruct each descendant's settlement.
@@ -970,6 +1193,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     jobs,
     backends: portBackends,
     hubProxyHandlersFor,
+    hubProxyStreamingFor,
     onPidReport: options.onPidReport,
   })
 
@@ -1000,6 +1224,17 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     return { ...base, dispatchSubagent: base.dispatchSubagent ?? dispatchSubagent }
   }
 
+  /**
+   * The streaming half of a worker's control port. It cannot be mixed into
+   * `handlers` (a method is served by one or the other), so it rides the separate
+   * `streaming` map `serveHubProxy` accepts. A source backend may specialize by
+   * worker; a static `hubProxyStreaming` is the fallback.
+   */
+  function hubProxyStreamingFor(workerID: number): Readonly<Record<string, HubProxyStreamHandler>> | undefined {
+    const backends = portBackends()
+    return backends?.hubProxyStreamingFor?.(workerID) ?? backends?.hubProxyStreaming
+  }
+
   // Materialise the pool, wiring its transferred job ports into the registry.
   const onJobPort = (workerID: number, port: MessagePort): void => {
     ports.attachJobPort(workerID, jobPortFromMessagePort(port))
@@ -1020,7 +1255,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     dispatcher: () => dispatcher,
     childrenOf,
     events: options.events,
-    ...defined({ eventPublisherFor: options.eventPublisherFor }),
+    ...defined({ eventPublisherFor: options.eventPublisherFor, onCancelRequested: options.onCancelRequested }),
     log,
   })
   const baseOnCancelled = resolvedCancellation?.onCancelled
@@ -1958,6 +2193,10 @@ export interface ProductionPortBackendsOptions {
   readonly hubProxy?: HubProxyHandlers
   /** Per-worker hub-proxy handlers (each control port served under its worker's session). */
   readonly hubProxyFor?: (workerID: number) => HubProxyHandlers | undefined
+  /** Per-worker streaming hub-proxy handlers (see {@link WorkerPortBackends.hubProxyStreamingFor}). */
+  readonly hubProxyStreamingFor?: (workerID: number) => Readonly<Record<string, HubProxyStreamHandler>> | undefined
+  /** Streaming hub-proxy handlers shared by every worker. */
+  readonly hubProxyStreaming?: Readonly<Record<string, HubProxyStreamHandler>>
   /**
    * The SQLite file the OWNED writer opens; defaults to the app database
    * ({@link Database.path}). Ignored when a `writer` is injected (the caller owns
@@ -2052,6 +2291,8 @@ export function buildProductionPortBackends(options: ProductionPortBackendsOptio
     egressMesh,
     ...(options.hubProxy === undefined ? {} : { hubProxy: options.hubProxy }),
     ...(options.hubProxyFor === undefined ? {} : { hubProxyFor: options.hubProxyFor }),
+    ...(options.hubProxyStreaming === undefined ? {} : { hubProxyStreaming: options.hubProxyStreaming }),
+    ...(options.hubProxyStreamingFor === undefined ? {} : { hubProxyStreamingFor: options.hubProxyStreamingFor }),
     // The default egress backend serves the data port AND attaches the worker's
     // control plane to the shared mesh; both the receiver and the attachment are
     // disposed with the port. A durable event reaching the data port is published
@@ -2135,6 +2376,8 @@ export interface ProductionSessionHubOptions {
   readonly events?: LiveEventPublisher
   /** Per-session live publisher, so a cancel carries the cancelled session's location. */
   readonly eventPublisherFor?: (sessionID: SessionID) => LiveEventPublisher | undefined
+  /** Abort in-flight plugin tools at the start of a cancel (see `SessionHubOptions`). */
+  readonly onCancelRequested?: (sessionID: SessionID) => void
   /**
    * Fired when a worker rebinds away from a session; lets the production layer
    * drop that session's per-session instance/context.
@@ -2277,6 +2520,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
       onSubagentDispatch: options.onSubagentDispatch,
       events: options.events,
       eventPublisherFor: options.eventPublisherFor,
+      onCancelRequested: options.onCancelRequested,
       writeBarrier: options.writeBarrier,
       onPidReport,
     }),
@@ -2385,6 +2629,10 @@ interface PerSessionResolvers {
   readonly eventsForSession: (sessionID: SessionID) => LiveEventPublisher
   readonly eventsForWorker: (workerID: number) => LiveEventPublisher | undefined
   readonly hubProxyFor: (workerID: number) => HubProxyHandlers
+  /** The streaming half of a worker's hub-proxy map (`pluginTool.metadata`). */
+  readonly hubProxyStreamingFor: (workerID: number) => Readonly<Record<string, HubProxyStreamHandler>>
+  /** Abort every in-flight plugin tool of a session (the hub cancel cascade). */
+  readonly abortPluginTools: (sessionID: SessionID) => void
   readonly instanceOfSessionDeep: (sessionID: SessionID | undefined) => InstanceContext | undefined
   readonly resolveInit: (sessionID?: SessionID) => Promise<SessionWorkerInit>
   readonly recordDispatch: (sessionID: SessionID) => void
@@ -2483,28 +2731,45 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
       plugin: () => (context === undefined ? Option.none() : Context.getOption(context, Plugin.Service)),
       run: runHubProxyFor(context),
     })
-  // Build the handler map per worker under THAT worker's session context. A
+  // The per-hub in-flight plugin-tool abort registry. Owned here because the
+  // plugin-tool authority (below) is the only registrar, and the hub cancel path
+  // reaches it through the resolver's `abortPluginTools`.
+  const pluginToolAborts = createPluginToolAbortRegistry()
+  const pluginToolFor = (context: Context.Context<never> | undefined): PluginToolAuthority =>
+    pluginToolAuthority({
+      plugin: () => (context === undefined ? Option.none() : Context.getOption(context, Plugin.Service)),
+      run: runHubProxyFor(context),
+      registerAbort: (sessionID, callID) => pluginToolAborts.registerAbort(sessionID, callID),
+    })
+  // Build the authority map per worker under THAT worker's session context. A
   // worker is bound to exactly one session, so its control port reaches the
   // right `SessionStatus`/`Permission`/`Question`/`systemTransform`/
   // `messagesTransform`/`pluginTool` instance.
+  const hubProxyAuthoritiesFor = (context: Context.Context<never> | undefined): HubProxyAuthorities => ({
+    sessionStatus: authorities.sessionStatus,
+    permission: authorities.permission,
+    question: authorities.question,
+    systemTransform: systemTransformFor(context),
+    messagesTransform: messagesTransformFor(context),
+    // The worker forwards plugin-tool executes here; the definition (and its
+    // plugin instance) stays on the hub. `registerAbort` keys each in-flight call
+    // so the hub cancel path / `pluginTool.abort` can unwind it.
+    pluginTool: pluginToolFor(context),
+    // The lazy descriptor refresh: descriptors shipped at init go stale when a
+    // plugin reloads, so the worker re-fetches them here.
+    pluginToolList: () => resolveContextPluginToolDescriptors(context),
+    // Best-effort per-call abort the worker may request directly.
+    pluginToolAbort: (input) => pluginToolAborts.abort(input.sessionID, input.callID),
+  })
   const hubProxyFor = (workerID: number): HubProxyHandlers => {
     const context = contextOfWorker(workerID)
-    return buildHubProxyHandlers(
-      {
-        sessionStatus: authorities.sessionStatus,
-        permission: authorities.permission,
-        question: authorities.question,
-        systemTransform: systemTransformFor(context),
-        messagesTransform: messagesTransformFor(context),
-        // The worker forwards plugin-tool executes here; the definition (and its
-        // plugin instance) stays on the hub.
-        pluginTool: pluginToolAuthority({
-          plugin: () => (context === undefined ? Option.none() : Context.getOption(context, Plugin.Service)),
-          run: runHubProxyFor(context),
-        }),
-      },
-      runHubProxyFor(context),
-    )
+    return buildHubProxyHandlers(hubProxyAuthoritiesFor(context), runHubProxyFor(context))
+  }
+  // The streaming half of the map: `pluginTool.execute` pushes mid-execute
+  // metadata to the awaiting worker. Served alongside the plain map.
+  const hubProxyStreamingFor = (workerID: number): Readonly<Record<string, HubProxyStreamHandler>> => {
+    const context = contextOfWorker(workerID)
+    return buildHubProxyStreamHandlers(hubProxyAuthoritiesFor(context))
   }
   // Per-session: the pool passes the session it is building a worker for, so
   // this session's instance/model (and plugin effect) is the one shipped, never
@@ -2588,6 +2853,8 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
     eventsForSession,
     eventsForWorker,
     hubProxyFor,
+    hubProxyStreamingFor,
+    abortPluginTools: (sessionID) => pluginToolAborts.abortSession(sessionID),
     instanceOfSessionDeep,
     resolveInit,
     recordDispatch,
@@ -2687,6 +2954,7 @@ export function productionSessionHubLayer(
             ...options.backends,
             hubProxy: options.backends?.hubProxy,
             hubProxyFor: options.backends?.hubProxyFor ?? resolvers.hubProxyFor,
+            hubProxyStreamingFor: options.backends?.hubProxyStreamingFor ?? resolvers.hubProxyStreamingFor,
             events: resolvers.events,
             eventsForWorker: resolvers.eventsForWorker,
           }))
@@ -2707,6 +2975,7 @@ export function productionSessionHubLayer(
         },
         onDispatch: resolvers.recordDispatch,
         onSubagentDispatch: resolvers.copyContextToChild,
+        onCancelRequested: (sessionID) => resolvers.abortPluginTools(sessionID),
       })
       hubRef = hub
       yield* Effect.addFinalizer(() =>

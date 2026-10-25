@@ -11,12 +11,36 @@
 // This module is deliberately dependency-light: both the worker (`layer.ts`) and
 // the hub (`hub.ts`) import it, so it must not reach back into either.
 
+import type { JSONSchema7 } from "@ai-sdk/provider"
+
 /** The clone-safe projection of one plugin tool, shipped to the worker init. */
 export interface PluginToolDescriptor {
   readonly id: string
   readonly description: string
-  readonly jsonSchema: unknown
+  readonly jsonSchema: JSONSchema7
 }
+
+/**
+ * A single mid-execute progress update a hub plugin tool reports through its
+ * `ToolContext.metadata`. Only clone-safe fields are carried: the worker turns
+ * them back into the local `Tool.Context.metadata` call.
+ */
+export interface PluginToolProgress {
+  readonly title?: string
+  readonly metadata?: unknown
+}
+
+/** Receives {@link PluginToolProgress} updates while a remote tool executes. */
+export type PluginToolProgressSink = (progress: PluginToolProgress) => void
+
+/**
+ * Ask the hub to unwind one in-flight `pluginTool.execute`, identified by its
+ * `(sessionID, callID)` frame. The worker builds this over the hub control port
+ * (`hubProxyPluginToolAbort`); {@link remotePluginToolHooks} adapts it onto each
+ * remote definition's {@link RemotePluginToolDefinition.abort}, which the
+ * registry invokes when the local `toolCtx.abort` fires.
+ */
+export type PluginToolAbort = (input: { readonly sessionID: string; readonly callID: string }) => void | Promise<void>
 
 /** One `pluginTool.execute` hub-proxy request: which tool, in which call frame. */
 export interface PluginToolExecuteInput {
@@ -38,7 +62,7 @@ export interface PluginToolExecuteResult {
 
 /** The worker's hub-port client for `pluginTool.execute`, when one is wired. */
 export interface PluginToolExecutor {
-  execute(input: PluginToolExecuteInput): Promise<PluginToolExecuteResult>
+  execute(input: PluginToolExecuteInput, onProgress?: PluginToolProgressSink): Promise<PluginToolExecuteResult>
 }
 
 /** The call frame a worker-side remote tool forwards to its executor. */
@@ -56,16 +80,50 @@ export interface RemotePluginToolContext {
  */
 export interface RemotePluginToolDefinition {
   readonly description: string
-  readonly jsonSchema: unknown
-  readonly execute: (args: unknown, ctx: RemotePluginToolContext) => Promise<PluginToolExecuteResult>
+  readonly jsonSchema: JSONSchema7
+  readonly execute: (
+    args: unknown,
+    ctx: RemotePluginToolContext,
+    onProgress?: PluginToolProgressSink,
+  ) => Promise<PluginToolExecuteResult>
+  /**
+   * Cross the isolate to abort this tool's in-flight hub call. Optional so a
+   * definition built without a hub control port (or an older caller) stays
+   * valid; the registry reads it structurally and invokes it on `toolCtx.abort`.
+   */
+  readonly abort?: (ctx: RemotePluginToolContext) => void | Promise<void>
+  /**
+   * Re-fetch the hub's descriptor set after an `UnknownPluginToolError` (a
+   * stale descriptor or a plugin reloaded mid-generation). Optional; the
+   * registry calls it structurally, then invalidates its cached registration so
+   * the next build re-registers the fresh descriptors.
+   */
+  readonly refresh?: () => void | Promise<void>
+}
+
+/**
+ * Raised when a hub plugin tool returns a result that cannot cross the isolate.
+ * Fail loud: a non-cloneable payload is a config defect, and naming the tool and
+ * the offending field turns a cryptic structuredClone failure into an actionable
+ * one. Hub-side code throws this; it surfaces to the worker as a tagged
+ * `HubProxyRemoteError`.
+ */
+export class PluginToolNotSerializableError extends Error {
+  readonly _tag = "PluginToolNotSerializableError"
+  constructor(
+    readonly toolID: string,
+    readonly detail: string,
+  ) {
+    super(`plugin tool "${toolID}" returned a non-serializable ${detail}`)
+    this.name = "PluginToolNotSerializableError"
+  }
 }
 
 /**
  * Whether `value` is a worker-side remote definition rather than a real
  * `ToolDefinition`. A real plugin tool carries a Zod `args` raw shape and never a
- * `jsonSchema` key; {@link remotePluginToolHooks} always sets `jsonSchema` (even
- * when it is `undefined`), so the own-key presence distinguishes them without a
- * fragile brand.
+ * `jsonSchema` key; {@link remotePluginToolHooks} always sets `jsonSchema`, so the
+ * own-key presence distinguishes them without a fragile brand.
  */
 export function isRemotePluginToolDefinition(value: unknown): value is RemotePluginToolDefinition {
   if (typeof value !== "object" || value === null) return false
@@ -78,29 +136,50 @@ export function isRemotePluginToolDefinition(value: unknown): value is RemotePlu
 }
 
 /**
+ * The optional hub callbacks each rebuilt remote definition carries: the abort
+ * bridge (adapted from a {@link PluginToolAbort}) and the lazy-refresh action.
+ * Both are omitted from the built stub when absent, so a definition without a
+ * hub control port never advertises a seam that would fail on call.
+ */
+export interface RemotePluginToolCallbacks {
+  readonly abort?: PluginToolAbort
+  readonly refresh?: () => void | Promise<void>
+}
+
+/**
  * Rebuild the `Hooks.tool` map a worker's reduced `Plugin.Service` lists — one
  * remote definition per descriptor. Each call forwards to `executor` with the
- * descriptor's id and the call frame; the hub owns the real plugin instance and
- * runs it.
+ * descriptor's id, the call frame, and the caller's progress sink; the hub owns
+ * the real plugin instance and runs it. `callbacks` (when supplied) attach the
+ * hub abort bridge and the lazy-refresh seam to every definition.
  */
 export function remotePluginToolHooks(
   descriptors: readonly PluginToolDescriptor[],
   executor: PluginToolExecutor,
+  callbacks: RemotePluginToolCallbacks = {},
 ): { readonly tool: Record<string, RemotePluginToolDefinition> } {
+  const { abort, refresh } = callbacks
   const tool: Record<string, RemotePluginToolDefinition> = {}
   for (const descriptor of descriptors) {
     tool[descriptor.id] = {
       description: descriptor.description,
       jsonSchema: descriptor.jsonSchema,
-      execute: (args, ctx) =>
-        executor.execute({
-          toolID: descriptor.id,
-          sessionID: ctx.sessionID,
-          messageID: ctx.messageID,
-          callID: ctx.callID ?? "",
-          agent: ctx.agent,
-          args,
-        }),
+      execute: (args, ctx, onProgress) =>
+        executor.execute(
+          {
+            toolID: descriptor.id,
+            sessionID: ctx.sessionID,
+            messageID: ctx.messageID,
+            callID: ctx.callID ?? "",
+            agent: ctx.agent,
+            args,
+          },
+          onProgress,
+        ),
+      ...(abort === undefined
+        ? {}
+        : { abort: (ctx: RemotePluginToolContext) => abort({ sessionID: ctx.sessionID, callID: ctx.callID ?? "" }) }),
+      ...(refresh === undefined ? {} : { refresh }),
     }
   }
   return { tool }

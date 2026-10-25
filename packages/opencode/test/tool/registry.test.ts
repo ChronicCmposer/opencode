@@ -2,12 +2,12 @@ import { afterEach, describe, expect } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
 import { fileURLToPath, pathToFileURL } from "url"
-import { Effect, Layer, Result, Schema } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Result, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ToolRegistry, pluginToolJsonSchema } from "@/tool/registry"
 import { Tool } from "@/tool/tool"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { pollWithTimeout, testEffect } from "../lib/effect"
 import { TestConfig } from "../fixture/config"
 import { Config } from "@/config/config"
 import { Plugin } from "@/plugin"
@@ -28,7 +28,12 @@ import {
   type PluginToolExecuteInput,
   type PluginToolExecuteResult,
   type PluginToolExecutor,
+  type RemotePluginToolContext,
 } from "@/session/worker/plugin-tool-wire"
+import { PluginToolIDCollisionError, createHubProxyClient, serveHubProxy } from "@/session/worker/layer"
+import { buildHubProxyHandlers, type HubProxyAuthorities } from "@/session/worker/hub"
+import { hubProxyPluginTool, hubProxyPluginToolAbort } from "@/session/worker/session-worker"
+import { HubProxyRemoteError } from "@/session/worker/hub-proxy-wire"
 
 const configLayer = TestConfig.layer({
   directories: () => InstanceState.directory.pipe(Effect.map((dir) => [path.join(dir, ".opencode")])),
@@ -85,6 +90,173 @@ const remotePluginLayer = Layer.succeed(
   }),
 )
 
+// L2 F2: a hand-built remote definition that emits progress mid-execute. It is
+// built directly (not via `remotePluginToolHooks`) so the optional third
+// `onProgress` argument is observable by the test.
+const progressMetadata: Array<{ title?: string; metadata?: unknown }> = []
+const progressDef = {
+  description: "remote progress tool",
+  jsonSchema: { type: "object", properties: {} },
+  execute: async (
+    _args: unknown,
+    _ctx: RemotePluginToolContext,
+    onProgress?: (progress: { title?: string; metadata?: unknown }) => unknown,
+  ): Promise<PluginToolExecuteResult> => {
+    await onProgress?.({ title: "working", metadata: { pct: 42 } })
+    await onProgress?.({ title: "almost", metadata: { pct: 90 } })
+    return { title: "done", output: "FINISHED", metadata: { final: true } }
+  },
+}
+const progressPluginLayer = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    init: () => Effect.void,
+    trigger: ((_name: unknown, _input: unknown, output: unknown) =>
+      Effect.succeed(output)) as Plugin.Interface["trigger"],
+    list: () => Effect.succeed([{ tool: { remote_progress: progressDef } } as unknown as Hooks]),
+  }),
+)
+
+// L2 F1: a remote definition exposing an abort bridge. `execute` stays pending
+// until the test releases it, so the abort subscription can be observed and the
+// listener-removal finalizer exercised.
+const abortBridgeCalls: RemotePluginToolContext[] = []
+let notifyAbortExecuteStarted: (() => void) | undefined
+let releaseAbortExecute: ((result: PluginToolExecuteResult) => void) | undefined
+const abortDef = {
+  description: "remote abort tool",
+  jsonSchema: { type: "object", properties: {} },
+  execute: (_args: unknown, _ctx: RemotePluginToolContext): Promise<PluginToolExecuteResult> =>
+    new Promise((resolve) => {
+      notifyAbortExecuteStarted?.()
+      releaseAbortExecute = resolve
+    }),
+  abort: (ctx: RemotePluginToolContext) => {
+    abortBridgeCalls.push(ctx)
+  },
+}
+const abortPluginLayer = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    init: () => Effect.void,
+    trigger: ((_name: unknown, _input: unknown, output: unknown) =>
+      Effect.succeed(output)) as Plugin.Interface["trigger"],
+    list: () => Effect.succeed([{ tool: { remote_abort: abortDef } } as unknown as Hooks]),
+  }),
+)
+
+// L2 F7: a remote descriptor whose id shadows the built-in `read` tool.
+const collisionDescriptors: readonly PluginToolDescriptor[] = [
+  { id: "read", description: "shadows the built-in read", jsonSchema: { type: "object", properties: {} } },
+]
+const collisionPluginLayer = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    init: () => Effect.void,
+    trigger: ((_name: unknown, _input: unknown, output: unknown) =>
+      Effect.succeed(output)) as Plugin.Interface["trigger"],
+    list: () => Effect.succeed([remotePluginToolHooks(collisionDescriptors, remoteExecutor) as unknown as Hooks]),
+  }),
+)
+
+// INT F1: the FULL abort path. The remote definition's abort bridge is the REAL
+// hub-proxy client (`remotePluginToolHooks` adapts it), so aborting the local
+// `toolCtx` crosses a MessageChannel to the hub's `pluginTool.abort` authority —
+// not a hand-built bridge. `execute` stays pending until the test releases it.
+const hubAbortCalls: { sessionID: string; callID: string }[] = []
+let releaseHubExecute: ((result: PluginToolExecuteResult) => void) | undefined
+let notifyHubExecuteStarted: (() => void) | undefined
+const hubProxyDescriptors: readonly PluginToolDescriptor[] = [
+  { id: "remote_hub_abort", description: "hub proxy abort tool", jsonSchema: { type: "object", properties: {} } },
+]
+const hubProxyClient = (() => {
+  const channel = new MessageChannel()
+  const map: HubProxyAuthorities = {
+    sessionStatus: {} as never,
+    permission: {} as never,
+    question: {} as never,
+    pluginTool: () =>
+      new Promise<PluginToolExecuteResult>((resolve) => {
+        notifyHubExecuteStarted?.()
+        releaseHubExecute = resolve
+      }),
+    pluginToolAbort: (input) => {
+      hubAbortCalls.push(input)
+    },
+  }
+  serveHubProxy(
+    buildHubProxyHandlers(map, (effect) => Promise.resolve(effect as never)),
+    channel.port2,
+  )
+  return createHubProxyClient(channel.port1)
+})()
+const hubProxyPluginLayer = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    init: () => Effect.void,
+    trigger: ((_name: unknown, _input: unknown, output: unknown) =>
+      Effect.succeed(output)) as Plugin.Interface["trigger"],
+    list: () =>
+      Effect.succeed([
+        remotePluginToolHooks(hubProxyDescriptors, hubProxyPluginTool(hubProxyClient)!, {
+          abort: hubProxyPluginToolAbort(hubProxyClient),
+        }) as unknown as Hooks,
+      ]),
+  }),
+)
+
+// INT F3: a stale descriptor whose execute reports the hub's
+// `UnknownPluginToolError`. `refresh` re-fetches the hub's (mutated) descriptor
+// set; the stub must additionally invalidate the cached registry state so the
+// next build re-registers the fresh descriptor.
+const staleDescriptor: PluginToolDescriptor = {
+  id: "stale_plugin_tool",
+  description: "stale descriptor",
+  jsonSchema: { type: "object", properties: {} },
+}
+const freshDescriptor: PluginToolDescriptor = {
+  id: "fresh_plugin_tool",
+  description: "fresh descriptor",
+  jsonSchema: { type: "object", properties: {} },
+}
+let healDescriptors: readonly PluginToolDescriptor[] = [staleDescriptor]
+const refreshCalls: string[] = []
+const staleExecutor: PluginToolExecutor = {
+  execute: async () => {
+    throw new HubProxyRemoteError('unknown plugin tool "stale_plugin_tool"', { tag: "UnknownPluginToolError" })
+  },
+}
+const healPluginLayer = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    init: () => Effect.void,
+    trigger: ((_name: unknown, _input: unknown, output: unknown) =>
+      Effect.succeed(output)) as Plugin.Interface["trigger"],
+    list: () =>
+      Effect.succeed([
+        remotePluginToolHooks(healDescriptors, staleExecutor, {
+          refresh: () => {
+            refreshCalls.push("refresh")
+            healDescriptors = [freshDescriptor]
+          },
+        }) as unknown as Hooks,
+      ]),
+  }),
+)
+
+// Build a `Tool.Context` with sane defaults; tests override the fields they probe.
+const makeToolContext = (agent: string, overrides: Partial<Tool.Context> = {}): Tool.Context => ({
+  sessionID: SessionID.make("ses_remote"),
+  messageID: MessageID.make("msg_remote"),
+  callID: "call_remote",
+  agent,
+  abort: new AbortController().signal,
+  messages: [],
+  metadata: () => Effect.void,
+  ask: () => Effect.void,
+  ...overrides,
+})
+
 const root = LayerNode.group([ToolRegistry.node, Agent.node])
 const replacements = [
   [Config.node, configLayer],
@@ -130,10 +302,24 @@ const withEmptyCodeMode = testEffect(
 )
 const withBrokenPlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, brokenPluginLayer]]))
 const withRemotePlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, remotePluginLayer]]))
+const withRemoteProgress = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, progressPluginLayer]]))
+const withRemoteAbort = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, abortPluginLayer]]))
+const withRemoteCollision = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, collisionPluginLayer]]))
+const withRemoteHubAbort = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, hubProxyPluginLayer]]))
+const withRefreshHeal = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, healPluginLayer]]))
 
 afterEach(async () => {
   await disposeAllInstances()
   remoteToolCalls.length = 0
+  progressMetadata.length = 0
+  abortBridgeCalls.length = 0
+  notifyAbortExecuteStarted = undefined
+  releaseAbortExecute = undefined
+  hubAbortCalls.length = 0
+  notifyHubExecuteStarted = undefined
+  releaseHubExecute = undefined
+  refreshCalls.length = 0
+  healDescriptors = [staleDescriptor]
 })
 
 describe("tool.registry", () => {
@@ -365,6 +551,158 @@ describe("tool.registry", () => {
       expect(result.title).toBe(remoteToolResult.title)
       expect(result.output).toBe(remoteToolResult.output)
       expect(result.metadata).toEqual({ ranOnHub: true })
+    }),
+  )
+
+  // L2 F2: a hub-executed plugin tool that emits progress mid-execute must have
+  // each update reach the live tool part through `toolCtx.metadata`, not only the
+  // final result metadata.
+  withRemoteProgress.instance("forwards remote plugin progress to toolCtx.metadata", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const loaded = (yield* registry.all()).find((tool) => tool.id === "remote_progress")
+      if (!loaded) throw new Error("remote_progress tool was not loaded")
+
+      const result = yield* loaded.execute(
+        {},
+        makeToolContext((yield* agents.defaultInfo()).name, {
+          metadata: (input) =>
+            Effect.sync(() => {
+              progressMetadata.push(input)
+            }),
+        }),
+      )
+
+      expect(progressMetadata).toEqual([
+        { title: "working", metadata: { pct: 42 } },
+        { title: "almost", metadata: { pct: 90 } },
+      ])
+      expect(result.output).toBe("FINISHED")
+      expect(result.metadata).toEqual({ final: true })
+    }),
+  )
+
+  // L2 F1: aborting the stub context must invoke the remote definition's hub
+  // abort bridge, and the listener must be removed once the call settles.
+  withRemoteAbort.instance("invokes the hub abort bridge on abort, then unsubscribes", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const loaded = (yield* registry.all()).find((tool) => tool.id === "remote_abort")
+      if (!loaded) throw new Error("remote_abort tool was not loaded")
+
+      const started = new Promise<void>((resolve) => {
+        notifyAbortExecuteStarted = resolve
+      })
+      const controller = new AbortController()
+      const fiber = yield* loaded
+        .execute({}, makeToolContext((yield* agents.defaultInfo()).name, { abort: controller.signal }))
+        .pipe(Effect.forkChild)
+
+      // Wait for the remote execute to start (the abort subscription is registered
+      // before the RPC), so the abort is deterministic rather than racing startup.
+      yield* Effect.promise(() => started)
+      expect(abortBridgeCalls).toEqual([])
+
+      controller.abort()
+      expect(abortBridgeCalls).toEqual([
+        {
+          sessionID: "ses_remote",
+          messageID: "msg_remote",
+          callID: "call_remote",
+          agent: (yield* agents.defaultInfo()).name,
+        },
+      ])
+
+      releaseAbortExecute?.({ title: "done", output: "DONE", metadata: {} })
+      const result = yield* Fiber.join(fiber)
+      expect(result.output).toBe("DONE")
+
+      // The listener was removed when the call settled: a repeat abort is inert.
+      controller.abort()
+      expect(abortBridgeCalls.length).toBe(1)
+    }),
+  )
+
+  // L2 F7: a remote plugin tool id must not silently shadow a built-in (or any
+  // other custom) tool. The failure is loud and names the offending id.
+  withRemoteCollision.instance("fails loud when a remote plugin tool id collides with a built-in tool", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const exit = yield* registry.ids().pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      const message = Exit.isFailure(exit) ? Cause.pretty(exit.cause) : ""
+      expect(message).toContain('"read"')
+      expect(message).toMatch(/collides with a locally registered tool/)
+      // The registry mirrors `PluginToolIDCollisionError`'s `reserved` wording
+      // exactly (it cannot import layer.ts without an ESM cycle).
+      expect(message).toContain(new PluginToolIDCollisionError("read", "reserved").message)
+    }),
+  )
+
+  // INT F1: abort must actually cross the hub proxy end-to-end. The remote
+  // definition's abort bridge is built from the real `hubProxyPluginToolAbort`
+  // client, so a local toolCtx abort reaches the hub's abort authority.
+  withRemoteHubAbort.instance("abort crosses the hub proxy to the hub abort authority", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const loaded = (yield* registry.all()).find((tool) => tool.id === "remote_hub_abort")
+      if (!loaded) throw new Error("remote_hub_abort tool was not loaded")
+
+      const started = new Promise<void>((resolve) => {
+        notifyHubExecuteStarted = resolve
+      })
+      const controller = new AbortController()
+      const fiber = yield* loaded
+        .execute(
+          {},
+          makeToolContext((yield* agents.defaultInfo()).name, {
+            sessionID: SessionID.make("ses_hub_abort"),
+            callID: "call_hub_abort",
+            abort: controller.signal,
+          }),
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Effect.promise(() => started)
+      expect(hubAbortCalls).toEqual([])
+
+      controller.abort()
+      yield* pollWithTimeout(
+        Effect.sync(() => (hubAbortCalls.length > 0 ? true : undefined)),
+        "the hub never received the pluginTool.abort RPC",
+      )
+
+      expect(hubAbortCalls).toEqual([{ sessionID: "ses_hub_abort", callID: "call_hub_abort" }])
+
+      releaseHubExecute?.({ title: "done", output: "DONE", metadata: {} })
+      const result = yield* Fiber.join(fiber)
+      expect(result.output).toBe("DONE")
+    }),
+  )
+
+  // INT F3: a stale descriptor self-heals. The stub refreshes the hub's set and
+  // invalidates the cached registration, so the next build lists the fresh tool.
+  withRefreshHeal.instance("refreshes and invalidates its cached state after UnknownPluginToolError", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+
+      expect(yield* registry.ids()).toContain("stale_plugin_tool")
+
+      const loaded = (yield* registry.all()).find((tool) => tool.id === "stale_plugin_tool")
+      if (!loaded) throw new Error("stale_plugin_tool was not loaded")
+
+      const exit = yield* loaded.execute({}, makeToolContext((yield* agents.defaultInfo()).name)).pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(refreshCalls).toEqual(["refresh"])
+
+      const ids = yield* registry.ids()
+      expect(ids).toContain("fresh_plugin_tool")
+      expect(ids).not.toContain("stale_plugin_tool")
     }),
   )
 

@@ -53,7 +53,12 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { MCP } from "@/mcp"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { McpCatalog } from "@/mcp/catalog"
-import { isRemotePluginToolDefinition, type RemotePluginToolDefinition } from "@/session/worker/plugin-tool-wire"
+import {
+  isRemotePluginToolDefinition,
+  type PluginToolExecuteResult,
+  type RemotePluginToolContext,
+  type RemotePluginToolDefinition,
+} from "@/session/worker/plugin-tool-wire"
 
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
   return (
@@ -190,6 +195,7 @@ const layer = Layer.effect(
           }
         }
 
+        const remoteToolIds = new Set<string>()
         const plugins = yield* plugin.list()
         for (const p of plugins) {
           for (const [id, def] of Object.entries(p.tool ?? {})) {
@@ -197,7 +203,8 @@ const layer = Layer.effect(
             // definitions; `fromPlugin` would call a local `execute` and
             // re-truncate, so those take the proxy-stub path instead.
             if (isRemotePluginToolDefinition(def)) {
-              custom.push(fromRemotePluginTool(id, def))
+              remoteToolIds.add(id)
+              custom.push(fromRemotePluginTool(id, def, () => InstanceState.invalidate(state)))
               continue
             }
             custom.push(fromPlugin(id, def))
@@ -227,27 +234,31 @@ const layer = Layer.effect(
           ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
         })
 
+        const builtin: Tool.Def[] = [
+          tool.invalid,
+          ...(questionEnabled ? [tool.question] : []),
+          tool.shell,
+          tool.read,
+          tool.glob,
+          tool.grep,
+          tool.edit,
+          tool.write,
+          tool.task,
+          tool.fetch,
+          tool.todo,
+          tool.search,
+          tool.skill,
+          tool.patch,
+          ...(tool.execute ? [tool.execute] : []),
+          ...(flags.experimentalLspTool ? [tool.lsp] : []),
+          ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
+        ]
+
+        assertRemoteToolIdsAreUnique(remoteToolIds, custom, builtin)
+
         return {
           custom,
-          builtin: [
-            tool.invalid,
-            ...(questionEnabled ? [tool.question] : []),
-            tool.shell,
-            tool.read,
-            tool.glob,
-            tool.grep,
-            tool.edit,
-            tool.write,
-            tool.task,
-            tool.fetch,
-            tool.todo,
-            tool.search,
-            tool.skill,
-            tool.patch,
-            ...(tool.execute ? [tool.execute] : []),
-            ...(flags.experimentalLspTool ? [tool.lsp] : []),
-            ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
-          ],
+          builtin,
           task: tool.task,
           read: tool.read,
         }
@@ -380,6 +391,79 @@ export function pluginToolJsonSchema(def: ToolDefinition): JSONSchema7 {
 }
 
 /**
+ * The worker-side sink a hub-executed plugin tool reports live progress through.
+ * Structurally mirrors the wire's `PluginToolProgressSink` but is declared here
+ * (a local type, not an import) so the stub forwards progress without the
+ * registry taking a hard dependency on each wire revision;
+ * {@link fromRemotePluginTool} runs the reported effect on the tool part through
+ * an `EffectBridge`.
+ */
+type RemoteProgressSink = (progress: { readonly title?: string; readonly metadata?: unknown }) => void | Promise<void>
+
+/** The optional hub abort bridge a remote definition may expose. */
+type RemoteAbortBridge = (ctx: RemotePluginToolContext) => void | Promise<void>
+
+/** The progress-aware `RemotePluginToolDefinition.execute` shape (wire v2). */
+type RemoteExecute = (
+  args: unknown,
+  ctx: RemotePluginToolContext,
+  onProgress?: RemoteProgressSink,
+) => Promise<PluginToolExecuteResult>
+
+/** Read the optional abort bridge off a remote definition without importing it. */
+function readRemoteAbortBridge(def: RemotePluginToolDefinition): RemoteAbortBridge | undefined {
+  const abort = (def as { readonly abort?: unknown }).abort
+  return typeof abort === "function" ? (abort as RemoteAbortBridge) : undefined
+}
+
+/** Read the optional lazy-refresh seam off a remote definition. */
+function readRemoteRefresh(def: RemotePluginToolDefinition): (() => void | Promise<void>) | undefined {
+  const refresh = (def as { readonly refresh?: unknown }).refresh
+  return typeof refresh === "function" ? (refresh as () => void | Promise<void>) : undefined
+}
+
+/**
+ * Whether a remote failure is the hub's `UnknownPluginToolError` — the stale
+ * descriptor signal that triggers a refresh. The failure crosses the control
+ * port as a `HubProxyRemoteError` carrying the remote `_tag`, so match on the tag
+ * structurally rather than importing the hub-only class (which lives behind the
+ * worker boundary and would couple this module to it).
+ */
+function isUnknownPluginToolError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { readonly tag?: unknown }).tag === "UnknownPluginToolError"
+  )
+}
+
+/**
+ * Remote plugin tools own the LLM-facing tool id. A collision — with a built-in,
+ * a `{tool,tools}/*` file tool, or another plugin — would make calls resolve to
+ * whichever definition wins, so it fails loud at registry build instead of
+ * silently shadowing. Non-remote duplicate ids keep the previous tolerance.
+ *
+ * `layer.ts` owns the descriptor-duplicate half of this policy
+ * (`assertPluginToolDescriptorsUnique`, which cannot know the built-ins); the
+ * registry owns the reserved/built-in half because it is the only place that
+ * knows them. The wording matches `PluginToolIDCollisionError`'s "reserved" case.
+ */
+function assertRemoteToolIdsAreUnique(
+  remoteIds: ReadonlySet<string>,
+  custom: readonly Tool.Def[],
+  builtin: readonly Tool.Def[],
+): void {
+  if (remoteIds.size === 0) return
+  const occurrences = new Map<string, number>()
+  for (const def of [...custom, ...builtin]) occurrences.set(def.id, (occurrences.get(def.id) ?? 0) + 1)
+  for (const id of remoteIds) {
+    if ((occurrences.get(id) ?? 0) > 1) {
+      throw new Error(`plugin tool id "${id}" collides with a locally registered tool`)
+    }
+  }
+}
+
+/**
  * Register a hub-executed plugin tool as a worker-side stub. The hub ships only
  * the clone-safe descriptor (`plugin-tool-wire.ts`); the plugin's real `execute`
  * closes over hub state and cannot cross the isolate, so this stub forwards the
@@ -389,30 +473,81 @@ export function pluginToolJsonSchema(def: ToolDefinition): JSONSchema7 {
  * the same `jsonSchema` and already bounds the result with
  * `Truncate.boundResult`, so this path must NOT re-truncate. A remote failure
  * surfaces as a defect, exactly like `fromPlugin`'s rejected plugin promise.
+ *
+ * Live progress is forwarded to `toolCtx.metadata` through an `EffectBridge`,
+ * and `toolCtx.abort` is subscribed so cancellation reaches the hub's per-call
+ * abort bridge (best-effort; the listener is removed when the call settles).
+ *
+ * When the hub reports `UnknownPluginToolError` the shipped descriptor is stale:
+ * `refresh` re-fetches the hub's set and `invalidateRemoteTools` drops the cached
+ * registration, so the next build re-registers fresh descriptors. The current
+ * call still fails (it cannot be retried transparently).
  */
-function fromRemotePluginTool(id: string, def: RemotePluginToolDefinition): Tool.Def {
+function fromRemotePluginTool(
+  id: string,
+  def: RemotePluginToolDefinition,
+  invalidateRemoteTools: () => Effect.Effect<void>,
+): Tool.Def {
   return {
     id,
     description: def.description,
     parameters: Schema.Unknown,
     jsonSchema: def.jsonSchema as JSONSchema7,
     execute: (args, toolCtx) =>
-      Effect.promise(() =>
-        def.execute(args, {
+      Effect.gen(function* () {
+        const bridge = yield* EffectBridge.make()
+        const remoteCtx: RemotePluginToolContext = {
           sessionID: toolCtx.sessionID,
           messageID: toolCtx.messageID,
           callID: toolCtx.callID,
           agent: toolCtx.agent,
+        }
+        const onProgress: RemoteProgressSink = (progress) =>
+          bridge.promise(
+            toolCtx.metadata({
+              title: progress.title,
+              metadata: progress.metadata as Tool.ExecuteResult["metadata"],
+            }),
+          )
+        const abort = readRemoteAbortBridge(def)
+        const onAbort = () => {
+          if (!abort) return
+          try {
+            void Promise.resolve(abort(remoteCtx)).catch(() => {})
+          } catch {
+            // Best-effort: an abort-bridge failure must not tear down the call.
+          }
+        }
+        // Subscribe before the RPC so an abort during execute reaches the hub; an
+        // already-aborted signal (the call started cancelled) is honoured at once.
+        if (toolCtx.abort.aborted) onAbort()
+        else toolCtx.abort.addEventListener("abort", onAbort)
+
+        return yield* Effect.tryPromise({
+          try: () => (def.execute as RemoteExecute)(args, remoteCtx, onProgress),
+          catch: (error) => error,
+        }).pipe(
+          Effect.ensuring(Effect.sync(() => toolCtx.abort.removeEventListener("abort", onAbort))),
+          Effect.map(
+            (result): Tool.ExecuteResult => ({
+              title: result.title,
+              output: result.output,
+              metadata: (result.metadata ?? {}) as Tool.ExecuteResult["metadata"],
+              attachments: result.attachments as Tool.ExecuteResult["attachments"],
+            }),
+          ),
+        )
+      }).pipe(
+        Effect.catch((error) => {
+          const refresh = readRemoteRefresh(def)
+          if (refresh === undefined || !isUnknownPluginToolError(error)) return Effect.fail(error)
+          return Effect.gen(function* () {
+            yield* Effect.promise(() => Promise.resolve(refresh()))
+            yield* invalidateRemoteTools()
+            return yield* Effect.fail(error)
+          })
         }),
-      ).pipe(
-        Effect.map(
-          (result): Tool.ExecuteResult => ({
-            title: result.title,
-            output: result.output,
-            metadata: (result.metadata ?? {}) as Tool.ExecuteResult["metadata"],
-            attachments: result.attachments as Tool.ExecuteResult["attachments"],
-          }),
-        ),
+        Effect.orDie,
       ),
   }
 }

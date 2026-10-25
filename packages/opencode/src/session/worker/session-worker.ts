@@ -76,6 +76,7 @@ import {
   llmModelClientLayer,
   reducedLlmLayer,
   reducedModelProviderLayer,
+  refreshablePluginTools,
   type BackgroundJobClientHandle,
   type BrokerClientHandle,
   type HubProxyClient,
@@ -94,6 +95,7 @@ import type {
   PluginToolDescriptor,
   PluginToolExecuteResult,
   PluginToolExecutor,
+  PluginToolProgress,
 } from "./plugin-tool-wire"
 
 /** The real model capabilities, serialized for the isolate boundary. */
@@ -141,9 +143,7 @@ export interface SessionWorkerModel {
  * unserved port. Modelled as a union so the served state is an explicit `true`,
  * never a truthy accident.
  */
-export type SessionWorkerCapabilities =
-  | { readonly sessionWorkerPorts: true }
-  | { readonly sessionWorkerPorts?: false }
+export type SessionWorkerCapabilities = { readonly sessionWorkerPorts: true } | { readonly sessionWorkerPorts?: false }
 
 export interface SessionWorkerInit {
   readonly snapshot: WorkerSnapshot
@@ -235,10 +235,7 @@ export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
   }
 
   const workerID = candidate.workerID
-  if (
-    workerID !== undefined &&
-    (typeof workerID !== "number" || !Number.isInteger(workerID) || workerID < 0)
-  ) {
+  if (workerID !== undefined && (typeof workerID !== "number" || !Number.isInteger(workerID) || workerID < 0)) {
     throw new Error(`session worker workerData.workerID must be a non-negative integer, received ${workerID}`)
   }
 
@@ -385,6 +382,27 @@ export interface SessionWorkerBootstrap {
   onChildResult(sink: ChildResultSink): () => void
   /** Tear down the bootstrapped child-result subscription. */
   dispose(): void
+  /**
+   * The hub-proxied plugin-tool abort seam (see {@link hubProxyPluginToolAbort}),
+   * built from the worker's single multiplexed control-port client. Absent on
+   * degraded boot; a consumer (the registry's tool-abort path) forwards an
+   * in-flight `(sessionID, callID)` here to unwind the hub-side execution.
+   */
+  readonly pluginToolAbort?: (input: { readonly sessionID: string; readonly callID: string }) => Promise<void>
+  /**
+   * The hub-proxied plugin-tool descriptor list (see
+   * {@link hubProxyPluginToolList}) — the lazy-refresh seam. Absent on degraded
+   * boot; a consumer re-fetches descriptors here when execution reports
+   * `UnknownPluginToolError` (a plugin reloaded mid-generation).
+   */
+  readonly pluginToolList?: () => Promise<readonly PluginToolDescriptor[]>
+  /**
+   * Re-fetch the descriptors from the hub and swap them into the worker's live
+   * `RemotePluginTools`. This is the lazy-refresh action for the design Q4 stale
+   * descriptor case: call it after `UnknownPluginToolError`, then re-register.
+   * Absent on degraded boot or when no plugin tools were shipped.
+   */
+  readonly refreshPluginTools?: () => Promise<void>
 }
 
 // ---------------------------------------------------------------------------
@@ -789,8 +807,46 @@ export function hubProxyMessagesTransform(
 export function hubProxyPluginTool(hubProxy: HubProxyClient | undefined): PluginToolExecutor | undefined {
   if (hubProxy === undefined) return undefined
   return {
-    execute: (input) => hubProxy.call("pluginTool.execute", [input]) as Promise<PluginToolExecuteResult>,
+    execute: (input, onProgress) =>
+      hubProxy.call(
+        "pluginTool.execute",
+        [input],
+        // The hub streams mid-execute `ToolContext.metadata` updates back as
+        // `pluginTool.metadata` event frames; every other event method is for a
+        // different concern and is dropped. The sink is optional, so a caller
+        // that does not surface progress pays nothing.
+        (method, payload) => {
+          if (method === "pluginTool.metadata") onProgress?.(payload as PluginToolProgress)
+        },
+      ) as Promise<PluginToolExecuteResult>,
   }
+}
+
+/**
+ * The hub-proxied plugin-tool abort: forwards a `(sessionID, callID)` pair over
+ * the same multiplexed control port so the hub can unwind an in-flight plugin
+ * tool. Returns `undefined` on degraded boot, so a caller wires no abort rather
+ * than a stub that would fail on call.
+ */
+export function hubProxyPluginToolAbort(
+  hubProxy: HubProxyClient | undefined,
+): ((input: { readonly sessionID: string; readonly callID: string }) => Promise<void>) | undefined {
+  if (hubProxy === undefined) return undefined
+  return (input) => hubProxy.call("pluginTool.abort", [input]) as Promise<void>
+}
+
+/**
+ * The hub-proxied plugin-tool descriptor list: the lazy-refresh seam. Descriptors
+ * are shipped once at worker-init, so a plugin that reloads mid-generation leaves
+ * them stale; a registry that hits `UnknownPluginToolError` can call this to
+ * re-fetch the current descriptors over the same multiplexed control port.
+ * Returns `undefined` on degraded boot, so the caller keeps its current list.
+ */
+export function hubProxyPluginToolList(
+  hubProxy: HubProxyClient | undefined,
+): (() => Promise<readonly PluginToolDescriptor[]>) | undefined {
+  if (hubProxy === undefined) return undefined
+  return () => hubProxy.call("pluginTool.list", []) as Promise<readonly PluginToolDescriptor[]>
 }
 
 /** Options for {@link bootstrapSessionWorker}; every field is additive. */
@@ -899,9 +955,7 @@ export function bootstrapSessionWorker(
         egressControl: egressControlChannel.port2,
         broker: brokerChannel.port2,
       },
-      [writerChannel.port2, egressChannel.port2, egressControlChannel.port2, brokerChannel.port2].map(
-        transferable,
-      ),
+      [writerChannel.port2, egressChannel.port2, egressControlChannel.port2, brokerChannel.port2].map(transferable),
     )
     clients = buildWorkerClients(
       {
@@ -916,9 +970,7 @@ export function bootstrapSessionWorker(
     // authorities over one control port; a single multiplexing client backs all
     // three proxies (each call is correlated by the client's own request id).
     const hubProxyChannel = new MessageChannel()
-    scope.postMessage({ type: "hub-proxy", port: hubProxyChannel.port2 }, [
-      transferable(hubProxyChannel.port2),
-    ])
+    scope.postMessage({ type: "hub-proxy", port: hubProxyChannel.port2 }, [transferable(hubProxyChannel.port2)])
     const hubProxyClient = createHubProxyClient(hubProxyChannel.port1)
     hubProxies = { sessionStatus: hubProxyClient, permission: hubProxyClient, question: hubProxyClient }
     // The shell tool's detached children are reaped by the hub, so the same
@@ -938,7 +990,13 @@ export function bootstrapSessionWorker(
   // array passes through unchanged.
   const systemTransform = hubProxySystemTransform(hubProxies?.sessionStatus)
   const messagesTransform = hubProxyMessagesTransform(hubProxies?.sessionStatus)
+  // The executor, abort and list seams all ride the SAME multiplexed control
+  // client (`hubProxies.sessionStatus`): the hub distinguishes the methods, so no
+  // second port is opened. The abort/list seams are surfaced on the bootstrap
+  // handle for the registry/cancel owners to consume.
   const pluginToolExecutor = hubProxyPluginTool(hubProxies?.sessionStatus)
+  const pluginToolAbort = hubProxyPluginToolAbort(hubProxies?.sessionStatus)
+  const pluginToolList = hubProxyPluginToolList(hubProxies?.sessionStatus)
   const plugins =
     init.plugins === undefined
       ? undefined
@@ -946,20 +1004,36 @@ export function bootstrapSessionWorker(
           ...(systemTransform === undefined ? {} : { systemTransform }),
           ...(messagesTransform === undefined ? {} : { messagesTransform }),
         })
-  // Pass the real hub-proxy clients so the reduced LLM sub-graph routes
-  // `Permission` over the hub control port (never a silent mock); absent
-  // (degraded boot) the sub-graph uses a fail-loud boundary.
-  const modelClient = llmModelClientLayer(config).pipe(
-    Layer.provide(reducedLlmLayer(init.snapshot, config, hubProxies, plugins)),
-  )
   // Hub-executed plugin tools need BOTH the clone-safe descriptors the hub
   // shipped and the hub-port executor. A descriptor without an executor (or the
   // reverse) cannot execute, so the option is omitted entirely: degraded boot
   // lists no plugin tools rather than a stub that would fail on call.
+  // A live handle, not a frozen literal: `refresh` swaps the descriptor set in
+  // place after a hub-side plugin reload, and the worker's `Plugin.Service.list()`
+  // reads the current set on every call (design Q4).
   const pluginTools =
     pluginToolExecutor === undefined || init.pluginTools === undefined || init.pluginTools.length === 0
       ? undefined
-      : { descriptors: init.pluginTools, executor: pluginToolExecutor }
+      : refreshablePluginTools(init.pluginTools, pluginToolExecutor, {
+          // The abort and list seams ride the same control client as the
+          // executor; attaching them here makes each rebuilt remote definition
+          // carry a working abort bridge and lazy-refresh action.
+          ...(pluginToolAbort === undefined ? {} : { abort: pluginToolAbort }),
+          ...(pluginToolList === undefined ? {} : { list: pluginToolList }),
+        })
+  // The lazy-refresh action. No plugin/config reload signal reaches a live worker,
+  // so the registry calls this after `UnknownPluginToolError` (a stale descriptor)
+  // rather than on a push. It is the SAME `refreshFromHub` each remote definition
+  // exposes, so the bootstrap handle and the in-graph defs refresh identically.
+  const refreshPluginTools = pluginTools?.refreshFromHub
+  // Pass the real hub-proxy clients so the reduced LLM sub-graph routes
+  // `Permission` over the hub control port (never a silent mock); absent
+  // (degraded boot) the sub-graph uses a fail-loud boundary. The same live
+  // `pluginTools` handle reaches the reduced sub-graph's `Plugin` replacement, so
+  // a future tool-consuming reduced node sees the refreshed set too.
+  const modelClient = llmModelClientLayer(config).pipe(
+    Layer.provide(reducedLlmLayer(init.snapshot, config, hubProxies, plugins, pluginTools)),
+  )
 
   const runtime = buildSessionWorkerLayer({
     // The full runnable graph needs the writer-backed Database and the serialized
@@ -1039,6 +1113,9 @@ export function bootstrapSessionWorker(
       unsubscribeChildResults()
       childResultSinks.clear()
     },
+    ...(pluginToolAbort === undefined ? {} : { pluginToolAbort }),
+    ...(pluginToolList === undefined ? {} : { pluginToolList }),
+    ...(refreshPluginTools === undefined ? {} : { refreshPluginTools }),
   }
 }
 

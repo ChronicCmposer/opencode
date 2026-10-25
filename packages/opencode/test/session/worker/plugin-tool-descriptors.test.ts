@@ -41,7 +41,7 @@ import { workerSnapshot } from "../../lib/snapshot"
 /** A clone-safe descriptor, the only plugin-tool data that crosses the isolate. */
 const descriptor = (
   id: string,
-  jsonSchema: unknown = { type: "object", properties: {}, additionalProperties: false },
+  jsonSchema: PluginToolDescriptor["jsonSchema"] = { type: "object", properties: {}, additionalProperties: false },
 ): PluginToolDescriptor => ({ id, description: `${id} tool`, jsonSchema })
 
 /** The clone-safe result a hub execution returns. */
@@ -113,7 +113,7 @@ describe("worker plugin tool descriptors (PT-2)", () => {
       type: "object",
       properties: { reason: { type: "string", description: "why" } },
       required: ["reason"],
-    }
+    } satisfies PluginToolDescriptor["jsonSchema"]
     const hooks = await listPlugins(
       built({ descriptors: [descriptor("compress", jsonSchema)], executor: recordingExecutor([]) }),
     )
@@ -175,10 +175,7 @@ describe("SessionWorkerInit.pluginTools (PT-2)", () => {
       buildSessionWorkerInit({
         model: { session: { providerID: FIXTURE_PROVIDER, modelID: FIXTURE_MODEL } },
         pluginTools: [descriptor("compress", { type: "object", properties: { reason: { type: "string" } } })],
-      }).pipe(
-        Effect.provide(initLayers()),
-        Effect.provideService(InstanceRef, instanceCtx),
-      ),
+      }).pipe(Effect.provide(initLayers()), Effect.provideService(InstanceRef, instanceCtx)),
     )
 
     expect(init.pluginTools).toHaveLength(1)

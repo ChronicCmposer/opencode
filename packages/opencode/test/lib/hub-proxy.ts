@@ -193,9 +193,12 @@ export function recordingHubAuthorities(
     ...(pluginTool === undefined
       ? {}
       : {
-          pluginTool: (input: Parameters<NonNullable<typeof pluginTool>>[0]) => {
+          pluginTool: (
+            input: Parameters<NonNullable<typeof pluginTool>>[0],
+            emit: Parameters<NonNullable<typeof pluginTool>>[1],
+          ) => {
             calls.push({ method: "pluginTool.execute", args: [input] })
-            return pluginTool(input)
+            return pluginTool(input, emit)
           },
         }),
   }

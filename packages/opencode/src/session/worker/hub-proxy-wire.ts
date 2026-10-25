@@ -36,7 +36,20 @@ export type HubProxyReply =
       readonly data?: unknown
     }
 
-export type HubProxyFrame = HubProxyRequest | HubProxyReply
+/**
+ * An unsolicited hub → worker push correlated to an in-flight request's `id`.
+ * A streaming handler emits these through its {@link HubProxyEventSink}; the
+ * client routes them to that request's `onEvent`, and drops any whose id is not
+ * (or is no longer) in flight.
+ */
+export type HubProxyEventFrame = {
+  readonly kind: "event"
+  readonly id: number
+  readonly method: string
+  readonly payload: unknown
+}
+
+export type HubProxyFrame = HubProxyRequest | HubProxyReply | HubProxyEventFrame
 
 /**
  * The namespaced hub-proxy methods. One worker control port multiplexes the
@@ -58,6 +71,8 @@ export type HubProxyMethod =
   | "systemTransform"
   | "messagesTransform"
   | "pluginTool.execute"
+  | "pluginTool.list"
+  | "pluginTool.abort"
   | "dispatchSubagent"
 
 /** A typed failure returned by a hub authority across the port. */
@@ -79,7 +94,16 @@ export class HubProxyRemoteError extends Error {
 }
 
 export interface HubProxyClient {
-  readonly call: (method: HubProxyMethod, args: readonly unknown[]) => Promise<unknown>
+  /**
+   * Call a hub authority. An optional `onEvent` receives unsolicited
+   * {@link HubProxyEventFrame} pushes correlated to this request's id while it
+   * is in flight; events for a settled or unknown id are dropped.
+   */
+  readonly call: (
+    method: HubProxyMethod,
+    args: readonly unknown[],
+    onEvent?: (method: string, payload: unknown) => void,
+  ) => Promise<unknown>
   /**
    * The typed subagent-dispatch RPC (Solution 1). Optional so lightweight test
    * doubles (`{ call, dispose }`) remain assignable; the multiplexed client
@@ -123,10 +147,34 @@ export function createHubProxyClient(port: MessagePort, options: HubProxyClientO
       new HubProxyRemoteError(`hub proxy request ${id} timed out after ${timeoutMs}ms`),
   })
 
-  const call = async (method: HubProxyMethod, args: readonly unknown[]): Promise<unknown> => {
-    const reply = await requests.request((id) => ({ kind: "request", id, method, args }))
-    if (reply.ok) return reply.value
-    throw new HubProxyRemoteError(reply.message, { tag: reply.tag, data: reply.data })
+  // The `onEvent` of each in-flight request, keyed by its correlation id. An
+  // event frame is only ever routed here, so one whose id is absent (settled or
+  // never requested) is dropped rather than surfaced.
+  const eventHandlers = new Map<number, (method: string, payload: unknown) => void>()
+  requests.onFrame((frame) => {
+    if (frame.kind !== "event") return
+    eventHandlers.get(frame.id)?.(frame.method, frame.payload)
+  })
+
+  const call = async (
+    method: HubProxyMethod,
+    args: readonly unknown[],
+    onEvent?: (method: string, payload: unknown) => void,
+  ): Promise<unknown> => {
+    // Capture the minted id so the handler is unregistered once this request
+    // settles — before the request is even posted, so no event can slip past it.
+    let id: number | undefined
+    try {
+      const reply = await requests.request((requestId) => {
+        id = requestId
+        if (onEvent !== undefined) eventHandlers.set(requestId, onEvent)
+        return { kind: "request", id: requestId, method, args }
+      })
+      if (reply.ok) return reply.value
+      throw new HubProxyRemoteError(reply.message, { tag: reply.tag, data: reply.data })
+    } finally {
+      if (id !== undefined) eventHandlers.delete(id)
+    }
   }
 
   return {
@@ -137,6 +185,22 @@ export function createHubProxyClient(port: MessagePort, options: HubProxyClientO
 }
 
 export type HubProxyHandlers = Readonly<Partial<Record<HubProxyMethod, (...args: readonly unknown[]) => unknown>>>
+
+/**
+ * A streaming handler's push channel: `emit` posts an unsolicited
+ * {@link HubProxyEventFrame} correlated to the request currently being served,
+ * so the caller's `onEvent` observes it while still awaiting the reply.
+ */
+export interface HubProxyEventSink {
+  emit(method: string, payload: unknown): void
+}
+
+/**
+ * A streaming hub handler. Unlike a {@link HubProxyHandlers} entry it may push
+ * any number of correlated events through `sink` before returning (or resolving
+ * to) the value that becomes the request's reply.
+ */
+export type HubProxyStreamHandler = (sink: HubProxyEventSink, args: readonly unknown[]) => unknown
 
 /** Own fields not worth carrying: the message rides the reply, the rest are noise. */
 const UNSERIALISED_ERROR_FIELDS = new Set(["message", "name", "stack", "cause", "_tag"])
@@ -156,6 +220,11 @@ function errorDataOf(error: unknown): unknown {
   }
 }
 
+/** Own-property lookup, so an inherited `Object.prototype` name never matches. */
+function ownLookup<T>(record: Readonly<Record<string, T>> | undefined, key: string): T | undefined {
+  return record !== undefined && Object.hasOwn(record, key) ? record[key] : undefined
+}
+
 /**
  * Hub side: serve hub-proxy requests against `handlers`; returns a disposer.
  *
@@ -167,8 +236,16 @@ function errorDataOf(error: unknown): unknown {
  * worker fails loud with a descriptive error instead of hanging or timing out.
  * Error replies are already clone-safe (`errorDataOf` drops non-cloneable
  * fields), so only a success reply needs the fallback.
+ *
+ * `streaming` adds an opt-in push channel: a method listed there is served by
+ * its {@link HubProxyStreamHandler}, which may `emit` correlated events before
+ * replying. Omitting `streaming` leaves the two-argument behaviour unchanged.
  */
-export function serveHubProxy(handlers: HubProxyHandlers, port: MessagePort): () => void {
+export function serveHubProxy(
+  handlers: HubProxyHandlers,
+  port: MessagePort,
+  streaming?: Readonly<Record<string, HubProxyStreamHandler>>,
+): () => void {
   const channel = workerFrameChannel<HubProxyFrame>(port, "hub-proxy")
   return channel.onMessage((frame) => {
     if (frame.kind !== "request") return
@@ -193,8 +270,45 @@ export function serveHubProxy(handlers: HubProxyHandlers, port: MessagePort): ()
         }
       }
     }
+    const succeed = (value: unknown): void =>
+      reply({ kind: "reply", id: frame.id, ok: true, value: value ?? null })
+    const fail = (error: unknown): void => {
+      const tag = errorTagOf(error)
+      const data = errorDataOf(error)
+      reply({
+        kind: "reply",
+        id: frame.id,
+        ok: false,
+        message: messageOf(error),
+        ...(tag === undefined ? {} : { tag }),
+        ...(data === undefined ? {} : { data }),
+      })
+    }
+    // `emit` pushes an unsolicited event correlated to this request. A
+    // non-cloneable payload reuses the reply path's fail-loud recovery so the
+    // worker learns the real cause instead of silently losing the event.
+    const emit = (method: string, payload: unknown): void => {
+      try {
+        channel.post({ kind: "event", id: frame.id, method, payload })
+      } catch {
+        reply({
+          kind: "reply",
+          id: frame.id,
+          ok: false,
+          message: `hub-proxy event payload for id ${frame.id} is not structured-cloneable`,
+        })
+      }
+    }
     // Own-property guard: a bare lookup would resolve inherited `Object.prototype`
     // members (`toString`, `valueOf`, ...) to functions and bypass the miss below.
+    // A streaming method wins over a plain handler of the same name.
+    const streamHandler = ownLookup(streaming, frame.method)
+    if (streamHandler !== undefined) {
+      Promise.resolve()
+        .then(() => streamHandler({ emit }, frame.args))
+        .then(succeed, fail)
+      return
+    }
     const handler = Object.hasOwn(handlers, frame.method) ? handlers[frame.method as HubProxyMethod] : undefined
     if (handler === undefined) {
       reply({ kind: "reply", id: frame.id, ok: false, message: `unknown hub-proxy method "${frame.method}"` })
@@ -202,20 +316,6 @@ export function serveHubProxy(handlers: HubProxyHandlers, port: MessagePort): ()
     }
     Promise.resolve()
       .then(() => handler(...frame.args))
-      .then(
-        (value) => reply({ kind: "reply", id: frame.id, ok: true, value: value ?? null }),
-        (error) => {
-          const tag = errorTagOf(error)
-          const data = errorDataOf(error)
-          reply({
-            kind: "reply",
-            id: frame.id,
-            ok: false,
-            message: messageOf(error),
-            ...(tag === undefined ? {} : { tag }),
-            ...(data === undefined ? {} : { data }),
-          })
-        },
-      )
+      .then(succeed, fail)
   })
 }
