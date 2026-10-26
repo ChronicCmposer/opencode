@@ -14,11 +14,12 @@
 //   * `pluginTool.list` / `pluginTool.abort` are first-class wire methods.
 
 import { describe, expect, test } from "bun:test"
-import { createHubProxyClient, serveHubProxy } from "@/session/worker/layer"
-import type {
-  HubProxyEventSink,
-  HubProxyMethod,
-  HubProxyStreamHandler,
+import {
+  createHubProxyClient,
+  serveHubProxy,
+  type HubProxyEventSink,
+  type HubProxyMethod,
+  type HubProxyStreamHandler,
 } from "@/session/worker/hub-proxy-wire"
 import { WORKER_FRAME_VERSION } from "@/session/worker/frame"
 
@@ -72,13 +73,15 @@ describe("hub-proxy streaming events", () => {
       capturedSink?.emit("late", { leaked: true })
 
       // An event frame naming an id that was never requested must be dropped too.
-      channel.port2.postMessage({
-        v: WORKER_FRAME_VERSION,
-        port: "hub-proxy",
-        kind: "event",
-        id: 987654,
-        payload: { kind: "event", id: 987654, method: "stray", payload: { leaked: true } },
-      })
+      channel.port2.postMessage(
+        JSON.stringify({
+          v: WORKER_FRAME_VERSION,
+          port: "hub-proxy",
+          kind: "event",
+          id: 987654,
+          payload: { kind: "event", id: 987654, method: "stray", payload: { leaked: true } },
+        }),
+      )
 
       // A later call on the same channel still resolves and sees only its own
       // events: the two dropped frames neither threw nor leaked.

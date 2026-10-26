@@ -119,7 +119,6 @@ async function runWorkerProbe(): Promise<CounterReport> {
     const clients = {
       writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
       egress: { emit: () => {} },
-      broker: { call: async () => null },
       backgroundJob: { wait: async () => null, cancel: async () => {} },
     } as never
     const modelClient = Layer.succeed(ModelClient, {

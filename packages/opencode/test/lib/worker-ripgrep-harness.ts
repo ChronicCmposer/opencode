@@ -30,7 +30,6 @@ import { workerSnapshot } from "./snapshot"
 export const stubClients = (): SessionLayerOptions["clients"] => ({
   writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
   egress: { emit: () => {} },
-  broker: { call: async () => null },
   backgroundJob: { wait: async () => null, cancel: async () => {} },
 })
 

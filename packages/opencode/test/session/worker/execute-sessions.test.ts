@@ -16,9 +16,10 @@ import {
   createSupervision,
   SessionWorkerDeadError,
 } from "@/session/worker/supervision"
-import { createFakeExecutorPool } from "../../lib/fake-worker-pool"
+import { createFakeExecutorPool, FakeExecutorWorker } from "../../lib/fake-worker-pool"
 import { createRecordingScheduler } from "../../lib/scheduler"
 import { flush, sid } from "../../lib/async"
+import { pollUntil } from "../../lib/poll"
 
 /** A transport that answers every run/startShell with a done frame. */
 function doneTransport(value: unknown = "ok"): ExecutorTransport {
@@ -103,17 +104,25 @@ describe("createSessionDispatch uses the per-session worker registry", () => {
   })
 
   test("assertNotBusy and cancel reach the owning worker", async () => {
-    const pool = createFakeExecutorPool(1, { mode: "blocking" })
+    // The registry owns the monotonic worker id, so the pool must honour the
+    // dispatcher-supplied id (the shared fake's eager-worker counter does not).
+    const pool = createExecutorWorkerPool({
+      spawn: (id) => new FakeExecutorWorker(id, { mode: "blocking" }),
+    })
     const dispatcher = createDispatcher({ pool })
     const dispatch = createSessionDispatch({ dispatcher, pool })
 
     const running = dispatch.ensureRunning(sid("ses_busy"))
-    await flush()
-
-    expect(await dispatch.assertNotBusy(sid("ses_busy"))).toBe(true)
+    // The registry records the worker only after the dispatch seam has admitted
+    // the session; wait on the observable assertion rather than a fixed flush.
+    await pollUntil(async () => await dispatch.assertNotBusy(sid("ses_busy")), {
+      message: "session was never registered as busy",
+    })
     await dispatch.cancel(sid("ses_busy"))
     await expect(running).rejects.toBeDefined()
-    expect(await dispatch.assertNotBusy(sid("ses_busy"))).toBe(false)
+    await pollUntil(async () => !(await dispatch.assertNotBusy(sid("ses_busy"))), {
+      message: "session stayed busy after cancel",
+    })
     await dispatcher.terminateAll()
   })
 

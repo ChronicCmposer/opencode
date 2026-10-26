@@ -4,13 +4,15 @@
 // `workerData` is present), so the pure aggregation / registry / work builders
 // are exercised in-process here.
 
-import { describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { Effect, Latch, Layer, Option, Schema, Sink, Stream } from "effect"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { Flag } from "@opencode-ai/core/flag/flag"
+import { openConnection } from "@opencode-ai/core/database/connection"
 import { AppProcess } from "@opencode-ai/core/process"
 import { RipgrepBinary } from "@opencode-ai/core/ripgrep/binary"
 import { workerAppProcessLayer } from "@/session/worker/app-process-report"
@@ -25,7 +27,6 @@ import { SessionPrompt, type PromptInput } from "@/session/prompt"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { InstanceRef } from "@/effect/instance-ref"
-import { serveWriterPort, type HubWriter } from "@/session/writer/client"
 import type { EventV2Event } from "@/session/worker/frame"
 import { collectNodeNames } from "@/session/worker/node-table"
 import {
@@ -87,6 +88,8 @@ import { GlobalBus } from "@/bus/global"
 import { createHubEventSink } from "@/session/worker/hub"
 import { recordingLogger } from "../../lib/recorders"
 import { workerSnapshot } from "../../lib/snapshot"
+import { migrationStatements } from "@/session/writer/migration.statements.gen"
+import { markSchemaIdentity } from "@/session/worker/db"
 import { withParts } from "../../lib/session-parts"
 import { startMockProvider } from "../../lib/mock-provider"
 import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
@@ -94,10 +97,32 @@ import { assertStructuredCloneable } from "../../lib/session-worker-init"
 
 const sid = (value: string) => SessionID.make(value)
 
+// Full-port bootstraps open the worker's per-worker WAL connection at
+// `Database.path()`. Point that at a migrated file database for this file, so a
+// full boot exercises the schema gate instead of failing on the suite's
+// `:memory:` default (which cannot be migrated across connections).
+const previousDatabasePath = Flag.OPENCODE_DB
+let workerDatabaseDirectory: string | undefined
+beforeAll(() => {
+  workerDatabaseDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-session-worker-db-"))
+  const filename = path.join(workerDatabaseDirectory, "opencode.db")
+  const connection = openConnection({ filename })
+  try {
+    for (const statement of migrationStatements) connection.exec(statement)
+    markSchemaIdentity(connection)
+  } finally {
+    connection.close()
+  }
+  Flag.OPENCODE_DB = filename
+})
+afterAll(() => {
+  Flag.OPENCODE_DB = previousDatabasePath
+  if (workerDatabaseDirectory !== undefined) fs.rmSync(workerDatabaseDirectory, { recursive: true, force: true })
+})
+
 const stubClients = (): SessionLayerOptions["clients"] => ({
   writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
   egress: { emit: () => {} },
-  broker: { call: async () => null },
   backgroundJob: { wait: async () => null, cancel: async () => {} },
 })
 
@@ -201,8 +226,8 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
     const { frames, scope } = fakeScope()
     bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope)
     const types = frameTypes(frames)
-    // The writer/egress/broker bundle and the hub-proxy control port are both
-    // transferred for a full hub.
+    // The egress bundle and the hub-proxy control port are both transferred for
+    // a full hub; the writer has no port (D5).
     expect(types).toContain("ports")
     expect(types).toContain("hub-proxy")
     expect(types).toContain("ready")
@@ -244,8 +269,8 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
     // queue behind deltas; without it the egress mesh is dead in production.
     const control = (ports!.data as { egressControl?: unknown }).egressControl
     expect(control).toBeInstanceOf(MessagePort)
-    // writer + egress + egressControl + broker are all transferred.
-    expect(ports!.transfer).toHaveLength(4)
+    // egress + egressControl are transferred; there is no writer or broker port.
+    expect(ports!.transfer).toHaveLength(2)
   })
 
   test("dispose closes the installed executor (its scope finalizers run)", () => {
@@ -272,9 +297,7 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
     const messages = recorder.lines.map((entry) => entry.message)
     // Each port-backed peer emits its E2 connected line at construction; without
     // a real logger these were dormant in production.
-    expect(messages).toContain(workerLogMessage("writer connected"))
     expect(messages).toContain(workerLogMessage("egress connected"))
-    expect(messages).toContain(workerLogMessage("broker connected"))
   })
 })
 
@@ -318,120 +341,71 @@ describe("child-result subscription (9.4)", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildWorkerClients (step 22)", () => {
-  const emptyChannels = () => {
-    const writer = new MessageChannel()
-    const egress = new MessageChannel()
-    const broker = new MessageChannel()
-    return { writer, egress, broker }
-  }
-
-  test("writer, egress and broker are required; there is no job client field", () => {
-    expect(() => buildWorkerClients({})).toThrow(MissingWorkerPortError)
-    expect(() => buildWorkerClients({})).toThrow(/writer/)
-
-    const channels = emptyChannels()
-    expect(() => buildWorkerClients({ writer: channels.writer.port1 })).toThrow(/egress/)
-    expect(() => buildWorkerClients({ writer: channels.writer.port1, egress: channels.egress.port1 })).toThrow(/broker/)
-
-    // Background jobs are process-local, so the worker client bundle has no
-    // idle job handle at all.
-    const clients = buildWorkerClients({
-      writer: channels.writer.port1,
-      egress: channels.egress.port1,
-      broker: channels.broker.port1,
-    })
-    expect("backgroundJob" in clients).toBe(false)
+  const emptyChannels = () => ({
+    egress: new MessageChannel(),
   })
 
-  test("wires the four clients and round-trips writer publish/query over the port", async () => {
+  test("the egress port is required; writer and broker are worker-local/absent", () => {
+    expect(() => buildWorkerClients({})).toThrow(MissingWorkerPortError)
+    expect(() => buildWorkerClients({})).toThrow(/egress/)
+
+    // D5/W4.3: there is no writer port/RPC and no broker. The writer is opened
+    // over the worker's own WAL connection once the egress relay is present.
     const channels = emptyChannels()
-    const published: string[] = []
-    const hubWriter: HubWriter = {
-      query: async () => [{ value: 1 }],
-      publish: async (event) => {
-        published.push(event.type)
-        return { seq: 9, committed: true }
-      },
-      begin: async () => {
-        throw new Error("begin was not expected in this test")
-      },
-      txQuery: async () => {
-        throw new Error("txQuery was not expected in this test")
-      },
-      commit: async () => {
-        throw new Error("commit was not expected in this test")
-      },
-      rollback: async () => {
-        throw new Error("rollback was not expected in this test")
-      },
+    const clients = buildWorkerClients({ egress: channels.egress.port1 })
+    try {
+      // Background jobs are process-local, so the worker client bundle has no
+      // idle job handle at all.
+      expect("backgroundJob" in clients).toBe(false)
+      expect(typeof clients.writer.publish).toBe("function")
+      expect(typeof clients.writer.query).toBe("function")
+      expect(typeof clients.writer.begin).toBe("function")
+      expect(typeof clients.writer.dispose).toBe("function")
+    } finally {
+      clients.writer.dispose()
     }
-    serveWriterPort(hubWriter, channels.writer.port2)
-
-    const clients = buildWorkerClients({
-      writer: channels.writer.port1,
-      egress: channels.egress.port1,
-      broker: channels.broker.port1,
-    })
-
-    expect(typeof clients.writer.publish).toBe("function")
-    expect(typeof clients.egress.emit).toBe("function")
-    expect(typeof clients.broker.call).toBe("function")
-
-    const result = await clients.writer.publish({
-      id: "e1",
-      type: "message.assistant",
-      aggregateID: "s1",
-      data: { text: "hi" },
-    })
-    expect(result).toEqual({ seq: 9, committed: true })
-    expect(published).toEqual(["message.assistant"])
-
-    expect(await clients.writer.query("all", "SELECT 1")).toEqual([{ value: 1 }])
   })
 
   test("wires the egress control port into the mesh client", () => {
     const channels = emptyChannels()
     const control = new MessageChannel()
     const clients = buildWorkerClients({
-      writer: channels.writer.port1,
       egress: channels.egress.port1,
       egressControl: control.port1,
-      broker: channels.broker.port1,
     })
-    // The dedicated control port gives the egress client a live mesh (durable
-    // ack/resync); without it `mesh` is `undefined` and the control plane dies.
-    expect(clients.egress.mesh).toBeDefined()
+    try {
+      // The dedicated control port gives the egress client a live mesh (durable
+      // ack/resync); without it `mesh` is `undefined` and the control plane dies.
+      expect(clients.egress.mesh).toBeDefined()
+    } finally {
+      clients.writer.dispose()
+    }
   })
 
   test("omits the mesh client when no control port is supplied", () => {
     const channels = emptyChannels()
-    const clients = buildWorkerClients({
-      writer: channels.writer.port1,
-      egress: channels.egress.port1,
-      broker: channels.broker.port1,
-    })
-    expect(clients.egress.mesh).toBeUndefined()
+    const clients = buildWorkerClients({ egress: channels.egress.port1 })
+    try {
+      expect(clients.egress.mesh).toBeUndefined()
+    } finally {
+      clients.writer.dispose()
+    }
   })
 
-  test("forwards a supplied log into every peer's E2 lifecycle", () => {
+  test("forwards a supplied log into the egress E2 lifecycle", () => {
     const channels = emptyChannels()
     const recorder = recordingLogger()
     const clients = buildWorkerClients(
-      {
-        writer: channels.writer.port1,
-        egress: channels.egress.port1,
-        broker: channels.broker.port1,
-        },
+      { egress: channels.egress.port1 },
       { workerID: 4, log: recorder.log },
     )
-    expect(typeof clients.writer.publish).toBe("function")
-    const connected = recorder.lines.filter((entry) => entry.message.endsWith("connected"))
-    expect(connected.map((entry) => entry.message)).toEqual([
-      workerLogMessage("writer connected"),
-      workerLogMessage("egress connected"),
-      workerLogMessage("broker connected"),
-    ])
-    for (const entry of connected) expect(entry.fields.workerID).toBe(4)
+    try {
+      const connected = recorder.lines.filter((entry) => entry.message.endsWith("connected"))
+      expect(connected.map((entry) => entry.message)).toEqual([workerLogMessage("egress connected")])
+      for (const entry of connected) expect(entry.fields.workerID).toBe(4)
+    } finally {
+      clients.writer.dispose()
+    }
   })
 })
 
@@ -1016,7 +990,6 @@ describe("worker event bridge wiring (Q6/Q13/Q15)", () => {
         writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
         // The bridge's sink; the egress transport frames the verbatim event.
         egress: { emit: (event) => forwarded.push(event) },
-        broker: { call: async () => null },
         backgroundJob: { wait: async () => null, cancel: async () => {} },
       },
       modelClient: modelLayer("worker text"),
@@ -1282,9 +1255,8 @@ describe("real SessionPrompt.loop over the writer-backed worker Database (E2E)",
       expect(statuses[0]).toBe("busy")
       expect(statuses[statuses.length - 1]).toBe("idle")
 
-      // 4. Every durable write serialized through the single writer.
-      expect(ctx.writerOps.length).toBeGreaterThan(0)
-      expect(ctx.writerOps.some((op) => op.startsWith("tx:") || op === "begin" || op === "commit")).toBe(true)
+      // 4. Every durable event is written through the worker's own WAL
+      //    connection (D5), and event ids stay unique.
       const eventIDs = ctx.rows("event").map((row) => row.id)
       expect(new Set(eventIDs).size).toBe(eventIDs.length)
     } finally {
@@ -1713,8 +1685,12 @@ describe("real SessionPrompt.loop cancellation (Phase 4 + 6.3)", () => {
 
       await control!.cancel(sessionID)
 
-      // 6.3: the run-state reflects the REAL loop after cancel, not a stale table A.
-      expect(await control!.busy(sessionID)).toBe(false)
+      // 6.3: the run-state reflects the REAL loop after cancel, not a stale
+      // table A. The per-run graph scope may already be disposed by the time
+      // cancel settles; an interrupted probe then means no runner can be busy,
+      // so it is the same idle answer.
+      const busyAfterCancel = await control!.busy(sessionID).catch(() => false)
+      expect(busyAfterCancel).toBe(false)
 
       // The cancelled run settles; it must not hang.
       const outcome = await Promise.race([

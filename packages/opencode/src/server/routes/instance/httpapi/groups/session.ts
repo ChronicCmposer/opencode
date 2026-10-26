@@ -78,17 +78,27 @@ export const PermissionResponsePayload = Schema.Struct({
 // Cancellation outcome reported by `POST /session/:sessionID/abort`, discriminated
 // on `mode`. `sessionID`, `mode` and `winner` are always present, so an idle body
 // with no outcome (`{}`) is not a valid response; the handler supplies the idle
-// "completed" outcome explicitly.
+// "completed" outcome explicitly. A cooperative cancel also returns the assistant
+// message the interrupted run settled on; a grace-expired terminate never does.
+const abortOutcomeFields = {
+  sessionID: SessionID,
+  acknowledged: Schema.Boolean,
+  durationMs: Schema.Number,
+}
+
 const abortOutcome = <const Mode extends string, const Winner extends string>(mode: Mode, winner: Winner) =>
   Schema.Struct({
-    sessionID: SessionID,
+    ...abortOutcomeFields,
     mode: Schema.Literal(mode),
     winner: Schema.Literal(winner),
-    acknowledged: Schema.Boolean,
-    durationMs: Schema.Number,
   })
 
-const AbortOutcomeCooperative = abortOutcome("cooperative", "cancel")
+const AbortOutcomeCooperative = Schema.Struct({
+  ...abortOutcomeFields,
+  mode: Schema.Literal("cooperative"),
+  winner: Schema.Literal("cancel"),
+  message: Schema.optional(SessionV1.WithParts),
+})
 const AbortOutcomeTerminated = abortOutcome("terminated", "cancel")
 const AbortOutcomeCompleted = abortOutcome("completed", "completion")
 export const AbortOutcome = Schema.Union([

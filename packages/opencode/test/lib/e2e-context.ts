@@ -1,14 +1,19 @@
-// Writer-backed worker E2E context (split from the former `parity-harness`).
+// Per-worker database E2E context (split from the former `parity-harness`).
 //
 // `createE2EContext` assembles a fully wired, in-process "production worker"
-// over a REAL writer: an in-memory SQLite connection behind the writer core,
-// exposed to the worker over a `MessagePort` and driven by the worker's
-// writer-backed Drizzle `Database`. It is the shared fixture for the
-// session-worker / layer-session / prompt-sequential suites; the flag-ON ≡
-// flag-OFF session parity harness lives in `./parity-session`.
+// over a REAL per-worker SQLite WAL connection: a file-backed database opened
+// through `openWorkerDatabase`, with the graph's `Database.Service` backed by
+// that connection and a worker-local writer handle for direct reads. There is no
+// writer isolate, port, or RPC. It is the shared fixture for the session-worker
+// / layer-session / prompt-sequential suites; the flag-ON ≡ flag-OFF session
+// parity harness lives in `./parity-session`.
 
-import { Effect, Layer, ManagedRuntime } from "effect"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { Effect, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { openConnection } from "@opencode-ai/core/database/connection"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import schema from "@opencode-ai/core/database/schema.gen"
 import type { InstanceContext } from "@/project/instance-context"
@@ -17,10 +22,9 @@ import { SessionStatus } from "@/session/status"
 import { MCP } from "@/mcp"
 import { LSP } from "@/lsp/lsp"
 import { Provider } from "@/provider/provider"
-import { createBunSqliteConnection } from "@/session/writer/connection"
-import { createWriterCore } from "@/session/writer/core"
-import { serveWriterPort, type HubWriter } from "@/session/writer/client"
-import { createWorkerWriterClient, type WorkerWriterClient } from "@/session/worker/writer-client"
+import { migrationStatements } from "@/session/writer/migration.statements.gen"
+import { markSchemaIdentity, openWorkerDatabase, type WorkerDatabase } from "@/session/worker/db"
+import { createWorkerDatabaseWriter, type WorkerWriterClient } from "@/session/worker/session-worker"
 import {
   RUNNABLE_SESSION_NODES,
   buildSessionWorkerLayer,
@@ -38,6 +42,7 @@ import {
 import { buildHubProxyHandlers, type HubProxyAuthorities } from "@/session/worker/hub"
 import { InstanceRef } from "@/effect/instance-ref"
 import { instantRunner } from "./hub-proxy"
+import { pluginPassThroughReplacement } from "./worker-plugin-routes"
 import { parityProject } from "./parity-project"
 import { tmpdir, type TmpDirOptions } from "../fixture/fixture"
 import { workerSnapshot } from "./snapshot"
@@ -57,6 +62,8 @@ export interface E2EContextOptions {
   readonly replacements?: LayerNode.Replacements
   /** Extra nodes to add to the worker graph (e.g. a mock seam). */
   readonly nodes?: ReadonlyArray<LayerNode.AnyNode>
+  /** Worker-hosted plugin hooks; absent installs the test pass-through. */
+  readonly plugins?: Parameters<typeof buildSessionWorkerLayer>[0]["plugins"]
   /**
    * Worker event egress. When supplied, the worker graph forwards its
    * session-scoped events over this handle (e.g. a hub events port) instead of
@@ -79,9 +86,10 @@ export interface E2EContextOptions {
 }
 
 /**
- * A fully wired, in-process "production worker" over a REAL writer: an
- * in-memory SQLite connection behind the writer core, exposed to the worker over
- * a `MessagePort` and driven by the worker's writer-backed Drizzle `Database`.
+ * A fully wired, in-process "production worker" over a REAL per-worker WAL
+ * connection. The graph's `Database.Service` is the worker database; a
+ * worker-local writer handle exposes the direct query/transaction seam the
+ * suites use to observe and pin the same connection.
  *
  * The `SessionProjector` node is included explicitly: `Session.updateMessage` /
  * `updatePart` publish durable events, and only the projector materializes the
@@ -89,14 +97,13 @@ export interface E2EContextOptions {
  * loop commits events but cannot find its own messages.
  */
 export interface E2EContext extends AsyncDisposable {
-  readonly connection: ReturnType<typeof createBunSqliteConnection>
+  readonly connection: WorkerDatabase["connection"]
+  readonly database: WorkerDatabase
   readonly writer: WorkerWriterClient
   readonly layer: Layer.Layer<unknown, unknown>
   readonly instance: InstanceContext
   /** Every `session.status` the worker set through the hub proxy, in order. */
   readonly statusLog: ReadonlyArray<E2EStatusRecord>
-  /** Every writer op the hub served, in order (one entry per statement). */
-  readonly writerOps: ReadonlyArray<string>
   /** Read every row of `table` in insertion order. */
   rows(table: string): ReadonlyArray<Record<string, unknown>>
   /** Idempotent teardown; alias of {@link dispose} for resource ownership. */
@@ -134,25 +141,24 @@ export function applyBaseSchema(connection: { exec(sql: string): void }): void {
   connection.exec(statements.join(";\n"))
 }
 
-/** Build the real hub writer over an in-memory SQLite connection, recording ops. */
-function createRecordingHub(
-  connection: ReturnType<typeof createBunSqliteConnection>,
-  writerOps: string[],
-): HubWriter {
-  const core = createWriterCore({ connection, sleep: async () => {} })
-  const record = <T>(op: string, run: () => Promise<T>): Promise<T> => {
-    writerOps.push(op)
-    return run()
-  }
-  return {
-    query: (method, sql, params) => record(`query:${method}`, () => core.query(method, sql, params)),
-    publish: (event, options) =>
-      record(`publish:${event.type}`, () => core.publish({ event, durable: options.durable })),
-    begin: () => record("begin", () => core.beginTransaction()),
-    txQuery: (handle, method, sql, params) =>
-      record(`tx:${method}`, () => core.txQuery(handle, method, sql, params)),
-    commit: (handle) => record("commit", () => core.commitTransaction(handle)),
-    rollback: (handle) => record("rollback", () => core.rollbackTransaction(handle)),
+/**
+ * Create the file-backed database the worker owns: apply the shipped
+ * migrations, mark the hub's schema identity, and seed the synthetic `e2e`
+ * project the instance context resolves (`session.project_id` is a real FK).
+ */
+function bootstrapWorkerDatabase(filename: string, projectDirectory: string, projectID: string): void {
+  const connection = openConnection({ filename })
+  try {
+    for (const statement of migrationStatements) connection.exec(statement)
+    markSchemaIdentity(connection)
+    for (const id of new Set(["e2e", projectID])) {
+      connection.run(
+        "INSERT INTO project (id, worktree, sandboxes, time_created, time_updated) VALUES (?, ?, ?, ?, ?)",
+        [id, projectDirectory, "[]", 0, 0],
+      )
+    }
+  } finally {
+    connection.close()
   }
 }
 
@@ -220,19 +226,17 @@ const E2E_TABLES: ReadonlySet<string> = new Set(["session", "message", "part", "
 /**
  * Assemble the in-process worker E2E context. The worker graph is the production
  * `RUNNABLE_SESSION_NODES` plus the projector and functional boundary mocks; the
- * `Database` replacement is left to the production `writerDatabaseLayer` (built
- * from the supplied writer), so this exercises the real worker DB wiring.
+ * `Database` replacement is the per-worker WAL connection, so this exercises the
+ * real worker DB wiring (W1.1/W1.4) without a writer isolate.
  */
 export function createE2EContext(options: E2EContextOptions): E2EContext {
   const { snapshot, modelConfig } = options
-  const connection = createBunSqliteConnection({ filename: ":memory:" })
-  applyBaseSchema(connection)
-
-  const writerOps: string[] = []
-  const hub = createRecordingHub(connection, writerOps)
-  const writerChannel = new MessageChannel()
-  const disposeWriter = serveWriterPort(hub, writerChannel.port1)
-  const writer = createWorkerWriterClient(writerChannel.port2)
+  const databaseDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-e2e-db-"))
+  const filename = path.join(databaseDirectory, "opencode.db")
+  bootstrapWorkerDatabase(filename, snapshot.directory, snapshot.projectId ?? "e2e")
+  const database = Effect.runSync(openWorkerDatabase({ filename }))
+  const connection = database.connection
+  const writer = createWorkerDatabaseWriter({ workerID: 1, filename })
 
   const local = createLocalHubProxies()
   const hubProxies = hubProxiesFor(options.hubProxies, local)
@@ -255,7 +259,9 @@ export function createE2EContext(options: E2EContextOptions): E2EContext {
     diagnostics: () => Effect.succeed({}),
     documentSymbol: () => Effect.succeed([]),
   })
-
+  // PENDING-plugin (W4.1): pass un-routed triggers through while delegating
+  // the hosted hooks to `options.plugins`.
+  const pluginReplacements: LayerNode.Replacements = [pluginPassThroughReplacement(options.plugins)]
   const extraNodes = options.nodes ?? []
   const built = buildSessionWorkerLayer({
     nodes: LayerNode.group([RUNNABLE_SESSION_NODES, SessionProjector.node, ...extraNodes]),
@@ -264,12 +270,12 @@ export function createE2EContext(options: E2EContextOptions): E2EContext {
     clients: {
       writer,
       egress: options.egress ?? { emit: () => {}, emitDurable: () => {} },
-      broker: { call: async () => null },
       backgroundJob: { wait: async () => null, cancel: async () => {} },
     },
     modelClient: llmModelClientLayer(modelConfig).pipe(
       Layer.provide(reducedLlmLayer(snapshot, modelConfig, hubProxies)),
     ),
+    ...(options.plugins === undefined ? {} : { plugins: options.plugins }),
     ...(hubProxies === undefined ? {} : { hubProxies }),
     replacements: [
       // `SessionProjector` runs IN the worker (o1-w3): `Session.updateMessage` /
@@ -281,6 +287,7 @@ export function createE2EContext(options: E2EContextOptions): E2EContext {
       [Provider.node, reducedModelProviderLayer(modelConfig)],
       [MCP.node, mcpLayer],
       [LSP.node, lspLayer],
+      ...pluginReplacements,
       ...(options.replacements ?? []),
     ],
   })
@@ -296,19 +303,18 @@ export function createE2EContext(options: E2EContextOptions): E2EContext {
     if (disposed) return
     disposed = true
     writer.dispose()
-    disposeWriter()
+    Effect.runSync(database.close)
     local.dispose()
-    writerChannel.port1.close()
-    writerChannel.port2.close()
+    fs.rmSync(databaseDirectory, { recursive: true, force: true })
   }
 
   return {
     connection,
+    database,
     writer,
     layer: built.layer,
     instance,
     statusLog: local.statusLog,
-    writerOps,
     rows: (table) => {
       if (!E2E_TABLES.has(table)) {
         throw new Error(`unknown E2E table "${table}" (expected one of ${[...E2E_TABLES].join(", ")})`)

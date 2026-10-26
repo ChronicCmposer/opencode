@@ -126,7 +126,7 @@ const SESSION_WORKER_ENTRY = new URL("../../../src/session/worker/session-worker
 type BootstrapOut =
   | { type: "ready" }
   | { type: "job-port"; port: MessagePort }
-  | { type: "ports"; writer: MessagePort; egress: MessagePort; egressControl: MessagePort; broker: MessagePort }
+  | { type: "ports"; egress: MessagePort; egressControl: MessagePort }
   | { type: "hub-proxy"; port: MessagePort }
 
 describe("session-worker bootstrap isolate (egress control)", () => {

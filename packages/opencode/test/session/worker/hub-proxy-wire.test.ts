@@ -90,3 +90,33 @@ describe("createHubProxyClient correlation", () => {
     dispose()
   })
 })
+
+describe("hub-proxy wire encoding", () => {
+  test("a request crosses the port as one JSON string envelope", async () => {
+    const posted: unknown[] = []
+    const port = {
+      postMessage: (message: unknown) => {
+        posted.push(message)
+      },
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      start: () => {},
+    } as unknown as MessagePort
+
+    const client = createHubProxyClient(port)
+    const pending = client.call("sessionStatus.list", [])
+    try {
+      expect(posted).toHaveLength(1)
+      expect(typeof posted[0]).toBe("string")
+      expect(JSON.parse(posted[0] as string)).toMatchObject({
+        v: 1,
+        port: "hub-proxy",
+        kind: "request",
+        payload: { kind: "request", method: "sessionStatus.list", args: [] },
+      })
+    } finally {
+      client.dispose()
+      await pending.catch(() => {})
+    }
+  })
+})

@@ -38,6 +38,7 @@ import {
 } from "@/session/worker/layer"
 import { workerGraphReplacements } from "@/session/worker/session-worker"
 import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
+import { pluginPassThroughReplacement } from "../../lib/worker-plugin-routes"
 import { startMockProvider, type MockProviderHandle } from "../../lib/mock-provider"
 import { workerSnapshot } from "../../lib/snapshot"
 
@@ -105,12 +106,11 @@ function workerLayer(
     clients: {
       writer,
       egress: { emit: () => {}, emitDurable: () => {} },
-      broker: { call: async () => null },
       backgroundJob: { wait: async () => null, cancel: async () => {} },
     },
     modelClient: llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(snapshot, config))),
     plugins,
-    replacements: workerGraphReplacements(config),
+    replacements: [...workerGraphReplacements(config), pluginPassThroughReplacement(plugins)],
   }).layer
 }
 

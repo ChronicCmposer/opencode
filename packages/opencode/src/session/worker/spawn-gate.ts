@@ -48,6 +48,10 @@ export interface SpawnPermit {
 export interface SpawnGateHandle {
   /** Wait for the one global permit, resolving in FIFO order. */
   acquire(): Promise<SpawnPermit>
+  /** Whether the single permit is currently held (permit-count probes/tests). */
+  readonly held?: boolean
+  /** Number of FIFO waiters not yet granted the permit. */
+  readonly waiting?: number
 }
 
 /** A spawn could not obtain the global permit within the configured timeout. */
@@ -94,6 +98,12 @@ export function createSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
   }
 
   return {
+    get held() {
+      return held
+    },
+    get waiting() {
+      return waiters.length
+    },
     acquire() {
       if (!held) {
         held = true

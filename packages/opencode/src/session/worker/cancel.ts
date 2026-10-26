@@ -265,3 +265,137 @@ export function createCancelController(options: CancelControllerOptions): Cancel
     },
   }
 }
+
+// ---- boot cancellation --------------------------------------------------------
+
+/**
+ * The D11 boot outcome. It is a typed value, not an exception: a cancelled boot
+ * is a normal terminal state and appends no message.
+ */
+export interface BootCancelResult {
+  readonly mode: "cancelled"
+  readonly winner: "cancel"
+  readonly phase: "boot"
+}
+
+export type BootState = "booting" | "ready" | "started" | "cancelled" | "failed"
+
+export type BootTelemetry =
+  | { readonly type: "boot-cancelled"; readonly phase: "boot" }
+  | { readonly type: "abort-death"; readonly phase: "boot"; readonly reason: string }
+
+/** The permit slice boot cancellation needs; `spawn-gate.SpawnPermit` satisfies it. */
+export interface BootPermit {
+  release(outcome?: "ready" | "failed", error?: unknown): void
+}
+
+export interface BootLifecycleOptions<T> {
+  /** The already-acquired spawn permit. Boot cancellation releases it exactly once. */
+  readonly permit: BootPermit
+  /** Construction/startup work; aborting the signal must settle it. */
+  readonly materialize: (signal: AbortSignal) => Promise<T>
+  /** Terminate a partial isolate (materialized, possibly ready, never started). */
+  readonly terminate: (partial: T | undefined) => void | Promise<void>
+  /** Invoked once when the caller starts the run. Never invoked after cancel. */
+  readonly onRun?: (worker: T) => void
+  readonly onTelemetry?: (event: BootTelemetry) => void
+}
+
+export interface BootLifecycle<T> {
+  /** Materialization result, or the typed cancel outcome when boot was cancelled. */
+  readonly ready: Promise<T | BootCancelResult>
+  readonly state: BootState
+  /** Mark the run started; refused once cancelled. */
+  readonly start: (worker: T) => boolean
+  /** Cancel boot exactly once. `undefined` once the run already started. */
+  readonly cancel: () => Promise<BootCancelResult | undefined>
+}
+
+export const BOOT_CANCELLED: BootCancelResult = Object.freeze({
+  mode: "cancelled",
+  winner: "cancel",
+  phase: "boot",
+})
+
+/**
+ * Own one boot interval: permit → materialize → (start). A cancel aborts
+ * construction, terminates any partial isolate, releases the permit once, and
+ * returns {@link BOOT_CANCELLED}. A graph that is ready but not started takes the
+ * same path. Death during abort is still a cancel win plus telemetry.
+ */
+export function createBootLifecycle<T>(options: BootLifecycleOptions<T>): BootLifecycle<T> {
+  const abort = new AbortController()
+  let state: BootState = "booting"
+  let partial: T | undefined
+  let released = false
+  let cancelling: Promise<BootCancelResult> | undefined
+
+  const releasePermit = (): void => {
+    if (released) return
+    released = true
+    options.permit.release("failed")
+  }
+
+  const materialization = options.materialize(abort.signal)
+  const ready: Promise<T | BootCancelResult> = materialization.then(
+    (worker) => {
+      partial = worker
+      if (state === "cancelled") return BOOT_CANCELLED
+      state = "ready"
+      return worker
+    },
+    (error: unknown) => {
+      releasePermit()
+      if (state === "cancelled") return BOOT_CANCELLED
+      state = "failed"
+      throw error
+    },
+  )
+
+  const cancel = (): Promise<BootCancelResult | undefined> => {
+    if (state === "started") return Promise.resolve(undefined)
+    if (state === "failed") return Promise.resolve(undefined)
+    if (cancelling !== undefined) return cancelling
+    state = "cancelled"
+    abort.abort()
+    cancelling = (async () => {
+      let abortDeath = false
+      try {
+        await materialization
+      } catch {
+        abortDeath = true
+      }
+      if (partial !== undefined) {
+        try {
+          await options.terminate(partial)
+        } catch {
+          abortDeath = true
+        }
+      }
+      releasePermit()
+      options.onTelemetry?.(
+        abortDeath
+          ? { type: "abort-death", phase: "boot", reason: "materialization or termination failed during abort" }
+          : { type: "boot-cancelled", phase: "boot" },
+      )
+      return BOOT_CANCELLED
+    })()
+    return cancelling
+  }
+
+  return {
+    ready,
+    get state() {
+      return state
+    },
+    start(worker) {
+      if (state !== "ready") return false
+      state = "started"
+      options.onRun?.(worker)
+      return true
+    },
+    cancel,
+  }
+}
+
+export * as CancelModule from "./cancel"

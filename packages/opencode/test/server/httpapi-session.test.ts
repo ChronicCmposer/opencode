@@ -4,7 +4,7 @@ import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { Cause, Config, ConfigProvider, Effect, Exit, Layer } from "effect"
+import { Cause, Config, ConfigProvider, Effect, Exit, Layer, Schema } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -22,7 +22,8 @@ import { Project } from "../../src/project/project"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import * as HttpSessionError from "../../src/server/routes/instance/httpapi/handlers/session-errors"
 import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/groups/experimental"
-import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
+import { AbortOutcome, SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
+import { toAbortOutcome } from "../../src/server/routes/instance/httpapi/handlers/session"
 import { Session } from "@/session/session"
 import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from "../../src/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
@@ -421,6 +422,80 @@ describe("session HttpApi", () => {
         ).toMatchObject([{ type: "assistant" }])
       }),
     { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.effect("projects a grace-expired terminate as a typed abort outcome without a message", () =>
+    Effect.sync(() => {
+      const sessionID = SessionID.descending()
+      const outcome = toAbortOutcome({
+        sessionID,
+        mode: "terminated",
+        winner: "cancel",
+        acknowledged: false,
+        durationMs: 5001,
+      })
+
+      expect(Schema.encodeSync(AbortOutcome)(outcome)).toEqual({
+        sessionID,
+        mode: "terminated",
+        winner: "cancel",
+        acknowledged: false,
+        durationMs: 5001,
+      })
+    }),
+  )
+
+  it.live(
+    "returns the last assistant message for a cooperative abort",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hang
+
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({
+          title: "cooperative abort",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        }).pipe(provideInstanceEffect(directory))
+
+        const accepted = yield* request(
+          `${pathFor(SessionPaths.promptAsync, { sessionID: session.id })}?directory=${encodeURIComponent(directory)}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "hold the request open" }],
+            }),
+          },
+        )
+        expect(accepted.status).toBe(204)
+
+        yield* llm.wait(1)
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const statuses = yield* requestJson<Record<string, { type: string }>>(
+              `${SessionPaths.status}?directory=${encodeURIComponent(directory)}`,
+            )
+            return statuses[session.id]?.type === "busy" ? (true as const) : undefined
+          }),
+          "session never became busy before abort",
+          "20 seconds",
+        )
+
+        const outcome = yield* requestJson<{
+          mode: string
+          winner: string
+          message?: { info: { role: string } }
+        }>(`${pathFor(SessionPaths.abort, { sessionID: session.id })}?directory=${encodeURIComponent(directory)}`, {
+          method: "POST",
+        })
+
+        expect(outcome).toMatchObject({ sessionID: session.id, mode: "cooperative", winner: "cancel" })
+        expect(outcome.message?.info.role).toBe("assistant")
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    90_000,
   )
 
   it.live("uses the persisted session directory for prompt requests", () =>

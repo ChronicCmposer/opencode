@@ -226,7 +226,6 @@ const triggerMessagesTransform = (
 const clients = (): SessionLayerOptions["clients"] => ({
   writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
   egress: { emit: () => {} },
-  broker: { call: async () => null },
   backgroundJob: { wait: async () => null, cancel: async () => {} },
 })
 
@@ -253,7 +252,7 @@ describe("messages.transform clone guard at the isolate boundary", () => {
     expect((metadata.nested as { at: Date }).at).toBeInstanceOf(Date)
   })
 
-  test("a representative WithParts payload round-trips the hub-proxy MessageChannel with no data loss", async () => {
+  test("a representative WithParts payload round-trips the hub-proxy JSON boundary", async () => {
     const payload = representativeMessages()
     const passThrough = async (
       _input: MessagesTransformInput,
@@ -267,19 +266,20 @@ describe("messages.transform clone guard at the isolate boundary", () => {
         { messages: payload },
       ])) as MessagesTransformOutput
 
-      expect(returned.messages).toStrictEqual(payload)
+      // W2.1: the port boundary is JSON, so dates become ISO strings and
+      // explicit `undefined` properties are omitted.
+      const json = JSON.parse(JSON.stringify(payload)) as unknown
+      expect(returned.messages).toStrictEqual(json as unknown[])
       const metadata = completedToolMetadata(returned.messages as WithParts[])
-      // Dates cross the port as Dates, not strings/numbers.
-      expect(metadata.generatedAt).toBeInstanceOf(Date)
-      expect((metadata.nested as { at: Date }).at).toBeInstanceOf(Date)
-      // An explicit `undefined` optional is preserved rather than dropped.
-      expect(Object.prototype.hasOwnProperty.call(metadata.nested, "note")).toBe(true)
+      expect(metadata.generatedAt).toBe("2026-10-25T00:00:00.000Z")
+      expect((metadata.nested as { at: string }).at).toBe("1970-01-01T00:00:00.000Z")
+      expect(Object.prototype.hasOwnProperty.call(metadata.nested, "note")).toBe(false)
     } finally {
       client.dispose()
     }
   })
 
-  test("a non-cloneable message payload fails loud at the worker boundary", async () => {
+  test("a non-JSON message payload fails loud at the worker boundary", async () => {
     const passThrough = async (
       _input: MessagesTransformInput,
       output: MessagesTransformOutput,
@@ -287,7 +287,7 @@ describe("messages.transform clone guard at the isolate boundary", () => {
     const client = clientFor(buildHubProxyHandlers(authorities(passThrough), instantRunner))
 
     try {
-      // A function is not structured-cloneable; the message array is the
+      // A function has no JSON representation; the message array is the
       // worker→hub request payload, so the failure happens locally and at once.
       const poisoned = {
         messages: [
@@ -305,10 +305,10 @@ describe("messages.transform clone guard at the isolate boundary", () => {
         caught = error
       }
 
-      // Pin the semantics that currently hold: a raw `DataCloneError`
-      // (`DOMException`), NOT a `HubProxyRemoteError` (no reply ever crosses).
-      expect(caught).toBeInstanceOf(DOMException)
-      expect((caught as DOMException).name).toBe("DataCloneError")
+      // W2.1: the encoder rejects a non-JSON payload with a typed ProtocolError
+      // before any frame crosses; it is not a `HubProxyRemoteError` reply.
+      expect((caught as { tag?: string }).tag).toBe("PROTOCOL")
+      expect((caught as Error).message).toMatch(/not JSON-serialisable/)
       expect(caught).not.toBeInstanceOf(HubProxyRemoteError)
 
       // Fail loud must not poison the channel: a well-formed call still works.

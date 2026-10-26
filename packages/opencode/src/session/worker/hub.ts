@@ -30,30 +30,16 @@ import { SessionStatus } from "@/session/status"
 import { Permission } from "@/permission"
 import { Question } from "@/question"
 import type { InstanceContext } from "@/project/instance-context"
-import { mergeEnv } from "@/session/broker/env"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Project } from "@opencode-ai/schema/project"
-import {
-  createBroker,
-  serveBrokerPort,
-  type BrokerBackend,
-  type BrokerClient,
-  type BrokerOptions,
-} from "@/session/broker/broker"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { attachMeshWorker, createEgressMesh, type DurableCommit, type EgressMesh } from "@/session/egress/mesh"
 import { durableMetaOf, type EventV2Event, type EventsAckPayload, type EventsResyncPayload } from "./frame"
 import { createLiveEventPublisher, instanceLocation, EventV2Bridge, type LiveEventPublisher } from "@/event-v2-bridge"
 import type { EventV2 } from "@opencode-ai/core/event"
-import {
-  createWriterClient,
-  serveWriterPort,
-  type HubWriter,
-  type WriterClient,
-  type WriterClientOptions,
-} from "@/session/writer/client"
-import { migrationStatements } from "../writer/migration.statements.gen"
+import { StateCache } from "@opencode-ai/core/bus"
 import type { SessionID } from "@/session/schema"
+import { createDbExecutor, type DbExecutor } from "./db-executor"
 import type { DispatchOrigin } from "@/session/origin"
 import { defined } from "@/util/object"
 import { setThreadName } from "@/util/thread-name"
@@ -87,6 +73,7 @@ import { resolveSessionWorkerIdleTimeoutMs, WORKER_COUNT_ENV } from "./pool"
 import { createEpochSequence, makeInstanceContext, type EpochSequence } from "./snapshot"
 import {
   buildSessionWorkerInit,
+  mergeEnv,
   resolveWorkerPlugins,
   type BuildSessionWorkerInitOptions,
   type WorkerModelSelection,
@@ -118,7 +105,7 @@ import type {
   PluginToolProgressSink,
 } from "./plugin-tool-wire"
 import { PluginToolNotSerializableError } from "./plugin-tool-wire"
-import { portFromMessagePort } from "./port"
+import { errorTagOf, portFromMessagePort } from "./port"
 import type { SessionWorkerInit } from "./session-worker"
 import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
 import { sessionThreadName } from "@/session/worker/thread-name"
@@ -127,6 +114,80 @@ import { Truncate } from "@/tool/truncate"
 import { pluginToolJsonSchema } from "@/tool/registry"
 import { Agent } from "@/agent/agent"
 import type { ShellInput } from "@/session/prompt"
+import { recordAsync } from "@/session/ledger/crash"
+
+/**
+ * Advisory hub cache. Entries are keyed by `(aggregateID, seq)` and fenced by the
+ * cache's state version; it is never authoritative. The durable database and log
+ * remain the only truth (D14).
+ */
+export type HubTruthCache = StateCache<unknown>
+
+/** The invalidator a durable event source calls after a commit. */
+export interface HubCacheInvalidation {
+  invalidate(aggregateID: string): void
+}
+
+/** The five crash phases a worker reports (D8). */
+export const WORKER_CRASH_PHASES = ["boot", "materialize", "stream", "tool", "commit"] as const
+export type WorkerCrashPhase = (typeof WORKER_CRASH_PHASES)[number]
+
+const WORKER_CRASH_PHASE_SET: ReadonlySet<string> = new Set(WORKER_CRASH_PHASES)
+
+/**
+ * The D8 crash payload a worker or dispatcher supplies to the hub. It is the
+ * persistence contract, not a hub-invented summary: every field comes from the
+ * crashing generation.
+ */
+export interface WorkerCrashed {
+  readonly sessionID: string
+  readonly workerID: number
+  readonly phase: WorkerCrashPhase
+  readonly lastCommittedMessageID: string | null
+  readonly inFlightCallIDs: readonly string[]
+  readonly retryable: false
+  readonly reason: string
+}
+
+/** Parse an untrusted crash payload at the boundary. */
+export function isWorkerCrashed(value: unknown): value is WorkerCrashed {
+  if (typeof value !== "object" || value === null) return false
+  const payload = value as Partial<WorkerCrashed>
+  return (
+    typeof payload.sessionID === "string" &&
+    typeof payload.workerID === "number" &&
+    Number.isInteger(payload.workerID) &&
+    payload.workerID >= 0 &&
+    typeof payload.phase === "string" &&
+    WORKER_CRASH_PHASE_SET.has(payload.phase) &&
+    (typeof payload.lastCommittedMessageID === "string" || payload.lastCommittedMessageID === null) &&
+    Array.isArray(payload.inFlightCallIDs) &&
+    payload.inFlightCallIDs.every((id) => typeof id === "string") &&
+    payload.retryable === false &&
+    typeof payload.reason === "string"
+  )
+}
+
+/**
+ * Read the typed `WorkerCrashed` payload a crash error carries. The shape may be
+ * attached as `workerCrashed`, `crash`, or on the cause; no payload means the W3
+ * contract is absent, so the hub must not fabricate one.
+ */
+export function workerCrashedFrom(error: unknown): WorkerCrashed | undefined {
+  if (typeof error !== "object" || error === null) return undefined
+  const candidate = error as {
+    readonly workerCrashed?: unknown
+    readonly crash?: unknown
+    readonly payload?: unknown
+    readonly cause?: unknown
+  }
+  if (isWorkerCrashed(candidate.workerCrashed)) return candidate.workerCrashed
+  if (isWorkerCrashed(candidate.crash)) return candidate.crash
+  const cause = workerCrashedFrom(candidate.cause)
+  if (cause !== undefined) return cause
+  // The dispatcher exposes the synthesized D8 payload as a getter.
+  return isWorkerCrashed(candidate.payload) ? candidate.payload : undefined
+}
 
 /** A descendant cancelled by the subagent cascade, and whether it needs a fallback idle. */
 export interface CancelledDescendant {
@@ -156,6 +217,12 @@ export interface CancelReport {
 export interface SessionHub {
   readonly dispatcher: Dispatcher
   /**
+   * The advisory hub cache. Never authoritative: the durable database and log
+   * remain the only truth (D14). It is empty on construction (a restart starts
+   * cold) and cleared on shutdown.
+   */
+  readonly cache?: HubTruthCache
+  /**
    * The session a worker is currently bound to (the dispatcher's key→worker map,
    * inverted). A worker isolate serves exactly one session at a time, so this is
    * the resolver the hub-proxy and live-event paths use to reach the worker's own
@@ -163,9 +230,9 @@ export interface SessionHub {
    */
   sessionOfWorker(workerID: number): SessionID | undefined
   /**
-   * Serve the worker's transferred writer / egress / broker ports against the
-   * hub's authorities (plan tasks 17/19/8.1). Returns a disposer; idempotent per
-   * worker. No-op for a port the hub has no backend for.
+   * Serve the worker's transferred egress ports against the hub's
+   * authorities. Returns a disposer; idempotent per worker. No-op for a port the
+   * hub has no backend for. The writer port is never served (D5).
    */
   attachWorkerPorts(workerID: number, ports: WorkerTransferredPorts): () => void
   /**
@@ -196,16 +263,18 @@ export interface SessionHub {
   terminateAll(): Promise<void>
 }
 
-/** The worker ports transferred as one `{type:"ports", …}` frame (session-worker.ts). */
+/**
+ * The worker data ports transferred as one `{type:"ports", …}` frame
+ * (session-worker.ts). The writer port is intentionally absent: the hub serves no
+ * SQLite RPC (D5).
+ */
 export interface WorkerTransferredPorts {
-  readonly writer?: MessagePort
   readonly egress?: MessagePort
   readonly egressControl?: MessagePort
-  readonly broker?: MessagePort
 }
 
 /** The data ports present in a transfer, in a stable order (for diagnostics). */
-const TRANSFERRED_PORT_NAMES = ["writer", "egress", "broker"] as const
+const TRANSFERRED_PORT_NAMES = ["egress", "egressControl"] as const
 function transferredPortNames(ports: WorkerTransferredPorts): string[] {
   return TRANSFERRED_PORT_NAMES.filter((name) => ports[name] !== undefined)
 }
@@ -233,14 +302,12 @@ export function isPidReport(frame: unknown): frame is PidReport {
 }
 
 /**
- * The hub-resident authorities a worker's ports are served against. `writer` and
- * `broker` are required to serve their ports; `egress` defaults to a draining
- * receiver (the SSE route wires a real sink later); `hubProxy` is served over the
- * worker control port when present.
+ * The hub-resident authorities a worker's ports are served against. `egress`
+ * defaults to a draining receiver (the SSE route wires a real sink later);
+ * `hubProxy` is served over the worker control port when present. There is
+ * deliberately no writer RPC (D5) and no broker authority (D20).
  */
 export interface WorkerPortBackends {
-  readonly writer: HubWriter
-  readonly broker: BrokerBackend
   /** Serve a worker's egress port; defaults to a draining receiver. */
   readonly egress?: (workerID: number, port: MessagePort, control?: MessagePort) => () => void
   /** Handlers for the three hub-proxy authorities served over the control port. */
@@ -262,8 +329,8 @@ export interface WorkerPortBackends {
   /** Streaming hub-proxy handlers shared by every worker (fallback for {@link hubProxyStreamingFor}). */
   readonly hubProxyStreaming?: Readonly<Record<string, HubProxyStreamHandler>>
   /**
-   * Tear down the backends' own resources (a writer/broker isolate). Called once
-   * by `SessionHub.terminateAll`, only when the backends were actually built.
+   * Tear down the backends' own resources. Called once by
+   * `SessionHub.terminateAll`, only when the backends were actually built.
    */
   readonly dispose?: () => void | Promise<void>
 }
@@ -271,8 +338,8 @@ export interface WorkerPortBackends {
 /**
  * The hub's port authorities, either ready to use or built on demand. A source
  * function is invoked at most once, on the first worker port attach (i.e. on the
- * first dispatch), so building a production node never spawns a writer/broker
- * isolate at graph-build time.
+ * first dispatch), so building a production node does no work at graph-build
+ * time.
  */
 export type WorkerPortBackendsSource = WorkerPortBackends | (() => WorkerPortBackends)
 
@@ -288,10 +355,9 @@ export interface SessionHubOptions {
   /** The executor pool; lazy pools spawn no isolate until the first dispatch. */
   readonly pool: ExecutorWorkerPool
   /**
-   * Hub-resident authorities for the worker writer / egress / broker ports and
-   * the hub-proxy control port (plan tasks 8/17/19/24). When present, the hub
-   * serves transferred worker ports; the production init advertises
-   * `capabilities.sessionWorkerPorts`.
+   * Hub-resident authorities for the worker egress ports and the
+   * hub-proxy control port. When present, the hub serves transferred worker
+   * ports; the production init advertises `capabilities.sessionWorkerPorts`.
    */
   readonly ports?: WorkerPortBackendsSource
   /**
@@ -342,6 +408,19 @@ export interface SessionHubOptions {
    * `PidRegistry`; absent means pid reports are ignored (a pure hub, no reaper).
    */
   readonly onPidReport?: (workerID: number, report: PidReport) => void
+  /**
+   * Off-loop fallback for hub-side SQL. The executor owns no ordering, cache,
+   * migration, or schema policy; callers own every query (D5).
+   */
+  readonly db?: DbExecutor
+  /** Advisory cache, never authoritative. Defaults to a fresh, empty cache. */
+  readonly cache?: HubTruthCache
+  /**
+   * Persist/surface the typed D8 payload a crashed generation reports. When the
+   * crash error carries no payload the hub logs the missing contract and does not
+   * fabricate one.
+   */
+  readonly onWorkerCrashed?: (payload: WorkerCrashed) => void | Promise<void>
   /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
   readonly log?: WorkerLogger
 }
@@ -378,6 +457,21 @@ export const SESSION_CANCELLED_TYPE = SessionV1.Event.Cancelled.type
 export interface HubEventSinkOptions {
   /** Live-only publisher the sink republishes each event through. */
   readonly publisher: LiveEventPublisher
+  /** Advisory cache invalidated when a durable event reaches the hub. */
+  readonly cache?: HubCacheInvalidation
+  /** Resolve a durable event's aggregate id; defaults to its `sessionID`. */
+  readonly aggregateOf?: (event: EventV2Event) => string | undefined
+}
+
+/** The aggregate an event belongs to, when its payload identifies one. */
+export function aggregateIDOfEvent(event: EventV2Event): string | undefined {
+  if (typeof event.properties !== "object" || event.properties === null) return undefined
+  const properties = event.properties as Record<string, unknown>
+  for (const field of ["sessionID", "aggregateID", "aggregate_id"]) {
+    const value = properties[field]
+    if (typeof value === "string" && value.length > 0) return value
+  }
+  return undefined
 }
 
 /**
@@ -387,8 +481,11 @@ export interface HubEventSinkOptions {
  * so the overflow/resync policy lives with the receiver that owns backpressure.
  */
 export interface HubEventSink {
-  /** Republish one worker event live-only. */
-  event(event: EventV2Event): void
+  /**
+   * Republish one worker event live-only. `durable` marks an event whose commit
+   * already happened in the worker, so the hub cache must drop the aggregate.
+   */
+  event(event: EventV2Event, options?: { readonly durable?: boolean }): void
   /** The worker signalled end-of-stream. */
   end(): void
   /** A backpressure resync: a non-durable delta was dropped; durable events continue. */
@@ -404,15 +501,19 @@ export interface HubEventSink {
 }
 
 export function createHubEventSink(options: HubEventSinkOptions): HubEventSink {
-  const { publisher } = options
+  const { publisher, cache } = options
+  const aggregateOf = options.aggregateOf ?? aggregateIDOfEvent
   let ended = false
   let resyncs = 0
   let acks = 0
   return {
-    event(event) {
+    event(event, meta) {
       // The event crosses verbatim as `{ id, type, properties }`; the frame's
       // `generation`/`ordinal` metadata is deliberately not republished.
       publisher.publish({ id: event.id, type: event.type, data: event.properties })
+      if (meta?.durable !== true) return
+      const aggregateID = aggregateOf(event)
+      if (aggregateID !== undefined) cache?.invalidate(aggregateID)
     },
     end() {
       ended = true
@@ -455,13 +556,13 @@ export function serveEventsPort(
     port,
     onFrame: (frame) => {
       if (frame.kind !== "event") return
-      sink.event(frame.payload.event)
-      if (onDurable === undefined) return
       // The canonical durability test (present only when BOTH `generation` and
       // `ordinal` are set), shared with the receiver and fan-out so the three
       // never drift on exactly which frames are durable.
       const meta = durableMetaOf(frame)
-      if (meta !== undefined) onDurable({ meta, event: frame.payload.event })
+      sink.event(frame.payload.event, { durable: meta !== undefined })
+      if (meta === undefined || onDurable === undefined) return
+      onDurable({ meta, event: frame.payload.event })
     },
     onEnd: () => sink.end(),
     onResync: (payload) => sink.resync(payload),
@@ -905,10 +1006,11 @@ export function pluginToolAuthority(options: {
 }
 
 /**
- * The per-worker port servers: the transferred writer / egress / broker and
- * hub-proxy control ports. Each attach is idempotent per worker (a re-attach
- * disposes the previous server first), and `disposeAll` tears every server down. The backend source and handler map are thunks because both
- * materialise lazily, after the pool and dispatcher exist.
+ * The per-worker port servers: the transferred egress and hub-proxy
+ * control ports. Each attach is idempotent per worker (a re-attach disposes the
+ * previous server first), and `disposeAll` tears every server down. The backend
+ * source and handler map are thunks because both materialise lazily, after the
+ * pool and dispatcher exist.
  */
 interface WorkerPortRegistryOptions {
   readonly log: WorkerLogger
@@ -924,8 +1026,8 @@ interface WorkerPortRegistry {
   readonly attachWorkerPorts: (workerID: number, ports: WorkerTransferredPorts) => () => void
   readonly attachHubProxyPort: (workerID: number, port: MessagePort) => () => void
   /**
-   * Dispose one retired worker's port servers (writer/egress/broker and
-   * hub-proxy). Idempotent; a never-attached worker is a no-op.
+   * Dispose one retired worker's port servers (egress and hub-proxy).
+   * Idempotent; a never-attached worker is a no-op.
    */
   readonly disposeWorker: (workerID: number) => void
   readonly disposeAll: () => void
@@ -936,17 +1038,15 @@ function createWorkerPortRegistry(options: WorkerPortRegistryOptions): WorkerPor
   const workerPortDisposers = new Map<number, () => void>()
   const hubProxyDisposers = new Map<number, () => void>()
 
-  // Serve a worker's transferred writer / egress / broker ports against the hub
-  // authorities. A port the hub has no backend for is left unserved (the worker
-  // only transfers ports the hub advertised in `capabilities.sessionWorkerPorts`).
+  // Serve a worker's transferred egress ports against the hub authorities. A
+  // port the hub has no backend for is left unserved (the worker only transfers
+  // ports the hub advertised in `capabilities.sessionWorkerPorts`).
   const attachWorkerPorts = (workerID: number, ports: WorkerTransferredPorts): (() => void) => {
     log(workerLogMessage("ports connected"), { level: "INFO", workerID, ports: transferredPortNames(ports) })
     workerPortDisposers.get(workerID)?.()
     const disposers: (() => void)[] = []
     const backends = options.backends()
     if (backends !== undefined) {
-      if (ports.writer !== undefined) disposers.push(serveWriterPort(backends.writer, ports.writer))
-      if (ports.broker !== undefined) disposers.push(serveBrokerPort(backends.broker, ports.broker))
       if (ports.egress !== undefined) {
         disposers.push(
           backends.egress !== undefined
@@ -1072,7 +1172,7 @@ function createCancelReporter(options: CancelReporterOptions): CancelReporter {
 
     // Report the terminal outcome to every SSE client. `SessionV1.Event.Cancelled`
     // is non-durable, and the live-only publisher refuses a durable definition, so
-    // this can never re-commit the session state already written through the writer.
+    // this can never re-commit the session state already written by the worker.
     //
     // Publish only when a cancel actually won. A `completion` outcome means the
     // run finished on its own during the grace window; telling the client it was
@@ -1112,6 +1212,50 @@ function createCancelReporter(options: CancelReporterOptions): CancelReporter {
 /** Compose the dispatcher + executor pool + cooperative cancel into one hub. */
 export function createSessionHub(options: SessionHubOptions): SessionHub {
   const log = options.log ?? noopWorkerLogger
+  const cache = options.cache ?? new StateCache<unknown>()
+  const db = options.db
+  const onWorkerCrashed = options.onWorkerCrashed
+
+  const surfaceWorkerCrash = async (error: unknown, sessionID: SessionID): Promise<void> => {
+    const payload = workerCrashedFrom(error)
+    if (payload === undefined) {
+      if (errorTagOf(error) === "WorkerCrashedError") {
+        log(workerLogMessage("worker crash payload missing"), {
+          level: "ERROR",
+          sessionID,
+          expected: {
+            sessionID,
+            workerID: "number",
+            phase: WORKER_CRASH_PHASES.join(" | "),
+            lastCommittedMessageID: "string | null",
+            inFlightCallIDs: "readonly string[]",
+            retryable: false,
+            reason: "string",
+          },
+        })
+      }
+      return
+    }
+    log(workerLogMessage("worker crashed"), {
+      level: "ERROR",
+      sessionID: payload.sessionID,
+      workerID: payload.workerID,
+      phase: payload.phase,
+      retryable: payload.retryable,
+      reason: payload.reason,
+    })
+    if (onWorkerCrashed === undefined) return
+    try {
+      await onWorkerCrashed(payload)
+    } catch (sinkError) {
+      // Persistence failure must never replace the crash the caller observes.
+      log(workerLogMessage("worker crash persistence failed"), {
+        level: "ERROR",
+        sessionID: payload.sessionID,
+        error: sinkError instanceof Error ? sinkError.message : String(sinkError),
+      })
+    }
+  }
   // The port authorities are built on the first attach (never at construction):
   // a value is used as-is; a source function is invoked once and memoised.
   const portSource = options.ports
@@ -1221,17 +1365,28 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
 
   return {
     dispatcher,
+    cache,
     // The inverted key→worker map: a worker's session, or undefined when idle.
     sessionOfWorker: (workerID) => dispatcher.registry.sessionsOn(workerID)[0],
     attachWorkerPorts: ports.attachWorkerPorts,
     attachHubProxyPort: ports.attachHubProxyPort,
-    ensureRunning: (sessionID, origin) => {
+    ensureRunning: async (sessionID, origin) => {
       onDispatch?.(sessionID)
-      return dispatch.ensureRunning(sessionID, undefined, origin)
+      try {
+        return await dispatch.ensureRunning(sessionID, undefined, origin)
+      } catch (error) {
+        await surfaceWorkerCrash(error, sessionID)
+        throw error
+      }
     },
-    startShell: (sessionID, shell) => {
+    startShell: async (sessionID, shell) => {
       onDispatch?.(sessionID)
-      return dispatch.startShell(sessionID, shell)
+      try {
+        return await dispatch.startShell(sessionID, shell)
+      } catch (error) {
+        await surfaceWorkerCrash(error, sessionID)
+        throw error
+      }
     },
     assertNotBusy: (sessionID) => dispatch.assertNotBusy(sessionID),
     cancel: async (sessionID) => (await cancelReporter.cancelWithReport(sessionID)).outcome,
@@ -1240,10 +1395,12 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     async terminateAll() {
       ports.disposeAll()
       await dispatcher.terminateAll()
+      cache.clear()
       // Only tear down backends we actually built (a source never attached to is
       // never constructed, so no isolate is spawned just to dispose it).
       const backends = disposables()
       await backends?.dispose?.()
+      await db?.close().catch(() => undefined)
     },
   }
 }
@@ -1265,7 +1422,7 @@ export interface BunExecutorTransportOptions {
   readonly timeoutMs?: number
   /** Maximum buffered outbound frames kept for late `waitFor` matches. */
   readonly bufferCapacity?: number
-  /** Called with the worker's transferred writer / egress / broker ports. */
+  /** Called with the worker's transferred egress ports. */
   readonly onWorkerPorts?: (ports: WorkerTransferredPorts) => void
   /** Called with the worker's transferred hub-proxy control port. */
   readonly onHubProxyPort?: (port: MessagePort) => void
@@ -1307,7 +1464,7 @@ type BootFrame =
 const asMessagePort = (value: unknown): MessagePort | undefined =>
   typeof MessagePort !== "undefined" && value instanceof MessagePort ? value : undefined
 
-const TRANSFERRED_PORT_FIELDS = ["writer", "egress", "egressControl", "broker"] as const
+const TRANSFERRED_PORT_FIELDS = ["egress", "egressControl"] as const
 
 /**
  * Parse a worker boot/port frame at the boundary. A frame with a boot/port
@@ -1322,10 +1479,8 @@ function parseBootFrame(data: unknown): BootFrame | undefined {
     readonly type?: unknown
     readonly threadId?: unknown
     readonly port?: unknown
-    readonly writer?: unknown
     readonly egress?: unknown
     readonly egressControl?: unknown
-    readonly broker?: unknown
   }
   if (frame.type === "ready") {
     return typeof frame.threadId === "number"
@@ -1334,10 +1489,8 @@ function parseBootFrame(data: unknown): BootFrame | undefined {
   }
   if (frame.type === "ports") {
     const ports: { -readonly [K in keyof WorkerTransferredPorts]: MessagePort | undefined } = {
-      writer: undefined,
       egress: undefined,
       egressControl: undefined,
-      broker: undefined,
     }
     for (const name of TRANSFERRED_PORT_FIELDS) {
       const value = frame[name]
@@ -1650,7 +1803,7 @@ export interface BunExecutorWorkerPoolOptions {
    * durable egress write is acked. Absent makes the result immediate.
    */
   readonly egressBarrier?: (sessionID: SessionID) => Promise<void> | undefined
-  /** Receive each worker's transferred writer / egress / broker ports (plan 8/17/19). */
+  /** Receive each worker's transferred egress ports. */
   readonly onWorkerPorts?: (workerID: number, ports: WorkerTransferredPorts) => void
   /** Receive each worker's transferred hub-proxy control port (plan 24). */
   readonly onHubProxyPort?: (workerID: number, port: MessagePort) => void
@@ -2047,7 +2200,7 @@ export type ProductionPoolFactory = (
   sinks: WorkerPoolSinks,
 ) => ExecutorWorkerPool
 
-/** Mark a generation as serving the worker writer / egress / broker ports. */
+/** Mark a generation as serving the worker egress ports. */
 function withSessionWorkerPorts(init: SessionWorkerInit): SessionWorkerInit {
   return { ...init, capabilities: { ...init.capabilities, sessionWorkerPorts: true } }
 }
@@ -2255,10 +2408,6 @@ export function createWorkerCancellation(
  * override; the defaults are the real hub authorities.
  */
 export interface ProductionPortBackendsOptions {
-  /** Override the hub writer source; defaults to a fresh `createWriterClient()`. */
-  readonly writer?: HubWriter
-  /** Override the hub broker source; defaults to a fresh `createBroker()`. */
-  readonly broker?: BrokerBackend
   /** Override the egress drain; defaults to {@link drainEgressPort}. */
   readonly egress?: (workerID: number, port: MessagePort, control?: MessagePort) => () => void
   /**
@@ -2274,6 +2423,8 @@ export interface ProductionPortBackendsOptions {
    * Takes precedence over {@link events} for the worker's events port.
    */
   readonly eventsForWorker?: (workerID: number) => LiveEventPublisher | undefined
+  /** Advisory hub cache invalidated by each durable event (never authoritative). */
+  readonly cache?: HubCacheInvalidation
   /**
    * Per-worker mesh subscription backlog bound; defaults to the mesh's own
    * `MESH_SUBSCRIPTION_BOUND`. A small bound makes the overflow/resync path
@@ -2292,52 +2443,10 @@ export interface ProductionPortBackendsOptions {
   readonly hubProxyStreamingFor?: (workerID: number) => Readonly<Record<string, HubProxyStreamHandler>> | undefined
   /** Streaming hub-proxy handlers shared by every worker. */
   readonly hubProxyStreaming?: Readonly<Record<string, HubProxyStreamHandler>>
-  /**
-   * The SQLite file the OWNED writer opens; defaults to the app database
-   * ({@link Database.path}). Ignored when a `writer` is injected (the caller owns
-   * its connection).
-   */
-  readonly databasePath?: string
-  readonly writerOptions?: WriterClientOptions
-  readonly brokerOptions?: BrokerOptions
-}
-
-/**
- * Wrap an owned hub writer so its isolate opens `filename` exactly once, on the
- * first request, then applies `statements` (the schema migrations) before any
- * request is served. The writer isolate spawns with NO connection — every
- * `publish`/`query` before `admin.open` throws `"writer connection is not open"`
- * — so the port server would reject without this. Opening lazily keeps graph
- * build free of I/O; a failed open/migrate resets the memo so a later call can
- * retry (the isolate's own respawn replays the open once it has succeeded).
- */
-export function lazyOpenWriter(writer: WriterClient, filename: string, statements: ReadonlyArray<string>): HubWriter {
-  let opened: Promise<unknown> | undefined
-  const ensureOpen = (): Promise<unknown> => {
-    if (opened !== undefined) return opened
-    opened = writer
-      .open(filename)
-      .then(() => writer.migrate(statements))
-      .catch((error) => {
-        opened = undefined
-        throw error
-      })
-    return opened
-  }
-  return {
-    query: (method, sql, params) => ensureOpen().then(() => writer.query(method, sql, params)),
-    publish: (event, options) => ensureOpen().then(() => writer.publish(event, options)),
-    begin: () => ensureOpen().then(() => writer.begin()),
-    txQuery: (handle, method, sql, params) => ensureOpen().then(() => writer.txQuery(handle, method, sql, params)),
-    commit: (handle) => ensureOpen().then(() => writer.commit(handle)),
-    rollback: (handle) => ensureOpen().then(() => writer.rollback(handle)),
-  }
 }
 
 /** The production port authorities plus the disposer that tears their isolates down. */
 export interface ProductionPortBackends extends WorkerPortBackends {
-  readonly writer: HubWriter
-  readonly broker: BrokerBackend
   /**
    * The ONE egress mesh the hub serves every worker's `egressControl` port
    * against. Exposed so a caller (or test) can observe the cross-isolate
@@ -2348,39 +2457,18 @@ export interface ProductionPortBackends extends WorkerPortBackends {
 }
 
 /**
- * Build the production hub-side port authorities from the real writer / broker /
- * egress implementations:
- *   * `writer` — a fresh hub `WriterClient` (the sole SQLite writer; structurally
- *     a `HubWriter`), which the hub serves with `serveWriterPort`;
- *   * `broker` — a fresh hub `BrokerClient` (structurally a `BrokerBackend`),
- *     served with `serveBrokerPort`;
+ * Build the production hub-side port authorities:
  *   * `egress` — the draining receiver ({@link drainEgressPort}); the SSE route
  *     swaps in a real sink later.
  *
- * `createBroker` spawns its isolate eagerly at construction, so the caller MUST
- * build these lazily (as a {@link WorkerPortBackendsSource}), never at
- * graph-build time. `dispose` closes the writer isolate and tears the broker
- * down; it is a no-op for an injected authority the caller owns.
+ * There is no writer authority (D5) and no broker (D20). `dispose` tears the
+ * mesh/port state down; it is safe to call when nothing was attached.
  */
 export function buildProductionPortBackends(options: ProductionPortBackendsOptions = {}): ProductionPortBackends {
-  let ownedWriter: WriterClient | undefined
-  let ownedBroker: BrokerClient | undefined
-  // An injected writer is trusted (the caller owns its connection); the owned
-  // writer opens the app database lazily, on the first request.
-  const writer: HubWriter =
-    options.writer ??
-    lazyOpenWriter(
-      (ownedWriter = createWriterClient(options.writerOptions)),
-      options.databasePath ?? Database.path(),
-      migrationStatements,
-    )
-  const broker: BrokerBackend = options.broker ?? (ownedBroker = createBroker(options.brokerOptions))
   // ONE mesh per hub: every worker's transferred `egressControl` port attaches
   // here, and the durable commit path publishes to it (plan task 8.10/8.11).
   const egressMesh = createEgressMesh(options.egressMeshBound === undefined ? {} : { bound: options.egressMeshBound })
   return {
-    writer,
-    broker,
     egressMesh,
     ...(options.hubProxy === undefined ? {} : { hubProxy: options.hubProxy }),
     ...(options.hubProxyFor === undefined ? {} : { hubProxyFor: options.hubProxyFor }),
@@ -2400,18 +2488,21 @@ export function buildProductionPortBackends(options: ProductionPortBackendsOptio
         const disposeReceiver =
           publisher === undefined
             ? drainEgressPort(port)
-            : serveEventsPort(port, createHubEventSink({ publisher }), undefined, (commit) =>
-                egressMesh.publish(commit),
+            : serveEventsPort(
+                port,
+                createHubEventSink({
+                  publisher,
+                  ...(options.cache === undefined ? {} : { cache: options.cache }),
+                }),
+                undefined,
+                (commit) => egressMesh.publish(commit),
               )
         return () => {
           disposeReceiver()
           attachment?.dispose()
         }
       }),
-    dispose: async () => {
-      if (ownedWriter !== undefined) await ownedWriter.close().catch(() => undefined)
-      if (ownedBroker !== undefined) await ownedBroker.teardown().catch(() => undefined)
-    },
+    dispose: async () => {},
   }
 }
 
@@ -2449,6 +2540,12 @@ export interface ProductionSessionHubOptions {
    * hub serves the ports.
    */
   readonly ports?: WorkerPortBackendsSource
+  /** Off-loop hub SQL fallback; see `SessionHubOptions.db`. */
+  readonly db?: DbExecutor
+  /** Advisory cache shared with the port backends (never authoritative). */
+  readonly cache?: HubTruthCache
+  /** Persist/surface the typed D8 payload (see `SessionHubOptions.onWorkerCrashed`). */
+  readonly onWorkerCrashed?: (payload: WorkerCrashed) => void | Promise<void>
   /** Invoked synchronously at the start of each dispatch (see `SessionHubOptions`). */
   readonly onDispatch?: (sessionID: SessionID) => void
   /** Live-only event publisher (worker republish + `session.cancelled`). */
@@ -2569,6 +2666,13 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
     const init = await resolveSource(sessionID)
     return options.ports === undefined ? init : withSessionWorkerPorts(init)
   }
+  // Persist every typed crash on the hub's off-loop DB thread unless the caller
+  // supplied its own sink. The payload returned to the caller is the same value.
+  const crashSink =
+    options.onWorkerCrashed ??
+    (options.db === undefined
+      ? undefined
+      : (payload: WorkerCrashed) => recordAsync(options.db!, payload).then(() => undefined))
   const pool =
     options.poolFactory !== undefined
       ? options.poolFactory(resolveInit, sinks)
@@ -2613,6 +2717,9 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
     log,
     ...defined({
       ports: options.ports,
+      db: options.db,
+      cache: options.cache,
+      onWorkerCrashed: crashSink,
       onDispatch: options.onDispatch,
       events: options.events,
       eventPublisherFor: options.eventPublisherFor,
@@ -2648,13 +2755,21 @@ export interface ProductionSessionHubNodeOptions {
   readonly cancellation?: WorkerCancellationOptions
   /**
    * Worker-port backends, ready or lazily built. Defaults to
-   * `() => buildProductionPortBackends(backends)` — the real hub writer / broker /
-   * egress authorities, constructed on the first dispatch — so the production
+   * `() => buildProductionPortBackends(backends)` — the real hub egress
+   * authorities, constructed on the first dispatch — so the production
    * node advertises `capabilities.sessionWorkerPorts` without spawning anything at
    * graph-build time.
    */
   readonly ports?: WorkerPortBackendsSource
-  /** Tuning for the default production port backends (writer/broker overrides, env). */
+  /** Off-loop hub SQL fallback; defaults to a lazy executor over `databasePath`. */
+  readonly db?: DbExecutor
+  /** SQLite file the default hub executor opens; defaults to the app database. */
+  readonly databasePath?: string
+  /** Advisory cache shared by the hub, event sink, and port backends. */
+  readonly cache?: HubTruthCache
+  /** Persist/surface the typed D8 crash payload. */
+  readonly onWorkerCrashed?: (payload: WorkerCrashed) => void | Promise<void>
+  /** Tuning for the default production port backends (env). */
   readonly backends?: ProductionPortBackendsOptions
   /** Test seam: build the pool from the resolved init. Defaults to the lazy production pool. */
   readonly poolFactory?: ProductionPoolFactory
@@ -3117,6 +3232,12 @@ export function productionSessionHubLayer(
       // dispatch/execute/cancel were dormant. `bridge` names the EventV2Bridge above.
       const effectBridge = yield* EffectBridge.make()
       const log = workerLoggerFromBridge(effectBridge)
+      // One advisory cache for the hub, its durable-event sink, and shutdown. It
+      // starts cold (no persisted prompt state) and is never authoritative.
+      const cache = options.cache ?? new StateCache<unknown>()
+      // The off-loop SQL fallback for hub queries. Construction spawns nothing;
+      // the executor's thread starts on the first query.
+      const db = options.db ?? createDbExecutor({ filename: options.databasePath ?? Database.path() })
       // The hub is assigned after the pool is built; the resolver's per-worker
       // lookups run lazily on the first port attach (post-assignment), so the
       // deferred reference is safe.
@@ -3148,12 +3269,15 @@ export function productionSessionHubLayer(
             hubProxyStreamingFor: options.backends?.hubProxyStreamingFor ?? resolvers.hubProxyStreamingFor,
             events: resolvers.events,
             eventsForWorker: resolvers.eventsForWorker,
+            cache,
           }))
       const hub = createProductionSessionHub({
         ...options,
         count,
         init: resolvers.resolveInit,
         ports,
+        db,
+        cache,
         events: resolvers.events,
         eventPublisherFor: resolvers.eventsForSession,
         log,

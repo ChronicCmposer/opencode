@@ -8,6 +8,8 @@
 
 import { describe, expect, test } from "bun:test"
 import {
+  FrameTooLargeError,
+  MAX_WORKER_FRAME_BYTES,
   ProtocolError,
   WORKER_FRAME_VERSION,
   UnsupportedFrameVersionError,
@@ -26,6 +28,7 @@ import {
   requireInteger,
   requireString,
   resyncFrame,
+  workerFrameByteLength,
   type EventsFrame,
   type WorkerFrameEnvelope,
 } from "@/session/worker/frame"
@@ -51,7 +54,7 @@ describe("parseWorkerFrame", () => {
   })
 
   test("accepts every documented port", () => {
-    for (const port of ["events", "writer", "broker", "job", "hub-proxy"] as const) {
+    for (const port of ["events", "writer", "job", "hub-proxy"] as const) {
       expect(parseWorkerFrame({ v: 1, port, kind: "ping" }).port).toBe(port)
     }
   })
@@ -209,12 +212,8 @@ describe("durableMetaOf", () => {
   })
 
   test("a half-stamped frame is not durable", () => {
-    expect(
-      durableMetaOf(eventFrame({ event: { id: "e", type: "t", properties: {} }, ordinal: 7 })),
-    ).toBeUndefined()
-    expect(
-      durableMetaOf(eventFrame({ event: { id: "e", type: "t", properties: {} }, generation: 2 })),
-    ).toBeUndefined()
+    expect(durableMetaOf(eventFrame({ event: { id: "e", type: "t", properties: {} }, ordinal: 7 }))).toBeUndefined()
+    expect(durableMetaOf(eventFrame({ event: { id: "e", type: "t", properties: {} }, generation: 2 }))).toBeUndefined()
   })
 
   test("control frames are never durable", () => {
@@ -257,5 +256,68 @@ describe("shared primitive parsers", () => {
     const primitives = createFramePrimitives(fail)
     expect(() => primitives.requireString({ s: 1 }, "s")).toThrow(CustomError)
     expect(() => primitives.requireInteger({ n: 1.5 }, "n")).toThrow(CustomError)
+  })
+})
+
+describe("worker frame size bound", () => {
+  /** Valid JSON frame text padded to exactly `bytes` UTF-8 bytes (ASCII padding). */
+  function frameTextOfByteLength(bytes: number): string {
+    const prefix = '{"v":1,"port":"writer","kind":"x","payload":{"pad":"'
+    const suffix = '"}}'
+    return prefix + "x".repeat(bytes - prefix.length - suffix.length) + suffix
+  }
+
+  test("measures exact UTF-8 bytes, not JavaScript string length", () => {
+    expect(workerFrameByteLength("é")).toBe(2)
+    expect(workerFrameByteLength("héllo 🌍")).toBe(new TextEncoder().encode("héllo 🌍").byteLength)
+  })
+
+  test("accepts a frame exactly at the 4 MiB bound", () => {
+    const text = frameTextOfByteLength(MAX_WORKER_FRAME_BYTES)
+    expect(workerFrameByteLength(text)).toBe(MAX_WORKER_FRAME_BYTES)
+    expect(decodeWorkerFrame(text).kind).toBe("x")
+  })
+
+  test("rejects a frame one byte over the bound as a typed rejection", () => {
+    const text = frameTextOfByteLength(MAX_WORKER_FRAME_BYTES + 1)
+    let caught: unknown
+    try {
+      decodeWorkerFrame(text)
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBeInstanceOf(FrameTooLargeError)
+    expect((caught as FrameTooLargeError).byteLength).toBe(MAX_WORKER_FRAME_BYTES + 1)
+    expect((caught as FrameTooLargeError).limit).toBe(MAX_WORKER_FRAME_BYTES)
+  })
+
+  test("rejects an over-bound payload before attempting JSON parse", () => {
+    // Not valid JSON: proof the byte bound is checked first, so a hostile
+    // oversized message cannot be parsed or truncated.
+    expect(() => decodeWorkerFrame("x".repeat(MAX_WORKER_FRAME_BYTES + 1))).toThrow(FrameTooLargeError)
+  })
+})
+
+describe("JSON payload encoding", () => {
+  test("rejects a non-JSON value instead of silently dropping it", () => {
+    expect(() =>
+      encodeWorkerFrame({
+        v: WORKER_FRAME_VERSION,
+        port: "hub-proxy",
+        kind: "reply",
+        payload: { value: () => {} },
+      }),
+    ).toThrow(ProtocolError)
+  })
+
+  test("rejects a bigint that JSON cannot represent", () => {
+    expect(() =>
+      encodeWorkerFrame({
+        v: WORKER_FRAME_VERSION,
+        port: "hub-proxy",
+        kind: "reply",
+        payload: { value: 1n },
+      }),
+    ).toThrow(ProtocolError)
   })
 })

@@ -1,19 +1,15 @@
-// Gate 7 — a flag-ON run must release its writer transaction before it returns,
-// so two back-to-back prompts in the SAME session both complete.
+// Gate 7 — a flag-ON run must release its database transaction before it
+// returns, so two back-to-back prompts in the SAME session both complete.
 //
-// Before the `session/writer/core.ts` `finishTransaction` fix, a flag-ON normal
-// completion could leave a transaction pinned past `message.completed`. The
-// immediate next prompt in that session then queued behind the pin (and in the
-// packaged binary hit `SQLiteError: database is locked` / `LockTimeoutError`).
-// The pin release is unit-tested in `session/writer/core.test.ts`; this is its
-// prompt-level twin: the REAL `SessionPrompt.loop` over the writer-backed worker
+// A normal completion that left a transaction pinned past `message.completed`
+// would make the immediate next prompt in that session fail. The pin release's
+// unit contract lives in `test/session/worker/busy-retry.test.ts`; this is its
+// prompt-level twin: the REAL `SessionPrompt.loop` over the per-worker WAL
 // `Database`, run twice in one session.
 //
-// The writer serializes everything through one queue and only runs an ordinary
-// statement (or a `begin`) while no transaction is pinned, so a leftover pin
-// shows up here as a bounded hang, not just a lock error. Every wait is bounded
-// well below the writer's 30s idle-rollback window: a prompt that only succeeds
-// because that timer fired is still a regression.
+// Each worker owns its connection (D5), so a leftover transaction shows up here
+// as a failed `BEGIN IMMEDIATE` probe, not just a lock error. Every wait is
+// bounded well below the old writer's 30s idle-rollback window.
 
 import { describe, expect, test } from "bun:test"
 import fs from "node:fs"
@@ -24,7 +20,6 @@ import { sql } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
-import { createWriterCore } from "@/session/writer/core"
 import { openWriterConnection } from "@/session/writer/connection"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
@@ -72,6 +67,15 @@ const mkModelConfig = (provider: { baseUrl: string; apiKey: string; model: strin
 /** Run an effect against the worker graph with the E2E instance context. */
 const runInContext = <A, E, R>(ctx: E2EContext, effect: Effect.Effect<A, E, R>): Promise<A> =>
   Effect.runPromise(effect.pipe(Effect.provide(ctx.layer), Effect.provideService(InstanceRef, ctx.instance)))
+
+/**
+ * Probe the worker's database connection for a leftover transaction: `BEGIN`
+ * fails loud when a transaction is still pinned, then `ROLLBACK` releases it.
+ */
+const probeWorkerConnection = async (ctx: E2EContext): Promise<void> => {
+  const handle = await ctx.writer.begin()
+  await ctx.writer.rollback(handle)
+}
 
 /** Create a session and its first user message through the worker's own services. */
 const seedSession = (ctx: E2EContext, modelID: string, text: string): Promise<SessionID> =>
@@ -190,15 +194,13 @@ describe("Gate 7 — sequential prompts in one session over the writer-backed wo
       const first = await runPrompt(work, sessionID, "prompt 1")
       expect(assistantText(first)).toBe("first-reply")
 
-      // 2. The writer is free the instant the run returns. `begin` only runs when
-      //    no transaction is pinned; a leftover pin would queue it for the full
-      //    idle-rollback window.
-      const probe = await settlesWithin(
-        ctx.writer.begin(),
+      // 2. The worker connection is free the instant the run returns. An open
+      //    transaction would make the probe's `BEGIN IMMEDIATE` fail.
+      await settlesWithin(
+        probeWorkerConnection(ctx),
         PIN_RELEASE_BUDGET_MS,
-        "writer still pinned immediately after prompt 1 completed",
+        "worker connection still pinned immediately after prompt 1 completed",
       )
-      await ctx.writer.rollback(probe)
 
       // 3. The next prompt starts immediately in the SAME session and completes.
       await seedUserMessage(ctx, sessionID, provider.model, "second prompt")
@@ -227,68 +229,12 @@ describe("Gate 7 — sequential prompts in one session over the writer-backed wo
     })
   }, 120_000)
 
-  test("a busy COMMIT whose retries are exhausted still releases the writer pin across the writer port", async () => {
-    await withE2EContext({ scripts: [{ text: "unused" }] }, async (ctx) => {
-      // Construct the production lock condition locally: a pinned transaction
-      // whose COMMIT fails with `database is locked`. `isSqliteBusy` classifies it
-      // as busy, so the writer keeps the pin and re-issues the COMMIT; once the
-      // retries are exhausted the finalization has failed, and the pin must not
-      // outlive it (otherwise every queued operation starves until the 30s idle
-      // rollback). The port surfaces the typed `SQLITE_BUSY_EXHAUSTED` failure.
-      const originalRun = ctx.connection.run.bind(ctx.connection)
-      let failCommit = true
-      ctx.connection.run = ((sql: string, params?: ReadonlyArray<unknown>) => {
-        if (failCommit && /^\s*commit\b/i.test(sql)) throw new Error("SQLiteError: database is locked")
-        return originalRun(sql, params)
-      }) as typeof ctx.connection.run
+  // The deleted writer isolate owned whole-transaction busy retry and its pin
+  // accounting (`SQLITE_BUSY_EXHAUSTED`, rollback/release on commit failure).
+  // D5 re-homes that behavior in `@/database/transaction`; the contract is
+  // covered by `test/session/worker/busy-retry.test.ts` and `test/session/bus.test.ts`.
 
-      const handle = await settlesWithin(ctx.writer.begin(), PIN_RELEASE_BUDGET_MS, "first begin did not settle")
-      await settlesWithin(
-        ctx.writer.txQuery(handle, "run", "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)", [
-          "evt_gate7",
-          "a",
-          1,
-          "t",
-          "{}",
-        ]),
-        PIN_RELEASE_BUDGET_MS,
-        "txQuery did not settle",
-      )
-      const commitError = await settlesWithin(
-        ctx.writer.commit(handle).then(
-          () => undefined,
-          (cause: unknown) => cause,
-        ),
-        PIN_RELEASE_BUDGET_MS,
-        "commit did not settle",
-      )
-      expect(commitError).toBeInstanceOf(Error)
-      expect((commitError as { tag?: string }).tag).toBe("SQLITE_BUSY_EXHAUSTED")
-      expect((commitError as { code?: string }).code).toBe("SQLITE_BUSY")
-      expect((commitError as Error).message).toMatch(/SQLITE_BUSY|database is locked/i)
-      failCommit = false
-
-      // The failed commit must not leave the writer pinned: a queued read settles
-      // promptly, and a fresh transaction can open on the recovered connection.
-      const read = await settlesWithin(
-        ctx.writer.query("all", "SELECT COUNT(*) AS n FROM event", []) as Promise<ReadonlyArray<{ n: number }>>,
-        PIN_RELEASE_BUDGET_MS,
-        "writer stayed pinned after a failed COMMIT",
-      )
-      // Assert the queued read actually returned its row, not merely that the
-      // promise settled: a starved query must not pass on `undefined`.
-      expect(read).toHaveLength(1)
-      expect(read[0]).toEqual({ n: expect.any(Number) })
-      const next = await settlesWithin(
-        ctx.writer.begin(),
-        PIN_RELEASE_BUDGET_MS,
-        "begin starved behind a failed COMMIT",
-      )
-      await ctx.writer.rollback(next)
-    })
-  }, 120_000)
-
-  test("a read queued behind the running prompt settles promptly once the run ends", async () => {
+  test("a read during the running prompt settles promptly and sees committed rows", async () => {
     await withE2EContext({ scripts: [{ text: "alpha" }, { text: "beta" }] }, async (ctx, provider) => {
       const sessionID = await seedSession(ctx, provider.model, "one")
       const work = createSessionWork({
@@ -301,16 +247,14 @@ describe("Gate 7 — sequential prompts in one session over the writer-backed wo
       await runPrompt(work, sessionID, "prompt 1")
       await seedUserMessage(ctx, sessionID, provider.model, "two")
 
-      // Kick off prompt 2 and immediately queue a read behind whatever writer
-      // transaction the run takes. The writer serializes both; the read must
-      // settle once the run finishes, not after the idle rollback timer.
+      // Kick off prompt 2 and immediately read from the worker's own WAL
+      // connection. WAL reads do not queue behind the run's write transaction and
+      // must settle with the rows committed so far.
       const secondRun = runPrompt(work, sessionID, "prompt 2")
-      const read = ctx.writer.query("all", "SELECT COUNT(*) AS n FROM message", []) as Promise<
-        ReadonlyArray<{ n: number }>
-      >
+      const read = Effect.runPromise(ctx.database.all<{ n: number }>("SELECT COUNT(*) AS n FROM message"))
       const [second, rows] = await Promise.all([
         secondRun,
-        settlesWithin(read, PIN_RELEASE_BUDGET_MS, "read starved behind the run's pinned transaction"),
+        settlesWithin(read, PIN_RELEASE_BUDGET_MS, "read starved behind the run's write transaction"),
       ])
 
       expect(assistantText(second)).toBe("beta")
@@ -320,37 +264,32 @@ describe("Gate 7 — sequential prompts in one session over the writer-backed wo
 })
 
 // ---------------------------------------------------------------------------
-// Regression: a MAIN-process durable write must survive the session-worker
-// writer holding the sole SQLite write lock.
+// Regression: a MAIN-process durable write must survive a session worker
+// holding the SQLite write lock.
 //
-// The E2E harness above cannot express this one: `createE2EContext` opens a
-// single `:memory:` connection (shared with the worker over a `MessagePort`),
-// so it exposes no INDEPENDENT main-process `Database.Service` connection and
-// a second `:memory:` connection would be a different database. This test
-// therefore builds the two connections the failure needs, over one real FILE:
+// D5 gives every worker its own WAL connection, so this test builds the two
+// connections the failure needs over one real FILE:
 //
-//   * the session-worker writer — the production `WriterCore` over its own
-//     `openWriterConnection` (driving the core in-process is the same lock
-//     semantics; production just moves it behind the writer isolate), and
+//   * the session worker — its own `openWriterConnection` pins
+//     `BEGIN IMMEDIATE` (the same lock semantics a running prompt holds), and
 //   * the main process — `Database.layerFromPath` -> `Database.Service`,
 //     issuing the durable write at the exact `event.ts` `commitDurableEvent`
 //     seam: `db.transaction(..., { behavior: "immediate" })`.
 //
-// While the writer's `BEGIN IMMEDIATE` is pinned, the main transaction's own
+// While the worker's `BEGIN IMMEDIATE` is pinned, the main transaction's own
 // `BEGIN IMMEDIATE` hits `SQLITE_BUSY` -> `database is locked` /
-// `LockTimeoutError`. Before the main connection had a bounded busy-retry the
-// write died outright; with it, the retry rides out the contention until the
-// writer releases.
+// `LockTimeoutError`. The main connection's bounded busy-retry rides out the
+// contention until the worker releases.
 //
 // `PRAGMA busy_timeout = 0` is applied to the main connection so the lock
 // surfaces immediately (rather than after the production 5s wait) — the same
 // technique the `effect-drizzle-sqlite` lock test uses. The contention itself
 // is real: a second connection genuinely holds the write lock.
 
-/** How long the worker writer holds its write lock while the main write contends. */
+/** How long the worker holds its write lock while the main write contends. */
 const MAIN_WRITE_CONTENTION_MS = 200
 
-describe("Main-process durable write vs the session-worker writer lock", () => {
+describe("Main-process durable write vs the session-worker write lock", () => {
   test("a main-process durable write settles instead of dying with database is locked", async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-main-write-"))
     const dbPath = path.join(directory, "main.db")
@@ -361,13 +300,12 @@ describe("Main-process durable write vs the session-worker writer lock", () => {
           // Fail fast on the lock instead of waiting the production `busy_timeout`.
           yield* db.run(sql`PRAGMA busy_timeout = 0`)
 
-          // The session-worker writer: its own connection to the SAME file.
+          // The session-worker connection: its own handle to the SAME file.
           const writerConnection = openWriterConnection(dbPath)
-          const writer = createWriterCore({ connection: writerConnection, checkpointIntervalMs: 0 })
           yield* Effect.addFinalizer(() => Effect.sync(() => writerConnection.close()))
 
-          // 1. Pin the sole write lock (as a running worker prompt would).
-          const handle = yield* Effect.promise(() => writer.beginTransaction())
+          // 1. Pin the write lock (as a running worker prompt would).
+          writerConnection.exec("BEGIN IMMEDIATE")
 
           // 2. Concurrent main-process durable write.
           const write = db.transaction(
@@ -396,7 +334,7 @@ describe("Main-process durable write vs the session-worker writer lock", () => {
 
           // 3. Hold the lock while the main write contends, then release it.
           yield* Effect.sleep(MAIN_WRITE_CONTENTION_MS)
-          yield* Effect.promise(() => writer.rollbackTransaction(handle))
+          writerConnection.exec("ROLLBACK")
 
           // 4. The main write must settle.
           const exit = yield* Fiber.join(fiber).pipe(Effect.exit)

@@ -79,7 +79,6 @@ const clients = (): SessionLayerOptions["clients"] => ({
     publish: async () => ({ seq: 7, committed: true }),
   },
   egress: { emit: () => {} },
-  broker: { call: async () => null },
   backgroundJob: { wait: async () => null, cancel: async () => {} },
 })
 
@@ -233,7 +232,6 @@ describe("session pipeline (6.1)", () => {
             },
           },
           egress: { emit: (event) => void emitted.push(event.type) },
-          broker: { call: async () => null },
           backgroundJob: { wait: async () => null, cancel: async () => {} },
         },
       }),
@@ -260,7 +258,6 @@ describe("session pipeline (6.1)", () => {
         clients: {
           writer: { query: async () => [], publish: async () => ({ seq: null, committed: false }) },
           egress: { emit: (event) => void emitted.push(event.type) },
-          broker: { call: async () => null },
           backgroundJob: { wait: async () => null, cancel: async () => {} },
         },
       }),
@@ -289,7 +286,6 @@ describe("session pipeline (6.1)", () => {
             },
           },
           egress: { emit: () => {} },
-          broker: { call: async () => null },
           backgroundJob: { wait: async () => null, cancel: async () => {} },
         },
       }),

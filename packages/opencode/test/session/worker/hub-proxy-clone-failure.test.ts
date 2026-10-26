@@ -19,8 +19,7 @@
 //     its timeout.
 
 import { describe, expect, test } from "bun:test"
-import { createHubProxyClient, serveHubProxy } from "@/session/worker/layer"
-import { HubProxyRemoteError } from "@/session/worker/hub-proxy-wire"
+import { HubProxyRemoteError, createHubProxyClient, serveHubProxy } from "@/session/worker/hub-proxy-wire"
 
 /** Serve `handlers` on a fresh channel and return the worker-end client. */
 function clientFor(
@@ -89,20 +88,15 @@ describe("hub-proxy reply clone guard", () => {
 
   test("recovery is exactly one clone-safe ok:false frame echoing the request id", async () => {
     const channel = new MessageChannel()
-    // Intercept the reply path: the first post (the un-cloneable success value)
-    // throws as a real port would; the fallback is captured rather than sent.
-    const posted: Array<Record<string, unknown>> = []
-    let replyAttempts = 0
-    // The fallback post IS the completion signal: the stub resolves this
-    // deferred the moment it captures the clone-safe frame, so the test awaits
-    // real delivery instead of racing a fixed sleep against the port.
+    // The success value fails JSON encoding before the port is touched, so only
+    // the recovery frame is ever posted. The fallback post IS the completion
+    // signal: the stub resolves this deferred the moment it captures the frame.
+    const posted: string[] = []
     let signalFallbackPosted: (() => void) | undefined
     const fallbackPosted = new Promise<void>((resolve) => {
       signalFallbackPosted = resolve
     })
-    channel.port2.postMessage = ((frame: Record<string, unknown>) => {
-      replyAttempts += 1
-      if (replyAttempts === 1) throw new DOMException("The object can not be cloned.", "DataCloneError")
+    channel.port2.postMessage = ((frame: string) => {
       posted.push(frame)
       signalFallbackPosted?.()
     }) as never
@@ -112,15 +106,16 @@ describe("hub-proxy reply clone guard", () => {
 
     try {
       void client.call("messagesTransform", [{}, { messages: [] }]).catch(() => {})
-      await awaitSignal(fallbackPosted, 2000, "the clone-safe fallback post")
+      await awaitSignal(fallbackPosted, 2000, "the JSON-safe fallback post")
 
-      // Exactly one success post (threw) plus exactly one fallback post (kept).
-      expect(replyAttempts).toBe(2)
+      // Exactly one post: the recovery frame. The un-serialisable success value
+      // never reached `postMessage`.
+      expect(posted).toHaveLength(1)
 
-      const envelope = posted[0]
-      expect(envelope?.kind).toBe("reply")
-      expect(envelope?.id).toBe(1)
-      const payload = envelope?.payload as Record<string, unknown>
+      const envelope = JSON.parse(posted[0]!) as Record<string, unknown>
+      expect(envelope.kind).toBe("reply")
+      expect(envelope.id).toBe(1)
+      const payload = envelope.payload as Record<string, unknown>
       expect(payload.ok).toBe(false)
       expect(payload.id).toBe(1)
       expect(String(payload.message)).toContain("not structured-cloneable")

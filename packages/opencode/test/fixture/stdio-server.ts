@@ -1,14 +1,9 @@
 // Shared fake MCP/LSP stdio-server plumbing.
 //
-// Two test fixtures run as real child processes and must not diverge on the
-// mechanics of being an MCP/LSP server:
-//
-//   - `test/session/broker/broker-child.ts` — the broker's fake child.
-//   - `test/fixture/mcp-lsp-descendants.ts` — the process-tree fake child.
-//
-// They differ only in their per-method behaviour, so this module owns the parts
-// they share: integer environment parsing, process-group discovery, and the MCP
-// (newline-delimited JSON) / LSP (`Content-Length`) framing. Both fixtures must
+// `test/fixture/mcp-lsp-descendants.ts` runs as a real child process and owns
+// the mechanics of being an MCP/LSP server. This module owns the shared parts:
+// integer environment parsing, process-group discovery, and the MCP
+// (newline-delimited JSON) / LSP (`Content-Length`) framing. The fixture must
 // import from here rather than re-implementing these.
 
 import { readFileSync } from "node:fs"

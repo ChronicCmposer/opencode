@@ -18,6 +18,19 @@
 // and a mutable `output`; hooks run in registration order and each observes the
 // previous hook's mutations. A throwing hook aborts the chain (fail loud).
 
+export {
+  DECLARED_ONLY_HOOKS,
+  UnclassifiedPluginHookError,
+  UnsupportedPluginHookError,
+  WORKER_HOOK_ROUTES,
+  assertPluginHookAdmission,
+  isDeclaredOnlyHook,
+  pluginHookAdmissionError,
+  workerHookRoute,
+  type WorkerHookName,
+  type WorkerHookRoute,
+} from "@/plugin/routes"
+
 /**
  * The mutable `chat.params` output a hook rewrites. The sampling fields are
  * optional: an absent field means "the worker's own baseline", so a plugin need

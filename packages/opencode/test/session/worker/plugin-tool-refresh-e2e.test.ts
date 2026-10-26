@@ -106,7 +106,6 @@ function fakePlugin(tools: () => Record<string, unknown>): Plugin.Interface {
 const clients = (): SessionLayerOptions["clients"] => ({
   writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
   egress: { emit: () => {} },
-  broker: { call: async () => null },
   backgroundJob: { wait: async () => null, cancel: async () => {} },
 })
 

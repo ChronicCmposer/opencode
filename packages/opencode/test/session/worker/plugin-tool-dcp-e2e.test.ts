@@ -65,6 +65,7 @@ import {
 } from "@/session/worker/plugin-tool-wire"
 import { recordingHubAuthorities } from "../../lib/hub-proxy"
 import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
+import { pluginPassThroughReplacement } from "../../lib/worker-plugin-routes"
 import { startMockProvider, type MockProviderHandle } from "../../lib/mock-provider"
 import { workerSnapshot } from "../../lib/snapshot"
 
@@ -215,7 +216,6 @@ const modelConfig = (provider: MockProviderHandle): WorkerModelConfig => ({
 const silentClients = (): Parameters<typeof buildSessionWorkerLayer>[0]["clients"] => ({
   writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
   egress: { emit: () => {} },
-  broker: { call: async () => null },
   backgroundJob: { wait: async () => null, cancel: async () => {} },
 })
 
@@ -234,13 +234,12 @@ function workerLayer(
     clients: {
       writer,
       egress: { emit: () => {}, emitDurable: () => {} },
-      broker: { call: async () => null },
       backgroundJob: { wait: async () => null, cancel: async () => {} },
     },
     modelClient: llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(snapshot, config))),
     plugins,
     pluginTools,
-    replacements: workerGraphReplacements(config),
+    replacements: [...workerGraphReplacements(config), pluginPassThroughReplacement(plugins, pluginTools)],
   }).layer
 }
 

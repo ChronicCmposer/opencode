@@ -6,8 +6,10 @@
 //
 //   * `events`    — EventV2 delivery plus flow control. THIS module owns the
 //                   `event` / `end` / `resync` / `ack` variants.
-//   * `writer`    — the single-writer SQLite + file-KV RPC (`session/writer/protocol.ts`).
-//   * `broker`    — the MCP/LSP child-process broker RPC (`session/broker/protocol.ts`).
+//   * `writer`    — reserved legacy single-writer SQLite + file-KV RPC family.
+//                   The writer protocol was removed with per-worker DBs; the port
+//                   name stays in the versioned set for frame compatibility.
+//                   No producer exists in v2.
 //   * `job`       — reserved legacy background-job envelope family. The job
 //                   registry/control port was removed with per-session workers;
 //                   the port name stays in the versioned set so an older frame
@@ -22,31 +24,33 @@
 //   * `id`      correlates a request/response pair when the family needs it;
 //   * `payload` is family-specific and left opaque to the envelope parser.
 //
-// Parsing happens once, at the boundary: `parseWorkerFrame` validates the
-// envelope and `parseEventsFrame` validates the `events` variants. After that the
-// value is trusted. Anything malformed — or carrying an unknown version — fails
-// loud rather than being patched, so illegal states never enter internal logic.
+// Parsing happens once, at the boundary: `decodeWorkerFrame` accepts one JSON
+// string and `parseWorkerFrame` decodes the envelope with Effect Schema. After
+// that the value is trusted. Anything malformed — a non-string, invalid JSON, an
+// unknown shape or version, or a message above 4 MiB — fails loud rather than
+// being patched or truncated, so illegal states never enter internal logic.
 //
 // The events `event` variant carries the EventV2 event VERBATIM as
 // `{ id, type, properties }`; there is deliberately no writer-style `data`
 // translation. `generation` / `ordinal` are frame metadata (payload siblings of
 // `event`), never fields on the event itself.
 
+import { Schema } from "effect"
 import type { WriterOrdinal } from "@/session/egress/ordinal"
 
 /** The only envelope version understood by this build. */
 export const WORKER_FRAME_VERSION = 1
 export type WorkerFrameVersion = typeof WORKER_FRAME_VERSION
 
-/** The worker ports that share the envelope. */
-export const WORKER_FRAME_PORTS = ["events", "writer", "broker", "job", "hub-proxy"] as const
-export type WorkerFramePort = (typeof WORKER_FRAME_PORTS)[number]
-const PORT_SET: ReadonlySet<string> = new Set(WORKER_FRAME_PORTS)
+/** The protocol schema version carried by the ready-handshake build hash. */
+export const WORKER_PROTOCOL_SCHEMA_VERSION = WORKER_FRAME_VERSION
 
-/** Narrow an untrusted value to a known worker port without an unsafe cast. */
-function isWorkerFramePort(value: unknown): value is WorkerFramePort {
-  return typeof value === "string" && PORT_SET.has(value)
-}
+/** Upper bound on one JSON message crossing a worker port (4 MiB). */
+export const MAX_WORKER_FRAME_BYTES = 4 * 1024 * 1024
+
+/** The worker ports that share the envelope. */
+export const WORKER_FRAME_PORTS = ["events", "writer", "job", "hub-proxy"] as const
+export type WorkerFramePort = (typeof WORKER_FRAME_PORTS)[number]
 
 /** The shared envelope every worker port transports. */
 export interface WorkerFrameEnvelope {
@@ -171,13 +175,26 @@ export class UnsupportedFrameVersionError extends ProtocolError {
   }
 }
 
+/** Raised when one JSON message exceeds {@link MAX_WORKER_FRAME_BYTES}. */
+export class FrameTooLargeError extends ProtocolError {
+  readonly _tag = "FrameTooLargeError"
+
+  constructor(
+    readonly byteLength: number,
+    readonly limit: number = MAX_WORKER_FRAME_BYTES,
+  ) {
+    super(`worker frame is ${byteLength} bytes (limit ${limit}); the frame was rejected, not truncated`)
+    this.name = "FrameTooLargeError"
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Shared primitive parsers
 // ---------------------------------------------------------------------------
 
 /**
  * A protocol's failure factory: build and throw that module's own protocol error.
- * Binding the shared parsers to it lets every framed protocol (writer, broker,
+ * Binding the shared parsers to it lets every framed protocol (writer,
  * events) keep its own error taxonomy while sharing one implementation.
  */
 export type ParseFail = (message: string) => never
@@ -193,22 +210,14 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** Parse a required string field; fails loud through `fail` (frame `ProtocolError` by default). */
-export function requireString(
-  record: Record<string, unknown>,
-  field: string,
-  fail: ParseFail = frameFail,
-): string {
+export function requireString(record: Record<string, unknown>, field: string, fail: ParseFail = frameFail): string {
   const value = record[field]
   if (typeof value !== "string") fail(`field "${field}" must be a string (got ${JSON.stringify(value)})`)
   return value
 }
 
 /** Parse a required finite-number field. */
-export function requireNumber(
-  record: Record<string, unknown>,
-  field: string,
-  fail: ParseFail = frameFail,
-): number {
+export function requireNumber(record: Record<string, unknown>, field: string, fail: ParseFail = frameFail): number {
   const value = record[field]
   if (typeof value !== "number" || !Number.isFinite(value)) {
     fail(`field "${field}" must be a finite number (got ${JSON.stringify(value)})`)
@@ -217,11 +226,7 @@ export function requireNumber(
 }
 
 /** Parse a required integer field. */
-export function requireInteger(
-  record: Record<string, unknown>,
-  field: string,
-  fail: ParseFail = frameFail,
-): number {
+export function requireInteger(record: Record<string, unknown>, field: string, fail: ParseFail = frameFail): number {
   const value = record[field]
   if (typeof value !== "number" || !Number.isInteger(value)) {
     fail(`field "${field}" must be an integer (got ${JSON.stringify(value)})`)
@@ -266,7 +271,7 @@ export interface FramePrimitives {
 
 /**
  * Bind the shared primitive parsers to a protocol's own failure type, so a
- * module (e.g. the broker) can parse with its own error while reusing the
+ * module can parse with its own error while reusing the
  * implementation. Once bound, each parser takes only `(record, field)`.
  */
 export function createFramePrimitives(fail: ParseFail): FramePrimitives {
@@ -291,45 +296,75 @@ export function jsonErrorOf(error: unknown): string {
 
 /** Serialise a frame to its JSON wire text. Inverse of `decodeWorkerFrame`. */
 export function encodeWorkerFrame(frame: WorkerFrameEnvelope): string {
-  return JSON.stringify(frame)
+  try {
+    return JSON.stringify(frame, rejectNonJson)
+  } catch (error) {
+    if (error instanceof ProtocolError) throw error
+    throw new ProtocolError(`frame is not JSON-serialisable (not structured-cloneable): ${jsonErrorOf(error)}`)
+  }
 }
 
-/** Parse wire text into a trusted envelope, failing loud on invalid JSON or shape. */
-export function decodeWorkerFrame(text: string): WorkerFrameEnvelope {
-  return parseWorkerFrame(parseJson(text))
+/** JSON has no representation for these; fail instead of silently dropping them. */
+function rejectNonJson(_key: string, value: unknown): unknown {
+  if (typeof value === "function" || typeof value === "symbol" || typeof value === "bigint") {
+    throw new ProtocolError(`frame is not JSON-serialisable (not structured-cloneable): encountered a ${typeof value}`)
+  }
+  return value
+}
+
+/** The exact UTF-8 size of one encoded worker frame. */
+export function workerFrameByteLength(text: string): number {
+  return new TextEncoder().encode(text).byteLength
+}
+
+/** Reject an over-bound message before it is posted or parsed. */
+export function assertWorkerFrameSize(text: string, limit: number = MAX_WORKER_FRAME_BYTES): string {
+  const byteLength = workerFrameByteLength(text)
+  if (byteLength > limit) throw new FrameTooLargeError(byteLength, limit)
+  return text
 }
 
 /**
- * Parse an untrusted message into a trusted envelope, failing loud. The envelope
- * is the shared boundary: once a frame passes here, its `v`, `port`, `kind` and
- * optional `id` are trusted, and `payload` is left for the family parser.
+ * Parse one wire message into a trusted envelope, failing loud on invalid JSON,
+ * a non-string message, a malformed shape, or an over-bound payload.
+ */
+export function decodeWorkerFrame(text: unknown): WorkerFrameEnvelope {
+  if (typeof text !== "string") {
+    throw new ProtocolError(`worker frame must be a JSON string (got ${typeof text})`)
+  }
+  return parseWorkerFrame(parseJson(assertWorkerFrameSize(text)))
+}
+
+const WorkerFrameSchema = Schema.Struct({
+  v: Schema.Literal(WORKER_FRAME_VERSION),
+  port: Schema.Literals(WORKER_FRAME_PORTS),
+  kind: Schema.NonEmptyString,
+  id: Schema.optional(Schema.Int),
+  payload: Schema.optional(Schema.Unknown),
+})
+
+/**
+ * Decode an untrusted message once with Effect Schema. The envelope is the shared
+ * boundary: after this decode its `v`, `port`, `kind` and optional `id` are
+ * trusted, and `payload` is left for the family parser.
  */
 export function parseWorkerFrame(input: unknown): WorkerFrameEnvelope {
   if (!isRecord(input)) throw new ProtocolError(`frame must be an object (got ${JSON.stringify(input)})`)
+  if (input["v"] !== WORKER_FRAME_VERSION) throw new UnsupportedFrameVersionError(input["v"])
 
-  const v = input["v"]
-  if (v !== WORKER_FRAME_VERSION) throw new UnsupportedFrameVersionError(v)
-
-  const port = input["port"]
-  if (!isWorkerFramePort(port)) {
-    throw new ProtocolError(
-      `field "port" must be one of ${WORKER_FRAME_PORTS.join(", ")} (got ${JSON.stringify(port)})`,
-    )
+  let parsed: typeof WorkerFrameSchema.Type
+  try {
+    parsed = Schema.decodeUnknownSync(WorkerFrameSchema)(input)
+  } catch (error) {
+    throw new ProtocolError(`frame does not match the worker envelope: ${jsonErrorOf(error)}`)
   }
 
-  const kind = input["kind"]
-  if (typeof kind !== "string" || kind.length === 0) {
-    throw new ProtocolError(`field "kind" must be a non-empty string (got ${JSON.stringify(kind)})`)
-  }
-
-  const id = parseOptionalId(input["id"])
-  const payload = input["payload"]
   return {
     v: WORKER_FRAME_VERSION,
-    port,
-    kind,
-    ...(id === undefined ? {} : { id }),
-    ...(payload === undefined ? {} : { payload }),
+    port: parsed.port,
+    kind: parsed.kind,
+    ...(parsed.id === undefined ? {} : { id: parsed.id }),
+    ...(parsed.payload === undefined ? {} : { payload: parsed.payload }),
   }
 }
 
@@ -452,14 +487,6 @@ function parseAckPayload(value: unknown): EventsAckPayload {
     throw new ProtocolError(`field "count" must be a non-negative integer (got ${JSON.stringify(count)})`)
   }
   return count === undefined ? {} : { count }
-}
-
-function parseOptionalId(value: unknown): number | undefined {
-  if (value === undefined) return undefined
-  if (typeof value !== "number" || !Number.isInteger(value)) {
-    throw new ProtocolError(`field "id" must be an integer (got ${JSON.stringify(value)})`)
-  }
-  return value
 }
 
 function parseOptionalInteger(value: unknown, field: string): number | undefined {

@@ -71,13 +71,8 @@ import {
   type ParityRunner,
   type SessionScript,
 } from "./parity-session"
-import { createBunSqliteConnection } from "@/session/writer/connection"
-import { createWriterCore } from "@/session/writer/core"
-import { serveWriterPort, type HubWriter } from "@/session/writer/client"
-import { createWorkerWriterClient } from "@/session/worker/writer-client"
 import { createEventSink, type EventSink, type SinkEvent } from "./event-sink"
 import { startMockProvider, type MockProviderHandle } from "./mock-provider"
-import { withDeadline } from "./async"
 import { pollUntil } from "./poll"
 import { workerSnapshot } from "./snapshot"
 import { tmpdir } from "../fixture/fixture"
@@ -230,7 +225,6 @@ const modelConfig = (provider: MockProviderHandle): WorkerModelConfig => ({
 function stubClients() {
   return {
     writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
-    broker: { call: async () => null },
     backgroundJob: { wait: async () => null, cancel: async () => {} },
   }
 }
@@ -794,60 +788,14 @@ describe("durable-row parity", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Head-of-line / backpressure: a read queued behind an in-flight durable write
-// (a pinned writer transaction) neither deadlocks nor exceeds a bounded
-// latency once the transaction commits.
+// Writer head-of-line / backpressure was a property of the deleted writer
+// isolate: one global queue serialized every statement behind a pinned
+// transaction. D5 removes that queue; each worker now owns a WAL connection and
+// concurrent readers do not queue behind a writer. The survival checks moved to
+// `test/session/worker/worker-db.test.ts` (per-connection concurrency),
+// `test/session/bus.test.ts` (transaction/sequence contract), and
+// `test/session/worker/busy-retry.test.ts` (bounded SQLITE_BUSY retry).
 // ---------------------------------------------------------------------------
-
-describe("writer head-of-line and backpressure", () => {
-  it("a read queued behind a pinned transaction resolves after commit within a bound", async () => {
-    const connection = createBunSqliteConnection({ filename: ":memory:" })
-    connection.exec(
-      [
-        "CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, owner_id TEXT)",
-        "CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL)",
-      ].join(";\n"),
-    )
-    const core = createWriterCore({ connection, sleep: async () => {} })
-    const hub: HubWriter = {
-      query: (method, sql, params) => core.query(method, sql, params),
-      publish: (writerEvent, options) => core.publish({ event: writerEvent, durable: options.durable }),
-      begin: () => core.beginTransaction(),
-      txQuery: (handle, method, sql, params) => core.txQuery(handle, method, sql, params),
-      commit: (handle) => core.commitTransaction(handle),
-      rollback: (handle) => core.rollbackTransaction(handle),
-    }
-    const channel = new MessageChannel()
-    const dispose = serveWriterPort(hub, channel.port1)
-    const writer = createWorkerWriterClient(channel.port2)
-    try {
-      // Pin a transaction: every non-control job queues behind it.
-      const handle = await writer.begin()
-      const startedAt = performance.now()
-      let readSettled = false
-      const read = writer.query("all", "SELECT COUNT(*) AS n FROM event").then((value) => {
-        readSettled = true
-        return value
-      })
-
-      // The read must NOT resolve while the transaction is pinned (HOL).
-      await new Promise((resolve) => setTimeout(resolve, 25))
-      expect(readSettled).toBe(false)
-
-      // Commit: the queued read drains promptly and never deadlocks.
-      await writer.commit(handle)
-      const value = await withDeadline(read, { timeoutMs: 2_000, message: "queued read deadlocked" })
-      expect(readSettled).toBe(true)
-      expect(Array.isArray(value)).toBe(true)
-      expect(performance.now() - startedAt).toBeLessThan(2_000)
-    } finally {
-      writer.dispose()
-      dispose()
-      channel.port1.close()
-      channel.port2.close()
-    }
-  })
-})
 
 // ---------------------------------------------------------------------------
 // Resource ownership: the E2E context owns a writer port, a hub-proxy channel

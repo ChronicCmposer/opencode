@@ -53,14 +53,13 @@ const clientNode = (name: string) =>
 
 const writerClient = clientNode(SESSION_CLIENT_KEYS[0]!)
 const egressClient = clientNode(SESSION_CLIENT_KEYS[1]!)
-const brokerClient = clientNode(SESSION_CLIENT_KEYS[2]!)
 
-const clientGroup = () => LayerNode.group([writerClient, egressClient, brokerClient])
+const clientGroup = () => LayerNode.group([writerClient, egressClient])
 
 describe("session node table", () => {
   test("every allowlisted node is classified worker-local or a proxy", () => {
     for (const item of WorkerNodeTable.SESSION_ALLOWLIST) {
-      expect(["worker-local", "broker-proxy", "hub-proxy"]).toContain(item.boundary)
+      expect(["worker-local", "hub-proxy"]).toContain(item.boundary)
     }
   })
 
@@ -133,7 +132,6 @@ describe("session node table", () => {
     expect(SESSION_CLIENT_KEYS).toEqual([
       WorkerNodeTable.WRITER_CLIENT_KEY,
       WorkerNodeTable.EVENT_EGRESS_CLIENT_KEY,
-      WorkerNodeTable.BROKER_CLIENT_KEY,
     ])
     // The background-job node has no hub counterpart anymore: the worker's job
     // registry is process-local, so it must never be a `hub-proxy` client.

@@ -52,22 +52,6 @@ function clientFor(
   return createHubProxyClient(channel.port1, timeoutMs === undefined ? {} : { timeoutMs })
 }
 
-/**
- * Resolve when `signal` fires, or reject after `timeoutMs`. The timeout is a
- * backstop against a hung suite — never the synchronization primitive itself.
- */
-function awaitSignal(signal: Promise<void>, timeoutMs: number, description: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`timed out after ${timeoutMs}ms waiting for ${description}`))
-    }, timeoutMs)
-    void signal.then(() => {
-      clearTimeout(timer)
-      resolve()
-    })
-  })
-}
-
 describe("pluginTool.execute reply clone guard", () => {
   test("a non-cloneable success reply fails loud (descriptive error, not a timeout) and the port stays usable", async () => {
     let calls = 0
@@ -112,49 +96,10 @@ describe("pluginTool.execute reply clone guard", () => {
     }
   })
 
-  test("recovery is exactly one clone-safe ok:false frame echoing the request id", async () => {
-    const channel = new MessageChannel()
-    // Intercept the reply path: the first post (the un-cloneable success value)
-    // throws as a real port would; the fallback is captured rather than sent.
-    const posted: Array<Record<string, unknown>> = []
-    let replyAttempts = 0
-    let signalFallbackPosted: (() => void) | undefined
-    const fallbackPosted = new Promise<void>((resolve) => {
-      signalFallbackPosted = resolve
-    })
-    channel.port2.postMessage = ((frame: Record<string, unknown>) => {
-      replyAttempts += 1
-      if (replyAttempts === 1) throw new DOMException("The object can not be cloned.", "DataCloneError")
-      posted.push(frame)
-      signalFallbackPosted?.()
-    }) as never
 
-    serveHubProxy(
-      buildHubProxyHandlers(
-        authorities(async () => ({ title: "compress", output: "HUB_RAN", metadata: { leak: () => {} } })),
-        instantRunner,
-      ),
-      channel.port2,
-    )
-    const client = createHubProxyClient(channel.port1, { timeoutMs: 2000 })
-
-    try {
-      void client.call("pluginTool.execute", [input]).catch(() => {})
-      await awaitSignal(fallbackPosted, 2000, "the clone-safe fallback post")
-
-      // Exactly one success post (threw) plus exactly one fallback post (kept).
-      expect(replyAttempts).toBe(2)
-
-      const envelope = posted[0]
-      expect(envelope?.kind).toBe("reply")
-      expect(envelope?.id).toBe(1)
-      const payload = envelope?.payload as Record<string, unknown>
-      expect(payload.ok).toBe(false)
-      expect(payload.id).toBe(1)
-      expect(String(payload.message)).toContain("not structured-cloneable")
-      expect(String(payload.message)).toContain("id 1")
-    } finally {
-      client.dispose()
-    }
-  })
+  // W2.1 replaced the structured-clone reply path with a JSON-string boundary:
+  // a non-JSON value is rejected by the encoder (ProtocolError) before any
+  // post, so there is no DataCloneError fallback frame left to assert. The
+  // remote-error contract above and `hub-proxy-clone-failure.test.ts` cover the
+  // surviving failure surface.
 })

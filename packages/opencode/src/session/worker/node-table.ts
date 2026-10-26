@@ -2,10 +2,10 @@
 //
 // The real `AppLayer` (`src/effect/app-runtime.ts`) composes ~47 nodes in one
 // flat group. Session workers must run a *reduced* graph: they own the session
-// pipeline, but database connections, OS children and process-global state stay
-// on the hub/writer/broker. This module declares that split as data and derives
-// pure validators, so the reduced layer can be checked mechanically instead of
-// by inspection.
+// pipeline and one WAL connection per worker, while migration, OS children and
+// process-global state stay on the hub. This module declares that split as data
+// and derives pure validators, so the reduced layer can be checked mechanically
+// instead of by inspection.
 //
 // The table is keyed by the node's service key (`LayerNode.Node.name`). Some
 // nodes (e.g. `session-projector`) use an explicit `name`; both are covered.
@@ -17,11 +17,10 @@ export type Role = "session" | "writer" | "broker" | "hub"
  * Where a node's side effects must live.
  *
  * - `worker-local` — safe to instantiate inside a session worker.
- * - `broker-proxy` — a client that forwards to the MCP/LSP broker worker.
  * - `hub-proxy` — a client that forwards to a hub-resident authority.
  * - `excluded` — must never be instantiated in a session worker.
  */
-export type Boundary = "worker-local" | "broker-proxy" | "hub-proxy" | "excluded"
+export type Boundary = "worker-local" | "hub-proxy" | "excluded"
 
 export interface NodeEntry {
   /** Human name used by the plan/task (e.g. `Session`, `Database`). */
@@ -40,6 +39,9 @@ const entry = (
   boundary: Boundary,
   note?: string,
 ): NodeEntry => ({ label, key, roles, boundary, ...(note === undefined ? {} : { note }) })
+
+/** The per-worker DB service key; `layer.ts` and `db.ts` share this constant. */
+export const WORKER_DB_KEY = "@opencode/session-worker/Db"
 
 /** The approved session-role allowlist (task list, plan line 58). */
 export const SESSION_ALLOWLIST: readonly NodeEntry[] = [
@@ -113,7 +115,13 @@ export const SESSION_ALLOWLIST: readonly NodeEntry[] = [
     "worker EventV2 → events-port frames",
   ),
   entry("WriterClient", "@opencode/session-worker/WriterClient", ["session"], "worker-local"),
-  entry("BrokerClient", "@opencode/session-worker/BrokerClient", ["session"], "broker-proxy"),
+  entry(
+    "WorkerDb",
+    WORKER_DB_KEY,
+    ["session"],
+    "worker-local",
+    "per-worker WAL connection; worker-writable tables only",
+  ),
   entry("SessionPipeline", "@opencode/session-worker/SessionPipeline", ["session"], "worker-local"),
   entry("ModelClient", "@opencode/session-worker/ModelClient", ["session"], "worker-local"),
   entry("WorkerSnapshot", "@opencode/session-worker/Snapshot", ["session"], "worker-local"),
@@ -123,10 +131,10 @@ export const SESSION_ALLOWLIST: readonly NodeEntry[] = [
 
 /** Nodes that must NEVER be instantiated inside a session worker (task exclusions). */
 export const SESSION_EXCLUDED: readonly NodeEntry[] = [
-  entry("Database", "@opencode/v2/storage/Database", ["hub", "writer"], "excluded", "writer owns the sole connection"),
-  entry("LSP", "@opencode/LSP", ["broker"], "excluded", "broker-proxy only"),
-  entry("MCP", "@opencode/MCP", ["broker"], "excluded", "broker-proxy only"),
-  entry("McpAuth", "@opencode/McpAuth", ["broker"], "excluded", "broker-proxy only"),
+  entry("Database", "@opencode/v2/storage/Database", ["hub"], "excluded", "hub migrates; each worker opens its own WAL connection"),
+  entry("LSP", "@opencode/LSP", ["hub"], "excluded", "hub-only; workers never spawn"),
+  entry("MCP", "@opencode/MCP", ["hub"], "excluded", "hub-only; workers never spawn"),
+  entry("McpAuth", "@opencode/McpAuth", ["hub"], "excluded", "hub-only; workers never spawn"),
   entry("Workspace", "@opencode/Workspace", ["hub"], "excluded"),
   entry("Worktree", "@opencode/Worktree", ["hub"], "excluded"),
   entry("Vcs", "@opencode/Vcs", ["hub"], "excluded"),
@@ -134,7 +142,7 @@ export const SESSION_EXCLUDED: readonly NodeEntry[] = [
   entry("Npm", "@opencode/Npm", ["hub"], "excluded", "no npm install in workers"),
   entry("ModelsDev", "@opencode/ModelsDev", ["hub"], "excluded", "hub-only catalog refresh"),
   // Residual nodes reachable from the real `SessionPrompt` graph (task 29). They
-  // are hub/writer/broker/infra-owned, so they are classified `excluded` and
+  // are hub/writer/infra-owned, so they are classified `excluded` and
   // supplied by boundary replacements rather than left fail-closed `unknown`.
   entry("Storage", "@opencode/Storage", ["hub", "writer"], "excluded", "writer-owned storage"),
   entry("Git", "@opencode/Git", ["hub"], "excluded", "hub-owned VCS"),
@@ -143,8 +151,8 @@ export const SESSION_EXCLUDED: readonly NodeEntry[] = [
   // `AppProcess` / `v2/Ripgrep` are worker-local (allowlist above). The binary
   // itself stays excluded: its resolved path ships in the hub snapshot, so the
   // layer replaces it with a snapshot-backed layer rather than a fail-loud one.
-  entry("RipgrepBinary", "@opencode/RipgrepBinary", ["broker"], "excluded", "snapshot-backed binary path"),
-  entry("McpBrowser", "@opencode/McpBrowser", ["broker"], "excluded", "broker-proxy only"),
+  entry("RipgrepBinary", "@opencode/RipgrepBinary", ["hub"], "excluded", "snapshot-backed binary path"),
+  entry("McpBrowser", "@opencode/McpBrowser", ["hub"], "excluded", "hub-only; workers never spawn"),
   entry("LocationServiceMap", "@opencode/example/LocationServiceMap", ["hub"], "excluded", "hub-composed location map"),
 ]
 
@@ -155,7 +163,6 @@ export const SESSION_EXCLUDED: readonly NodeEntry[] = [
  */
 export const WRITER_CLIENT_KEY = "@opencode/session-worker/WriterClient"
 export const EVENT_EGRESS_CLIENT_KEY = "@opencode/session-worker/EventEgressClient"
-export const BROKER_CLIENT_KEY = "@opencode/session-worker/BrokerClient"
 
 /**
  * The worker's EventV2 → events-port bridge node. Worker-local (it subscribes to
@@ -168,7 +175,6 @@ export const EVENT_BRIDGE_KEY = "@opencode/session-worker/EventBridge"
 export const SESSION_CLIENT_KEYS: readonly string[] = [
   WRITER_CLIENT_KEY,
   EVENT_EGRESS_CLIENT_KEY,
-  BROKER_CLIENT_KEY,
 ]
 
 /**

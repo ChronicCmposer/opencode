@@ -7,8 +7,10 @@
 // compiled artifact, while this one proves no worker entry was forgotten. A
 // forgotten entry is invisible to in-process tests (they load workers from
 // source) and only explodes in the packaged binary as
-// `ModuleNotFound resolving "/$bunfs/root/<worker>.ts"` — the writer bug this
-// gate exists for.
+// `ModuleNotFound resolving "/$bunfs/root/<worker>.ts"`.
+//
+// The writer-worker entry (D5/W1.4) and broker-worker entry (W4.3) are gone; no
+// Session worker needs either bundled entry.
 
 import { describe, expect, test } from "bun:test"
 import path from "node:path"
@@ -35,20 +37,6 @@ const ENTRIES: readonly WorkerEntry[] = [
     shim: "session-worker.js",
     define: "OPENCODE_SESSION_WORKER_PATH",
     consumer: "src/session/worker/hub.ts",
-  },
-  {
-    name: "writer-worker",
-    source: "./src/session/writer/worker.ts",
-    shim: "writer-worker.js",
-    define: "OPENCODE_WRITER_WORKER_PATH",
-    consumer: "src/session/writer/client.ts",
-  },
-  {
-    name: "broker-worker",
-    source: "./src/session/broker/broker-worker.ts",
-    shim: "broker-worker.js",
-    define: "OPENCODE_BROKER_WORKER_PATH",
-    consumer: "src/session/broker/broker.ts",
   },
   {
     name: "tree-sitter",

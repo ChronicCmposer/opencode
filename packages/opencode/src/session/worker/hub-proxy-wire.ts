@@ -142,8 +142,7 @@ export function createHubProxyClient(port: MessagePort, options: HubProxyClientO
     idOf: (reply) => reply.id,
     nextId: () => nextId++,
     disposedError: () => new HubProxyRemoteError(DISPOSED_MESSAGE),
-    timeoutError: (id, timeoutMs) =>
-      new HubProxyRemoteError(`hub proxy request ${id} timed out after ${timeoutMs}ms`),
+    timeoutError: (id, timeoutMs) => new HubProxyRemoteError(`hub proxy request ${id} timed out after ${timeoutMs}ms`),
   })
 
   // The `onEvent` of each in-flight request, keyed by its correlation id. An
@@ -205,15 +204,17 @@ export type HubProxyStreamHandler = (sink: HubProxyEventSink, args: readonly unk
 const UNSERIALISED_ERROR_FIELDS = new Set(["message", "name", "stack", "cause", "_tag"])
 
 /**
- * A tagged error's own structured-clone-safe fields, or `undefined` when there
- * are none. A field that cannot cross the port (a function, an accessor that
- * throws) is dropped rather than failing the whole reply.
+ * A tagged error's own JSON-safe fields, or `undefined` when there are none. A
+ * field that cannot be represented as JSON is dropped rather than failing the
+ * whole reply.
  */
 function errorDataOf(error: unknown): unknown {
   if (error === null || typeof error !== "object") return undefined
   try {
     const fields = Object.entries(error).filter(([key]) => !UNSERIALISED_ERROR_FIELDS.has(key))
-    return fields.length === 0 ? undefined : structuredClone(Object.fromEntries(fields))
+    if (fields.length === 0) return undefined
+    const text = JSON.stringify(Object.fromEntries(fields))
+    return text === undefined ? undefined : JSON.parse(text)
   } catch {
     return undefined
   }
@@ -228,12 +229,12 @@ function ownLookup<T>(record: Readonly<Record<string, T>> | undefined, key: stri
  * Hub side: serve hub-proxy requests against `handlers`; returns a disposer.
  *
  * Replying can fail two ways. A genuinely dead peer (the port is gone) drops the
- * reply silently — nothing can be done. But `channel.post` also throws
- * `DataCloneError` synchronously when a SUCCESS reply's `value` is not
- * structured-cloneable (e.g. a plugin hook leaked a function). That case is
- * recoverable: post ONE clone-safe `ok:false` frame with the same `id`, so the
+ * reply silently — nothing can be done. But `channel.post` also throws the frame
+ * codec's `ProtocolError` synchronously when a SUCCESS reply's `value` cannot be
+ * represented as JSON (e.g. a plugin hook leaked a function). That case is
+ * recoverable: post ONE JSON-safe `ok:false` frame with the same `id`, so the
  * worker fails loud with a descriptive error instead of hanging or timing out.
- * Error replies are already clone-safe (`errorDataOf` drops non-cloneable
+ * Error replies are already JSON-safe (`errorDataOf` drops non-serialisable
  * fields), so only a success reply needs the fallback.
  *
  * `streaming` adds an opt-in push channel: a method listed there is served by
@@ -252,8 +253,8 @@ export function serveHubProxy(
       try {
         channel.post(payload)
       } catch {
-        // Either the peer is gone or `payload.value` is not structured-cloneable.
-        // A clone-safe `ok:false` fallback distinguishes the latter for the
+        // Either the peer is gone or `payload.value` is not JSON-serialisable.
+        // A JSON-safe `ok:false` fallback distinguishes the latter for the
         // worker; on a detached port this second post may throw or silently
         // no-op, and either way there is nobody left to hear the fallback.
         if (!payload.ok) return
@@ -262,15 +263,14 @@ export function serveHubProxy(
             kind: "reply",
             id: payload.id,
             ok: false,
-            message: `hub-proxy reply value for id ${payload.id} is not structured-cloneable`,
+            message: `hub-proxy reply value for id ${payload.id} is not JSON-serialisable (not structured-cloneable)`,
           })
         } catch {
           // Peer gone: nothing to do.
         }
       }
     }
-    const succeed = (value: unknown): void =>
-      reply({ kind: "reply", id: frame.id, ok: true, value: value ?? null })
+    const succeed = (value: unknown): void => reply({ kind: "reply", id: frame.id, ok: true, value: value ?? null })
     const fail = (error: unknown): void => {
       const tag = errorTagOf(error)
       const data = errorDataOf(error)
@@ -294,7 +294,7 @@ export function serveHubProxy(
           kind: "reply",
           id: frame.id,
           ok: false,
-          message: `hub-proxy event payload for id ${frame.id} is not structured-cloneable`,
+          message: `hub-proxy event payload for id ${frame.id} is not JSON-serialisable (not structured-cloneable)`,
         })
       }
     }

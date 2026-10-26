@@ -3,7 +3,7 @@
 //
 // The hub ships one structured-cloned `SessionWorkerInit` per worker generation:
 //   * `snapshot` — {@link buildWorkerSnapshot} (plan decisions 67/68);
-//   * `env` — an immutable overlay merged with `broker/env.ts` (decision 68);
+//   * `env` — an immutable overlay merged onto the inherited environment;
 //   * `model` — a plain-data model bootstrap ({@link resolveWorkerModel}).
 //
 // `workerData` crosses an isolate boundary, so it must be structured-clone
@@ -18,7 +18,6 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { Auth } from "@/auth"
 import { Config } from "@/config/config"
 import { Provider, parseModel } from "@/provider/provider"
-import { mergeEnv } from "@/session/broker/env"
 
 import type {
   SerializedModelCapabilities,
@@ -30,6 +29,11 @@ import type {
 import type { WorkerEnv } from "./layer"
 import type { Role } from "./node-table"
 import { CHAT_PARAM_KEYS } from "./plugin-host"
+import {
+  UnclassifiedPluginHookError,
+  UnsupportedPluginHookError,
+  pluginHookAdmissionError,
+} from "@/plugin/routes"
 import type {
   ChatHeadersOutput,
   ChatParamsOutput,
@@ -51,6 +55,26 @@ export interface BuildWorkerEnvOptions {
   readonly base?: Record<string, string | undefined>
   /** Overlay applied on top; `undefined` deletes an inherited key. */
   readonly overlay?: Record<string, string | undefined>
+}
+
+/**
+ * Merge `overlay` onto `base` without mutating either: a present value
+ * overrides, `undefined` deletes the inherited key. Both the worker init and the
+ * hub transport use this one policy.
+ */
+export function mergeEnv(
+  overlay?: Readonly<Record<string, string | undefined>>,
+  base: Readonly<Record<string, string | undefined>> = process.env,
+): Record<string, string> {
+  const env: Record<string, string> = {}
+  for (const [key, value] of Object.entries(base)) {
+    if (value !== undefined) env[key] = value
+  }
+  for (const [key, value] of Object.entries(overlay ?? {})) {
+    if (value === undefined) delete env[key]
+    else env[key] = value
+  }
+  return env
 }
 
 /**
@@ -295,6 +319,12 @@ export class WorkerPluginNotSerializableError extends Schema.TaggedErrorClass<Wo
   }
 }
 
+/** A hook admission failure raised before a worker init is built. */
+export type WorkerPluginHookError = UnsupportedPluginHookError | UnclassifiedPluginHookError
+
+/** Every typed failure the worker plugin resolver can return. */
+export type WorkerPluginResolveError = WorkerPluginNotSerializableError | WorkerPluginHookError
+
 /** One hub plugin's model-facing hooks, before resolution (functions allowed). */
 export interface WorkerPluginSource {
   readonly name: string
@@ -409,6 +439,13 @@ function runPluginHook<T>(
 export const resolveWorkerPlugins = Effect.fn("WorkerPlugins.resolve")(function* (
   options: ResolveWorkerPluginsOptions,
 ) {
+  // Admission: a hook added after startup reaches the next run here. An
+  // unsupported or unclassified trigger is typed, never a silent skip.
+  for (const source of options.sources) {
+    const error = pluginHookAdmissionError(source.name, source.hooks)
+    if (error !== undefined) return yield* error
+  }
+
   const input = pluginHookInput(options.model, options.sessionID ?? "", options.agent ?? "", options.message)
   const plugins: WorkerPlugin[] = []
   for (const source of options.sources) {
@@ -473,7 +510,7 @@ export interface BuildSessionWorkerInitOptions {
   /**
    * Capabilities the hub advertises for this worker generation. Set
    * `{ sessionWorkerPorts: true }` once the hub serves the writer / egress /
-   * broker ports, so the entry transfers them instead of using its in-worker
+   * egress ports, so the entry transfers them instead of using its in-worker
    * fallback.
    */
   readonly capabilities?: SessionWorkerCapabilities
@@ -484,7 +521,7 @@ export interface BuildSessionWorkerInitOptions {
    */
   readonly plugins?:
     | readonly WorkerPlugin[]
-    | ((model: WorkerModel) => Effect.Effect<readonly WorkerPlugin[], WorkerPluginNotSerializableError>)
+    | ((model: WorkerModel) => Effect.Effect<readonly WorkerPlugin[], WorkerPluginResolveError>)
   /**
    * Clone-safe descriptors for hub-executed plugin tools. A plugin tool's
    * `execute` closes over hub plugin state and cannot cross the isolate, so the

@@ -1423,11 +1423,15 @@ it.instance("cancel interrupts loop and resolves with an assistant message", () 
     const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
     yield* llm.wait(1)
     yield* waitForBusy(chat.id)
-    yield* prompt.cancel(chat.id)
+    const outcome = yield* prompt.cancel(chat.id)
+    expect(outcome?.mode).toBe("cooperative")
+    // Cooperative cancel returns the assistant message the loop finalized.
+    expect(outcome?.message?.info.role).toBe("assistant")
     const exit = yield* Fiber.await(fiber)
     expect(Exit.isSuccess(exit)).toBe(true)
     if (Exit.isSuccess(exit)) {
       expect(exit.value.info.role).toBe("assistant")
+      expect(outcome?.message?.info.id).toBe(exit.value.info.id)
     }
   }),
 )

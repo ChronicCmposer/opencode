@@ -6,7 +6,13 @@
 // `ready`. The harness surfaces all of them plus an `ExecutorTransport` so tests
 // can drive the isolate the way the hub does.
 
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import { describe, expect, test } from "bun:test"
+import { openConnection } from "@opencode-ai/core/database/connection"
+import { migrationStatements } from "@/session/writer/migration.statements.gen"
+import { markSchemaIdentity } from "@/session/worker/db"
 import { bootSessionWorker } from "./session-worker-harness"
 import { sessionWorkerInit } from "./session-worker-init"
 
@@ -29,19 +35,31 @@ describe("session worker harness", () => {
   })
 
   test("observes the transferred relay and hub-proxy ports on a full boot", async () => {
+    // A full boot opens the worker's per-worker WAL connection at
+    // `Database.path()`; point it at a migrated file (the suite default is an
+    // unmigrated `:memory:` database).
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-harness-db-"))
+    const filename = path.join(directory, "opencode.db")
+    const connection = openConnection({ filename })
+    try {
+      for (const statement of migrationStatements) connection.exec(statement)
+      markSchemaIdentity(connection)
+    } finally {
+      connection.close()
+    }
     const handle = await bootSessionWorker({
       timeoutMs: 20_000,
+      env: { OPENCODE_DB: filename },
       init: { ...sessionWorkerInit(), capabilities: { sessionWorkerPorts: true } },
     })
     try {
       expect(handle.ready.type).toBe("ready")
-      expect(handle.ports?.writer).toBeInstanceOf(MessagePort)
       expect(handle.ports?.egress).toBeInstanceOf(MessagePort)
       expect(handle.ports?.egressControl).toBeInstanceOf(MessagePort)
-      expect(handle.ports?.broker).toBeInstanceOf(MessagePort)
       expect(handle.hubProxyPort).toBeInstanceOf(MessagePort)
     } finally {
       await handle.terminate()
+      fs.rmSync(directory, { recursive: true, force: true })
     }
   })
 

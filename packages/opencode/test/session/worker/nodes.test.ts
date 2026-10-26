@@ -462,25 +462,8 @@ describe("34a lazy production activation", () => {
           return createExecutorWorker({ id, transport: instantTransport() })
         },
       })
-    const backends = {
-      writer: {
-        query: async () => [],
-        publish: async () => ({ seq: null, committed: false }),
-        begin: async () => {
-          throw new Error("begin was not expected in this test")
-        },
-        txQuery: async () => {
-          throw new Error("txQuery was not expected in this test")
-        },
-        commit: async () => {
-          throw new Error("commit was not expected in this test")
-        },
-        rollback: async () => {
-          throw new Error("rollback was not expected in this test")
-        },
-      },
-      broker: {} as never,
-    }
+    // No broker or writer authority is served; the capability is still advertised.
+    const backends = {}
 
     await Effect.runPromise(
       provideInstance(

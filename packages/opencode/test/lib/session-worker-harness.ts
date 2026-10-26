@@ -5,8 +5,9 @@
 // executor's `{type:"ready", threadId}` handshake. On a full boot the entry also
 // transfers its worker-port channels before that handshake:
 //
-//   * `{type:"ports", writer, egress, egressControl, broker}` — the writer,
-//     egress (plus dedicated control) and broker relays;
+//   * `{type:"ports", egress, egressControl}` — the egress plus dedicated control
+//     relays. D5 removed the writer port/RPC (the worker opens its own WAL
+//     connection) and W4.3 removed the broker;
 //   * `{type:"hub-proxy", port}` — the multiplexed hub control link.
 //
 // Those frames are captured from the buffered messages once `ready` arrives; a
@@ -32,10 +33,8 @@ export interface SessionWorkerReady {
 
 /** The worker's transferred relay ports (full hub-port boot only). */
 export interface SessionWorkerPorts {
-  readonly writer: MessagePort
   readonly egress: MessagePort
   readonly egressControl?: MessagePort
-  readonly broker: MessagePort
 }
 
 /** The worker's transferred hub control link (full hub-port boot only). */
@@ -90,18 +89,14 @@ function findPorts(messages: ReadonlyArray<unknown>): SessionWorkerPorts | undef
     if (frame === null || typeof frame !== "object") continue
     if ((frame as { readonly type?: unknown }).type !== "ports") continue
     const candidate = frame as {
-      readonly writer?: unknown
       readonly egress?: unknown
       readonly egressControl?: unknown
-      readonly broker?: unknown
     }
     return {
-      writer: requireMessagePort(candidate.writer, "ports", "writer"),
       egress: requireMessagePort(candidate.egress, "ports", "egress"),
       ...(candidate.egressControl === undefined
         ? {}
         : { egressControl: requireMessagePort(candidate.egressControl, "ports", "egressControl") }),
-      broker: requireMessagePort(candidate.broker, "ports", "broker"),
     }
   }
   return undefined
@@ -140,7 +135,7 @@ export async function bootSessionWorker(options: BootSessionWorkerOptions = {}):
   const hubProxyPort = findHubProxyPort(worker.messages)
 
   const closePorts = () => {
-    for (const transferred of [ports?.writer, ports?.egress, ports?.egressControl, ports?.broker, hubProxyPort]) {
+    for (const transferred of [ports?.egress, ports?.egressControl, hubProxyPort]) {
       try {
         transferred?.close()
       } catch {

@@ -5,7 +5,6 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Effect, Exit, Layer, Option, RcMap, Schema, Context, TxReentrantLock } from "effect"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { Git } from "@/git"
-import { isEnoent } from "@/session/writer/protocol"
 
 type Migration = (dir: string, fs: FSUtil.Interface, git: Git.Interface) => Effect.Effect<void, FSUtil.Error>
 
@@ -61,37 +60,16 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Storage") {}
 
-/**
- * The single-writer boundary for `Storage` (plan task 7.13). When present, every
- * mutation and read proxies through it, so file-KV never bypasses the writer
- * (the worker's storage operations serialize on the writer's one queue). Absent
- * (the default, flag off), the service reads and writes the filesystem directly,
- * byte-identical to before.
- */
-export interface WriterPort {
-  readonly read: (key: ReadonlyArray<string>) => Effect.Effect<{ readonly found: boolean; readonly content?: unknown }>
-  /**
-   * Atomic read-modify-write owned by the writer's serialized queue, so two
-   * concurrent `Storage.update` calls can never lose a write. `found: false` when
-   * the entry is absent.
-   */
-  readonly update: <T>(
-    key: ReadonlyArray<string>,
-    fn: (draft: T) => void,
-  ) => Effect.Effect<{ readonly found: boolean; readonly content?: T }>
-  readonly write: (key: ReadonlyArray<string>, content: unknown) => Effect.Effect<void>
-  readonly remove: (key: ReadonlyArray<string>) => Effect.Effect<void>
-  readonly list: (prefix: ReadonlyArray<string>) => Effect.Effect<ReadonlyArray<ReadonlyArray<string>>>
-}
-
-export class WriterService extends Context.Service<WriterService, WriterPort>()("@opencode/StorageWriter") {}
-
 function file(dir: string, key: string[]) {
   return path.join(dir, ...key) + ".json"
 }
 
+/** Node-style ENOENT; the Effect FS adapter adds its own tagged `NotFound`. */
+function isEnoent(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code: unknown }).code === "ENOENT"
+}
+
 function missing(err: unknown) {
-  // Shared Node-ENOENT detector; the Effect adapter adds its own tagged NotFound.
   if (isEnoent(err)) return true
   if (!err || typeof err !== "object") return false
   if ("reason" in err && err.reason && typeof err.reason === "object" && "_tag" in err.reason) {
@@ -100,7 +78,7 @@ function missing(err: unknown) {
   return false
 }
 
-/** The writer port yields parsed-but-untyped content; `read`/`update` are generic. */
+/** Stored JSON is parsed but untyped; `read`/`update` carry the caller's generic. */
 function narrow<T>(value: unknown): T {
   return value as T
 }
@@ -247,7 +225,6 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
     const git = yield* Git.Service
-    const writer = yield* Effect.serviceOption(WriterService)
     const locks = yield* RcMap.make({
       lookup: () => TxReentrantLock.make(),
       idleTimeToLive: 0,
@@ -298,8 +275,7 @@ const layer = Layer.effect(
 
     /**
      * The direct-filesystem backend: reads and writes the files itself, guarded by
-     * the per-file reentrant lock. This is the default when no writer port is
-     * present (flag off), byte-identical to before the single-writer boundary.
+     * the per-file reentrant lock. There is no writer authority to proxy to.
      */
     const direct = (): Interface => ({
       remove: Effect.fn("Storage.remove")(function* (key: string[]) {
@@ -352,42 +328,7 @@ const layer = Layer.effect(
       }),
     })
 
-    /**
-     * The writer-proxied backend: every read and mutation crosses the writer port,
-     * so file-KV serializes on the writer's one queue and never bypasses it. A
-     * missing key surfaces the same `NotFoundError` as the direct path.
-     */
-    const proxied = (port: WriterPort): Interface => ({
-      remove: Effect.fn("Storage.remove")(function* (key: string[]) {
-        yield* port.remove(key)
-      }),
-
-      read: <T>(key: string[]) =>
-        Effect.gen(function* () {
-          const result = yield* port.read(key)
-          if (!result.found) return yield* fail(file((yield* state).dir, key))
-          return narrow<T>(result.content)
-        }),
-
-      update: <T>(key: string[], fn: (draft: T) => void) =>
-        Effect.gen(function* () {
-          const result = yield* port.update<T>(key, fn)
-          if (!result.found) return yield* fail(file((yield* state).dir, key))
-          return narrow<T>(result.content)
-        }),
-
-      write: (key: string[], content: unknown) => port.write(key, content),
-
-      list: Effect.fn("Storage.list")(function* (prefix: string[]) {
-        const keys = yield* port.list(prefix)
-        return keys.map((key) => [...key])
-      }),
-    })
-
-    // Port selection happens ONCE, here at layer construction: whichever backend
-    // is chosen, no method re-inspects a `serviceOption` or branches per call.
-    if (Option.isNone(writer)) return Service.of(direct())
-    return Service.of(proxied(writer.value))
+    return Service.of(direct())
   }),
 )
 

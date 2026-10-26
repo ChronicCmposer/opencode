@@ -114,7 +114,7 @@ describe("spawn-gate wiring", () => {
       await flush()
 
       const worker = FakeWorker.instances[0]!
-      worker.emit({ type: "ports", writer: "not-a-port" })
+      worker.emit({ type: "ports", egress: "not-a-port" })
 
       const settled = await run
       expect(settled).toMatchObject({ ok: false })

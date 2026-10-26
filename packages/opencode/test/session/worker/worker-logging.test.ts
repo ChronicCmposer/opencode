@@ -58,7 +58,6 @@ async function readUntil(file: string, needle: string, timeoutMs = 5000): Promis
 const stubClients = (): SessionLayerOptions["clients"] => ({
   writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
   egress: { emit: () => {} },
-  broker: { call: async () => null },
   backgroundJob: { wait: async () => null, cancel: async () => {} },
 })
 

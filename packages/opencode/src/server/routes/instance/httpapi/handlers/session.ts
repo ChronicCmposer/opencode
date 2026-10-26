@@ -15,7 +15,6 @@ import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
 import { Todo } from "@/session/todo"
 import { MessageID, PartID, SessionID } from "@/session/schema"
-import type { CancelOutcome } from "@/session/worker/cancel"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Effect, Option, Schema, Scope } from "effect"
 import * as Stream from "effect/Stream"
@@ -63,7 +62,7 @@ const idleAbortOutcome = (sessionID: SessionID): typeof AbortOutcome.Type => ({
  * correlation is an invariant of the cancel controller (`worker/cancel.ts`), so
  * the exhaustive switch restates it per mode rather than trusting a widened pair.
  */
-const toAbortOutcome = (outcome: CancelOutcome): typeof AbortOutcome.Type => {
+export const toAbortOutcome = (outcome: SessionPrompt.CancelResult): typeof AbortOutcome.Type => {
   switch (outcome.mode) {
     case "cooperative":
       return {
@@ -72,6 +71,7 @@ const toAbortOutcome = (outcome: CancelOutcome): typeof AbortOutcome.Type => {
         winner: "cancel",
         acknowledged: outcome.acknowledged,
         durationMs: outcome.durationMs,
+        ...(outcome.message ? { message: outcome.message } : {}),
       }
     case "terminated":
       return {
@@ -92,8 +92,10 @@ const toAbortOutcome = (outcome: CancelOutcome): typeof AbortOutcome.Type => {
   }
 }
 
-const resolveAbortOutcome = (sessionID: SessionID, outcome: CancelOutcome | undefined): typeof AbortOutcome.Type =>
-  outcome === undefined ? idleAbortOutcome(sessionID) : toAbortOutcome(outcome)
+export const resolveAbortOutcome = (
+  sessionID: SessionID,
+  outcome: SessionPrompt.CancelResult | undefined,
+): typeof AbortOutcome.Type => (outcome === undefined ? idleAbortOutcome(sessionID) : toAbortOutcome(outcome))
 
 export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", (handlers) =>
   Effect.gen(function* () {

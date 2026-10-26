@@ -139,7 +139,6 @@ async function initialize(message: InitMessage): Promise<void> {
         },
       },
       egress: { emit: (event) => void emitted.push(event.type) },
-      broker: { call: async () => null },
       backgroundJob: { wait: async () => null, cancel: async () => {} },
     },
     modelClient: modelLayer(message.model),

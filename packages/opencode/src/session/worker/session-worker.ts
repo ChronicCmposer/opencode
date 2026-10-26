@@ -2,7 +2,7 @@
 //
 // This is the isolate the hub's `createBunExecutorWorkerPool` spawns. It builds
 // the reduced session layer (`buildSessionWorkerLayer`, Phase 6), wires the
-// port-backed clients (writer / egress / broker), installs a process-local
+// the egress client and its own WAL database, installs a process-local
 // background-job registry, and installs the executor with the real session work
 // kind.
 //
@@ -12,7 +12,7 @@
 // transferred `MessagePort`s (they cannot cross an isolate boundary).
 //
 // Protocol: the `execute.ts` frame protocol over the default worker channel.
-// The worker additionally transfers its writer / egress / broker ports and its
+// The worker additionally transfers its egress ports and its
 // hub-proxy control port to the hub. (The old dedicated job control link was
 // removed with the per-session worker refactor; background jobs stay local.)
 //
@@ -23,6 +23,7 @@
 // `pgrep -f 'oc serve'` instead. Names are clipped to the kernel's 15-byte
 // `comm` limit (see `@/util/thread-name`).
 
+import { randomUUID } from "node:crypto"
 import { threadId, workerData } from "node:worker_threads"
 import { Cause, Context, Effect, Exit, Fiber, Layer, Option, Scope } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -39,9 +40,12 @@ import { EffectBridge } from "@/effect/bridge"
 import { setThreadName } from "@/util/thread-name"
 import type { InstanceContext } from "@/project/instance-context"
 import { Provider } from "@/provider/provider"
-import { createWorkerWriterClient, type WorkerWriterClient } from "./writer-client"
+import { Bus } from "@opencode-ai/core/bus"
+import * as Database from "@opencode-ai/core/database/database"
+import { Durable } from "@opencode-ai/schema/durable-event-manifest"
+import { openWriterConnection } from "@/session/writer/connection"
 import { createWorkerEgressClient, type WorkerEgressClient } from "./egress-client"
-import { createWorkerBrokerClient } from "./broker-client"
+import { openWorkerDatabase, type WorkerConnection, type WorkerDatabase } from "./db"
 import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
 import { workerLoggingLayer } from "./worker-logging"
 import { messageOf } from "./port"
@@ -72,7 +76,6 @@ import {
   reducedLlmLayer,
   reducedModelProviderLayer,
   refreshablePluginTools,
-  type BrokerClientHandle,
   type HubProxyClient,
   type HubProxyClients,
   type PipelineMessage,
@@ -131,11 +134,10 @@ export interface SessionWorkerModel {
 
 /**
  * Capabilities the hub advertises for a worker generation. `sessionWorkerPorts`
- * is `true` once the hub serves the worker's writer / egress / broker ports (see
- * `serveWriterPort` and the egress/broker servers); the `false`/absent member
- * means the entry uses an in-worker fallback so a session cannot hang on an
- * unserved port. Modelled as a union so the served state is an explicit `true`,
- * never a truthy accident.
+ * is `true` once the hub serves the worker's egress ports; the `false`/absent
+ * member means the entry uses an in-worker fallback so a session cannot hang on
+ * an unserved port. Modelled as a union so the served state is an explicit
+ * `true`, never a truthy accident.
  */
 export type SessionWorkerCapabilities = { readonly sessionWorkerPorts: true } | { readonly sessionWorkerPorts?: false }
 
@@ -274,13 +276,96 @@ export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
 // Client aggregation (step 22).
 // ---------------------------------------------------------------------------
 
+/**
+ * The worker-local writer over its own SQLite WAL connection (D5). It replaces
+ * the deleted writer RPC: every primitive below runs in this isolate.
+ */
+export interface WorkerWriterClient extends WriterClientHandle {
+  begin(): Promise<string>
+  txQuery(handle: string, method: string, sql: string, params?: readonly unknown[]): Promise<unknown>
+  commit(handle: string): Promise<void>
+  rollback(handle: string): Promise<void>
+  dispose(): void
+}
+
+type WriterQueryConnection = Pick<WorkerConnection, "all" | "values" | "run" | "exec">
+
+function writerQuery(connection: WriterQueryConnection, method: string, sql: string, params?: readonly unknown[]): unknown {
+  switch (method) {
+    case "all":
+      return connection.all(sql, params)
+    case "values":
+      return connection.values(sql, params)
+    case "run":
+      return connection.run(sql, params)
+    case "exec":
+      connection.exec(sql)
+      return { changes: 0 }
+    default:
+      throw new Error(`unsupported worker writer query method "${method}" (expected all|values|run|exec)`)
+  }
+}
+
+/**
+ * Expose the `WriterClientHandle` seam over one per-worker WAL connection. The
+ * production boot passes the connection owned by `db.ts`, so the graph writer
+ * and the worker `Database` share exactly one handle; the fallback opens the
+ * retained WAL helper for standalone callers (tests, legacy boot).
+ */
+export function createWorkerDatabaseWriter(
+  options: { workerID?: number; filename?: string; connection?: WorkerConnection } = {},
+): WorkerWriterClient {
+  const connection = options.connection ?? openWriterConnection(options.filename ?? Database.path())
+  const ownerID = `worker-${options.workerID ?? threadId}-${process.pid}-${randomUUID()}`
+  const bus = Bus.create({ connection, ownerID })
+  const transactions = new Set<string>()
+  let nextTransaction = 1
+
+  const requireTransaction = (handle: string): void => {
+    if (!transactions.has(handle)) throw new Error(`unknown or spent transaction handle "${handle}"`)
+  }
+
+  return {
+    query: async (method, sql, params) => writerQuery(connection, method, sql, params),
+    publish: async (event) => {
+      const definition =
+        Durable.get(event.type) ?? [...Durable.values()].find((candidate) => candidate.type === event.type)
+      if (definition === undefined) throw new Error(`unknown durable event type "${event.type}"`)
+      const published = bus.publish([
+        { definition, data: event.data as never, id: event.id as never },
+      ])
+      const last = published[published.length - 1]
+      return { seq: last?.durable?.seq ?? null, committed: true }
+    },
+    begin: async () => {
+      const handle = `tx-${nextTransaction++}`
+      connection.exec("BEGIN IMMEDIATE")
+      transactions.add(handle)
+      return handle
+    },
+    txQuery: async (handle, method, sql, params) => {
+      requireTransaction(handle)
+      return writerQuery(connection, method, sql, params)
+    },
+    commit: async (handle) => {
+      requireTransaction(handle)
+      connection.exec("COMMIT")
+      transactions.delete(handle)
+    },
+    rollback: async (handle) => {
+      requireTransaction(handle)
+      connection.exec("ROLLBACK")
+      transactions.delete(handle)
+    },
+    dispose: () => connection.close(),
+  }
+}
+
 /** The transferred ports a worker rebuilds its function-valued clients over. */
 export interface WorkerClientPorts {
-  readonly writer?: MessagePort | undefined
   readonly egress?: MessagePort | undefined
   /** Optional dedicated egress control (mesh) port. */
   readonly egressControl?: MessagePort | undefined
-  readonly broker?: MessagePort | undefined
 }
 
 /** Raised when a required worker client port was not supplied. */
@@ -304,7 +389,7 @@ const transferable = (port: MessagePort): Transferable => port as unknown as Tra
 
 /**
  * The client handles the reduced session layer installs. The writer is the full
- * `WorkerWriterClient`, so the production worker can build a real writer-backed
+ * `WorkerWriterClient`, so the production worker can build a real DB-backed
  * `Database` (statements AND `begin`/`txQuery`/`commit`/`rollback`). The
  * background-job handle is process-local (the hub no longer serves a job port).
  */
@@ -312,41 +397,35 @@ export interface WorkerClients {
   readonly writer: WorkerWriterClient
   /** The full egress client, so the production control-plane mesh is reachable. */
   readonly egress: WorkerEgressClient
-  readonly broker: BrokerClientHandle
 }
 
 /**
- * Wire the port-backed clients. Every port is required: a missing one fails loud
- * rather than degrading to a mock that silently drops writes.
+ * Wire the egress port and expose the writer over the worker's one WAL
+ * connection. A missing egress port fails loud rather than degrading to a mock
+ * that silently drops events; the writer is never a port because D5 has no
+ * writer RPC.
  *
  * `workerID`, when supplied, is threaded onto every client so their E2 lifecycle
  * log lines carry the worker's owner id. It is omitted (never fabricated) when
  * the caller does not know it.
  *
- * `log`, when supplied, is threaded into every port-backed client so the E2
- * peer lifecycle lines (`writer connected`/`egress connected`/`broker connected`
- * and their closes) actually fire in the isolate. Absent keeps the no-op default.
+ * `log`, when supplied, is threaded into the egress client so the E2 peer
+ * lifecycle lines actually fire in the isolate. Absent keeps the no-op default.
  */
 export function buildWorkerClients(
   ports: WorkerClientPorts,
-  options: { workerID?: number; log?: WorkerLogger } = {},
+  options: { workerID?: number; log?: WorkerLogger; database?: WorkerDatabase } = {},
 ): WorkerClients {
-  const writer = requirePort(ports.writer, "writer")
   const egress = requirePort(ports.egress, "egress")
-  const broker = requirePort(ports.broker, "broker")
   const workerID = options.workerID
   const withLog = options.log === undefined ? {} : { log: options.log }
   return {
-    writer: createWorkerWriterClient(writer, {
+    writer: createWorkerDatabaseWriter({
       ...(workerID === undefined ? {} : { workerID }),
-      ...withLog,
+      ...(options.database === undefined ? {} : { connection: options.database.connection }),
     }),
     egress: createWorkerEgressClient(egress, {
       ...(ports.egressControl === undefined ? {} : { controlPort: ports.egressControl }),
-      ...(workerID === undefined ? {} : { workerID }),
-      ...withLog,
-    }),
-    broker: createWorkerBrokerClient(broker, {
       ...(workerID === undefined ? {} : { workerID }),
       ...withLog,
     }),
@@ -654,7 +733,7 @@ export function productionWorkRegistry(session: SessionWork): SessionWorkFactory
 
 /**
  * The client handles used when the hub does not (yet) serve the worker's
- * writer / egress / broker ports: in-process adapters so a reduced turn can
+ * egress ports: in-process adapters so a reduced turn can
  * still complete. Durable writes and egress are the hub's authority, so the
  * fallback reports a non-committed publish and emits nothing.
  */
@@ -686,7 +765,6 @@ function directClients(): WorkerClients {
       mesh: undefined,
       dispose: () => {},
     },
-    broker: { call: async () => null },
   }
 }
 
@@ -859,7 +937,7 @@ export interface BootstrapSessionWorkerOptions {
 }
 
 /**
- * Whether the hub serves this worker's writer / egress / broker ports, i.e.
+ * Whether the hub serves this worker's egress ports, i.e.
  * whether the full prompt path boots. A discriminated switch over the
  * capabilities union keeps the two boot modes explicit at the decision site.
  */
@@ -878,7 +956,7 @@ function servesWorkerPorts(capabilities: SessionWorkerCapabilities | undefined):
  * tests can import this module (`buildWorkerClients`, the registry) without a
  * worker context; the module only bootstraps when `workerData` is present.
  *
- * The writer / egress (plus its dedicated control plane) / broker ports are
+ * The egress (plus its dedicated control plane) ports are
  * transferred only when the hub advertises `capabilities.sessionWorkerPorts`,
  * because a port nobody serves would make a session hang; the production hub
  * serves all of them. There is no dedicated job control link (background jobs
@@ -909,37 +987,35 @@ export function bootstrapSessionWorker(
   if (init.sessionID !== undefined) namer.bind(init.sessionID)
   else if (init.workerID !== undefined) namer.bind(String(init.workerID))
   let clients: WorkerClients
+  let database: WorkerDatabase | undefined
   let hubProxies: HubProxyClients | undefined
   let pidReporter: PidReporterInterface | undefined
-  // The real `SessionPrompt` loop needs the writer-backed Database and an
+  // The real `SessionPrompt` loop needs the worker's own WAL connection and an
   // ambient `InstanceRef`; only the full hub-port wiring provides them. The
   // degraded (no-port) boot runs the reduced pipeline.
   const usePrompt = servesWorkerPorts(init.capabilities)
   if (usePrompt) {
-    const writerChannel = new MessageChannel()
+    // One connection per worker generation: the schema gate is read-only and a
+    // mismatch refuses boot before any run starts (D5/D7).
+    database = Effect.runSync(openWorkerDatabase({ filename: Database.path() }))
     const egressChannel = new MessageChannel()
     // A dedicated control plane, so durable wakeups and resync never queue
     // behind the delta stream; without it the egress mesh is dead in production.
     const egressControlChannel = new MessageChannel()
-    const brokerChannel = new MessageChannel()
     scope.postMessage(
       {
         type: "ports",
-        writer: writerChannel.port2,
         egress: egressChannel.port2,
         egressControl: egressControlChannel.port2,
-        broker: brokerChannel.port2,
       },
-      [writerChannel.port2, egressChannel.port2, egressControlChannel.port2, brokerChannel.port2].map(transferable),
+      [egressChannel.port2, egressControlChannel.port2].map(transferable),
     )
     clients = buildWorkerClients(
       {
-        writer: writerChannel.port1,
         egress: egressChannel.port1,
         egressControl: egressControlChannel.port1,
-        broker: brokerChannel.port1,
       },
-      { workerID: reportedWorkerID(init, threadId), log },
+      { workerID: reportedWorkerID(init, threadId), log, database },
     )
     // The hub serves the `SessionStatus` / `Permission` / `Question`
     // authorities over one control port; a single multiplexing client backs all
@@ -1029,7 +1105,11 @@ export function bootstrapSessionWorker(
     // PENDING hub-a: `node-table.ts`/`layer.ts` still declare an unused
     // `BackgroundJobClientNode`; supply its inert handle here until that removal
     // lands (the session worker owns its jobs through the process-local service).
-    clients: { ...clients, backgroundJob: { wait: async () => ({ timedOut: true }), cancel: async () => {} } },
+    clients: {
+      ...clients,
+      ...(database === undefined ? {} : { database }),
+      backgroundJob: { wait: async () => ({ timedOut: true }), cancel: async () => {} },
+    },
     modelClient,
     backgroundJob: backgroundJobLayer,
     // The worker serves exactly one serialized model, so the reduced provider is
@@ -1103,6 +1183,9 @@ export function bootstrapSessionWorker(
       // The registry scope outlives every run, so close it explicitly with the
       // worker bootstrap; a still-running job is interrupted with the isolate.
       void Effect.runPromise(Scope.close(backgroundJobScope, Exit.void)).catch(() => undefined)
+      // The worker's one WAL connection is owned by bootstrap, not the graph
+      // scope finalizer alone; close is idempotent.
+      if (database !== undefined) Effect.runSync(database.close)
     },
   }
 }

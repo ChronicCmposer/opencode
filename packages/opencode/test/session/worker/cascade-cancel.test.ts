@@ -85,4 +85,30 @@ describe("cancelSessionTree", () => {
 
     expect(cancelled).toEqual(["b", "a"])
   })
+
+  test("only the requested subtree is cancelled; a sibling branch is untouched", async () => {
+    const tree: Record<string, string[]> = {
+      root: ["branch-a", "branch-b"],
+      "branch-a": ["a-child"],
+      "branch-b": ["b-child"],
+      "a-child": [],
+      "b-child": [],
+    }
+    const cancelled: string[] = []
+    await Effect.runPromise(
+      cancelSessionTree({
+        children: (sessionID) => Effect.succeed((tree[sessionID] ?? []).map((child) => ({ id: id(child) }))),
+        cancelOne: (sessionID) =>
+          Effect.sync(() => {
+            cancelled.push(sessionID)
+            return undefined
+          }),
+      })(id("branch-a")),
+    )
+
+    expect(cancelled).toEqual(["a-child", "branch-a"])
+    expect(cancelled).not.toContain("branch-b")
+    expect(cancelled).not.toContain("b-child")
+    expect(cancelled).not.toContain("root")
+  })
 })

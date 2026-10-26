@@ -15,6 +15,7 @@ const generated = await import("./generate.ts")
 
 import { Script } from "@opencode-ai/script"
 import pkg from "../package.json"
+import { computeBuildHash } from "../src/session/worker/build-hash.ts"
 
 const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
@@ -22,6 +23,12 @@ const skipInstall = process.argv.includes("--skip-install")
 const sourcemapsFlag = process.argv.includes("--sourcemaps")
 const plugin = createSolidTransformPlugin()
 const skipEmbedWebUi = process.argv.includes("--skip-embed-web-ui")
+
+// The session-worker build identity: entry bundle bytes plus the protocol schema
+// version. Plugins and runtime configuration are intentionally excluded.
+const sessionWorkerBuildHash = computeBuildHash({
+  entryBundle: await Bun.file(path.join(dir, "src/session/worker/session-worker.ts")).arrayBuffer(),
+})
 
 const createEmbeddedWebUIBundle = async () => {
   console.log(`Building Web UI to embed in the binary`)
@@ -174,10 +181,6 @@ for (const item of targets) {
   const workerPath = "./src/cli/tui/worker.ts"
   const sessionWorkerSourcePath = "./src/session/worker/session-worker.ts"
   const sessionWorkerPath = "session-worker.js"
-  const writerWorkerSourcePath = "./src/session/writer/worker.ts"
-  const writerWorkerPath = "writer-worker.js"
-  const brokerWorkerSourcePath = "./src/session/broker/broker-worker.ts"
-  const brokerWorkerPath = "broker-worker.js"
   const treeSitterWorkerPath = "opentui-tree-sitter-worker.js"
   const bunfsRoot = item.os === "win32" ? "B:/~BUN/root/" : "/$bunfs/root/"
 
@@ -186,8 +189,6 @@ for (const item of targets) {
   // flat bunfs name, so embed a tiny shim that imports the bundled entrypoint rather
   // than duplicating the worker bundle.
   const sessionWorkerShim = workerShim(sessionWorkerSourcePath)
-  const writerWorkerShim = workerShim(writerWorkerSourcePath)
-  const brokerWorkerShim = workerShim(brokerWorkerSourcePath)
 
   await Bun.build({
     conditions: ["bun", "node"],
@@ -210,8 +211,6 @@ for (const item of targets) {
     },
     files: {
       [sessionWorkerPath]: sessionWorkerShim,
-      [writerWorkerPath]: writerWorkerShim,
-      [brokerWorkerPath]: brokerWorkerShim,
       [treeSitterWorkerPath]: treeSitterWorker,
       ...(embeddedFileMap ? { "opencode-web-ui.gen.ts": embeddedFileMap } : {}),
     },
@@ -220,10 +219,6 @@ for (const item of targets) {
       workerPath,
       sessionWorkerSourcePath,
       sessionWorkerPath,
-      writerWorkerSourcePath,
-      writerWorkerPath,
-      brokerWorkerSourcePath,
-      brokerWorkerPath,
       treeSitterWorkerPath,
       ...(embeddedFileMap ? ["opencode-web-ui.gen.ts"] : []),
     ],
@@ -234,8 +229,7 @@ for (const item of targets) {
       OTUI_TREE_SITTER_WORKER_PATH: bunfsRoot + treeSitterWorkerPath,
       OPENCODE_WORKER_PATH: workerPath,
       OPENCODE_SESSION_WORKER_PATH: bunfsRoot + sessionWorkerPath,
-      OPENCODE_WRITER_WORKER_PATH: bunfsRoot + writerWorkerPath,
-      OPENCODE_BROKER_WORKER_PATH: bunfsRoot + brokerWorkerPath,
+      OPENCODE_BUILD_HASH: JSON.stringify(sessionWorkerBuildHash),
       OPENCODE_CHANNEL: `'${Script.channel}'`,
       // Compile the fault-injection seam out of production binaries. `define`
       // values are raw code, so `"false"` inlines the boolean literal `false`

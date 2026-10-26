@@ -30,7 +30,6 @@ import {
   createWorkerCancellation,
   describeSessionWorkerEntry,
   fallbackInstanceContext,
-  lazyOpenWriter,
   makeSessionHubNode,
   productionSessionHubLayer,
   productionSessionHubNode,
@@ -77,14 +76,10 @@ import { TestLLMServer } from "../../lib/llm-server"
 import { settleOf, sid } from "../../lib/async"
 import { lineFor, recordingLogger } from "../../lib/recorders"
 import { pollUntil } from "../../lib/poll"
-import { createHubProxyClient } from "@/session/worker/layer"
+import { createHubProxyClient } from "@/session/worker/hub-proxy-wire"
 import type { HubProxyMethod } from "@/session/worker/hub-proxy-wire"
-import { createWorkerWriterClient } from "@/session/worker/writer-client"
-import { createWorkerBrokerClient } from "@/session/worker/broker-client"
 import { createWorkerEgressClient } from "@/session/worker/egress-client"
 import { createEgressReceiver } from "@/session/egress/receiver"
-import type { BrokerBackend } from "@/session/broker/broker"
-import { serveWriterPort, type HubWriter, type WriterClient } from "@/session/writer/client"
 import { sessionWorkerNodes } from "@/session/worker/nodes"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
@@ -101,7 +96,6 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Provider } from "@/provider/provider"
 import path from "node:path"
 import { tmpdir } from "../../fixture/fixture"
-import { healthyEnv } from "../writer/fixtures"
 
 const it = testEffect(TestLLMServer.layer)
 
@@ -110,21 +104,6 @@ const EXECUTOR_FIXTURE = new URL("../../fixture/session-execute-worker.ts", impo
 /** The production worker entry (reduced layer as the work factory). */
 const SESSION_WORKER = new URL("../../../src/session/worker/session-worker.ts", import.meta.url)
 
-/** Transaction methods for writer stubs whose tests never exercise them; fail loud if reached. */
-const unusedHubWriterTx: Pick<HubWriter, "begin" | "txQuery" | "commit" | "rollback"> = {
-  begin: async () => {
-    throw new Error("begin was not expected in this test")
-  },
-  txQuery: async () => {
-    throw new Error("txQuery was not expected in this test")
-  },
-  commit: async () => {
-    throw new Error("commit was not expected in this test")
-  },
-  rollback: async () => {
-    throw new Error("rollback was not expected in this test")
-  },
-}
 
 describe("12.1 the hub executes zero sessions", () => {
   it.live("work runs in the reduced-layer worker, never on the hub", () =>
@@ -734,12 +713,6 @@ describe("W11 production egress mesh", () => {
   test("the production egress backend attaches a mesh and publishes durable commits under load", async () => {
     const { publisher, published } = recordingPublisher()
     const backends = buildProductionPortBackends({
-      writer: {
-        query: async () => [],
-        publish: async () => ({ seq: null, committed: false }),
-        ...unusedHubWriterTx,
-      },
-      broker: fakeBroker(),
       events: publisher,
       // A tiny bound makes the overflow (resync) path deterministic without
       // driving hundreds of frames.
@@ -873,46 +846,12 @@ describe("15 layer lifecycle / leak", () => {
 })
 
 describe("35a worker port serving", () => {
-  const hubWriter: HubWriter = {
-    query: async () => [{ n: 1 }],
-    publish: async () => ({ seq: 7, committed: true }),
-    begin: async () => {
-      throw new Error("begin was not expected in this test")
-    },
-    txQuery: async () => {
-      throw new Error("txQuery was not expected in this test")
-    },
-    commit: async () => {
-      throw new Error("commit was not expected in this test")
-    },
-    rollback: async () => {
-      throw new Error("rollback was not expected in this test")
-    },
-  }
 
-  test("serves a worker's writer port against the hub writer", async () => {
-    const hub = createSessionHub({ pool: trackedLazyPool([]), ports: { writer: hubWriter, broker: {} as never } })
-    const channel = new MessageChannel()
-    const dispose = hub.attachWorkerPorts(1, { writer: channel.port1 })
-    const client = createWorkerWriterClient(channel.port2)
-
-    expect(await client.query("all", "SELECT 1", [])).toEqual([{ n: 1 }])
-    expect(await client.publish({ id: "e1", type: "t", aggregateID: "a", data: {} })).toEqual({
-      seq: 7,
-      committed: true,
-    })
-
-    client.dispose()
-    dispose()
-    channel.port1.close()
-    channel.port2.close()
-    await hub.terminateAll()
-  })
 
   test("serves the hub-proxy authorities over a worker control port", async () => {
     const hub = createSessionHub({
       pool: trackedLazyPool([]),
-      ports: { writer: hubWriter, broker: {} as never, hubProxy: { "sessionStatus.get": () => "pong" } },
+      ports: { hubProxy: { "sessionStatus.get": () => "pong" } },
     })
     const channel = new MessageChannel()
     const dispose = hub.attachHubProxyPort(1, channel.port1)
@@ -934,16 +873,13 @@ describe("35a worker port serving", () => {
 
   test("returns idempotent disposers and is a no-op without backends", () => {
     const hub = createSessionHub({ pool: trackedLazyPool([]) })
-    const writerChannel = new MessageChannel()
     const proxyChannel = new MessageChannel()
-    const disposePorts = hub.attachWorkerPorts(1, { writer: writerChannel.port1 })
+    const disposePorts = hub.attachWorkerPorts(1, {})
     const disposeProxy = hub.attachHubProxyPort(1, proxyChannel.port1)
     expect(typeof disposePorts).toBe("function")
     expect(typeof disposeProxy).toBe("function")
     disposePorts()
     disposeProxy()
-    writerChannel.port1.close()
-    writerChannel.port2.close()
     proxyChannel.port1.close()
     proxyChannel.port2.close()
   })
@@ -977,7 +913,7 @@ describe("42 crash/respawn end-to-end", () => {
 })
 
 // ---------------------------------------------------------------------------
-// 36 production port backends: capabilities + writer/broker/egress round-trip.
+// 36 production port backends: capabilities + broker/egress round-trip.
 // ---------------------------------------------------------------------------
 
 const productionInstanceCtx = {
@@ -1080,11 +1016,9 @@ const portPoolFactory =
         captured.capabilities = (await resolveInit()).capabilities
         captured.created.push(id)
         if (emitPorts) {
-          const writer = new MessageChannel()
           const egress = new MessageChannel()
-          const broker = new MessageChannel()
-          sinks.onWorkerPorts(id, { writer: writer.port2, egress: egress.port2, broker: broker.port2 })
-          captured.ports = { writer: writer.port1, egress: egress.port1, broker: broker.port1 }
+          sinks.onWorkerPorts(id, { egress: egress.port2 })
+          captured.ports = { egress: egress.port1 }
         }
         return new ImmediateWorker(id)
       },
@@ -1105,16 +1039,6 @@ const hubProxyPoolFactory =
       },
     })
 
-const fakeBroker = (): BrokerBackend => ({
-  acquire: async () => ({ instanceId: "test", servers: [] }),
-  call: async () => ({ ok: true }),
-  cancel: async () => {},
-  oauth: async () => ({ callbackUrl: "http://localhost/oauth", instanceId: "test", owner: "broker" }),
-  release: async () => {},
-  ping: async () => ({ threadId: 0, directories: 0 }),
-  teardown: async () => {},
-})
-
 describe("36 production port backends", () => {
   test("productionSessionHubNode is exported and provides SessionHubService", () => {
     expect(typeof productionSessionHubNode).toBe("function")
@@ -1122,20 +1046,10 @@ describe("36 production port backends", () => {
     expect(productionSessionHubNode().service).toBe(SessionHubService)
   })
 
-  test("the production node advertises sessionWorkerPorts and round-trips writer/broker/egress", async () => {
+  test("the production node advertises sessionWorkerPorts and round-trips egress", async () => {
     const captured: CapturedPorts = { created: [] }
-    const writerCalls: unknown[] = []
     const egressFrames: unknown[] = []
     const backends: WorkerPortBackends = {
-      writer: {
-        query: async (method, sql, params) => {
-          writerCalls.push([method, sql, params])
-          return [{ n: 1 }]
-        },
-        publish: async () => ({ seq: 7, committed: true }),
-        ...unusedHubWriterTx,
-      },
-      broker: fakeBroker(),
       egress: (_workerID, port) => {
         const receiver = createEgressReceiver({ port, onFrame: (frame) => egressFrames.push(frame) })
         return () => receiver.close()
@@ -1164,26 +1078,9 @@ describe("36 production port backends", () => {
             expect(captured.capabilities).toEqual({ sessionWorkerPorts: true })
             expect(captured.created).toEqual([1])
             const ports = captured.ports
-            expect(ports?.writer).toBeDefined()
-            expect(ports?.broker).toBeDefined()
             expect(ports?.egress).toBeDefined()
 
             yield* Effect.promise(async () => {
-              // Writer port round-trip against the hub authority.
-              const writer = createWorkerWriterClient(ports!.writer!)
-              expect(await writer.query("all", "SELECT 1", [])).toEqual([{ n: 1 }])
-              expect(await writer.publish({ id: "e1", type: "t", aggregateID: "a", data: {} })).toEqual({
-                seq: 7,
-                committed: true,
-              })
-              expect(writerCalls).toEqual([["all", "SELECT 1", []]])
-              writer.dispose()
-
-              // Broker port round-trip against the hub authority.
-              const broker = createWorkerBrokerClient(ports!.broker!)
-              expect(await broker.call("dir", "srv", "method")).toEqual({ ok: true })
-              broker.dispose()
-
               // Egress port round-trip: the emitted delta reaches the hub receiver.
               const egress = createWorkerEgressClient(ports!.egress!, { windowMs: 0 })
               egress.emit({ id: "x1", type: "session.text", properties: { text: "hi" } })
@@ -1192,7 +1089,7 @@ describe("36 production port backends", () => {
               expect(egressFrames.length).toBeGreaterThan(0)
               egress.dispose()
 
-              for (const port of [ports!.writer!, ports!.broker!, ports!.egress!]) port.close()
+              ports!.egress!.close()
             })
           }),
         ),
@@ -1239,18 +1136,8 @@ describe("36 production port backends", () => {
                 entry: EXECUTOR_FIXTURE,
                 workKind: "instant",
                 poolFactory: hubProxyPoolFactory(captured),
-                // Injected authorities, so building the port backends spawns no
-                // real writer/broker isolate; the hub-proxy handlers still come
-                // from the layer's real service deps.
-                backends: {
-                  writer: {
-                    query: async () => [],
-                    publish: async () => ({ seq: null, committed: false }),
-                    ...unusedHubWriterTx,
-                  },
-                  broker: fakeBroker(),
-                  databasePath: ":memory:",
-                },
+                // Building the port backends does no eager work; the
+                // hub-proxy handlers come from the layer's real service deps.
               }),
             )
             const hub = Context.get(context, SessionHubService)
@@ -1266,47 +1153,8 @@ describe("36 production port backends", () => {
     )
   })
 
-  test("the owned production writer opens + migrates the app database so a worker durable publish succeeds", async () => {
-    await using tmp = await tmpdir()
-    const filename = path.join(tmp.path, "writer.db")
-    // No manual seed: `buildProductionPortBackends` ships the production schema
-    // over `writer.migrate(...)`, so the owned isolate creates `event`/`event_sequence`.
-    const backends = buildProductionPortBackends({
-      databasePath: filename,
-      broker: fakeBroker(),
-      writerOptions: { env: healthyEnv },
-    })
-    const channel = new MessageChannel()
-    const dispose = serveWriterPort(backends.writer, channel.port1)
-    const client = createWorkerWriterClient(channel.port2)
-    try {
-      expect(await client.publish({ id: "e1", type: "t", aggregateID: "a", data: { k: 1 } })).toMatchObject({
-        seq: 0,
-        committed: true,
-      })
-      expect(await client.query("all", "SELECT seq, type FROM event WHERE aggregate_id = ?", ["a"])).toEqual([
-        { seq: 0, type: "t" },
-      ])
-    } finally {
-      client.dispose()
-      dispose()
-      channel.port1.close()
-      channel.port2.close()
-      await backends.dispose()
-    }
-  })
-
-  test("buildProductionPortBackends defaults to a draining egress and owns only its own isolates", async () => {
-    let torndown = 0
-    const broker = fakeBroker()
-    const backends = buildProductionPortBackends({
-      writer: {
-        query: async () => [],
-        publish: async () => ({ seq: null, committed: false }),
-        ...unusedHubWriterTx,
-      },
-      broker: { ...broker, teardown: async () => void (torndown += 1) },
-    })
+  test("buildProductionPortBackends defaults to a draining egress", async () => {
+    const backends = buildProductionPortBackends()
 
     expect(backends.egress).toBeDefined()
     const channel = new MessageChannel()
@@ -1317,9 +1165,7 @@ describe("36 production port backends", () => {
     channel.port1.close()
     channel.port2.close()
 
-    // An injected authority belongs to the caller: dispose must not tear it down.
     await backends.dispose()
-    expect(torndown).toBe(0)
   })
 
   test("flag-off excludes the production hub node (zero workers)", () => {
@@ -1499,12 +1345,6 @@ describe("Q22 hub event sink", () => {
   test("buildProductionPortBackends serves the events port with a live sink", async () => {
     const { publisher, published } = recordingPublisher()
     const backends = buildProductionPortBackends({
-      writer: {
-        query: async () => [],
-        publish: async () => ({ seq: null, committed: false }),
-        ...unusedHubWriterTx,
-      },
-      broker: fakeBroker(),
       events: publisher,
     })
     const channel = new MessageChannel()
@@ -2057,7 +1897,7 @@ describe("W4 pid-report receive", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Fixes A/C/D — define-aware worker entry, migration after open, error cause.
+// Fixes A/D — define-aware worker entry and error cause.
 // ---------------------------------------------------------------------------
 
 describe("A define-aware session worker entry", () => {
@@ -2107,45 +1947,6 @@ describe("A2 describeSessionWorkerEntry reports the resolution source", () => {
   test("an empty env override falls through to the default source", () => {
     const described = describeSessionWorkerEntry({ env: { OPENCODE_SESSION_WORKER_PATH: "" } })
     expect(described.source).toBe("default")
-  })
-})
-
-describe("C writer migration runs after open", () => {
-  /** A `WriterClient` whose admin calls are recorded; tx methods fail loud if reached. */
-  const spyWriter = (calls: string[], onMigrate?: () => void): WriterClient =>
-    ({
-      open: async (filename: string) => {
-        calls.push(`open:${filename}`)
-        return { opened: true, filename }
-      },
-      migrate: async (statements: ReadonlyArray<string>) => {
-        calls.push(`migrate:${statements.join(",")}`)
-        onMigrate?.()
-      },
-      query: async () => [],
-      publish: async () => ({ seq: 0, committed: true }),
-      ...unusedHubWriterTx,
-    }) as unknown as WriterClient
-
-  test("opens then migrates exactly once, before the first request", async () => {
-    const calls: string[] = []
-    const hubWriter = lazyOpenWriter(spyWriter(calls), "app.db", ["CREATE TABLE t(x)"])
-    await hubWriter.query("all", "SELECT 1", [])
-    await hubWriter.publish({ id: "e", type: "t", aggregateID: "a", data: {} }, { durable: true })
-    expect(calls).toEqual(["open:app.db", "migrate:CREATE TABLE t(x)"])
-  })
-
-  test("a failed migrate resets the memo so the next request retries", async () => {
-    const calls: string[] = []
-    let attempts = 0
-    const writer = spyWriter(calls, () => {
-      attempts += 1
-      if (attempts === 1) throw new Error("migrate boom")
-    })
-    const hubWriter = lazyOpenWriter(writer, "app.db", ["S"])
-    await expect(hubWriter.query("all", "SELECT 1", [])).rejects.toThrow("migrate boom")
-    await hubWriter.query("all", "SELECT 1", [])
-    expect(attempts).toBe(2)
   })
 })
 
@@ -2540,22 +2341,19 @@ describe("W12 observability — rebind and ports", () => {
   test("E1 logs each connected hub port under its worker id", async () => {
     const { log, lines } = recordingLog()
     const hub = createSessionHub({ pool: trackedLazyPool([]), log })
-    const writer = new MessageChannel()
-    const broker = new MessageChannel()
+    const egress = new MessageChannel()
     const hubProxy = new MessageChannel()
     try {
-      hub.attachWorkerPorts(4, { writer: writer.port1, broker: broker.port1 })
+      hub.attachWorkerPorts(4, { egress: egress.port1 })
       hub.attachHubProxyPort(5, hubProxy.port1)
 
       const connected = lines.filter((entry) => entry.message === workerLogMessage("ports connected"))
       const portsByWorker = new Map(connected.map((entry) => [entry.fields.workerID, entry.fields.ports]))
-      expect(portsByWorker.get(4)).toEqual(["writer", "broker"])
+      expect(portsByWorker.get(4)).toEqual(["egress"])
       expect(portsByWorker.get(5)).toEqual(["hub-proxy"])
     } finally {
-      writer.port1.close()
-      writer.port2.close()
-      broker.port1.close()
-      broker.port2.close()
+      egress.port1.close()
+      egress.port2.close()
       hubProxy.port1.close()
       hubProxy.port2.close()
       await hub.terminateAll()

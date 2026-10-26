@@ -27,6 +27,7 @@ import {
   SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES,
 } from "@/util/mcp-resource"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { ToolRoute } from "@/tool/route"
 
 const MCP_RESOURCE_TOOLS = {
   list: "list_mcp_resources",
@@ -52,6 +53,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const mcp = yield* MCP.Service
   const truncate = yield* Truncate.Service
   const flags = yield* RuntimeFlags.Service
+  // The one routing decision for this process: worker-local tools versus
+  // hub-executed MCP/LSP. Every registration below asks this predicate, never
+  // the presence of a client or a layer node.
+  const toolHost = ToolRoute.hostForRole()
+  const available = (ref: ToolRoute.ToolRef) => ToolRoute.runsOn(ToolRoute.routeTool(ref), toolHost)
 
   const context = (args: Record<string, unknown>, options: ToolExecutionOptions): Tool.Context => ({
     sessionID: input.session.id,
@@ -93,6 +99,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       agent: input.agent,
       permission: input.session.permission,
     })) {
+      if (!available({ id: item.id, source: ToolRoute.sourceForRegistryTool(item.id) })) continue
       const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))
       tools[item.id] = tool({
         description: item.description,
@@ -320,9 +327,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       },
     })
 
-  const hasMcpResourceServer = Object.values(yield* mcp.clients()).some(
-    (client) => !!client.getServerCapabilities()?.resources,
-  )
+  const hasMcpResourceServer =
+    available({ id: MCP_RESOURCE_TOOLS.list, source: "mcp" }) &&
+    Object.values(yield* mcp.clients()).some((client) => !!client.getServerCapabilities()?.resources)
   if (hasMcpResourceServer) {
     tools[MCP_RESOURCE_TOOLS.list] = createMcpResourceListTool({
       tool: MCP_RESOURCE_TOOLS.list,
@@ -351,6 +358,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
 
   const registerMcpTools = Effect.fnUntraced(function* () {
     if (flags.experimentalCodeMode) return
+    if (!available({ id: "mcp", source: "mcp" })) return
     for (const [key, entry] of Object.entries(yield* mcp.tools())) {
       const item = McpCatalog.convertTool(entry.def, entry.client, entry.timeout)
       const execute = item.execute

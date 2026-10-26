@@ -94,14 +94,43 @@ const payloadEnvelope = <Version extends number | undefined>(
  * previous synchronous throw / raw `decodeUnknownSync`) so callers must decide
  * how an unknown or malformed durable row is surfaced.
  */
+const decodeWithDefinition = (event: SerializedEvent, definition: Definition): Payload => {
+  const durable = definition.durable
+  if (durable === undefined) {
+    throw new InvalidDurableEventError({ type: event.type, message: `Event type ${event.type} is not durable` })
+  }
+  return {
+    ...payloadEnvelope(event, definition, durable.version),
+    data: Schema.decodeUnknownSync(definition.data)(event.data),
+  }
+}
+
+/**
+ * The one durable-event decode policy, shared by the Effect read paths and the
+ * synchronous worker Bus. An unknown or non-durable stored type is a hard,
+ * descriptive failure rather than a fabricated payload.
+ */
+export const decodeDurablePayload = (
+  event: SerializedEvent,
+  definitions: ReadonlyMap<string, Definition> = Durable,
+): Payload => {
+  const definition = definitions.get(event.type)
+  if (!definition?.durable) {
+    throw new InvalidDurableEventError({ type: event.type, message: `Unknown durable event type ${event.type}` })
+  }
+  return decodeWithDefinition(event, definition)
+}
+
 const decodeSerializedEvent = (event: SerializedEvent): Effect.Effect<Payload, InvalidDurableEventError> =>
   Effect.gen(function* () {
     const definition = Durable.get(event.type)
     if (!definition?.durable) {
-      return yield* new InvalidDurableEventError({ type: event.type, message: `Unknown durable event type ${event.type}` })
+      return yield* new InvalidDurableEventError({
+        type: event.type,
+        message: `Unknown durable event type ${event.type}`,
+      })
     }
-    const data = yield* Schema.decodeUnknownEffect(definition.data)(event.data).pipe(Effect.orDie)
-    return { ...payloadEnvelope(event, definition, definition.durable.version), data }
+    return yield* Effect.sync(() => decodeWithDefinition(event, definition)).pipe(Effect.orDie)
   })
 
 export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(

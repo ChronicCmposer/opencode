@@ -895,7 +895,6 @@ describe("retired worker hub-side port disposal", () => {
   /** Minimal backends: only the egress disposer matters to these tests. */
   const egressBackends = (disposed: number[]) => ({
     writer: {} as never,
-    broker: {} as never,
     egress: (workerID: number, port: MessagePort) => {
       port.start()
       return () => disposed.push(workerID)

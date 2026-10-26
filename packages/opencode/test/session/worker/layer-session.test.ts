@@ -44,6 +44,7 @@ import { Question } from "@/question"
 import { startMockProvider, type MockProviderHandle } from "../../lib/mock-provider"
 import { workerSnapshot } from "../../lib/snapshot"
 import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
+import { pluginPassThroughReplacement } from "../../lib/worker-plugin-routes"
 
 const sid = (value: string) => SessionID.make(value)
 
@@ -60,7 +61,6 @@ const modelConfig = (provider: MockProviderHandle): WorkerModelConfig => ({
 const stubClients = (): SessionLayerOptions["clients"] => ({
   writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
   egress: { emit: () => {} },
-  broker: { call: async () => null },
   backgroundJob: { wait: async () => null, cancel: async () => {} },
 })
 
@@ -154,7 +154,6 @@ describe("real session against the mock provider", () => {
           emit: (event) =>
             void emitted.push({ type: event.type, text: (event.properties as { text: string }).text }),
         },
-        broker: { call: async () => null },
         backgroundJob: { wait: async () => null, cancel: async () => {} },
       },
       // The LLM-backed ModelClient makes a real streaming call to the provider.
@@ -390,13 +389,17 @@ describe("full-graph prompt path against the mock provider", () => {
         clients: {
           writer: ctx.writer,
           egress: { emit: () => {}, emitDurable: () => {} },
-          broker: { call: async () => null },
           backgroundJob: { wait: async () => null, cancel: async () => {} },
         },
         modelClient: llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(snapshot, config))),
         // The hub-shipped provider/snapshot the production worker installs; MCP
         // and LSP are intentionally left to `boundaryReplacements`.
-        replacements: workerGraphReplacements(config),
+        replacements: [
+          ...workerGraphReplacements(config),
+          // PENDING-plugin (W4.1): keep this boundary test focused on MCP/LSP
+          // while the remaining invoked hooks gain routes.
+          pluginPassThroughReplacement(),
+        ],
       })
       const result = await Effect.runPromise(
         Effect.gen(function* () {

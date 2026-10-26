@@ -13,6 +13,8 @@
 
 import { Schema } from "effect"
 import type { SessionID } from "@/session/schema"
+import { isWorkerCrashPhase, workerCrashed, type WorkerCrashPhase, type WorkerCrashed } from "@/session/ledger/crash"
+import type { AutoResumeDecision } from "@/session/ledger/resume"
 import type { PromptInput, ShellInput } from "@/session/prompt"
 import { defined } from "@/util/object"
 import { createSessionWorkerRegistry, type SessionWorkerRegistry } from "./session-registry"
@@ -62,9 +64,31 @@ export interface WorkerPool {
 export class WorkerCrashedError extends Schema.TaggedErrorClass<WorkerCrashedError>()("WorkerCrashedError", {
   message: Schema.String,
   workerID: Schema.Number,
+  /** The crash phase from the D8 payload, when the isolate reported one. */
+  sessionID: Schema.optional(Schema.String),
+  phase: Schema.optional(Schema.String),
+  lastCommittedMessageID: Schema.optional(Schema.NullOr(Schema.String)),
+  inFlightCallIDs: Schema.optional(Schema.Array(Schema.String)),
+  reason: Schema.optional(Schema.String),
   /** The underlying isolate failure, when one was captured. */
   cause: Schema.optional(Schema.Defect()),
-}) {}
+}) {
+  /** A crash is never retried on the same run. */
+  readonly retryable = false as const
+
+  /** The typed D8 payload, present when the crash carried full context. */
+  get payload(): WorkerCrashed | undefined {
+    if (this.sessionID === undefined || !isWorkerCrashPhase(this.phase)) return undefined
+    return workerCrashed({
+      sessionID: this.sessionID,
+      workerID: this.workerID,
+      phase: this.phase,
+      lastCommittedMessageID: this.lastCommittedMessageID ?? null,
+      inFlightCallIDs: this.inFlightCallIDs ?? [],
+      reason: this.reason ?? this.message,
+    })
+  }
+}
 
 /** The underlying failure's text, embedded in a crash error so its cause is never lost. */
 function describeFailure(error: unknown): string {
@@ -76,6 +100,21 @@ export class SessionCancelledError extends Schema.TaggedErrorClass<SessionCancel
   message: Schema.String,
   sessionID: Schema.String,
 }) {}
+
+/**
+ * A child whose parent worker crashed. It is a cancellation (never a resume) and
+ * remains a `SessionCancelledError` so existing cancellation callers keep working.
+ */
+export class ParentCrashedError extends SessionCancelledError {
+  readonly reason = "parent-crashed" as const
+  constructor(
+    readonly parentSessionID: SessionID,
+    readonly childSessionID: SessionID,
+  ) {
+    super({ message: `parent session ${parentSessionID} crashed; child ${childSessionID} was cancelled`, sessionID: childSessionID })
+    this.name = "ParentCrashedError"
+  }
+}
 
 /** Every terminal mode a cancelled run can report. There is no admission queue. */
 export const CANCELLED_MODES = ["cooperative", "terminated", "completed"] as const
@@ -148,6 +187,20 @@ export interface DispatcherOptions {
   readonly writeBarrier?: (sessionID: SessionID) => Promise<void> | undefined
   /** Hub-side cleanup when a session's worker is retired (reap/cancel/crash). */
   readonly onSessionReleased?: (sessionID: SessionID, workerID?: number) => void
+  /** Persist the D8 payload before the crash is returned to the caller. */
+  readonly recordCrash?: (payload: WorkerCrashed) => void
+  /** Ledger context for a crash whose isolate could not report it. */
+  readonly crashState?: (sessionID: SessionID) => {
+    readonly phase?: WorkerCrashPhase
+    readonly lastCommittedMessageID: string | null
+    readonly inFlightCallIDs: readonly string[]
+  }
+  /** Observe every typed crash payload after it is recorded. */
+  readonly onCrash?: (payload: WorkerCrashed) => void
+  /** Apply the ledger/cap/cancel guard to a crash payload. */
+  readonly resumeDecision?: (payload: WorkerCrashed) => AutoResumeDecision
+  /** Observe an allowed auto-resume; re-dispatch stays with the hub owner. */
+  readonly onAutoResume?: (decision: Extract<AutoResumeDecision, { resume: true }>, payload: WorkerCrashed) => void
 }
 
 export interface Dispatcher extends AsyncDisposable {
@@ -441,6 +494,55 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     nextWaiter(pending.sessionID)
   }
 
+  /** The typed D8 payload for one crash, with the error's own context winning. */
+  const crashPayloadFor = (pending: Pending, error: unknown): WorkerCrashed => {
+    const reported = error instanceof WorkerCrashedError ? error : undefined
+    const state = options.crashState?.(pending.sessionID)
+    const phase = isWorkerCrashPhase(reported?.phase) ? reported.phase : (state?.phase ?? "stream")
+    return workerCrashed({
+      sessionID: pending.sessionID,
+      workerID: reported?.workerID ?? workers.worker(pending.sessionID)?.id ?? pending.workerID ?? -1,
+      phase,
+      lastCommittedMessageID: reported?.lastCommittedMessageID ?? state?.lastCommittedMessageID ?? null,
+      inFlightCallIDs: reported?.inFlightCallIDs ?? state?.inFlightCallIDs ?? [],
+      reason: reported?.reason ?? describeFailure(error),
+    })
+  }
+
+  /**
+   * A parent crash cancels its subagent children immediately: the dead parent can
+   * never resume them, so each child rejects with `ParentCrashedError`. Recursion
+   * uses one visited set, matching the explicit-cancel cascade.
+   */
+  function crashChildren(parentSessionID: SessionID, seen: Set<SessionID> = new Set()): void {
+    if (seen.has(parentSessionID)) return
+    seen.add(parentSessionID)
+    for (const childSessionID of cancellation?.childrenOf?.(parentSessionID) ?? []) {
+      if (seen.has(childSessionID)) continue
+      const failure = new ParentCrashedError(parentSessionID, childSessionID)
+      rejectWaiters(childSessionID, failure)
+      const owned = byKey.get(childSessionID)
+      const worker = workers.worker(childSessionID)
+      if (owned !== undefined) {
+        owned.gate.claim("cancel")
+        owned.reject(failure)
+        byKey.delete(childSessionID)
+        workers.release(childSessionID)
+      }
+      if (worker !== undefined) {
+        cancellation?.reap?.(worker)
+        retireWorker(childSessionID)
+        cancellation?.onCancelled?.({
+          sessionID: childSessionID,
+          mode: "terminated",
+          workerID: worker.id,
+          resumeFromDb: true,
+        })
+      }
+      crashChildren(childSessionID, seen)
+    }
+  }
+
   const fail = (pending: Pending, error: unknown): void => {
     pending.markSettled()
     // Same ownership rule as `finalizeCompletion`: the cancel settles this run.
@@ -467,24 +569,35 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       void cancelWithGrace(pending.sessionID).catch(() => undefined)
       retireWorker(pending.sessionID)
     } else if (crashed) {
+      const payload = crashPayloadFor(pending, error)
       log(workerLogMessage("worker crashed"), {
         level: "WARN",
         sessionID: pending.sessionID,
-        workerID: worker?.id ?? pending.workerID,
-        reason: "crash",
+        workerID: payload.workerID,
+        phase: payload.phase,
+        reason: payload.reason,
       })
+      options.recordCrash?.(payload)
+      options.onCrash?.(payload)
       pending.reject(
-        error instanceof WorkerCrashedError
-          ? error
-          : new WorkerCrashedError({
-              message: `worker ${worker?.id ?? pending.workerID ?? -1} crashed: ${describeFailure(error)}`,
-              workerID: worker?.id ?? pending.workerID ?? -1,
-              cause: error,
-            }),
+        new WorkerCrashedError({
+          message:
+            error instanceof WorkerCrashedError
+              ? error.message
+              : `worker ${payload.workerID} crashed: ${payload.reason}`,
+          workerID: payload.workerID,
+          sessionID: payload.sessionID,
+          phase: payload.phase,
+          lastCommittedMessageID: payload.lastCommittedMessageID,
+          inFlightCallIDs: payload.inFlightCallIDs,
+          reason: payload.reason,
+          cause: error instanceof WorkerCrashedError ? (error.cause ?? error) : error,
+        }),
       )
-      // A parent crash is an implicit cancel of its subagent children.
-      void cancelWithGrace(pending.sessionID).catch(() => undefined)
+      crashChildren(pending.sessionID)
       retireWorker(pending.sessionID)
+      const decision = options.resumeDecision?.(payload)
+      if (decision?.resume === true) options.onAutoResume?.(decision, payload)
     } else {
       log(workerLogMessage("worker run failed"), {
         level: "ERROR",

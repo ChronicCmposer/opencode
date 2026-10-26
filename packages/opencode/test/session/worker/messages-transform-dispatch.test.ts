@@ -23,7 +23,6 @@ const MESSAGES_TRANSFORM = "experimental.chat.messages.transform" satisfies Plug
 const clients = {
   writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
   egress: { emit: () => {} },
-  broker: { call: async () => null },
   backgroundJob: { wait: async () => null, cancel: async () => {} },
 }
 

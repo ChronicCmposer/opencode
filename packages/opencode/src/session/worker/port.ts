@@ -1,7 +1,7 @@
 // Phase 9/11 — shared worker port plumbing.
 //
 // The cancel control channel (`cancel.ts`), the writer relay
-// (`writer-client.ts`) and the broker relay (`broker-client.ts`) all adapt a real
+// all adapt a real
 // `MessagePort` to a framed request/response channel, and all need the same
 // unref'd timer, error-message coercion and peer lifecycle lines. This module is
 // the one implementation they share, so the port glue is not duplicated per
@@ -18,8 +18,10 @@ import { workerLogMessage, type WorkerLogger } from "./log"
 import {
   ProtocolError,
   WORKER_FRAME_VERSION,
+  assertWorkerFrameSize,
+  decodeWorkerFrame,
+  encodeWorkerFrame,
   isRecord,
-  parseWorkerFrame,
   type WorkerFramePort,
 } from "./frame"
 
@@ -55,7 +57,7 @@ export function errorTagOf(error: unknown): string | undefined {
  * build-time define, then the caller's source-relative fallback. The packaged
  * binary cannot resolve a source path (`new URL("./x.ts", import.meta.url)`
  * becomes `/$bunfs/root/x.ts`), so the build injects a define; this is the one
- * resolution order every worker (session, writer, broker) shares.
+ * resolution order every worker shares.
  *
  * `fallback` is passed in rather than constructed here so it resolves against the
  * caller's `import.meta.url`.
@@ -101,28 +103,30 @@ export interface WorkerFrameCarrier {
 
 /**
  * Adapt a `MessagePort` whose frames share the versioned worker envelope. Outbound
- * frames are wrapped as `{ v, port, kind, id?, payload }`; inbound messages are
- * parsed once by `parseWorkerFrame`, so a frame from another port or with a
- * mismatched payload discriminant fails loud instead of being blindly cast.
+ * frames are encoded to ONE JSON string and size-checked; inbound messages are
+ * decoded exactly once with the frame Schema at this boundary, so a frame from
+ * another port or with a mismatched payload discriminant fails loud instead of
+ * being blindly cast. There is no structured-clone fallback.
  */
 export function workerFrameChannel<Frame extends WorkerFrameCarrier>(
   port: MessagePort,
   portName: WorkerFramePort,
 ): FrameChannel<Frame> {
-  const channel = portFromMessagePort<unknown>(port)
+  const channel = portFromMessagePort<string>(port)
   return {
     post: (frame) => {
-      channel.post({
+      const text = encodeWorkerFrame({
         v: WORKER_FRAME_VERSION,
         port: portName,
         kind: frame.kind,
         ...(frame.id === undefined ? {} : { id: frame.id }),
         payload: frame,
       })
+      channel.post(assertWorkerFrameSize(text))
     },
     onMessage: (handler) =>
       channel.onMessage((data) => {
-        const envelope = parseWorkerFrame(data)
+        const envelope = decodeWorkerFrame(data)
         if (envelope.port !== portName) {
           throw new ProtocolError(`expected worker port "${portName}" (got ${JSON.stringify(envelope.port)})`)
         }
@@ -167,7 +171,7 @@ export interface RequestChannelOptions<Frame, Reply extends Frame, Id> {
   /**
    * Reject a request whose id is already in flight, instead of silently
    * overwriting its waiter. Omitted callers keep the historical overwrite
-   * behaviour; a caller with caller-supplied ids (the broker) supplies it.
+   * behaviour; a caller with caller-supplied ids supplies it.
    */
   readonly duplicateError?: (id: Id) => unknown
   /**
@@ -275,7 +279,9 @@ export function createRequestChannel<Frame, Reply extends Frame, Id>(
           send()
           return
         }
-        Promise.resolve().then(options.awaitPost).then(send, (error) => rejectWaiter(id, mapPostError(error)))
+        Promise.resolve()
+          .then(options.awaitPost)
+          .then(send, (error) => rejectWaiter(id, mapPostError(error)))
       })
     },
     onFrame(handler) {
@@ -371,12 +377,7 @@ export function peerLifecycle(
  * (with the error `reason`) before rethrowing. `build` is where the port is
  * started, so a start failure surfaces here.
  */
-export function connectPeer<T>(
-  log: WorkerLogger,
-  peer: string,
-  workerID: number | undefined,
-  build: () => T,
-): T {
+export function connectPeer<T>(log: WorkerLogger, peer: string, workerID: number | undefined, build: () => T): T {
   const lifecycle = peerLifecycle(peer, workerID)
   try {
     const client = build()

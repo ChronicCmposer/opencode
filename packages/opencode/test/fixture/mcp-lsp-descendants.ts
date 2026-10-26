@@ -22,7 +22,7 @@
 // itself is spawned detached by the test, making it the group leader.
 //
 // Integer env parsing, process-group discovery, and the MCP/LSP framing come
-// from `./stdio-server`, shared with `test/session/broker/broker-child.ts`.
+// from `./stdio-server`.
 
 import {
   type JsonRpcMessage,

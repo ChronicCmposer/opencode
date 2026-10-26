@@ -100,8 +100,17 @@ function hasActiveToolCalls(parts: readonly SessionV1.Part[]) {
   )
 }
 
+/**
+ * A cancel outcome enriched with the message the interrupted run settled on.
+ *
+ * Cooperative cancellation must not lose the assistant message the worker just
+ * finalized; the hub and HTTP layers can project the same outcome fields they
+ * already use and read `message` when they need the conversation tail.
+ */
+export type CancelResult = CancelOutcome & { readonly message?: SessionV1.WithParts }
+
 export interface Interface {
-  readonly cancel: (sessionID: SessionID) => Effect.Effect<CancelOutcome | undefined>
+  readonly cancel: (sessionID: SessionID) => Effect.Effect<CancelResult | undefined>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
@@ -152,10 +161,17 @@ const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
-      return yield* cancelSessionTree({
+      const outcome = yield* cancelSessionTree({
         children: (id) => sessions.children(id),
         cancelOne: (id) => state.cancel(id),
       })(sessionID)
+      if (outcome === undefined || outcome.mode !== "cooperative") return outcome
+      // A cooperative cancel interrupted the loop's own fiber, so its
+      // `onInterrupt` finalizer already persisted the assistant message. Read it
+      // back once; a genuinely empty session has no message to return and must
+      // not turn a successful cancel into a failure.
+      const message = yield* lastAssistant(sessionID).pipe(Effect.exit)
+      return Exit.isSuccess(message) ? { ...outcome, message: message.value } : outcome
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
