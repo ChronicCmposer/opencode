@@ -1,27 +1,33 @@
 // Session-worker thread-name grammar for human observability.
 //
-// A worker thread advertises which session slot it serves via its OS thread
-// name (see `@/util/thread-name` for the write path). The grammar is:
+// A worker advertises its bound session via its OS thread name (see
+// `@/util/thread-name` for the write path). The grammar is:
 //
-//   idle    `ocs<slot>`
-//   running `ocs<slot>:<last 6 of sessionID>`
+//   idle    `ocs:<last 6 of sessionID>`
+//   running `ocs:<last 6 of sessionID>!`
 //
-// Prefix `oc` marks opencode, `s` marks a session slot, no dash, no
-// zero-padding. The id suffix is a short, human-recognisable fingerprint — the
-// last 6 chars of the session id — so `ps -T` distinguishes concurrent runs.
-// The result is clipped to the kernel's 15-byte `comm` limit.
+// Prefix `ocs:` marks an opencode session worker and the trailing `!` marks a
+// live run, so `ps -T` shows at a glance which worker is busy. The id suffix is
+// a short, human-recognisable fingerprint — the last 6 chars of the session id —
+// so concurrent workers remain distinguishable. The result is clipped to the
+// kernel's 15-byte `comm` limit.
 
 import { threadNameWithinLimit } from "@/util/thread-name"
 
+export interface SessionThreadNameOptions {
+  /** Append the live-run marker (`!`) while a run is in flight. */
+  readonly running?: boolean
+}
+
 /**
- * Build the OS thread name for the session worker in `slot`. Without a
- * `sessionID` the slot is idle (`ocs<slot>`); with one it is running and appends
- * the last 6 chars of the id. Always clipped to the kernel's `comm` limit.
+ * Build the OS thread name for a worker bound to `sessionID`. The idle form is
+ * `ocs:<last6>`; `running: true` appends `!`. Always clipped to the kernel's
+ * `comm` limit.
  */
-export function sessionThreadName(slot: number, sessionID?: string): string {
-  const idle = `ocs${slot}`
-  if (!sessionID) return threadNameWithinLimit(idle)
-  return threadNameWithinLimit(`${idle}:${sessionID.slice(-6)}`)
+export function sessionThreadName(sessionID: string, options?: SessionThreadNameOptions): string {
+  if (sessionID.length === 0) throw new Error("sessionThreadName requires a non-empty session id")
+  const idle = `ocs:${sessionID.slice(-6)}`
+  return threadNameWithinLimit(options?.running === true ? `${idle}!` : idle)
 }
 
 export * as SessionThreadName from "./thread-name"

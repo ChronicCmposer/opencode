@@ -1,9 +1,9 @@
 // Phase 5.1–5.5 — session dispatch on the live V1 path, over real Bun workers.
 //
-// A real `createDispatcher` (Phase 4) schedules sessions onto executor workers
-// (`execute.ts`) whose run-state machines live inside the isolates. The hub
-// keeps only the key→worker map + admission; the hub event loop stays free while
-// a worker runs a session.
+// A real `createDispatcher` schedules each session onto its own lazily
+// materialized executor worker (`execute.ts`) whose run-state machine lives
+// inside the isolate. The hub keeps only the session→worker map; its event loop
+// stays free while a worker runs a session.
 
 import { describe, expect, test } from "bun:test"
 import { createDispatcher, SessionCancelledError } from "@/session/worker/dispatch"
@@ -19,7 +19,6 @@ import { createWorkerHarness, type WorkerHarness } from "../../lib/worker-harnes
 import { spawnTransport } from "../../lib/transport"
 import { capture, sid } from "../../lib/async"
 import { pollUntil } from "../../lib/poll"
-import type { WorkerLogger } from "@/session/worker/log"
 
 interface Rig extends AsyncDisposable {
   readonly harness: WorkerHarness
@@ -28,10 +27,10 @@ interface Rig extends AsyncDisposable {
   readonly pool: ReturnType<typeof createExecutorWorkerPool>
 }
 
-function makeRig(k: number): Rig {
+function makeRig(): Rig {
   const harness = createWorkerHarness({ cores: 4, timeoutMs: 10_000 })
+  // Per-session: one worker materializes per session on its first dispatch.
   const pool = createExecutorWorkerPool({
-    k,
     spawn: (id) => createExecutorWorker({ id, transport: spawnTransport(harness), workKind: "slow" }),
   })
   const dispatcher = createDispatcher({ pool })
@@ -50,7 +49,7 @@ function makeRig(k: number): Rig {
 
 describe("5.1 a V1 session run executes in a worker with the hub loop idle", () => {
   test("the hub ticks while the worker runs, then the result round-trips", async () => {
-    await using rig = makeRig(1)
+    await using rig = makeRig()
     let settled = false
     const running = rig.dispatch.ensureRunning(sid("ses_a")).then((value) => {
       settled = true
@@ -68,7 +67,7 @@ describe("5.1 a V1 session run executes in a worker with the hub loop idle", () 
 
 describe("5.3 per-key serialization is preserved", () => {
   test("two dispatches for one key join a single worker execution", async () => {
-    await using rig = makeRig(1)
+    await using rig = makeRig()
     const first = rig.dispatch.ensureRunning(sid("ses_x"))
     const second = rig.dispatch.ensureRunning(sid("ses_x"))
     const [a, b] = await Promise.all([first, second])
@@ -80,7 +79,7 @@ describe("5.3 per-key serialization is preserved", () => {
 
 describe("5.4 RunnerBusy / assertNotBusy hold worker-local; the hub forwards control", () => {
   test("assertNotBusy answers from the worker and startShell rejects while running", async () => {
-    await using rig = makeRig(1)
+    await using rig = makeRig()
     const running = rig.dispatch.ensureRunning(sid("ses_a"))
     await pollUntil(() => rig.dispatch.assertNotBusy(sid("ses_a")), { message: "worker never became busy" })
 
@@ -93,9 +92,9 @@ describe("5.4 RunnerBusy / assertNotBusy hold worker-local; the hub forwards con
   })
 })
 
-describe("5.5 different sessions run concurrently on different workers", () => {
-  test("K=2 runs two sessions at once", async () => {
-    await using rig = makeRig(2)
+describe("5.5 different sessions run concurrently on different per-session workers", () => {
+  test("two sessions run at once on distinct workers", async () => {
+    await using rig = makeRig()
     const a = rig.dispatch.ensureRunning(sid("ses_a"))
     const b = rig.dispatch.ensureRunning(sid("ses_b"))
 
@@ -112,7 +111,7 @@ describe("5.5 different sessions run concurrently on different workers", () => {
 
 describe("5.4 hub forwards cancellation", () => {
   test("cancelling a running session rejects the caller", async () => {
-    await using rig = makeRig(1)
+    await using rig = makeRig()
     const running = rig.dispatch.ensureRunning(sid("ses_a"))
     await pollUntil(() => rig.dispatch.assertNotBusy(sid("ses_a")), { message: "worker never became busy" })
 
@@ -121,47 +120,22 @@ describe("5.4 hub forwards cancellation", () => {
   })
 
   test("a cancelled worker session leaves the worker run-state clean and reusable", async () => {
-    await using rig = makeRig(1)
+    await using rig = makeRig()
     const running = rig.dispatch.ensureRunning(sid("ses_a"))
     await pollUntil(() => rig.dispatch.assertNotBusy(sid("ses_a")), { message: "worker never became busy" })
 
     await rig.dispatch.cancel(sid("ses_a"))
     await expect(running).rejects.toBeInstanceOf(SessionCancelledError)
 
-    // The worker's per-key run-state is idle after the cancel, so a fresh
-    // session runs to completion on the same worker.
+    // The cancelled session's worker is retired; a fresh session materializes its
+    // own worker and runs to completion.
     expect(await rig.dispatch.assertNotBusy(sid("ses_a"))).toBe(false)
     const next = await rig.dispatch.ensureRunning(sid("ses_b"))
     expect(next.sessionID).toBe("ses_b")
   })
 })
 
-describe("12 B1 worker spawning over real worker handles", () => {
-  test("every spawned executor worker logs 'worker spawning' with its id and kind", async () => {
-    const harness = createWorkerHarness({ cores: 4, timeoutMs: 10_000 })
-    const entries: Array<{ message: string; fields: Record<string, unknown> }> = []
-    const log: WorkerLogger = (message, fields) => entries.push({ message, fields })
-    const pool = createExecutorWorkerPool({
-      k: 2,
-      spawn: (id) => createExecutorWorker({ id, transport: spawnTransport(harness), workKind: "slow", log }),
-      log,
-    })
-
-    try {
-      const spawning = entries.filter((entry) => entry.message === "session workers: worker spawning")
-      expect(spawning.map((entry) => entry.fields)).toEqual([
-        { workerID: 1, kind: "slow", reason: "initial" },
-        { workerID: 2, kind: "slow", reason: "initial" },
-      ])
-
-      pool.spawn("headroom")
-      expect(entries.filter((entry) => entry.message === "session workers: worker spawning")).toHaveLength(3)
-    } finally {
-      await pool.terminateAll().catch(() => undefined)
-      await harness.terminateAll().catch(() => undefined)
-    }
-  })
-
+describe("12 B1 worker spawn logging", () => {
   test("a spawn bound to a session logs it with the given reason", () => {
     const entries: Array<{ message: string; fields: Record<string, unknown> }> = []
     const transport: ExecutorTransport = {

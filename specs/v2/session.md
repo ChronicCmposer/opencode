@@ -132,6 +132,45 @@ Plugin tools registered in the hub remain hub-owned when Session execution runs 
 
 These follow-ups change runtime and outbound-request behavior only. They add no database migration and no durable-event version change.
 
+## Session Workers: Per-Session Lifecycle
+
+Under `OPENCODE_EXPERIMENTAL_SESSION_WORKERS`, Session execution runs in a Bun worker isolate while the hub keeps authority. The scheduler is unbounded and per-session:
+
+- Lazily materialize exactly one worker per Session on its first dispatch, reuse it across turns, and never keep a warm minimum. The only backpressure is the operating system's memory bound (OOM).
+- A Session has at most one active run. A different run dispatched while one is in flight parks in a per-session, unbounded waiter list rather than an admission queue.
+- Reap a worker after it has had no in-flight run and no queued prompt for `OPENCODE_SESSION_WORKER_REAP_MS` (default `300000` ms, five minutes); an invalid value falls back to the default with a warning. Reaping and terminal cancellation dispose the worker, so the next dispatch lazily creates a fresh one.
+
+The former sized-pool machinery is removed: pool size K; the two obsolete env knobs `OPENCODE_SESSION_WORKER_COUNT` and `OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION` (each now warns once and is ignored); `deriveHeadroom`; the foreground/headroom split; admission queues; `HeadroomFullError`; `SessionQueueFullError`; `degradedCount`; the hub job registry and its `JobInfo` result routing; and `dispatchSubagent`/`SubagentDispatchProxy`.
+
+### Depth and spawn
+
+Depth is explicit `metadata.depth` in the existing Session metadata JSON; it is never inferred from the persisted parent chain and needs no database migration. Implicit children (`delegate` and metadata-only spawns) carry no depth metadata and are therefore depth 0. A `task` child is parent depth + 1. `subagent_depth` is enforced on the shared prompt path, which also covers direct, worker-carried, and resumed loops; `Session.spawn` additionally checks it before creating a child when the caller supplies `depthLimit`.
+
+```text
+Session.spawn({ parentID, childID?, prompt, type, title?, agent?, model?, metadata?, depthLimit? })
+  -> { childID, result }
+```
+
+`Session.spawn` creates the child when `childID` is absent and stamps its depth, or stamps depth on an existing child, then prompts it. In a worker it forwards over the hub-proxy `session.spawn` method so the child runs on its own worker, never in the parent's isolate. A background `task` forks into the local `background` job. `delegate` is unchanged: it creates and prompts the child directly at depth 0 and is still cascade-cancelled through `parentID`.
+
+### Thread naming
+
+A worker advertises its bound Session in the OS thread name: idle `ocs:<last6>`, running `ocs:<last6>!`. The name is set at bind/creation, toggled for each run, cleared when the run reaches a terminal state, and reset on dispose. The suffix is the last six characters of the Session ID, clipped to the kernel `comm` limit.
+
+### Crash supervision
+
+Five consecutive crashes on one Session mark it dead and log it; crashes back off from 1 s with doubling, capped at 30 s. The in-flight run rejects at most once with `WorkerCrashedError` and is never requeued. A user-initiated dispatch resets that Session's supervision state; background and automatic dispatch fail fast on a dead Session (`SessionWorkerDeadError`) instead of spawning forever. There is no pool-wide degraded count: a dead Session affects only itself.
+
+### Spawn gate
+
+One global permit serializes cold worker spawns. It is held from `new Worker` until the boot-ready handshake; waiters queue FIFO and are never rejected while they wait. If acquisition times out, only that spawn fails (`SpawnGateTimeoutError`), not the Session. The same permit covers crash respawns.
+
+### Cancellation and parity
+
+Cancellation recursively walks `Session.children(parentID)` children-first; `parentID` is retained on every child, so the cascade never depends on an ephemeral in-memory index. With `OPENCODE_EXPERIMENTAL_SESSION_WORKERS` on or off, caller-facing behavior is the same. The allowed differences are isolation, transport, the crash error type, and thread naming.
+
+This lifecycle changes runtime behavior only: it adds no database migration and no durable-event version change, and persisted history is unchanged.
+
 ## V1 Runtime Context Parity
 
 This is the canonical checklist for model-visible runtime context still needed before the V2 runner replaces V1. Keep each behavior in its owning boundary rather than treating all model-visible text as a durable Context Source. Update this table in the PR that changes a status.

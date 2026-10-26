@@ -1,16 +1,24 @@
-// Phase 4.7 (crash-loop half) — supervision backoff + degraded pool.
-//
-// Backoff doubles from 1 s and caps at 30 s; five crashes on one slot mark it
-// degraded (the pool runs at K−1). A healthy run resets the counter.
+// Per-session crash supervision: five consecutive crashes mark a session dead;
+// backoff doubles from 1s; a healthy run or a user-initiated dispatch resets the
+// policy; background/auto dispatch on a dead session fails fast.
 
 import { describe, expect, test } from "bun:test"
 import {
-  CRASH_ATTEMPTS_BEFORE_DEGRADED,
+  CRASH_ATTEMPTS_BEFORE_DEAD,
   CRASH_BACKOFF_INITIAL_MS,
   CRASH_BACKOFF_MAX_MS,
+  MAX_SUPERVISION_SESSIONS,
   crashBackoffMs,
   createSupervision,
 } from "@/session/worker/supervision"
+import { createRecordingScheduler } from "../../lib/scheduler"
+
+function setup() {
+  const clock = { now: 0 }
+  const scheduler = createRecordingScheduler()
+  const supervision = createSupervision({ now: () => clock.now, schedule: scheduler.schedule })
+  return { clock, scheduler, supervision }
+}
 
 describe("crash backoff schedule", () => {
   test("doubles from 1s and caps at 30s", () => {
@@ -26,7 +34,7 @@ describe("crash backoff schedule", () => {
   test("the approved constants are 1s / 30s / 5 attempts", () => {
     expect(CRASH_BACKOFF_INITIAL_MS).toBe(1_000)
     expect(CRASH_BACKOFF_MAX_MS).toBe(30_000)
-    expect(CRASH_ATTEMPTS_BEFORE_DEGRADED).toBe(5)
+    expect(CRASH_ATTEMPTS_BEFORE_DEAD).toBe(5)
   })
 
   test("caps without overflow and maps non-finite counts to no backoff", () => {
@@ -37,62 +45,111 @@ describe("crash backoff schedule", () => {
   })
 })
 
-describe("supervision", () => {
-  test("the fifth crash on one slot degrades it", () => {
-    const supervision = createSupervision()
-    for (let attempt = 1; attempt < CRASH_ATTEMPTS_BEFORE_DEGRADED; attempt++) {
-      const decision = supervision.recordCrash(1)
+describe("per-session crash supervision", () => {
+  test("the fifth consecutive crash marks the session dead", () => {
+    const { scheduler, supervision } = setup()
+
+    for (let attempt = 1; attempt < CRASH_ATTEMPTS_BEFORE_DEAD; attempt++) {
+      const decision = supervision.recordCrash("ses_a")
       expect(decision.attempts).toBe(attempt)
-      expect(decision.degraded).toBe(false)
+      expect(decision.dead).toBe(false)
       expect(decision.delayMs).toBe(crashBackoffMs(attempt))
     }
 
-    const final = supervision.recordCrash(1)
+    const final = supervision.recordCrash("ses_a")
     expect(final.attempts).toBe(5)
-    expect(final.degraded).toBe(true)
-    expect(supervision.isDegraded(1)).toBe(true)
-    expect(supervision.degradedCount).toBe(1)
+    expect(final.dead).toBe(true)
+    expect(supervision.isDead("ses_a")).toBe(true)
+    expect(scheduler.timers.map((timer) => timer.delayMs)).toEqual([1_000, 2_000, 4_000, 8_000])
   })
 
-  test("a healthy run resets the crash counter and clears degradation", () => {
-    const supervision = createSupervision()
-    for (let i = 0; i < CRASH_ATTEMPTS_BEFORE_DEGRADED; i++) supervision.recordCrash(1)
-    expect(supervision.degradedCount).toBe(1)
+  test("crash state is isolated per session", () => {
+    const { supervision } = setup()
+    for (let i = 0; i < CRASH_ATTEMPTS_BEFORE_DEAD; i++) supervision.recordCrash("ses_a")
 
-    supervision.recordHealthy(1)
-    expect(supervision.isDegraded(1)).toBe(false)
-    expect(supervision.degradedCount).toBe(0)
-    expect(supervision.recordCrash(1).attempts).toBe(1)
+    expect(supervision.isDead("ses_a")).toBe(true)
+    expect(supervision.isDead("ses_b")).toBe(false)
+    expect(supervision.recordCrash("ses_b").dead).toBe(false)
   })
 
-  test("degradation is tracked per slot", () => {
-    const supervision = createSupervision()
-    for (let i = 0; i < CRASH_ATTEMPTS_BEFORE_DEGRADED; i++) supervision.recordCrash(1)
+  test("a healthy run resets the crash counter", () => {
+    const { scheduler, supervision } = setup()
+    for (let i = 0; i < CRASH_ATTEMPTS_BEFORE_DEAD; i++) supervision.recordCrash("ses_a")
+    expect(supervision.isDead("ses_a")).toBe(true)
 
-    expect(supervision.isDegraded(1)).toBe(true)
-    expect(supervision.isDegraded(2)).toBe(false)
-    expect(supervision.recordCrash(2).degraded).toBe(false)
-    expect(supervision.degradedCount).toBe(1)
+    supervision.recordHealthy("ses_a")
+    expect(supervision.isDead("ses_a")).toBe(false)
+    expect(supervision.recordCrash("ses_a").attempts).toBe(1)
+    expect(scheduler.timers.at(-1)?.delayMs).toBe(1_000)
   })
 
-  test("forget drops a removed slot's state so degraded entries do not leak", () => {
-    const supervision = createSupervision()
-    for (let i = 0; i < CRASH_ATTEMPTS_BEFORE_DEGRADED; i++) supervision.recordCrash(7)
-    expect(supervision.isDegraded(7)).toBe(true)
-    expect(supervision.degradedCount).toBe(1)
+  test("auto dispatch waits out the backoff then proceeds", () => {
+    const { clock, scheduler, supervision } = setup()
+    supervision.recordCrash("ses_a")
 
-    supervision.forget(7)
-    expect(supervision.isDegraded(7)).toBe(false)
-    expect(supervision.degradedCount).toBe(0)
-    expect(supervision.recordCrash(7).attempts).toBe(1)
+    expect(supervision.decideDispatch("ses_a", "auto")).toEqual({ kind: "backoff", delayMs: 1_000 })
+
+    clock.now = 400
+    expect(supervision.decideDispatch("ses_a", "auto")).toEqual({ kind: "backoff", delayMs: 600 })
+
+    clock.now = 1_200
+    scheduler.fire()
+    expect(supervision.decideDispatch("ses_a", "auto")).toEqual({ kind: "allow" })
   })
 
-  test("fails loud on an invalid worker id", () => {
-    const supervision = createSupervision()
-    expect(() => supervision.recordCrash(-1)).toThrow()
-    expect(() => supervision.recordCrash(1.5)).toThrow()
-    expect(() => supervision.recordHealthy(Number.NaN)).toThrow()
-    expect(() => supervision.isDegraded(-2)).toThrow()
-    expect(() => supervision.forget(-3)).toThrow()
+  test("a user-initiated dispatch resets a dead session and respawns", () => {
+    const { supervision } = setup()
+    for (let i = 0; i < CRASH_ATTEMPTS_BEFORE_DEAD; i++) supervision.recordCrash("ses_a")
+    expect(supervision.decideDispatch("ses_a", "auto")).toEqual({ kind: "dead" })
+
+    expect(supervision.decideDispatch("ses_a", "user")).toEqual({ kind: "allow" })
+    expect(supervision.isDead("ses_a")).toBe(false)
+    expect(supervision.recordCrash("ses_a").attempts).toBe(1)
+  })
+
+  test("background/auto dispatch on a dead session fails fast", () => {
+    const { scheduler, supervision } = setup()
+    for (let i = 0; i < CRASH_ATTEMPTS_BEFORE_DEAD; i++) supervision.recordCrash("ses_a")
+    const timersAfterDeath = scheduler.timers.length
+
+    expect(supervision.decideDispatch("ses_a", "auto")).toEqual({ kind: "dead" })
+    expect(supervision.isDead("ses_a")).toBe(true)
+    expect(scheduler.timers).toHaveLength(timersAfterDeath)
+  })
+
+  test("forget clears state and cancels a pending backoff timer", () => {
+    const { scheduler, supervision } = setup()
+    supervision.recordCrash("ses_a")
+    expect(scheduler.pending()).toHaveLength(1)
+
+    supervision.forget("ses_a")
+    expect(supervision.isDead("ses_a")).toBe(false)
+    expect(scheduler.pending()).toHaveLength(0)
+    expect(supervision.recordCrash("ses_a").attempts).toBe(1)
+  })
+
+  test("crash history is bounded and evicts the oldest session", () => {
+    const { scheduler, supervision } = setup()
+    for (let index = 0; index < MAX_SUPERVISION_SESSIONS; index++) {
+      supervision.recordCrash(`ses_${index}`)
+    }
+    expect(supervision.size).toBe(MAX_SUPERVISION_SESSIONS)
+    expect(scheduler.pending()).toHaveLength(MAX_SUPERVISION_SESSIONS)
+
+    supervision.recordCrash("ses_new")
+    expect(supervision.size).toBe(MAX_SUPERVISION_SESSIONS)
+    expect(scheduler.pending()).toHaveLength(MAX_SUPERVISION_SESSIONS)
+    // The oldest entry (and its timer) is gone; the new one is retained.
+    expect(supervision.recordCrash("ses_0").attempts).toBe(1)
+    expect(supervision.recordCrash("ses_new").attempts).toBe(2)
+  })
+
+  test("fails loud on an invalid session id", () => {
+    const { supervision } = setup()
+    expect(() => supervision.recordCrash("")).toThrow()
+    expect(() => supervision.recordHealthy("")).toThrow()
+    expect(() => supervision.isDead("")).toThrow()
+    expect(() => supervision.decideDispatch("", "auto")).toThrow()
+    expect(() => supervision.forget("")).toThrow()
   })
 })

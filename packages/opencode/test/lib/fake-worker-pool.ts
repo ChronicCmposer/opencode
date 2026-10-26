@@ -19,14 +19,12 @@ import {
   WorkerCrashedError,
   type SessionRun,
   type SessionWorker,
-  type WorkerKind,
   type WorkerPool,
 } from "@/session/worker/dispatch"
 import type { CancelFrame, CancelPort } from "@/session/worker/cancel"
 import {
   type ExecutorRun,
   type ExecutorWorker,
-  type ExecutorWorkerKind,
   type ExecutorWorkerPool,
   type SessionExecutionResult,
 } from "@/session/worker/execute"
@@ -57,6 +55,12 @@ export interface FakeSessionWorkerOptions {
   readonly onCancel?: FakeCancelOutcome
   /** Whether the cancel port reports a matching `cancel-ack`. Defaults to `true`. */
   readonly acknowledge?: boolean
+  /**
+   * Whether the worker reports active background work for an idle-reap probe.
+   * A test flips {@link FakeSessionWorker.backgroundWork} to model a job
+   * starting/completing. Defaults to `false`.
+   */
+  readonly activeWork?: boolean
 }
 
 interface PendingRun {
@@ -67,6 +71,10 @@ interface PendingRun {
 /** A worker whose runs the test completes/crashes/fails explicitly or by mode. */
 export class FakeSessionWorker implements SessionWorker {
   alive = true
+  /** Models a running process-local background job; the reap probe reads it. */
+  backgroundWork: boolean
+  /** Optional gate the reap probe awaits, so a test can race a new dispatch. */
+  activeWorkGate: Promise<void> | undefined
   readonly runs: SessionRun[] = []
   readonly mode: FakeWorkerMode
   readonly cancelPort: CancelPort
@@ -84,6 +92,7 @@ export class FakeSessionWorker implements SessionWorker {
     this.failure = options.failure ?? (() => new Error("fake session failure"))
     this.onCancel = options.onCancel ?? "resolve"
     this.acknowledge = options.acknowledge ?? true
+    this.backgroundWork = options.activeWork ?? false
     this.cancelPort = {
       notify: (frame) => {
         if (frame.type !== "cancel") return
@@ -104,6 +113,12 @@ export class FakeSessionWorker implements SessionWorker {
   /** Runs currently awaiting an explicit settle (only in `cooperative` mode). */
   get pendingCount(): number {
     return this.pending.size
+  }
+
+  /** Idle-reap probe: the test-driven background-job state. */
+  async hasActiveWork(_sessionID: SessionID): Promise<boolean> {
+    await this.activeWorkGate
+    return this.backgroundWork
   }
 
   execute(run: SessionRun): Promise<void> {
@@ -181,7 +196,7 @@ export interface FakeWorkerPoolOptions {
   /** Mode applied to every worker; defaults to `"cooperative"`. */
   readonly mode?: FakeWorkerMode
   /** Per-worker mode override, given the worker's id, kind and whether it was initial. */
-  readonly modeFor?: (context: { readonly id: number; readonly kind: WorkerKind; readonly initial: boolean }) => FakeWorkerMode
+  readonly modeFor?: (context: { readonly id: number; readonly kind: string; readonly initial: boolean }) => FakeWorkerMode
   /** Failure factory forwarded to `fail`-mode workers. */
   readonly failure?: () => unknown
   /** Id assigned to the first spawned worker; defaults to `workers.length + 1`. */
@@ -190,6 +205,8 @@ export interface FakeWorkerPoolOptions {
   readonly onCancel?: FakeCancelOutcome
   /** Whether every worker acknowledges cancels; defaults to `true`. */
   readonly acknowledge?: boolean
+  /** Whether every worker reports active background work; defaults to `false`. */
+  readonly activeWork?: boolean
 }
 
 /** An in-memory `WorkerPool`: K initial workers plus a spawn log. */
@@ -210,18 +227,25 @@ export class FakePool implements WorkerPool {
         failure: options.failure,
         onCancel: options.onCancel,
         acknowledge: options.acknowledge,
+        activeWork: options.activeWork,
       }),
     )
     this.nextSpawnId = options.firstSpawnId ?? this.workers.length + 1
   }
 
-  spawn(kind: WorkerKind): SessionWorker {
-    const id = this.nextSpawnId++
-    const worker = new FakeSessionWorker(id, {
-      mode: this.options.modeFor?.({ id, kind, initial: false }) ?? this.options.mode,
+  spawn(id?: number | string): SessionWorker {
+    // The dispatcher supplies its registry id (number); legacy tests may pass a
+    // kind ("headroom") and keep the pool's own counter.
+    const workerID = typeof id === "number" ? id : this.nextSpawnId
+    if (typeof id === "number") this.nextSpawnId = Math.max(this.nextSpawnId, workerID + 1)
+    else this.nextSpawnId += 1
+    const kind = typeof id === "string" ? id : "session"
+    const worker = new FakeSessionWorker(workerID, {
+      mode: this.options.modeFor?.({ id: workerID, kind, initial: false }) ?? this.options.mode,
       failure: this.options.failure,
       onCancel: this.options.onCancel,
       acknowledge: this.options.acknowledge,
+      activeWork: this.options.activeWork,
     })
     this.spawned.push(worker)
     return worker
@@ -419,7 +443,7 @@ export class FakeExecutorPool implements ExecutorWorkerPool {
     this.nextSpawnId = firstSpawnId ?? this.workers.length + 1
   }
 
-  spawn(_kind: ExecutorWorkerKind): FakeExecutorWorker {
+  spawn(_id?: number): FakeExecutorWorker {
     const worker = new FakeExecutorWorker(this.nextSpawnId++, this.workerOptions)
     this.spawned.push(worker)
     return worker

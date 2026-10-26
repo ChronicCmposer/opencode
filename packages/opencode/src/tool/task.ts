@@ -4,6 +4,8 @@ import { ToolJsonSchema } from "./json-schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { BackgroundJob } from "@/background/job"
 import { Session } from "@/session/session"
+import { SessionDepth } from "@/session/depth"
+import type { DispatchOrigin } from "@/session/origin"
 import { SessionID, MessageID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
@@ -14,40 +16,11 @@ import { Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
-import type { JobInfo } from "@/session/worker/job-registry"
-
-/**
- * A subagent child routed to the hub dispatcher. The dispatcher owns depth
- * admission and worker selection, so the task tool only describes the child.
- */
-export interface TaskSubagentDispatch {
-  readonly parentID: SessionID
-  readonly childID: SessionID
-  readonly type: string
-  /** The child's nesting depth; ≥ 1 for a subagent (0 is a root). */
-  readonly depth: number
-  readonly title?: string
-  readonly metadata?: Record<string, unknown>
-  /**
-   * The first user prompt the hub-dispatched child must run. Without it the
-   * child session has no user message and `SessionPrompt.loop` fails
-   * immediately, so the producer must always populate it.
-   */
-  readonly prompt?: SessionPrompt.PromptInput
-}
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
-  /**
-   * Route a child through the subagent dispatcher at depth ≥ 1 instead of
-   * running it inline, and resolve with the child's settled `JobInfo`. Absent in
-   * flag-off/inline runs, where the child executes on the caller (the historical
-   * behaviour). The dispatcher owns the child, so a domain failure is reported
-   * through the returned status rather than by failing this effect.
-   */
-  dispatchSubagent?(request: TaskSubagentDispatch): Effect.Effect<JobInfo>
 }
 
 const id = "task"
@@ -107,6 +80,22 @@ function renderOutput(input: {
   ].join("\n")
 }
 
+/** The child result's terminal text, or the failure the task tool surfaces. */
+function requireTaskText(sessionID: SessionID, result: SessionV1.WithParts): Effect.Effect<string, Error> {
+  if (result.info.role === "assistant" && result.info.error) {
+    const message =
+      "message" in result.info.error.data && typeof result.info.error.data.message === "string"
+        ? result.info.error.data.message
+        : result.info.error.name
+    return Effect.fail(new Error(`Subagent failed (task_id: ${sessionID}): ${message}`))
+  }
+  const failed = result.parts.findLast((item) => item.type === "tool" && item.state.status === "error")
+  if (failed?.type === "tool" && failed.state.status === "error") {
+    return Effect.fail(new Error(`Subagent failed (task_id: ${sessionID}): ${failed.state.error}`))
+  }
+  return Effect.succeed(result.parts.findLast((item) => item.type === "text")?.text ?? "")
+}
+
 export const TaskTool = Tool.define(
   id,
   Effect.gen(function* () {
@@ -131,23 +120,10 @@ export const TaskTool = Tool.define(
       }
 
       const parent = yield* sessions.get(ctx.sessionID)
-      const visited = new Set<SessionID>([ctx.sessionID])
-      let current = parent
-      let depth = 0
-      while (current.parentID) {
-        if (visited.has(current.parentID)) {
-          return yield* Effect.fail(new Error("Subagent parent chain is cyclic"))
-        }
-        visited.add(current.parentID)
-        depth++
-        current = yield* sessions.get(current.parentID)
-      }
-      if (depth >= (cfg.subagent_depth ?? 1)) {
-        return yield* Effect.fail(
-          new Error(
-            `Subagent depth limit reached (${cfg.subagent_depth ?? 1}). Increase "subagent_depth" to allow nested subagents.`,
-          ),
-        )
+      const depthLimit = cfg.subagent_depth ?? 1
+      const childDepth = SessionDepth.nextDepth(parent.metadata)
+      if (SessionDepth.exceedsSubagentDepth(childDepth, depthLimit)) {
+        return yield* Effect.fail(new Error(SessionDepth.subagentDepthMessage(depthLimit)))
       }
 
       if (!ctx.extra?.bypassAgentCheck) {
@@ -231,31 +207,32 @@ export const TaskTool = Tool.define(
       const ops = ctx.extra?.promptOps as TaskPromptOps
       if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
 
-      const runTask = Effect.fn("TaskTool.runTask")(function* () {
+      const runSpawn = Effect.fn("TaskTool.runSpawn")(function* () {
         const parts = yield* ops.resolvePromptParts(params.prompt)
-        const result = yield* ops.prompt({
-          messageID: MessageID.ascending(),
-          sessionID: nextSession.id,
-          model: {
-            modelID: model.modelID,
-            providerID: model.providerID,
+        // Background/auto work must fail fast on a dead worker; a foreground task
+        // is an explicit user action and may reset crash supervision.
+        const origin: DispatchOrigin = runInBackground ? "auto" : "user"
+        const spawned = yield* sessions.spawn({
+          parentID: ctx.sessionID,
+          childID: nextSession.id,
+          type: id,
+          title: params.description,
+          origin,
+          metadata,
+          depthLimit,
+          prompt: {
+            messageID: MessageID.ascending(),
+            sessionID: nextSession.id,
+            model: {
+              modelID: model.modelID,
+              providerID: model.providerID,
+            },
+            variant: next.model ? undefined : variant,
+            agent: next.name,
+            parts,
           },
-          variant: next.model ? undefined : variant,
-          agent: next.name,
-          parts,
         })
-        if (result.info.role === "assistant" && result.info.error) {
-          const message =
-            "message" in result.info.error.data && typeof result.info.error.data.message === "string"
-              ? result.info.error.data.message
-              : result.info.error.name
-          return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${message}`))
-        }
-        const failed = result.parts.findLast((item) => item.type === "tool" && item.state.status === "error")
-        if (failed?.type === "tool" && failed.state.status === "error") {
-          return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${failed.state.error}`))
-        }
-        return result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        return yield* requireTaskText(spawned.childID, spawned.result)
       })
 
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
@@ -328,7 +305,7 @@ export const TaskTool = Tool.define(
         }),
       })
 
-      const startJob = (run: Effect.Effect<string, unknown>) =>
+      const startJob = (work: Effect.Effect<string, unknown>) =>
         background.start({
           id: nextSession.id,
           type: id,
@@ -342,7 +319,7 @@ export const TaskTool = Tool.define(
             }),
             notify(nextSession.id),
           ]),
-          run: run.pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
+          run: work.pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
         })
 
       // A background child outlives this tool call, so the abort listener must be
@@ -368,65 +345,12 @@ export const TaskTool = Tool.define(
         )
       })
 
-      const dispatchSubagent = ops.dispatchSubagent
-      if (dispatchSubagent) {
-        const parts = yield* ops.resolvePromptParts(params.prompt)
-        const prompt: SessionPrompt.PromptInput = {
-          messageID: MessageID.ascending(),
-          sessionID: nextSession.id,
-          model: { modelID: model.modelID, providerID: model.providerID },
-          variant: next.model ? undefined : variant,
-          agent: next.name,
-          parts,
-        }
-        const request: TaskSubagentDispatch = {
-          parentID: ctx.sessionID,
-          childID: nextSession.id,
-          type: id,
-          depth: depth + 1,
-          title: params.description,
-          metadata,
-          prompt,
-        }
-
-        // Background joins/registers a local job whose run awaits the child, so
-        // the parent is notified through the existing background machinery. The
-        // foreground awaits the dispatcher's settled outcome directly.
-        if (runInBackground) {
-          const run = Effect.gen(function* () {
-            const settled = yield* dispatchSubagent(request)
-            if (settled.status === "completed") return settled.output ?? ""
-            return yield* Effect.fail(
-              new Error(settled.status === "cancelled" ? "Task cancelled" : (settled.error ?? "Task failed")),
-            )
-          })
-          if (yield* background.extend({ id: nextSession.id, run })) return updatedResult()
-          const info = yield* startJob(run)
-          yield* notify(info.id)
-          yield* awaitBackgroundAbort()
-          return runningResult(info.id)
-        }
-
-        const settled = yield* dispatchSubagent(request)
-        if (settled.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
-        const state = settled.status === "error" ? "error" : settled.status === "completed" ? "completed" : "running"
-        return {
-          title: params.description,
-          metadata,
-          output: renderOutput({
-            sessionID: nextSession.id,
-            state,
-            text: settled.output ?? settled.error ?? "",
-          }),
-        }
-      }
-
-      // Inline fallback: the child runs on the caller (flag-off historical path).
-      if (yield* background.extend({ id: nextSession.id, run: runTask() })) return updatedResult()
-
-      const info = yield* startJob(runTask())
-
+      // Background joins/registers a local job whose run awaits the child, so the
+      // parent is notified through the existing background machinery. Foreground
+      // awaits the spawn directly.
       if (runInBackground) {
+        if (yield* background.extend({ id: nextSession.id, run: runSpawn() })) return updatedResult()
+        const info = yield* startJob(runSpawn())
         yield* notify(info.id)
         yield* awaitBackgroundAbort()
         return runningResult(info.id)
@@ -444,24 +368,16 @@ export const TaskTool = Tool.define(
           ctx.abort.addEventListener("abort", onAbort)
         }),
         () =>
-          Effect.gen(function* () {
-            const result = yield* Effect.raceFirst(
-              background.wait({ id: nextSession.id }).pipe(Effect.map((waited) => waited.info)),
-              background.waitForPromotion(nextSession.id),
-            )
-            if (result?.metadata?.background === true) return runningResult(nextSession.id)
-            if (result?.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
-            if (result?.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
-            return {
+          runSpawn().pipe(
+            Effect.map((text) => ({
               title: params.description,
               metadata,
-              output: renderOutput({ sessionID: nextSession.id, state: "completed", text: result?.output ?? "" }),
-            }
-          }),
+              output: renderOutput({ sessionID: nextSession.id, state: "completed", text }),
+            })),
+          ),
         (_, exit) =>
           Effect.gen(function* () {
-            if (Exit.hasInterrupts(exit))
-              yield* Effect.all([cancel, background.cancel(nextSession.id)], { discard: true })
+            if (Exit.hasInterrupts(exit)) yield* cancel
           }).pipe(
             Effect.ensuring(
               Effect.sync(() => {

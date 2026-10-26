@@ -122,7 +122,7 @@ describe("FakeExecutorWorker", () => {
 
   test("the executor pool exposes spawned workers and their results", () => {
     const pool = createFakeExecutorPool(1, { value: "x" })
-    const spawned = pool.spawn("foreground")
+    const spawned = pool.spawn()
     expect(pool.byID(spawned.id)).toBe(spawned)
     expect(pool.workers).toHaveLength(1)
   })

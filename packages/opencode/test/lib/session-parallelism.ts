@@ -199,13 +199,14 @@ export async function runParallelSessions(options: ParallelSessionOptions): Prom
   const spawned: SpawnedWorker[] = []
 
   const pool = createExecutorWorkerPool({
-    k: poolSize,
     spawn: (id) => {
       const worker = spawnSessionWorker(harness, id, entry, env, timeoutMs)
       spawned.push(worker)
       return worker.worker
     },
   })
+  // Eagerly materialize the requested number of workers for the measurement.
+  for (let index = 0; index < poolSize; index += 1) pool.spawn()
   const dispatcher = createDispatcher({ pool })
   const dispatch = createSessionDispatch({ dispatcher, pool })
 

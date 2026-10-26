@@ -7,7 +7,6 @@
 // These are MACHINE-DEPENDENT numbers: the harness only collects and reports
 // them, never asserting a boot-time threshold.
 
-import { deriveWorkerCount } from "@/session/worker/pool"
 import { readRssBytes } from "./boot-memory"
 import { MOCK_SSE_WORKER_ENTRY } from "./mock-sse-worker"
 import { measureBootLevels, type BootLevelSummary } from "./worker-boot"
@@ -42,6 +41,7 @@ export interface SessionBootReport {
 
 export interface MeasureSessionBootOptions {
   readonly cores?: number
+  /** Baseline worker count; defaults to 1 (one worker per session). */
   readonly k?: number
   readonly extra?: number
   readonly entry?: string | URL
@@ -57,7 +57,8 @@ export async function measureSessionWorkerBoot(options: MeasureSessionBootOption
   const timeoutMs = options.timeoutMs ?? DEFAULT_BOOT_TIMEOUT_MS
   const harness = createWorkerHarness({ cores: options.cores, timeoutMs })
   const cores = harness.cores
-  const k = options.k ?? deriveWorkerCount(cores)
+  // One worker per session: no pool-size derivation. `k` is only a harness knob.
+  const k = options.k ?? 1
   const extra = options.extra ?? DEFAULT_EXTRA_WORKERS
   const entry = options.entry ?? MOCK_SSE_WORKER_ENTRY
 

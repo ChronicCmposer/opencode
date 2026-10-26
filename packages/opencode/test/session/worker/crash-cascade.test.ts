@@ -3,8 +3,8 @@
 // A subagent parent that CRASHES must implicitly cancel its children, and the
 // cascade is children-first, bounded by the same grace window as an explicit
 // cancel. The dispatcher reads the `parentID → children` index through the
-// landed `CancellationConfig.childrenOf` seam (wired to the Phase 9 job
-// registry), so no new index is introduced here.
+// `CancellationConfig.childrenOf` seam the caller supplies; no new index is
+// introduced here.
 //
 // These tests drive the dispatcher against the shared in-memory `WorkerPool`
 // fake, so the crash/cascade ordering is deterministic and no isolates are
@@ -17,6 +17,7 @@ import {
   WorkerCrashedError,
   type CancellationConfig,
 } from "@/session/worker/dispatch"
+import { SessionWorkerReplyTimeoutError } from "@/session/worker/execute"
 import { capture, flush, sid } from "../../lib/async"
 import { createFakeWorkerPool } from "../../lib/fake-worker-pool"
 
@@ -42,9 +43,8 @@ describe("9.6 parent CRASH implicitly cancels its children (children-first)", ()
     const parent = capture(dispatcher.dispatch({ sessionID: sid("ses_parent") }))
     const child = capture(dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 }))
     await flush()
-    expect(dispatcher.headroomSlotCount).toBe(1)
 
-    pool.workers[0].crash(sid("ses_parent"))
+    pool.spawned[0].crash(sid("ses_parent"))
 
     expect(await parent).toEqual({ ok: false, error: expect.any(WorkerCrashedError) })
     expect(await child).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
@@ -66,9 +66,8 @@ describe("9.6 parent CRASH implicitly cancels its children (children-first)", ()
     const child = capture(dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 }))
     const grandchild = capture(dispatcher.dispatch({ sessionID: sid("ses_grandchild"), depth: 2 }))
     await flush()
-    expect(dispatcher.headroomSlotCount).toBe(2)
 
-    pool.workers[0].crash(sid("ses_parent"))
+    pool.spawned[0].crash(sid("ses_parent"))
 
     expect(await parent).toEqual({ ok: false, error: expect.any(WorkerCrashedError) })
     expect(await child).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
@@ -86,7 +85,7 @@ describe("9.6 parent CRASH implicitly cancels its children (children-first)", ()
     const parent = capture(dispatcher.dispatch({ sessionID: sid("ses_parent") }))
     await flush()
 
-    pool.workers[0].crash(sid("ses_parent"))
+    pool.spawned[0].crash(sid("ses_parent"))
     expect(await parent).toEqual({ ok: false, error: expect.any(WorkerCrashedError) })
 
     await dispatcher.terminateAll()
@@ -102,7 +101,7 @@ describe("9.6 parent CRASH implicitly cancels its children (children-first)", ()
     await flush()
 
     const cause = new Error("worker isolate died: TypeError: db.select is not a function")
-    pool.workers[0].crashWith(sid("ses_parent"), cause)
+    pool.spawned[0].crashWith(sid("ses_parent"), cause)
 
     const settled = await parent
     if (settled.ok) throw new Error("expected the parent dispatch to crash")
@@ -128,14 +127,32 @@ describe("9.6 parent CRASH implicitly cancels its children (children-first)", ()
     const parent = capture(dispatcher.dispatch({ sessionID: sid("ses_parent") }))
     const child = capture(dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 }))
     await flush()
-    expect(dispatcher.headroomSlotCount).toBe(1)
 
-    pool.workers[0].crash(sid("ses_parent"))
+    pool.spawned[0].crash(sid("ses_parent"))
 
     expect(await parent).toEqual({ ok: false, error: expect.any(WorkerCrashedError) })
     expect(await child).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
-    // The child ran on the spawned headroom worker; the terminate path reaped it.
-    expect(reaped).toEqual([pool.spawned[0].id])
+    // The child ran on its own per-session worker; the terminate path reaped it.
+    expect(reaped).toEqual([pool.spawned[1].id])
+
+    await dispatcher.terminateAll()
+  })
+
+  test("a parent reply-timeout cancels its running subagent child", async () => {
+    const pool = createFakeWorkerPool(1)
+    const { config, cancelled } = cancellation({ ses_parent: ["ses_child"] })
+    const dispatcher = createDispatcher({ pool, cancellation: config })
+
+    const parent = capture(dispatcher.dispatch({ sessionID: sid("ses_parent") }))
+    const child = capture(dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 }))
+    await flush()
+
+    pool.spawned[0].fail(sid("ses_parent"), new SessionWorkerReplyTimeoutError(30_000))
+
+    expect(await parent).toEqual({ ok: false, error: expect.any(SessionWorkerReplyTimeoutError) })
+    expect(await child).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
+    expect(cancelled).toContain(sid("ses_child"))
+    expect(dispatcher.registry.has(sid("ses_child"))).toBe(false)
 
     await dispatcher.terminateAll()
   })

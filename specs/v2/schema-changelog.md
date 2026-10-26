@@ -1,5 +1,17 @@
 # V2 Schema Changelog
 
+## 2026-10-26: Per-Session Worker Lifecycle
+
+- Replace the sized worker pool and admission model with one unbounded, lazily materialized worker per Session, reused across turns and reaped after `OPENCODE_SESSION_WORKER_REAP_MS` (default `300000` ms) when no run is in flight and no prompt is queued.
+- Remove pool size K, `OPENCODE_SESSION_WORKER_COUNT`, `OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION` (obsolete; warn and ignore), `deriveHeadroom`, the foreground/headroom split, admission queues, `HeadroomFullError`, `SessionQueueFullError`, `degradedCount`, the hub job registry and `JobInfo` result routing, and `dispatchSubagent`/`SubagentDispatchProxy`.
+- Carry subagent depth explicitly as `metadata.depth` in existing Session metadata; implicit children (`delegate`, metadata spawns) are depth 0 and a `task` child is parent + 1. `subagent_depth` is enforced on the shared prompt path and pre-checked by `Session.spawn`.
+- Add `Session.spawn({ parentID, childID?, prompt, type, title?, agent?, model?, metadata?, depthLimit? }) -> { childID, result }` and its hub-proxy `session.spawn` method. A background `task` forks into the local `background` job; `delegate` keeps its raw create-and-prompt path at depth 0.
+- Name workers `ocs:<last6>` when idle and `ocs:<last6>!` while running.
+- Supervise crashes per Session: five consecutive crashes mark it dead; backoff doubles from 1 s (capped at 30 s); in-flight runs reject with `WorkerCrashedError`; user-initiated dispatches reset; background and automatic dispatches fail fast.
+- Serialize cold spawns behind one global boot-ready permit; a spawn-gate timeout fails only that spawn, not the Session.
+- Preserve caller-facing parity with the flag on or off; the allowed differences are isolation, transport, crash error type, and thread naming.
+- Add no database migration and no durable-event version change; persisted history is unchanged.
+
 ## 2026-10-25: Worker-Safe Plugin Tools
 
 - Route hub-owned plugin tools across the worker-safe hub proxy, so a worker lists descriptors and invokes calls while plugin code, credentials, and runtime state stay in the hub process.

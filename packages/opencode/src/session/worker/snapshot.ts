@@ -23,7 +23,6 @@ import type { InstanceContext } from "@/project/instance-context"
 import { Snapshot } from "@/snapshot"
 
 import type { WorkerSnapshot } from "./layer"
-import { resolveWorkerCount } from "./pool"
 
 /**
  * Build an {@link InstanceContext} from the minimum identity an isolate or a hub
@@ -89,7 +88,7 @@ export const createEpochSequence = (initial = 0): EpochSequence => {
 }
 
 export interface BuildWorkerSnapshotOptions {
-  /** Explicit pool size; defaults to {@link resolveWorkerCount}. */
+  /** Explicit worker count; defaults to the per-session reality of one. */
   readonly workerCount?: number
   /** Injected clock; defaults to `Date.now`. */
   readonly clock?: () => number
@@ -159,7 +158,7 @@ export const buildWorkerSnapshot = Effect.fn("WorkerSnapshot.build")(function* (
     auth: authInfo,
     modelsDev: models,
     flags,
-    workerCount: options.workerCount ?? resolveWorkerCount(),
+    workerCount: options.workerCount ?? 1,
   } satisfies WorkerSnapshot
 })
 

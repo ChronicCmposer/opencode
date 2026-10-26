@@ -38,11 +38,11 @@ import { SessionPrompt } from "../../src/session/prompt"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
 import {
-  SubagentDispatchProxyService,
-  type SubagentDispatchProxy,
-  type SubagentDispatchRequest,
+  SessionSpawnProxyService,
+  type SessionSpawnProxy,
+  type SessionSpawnRequest,
+  type SessionSpawnResult,
 } from "@/session/worker/subagent"
-import type { JobInfo } from "@/session/worker/job-registry"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -2820,42 +2820,33 @@ noLLMServer.instance(
 )
 
 // ---------------------------------------------------------------------------
-// Solution 1 (B1) — the subagent dispatch seam. `SessionPrompt`'s `ops()` is the
-// production composition site for `TaskPromptOps`; it wires `dispatchSubagent`
-// from the hub-proxy `SubagentDispatchProxyService` (the worker has no
-// `SessionHubService`). Present with the proxy (a real nested subagent is routed
-// through it at depth ≥ 1); absent without it (the task runs inline).
+// The session-spawn seam. `SessionPrompt`'s `ops()` no longer owns subagent
+// dispatch: the task tool calls `Session.spawn`, which prefers the hub-proxy
+// `SessionSpawnProxyService` in a worker (so the child runs on its own
+// per-session worker) and prompts directly on the main process.
 // ---------------------------------------------------------------------------
 
-/** A settled `JobInfo` as the hub-proxy dispatch would hand it back. */
-function dispatchedJob(request: SubagentDispatchRequest): JobInfo {
-  return {
-    id: request.childID,
-    type: request.type,
-    status: "completed",
-    started_at: 0,
-    completed_at: 1,
-    output: "dispatched output",
-    parentID: request.parentID,
-    depth: request.depth ?? 1,
-  }
+/** A settled spawn result as the hub-proxy `session.spawn` RPC would return it. */
+function spawnedSession(request: SessionSpawnRequest): SessionSpawnResult {
+  const childID = request.childID ?? request.parentID
+  return { childID, result: withParts(childID) }
 }
 
-/** A recording `SubagentDispatchProxy` backing the worker's dispatch RPC. */
-function recordingDispatchProxy(calls: SubagentDispatchRequest[]): SubagentDispatchProxy {
+/** A recording `SessionSpawnProxy` backing the worker's `session.spawn` RPC. */
+function recordingSpawnProxy(calls: SessionSpawnRequest[]): SessionSpawnProxy {
   return {
-    dispatchSubagent: (request) =>
+    spawn: (request) =>
       Effect.sync(() => {
         calls.push(request)
-        return dispatchedJob(request)
+        return spawnedSession(request)
       }),
   }
 }
 
 it.instance(
-  "a nested subagent is routed through the hub-proxy dispatchSubagent RPC at depth >= 1",
+  "a nested subagent is routed through the hub-proxy session.spawn RPC",
   () => {
-    const calls: SubagentDispatchRequest[] = []
+    const calls: SessionSpawnRequest[] = []
     return Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
       const prompt = yield* SessionPrompt.Service
@@ -2870,29 +2861,30 @@ it.instance(
 
       const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
 
-      // The task tool routes the child through `ops().dispatchSubagent`, which is
-      // wired from the proxy service the worker graph exposes.
-      const dispatch = yield* pollWithTimeout(
+      // The task tool calls `Session.spawn`, which reads this proxy from the
+      // worker graph and forwards the child to the hub.
+      const spawn = yield* pollWithTimeout(
         Effect.sync(() => calls[0]),
-        "subagent was never routed through the hub-proxy dispatchSubagent RPC",
+        "subagent was never routed through the hub-proxy session.spawn RPC",
       )
-      expect(dispatch.parentID).toBe(chat.id)
-      expect(dispatch.depth).toBeGreaterThanOrEqual(1)
+      expect(spawn.parentID).toBe(chat.id)
+      expect(spawn.prompt.sessionID).not.toBe(chat.id)
 
       yield* prompt.cancel(chat.id)
       yield* Fiber.await(fiber)
-    }).pipe(Effect.provideService(SubagentDispatchProxyService, recordingDispatchProxy(calls)))
+    }).pipe(Effect.provideService(SessionSpawnProxyService, recordingSpawnProxy(calls)))
   },
   { config: cfg },
   15_000,
 )
 
 it.instance(
-  "without the hub-proxy dispatch service no dispatchSubagent is wired",
+  "without the hub-proxy spawn service no session.spawn is wired",
   () =>
     Effect.gen(function* () {
-      const proxy = yield* Effect.serviceOption(SubagentDispatchProxyService)
-      // `ops` reads exactly this option: absent means the inline task path.
+      const proxy = yield* Effect.serviceOption(SessionSpawnProxyService)
+      // `Session.spawn` reads exactly this option: absent means the in-process
+      // prompt path.
       expect(proxy._tag).toBe("None")
     }),
   { config: cfg },

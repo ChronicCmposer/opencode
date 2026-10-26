@@ -1,10 +1,9 @@
-// Session worker pool sizing and the production pool wrapper.
+// Session worker pool configuration and the production pool wrapper.
 //
-// K = `floor(cores × F)`, floor 1, where F defaults to
-// `DEFAULT_OVERSUBSCRIPTION_FACTOR` (2) and cores defaults to
-// `os.availableParallelism()`. `OPENCODE_SESSION_WORKER_COUNT` overrides K
-// absolutely; `OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION` retunes F. Cores are
-// injected so sizing is deterministic.
+// The sized pool is gone: one lazily-materialized worker per session replaces
+// `OPENCODE_SESSION_WORKER_COUNT` / `OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION`.
+// Those knobs only produce obsolete warnings now. `OPENCODE_SESSION_WORKER_REAP_MS`
+// still bounds an idle worker's lifetime.
 
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
@@ -24,11 +23,15 @@ import {
   resolveWorkerModel,
 } from "@/session/worker/init"
 import {
-  DEFAULT_OVERSUBSCRIPTION_FACTOR,
+  DEFAULT_REAP_MS,
   OVERSUBSCRIPTION_ENV,
+  REAP_MS_ENV,
   WORKER_COUNT_ENV,
-  deriveWorkerCount,
-  resolveWorkerCount,
+  obsoleteOversubscriptionWarning,
+  obsoleteWorkerCountWarning,
+  reapMsWarning,
+  removedKnobWarnings,
+  resolveReapMs,
 } from "@/session/worker/pool"
 import { createProductionWorkerPool } from "@/session/worker/hub"
 import { buildWorkerSnapshot, createEpochSequence, nextEpoch } from "@/session/worker/snapshot"
@@ -39,56 +42,96 @@ import { sid } from "../../lib/async"
 /** The dependency-light executor fixture (speaks the executor protocol). */
 const EXECUTOR_FIXTURE = new URL("../../fixture/session-execute-worker.ts", import.meta.url)
 
-describe("worker count sizing", () => {
-  test("oversubscribes cores by the default factor", () => {
-    expect(resolveWorkerCount({ availableParallelism: () => 4, env: {} })).toBe(8)
-    expect(resolveWorkerCount({ availableParallelism: () => 8, env: {} })).toBe(16)
+describe("pool sizing removal", () => {
+  test("no longer exports a machine-derived pool size", async () => {
+    const pool = await import("@/session/worker/pool")
+
+    for (const name of ["resolveWorkerCount", "deriveWorkerCount", "DEFAULT_OVERSUBSCRIPTION_FACTOR"]) {
+      expect(pool).not.toHaveProperty(name)
+    }
+  })
+})
+
+describe("reap window", () => {
+  test("defaults to five minutes", () => {
+    expect(DEFAULT_REAP_MS).toBe(300_000)
+    expect(resolveReapMs({})).toBe(DEFAULT_REAP_MS)
   })
 
-  test("derives nproc × factor on small machines", () => {
-    for (const [cores, expected] of [
-      [1, 2],
-      [2, 4],
-      [3, 6],
-    ] as const) {
-      expect(resolveWorkerCount({ availableParallelism: () => cores, env: {} })).toBe(expected)
+  test("parses a positive integer", () => {
+    expect(resolveReapMs({ [REAP_MS_ENV]: "1500" })).toBe(1500)
+    expect(resolveReapMs({ [REAP_MS_ENV]: " 42 " })).toBe(42)
+    expect(resolveReapMs({ [REAP_MS_ENV]: "1" })).toBe(1)
+  })
+
+  test("an empty value falls back to the default and reports why", () => {
+    for (const raw of ["", "   "]) {
+      expect(resolveReapMs({ [REAP_MS_ENV]: raw })).toBe(DEFAULT_REAP_MS)
+      const warning = reapMsWarning({ [REAP_MS_ENV]: raw })
+      expect(warning).toContain(REAP_MS_ENV)
+      expect(warning).toContain("empty")
+      expect(warning).toContain(String(DEFAULT_REAP_MS))
     }
   })
 
-  test("deriveWorkerCount floors cores × factor with a floor of one", () => {
-    expect(deriveWorkerCount(4)).toBe(4 * DEFAULT_OVERSUBSCRIPTION_FACTOR)
-    expect(deriveWorkerCount(4, 3)).toBe(12)
-    expect(deriveWorkerCount(1)).toBe(2)
-  })
-
-  test("the oversubscription factor is overridable", () => {
-    expect(resolveWorkerCount({ availableParallelism: () => 4, env: { [OVERSUBSCRIPTION_ENV]: "3" } })).toBe(12)
-    expect(resolveWorkerCount({ availableParallelism: () => 4, env: { [OVERSUBSCRIPTION_ENV]: "1.5" } })).toBe(6)
-  })
-
-  test("the absolute count override wins over the factor", () => {
-    expect(resolveWorkerCount({ availableParallelism: () => 2, env: { [WORKER_COUNT_ENV]: "5" } })).toBe(5)
-  })
-
-  test("an invalid factor, override or core count fails loud", () => {
-    for (const factor of ["0", "abc"]) {
-      expect(() =>
-        resolveWorkerCount({ availableParallelism: () => 4, env: { [OVERSUBSCRIPTION_ENV]: factor } }),
-      ).toThrow(/OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION/)
+  test("a malformed value falls back to the default and reports the raw input", () => {
+    for (const raw of ["0", "-1", "1.5", "nope", "NaN", "Infinity"]) {
+      expect(resolveReapMs({ [REAP_MS_ENV]: raw })).toBe(DEFAULT_REAP_MS)
+      const warning = reapMsWarning({ [REAP_MS_ENV]: raw })
+      expect(warning).toContain(REAP_MS_ENV)
+      expect(warning).toContain(raw)
+      expect(warning).toContain("positive integer")
+      expect(warning).toContain(String(DEFAULT_REAP_MS))
     }
-    expect(() => resolveWorkerCount({ availableParallelism: () => 8, env: { [WORKER_COUNT_ENV]: "0" } })).toThrow(
-      /OPENCODE_SESSION_WORKER_COUNT/,
-    )
-    expect(() => resolveWorkerCount({ availableParallelism: () => 8, env: { [WORKER_COUNT_ENV]: "abc" } })).toThrow(
-      /OPENCODE_SESSION_WORKER_COUNT/,
-    )
-    expect(() => resolveWorkerCount({ availableParallelism: () => 0, env: {} })).toThrow(/availableParallelism/)
-    expect(() => deriveWorkerCount(0)).toThrow(/availableParallelism/)
-    expect(() => deriveWorkerCount(2.5)).toThrow(/availableParallelism/)
   })
 
-  test("falls back to the real available parallelism when not injected", () => {
-    expect(resolveWorkerCount({ env: {} })).toBeGreaterThanOrEqual(1)
+  test("warns only when the value is present but unusable", () => {
+    expect(reapMsWarning({})).toBeUndefined()
+    expect(reapMsWarning({ [REAP_MS_ENV]: "1" })).toBeUndefined()
+  })
+})
+
+describe("removed pool knobs", () => {
+  test("absent and empty knobs produce no warnings", () => {
+    expect(removedKnobWarnings({})).toEqual([])
+    expect(obsoleteWorkerCountWarning({})).toBeUndefined()
+    expect(obsoleteOversubscriptionWarning({})).toBeUndefined()
+
+    const empty = { [WORKER_COUNT_ENV]: "", [OVERSUBSCRIPTION_ENV]: "   " }
+    expect(removedKnobWarnings(empty)).toEqual([])
+    expect(obsoleteWorkerCountWarning(empty)).toBeUndefined()
+    expect(obsoleteOversubscriptionWarning(empty)).toBeUndefined()
+  })
+
+  test("each set knob yields exactly one warning naming it as obsolete and ignored", () => {
+    const count = obsoleteWorkerCountWarning({ [WORKER_COUNT_ENV]: "5" })
+    if (count === undefined) throw new Error("expected an obsolete worker-count warning")
+    expect(count).toContain(WORKER_COUNT_ENV)
+    expect(count).toContain("obsolete; ignored")
+    const countWarnings = removedKnobWarnings({ [WORKER_COUNT_ENV]: "5" })
+    expect(countWarnings).toHaveLength(1)
+    expect(countWarnings[0]).toBe(count)
+
+    const oversubscription = obsoleteOversubscriptionWarning({ [OVERSUBSCRIPTION_ENV]: "3" })
+    if (oversubscription === undefined) throw new Error("expected an obsolete oversubscription warning")
+    expect(oversubscription).toContain(OVERSUBSCRIPTION_ENV)
+    expect(oversubscription).toContain("obsolete; ignored")
+    const oversubscriptionWarnings = removedKnobWarnings({ [OVERSUBSCRIPTION_ENV]: "3" })
+    expect(oversubscriptionWarnings).toHaveLength(1)
+    expect(oversubscriptionWarnings[0]).toBe(oversubscription)
+  })
+
+  test("both knobs yield exactly two warnings in a stable order", () => {
+    const warnings = removedKnobWarnings({ [WORKER_COUNT_ENV]: "5", [OVERSUBSCRIPTION_ENV]: "3" })
+    expect(warnings).toHaveLength(2)
+    expect(warnings[0]).toContain(WORKER_COUNT_ENV)
+    expect(warnings[1]).toContain(OVERSUBSCRIPTION_ENV)
+  })
+
+  test("malformed values are still only reported as obsolete and never throw", () => {
+    const env = { [WORKER_COUNT_ENV]: "abc", [OVERSUBSCRIPTION_ENV]: "0" }
+    expect(() => removedKnobWarnings(env)).not.toThrow()
+    expect(removedKnobWarnings(env)).toHaveLength(2)
   })
 })
 
@@ -142,6 +185,12 @@ describe("buildWorkerSnapshot", () => {
     expect(snapshot.auth.anthropic).toEqual({ type: "api", key: "sk-secret" })
     expect(snapshot.modelsDev.anthropic?.id).toBe("anthropic")
     expect(typeof snapshot.epoch).toBe("number")
+  })
+
+  test("defaults to one worker per session instead of sizing a pool", async () => {
+    const snapshot = await Effect.runPromise(buildSnapshot({ clock: () => 1000 }))
+
+    expect(snapshot.workerCount).toBe(1)
   })
 
   test("is JSON-serializable (structured-clone friendly)", async () => {
@@ -413,22 +462,21 @@ describe("buildSessionWorkerInit", () => {
 // ---------------------------------------------------------------------------
 
 describe("createProductionWorkerPool", () => {
-  test("wraps the production entry with an oversubscribed pool that becomes ready on use", async () => {
-    const cores = 4
-    const count = resolveWorkerCount({ availableParallelism: () => cores, env: {} })
+  test("wraps the production entry with a pool that becomes ready on use", async () => {
     const pool = createProductionWorkerPool({
       init: sessionWorkerInit(),
-      count,
       entry: EXECUTOR_FIXTURE,
       workKind: "instant",
       timeoutMs: 15_000,
     })
 
-    expect(count).toBeGreaterThan(cores)
-    expect(pool.workers).toHaveLength(count)
+    // No prewarm: each worker materializes lazily under the dispatcher's id.
+    expect(pool.workers).toHaveLength(0)
+    const workers = Array.from({ length: 4 }, () => pool.spawn())
 
-    await Promise.all(pool.workers.map((worker, index) => worker.execute({ sessionID: sid(`ses_${index}`), depth: 0 })))
+    await Promise.all(workers.map((worker, index) => worker.execute({ sessionID: sid(`ses_${index}`), depth: 0 })))
 
+    expect(pool.workers).toHaveLength(4)
     expect(pool.workers.every((worker) => worker.alive)).toBe(true)
     for (const index of pool.workers.keys()) {
       expect(pool.resultFor(sid(`ses_${index}`))?.sessionID).toBe(sid(`ses_${index}`))

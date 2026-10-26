@@ -1,11 +1,13 @@
 // Phase 9/11 — shared worker port plumbing.
 //
-// The cancel control channel (`cancel.ts`), the job channel (`job-client.ts`),
-// the writer relay (`writer-client.ts`) and the broker relay (`broker-client.ts`)
-// all adapt a real `MessagePort` to a framed request/response channel, and all
-// need the same unref'd timer, error-message coercion and peer lifecycle lines.
-// This module is the one implementation they share, so the port glue is not
-// duplicated per protocol.
+// The cancel control channel (`cancel.ts`), the writer relay
+// (`writer-client.ts`) and the broker relay (`broker-client.ts`) all adapt a real
+// `MessagePort` to a framed request/response channel, and all need the same
+// unref'd timer, error-message coercion and peer lifecycle lines. This module is
+// the one implementation they share, so the port glue is not duplicated per
+// protocol. (The background-job channel was removed with the per-session worker
+// refactor; its `job` envelope port name is retained in `frame.ts` for wire
+// compatibility only.)
 //
 // `createRequestChannel` is deliberately dependency-free: it depends only on the
 // `FrameChannel` shape and the `PortScheduler` seam declared here, so importing
@@ -21,7 +23,7 @@ import {
   type WorkerFramePort,
 } from "./frame"
 
-/** Timer seam shared by dispatch, cancel, and the job registry; unref'd. */
+/** Timer seam shared by dispatch and cancel; unref'd. */
 export type PortScheduler = (delayMs: number, run: () => void) => () => void
 
 export const defaultSchedule: PortScheduler = (delayMs, run) => {

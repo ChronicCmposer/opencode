@@ -1,71 +1,50 @@
-// Session worker pool sizing.
+// Session worker configuration.
 //
-// The hub sizes its production pool by oversubscribing the machine's cores:
-// `nproc * DEFAULT_OVERSUBSCRIPTION_FACTOR` (2), floor 1, so the hub, the single
-// writer and the broker keep their cores while several sessions still run in
-// parallel (plan decision line 22). Retune the factor with
-// `OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION`, or pin the count absolutely with
-// `OPENCODE_SESSION_WORKER_COUNT`.
+// Workers are materialized lazily, one per session, so there is no sized pool.
+// `OPENCODE_SESSION_WORKER_COUNT` and `OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION`
+// are obsolete: when set, each produces one warning and is otherwise ignored.
 //
-// Dispatch/scheduling and the worker lifecycle live in `execute.ts`/`hub.ts`;
-// this module owns only sizing.
+// `OPENCODE_SESSION_WORKER_REAP_MS` (default 300000) is the idle window after
+// which a session worker with no in-flight run and no queued prompt is reaped.
+// `OPENCODE_SESSION_WORKER_IDLE_TIMEOUT_MS` arms the run/startShell watchdog.
+//
+// Dispatch/scheduling and the worker lifecycle live in `execute.ts`/`hub.ts`.
 
-import os from "node:os"
-import { isPositiveInt, parsePositiveInt } from "@/util/parse"
+import { isPositiveInt } from "@/util/parse"
 
 export const WORKER_COUNT_ENV = "OPENCODE_SESSION_WORKER_COUNT"
 export const OVERSUBSCRIPTION_ENV = "OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION"
 export const SESSION_WORKER_IDLE_TIMEOUT_ENV = "OPENCODE_SESSION_WORKER_IDLE_TIMEOUT_MS"
-export const DEFAULT_OVERSUBSCRIPTION_FACTOR = 2
+export const REAP_MS_ENV = "OPENCODE_SESSION_WORKER_REAP_MS"
+export const DEFAULT_REAP_MS = 300_000
 
 export type Env = Record<string, string | undefined>
 
-export interface WorkerCountOptions {
-  /** Injected parallelism; defaults to `os.availableParallelism`. */
-  readonly availableParallelism?: () => number
-  /** Environment source for the override; defaults to `process.env`. */
-  readonly env?: Env
-}
-
 /**
- * Resolve the pool size. `OPENCODE_SESSION_WORKER_COUNT` (a positive integer)
- * wins outright; otherwise `OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION` tunes the
- * oversubscription factor applied to `availableParallelism()`.
+ * Warn when the obsolete absolute-count knob is still set. One worker per
+ * session replaces the sized pool, so the value is ignored; an empty or absent
+ * value is not "set" and produces no warning.
  */
-export function resolveWorkerCount(options: WorkerCountOptions = {}): number {
-  const env = options.env ?? process.env
-  const override = parseWorkerCountOverride(env[WORKER_COUNT_ENV])
-  if (override !== undefined) return override
-  const factor = parseOversubscriptionFactor(env[OVERSUBSCRIPTION_ENV])
-  return deriveWorkerCount(readParallelism(options.availableParallelism), factor)
+export function obsoleteWorkerCountWarning(env: Env = process.env): string | undefined {
+  return obsoleteKnobWarning(env, WORKER_COUNT_ENV)
 }
 
-/** Oversubscribe `cores` by `factor`, floor 1. */
-export function deriveWorkerCount(cores: number, factor: number = DEFAULT_OVERSUBSCRIPTION_FACTOR): number {
-  parsePositiveInt(cores, "availableParallelism")
-  return Math.max(1, Math.floor(cores * factor))
+/** Warn when the obsolete oversubscription-factor knob is still set. */
+export function obsoleteOversubscriptionWarning(env: Env = process.env): string | undefined {
+  return obsoleteKnobWarning(env, OVERSUBSCRIPTION_ENV)
 }
 
-function parseWorkerCountOverride(raw: string | undefined): number | undefined {
+/** Every obsolete-knob warning, in a stable order (count, then factor). */
+export function removedKnobWarnings(env: Env = process.env): string[] {
+  return [obsoleteWorkerCountWarning(env), obsoleteOversubscriptionWarning(env)].filter(
+    (warning): warning is string => warning !== undefined,
+  )
+}
+
+function obsoleteKnobWarning(env: Env, name: string): string | undefined {
+  const raw = env[name]
   if (raw === undefined || raw.trim() === "") return undefined
-  return parsePositiveInt(raw, WORKER_COUNT_ENV)
-}
-
-function parseOversubscriptionFactor(raw: string | undefined): number {
-  if (raw === undefined || raw.trim() === "") return DEFAULT_OVERSUBSCRIPTION_FACTOR
-  const factor = Number(raw)
-  if (!Number.isFinite(factor) || factor <= 0) {
-    throw new Error(`invalid ${OVERSUBSCRIPTION_ENV}: ${raw} (expected a positive number)`)
-  }
-  return factor
-}
-
-/**
- * Read the detected core count without validating it: `deriveWorkerCount` is the
- * single place that validates, so the check is not applied twice.
- */
-function readParallelism(availableParallelism?: () => number): number {
-  return (availableParallelism ?? os.availableParallelism.bind(os))()
+  return `${name} is obsolete; ignored (one worker per session)`
 }
 
 export interface IdleTimeoutOptions {
@@ -90,6 +69,42 @@ function parseIdleTimeout(raw: string | undefined): number {
   if (raw === undefined || raw.trim() === "") return 0
   const parsed = Number(raw)
   return isPositiveInt(parsed) ? parsed : 0
+}
+
+/**
+ * Resolve the idle window after which a session worker is reaped. A positive
+ * integer wins; an absent value uses the five-minute default. Unlike pool
+ * sizing, a malformed value is NOT fatal: reaping is a resilience feature, so a
+ * typo falls back to the default and {@link reapMsWarning} reports why.
+ */
+export function resolveReapMs(env: Env = process.env): number {
+  const parsed = parseReapMs(env[REAP_MS_ENV])
+  return parsed.kind === "value" ? parsed.ms : DEFAULT_REAP_MS
+}
+
+/**
+ * The reason `resolveReapMs` fell back to the default, or `undefined` when the
+ * knob is absent or valid. Callers emit this at WARN at startup.
+ */
+export function reapMsWarning(env: Env = process.env): string | undefined {
+  const parsed = parseReapMs(env[REAP_MS_ENV])
+  if (parsed.kind === "absent" || parsed.kind === "value") return undefined
+  if (parsed.kind === "empty") return `${REAP_MS_ENV} is empty; using default ${DEFAULT_REAP_MS} ms`
+  return `invalid ${REAP_MS_ENV}: ${parsed.raw} (expected a positive integer); using default ${DEFAULT_REAP_MS} ms`
+}
+
+type ParsedReapMs =
+  | { readonly kind: "absent" }
+  | { readonly kind: "empty" }
+  | { readonly kind: "invalid"; readonly raw: string }
+  | { readonly kind: "value"; readonly ms: number }
+
+function parseReapMs(raw: string | undefined): ParsedReapMs {
+  if (raw === undefined) return { kind: "absent" }
+  if (raw.trim() === "") return { kind: "empty" }
+  const parsed = Number(raw)
+  if (!isPositiveInt(parsed)) return { kind: "invalid", raw }
+  return { kind: "value", ms: parsed }
 }
 
 export * as WorkerPoolModule from "./pool"

@@ -1,19 +1,13 @@
-// Regression (Fix 1 follow-up) — a subagent child dispatched through the
-// hub-proxy `dispatchSubagent` path must inherit the PARENT's per-session
-// instance/context.
+// Per-session context after a child's own entry is released/reaped.
 //
-// The bug: `hub.ensureRunning`/`startShell` capture the dispatching session's
-// `InstanceRef`/runtime context via `onDispatch`, but a subagent child is
-// dispatched by the raw scheduler (`subagent.dispatchSubagent` →
-// `scheduler.dispatch`), which never calls `onDispatch`. So the child's
-// `resolveInit` fell through to `process.cwd()`/`Project.ID.global` (H1) and the
-// child worker's per-worker hub-proxy handlers ran with no `InstanceRef` and
-// died (H2).
-//
-// This suite exercises the UNCOVERED path: it drives `dispatchSubagent` over a
-// hub-proxy control port (not `hub.ensureRunning`) and asserts the child
-// inherits the parent's directory and a context in which a hub-side
-// `SessionStatus.set` succeeds.
+// The old ancestor-chain fallback (and its `onSubagentDispatch` copy) was dead
+// once the job registry was removed: every dispatch records the session's own
+// ambient instance/runtime context synchronously before the pool materializes
+// its worker (`onDispatch` -> `recordDispatch`). `resolveInit` then reads the
+// session's PERSISTED directory/project from that context. This suite proves a
+// delegate-shaped child (`parentID` + raw `session.prompt`) and an
+// auto-continuation child (no ambient `InstanceRef`) still boot under the
+// parent's directory after their per-session entry was released by a reap.
 
 import { describe, expect, test } from "bun:test"
 import { Context, Effect, Layer, Option } from "effect"
@@ -32,116 +26,51 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import {
-  createExecutorWorkerPool,
-  type ExecutorRun,
-  type ExecutorWorker,
-  type SessionExecutionResult,
-} from "@/session/worker/execute"
+import { type ExecutorWorker, type SessionExecutionResult } from "@/session/worker/execute"
 import {
   createLazyExecutorWorkerPool,
-  createSessionHub,
   productionSessionHubLayer,
   SessionHubService,
   type ProductionPoolFactory,
 } from "@/session/worker/hub"
 import type { SessionWorkerInit } from "@/session/worker/session-worker"
-import { createHubProxyClient } from "@/session/worker/layer"
-import { capture, flush, sid } from "../../lib/async"
+import { sid } from "../../lib/async"
 
-// ---------------------------------------------------------------------------
-// (a) unit: `createSessionHub` invokes the propagation hook with (child, parent).
-// ---------------------------------------------------------------------------
+const PARENT_ID = sid("ses_parent")
+const CHILD_ID = sid("ses_child")
+const PARENT_DIR = "/work/parent"
 
-/** An in-memory executor worker that completes instantly and keeps its result. */
-class BridgingWorker implements ExecutorWorker {
-  alive = true
-  readonly runs: ExecutorRun[] = []
-  private readonly results = new Map<SessionID, SessionExecutionResult>()
-
-  constructor(readonly id: number) {}
-
-  async execute(run: ExecutorRun): Promise<void> {
-    this.runs.push(run)
-    this.results.set(run.sessionID, { sessionID: run.sessionID, value: null })
-  }
-  async cancel(): Promise<void> {}
-  async assertNotBusy(): Promise<boolean> {
-    return false
-  }
-  resultFor(sessionID: SessionID): SessionExecutionResult | undefined {
-    return this.results.get(sessionID)
-  }
-  async terminate(): Promise<void> {
-    this.alive = false
-  }
-}
-
-describe("subagent dispatch propagates the parent's per-session context (unit)", () => {
-  test("the hub calls onSubagentDispatch with (childID, parentID) over the dispatchSubagent RPC", async () => {
-    const pool = createExecutorWorkerPool({ k: 1, spawn: (id) => new BridgingWorker(id) })
-    const propagated: Array<{ childID: SessionID; parentID: SessionID }> = []
-    const hub = createSessionHub({
-      pool,
-      subagentDepth: 2,
-      onSubagentDispatch: (childID, parentID) => propagated.push({ childID, parentID }),
-      ports: { writer: {} as never, broker: {} as never, hubProxy: {} },
-    })
-    const channel = new MessageChannel()
-    const dispose = hub.attachHubProxyPort(1, channel.port1)
-    const client = createHubProxyClient(channel.port2)
-
-    await client.dispatchSubagent!({
-      parentID: sid("ses_parent"),
-      childID: sid("ses_child"),
-      type: "task",
-      depth: 1,
-    })
-    await flush()
-
-    expect(propagated).toEqual([{ childID: sid("ses_child"), parentID: sid("ses_parent") }])
-
-    dispose()
-    client.dispose()
-    await hub.terminateAll()
-  })
+const ambient = (directory: string) => ({
+  directory,
+  worktree: directory,
+  project: { id: "proj-parent" } as never,
 })
 
-// ---------------------------------------------------------------------------
-// (b) integration: through `productionSessionHubLayer`, the child inherits the
-// parent's ambient directory (H1) and a working hub-proxy context (H2).
-// ---------------------------------------------------------------------------
+const providerInfo = {
+  id: "test",
+  name: "Test",
+  source: "api",
+  env: [],
+  options: { baseURL: "https://api.example.test/v1", headers: { "x-provider": "1" } },
+  models: {},
+} as unknown as Provider.Info
 
-describe("subagent dispatch inherits the parent's instance/context (production layer)", () => {
-  const ambient = (directory: string) => ({ directory, worktree: directory, project: {} as never })
+const providerModel = {
+  id: "model",
+  providerID: "test",
+  api: { id: "model-api", url: "https://fallback.example.test/v1", npm: "@ai-sdk/openai-compatible" },
+  name: "Model",
+  capabilities: {},
+  cost: {},
+  limit: { context: 1_000, output: 1_000 },
+  status: "active",
+  options: {},
+  headers: { "x-model": "1" },
+  release_date: "2024-01-01",
+} as unknown as Provider.Model
 
-  const providerInfo = {
-    id: "test",
-    name: "Test",
-    source: "api",
-    env: [],
-    options: { baseURL: "https://api.example.test/v1", headers: { "x-provider": "1" } },
-    models: {},
-  } as unknown as Provider.Info
-
-  const providerModel = {
-    id: "model",
-    providerID: "test",
-    api: { id: "model-api", url: "https://fallback.example.test/v1", npm: "@ai-sdk/openai-compatible" },
-    name: "Model",
-    capabilities: {},
-    cost: {},
-    limit: { context: 1_000, output: 1_000 },
-    status: "active",
-    options: {},
-    headers: { "x-model": "1" },
-    release_date: "2024-01-01",
-  } as unknown as Provider.Model
-
-  // `SessionStatus.set` reads the ambient `InstanceRef` and dies without it, so a
-  // successful child-port call proves the child's hub-proxy handlers run under a
-  // real instance context (H2).
-  const deps = Layer.mergeAll(
+const deps = () =>
+  Layer.mergeAll(
     Layer.mock(Config.Service, {
       get: () => Effect.succeed({ model: "config/default" } as ConfigV1.Info),
       directories: () => Effect.succeed(["/cfg/opencode"]),
@@ -161,125 +90,120 @@ describe("subagent dispatch inherits the parent's instance/context (production l
     Layer.mock(SessionStatus.Service, {
       get: () => Effect.succeed({ type: "idle" } as SessionStatus.Info),
       list: () => Effect.succeed(new Map()),
-      set: () =>
-        Effect.gen(function* () {
-          const ctx = yield* InstanceRef
-          if (!ctx) return yield* Effect.die(new Error("InstanceRef not provided to the hub-proxy handler"))
-        }),
+      set: () => Effect.void,
     }),
     Layer.mock(Permission.Service, {}),
     Layer.mock(Question.Service, {}),
     Layer.mock(EventV2Bridge.Service, { publishLive: () => Effect.void }),
   )
 
-  /** A `Session` stub whose `get` records every session it was asked about. */
-  const sessionLayer = (directoryBySession: Map<SessionID, string>, queried: SessionID[]) =>
-    Layer.succeed(
-      Session.Service,
-      Session.Service.of({
-        get: (sessionID: SessionID) => {
-          queried.push(sessionID)
-          return Effect.succeed({
-            id: sessionID,
-            directory: directoryBySession.get(sessionID) ?? "/persisted/unknown",
-            projectID: "proj-test",
-            model: { id: "m", providerID: "p" },
-          } as unknown as Session.Info)
-        },
-        findMessage: () => Effect.succeed(Option.none()),
-      } as unknown as Session.Interface),
-    )
+// Both sessions persist the SAME directory (a subagent shares the parent's
+// working directory). The child carries `parentID`, which is what a
+// delegate-shaped caller relies on.
+const sessionLayer = Layer.succeed(
+  Session.Service,
+  Session.Service.of({
+    get: (sessionID: SessionID) =>
+      Effect.succeed({
+        id: sessionID,
+        parentID: sessionID === CHILD_ID ? PARENT_ID : undefined,
+        projectID: "proj-parent",
+        directory: PARENT_DIR,
+        model: { id: "m", providerID: "p" },
+      } as unknown as Session.Info),
+    findMessage: () => Effect.succeed(Option.none()),
+  } as unknown as Session.Interface),
+)
 
-  /**
-   * A pool whose single worker records the init resolved for the session it is
-   * asked to run AND transfers a hub-proxy control port, so the test can drive
-   * the real `dispatchSubagent`/`sessionStatus.set` handlers per worker.
-   */
-  const recordingPortPool =
-    (
-      captured: Array<{ sessionID: SessionID; init: SessionWorkerInit }>,
-      hubProxyPorts: Map<number, MessagePort>,
-    ): ProductionPoolFactory =>
-    (resolveInit, sinks) => {
-      const results = new Map<SessionID, SessionExecutionResult>()
-      return createLazyExecutorWorkerPool({
-        k: 1,
-        create: async (id) => {
-          const channel = new MessageChannel()
-          sinks.onHubProxyPort(id, channel.port2)
-          hubProxyPorts.set(id, channel.port1)
-          return {
-            id,
-            alive: true,
-            execute: async (run) => {
-              captured.push({ sessionID: run.sessionID, init: await resolveInit(run.sessionID) })
-              results.set(run.sessionID, { sessionID: run.sessionID, value: null })
-            },
-            cancel: async () => {},
-            assertNotBusy: async () => false,
-            resultFor: (sessionID) => results.get(sessionID),
-            terminate: async () => {},
-          } satisfies ExecutorWorker
+/** A pool whose workers record the init resolved for the session they run. */
+const recordingPool =
+  (captured: Array<{ sessionID: SessionID; init: SessionWorkerInit }>): ProductionPoolFactory =>
+  (resolveInit) => {
+    const results = new Map<SessionID, SessionExecutionResult>()
+    return createLazyExecutorWorkerPool({
+      create: async (id) => ({
+        id,
+        alive: true,
+        execute: async (run) => {
+          captured.push({ sessionID: run.sessionID, init: await resolveInit(run.sessionID) })
+          results.set(run.sessionID, { sessionID: run.sessionID, value: null })
         },
-      })
-    }
+        cancel: async () => {},
+        assertNotBusy: async () => false,
+        resultFor: (sessionID) => results.get(sessionID),
+        terminate: async () => {},
+      }) satisfies ExecutorWorker,
+    })
+  }
 
-  test("the child resolves under the parent's directory and its hub-proxy context is live", async () => {
+/** Build the production hub once per test with the recording pool. */
+const buildHub = (captured: Array<{ sessionID: SessionID; init: SessionWorkerInit }>) =>
+  productionSessionHubLayer({ count: 1, poolFactory: recordingPool(captured) }).pipe(Layer.provide(deps()))
+
+const childInits = (captured: Array<{ sessionID: SessionID; init: SessionWorkerInit }>) =>
+  captured.filter((entry) => entry.sessionID === CHILD_ID).map((entry) => entry.init)
+
+describe("per-session context survives a released child entry", () => {
+  test("a delegate-shaped child re-boots under the parent's directory after a reap", async () => {
     const captured: Array<{ sessionID: SessionID; init: SessionWorkerInit }> = []
-    const hubProxyPorts = new Map<number, MessagePort>()
-    const queried: SessionID[] = []
-    const layer = productionSessionHubLayer({
-      count: 1,
-      poolFactory: recordingPortPool(captured, hubProxyPorts),
-    }).pipe(Layer.provide(deps))
-
-    const parentID = sid("ses_parent_ctx")
-    const childID = sid("ses_child_ctx")
-    const sessions = sessionLayer(new Map([[parentID, "/persisted/parent"]]), queried)
 
     await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
-          const context = yield* Layer.build(layer)
+          const context = yield* Layer.build(buildHub(captured))
           const hub = Context.get(context, SessionHubService)
 
-          // The parent dispatch is what populates the per-session instance/context.
-          yield* Effect.promise(() => hub.ensureRunning(parentID)).pipe(
-            Effect.provide(sessions),
-            Effect.provideService(InstanceRef, ambient("/ambient/parent")),
+          // The parent records its ambient instance.
+          yield* Effect.promise(() => hub.ensureRunning(PARENT_ID)).pipe(
+            Effect.provide(sessionLayer),
+            Effect.provideService(InstanceRef, ambient(PARENT_DIR)),
           )
-
-          const parentPort = hubProxyPorts.get(1)
-          expect(parentPort).toBeDefined()
-          const client = createHubProxyClient(parentPort!)
-
-          // Drive the CHILD through the hub-proxy path — NOT `ensureRunning`.
-          const info = yield* Effect.promise(() =>
-            client.dispatchSubagent!({ parentID, childID, type: "task", depth: 1 }),
+          // Raw `session.prompt` on the child: the child records the ambient
+          // instance/context, and `resolveInit` reads its persisted directory.
+          yield* Effect.promise(() => hub.ensureRunning(CHILD_ID)).pipe(
+            Effect.provide(sessionLayer),
+            Effect.provideService(InstanceRef, ambient(PARENT_DIR)),
           )
-          expect(info.status).toBe("completed")
-
-          // H2: the child worker's own control port serves `sessionStatus.set`
-          // under a live instance context.
-          const childPort = hubProxyPorts.get(2)
-          expect(childPort).toBeDefined()
-          const childClient = createHubProxyClient(childPort!)
-          const status = yield* Effect.promise(() =>
-            capture(childClient.call("sessionStatus.set", [childID, { type: "busy" }])),
-          )
-          expect(status.ok).toBe(true)
-
-          childClient.dispose()
-          client.dispose()
+          // Reap the child's worker: the hub releases its per-session entry.
+          yield* Effect.promise(() => hub.cancel(CHILD_ID))
+          // Auto-continuation: no ambient `InstanceRef`, only the app's Session
+          // context. The persisted directory (not the hub cwd) must win.
+          yield* Effect.promise(() => hub.ensureRunning(CHILD_ID)).pipe(Effect.provide(sessionLayer))
         }),
       ),
     )
 
-    // H1: the child booted under the parent's directory, never `process.cwd()`.
-    const childInit = captured.find((entry) => entry.sessionID === childID)?.init
-    expect(childInit?.snapshot.directory).toBe("/ambient/parent")
-    // The persisted-directory fallback was reachable for the child: the hub
-    // queried the child session through the inherited context.
-    expect(queried).toContain(childID)
+    const inits = childInits(captured)
+    expect(inits).toHaveLength(2)
+    expect(inits[0]?.snapshot.directory).toBe(PARENT_DIR)
+    expect(inits[0]?.snapshot.projectId).toBe("proj-parent")
+    // The boot after the reaped entry has no ambient instance to inherit.
+    expect(inits[1]?.snapshot.directory).toBe(PARENT_DIR)
+    expect(inits[1]?.snapshot.projectId).toBe("proj-parent")
+    expect(inits[1]?.snapshot.directory).not.toBe(process.cwd())
+  })
+
+  test("an auto-continuation child with no ambient instance boots under its persisted directory", async () => {
+    const captured: Array<{ sessionID: SessionID; init: SessionWorkerInit }> = []
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const context = yield* Layer.build(buildHub(captured))
+          const hub = Context.get(context, SessionHubService)
+
+          // The very first child dispatch carries no ambient InstanceRef: this is
+          // the post-reap auto-continuation shape. Its persisted row supplies the
+          // directory, so it never falls back to the hub cwd.
+          yield* Effect.promise(() => hub.ensureRunning(CHILD_ID)).pipe(Effect.provide(sessionLayer))
+        }),
+      ),
+    )
+
+    const inits = childInits(captured)
+    expect(inits).toHaveLength(1)
+    expect(inits[0]?.snapshot.directory).toBe(PARENT_DIR)
+    expect(inits[0]?.snapshot.projectId).toBe("proj-parent")
+    expect(inits[0]?.snapshot.directory).not.toBe(process.cwd())
   })
 })

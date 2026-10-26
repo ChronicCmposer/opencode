@@ -1,38 +1,13 @@
 import { describe, expect, test } from "bun:test"
-import { deriveWorkerCount as canonicalDeriveWorkerCount } from "@/session/worker/pool"
-import { deriveWorkerCount, measureBootMemory, readRssBytes } from "./boot-memory"
-
-describe("worker count derivation", () => {
-  // WS2: `boot-memory` no longer owns sizing. It re-exports the canonical pool
-  // helper so the harness and production sizing can never drift apart.
-  test("re-exports the canonical pool sizing helper", () => {
-    expect(deriveWorkerCount).toBe(canonicalDeriveWorkerCount)
-  })
-
-  test("oversubscribes: floor(cores * factor), default factor 2", () => {
-    expect(deriveWorkerCount(4)).toBe(8)
-    expect(deriveWorkerCount(8)).toBe(16)
-  })
-
-  test("agrees with the canonical helper across core counts (incl. small machines)", () => {
-    for (const cores of [1, 2, 3, 4, 6, 8, 16, 32]) {
-      expect(deriveWorkerCount(cores)).toBe(canonicalDeriveWorkerCount(cores))
-    }
-  })
-
-  test("fails loudly on an invalid core count", () => {
-    expect(() => deriveWorkerCount(0)).toThrow(/availableParallelism/)
-    expect(() => deriveWorkerCount(2.5)).toThrow(/availableParallelism/)
-  })
-})
+import { measureBootMemory, readRssBytes } from "./boot-memory"
 
 describe("boot/memory measurement harness", () => {
   // Records raw numbers only. Per the repo convention there is deliberately NO
   // machine-dependent threshold assertion: we assert scenario completion and that
   // metrics were collected, never that boot ms or RSS falls under a bound.
   test("records per-worker boot ms and RSS at K and at K+2", async () => {
-    // Explicit `k` keeps this test booting 4 isolates rather than the
-    // oversubscribed default of `cores * 2` (which would be 8 here).
+    // Explicit `k` keeps this test booting 4 isolates; omitting it would boot
+    // the per-session default of one baseline worker plus two extra.
     const report = await measureBootMemory({ cores: 4, k: 2, extra: 2 }) // K = 2, K+2 = 4
 
     expect(report.k).toBe(2)
@@ -60,6 +35,14 @@ describe("boot/memory measurement harness", () => {
 
   test("honors an explicit k override", async () => {
     const report = await measureBootMemory({ cores: 8, k: 1, extra: 1 })
+
+    expect(report.k).toBe(1)
+    expect(report.atK.samples).toHaveLength(1)
+    expect(report.atKPlusExtra.samples).toHaveLength(2)
+  })
+
+  test("defaults to one worker per session when k is omitted", async () => {
+    const report = await measureBootMemory({ cores: 4, extra: 1 })
 
     expect(report.k).toBe(1)
     expect(report.atK.samples).toHaveLength(1)

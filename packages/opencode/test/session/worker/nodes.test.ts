@@ -411,7 +411,7 @@ describe("34a lazy production activation", () => {
     const created: number[] = []
     const poolFactory: ProductionPoolFactory = (resolveInit, _sinks) =>
       createLazyExecutorWorkerPool({
-        k: 1,
+        // Per-session dispatch materialises the worker on first use.
         create: async (id) => {
           await resolveInit()
           created.push(id)
@@ -425,7 +425,7 @@ describe("34a lazy production activation", () => {
           Effect.gen(function* () {
             const context = yield* Layer.build(
               buildProductionNode({
-                count: 1,
+                count: 0,
                 entry: EXECUTOR_FIXTURE,
                 workKind: "instant",
                 timeoutMs: 15_000,
@@ -438,7 +438,8 @@ describe("34a lazy production activation", () => {
 
             const result = yield* Effect.promise(() => hub.ensureRunning(sid("ses_activation")))
             expect(result.sessionID).toBe("ses_activation")
-            // The first dispatch resolves the init and materialises K=1 worker.
+            // The first dispatch resolves the init and materialises the session's
+            // one worker (id 1; no warm slot consumed it).
             expect(created).toEqual([1])
           }),
         ),
@@ -450,7 +451,6 @@ describe("34a lazy production activation", () => {
     let initCapabilities: unknown
     const poolFactory: ProductionPoolFactory = (resolveInit, _sinks) =>
       createLazyExecutorWorkerPool({
-        k: 1,
         create: async (id) => {
           initCapabilities = (await resolveInit()).capabilities
           return createExecutorWorker({ id, transport: instantTransport() })

@@ -20,6 +20,13 @@ import type { PromptInput, ShellInput } from "@/session/prompt"
 import type { CancelFrame, CancelPort } from "./cancel"
 import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
 import { errorTagOf, messageOf } from "./port"
+import type { DispatchOrigin } from "@/session/origin"
+import {
+  createSupervision,
+  SessionWorkerDeadError,
+  type DispatchDecision,
+  type Supervision,
+} from "./supervision"
 
 /** JSON-safe result of one session run (the full message crosses via egress). */
 export interface SessionExecutionResult {
@@ -154,6 +161,7 @@ export type SessionExecutorInbound =
     }
   | { readonly type: "cancel"; readonly id: number; readonly sessionID: SessionID }
   | { readonly type: "assertNotBusy"; readonly id: number; readonly sessionID: SessionID }
+  | { readonly type: "hasActiveWork"; readonly id: number; readonly sessionID: SessionID }
   | { readonly type: "ping"; readonly id: number }
 
 export interface SessionExecutorReady {
@@ -168,6 +176,16 @@ export interface SessionExecutorBusy {
   readonly type: "busy"
   readonly id: number
   readonly busy: boolean
+}
+/**
+ * Reply to a `hasActiveWork` probe: whether the worker still owns work that must
+ * outlive an idle turn (a running process-local background job). Distinct from
+ * `busy`, which owns the run/waiters state and gates a new prompt.
+ */
+export interface SessionExecutorActiveWork {
+  readonly type: "activeWork"
+  readonly id: number
+  readonly active: boolean
 }
 export interface SessionExecutorCancelled {
   readonly type: "cancelled"
@@ -189,6 +207,7 @@ export type SessionExecutorOutbound =
   | SessionExecutorReady
   | SessionExecutorPong
   | SessionExecutorBusy
+  | SessionExecutorActiveWork
   | SessionExecutorCancelled
   | SessionExecutorDone
   | SessionExecutorFailed
@@ -218,6 +237,14 @@ export interface SessionExecutorOptions {
    * executor's own machine answers.
    */
   readonly control?: SessionRunControl
+  /**
+   * Worker-local background-work probe. Answers whether `sessionID` still owns
+   * work that must outlive an idle turn (a running process-local background
+   * job). Deliberately separate from `control.busy`: background work must not
+   * make a new prompt fail `assertNotBusy`, but it must keep the isolate alive
+   * across an idle-reap window. Absent means "no background work".
+   */
+  readonly activeWork?: (sessionID: SessionID) => Promise<boolean>
   /**
    * Run-start seam: called once with the run's `sessionID` after the work is
    * resolved and before it executes (e.g. to rename the worker's thread).
@@ -290,6 +317,12 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
         return { type: "pong", id: message.id }
       case "assertNotBusy":
         return { type: "busy", id: message.id, busy: await busy(message.sessionID) }
+      case "hasActiveWork":
+        return {
+          type: "activeWork",
+          id: message.id,
+          active: options.activeWork === undefined ? false : await options.activeWork(message.sessionID),
+        }
       case "cancel":
         await cancel(message.sessionID)
         return { type: "cancelled", id: message.id }
@@ -316,6 +349,8 @@ export interface SessionExecutorInstallOptions {
   readonly work: SessionWorkFactory
   /** Worker-local run control; forwarded to the installed executor (Phase 4). */
   readonly control?: SessionRunControl
+  /** Worker-local background-work probe; forwarded to the installed executor. */
+  readonly activeWork?: (sessionID: SessionID) => Promise<boolean>
   /** Run-start seam; forwarded to the installed executor. */
   readonly onRunStart?: (sessionID: SessionID) => void
   readonly onIdle?: (sessionID: SessionID) => Effect.Effect<void>
@@ -346,6 +381,7 @@ export function installSessionExecutor(
     machine,
     work: options.work,
     control: options.control,
+    activeWork: options.activeWork,
     onRunStart: options.onRunStart,
   })
 
@@ -401,9 +437,14 @@ export interface ExecutorSessionWorker {
   readonly alive: boolean
   execute(run: ExecutorRun): Promise<void>
   terminate(): Promise<void>
+  /**
+   * Idle-reap liveness probe: whether the worker still owns work that must
+   * outlive an idle turn (a running process-local background job). Optional so
+   * minimal test fakes remain valid; `createExecutorWorker` always provides it.
+   * Kept distinct from `assertNotBusy`, which gates a new prompt.
+   */
+  hasActiveWork?(sessionID: SessionID): Promise<boolean>
 }
-
-export type ExecutorWorkerKind = "foreground" | "headroom"
 
 /** The transport the hub adapter needs; a worker harness handle satisfies it. */
 export interface ExecutorTransport {
@@ -425,6 +466,13 @@ export interface ExecutorTransport {
 export interface ExecutorWorker extends ExecutorSessionWorker {
   cancel(sessionID: SessionID): Promise<void>
   assertNotBusy(sessionID: SessionID): Promise<boolean>
+  /**
+   * Idle-reap liveness probe (M5): whether `sessionID` still owns a running
+   * process-local background job. The dispatcher re-arms the reap timer instead
+   * of retiring a worker that answers `true`. Distinct from `assertNotBusy`, so
+   * background work never blocks a new prompt. Optional for test fakes.
+   */
+  hasActiveWork?(sessionID: SessionID): Promise<boolean>
   resultFor(sessionID: SessionID): SessionExecutionResult | undefined
   /**
    * Cooperative cancel control port (plan 11.2). `dispatch.ts`'s
@@ -694,6 +742,26 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     return message.type === "busy" ? message.busy : false
   }
 
+  /**
+   * Ask the worker whether it still owns background work for `sessionID`. The
+   * reply crosses an isolate boundary, so `active` is re-checked at runtime: a
+   * malformed or unexpected reply fails loud instead of silently keeping (or
+   * reaping) the worker on a guess.
+   */
+  const hasActiveWork = async (sessionID: SessionID): Promise<boolean> => {
+    const message = await request(
+      (id) => ({ type: "hasActiveWork", id, sessionID }),
+      (reply) => reply.type === "activeWork",
+      waitOptions,
+    )
+    if (message.type !== "activeWork") throw new Error(`unexpected executor reply: ${message.type}`)
+    const active: unknown = message.active
+    if (typeof active !== "boolean") {
+      throw new Error(`malformed "activeWork" reply: active must be a boolean (got ${JSON.stringify(active)})`)
+    }
+    return active
+  }
+
   const cancelPort = createExecutorCancelPort({ cancel, log })
 
   return {
@@ -705,6 +773,7 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     cancel,
     cancelPort,
     assertNotBusy,
+    hasActiveWork,
     ...(options.egressBarrier === undefined
       ? {}
       : { awaitEgress: (sessionID: SessionID) => Promise.resolve(options.egressBarrier?.(sessionID)) }),
@@ -719,67 +788,71 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
 }
 
 export interface ExecutorWorkerPoolOptions {
-  readonly k: number
   /** Spawn one executor worker (production: a Bun worker + transport). */
   readonly spawn: (id: number) => ExecutorWorker
+  /** Pool-side cleanup when a session's worker is retired (e.g. init cache). */
+  readonly onSessionReleased?: (sessionID: SessionID) => void
   /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
   readonly log?: WorkerLogger
 }
 
 /** Structural mirror of dispatch's `WorkerPool` plus result/worker lookup. */
 export interface ExecutorWorkerPool {
+  /** Every worker currently materialized (retired workers are removed). */
   readonly workers: ReadonlyArray<ExecutorSessionWorker>
-  spawn(kind: ExecutorWorkerKind): ExecutorSessionWorker
+  /**
+   * Materialize one fresh worker. The dispatcher passes its registry id so the
+   * session map and the isolate agree; direct callers may omit it and let the
+   * pool assign the next monotonic id.
+   */
+  spawn(id?: number): ExecutorSessionWorker
+  /**
+   * Release a retired session's worker: drop its pool entry (when `workerID` is
+   * supplied) and run the pool's own per-session cleanup. A retired worker is no
+   * longer findable via {@link byID} or {@link resultFor}, so the pool stays
+   * bounded at the number of live sessions, not every session ever dispatched.
+   */
+  releaseSession?(sessionID: SessionID, workerID?: number): void
   terminateAll(): Promise<void>
   byID(id: number): ExecutorWorker | undefined
   resultFor(sessionID: SessionID): SessionExecutionResult | undefined
 }
 
 export function createExecutorWorkerPool(options: ExecutorWorkerPoolOptions): ExecutorWorkerPool {
-  const log = options.log ?? noopWorkerLogger
-  const foreground = Array.from({ length: options.k }, (_, index) => options.spawn(index + 1))
-  const extra: ExecutorWorker[] = []
-  // One monotonic counter shared by foreground and extra, so a slot that is
-  // terminated and replaced never reuses an id.
-  let nextId = options.k + 1
-  const all = (): ExecutorWorker[] => [...foreground, ...extra]
+  // Keyed by id for O(1) lookup and removal on retirement; insertion order is
+  // preserved so `workers` stays stable.
+  const materialized = new Map<number, ExecutorWorker>()
+  // One monotonic counter, so a retired/replacement worker never reuses an id.
+  let nextId = 1
+  const create = (id?: number): ExecutorWorker => {
+    // Honour a dispatcher-supplied id (the registry owns the monotonic source
+    // there), while direct/eager callers keep the pool's own counter. A supplied
+    // id already held by a live worker (mixed eager + dispatch use) must never
+    // overwrite it, so fall through to the next free id.
+    const workerID = id === undefined || materialized.has(id) ? nextId : id
+    nextId = Math.max(nextId, workerID + 1)
+    const worker = options.spawn(workerID)
+    materialized.set(worker.id, worker)
+    return worker
+  }
 
   return {
     get workers() {
-      return foreground.slice()
+      return [...materialized.values()]
     },
-    spawn() {
-      const worker = options.spawn(nextId++)
-      extra.push(worker)
-      // Forward the inner worker wholesale and override only `terminate`, so a
-      // newly added control-surface field never has to be re-copied by hand. A
-      // proxy (not a spread) preserves prototype methods and live accessors, so
-      // the production plain object and a class-based test double behave alike.
-      const wrapped: ExecutorWorker = new Proxy(worker, {
-        get(target, property, receiver) {
-          if (property !== "terminate") {
-            const value = Reflect.get(target, property, receiver)
-            return typeof value === "function" ? value.bind(target) : value
-          }
-          return async () => {
-            // Drop the terminated worker from the headroom set so the pool's
-            // bookkeeping tracks live workers only.
-            const index = extra.indexOf(worker)
-            if (index >= 0) extra.splice(index, 1)
-            await worker.terminate()
-          }
-        },
-      })
-      return wrapped
+    spawn: create,
+    releaseSession: (sessionID, workerID) => {
+      if (workerID !== undefined) materialized.delete(workerID)
+      options.onSessionReleased?.(sessionID)
     },
     async terminateAll() {
-      const workers = all()
-      extra.length = 0
+      const workers = [...materialized.values()]
+      materialized.clear()
       await Promise.all(workers.map((worker) => worker.terminate().catch(() => undefined)))
     },
-    byID: (id) => all().find((worker) => worker.id === id),
+    byID: (id) => materialized.get(id),
     resultFor: (sessionID) => {
-      for (const worker of all()) {
+      for (const worker of materialized.values()) {
         const result = worker.resultFor(sessionID)
         if (result !== undefined) return result
       }
@@ -804,13 +877,23 @@ export interface SessionScheduler {
 }
 
 export interface SessionDispatch {
-  /** Dispatch `sessionID` at `depth` (default 0, or `depthOf(sessionID)`) and resolve its result. */
-  ensureRunning(sessionID: SessionID, depth?: number): Promise<SessionExecutionResult>
+  /**
+   * Dispatch `sessionID` at `depth` (default 0, or `depthOf(sessionID)`) and
+   * resolve its result. `origin` defaults to `"user"`: an explicit prompt always
+   * resets crash supervision, while background/auto work fails fast on a dead
+   * session.
+   */
+  ensureRunning(sessionID: SessionID, depth?: number, origin?: DispatchOrigin): Promise<SessionExecutionResult>
   /**
    * Dispatch `sessionID` on the shell-start path, carrying `shell` to the worker
    * so it resolves the real shell work, at `depth` (default 0).
    */
-  startShell(sessionID: SessionID, shell?: ShellInput, depth?: number): Promise<SessionExecutionResult>
+  startShell(
+    sessionID: SessionID,
+    shell?: ShellInput,
+    depth?: number,
+    origin?: DispatchOrigin,
+  ): Promise<SessionExecutionResult>
   cancel(sessionID: SessionID): Promise<void>
   assertNotBusy(sessionID: SessionID): Promise<boolean>
   cancelAll(): Promise<void>
@@ -821,11 +904,13 @@ export interface SessionDispatchOptions {
   readonly pool: ExecutorWorkerPool
   /**
    * Resolve a session's subagent depth when the caller does not pass one. The
-   * production hub supplies this from its job registry, so a child session
-   * scheduled through `ensureRunning(sessionID)` still lands on headroom.
+   * production hub passes the depth explicitly on every run (from
+   * `Session.spawn`'s persisted `metadata.depth`), so it leaves this absent.
    * Defaults to 0 (a foreground root).
    */
   readonly depthOf?: (sessionID: SessionID) => number
+  /** Per-session crash policy; defaults to a fresh in-process policy. */
+  readonly supervision?: Supervision
 }
 
 /**
@@ -835,6 +920,19 @@ export interface SessionDispatchOptions {
  * owning worker.
  */
 export function createSessionDispatch(options: SessionDispatchOptions): SessionDispatch {
+  const supervision = options.supervision ?? createSupervision()
+  // Coalesced dispatches share one rejection instance: every waiter's `admit`
+  // observes the exact same crash error. Count each crash event once, not once
+  // per joined waiter, so five waiters cannot mark a session dead for one crash.
+  const countedCrashEvents = new WeakSet<object>()
+  const recordCrashOnce = (sessionID: SessionID, error: unknown): void => {
+    if (typeof error === "object" && error !== null) {
+      if (countedCrashEvents.has(error)) return
+      countedCrashEvents.add(error)
+    }
+    supervision.recordCrash(sessionID)
+  }
+
   const workerFor = (sessionID: SessionID): ExecutorWorker | undefined => {
     const workerID = options.dispatcher.registry.get(sessionID)?.workerID
     return workerID === undefined ? undefined : options.pool.byID(workerID)
@@ -846,22 +944,48 @@ export function createSessionDispatch(options: SessionDispatchOptions): SessionD
     return result
   }
 
-  /** Admit `sessionID` at its resolved depth and frame mode, then await admission. */
-  const admit = (
+  /** Fail fast when supervision forbids this dispatch before any worker spawns. */
+  const requireAdmission = (sessionID: SessionID, origin: DispatchOrigin): void => {
+    const decision: DispatchDecision = supervision.decideDispatch(sessionID, origin)
+    if (decision.kind === "allow") return
+    if (decision.kind === "dead") throw new SessionWorkerDeadError(sessionID)
+    throw new Error(`session ${sessionID} worker crashed recently; retry in ${decision.delayMs}ms`)
+  }
+
+  /**
+   * Admit `sessionID` at its resolved depth and frame mode, then await
+   * admission. A worker crash is counted per session; a successful run resets
+   * the count. The in-flight run still rejects at-most-once, so a crash never
+   * silently retries.
+   */
+  const admit = async (
     sessionID: SessionID,
     depth: number | undefined,
     mode: SessionRunMode,
     shell?: ShellInput,
-  ): Promise<void> =>
-    options.dispatcher.dispatch({
-      sessionID,
-      depth: depth ?? options.depthOf?.(sessionID) ?? 0,
-      mode,
-      ...(shell === undefined ? {} : { shell }),
-    })
+    origin: DispatchOrigin = "user",
+  ): Promise<void> => {
+    requireAdmission(sessionID, origin)
+    try {
+      await options.dispatcher.dispatch({
+        sessionID,
+        depth: depth ?? options.depthOf?.(sessionID) ?? 0,
+        mode,
+        ...(shell === undefined ? {} : { shell }),
+      })
+    } catch (error) {
+      if (errorTagOf(error) === "WorkerCrashedError") recordCrashOnce(sessionID, error)
+      throw error
+    }
+    supervision.recordHealthy(sessionID)
+  }
 
-  const ensureRunning = async (sessionID: SessionID, depth?: number): Promise<SessionExecutionResult> => {
-    await admit(sessionID, depth, "run")
+  const ensureRunning = async (
+    sessionID: SessionID,
+    depth?: number,
+    origin: DispatchOrigin = "user",
+  ): Promise<SessionExecutionResult> => {
+    await admit(sessionID, depth, "run", undefined, origin)
     return requireResult(sessionID)
   }
 
@@ -874,9 +998,10 @@ export function createSessionDispatch(options: SessionDispatchOptions): SessionD
     sessionID: SessionID,
     shell?: ShellInput,
     depth?: number,
+    origin: DispatchOrigin = "user",
   ): Promise<SessionExecutionResult> => {
     if (await assertNotBusy(sessionID)) throw new SessionBusyError({ sessionID })
-    await admit(sessionID, depth, "startShell", shell)
+    await admit(sessionID, depth, "startShell", shell, origin)
     return requireResult(sessionID)
   }
 

@@ -9,7 +9,6 @@
 // `reportedRssBytes` is an observed in-worker sample, `rssBytes` is the hub reading.
 
 import path from "node:path"
-import { deriveWorkerCount } from "@/session/worker/pool"
 import { measureBootLevels, type BootLevelSummary } from "./worker-boot"
 import { createWorkerHarness } from "./worker-harness"
 
@@ -44,7 +43,10 @@ export interface BootMemoryReport {
 export interface MeasureBootMemoryOptions {
   /** Injected core count; defaults to `os.availableParallelism()`. */
   readonly cores?: number
-  /** Baseline worker count; defaults to `deriveWorkerCount(cores)`. */
+  /**
+   * Baseline worker count. Defaults to one worker per session: v2 materializes
+   * one worker per session lazily, so there is no pool-size derivation.
+   */
   readonly k?: number
   /** Extra workers spawned beyond K. Defaults to 2 (i.e. K+2). */
   readonly extra?: number
@@ -59,10 +61,6 @@ interface BootMessage {
   readonly rssBytes: number
 }
 
-// Pool sizing is owned by the production pool module; the harness re-exports the
-// canonical helper so it can never drift from what the hub actually spawns.
-export { deriveWorkerCount }
-
 export function readRssBytes(): number {
   const rss = process.memoryUsage().rss
   if (!Number.isFinite(rss) || rss <= 0) {
@@ -75,7 +73,7 @@ export async function measureBootMemory(options: MeasureBootMemoryOptions = {}):
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const harness = createWorkerHarness({ cores: options.cores, timeoutMs })
   const cores = harness.cores
-  const k = options.k ?? deriveWorkerCount(cores)
+  const k = options.k ?? 1
   const extra = options.extra ?? DEFAULT_EXTRA_WORKERS
   const entry = options.entry ?? path.join(import.meta.dir, "../fixture/boot-worker.ts")
 

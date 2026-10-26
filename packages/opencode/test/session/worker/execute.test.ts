@@ -454,7 +454,7 @@ describe("5.7 executor robustness", () => {
     await expect(installed.dispose()).resolves.toBeUndefined()
   })
 
-  test("extra executor workers share one monotonic id and drop from the pool on terminate", async () => {
+  test("materialized workers share one monotonic id source", async () => {
     const spawnIds: number[] = []
     const transport = (): ExecutorTransport => {
       let alive = true
@@ -471,25 +471,114 @@ describe("5.7 executor robustness", () => {
       }
     }
     const pool = createExecutorWorkerPool({
-      k: 2,
       spawn: (id) => {
         spawnIds.push(id)
         return createExecutorWorker({ id, transport: transport() })
       },
     })
+    const first = pool.spawn()
+    const second = pool.spawn()
     expect(spawnIds).toEqual([1, 2])
-
-    const first = pool.spawn("headroom")
-    const second = pool.spawn("headroom")
-    expect(spawnIds).toEqual([1, 2, 3, 4])
+    expect(first.id).toBe(1)
+    expect(second.id).toBe(2)
     expect(pool.byID(first.id)).toBeDefined()
 
-    await first.terminate()
-    expect(pool.byID(first.id)).toBeUndefined()
+    const third = pool.spawn()
+    expect(third.id).toBe(3)
+    expect(pool.workers).toHaveLength(3)
 
-    const third = pool.spawn("headroom")
-    expect(third.id).toBe(5)
     await pool.terminateAll()
+    expect(pool.workers).toHaveLength(0)
+  })
+})
+
+describe("executor background-work probe", () => {
+  /** A transport that answers the last posted request with an `activeWork` frame. */
+  const probeTransport = (
+    active: unknown,
+  ): { readonly transport: ExecutorTransport; readonly posted: SessionExecutorInbound[] } => {
+    const posted: SessionExecutorInbound[] = []
+    return {
+      posted,
+      transport: {
+        post: (message) => posted.push(message),
+        waitFor: async (match) => {
+          const request = posted[posted.length - 1]!
+          const reply = { type: "activeWork", id: request.id, active } as unknown as SessionExecutorOutbound
+          if (match(reply)) return reply
+          throw new Error("no matching reply")
+        },
+        alive: true,
+        terminate: async () => 0,
+      },
+    }
+  }
+
+  test("the executor answers hasActiveWork from its background probe", () =>
+    withScope(async (scope) => {
+      const seen: SessionID[] = []
+      const executor = createSessionExecutor({
+        machine: createSessionRunMachine({ scope }),
+        work: echoWork,
+        activeWork: async (sessionID) => {
+          seen.push(sessionID)
+          return true
+        },
+      })
+
+      expect(await executor.handle({ type: "hasActiveWork", id: 1, sessionID: sid("ses_1") })).toEqual({
+        type: "activeWork",
+        id: 1,
+        active: true,
+      })
+      expect(seen).toEqual([sid("ses_1")])
+    }))
+
+  test("without a probe the executor reports no active background work", () =>
+    withScope(async (scope) => {
+      const executor = createSessionExecutor({ machine: createSessionRunMachine({ scope }), work: echoWork })
+      expect(await executor.handle({ type: "hasActiveWork", id: 2, sessionID: sid("ses_1") })).toEqual({
+        type: "activeWork",
+        id: 2,
+        active: false,
+      })
+    }))
+
+  test("active background work does not make the session busy", () =>
+    withScope(async (scope) => {
+      const executor = createSessionExecutor({
+        machine: createSessionRunMachine({ scope }),
+        work: echoWork,
+        activeWork: async () => true,
+      })
+
+      // A new prompt is still allowed: the probe is not part of `assertNotBusy`.
+      expect(await executor.handle({ type: "assertNotBusy", id: 3, sessionID: sid("ses_1") })).toEqual({
+        type: "busy",
+        id: 3,
+        busy: false,
+      })
+      expect(await executor.handle({ type: "hasActiveWork", id: 4, sessionID: sid("ses_1") })).toEqual({
+        type: "activeWork",
+        id: 4,
+        active: true,
+      })
+    }))
+
+  test("createExecutorWorker posts hasActiveWork and returns the reply", async () => {
+    const { transport, posted } = probeTransport(true)
+    const worker = createExecutorWorker({ id: 1, transport })
+
+    expect(await worker.hasActiveWork?.(sid("ses_1"))).toBe(true)
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toMatchObject({ type: "hasActiveWork", sessionID: "ses_1" })
+  })
+
+  test("a malformed hasActiveWork reply fails loud", async () => {
+    const { transport } = probeTransport("yes")
+    const worker = createExecutorWorker({ id: 1, transport })
+
+    await expect(worker.hasActiveWork?.(sid("ses_1"))).rejects.toThrow(/active must be a boolean/)
   })
 })
 
@@ -948,11 +1037,10 @@ describe("A9 the per-session results map is bounded", () => {
 describe("A10 the pool spawn wrapper exposes the cancel port", () => {
   test("a spawned pool worker carries its cancel port", async () => {
     const pool = createExecutorWorkerPool({
-      k: 1,
       spawn: (id) => createExecutorWorker({ id, transport: noopTransport() }),
     })
 
-    const spawned = pool.spawn("headroom") as ExecutorWorker
+    const spawned = pool.spawn() as ExecutorWorker
     expect(spawned.cancelPort).toBeDefined()
     await pool.terminateAll()
   })

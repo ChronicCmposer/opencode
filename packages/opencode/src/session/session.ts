@@ -35,6 +35,10 @@ import { Snapshot } from "@/snapshot"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { SessionID, MessageID, PartID } from "./schema"
+import type { SessionPrompt } from "./prompt"
+import { SessionDepth } from "./depth"
+import type { DispatchOrigin } from "./origin"
+import { SessionSpawnProxyService } from "./worker/subagent"
 
 import type { Provider } from "@/provider/provider"
 import { Global } from "@opencode-ai/core/global"
@@ -270,6 +274,44 @@ export const CreateInput = Schema.optional(
 )
 export type CreateInput = Types.DeepMutable<Schema.Schema.Type<typeof CreateInput>>
 
+/**
+ * Spawn a child session and prompt it. The child is created when `childID` is
+ * absent; either way its `metadata.depth` is stamped from the parent's explicit
+ * depth, so nesting never depends on walking the persisted parent chain.
+ */
+export interface SpawnInput {
+  readonly parentID: SessionID
+  readonly childID?: SessionID
+  readonly prompt: SessionPrompt.PromptInput
+  readonly type: string
+  readonly title?: string
+  readonly agent?: string
+  readonly model?: Schema.Schema.Type<typeof Model>
+  readonly metadata?: typeof Metadata.Type
+  /**
+   * Who asked for the child's run. A background task is `"auto"` (fail fast on a
+   * dead child worker); an explicit foreground/user spawn stays `"user"`.
+   */
+  readonly origin?: DispatchOrigin
+  /**
+   * Reject the spawn before any child exists when the child's depth would
+   * exceed this limit. Omitted means the caller enforces its own policy.
+   */
+  readonly depthLimit?: number
+}
+export interface SpawnOutput {
+  readonly childID: SessionID
+  readonly result: SessionV1.WithParts
+}
+
+/**
+ * The prompt authority's service key, resolved by its string so this module
+ * neither imports `prompt.ts` at runtime (an ESM/layer cycle) nor widens the
+ * Session layer's requirements. Present in the main process; a worker uses the
+ * hub-proxy `SessionSpawnProxyService` instead.
+ */
+const SessionPromptService = Context.Service<SessionPrompt.Interface>("@opencode/SessionPrompt")
+
 export const ForkInput = Schema.Struct({
   sessionID: SessionID,
   messageID: Schema.optional(MessageID),
@@ -413,6 +455,7 @@ export type NotFound = NotFoundError
 export interface Interface {
   readonly list: (input?: ListInput) => Effect.Effect<Info[]>
   readonly listGlobal: (input?: GlobalListInput) => Effect.Effect<GlobalInfo[]>
+  readonly spawn: (input: SpawnInput) => Effect.Effect<SpawnOutput>
   readonly create: (input?: {
     parentID?: SessionID
     title?: string
@@ -688,6 +731,65 @@ const layer: Layer.Layer<
       })
     })
 
+    const stampDepth = Effect.fnUntraced(function* (childID: SessionID, metadata: typeof Metadata.Type) {
+      const existing = yield* get(childID).pipe(Effect.orDie)
+      yield* patch(childID, { metadata: { ...existing.metadata, ...metadata } }).pipe(Effect.orDie)
+      return existing
+    })
+
+    const spawn = Effect.fn("Session.spawn")(function* (input: SpawnInput) {
+      const parent = yield* get(input.parentID).pipe(Effect.orDie)
+      const childDepth = SessionDepth.nextDepth(parent.metadata)
+      if (input.depthLimit !== undefined && SessionDepth.exceedsSubagentDepth(childDepth, input.depthLimit)) {
+        return yield* Effect.die(new Error(SessionDepth.subagentDepthMessage(input.depthLimit)))
+      }
+      const metadata = { ...input.metadata, depth: childDepth }
+      const child =
+        input.childID === undefined
+          ? yield* create({
+              parentID: input.parentID,
+              title: input.title,
+              agent: input.agent,
+              model: input.model,
+              metadata,
+            })
+          : yield* stampDepth(input.childID, metadata)
+      // The origin rides the prompt so it also crosses the hub-proxy spawn
+      // request (the worker's `Session.spawn` forwards only the prompt); an
+      // absent origin is an explicit user action.
+      const origin = input.origin ?? input.prompt.origin
+      const prompt = {
+        ...input.prompt,
+        sessionID: child.id,
+        ...(origin === undefined ? {} : { origin }),
+      }
+
+      // A worker prefers the hub-proxy spawn: the child's own per-session worker
+      // must run the prompt, never the parent's isolate. The main process has no
+      // proxy and prompts directly (flag-off and hub authority paths).
+      const proxy = yield* Effect.serviceOption(SessionSpawnProxyService)
+      if (Option.isSome(proxy)) {
+        const spawned = yield* proxy.value
+          .spawn({
+            parentID: input.parentID,
+            childID: child.id,
+            type: input.type,
+            title: input.title,
+            metadata,
+            prompt,
+          })
+          .pipe(Effect.orDie)
+        return { childID: spawned.childID, result: spawned.result }
+      }
+
+      const promptService = yield* Effect.serviceOption(SessionPromptService)
+      if (Option.isNone(promptService)) {
+        return yield* Effect.die(new Error("Session.spawn requires SessionPrompt or a session-spawn proxy"))
+      }
+      const result = yield* promptService.value.prompt(prompt).pipe(Effect.orDie)
+      return { childID: child.id, result }
+    })
+
     const fork = Effect.fn("Session.fork")(function* (input: { sessionID: SessionID; messageID?: MessageID }) {
       const ctx = yield* InstanceState.context
       const original = yield* get(input.sessionID)
@@ -906,6 +1008,7 @@ const layer: Layer.Layer<
     return Service.of({
       list,
       listGlobal,
+      spawn,
       create,
       fork,
       touch,

@@ -112,7 +112,6 @@ import {
   type PluginToolExecutor,
 } from "./plugin-tool-wire"
 import type { Hooks } from "@opencode-ai/plugin"
-import type { JobClient } from "./job-client"
 import type {
   ChatHeadersOutput,
   ChatParamsOutput,
@@ -126,8 +125,7 @@ import type {
 } from "./plugin-host"
 import { writerSqlClientLayer, type WriterSqlHandle } from "./writer-sql-client"
 import { PidReporter, type PidReporterInterface } from "./pid-registry"
-import type { JobInfo } from "./job-registry"
-import { SubagentDispatchProxyService } from "./subagent"
+import { SessionSpawnProxyService, type SessionSpawnRequest, type SessionSpawnResult } from "./subagent"
 
 export { PidReporter } from "./pid-registry"
 export type { PidReport, PidReportEntry, PidReporterInterface } from "./pid-registry"
@@ -491,18 +489,18 @@ export interface HubProxyClients {
 }
 
 /**
- * Worker-side `SubagentDispatchProxy` over the hub-proxy control port. The
- * `SessionPrompt` layer reads it optionally, so `ops.dispatchSubagent` is wired
- * exactly when a worker reaches a hub control plane.
+ * Worker-side `SessionSpawnProxy` over the hub-proxy control port. `Session.spawn`
+ * reads it optionally, so a worker forwards the spawn to the hub instead of
+ * running the child on its own isolate.
  */
-export function subagentDispatchProxyLayer(client: HubProxyClient): Layer.Layer<SubagentDispatchProxyService> {
-  return Layer.succeed(SubagentDispatchProxyService, {
-    dispatchSubagent: (request) => hubProxyCall<JobInfo>(client, "dispatchSubagent", [request]),
+export function sessionSpawnProxyLayer(client: HubProxyClient): Layer.Layer<SessionSpawnProxyService> {
+  return Layer.succeed(SessionSpawnProxyService, {
+    spawn: (request: SessionSpawnRequest) => hubProxyCall<SessionSpawnResult>(client, "session.spawn", [request]),
   })
 }
 
-/** The client the subagent-dispatch proxy multiplexes over. */
-export function subagentDispatchClient(clients: HubProxyClients): HubProxyClient {
+/** The client the session-spawn proxy multiplexes over. */
+export function sessionSpawnClient(clients: HubProxyClients): HubProxyClient {
   return clients.subagent ?? clients.sessionStatus
 }
 
@@ -933,23 +931,12 @@ export function writerDatabaseLayer(writer: WriterClientHandle): Layer.Layer<Dat
 }
 
 /**
- * The process-local `BackgroundJob` registry. Used when no hub-backed client is
- * supplied (tests / degraded boot); production overrides it with
- * {@link backgroundJobClientLayer} over the transferred job port so every
- * lifecycle transition is reported to the hub registry (plan decision 54).
+ * The process-local `BackgroundJob` registry. Per-session workers run their own
+ * background jobs; cascade cancellation reaches their child sessions through
+ * `Session.children`, so no hub-side job registry is needed.
  */
 export function localBackgroundJobLayer(): Layer.Layer<BackgroundJob.Service> {
   return Layer.effect(BackgroundJob.Service, CoreBackgroundJob.make)
-}
-
-/**
- * The hub-backed `BackgroundJob` service over a full {@link JobClient}: the
- * worker owns the run locally, the hub registry owns cross-worker coordination
- * (plan decision 54). This is the production replacement for the excluded
- * `BackgroundJob` node.
- */
-export function backgroundJobClientLayer(client: JobClient): Layer.Layer<BackgroundJob.Service> {
-  return BackgroundJob.clientLayer(client)
 }
 
 /**
@@ -1775,9 +1762,8 @@ export interface SessionLayerOptions {
    */
   readonly hubProxies?: HubProxyClients
   /**
-   * Functional `BackgroundJob` replacement. Production supplies the hub-backed
-   * client layer ({@link backgroundJobClientLayer}); the default is the
-   * process-local registry.
+   * Functional `BackgroundJob` replacement; the default is the process-local
+   * registry (per-session workers own their background jobs).
    */
   readonly backgroundJob?: Layer.Layer<BackgroundJob.Service>
   /**
@@ -1850,13 +1836,13 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
   // unchanged while the production graph sees the control-port reporter.
   const withPid =
     options.pidReporter === undefined ? built : Layer.merge(built, Layer.succeed(PidReporter, options.pidReporter))
-  // `SubagentDispatchProxy` is likewise not a graph node: `SessionPrompt.ops`
-  // reads it optionally, so a hub-reaching worker gets `dispatchSubagent` while
+  // `SessionSpawnProxy` is likewise not a graph node: `Session.spawn`
+  // reads it optionally, so a hub-reaching worker forwards `session.spawn` while
   // a degraded/hub-less graph builds unchanged (and runs sub-agents inline).
   const layer =
     options.hubProxies === undefined
       ? withPid
-      : Layer.merge(withPid, subagentDispatchProxyLayer(subagentDispatchClient(options.hubProxies)))
+      : Layer.merge(withPid, sessionSpawnProxyLayer(sessionSpawnClient(options.hubProxies)))
   // `logging` is not a graph node either: it contributes only context references
   // (the file sink + minimum level), so merging it leaves the graph and its
   // node-table assertion untouched. Absent keeps the layer unchanged.

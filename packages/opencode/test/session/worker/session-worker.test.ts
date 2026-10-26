@@ -18,13 +18,15 @@ import { ShellTool } from "@/tool/shell"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { MessageID, PartID, SessionID } from "@/session/schema"
+import { BackgroundJob } from "@/background/job"
+import { BackgroundJob as CoreBackgroundJob } from "@opencode-ai/core/background-job"
 import { Session } from "@/session/session"
 import { SessionPrompt, type PromptInput } from "@/session/prompt"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { InstanceRef } from "@/effect/instance-ref"
 import { serveWriterPort, type HubWriter } from "@/session/writer/client"
-import { WORKER_FRAME_VERSION, type EventV2Event } from "@/session/worker/frame"
+import type { EventV2Event } from "@/session/worker/frame"
 import { collectNodeNames } from "@/session/worker/node-table"
 import {
   EventEgressClientNode,
@@ -49,9 +51,11 @@ import {
   MissingWorkerPortError,
   bootstrapSessionWorker,
   buildWorkerClients,
+  createBackgroundWorkProbe,
   createControlPidReporter,
   createSessionWork,
   createWorkRegistry,
+  hasRunningBackgroundJob,
   parseSessionWorkerInit,
   productionWorkRegistry,
   reportedWorkerID,
@@ -61,7 +65,6 @@ import {
   type SessionWorkerInit,
   type SessionWorkerModel,
 } from "@/session/worker/session-worker"
-import type { JobInfo } from "@/session/worker/job-registry"
 import { workerLogMessage } from "@/session/worker/log"
 import {
   createPidRegistry,
@@ -82,11 +85,9 @@ import { provideInstance, testInstanceStoreLayer } from "../../fixture/fixture"
 import { Snapshot } from "@/snapshot"
 import { GlobalBus } from "@/bus/global"
 import { createHubEventSink } from "@/session/worker/hub"
-import { flush } from "../../lib/async"
 import { recordingLogger } from "../../lib/recorders"
 import { workerSnapshot } from "../../lib/snapshot"
 import { withParts } from "../../lib/session-parts"
-import { createJobClient, type JobPort } from "@/session/worker/job-client"
 import { startMockProvider } from "../../lib/mock-provider"
 import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
 import { assertStructuredCloneable } from "../../lib/session-worker-init"
@@ -116,6 +117,54 @@ const buildLayer = (overrides: Partial<SessionLayerOptions> = {}) =>
     modelClient: modelLayer("worker text"),
     ...overrides,
   })
+
+describe("worker background-work probe (M5)", () => {
+  const job = (overrides: Partial<BackgroundJob.Info> & Pick<BackgroundJob.Info, "id">): BackgroundJob.Info => ({
+    type: "task",
+    status: "running",
+    started_at: 1,
+    ...overrides,
+  })
+
+  test("a running job for the session keeps the worker alive", () => {
+    expect(hasRunningBackgroundJob([job({ id: "job_1", parentID: "ses_1" })], "ses_1")).toBe(true)
+  })
+
+  test("a running unparented job counts (it still owns this isolate)", () => {
+    expect(hasRunningBackgroundJob([job({ id: "job_1" })], "ses_1")).toBe(true)
+  })
+
+  test("a job for another session does not keep this worker alive", () => {
+    expect(hasRunningBackgroundJob([job({ id: "job_1", parentID: "ses_2" })], "ses_1")).toBe(false)
+  })
+
+  test("terminal jobs do not keep the worker alive", () => {
+    for (const status of ["completed", "error", "cancelled"] as const) {
+      expect(hasRunningBackgroundJob([job({ id: "job_1", parentID: "ses_1", status })], "ses_1")).toBe(false)
+    }
+    expect(hasRunningBackgroundJob([], "ses_1")).toBe(false)
+  })
+
+  test("the probe follows a real process-local job registry from running to terminal", async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const jobs = yield* CoreBackgroundJob.make
+          const probe = createBackgroundWorkProbe(jobs)
+          const sessionID = sid("ses_probe")
+          const active = () => Effect.promise(() => probe(sessionID))
+
+          expect(yield* active()).toBe(false)
+          yield* jobs.start({ id: "job_1", type: "task", parentID: sessionID, run: Effect.never })
+          expect(yield* active()).toBe(true)
+
+          yield* jobs.cancel("job_1")
+          expect(yield* active()).toBe(false)
+        }),
+      ),
+    )
+  })
+})
 
 describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () => {
   const fakeScope = () => {
@@ -148,13 +197,12 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
   const frameTypes = (frames: ReadonlyArray<{ data: unknown }>): string[] =>
     frames.map((frame) => (frame.data as { type?: string }).type ?? "")
 
-  test("transfers job, worker and hub-proxy ports when the capability is advertised", () => {
+  test("transfers worker and hub-proxy ports when the capability is advertised", () => {
     const { frames, scope } = fakeScope()
     bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope)
     const types = frameTypes(frames)
-    // The dedicated job control link is always transferred; the writer/egress/
-    // broker bundle and the hub-proxy control port join it for a full hub.
-    expect(types).toContain("job-port")
+    // The writer/egress/broker bundle and the hub-proxy control port are both
+    // transferred for a full hub.
     expect(types).toContain("ports")
     expect(types).toContain("hub-proxy")
     expect(types).toContain("ready")
@@ -175,7 +223,6 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
     const { frames, scope } = fakeScope()
     bootstrapSessionWorker(init(), scope)
     const types = frameTypes(frames)
-    expect(types).toContain("job-port")
     expect(types).toContain("ready")
     // No served ports: transferring one nobody serves would hang a session.
     expect(types).not.toContain("ports")
@@ -241,84 +288,6 @@ describe("child-result subscription (9.4)", () => {
     },
     capabilities: { sessionWorkerPorts: true },
   })
-
-  test("production installs the subscriber the hub routes settled children to", async () => {
-    const { frames, scope } = fakeScope()
-    const bootstrap = bootstrapSessionWorker(init(), scope)
-    const received = new Promise<JobInfo>((resolve) => bootstrap.onChildResult(resolve))
-
-    // Drive the hub half of the transferred job port: the registry pushes a
-    // settled child keyed by the parent session.
-    const jobFrame = frames.find((frame) => (frame.data as { type?: string }).type === "job-port")
-    expect(jobFrame).toBeDefined()
-    const hubPort = (jobFrame!.data as { port: MessagePort }).port
-    hubPort.start()
-    const result: JobInfo = {
-      id: "ses_child",
-      type: "task",
-      status: "completed",
-      started_at: 1,
-      completed_at: 2,
-      output: "done",
-      parentID: "ses_parent",
-      depth: 1,
-    }
-    hubPort.postMessage({
-      v: WORKER_FRAME_VERSION,
-      port: "job",
-      kind: "push",
-      payload: { kind: "push", type: "childResult", parentID: "ses_parent", result },
-    })
-
-    expect(await received).toMatchObject({ id: "ses_child", parentID: "ses_parent", status: "completed" })
-    bootstrap.dispose()
-    hubPort.close()
-  })
-
-  test("a disposed bootstrap unsubscribes the child-result handler", async () => {
-    const { frames, scope } = fakeScope()
-    let unsubscribed = false
-    // Wrap the real client so the test observes the subscription teardown
-    // itself, not merely the absence of a delivery (which a still-installed
-    // handler would also produce after `childResultSinks.clear()`).
-    const jobClientFactory = (port: JobPort) => {
-      const client = createJobClient(port)
-      return {
-        ...client,
-        onChildResult(handler: (result: JobInfo) => void) {
-          const unsubscribe = client.onChildResult(handler)
-          return () => {
-            unsubscribed = true
-            unsubscribe()
-          }
-        },
-      }
-    }
-    const bootstrap = bootstrapSessionWorker(init(), scope, { jobClientFactory })
-    let delivered = 0
-    bootstrap.onChildResult(() => void (delivered += 1))
-    bootstrap.dispose()
-    expect(unsubscribed).toBe(true)
-
-    const jobFrame = frames.find((frame) => (frame.data as { type?: string }).type === "job-port")!
-    const hubPort = (jobFrame.data as { port: MessagePort }).port
-    hubPort.start()
-    hubPort.postMessage({
-      v: WORKER_FRAME_VERSION,
-      port: "job",
-      kind: "push",
-      payload: {
-        kind: "push",
-        type: "childResult",
-        parentID: "ses_parent",
-        result: { id: "ses_child", type: "task", status: "completed", started_at: 1, depth: 1 },
-      },
-    })
-    // Let the queued port message run; an unsubscribed client delivers nothing.
-    await flush()
-    expect(delivered).toBe(0)
-    hubPort.close()
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -330,24 +299,25 @@ describe("buildWorkerClients (step 22)", () => {
     const writer = new MessageChannel()
     const egress = new MessageChannel()
     const broker = new MessageChannel()
-    const backgroundJob = new MessageChannel()
-    return { writer, egress, broker, backgroundJob }
+    return { writer, egress, broker }
   }
 
-  test("every port is required and a missing one fails loud", () => {
+  test("writer, egress and broker are required; the background job seam is process-local", () => {
     expect(() => buildWorkerClients({})).toThrow(MissingWorkerPortError)
     expect(() => buildWorkerClients({})).toThrow(/writer/)
 
     const channels = emptyChannels()
     expect(() => buildWorkerClients({ writer: channels.writer.port1 })).toThrow(/egress/)
     expect(() => buildWorkerClients({ writer: channels.writer.port1, egress: channels.egress.port1 })).toThrow(/broker/)
-    expect(() =>
-      buildWorkerClients({
-        writer: channels.writer.port1,
-        egress: channels.egress.port1,
-        broker: channels.broker.port1,
-      }),
-    ).toThrow(/backgroundJob/)
+
+    // No hub-side job registry remains, so the reduced client is always local
+    // and needs no transferred port.
+    const clients = buildWorkerClients({
+      writer: channels.writer.port1,
+      egress: channels.egress.port1,
+      broker: channels.broker.port1,
+    })
+    expect(typeof clients.backgroundJob.wait).toBe("function")
   })
 
   test("wires the four clients and round-trips writer publish/query over the port", async () => {
@@ -378,7 +348,6 @@ describe("buildWorkerClients (step 22)", () => {
       writer: channels.writer.port1,
       egress: channels.egress.port1,
       broker: channels.broker.port1,
-      backgroundJob: channels.backgroundJob.port1,
     })
 
     expect(typeof clients.writer.publish).toBe("function")
@@ -406,7 +375,6 @@ describe("buildWorkerClients (step 22)", () => {
       egress: channels.egress.port1,
       egressControl: control.port1,
       broker: channels.broker.port1,
-      backgroundJob: channels.backgroundJob.port1,
     })
     // The dedicated control port gives the egress client a live mesh (durable
     // ack/resync); without it `mesh` is `undefined` and the control plane dies.
@@ -419,7 +387,6 @@ describe("buildWorkerClients (step 22)", () => {
       writer: channels.writer.port1,
       egress: channels.egress.port1,
       broker: channels.broker.port1,
-      backgroundJob: channels.backgroundJob.port1,
     })
     expect(clients.egress.mesh).toBeUndefined()
   })
@@ -432,8 +399,7 @@ describe("buildWorkerClients (step 22)", () => {
         writer: channels.writer.port1,
         egress: channels.egress.port1,
         broker: channels.broker.port1,
-        backgroundJob: channels.backgroundJob.port1,
-      },
+        },
       { workerID: 4, log: recorder.log },
     )
     expect(typeof clients.writer.publish).toBe("function")

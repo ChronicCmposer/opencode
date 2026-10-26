@@ -8,6 +8,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Effect, Latch, Layer, Option, Schema, Scope, Context } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
+import type { DispatchOrigin } from "./origin"
 import { SessionStatus } from "./status"
 import { SessionHubService, type SessionHub } from "./worker/hub"
 import { SessionBusyError, type SessionExecutionResult } from "./worker/execute"
@@ -21,6 +22,7 @@ export interface Interface {
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
+    origin?: DispatchOrigin,
   ) => Effect.Effect<SessionV1.WithParts>
   readonly startShell: (
     sessionID: SessionID,
@@ -85,13 +87,11 @@ export const layer = Layer.effect(
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
       const hub = yield* hubIfEnabled
       if (hub !== undefined) {
-        // The hub cancels the session AND cascades to its subagent children,
-        // reporting which descendants need the fallback idle. Phase 6.1 parity:
-        // background subagents/jobs must not outlive the cancel — in flag-on they
-        // live in the hub registry, not the process-local `BackgroundJob`, so the
-        // bridge marks them cancelled too.
+        // The hub cancels the session; `SessionPrompt.cancel` has already walked
+        // `Session.children` children-first, so this call only needs the
+        // session's own outcome and fallback idle.
         const report = yield* Effect.promise(() => hub.cancelWithReport(sessionID))
-        yield* cancelBackgroundJobs(background, sessionID, hub.jobs)
+        yield* cancelBackgroundJobs(background, sessionID)
         // Single-idle authority, extended to the subagent cascade. The worker
         // publishes its own terminal idle only for a cooperative settle or a
         // natural completion; a queued or grace-terminated child never does, so
@@ -131,10 +131,13 @@ export const layer = Layer.effect(
       sessionID: SessionID,
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
+      origin?: DispatchOrigin,
     ) {
       const hub = yield* hubIfEnabled
       if (hub !== undefined) {
-        return yield* Effect.promise(() => hub.ensureRunning(sessionID)).pipe(Effect.flatMap(parseSessionResult))
+        return yield* Effect.promise(() => hub.ensureRunning(sessionID, origin)).pipe(
+          Effect.flatMap(parseSessionResult),
+        )
       }
       const runners = yield* InstanceState.get(state)
       return yield* runners.ensureRunning(sessionID, work, onInterrupt)
@@ -178,32 +181,9 @@ export const layer = Layer.effect(
   }),
 )
 
-/**
- * The slice of the hub's cross-worker job registry `cancelBackgroundJobs` needs.
- * Structural so `run-state.ts` depends on neither the hub nor `job-registry.ts`;
- * `JobRegistry` satisfies it exactly.
- */
-interface HubJob {
-  readonly id: string
-  readonly status: string
-  readonly parentID?: string
-  readonly metadata?: Record<string, unknown>
-}
-
-interface HubJobRegistry {
-  list(): ReadonlyArray<HubJob>
-  cancel(id: string): unknown
-}
-
-const metadataString = (metadata: Record<string, unknown> | undefined, key: string): string | undefined => {
-  const value = metadata?.[key]
-  return typeof value === "string" ? value : undefined
-}
-
 const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(function* (
   background: BackgroundJob.Interface,
   sessionID: SessionID,
-  hubJobs?: HubJobRegistry,
 ) {
   // Bounded, transitive cancel: a matched job joins the pending set, so its own
   // children (matched by `sessionId`/`parentSessionId`) are cancelled next round.
@@ -237,32 +217,6 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
     batch = jobs.filter(matches)
   }
 
-  // Flag-on bridge: a subagent's job lives in the hub registry, not the
-  // process-local `BackgroundJob`, so the dispatcher cascade is the only thing
-  // that reaches it — and it reaches only registry-linked children. Match the
-  // hub jobs by the same `metadata.parentSessionId`/`sessionId` the task tool
-  // writes, so a worker job the cascade missed is still marked cancelled.
-  if (hubJobs === undefined) return
-  const hubMatches = (job: HubJob) => {
-    if (job.status !== "running") return false
-    if (cancelled.has(job.id)) return false
-    if (pending.has(job.id)) return true
-    const hubSessionID = metadataString(job.metadata, "sessionId")
-    if (hubSessionID !== undefined && pending.has(hubSessionID)) return true
-    const parentSessionID = job.parentID ?? metadataString(job.metadata, "parentSessionId")
-    return parentSessionID !== undefined && pending.has(parentSessionID)
-  }
-  let hubBatch = hubJobs.list().filter(hubMatches)
-  while (hubBatch.length > 0) {
-    for (const job of hubBatch) {
-      hubJobs.cancel(job.id)
-      cancelled.add(job.id)
-      pending.add(job.id)
-      const hubSessionID = metadataString(job.metadata, "sessionId")
-      if (hubSessionID !== undefined) pending.add(hubSessionID)
-    }
-    hubBatch = hubJobs.list().filter(hubMatches)
-  }
 })
 
 function busyError(sessionID: SessionID) {

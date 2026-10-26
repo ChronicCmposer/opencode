@@ -18,7 +18,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createBroker } from "@/session/broker/broker"
 import { createWriterClient } from "@/session/writer/client"
-import type { ExecutorSessionWorker, ExecutorWorkerKind, ExecutorWorkerPool } from "@/session/worker/execute"
+import type { ExecutorSessionWorker, ExecutorWorkerPool } from "@/session/worker/execute"
 import { createProductionSessionHub } from "@/session/worker/hub"
 import { pollUntil } from "../../lib/poll"
 import { sessionWorkerInit } from "../../lib/session-worker-init"
@@ -61,7 +61,7 @@ function inertPool(count: number): ExecutorWorkerPool {
   })
   return {
     workers: Array.from({ length: count }, (_, index) => worker(index + 1)),
-    spawn: (_kind: ExecutorWorkerKind) => worker(count + 1),
+    spawn: () => worker(count + 1),
     terminateAll: async () => {},
     byID: () => undefined,
     resultFor: () => undefined,

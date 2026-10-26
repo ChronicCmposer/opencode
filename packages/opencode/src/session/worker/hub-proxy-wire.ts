@@ -9,8 +9,7 @@
 // `serveHubProxy` workaround.
 
 import { createRequestChannel, errorTagOf, messageOf, workerFrameChannel } from "./port"
-import type { JobInfo } from "./job-registry"
-import type { SubagentDispatchRequest } from "./subagent"
+import type { SessionSpawnRequest, SessionSpawnResult } from "./subagent"
 
 export type HubProxyRequest = {
   readonly kind: "request"
@@ -73,7 +72,7 @@ export type HubProxyMethod =
   | "pluginTool.execute"
   | "pluginTool.list"
   | "pluginTool.abort"
-  | "dispatchSubagent"
+  | "session.spawn"
 
 /** A typed failure returned by a hub authority across the port. */
 export class HubProxyRemoteError extends Error {
@@ -105,11 +104,11 @@ export interface HubProxyClient {
     onEvent?: (method: string, payload: unknown) => void,
   ) => Promise<unknown>
   /**
-   * The typed subagent-dispatch RPC (Solution 1). Optional so lightweight test
-   * doubles (`{ call, dispose }`) remain assignable; the multiplexed client
-   * always installs it.
+   * The typed session-spawn RPC. Optional so lightweight test doubles
+   * (`{ call, dispose }`) remain assignable; the multiplexed client always
+   * installs it.
    */
-  readonly dispatchSubagent?: (request: SubagentDispatchRequest) => Promise<JobInfo>
+  readonly spawn?: (request: SessionSpawnRequest) => Promise<SessionSpawnResult>
   dispose(): void
 }
 
@@ -179,7 +178,7 @@ export function createHubProxyClient(port: MessagePort, options: HubProxyClientO
 
   return {
     call,
-    dispatchSubagent: (request) => call("dispatchSubagent", [request]) as Promise<JobInfo>,
+    spawn: (request) => call("session.spawn", [request]) as Promise<SessionSpawnResult>,
     dispose: () => requests.dispose(),
   }
 }

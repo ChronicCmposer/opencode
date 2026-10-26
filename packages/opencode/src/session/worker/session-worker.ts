@@ -1,9 +1,10 @@
 // Phase 12 — production session-worker entry.
 //
 // This is the isolate the hub's `createBunExecutorWorkerPool` spawns. It builds
-// the reduced session layer (`buildSessionWorkerLayer`, Phase 6), wires the four
-// Wave-1 port-backed clients (writer / egress / broker / background-job) and
-// installs the executor with the real session work kind.
+// the reduced session layer (`buildSessionWorkerLayer`, Phase 6), wires the
+// port-backed clients (writer / egress / broker), installs a process-local
+// background-job registry, and installs the executor with the real session work
+// kind.
 //
 // Initialisation arrives through `workerData` (structured-cloned, never a
 // closure): the immutable `WorkerSnapshot`, the `WorkerEnv` overlay, and the
@@ -12,7 +13,8 @@
 //
 // Protocol: the `execute.ts` frame protocol over the default worker channel.
 // The worker additionally transfers its writer / egress / broker ports and its
-// dedicated job control link to the hub.
+// hub-proxy control port to the hub. (The old dedicated job control link was
+// removed with the per-session worker refactor; background jobs stay local.)
 //
 // Thread naming (Linux-only, fail-soft): the isolate names its OS thread so
 // `ps -T`/`top -H`/htop label the slot instead of the process (htop needs
@@ -22,13 +24,15 @@
 // `comm` limit (see `@/util/thread-name`).
 
 import { threadId, workerData } from "node:worker_threads"
-import { Cause, Effect, Fiber, Layer, Option } from "effect"
+import { Cause, Context, Effect, Exit, Fiber, Layer, Option, Scope } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { isRole, setProcessRole } from "@/effect/process-role"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { AppProcess } from "@opencode-ai/core/process"
+import { BackgroundJob } from "@/background/job"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRunState } from "@/session/run-state"
+import type { SessionID } from "@/session/schema"
 import { Snapshot } from "@/snapshot"
 import { InstanceRef } from "@/effect/instance-ref"
 import { EffectBridge } from "@/effect/bridge"
@@ -38,18 +42,11 @@ import { Provider } from "@/provider/provider"
 import { createWorkerWriterClient, type WorkerWriterClient } from "./writer-client"
 import { createWorkerEgressClient, type WorkerEgressClient } from "./egress-client"
 import { createWorkerBrokerClient } from "./broker-client"
-import {
-  createBackgroundJobClient,
-  createJobClient,
-  jobPortFromMessagePort,
-  type JobClient,
-  type JobPort,
-} from "./job-client"
 import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
 import { workerLoggingLayer } from "./worker-logging"
 import { messageOf } from "./port"
 import { sessionThreadName } from "./thread-name"
-import type { JobInfo } from "./job-registry"
+import { createThreadNamer } from "./thread-naming"
 import {
   DEFAULT_WORK_KIND,
   UnknownWorkKindError,
@@ -70,7 +67,7 @@ import {
 import {
   SessionPipeline,
   PIPELINE_SESSION_NODES,
-  backgroundJobClientLayer,
+  localBackgroundJobLayer,
   buildSessionWorkerLayer,
   createHubProxyClient,
   llmModelClientLayer,
@@ -165,6 +162,11 @@ export interface SessionWorkerInit {
    */
   readonly workerID?: number
   /**
+   * The session this isolate is bound to at boot, when the hub knows it. Drives
+   * the thread-naming seam (`onBind`) before the first run arrives.
+   */
+  readonly sessionID?: string
+  /**
    * Worker-hosted plugin hooks (Phase 6.3, plan decision 70): the hub owns plugin
    * loading but the model-facing `chat.params`/`chat.headers` hooks run in the
    * isolate. Supplied when the hub can hand the loaded hooks across (in-process
@@ -239,6 +241,11 @@ export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
     throw new Error(`session worker workerData.workerID must be a non-negative integer, received ${workerID}`)
   }
 
+  const sessionID = candidate.sessionID
+  if (sessionID !== undefined && typeof sessionID !== "string") {
+    throw new Error(`session worker workerData.sessionID must be a string, received ${typeof sessionID}`)
+  }
+
   const plugins = candidate.plugins
   if (plugins !== undefined && !Array.isArray(plugins)) {
     throw new Error("session worker workerData.plugins must be an array when present")
@@ -260,6 +267,7 @@ export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
     role,
     ...(candidate.capabilities === undefined ? {} : { capabilities: candidate.capabilities }),
     ...(workerID === undefined ? {} : { workerID }),
+    ...(sessionID === undefined ? {} : { sessionID }),
     ...(plugins === undefined ? {} : { plugins }),
     ...(pluginTools === undefined ? {} : { pluginTools }),
   }
@@ -276,7 +284,6 @@ export interface WorkerClientPorts {
   /** Optional dedicated egress control (mesh) port. */
   readonly egressControl?: MessagePort | undefined
   readonly broker?: MessagePort | undefined
-  readonly backgroundJob?: MessagePort | undefined
 }
 
 /** Raised when a required worker client port was not supplied. */
@@ -299,9 +306,10 @@ function requirePort(port: MessagePort | undefined, field: string): MessagePort 
 const transferable = (port: MessagePort): Transferable => port as unknown as Transferable
 
 /**
- * The four client handles the reduced session layer installs. The writer is the
- * full `WorkerWriterClient`, so the production worker can build a real
- * writer-backed `Database` (statements AND `begin`/`txQuery`/`commit`/`rollback`).
+ * The client handles the reduced session layer installs. The writer is the full
+ * `WorkerWriterClient`, so the production worker can build a real writer-backed
+ * `Database` (statements AND `begin`/`txQuery`/`commit`/`rollback`). The
+ * background-job handle is process-local (the hub no longer serves a job port).
  */
 export interface WorkerClients {
   readonly writer: WorkerWriterClient
@@ -312,12 +320,8 @@ export interface WorkerClients {
 }
 
 /**
- * Wire the four Wave-1 port-backed clients. Every port is required: a missing
- * one fails loud rather than degrading to a mock that silently drops writes.
- *
- * A pre-built `jobClient` may be supplied so the same `MessagePort` backs both
- * the reduced `BackgroundJobClientHandle` seam and the real `BackgroundJob`
- * node; two clients on one port would steal each other's replies.
+ * Wire the port-backed clients. Every port is required: a missing one fails loud
+ * rather than degrading to a mock that silently drops writes.
  *
  * `workerID`, when supplied, is threaded onto every client so their E2 lifecycle
  * log lines carry the worker's owner id. It is omitted (never fabricated) when
@@ -329,12 +333,11 @@ export interface WorkerClients {
  */
 export function buildWorkerClients(
   ports: WorkerClientPorts,
-  options: { jobClient?: JobClient; workerID?: number; log?: WorkerLogger } = {},
+  options: { workerID?: number; log?: WorkerLogger } = {},
 ): WorkerClients {
   const writer = requirePort(ports.writer, "writer")
   const egress = requirePort(ports.egress, "egress")
   const broker = requirePort(ports.broker, "broker")
-  const job = options.jobClient ?? createBackgroundJobClient(requirePort(ports.backgroundJob, "backgroundJob"))
   const workerID = options.workerID
   const withLog = options.log === undefined ? {} : { log: options.log }
   return {
@@ -351,36 +354,25 @@ export function buildWorkerClients(
       ...(workerID === undefined ? {} : { workerID }),
       ...withLog,
     }),
-    backgroundJob: backgroundJobHandle(job),
+    backgroundJob: idleBackgroundJobClient,
   }
 }
 
-/** Narrow the full job client to the reduced `BackgroundJobClientHandle` seam. */
-function backgroundJobHandle(client: Pick<JobClient, "wait" | "cancel">): BackgroundJobClientHandle {
-  return { wait: (id, timeoutMs) => client.wait(id, timeoutMs), cancel: (id) => client.cancel(id) }
+// The worker's `BackgroundJob` registry is process-local, so the reduced
+// `BackgroundJobClientHandle` seam has no hub counterpart anymore; it stays for
+// degraded boot wiring but is never read there.
+const idleBackgroundJobClient: BackgroundJobClientHandle = {
+  wait: async () => ({ timedOut: true }),
+  cancel: async () => {},
 }
 
 // ---------------------------------------------------------------------------
-// Child-result routing (9.4 handshake).
+// Session-worker bootstrap handle.
 // ---------------------------------------------------------------------------
 
-/**
- * A settled subagent result the hub registry routes to the worker hosting the
- * child's `parentID`. The worker subscribes once at boot; consumers attach
- * through {@link SessionWorkerBootstrap.onChildResult}.
- */
-export type ChildResultSink = (result: JobInfo) => void
-
-/**
- * The handle {@link bootstrapSessionWorker} returns: the registration handshake
- * for hub-routed child results plus teardown. The subscription is installed
- * unconditionally in production, so a routed child result is never silently
- * dropped; a consumer (or test) attaches a {@link ChildResultSink}.
- */
+/** The handle {@link bootstrapSessionWorker} returns: teardown plus live seams. */
 export interface SessionWorkerBootstrap {
-  /** Subscribe to settled child results routed to this worker; returns an unsubscribe. */
-  onChildResult(sink: ChildResultSink): () => void
-  /** Tear down the bootstrapped child-result subscription. */
+  /** Tear down the bootstrapped worker state. */
   dispose(): void
   /**
    * The hub-proxied plugin-tool abort seam (see {@link hubProxyPluginToolAbort}),
@@ -646,6 +638,32 @@ export function createSessionWork(options: SessionWorkOptions): SessionWork {
   }
 }
 
+/**
+ * Whether `sessionID` still owns a running process-local background job. A
+ * per-session worker only starts jobs for its own session, but an unparented
+ * job still owns the isolate, so both count. Terminal jobs (`completed`,
+ * `error`, `cancelled`) are retained by the registry and must not keep the
+ * worker pinned.
+ */
+export function hasRunningBackgroundJob(jobs: readonly BackgroundJob.Info[], sessionID: string): boolean {
+  return jobs.some(
+    (job) => job.status === "running" && (job.parentID === undefined || job.parentID === sessionID),
+  )
+}
+
+/**
+ * The worker-side `hasActiveWork` probe: consult the process-local
+ * `BackgroundJob.Service.list()` (not the run/waiters state) so a background
+ * job keeps the isolate alive across an idle-reap window without making a new
+ * prompt fail `assertNotBusy`.
+ */
+export function createBackgroundWorkProbe(
+  jobs: BackgroundJob.Interface,
+): (sessionID: SessionID) => Promise<boolean> {
+  return (sessionID) =>
+    Effect.runPromise(jobs.list().pipe(Effect.map((running) => hasRunningBackgroundJob(running, sessionID))))
+}
+
 /** An explicit work-kind registry; an unknown kind is a typed error. */
 export type WorkFactories = Readonly<Record<string, SessionWork>>
 
@@ -869,12 +887,6 @@ export interface BootstrapSessionWorkerOptions {
    * `log` reaches the reporter's E4 `pid report failed` line.
    */
   readonly pidReporterFactory?: ControlPidReporterFactory
-  /**
-   * Test seam: build the job control client. Defaults to `createJobClient`, so
-   * production is unchanged; a test can wrap the client to observe the
-   * child-result subscription lifecycle.
-   */
-  readonly jobClientFactory?: (port: JobPort) => JobClient
 }
 
 /**
@@ -897,10 +909,11 @@ function servesWorkerPorts(capabilities: SessionWorkerCapabilities | undefined):
  * tests can import this module (`buildWorkerClients`, the registry) without a
  * worker context; the module only bootstraps when `workerData` is present.
  *
- * The dedicated job control link is always transferred. The writer / egress
- * (plus its dedicated control plane) / broker ports are transferred only when
- * the hub advertises `capabilities.sessionWorkerPorts`, because a port nobody
- * serves would make a session hang; the production hub serves all four.
+ * The writer / egress (plus its dedicated control plane) / broker ports are
+ * transferred only when the hub advertises `capabilities.sessionWorkerPorts`,
+ * because a port nobody serves would make a session hang; the production hub
+ * serves all of them. There is no dedicated job control link (background jobs
+ * are process-local), and the hub-proxy control port is transferred separately.
  *
  * Returns the child-result registration handshake so a caller can subscribe to
  * settled subagents the hub routes to this worker (and tear the subscription
@@ -919,20 +932,12 @@ export function bootstrapSessionWorker(
     options.pidReporterFactory ??
     ((port: MessagePort, workerID: number, forwarded: WorkerLogger) =>
       createControlPidReporter(port, workerID, { log: forwarded }))
-  const jobChannel = new MessageChannel()
-  scope.postMessage({ type: "job-port", port: jobChannel.port2 }, [transferable(jobChannel.port2)])
-  // One full job client backs both the reduced `BackgroundJobClientHandle` seam
-  // and the real `BackgroundJob` node (a second client on the same port would
-  // steal replies).
-  const jobClient = (options.jobClientFactory ?? createJobClient)(jobPortFromMessagePort(jobChannel.port1))
-  // The hub registry routes a settled child to the worker hosting its
-  // `parentID`; subscribe at boot so the push reaches consumers. The sink set is
-  // the registration handshake returned to the caller.
-  const childResultSinks = new Set<ChildResultSink>()
-  const unsubscribeChildResults = jobClient.onChildResult((result) => {
-    for (const sink of [...childResultSinks]) sink(result)
-  })
-
+  // Thread-naming lifecycle seam (N slice): bind at boot when the hub shipped
+  // the session, then toggle running/idle per run and clear on dispose.
+  const namer = createThreadNamer({ setName: setThreadName })
+  // Bind before the first run so a pre-run `onIdle`/dispose names the right
+  // session; the module boot already applied the same name from `workerData`.
+  if (init.sessionID !== undefined) namer.onBind(init.sessionID)
   let clients: WorkerClients
   let hubProxies: HubProxyClients | undefined
   let pidReporter: PidReporterInterface | undefined
@@ -964,7 +969,7 @@ export function bootstrapSessionWorker(
         egressControl: egressControlChannel.port1,
         broker: brokerChannel.port1,
       },
-      { jobClient, workerID: reportedWorkerID(init, threadId), log },
+      { workerID: reportedWorkerID(init, threadId), log },
     )
     // The hub serves the `SessionStatus` / `Permission` / `Question`
     // authorities over one control port; a single multiplexing client backs all
@@ -978,7 +983,7 @@ export function bootstrapSessionWorker(
     // two frame shapes). Only the full-port boot owns children.
     pidReporter = createPidReporter(hubProxyChannel.port1, reportedWorkerID(init, threadId), log)
   } else {
-    clients = directClients(backgroundJobHandle(jobClient))
+    clients = directClients(idleBackgroundJobClient)
   }
 
   const config = modelConfig(init.model)
@@ -1035,6 +1040,18 @@ export function bootstrapSessionWorker(
     Layer.provide(reducedLlmLayer(init.snapshot, config, hubProxies, plugins, pluginTools)),
   )
 
+  // One process-local `BackgroundJob` registry per worker, built on a scope that
+  // lives for the isolate. `createSessionWork` provides the graph layer per run,
+  // so a `Layer.effect` registry would be rebuilt (and its jobs interrupted) at
+  // every turn boundary; a single `Layer.succeed` value keeps a background job
+  // alive after the turn that started it, which the idle-reap probe observes.
+  const backgroundJobScope = Effect.runSync(Scope.make())
+  const backgroundJobContext = Effect.runSync(
+    Layer.buildWithScope(localBackgroundJobLayer(), backgroundJobScope),
+  )
+  const backgroundJobs = Context.get(backgroundJobContext, BackgroundJob.Service)
+  const backgroundJobLayer = Layer.succeed(BackgroundJob.Service, backgroundJobs)
+
   const runtime = buildSessionWorkerLayer({
     // The full runnable graph needs the writer-backed Database and the serialized
     // model catalog the hub ships; the degraded boot runs the reduced pipeline.
@@ -1046,7 +1063,7 @@ export function bootstrapSessionWorker(
     env: init.env,
     clients,
     modelClient,
-    backgroundJob: backgroundJobClientLayer(jobClient),
+    backgroundJob: backgroundJobLayer,
     // The worker serves exactly one serialized model, so the reduced provider is
     // the graph's provider (the real loop's `LLM` and `SessionPrompt` use it), and
     // snapshot tracking is a fail-soft no-op (the isolate cannot run `git`). With
@@ -1091,6 +1108,10 @@ export function bootstrapSessionWorker(
       cancel: (sessionID) => control?.cancel(sessionID) ?? Promise.resolve(),
       busy: (sessionID) => control?.busy(sessionID) ?? Promise.resolve(false),
     },
+    // A running process-local background job keeps the isolate alive across an
+    // idle-reap window (M5). Kept separate from `busy`: a background job must
+    // never block the next prompt.
+    activeWork: createBackgroundWorkProbe(backgroundJobs),
     // Dynamic OS thread name (Linux-only, fail-soft): `ocs<slot>` at rest and
     // `ocs<slot>:<last6>` while a run is live. `onIdle` fires on every terminal
     // (settle, cooperative cancel, interrupt), so the name always resets. Both
@@ -1099,19 +1120,17 @@ export function bootstrapSessionWorker(
     ...(slot === undefined
       ? {}
       : {
-          onRunStart: (sessionID) => setThreadName(sessionThreadName(slot, sessionID)),
-          onIdle: () => Effect.sync(() => setThreadName(sessionThreadName(slot))),
+          onRunStart: (sessionID) => namer.onRunStart(sessionID),
+          onIdle: () => Effect.sync(() => namer.onIdle()),
         }),
   })
 
   return {
-    onChildResult(sink) {
-      childResultSinks.add(sink)
-      return () => childResultSinks.delete(sink)
-    },
     dispose() {
-      unsubscribeChildResults()
-      childResultSinks.clear()
+      namer.onDispose()
+      // The registry scope outlives every run, so close it explicitly with the
+      // worker bootstrap; a still-running job is interrupted with the isolate.
+      void Effect.runPromise(Scope.close(backgroundJobScope, Exit.void)).catch(() => undefined)
     },
     ...(pluginToolAbort === undefined ? {} : { pluginToolAbort }),
     ...(pluginToolList === undefined ? {} : { pluginToolList }),
@@ -1147,6 +1166,7 @@ if (workerData !== null && workerData !== undefined) {
   setProcessRole(init.role)
   // Name the OS thread for its slot before any heavy bootstrap. Fail-soft and
   // Linux-only (see `@/util/thread-name`); skipped when the hub shipped no slot.
-  if (init.workerID !== undefined) setThreadName(sessionThreadName(init.workerID))
+  if (init.sessionID !== undefined) setThreadName(sessionThreadName(init.sessionID))
+  else if (init.workerID !== undefined) setThreadName(sessionThreadName(String(init.workerID)))
   bootstrapSessionWorker(init, globalThis as unknown as WorkerScope)
 }

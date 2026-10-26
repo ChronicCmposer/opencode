@@ -1,15 +1,18 @@
 // Step 2 — harness for the real session-worker entry.
 //
 // `bootSessionWorker` spawns `src/session/worker/session-worker.ts` with a
-// structured-cloned `SessionWorkerInit` as `workerData`, then observes its two
-// control frames:
+// structured-cloned `SessionWorkerInit` as `workerData`, then waits for the
+// executor's `{type:"ready", threadId}` handshake. On a full boot the entry also
+// transfers its worker-port channels before that handshake:
 //
-//   * `{type:"job-port", port}` — the worker's dedicated job control link
-//     (transferred before `ready`), surfaced as `jobPort`;
-//   * `{type:"ready", threadId}` — the executor's readiness announcement.
+//   * `{type:"ports", writer, egress, egressControl, broker}` — the writer,
+//     egress (plus dedicated control) and broker relays;
+//   * `{type:"hub-proxy", port}` — the multiplexed hub control link.
 //
-// It exposes an `ExecutorTransport` (`port`) plus `terminate`, reusing the shared
-// worker harness and `test/lib/transport.ts`'s adapter rather than re-implementing
+// Those frames are captured from the buffered messages once `ready` arrives; a
+// degraded boot (`sessionWorkerPorts` unset) sends only `ready`. It exposes an
+// `ExecutorTransport` (`port`) plus `terminate`, reusing the shared worker
+// harness and `test/lib/transport.ts`'s adapter rather than re-implementing
 // message buffering.
 
 import type { ExecutorTransport, SessionExecutorInbound, SessionExecutorOutbound } from "@/session/worker/execute"
@@ -27,9 +30,17 @@ export interface SessionWorkerReady {
   readonly threadId: number
 }
 
-/** The worker's transferred job control link frame. */
-export interface SessionJobPortFrame {
-  readonly type: "job-port"
+/** The worker's transferred relay ports (full hub-port boot only). */
+export interface SessionWorkerPorts {
+  readonly writer: MessagePort
+  readonly egress: MessagePort
+  readonly egressControl?: MessagePort
+  readonly broker: MessagePort
+}
+
+/** The worker's transferred hub control link (full hub-port boot only). */
+export interface SessionHubProxyFrame {
+  readonly type: "hub-proxy"
   readonly port: MessagePort
 }
 
@@ -49,8 +60,10 @@ export interface SessionWorkerHandle extends AsyncDisposable {
   readonly port: ExecutorTransport
   /** The underlying harness worker (for lower-level frame inspection). */
   readonly worker: HarnessWorker<SessionExecutorOutbound, SessionExecutorInbound>
-  /** The worker's transferred job control link, once observed. */
-  readonly jobPort: MessagePort | undefined
+  /** The worker's relay ports, when it booted with hub-served ports. */
+  readonly ports: SessionWorkerPorts | undefined
+  /** The worker's hub control link, when it booted with hub-served ports. */
+  readonly hubProxyPort: MessagePort | undefined
   /** The observed readiness frame. */
   readonly ready: SessionWorkerReady
   readonly harness: WorkerHarness
@@ -59,22 +72,57 @@ export interface SessionWorkerHandle extends AsyncDisposable {
 
 const DEFAULT_BOOT_TIMEOUT_MS = 15_000
 
-/** Find the most recent transferred port frame in a worker's buffered messages. */
-function findJobPort(messages: ReadonlyArray<unknown>): MessagePort | undefined {
+const isMessagePort = (value: unknown): value is MessagePort =>
+  typeof MessagePort !== "undefined" && value instanceof MessagePort
+
+/** A frame that claims to carry a port must carry a real one; a malformed boot frame fails loud. */
+function requireMessagePort(value: unknown, frameType: string, field: string): MessagePort {
+  if (!isMessagePort(value)) {
+    throw new Error(`"${frameType}" boot frame is missing a MessagePort "${field}" (received ${typeof value})`)
+  }
+  return value
+}
+
+/** Find the most recent transferred relay-ports frame in the buffered messages. */
+function findPorts(messages: ReadonlyArray<unknown>): SessionWorkerPorts | undefined {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const frame = messages[index]
     if (frame === null || typeof frame !== "object") continue
-    if ((frame as { readonly type?: unknown }).type !== "job-port") continue
-    const port = (frame as { readonly port?: unknown }).port
-    if (typeof MessagePort !== "undefined" && port instanceof MessagePort) return port
+    if ((frame as { readonly type?: unknown }).type !== "ports") continue
+    const candidate = frame as {
+      readonly writer?: unknown
+      readonly egress?: unknown
+      readonly egressControl?: unknown
+      readonly broker?: unknown
+    }
+    return {
+      writer: requireMessagePort(candidate.writer, "ports", "writer"),
+      egress: requireMessagePort(candidate.egress, "ports", "egress"),
+      ...(candidate.egressControl === undefined
+        ? {}
+        : { egressControl: requireMessagePort(candidate.egressControl, "ports", "egressControl") }),
+      broker: requireMessagePort(candidate.broker, "ports", "broker"),
+    }
+  }
+  return undefined
+}
+
+/** Find the most recent transferred hub-proxy port frame in the buffered messages. */
+function findHubProxyPort(messages: ReadonlyArray<unknown>): MessagePort | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const frame = messages[index]
+    if (frame === null || typeof frame !== "object") continue
+    if ((frame as { readonly type?: unknown }).type !== "hub-proxy") continue
+    return requireMessagePort((frame as { readonly port?: unknown }).port, "hub-proxy", "port")
   }
   return undefined
 }
 
 /**
- * Spawn the production entry and resolve once its `ready` (and transferred
- * `job-port`) frames are observed. The returned handle owns the isolate:
- * `terminate()` closes the job port and tears the worker down.
+ * Spawn the production entry and resolve once its `ready` handshake is observed;
+ * any relay ports posted before it are captured from the same buffered stream.
+ * The returned handle owns the isolate: `terminate()` closes the transferred
+ * ports and tears the worker down.
  */
 export async function bootSessionWorker(options: BootSessionWorkerOptions = {}): Promise<SessionWorkerHandle> {
   const ownsHarness = options.harness === undefined
@@ -85,18 +133,24 @@ export async function bootSessionWorker(options: BootSessionWorkerOptions = {}):
   })
   const port = adaptTransport(worker)
 
-  // The entry posts `job-port` at module top level, before `installSessionExecutor`
-  // announces `ready`; awaiting both is safe because buffered frames resolve.
+  // `ready` is the terminal boot frame: the entry posts its relay ports before
+  // installing the executor, so once it arrives the frames are already buffered.
   const ready = (await worker.waitFor("ready")) as SessionWorkerReady
-  await worker.waitFor("job-port")
-  const jobPort = findJobPort(worker.messages)
+  const ports = findPorts(worker.messages)
+  const hubProxyPort = findHubProxyPort(worker.messages)
+
+  const closePorts = () => {
+    for (const transferred of [ports?.writer, ports?.egress, ports?.egressControl, ports?.broker, hubProxyPort]) {
+      try {
+        transferred?.close()
+      } catch {
+        // The port may already be closed with the isolate; termination still proceeds.
+      }
+    }
+  }
 
   const terminate = async (code = 0): Promise<number> => {
-    try {
-      jobPort?.close()
-    } catch {
-      // The port may already be closed with the isolate; termination still proceeds.
-    }
+    closePorts()
     if (ownsHarness) {
       await harness.dispose()
       return code
@@ -107,7 +161,8 @@ export async function bootSessionWorker(options: BootSessionWorkerOptions = {}):
   return {
     port,
     worker,
-    jobPort,
+    ports,
+    hubProxyPort,
     ready,
     harness,
     terminate,

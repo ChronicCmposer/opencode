@@ -12,6 +12,7 @@ import { Effect, Latch, Layer } from "effect"
 import { BackgroundJob } from "@/background/job"
 import type { SessionID } from "@/session/schema"
 import { SessionRunState } from "@/session/run-state"
+import type { DispatchOrigin } from "@/session/origin"
 import { SessionStatus } from "@/session/status"
 import type { ShellInput } from "@/session/prompt"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -157,6 +158,47 @@ describe("SessionRunState.startShell — flag seam", () => {
         expect(result).toEqual(withParts(sessionID))
         expect(localWorkRan).toBe(true)
       }).pipe(Effect.provide(runStateLayer)),
+    )
+  })
+})
+
+/** A hub that records the `ensureRunning` origin it receives, then delegates. */
+const recordingEnsureHub = (
+  sessionID: SessionID,
+  forwarded: Array<{ sessionID: SessionID; origin?: DispatchOrigin }>,
+) => {
+  const base = createSessionHub({ pool: createFakeExecutorPool(1, { value: withParts(sessionID) }) })
+  return {
+    ...base,
+    ensureRunning: async (id: SessionID, origin?: DispatchOrigin) => {
+      forwarded.push({ sessionID: id, origin })
+      return base.ensureRunning(id, origin)
+    },
+  } satisfies SessionHub
+}
+
+describe("SessionRunState.ensureRunning — dispatch origin seam", () => {
+  it.live("flag ON forwards the origin to the hub (absent stays undefined = user)", () => {
+    const sessionID = sid("ses_origin_on")
+    const forwarded: Array<{ sessionID: SessionID; origin?: DispatchOrigin }> = []
+    const hub = recordingEnsureHub(sessionID, forwarded)
+    const work = Effect.succeed(withParts(sessionID))
+
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        yield* state.ensureRunning(sessionID, work, work, "auto")
+        yield* state.ensureRunning(sessionID, work, work)
+
+        expect(forwarded).toEqual([
+          { sessionID, origin: "auto" },
+          { sessionID, origin: undefined },
+        ])
+      }).pipe(
+        Effect.provide(runStateLayer),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+      ),
     )
   })
 })

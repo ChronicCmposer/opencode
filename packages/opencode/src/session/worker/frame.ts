@@ -8,7 +8,11 @@
 //                   `event` / `end` / `resync` / `ack` variants.
 //   * `writer`    — the single-writer SQLite + file-KV RPC (`session/writer/protocol.ts`).
 //   * `broker`    — the MCP/LSP child-process broker RPC (`session/broker/protocol.ts`).
-//   * `job`       — the background-job control plane (`worker/job-client.ts`).
+//   * `job`       — reserved legacy background-job envelope family. The job
+//                   registry/control port was removed with per-session workers;
+//                   the port name stays in the versioned set so an older frame
+//                   is still recognised (and rejected by its port consumer)
+//                   rather than silently misrouted. No producer exists in v2.
 //   * `hub-proxy` — worker → hub authority forwarding (`worker/layer.ts`).
 //
 // The envelope is `{ v, port, kind, id?, payload? }`:

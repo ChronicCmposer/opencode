@@ -59,7 +59,7 @@ export interface RecordingHubAuthorityOverrides {
   readonly sessionStatus?: Partial<SessionStatus.Interface>
   readonly permission?: Partial<Permission.Interface>
   readonly question?: Partial<Question.Interface>
-  readonly dispatchSubagent?: HubProxyAuthorities["dispatchSubagent"]
+  readonly sessionSpawn?: HubProxyAuthorities["sessionSpawn"]
   readonly systemTransform?: HubProxyAuthorities["systemTransform"]
   readonly messagesTransform?: HubProxyAuthorities["messagesTransform"]
   readonly pluginTool?: HubProxyAuthorities["pluginTool"]
@@ -152,7 +152,7 @@ export function recordingHubAuthorities(
     },
   }
 
-  const dispatchSubagent = overrides.dispatchSubagent
+  const sessionSpawn = overrides.sessionSpawn
   const systemTransform = overrides.systemTransform
   const messagesTransform = overrides.messagesTransform
   const pluginTool = overrides.pluginTool
@@ -160,12 +160,12 @@ export function recordingHubAuthorities(
     sessionStatus,
     permission,
     question,
-    ...(dispatchSubagent === undefined
+    ...(sessionSpawn === undefined
       ? {}
       : {
-          dispatchSubagent: (request: Parameters<NonNullable<typeof dispatchSubagent>>[0]) => {
-            calls.push({ method: "dispatchSubagent", args: [request] })
-            return dispatchSubagent(request)
+          sessionSpawn: (request: Parameters<NonNullable<typeof sessionSpawn>>[0]) => {
+            calls.push({ method: "session.spawn", args: [request] })
+            return sessionSpawn(request)
           },
         }),
     ...(systemTransform === undefined

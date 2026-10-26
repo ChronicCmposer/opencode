@@ -1,28 +1,48 @@
 // Step 2 — boot the real `session-worker.ts` entry and observe its control frames.
 //
 // Contract: the production entry installs the executor on the default worker
-// channel and transfers a `job-port` frame (its dedicated job control link)
-// before announcing `ready`. The harness surfaces both plus an `ExecutorTransport`
-// so tests can drive the isolate the way the hub does.
+// channel and announces `ready`. A full hub-port boot transfers its relay ports
+// (`ports` then `hub-proxy`) before that handshake; a degraded boot sends only
+// `ready`. The harness surfaces all of them plus an `ExecutorTransport` so tests
+// can drive the isolate the way the hub does.
 
 import { describe, expect, test } from "bun:test"
 import { bootSessionWorker } from "./session-worker-harness"
 import { sessionWorkerInit } from "./session-worker-init"
 
 describe("session worker harness", () => {
-  test("boots the production entry and observes ready + job-port frames", async () => {
+  test("boots the production entry and observes the ready handshake", async () => {
     const handle = await bootSessionWorker({ timeoutMs: 20_000 })
     try {
       expect(handle.ready.type).toBe("ready")
       // `threadId` is 0 on the hub; a positive id proves the entry ran in an isolate.
       expect(handle.ready.threadId).toBeGreaterThan(0)
-      expect(handle.jobPort).toBeInstanceOf(MessagePort)
+      // The default init is the degraded boot: no hub-served ports are transferred.
+      expect(handle.ports).toBeUndefined()
+      expect(handle.hubProxyPort).toBeUndefined()
       expect(handle.port.alive).toBe(true)
     } finally {
       await handle.terminate()
     }
 
     expect(handle.port.alive).toBe(false)
+  })
+
+  test("observes the transferred relay and hub-proxy ports on a full boot", async () => {
+    const handle = await bootSessionWorker({
+      timeoutMs: 20_000,
+      init: { ...sessionWorkerInit(), capabilities: { sessionWorkerPorts: true } },
+    })
+    try {
+      expect(handle.ready.type).toBe("ready")
+      expect(handle.ports?.writer).toBeInstanceOf(MessagePort)
+      expect(handle.ports?.egress).toBeInstanceOf(MessagePort)
+      expect(handle.ports?.egressControl).toBeInstanceOf(MessagePort)
+      expect(handle.ports?.broker).toBeInstanceOf(MessagePort)
+      expect(handle.hubProxyPort).toBeInstanceOf(MessagePort)
+    } finally {
+      await handle.terminate()
+    }
   })
 
   test("round-trips an executor ping/pong frame over the transport", async () => {

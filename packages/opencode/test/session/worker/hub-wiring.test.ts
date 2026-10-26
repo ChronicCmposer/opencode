@@ -32,14 +32,14 @@ import {
   type SessionHub,
 } from "@/session/worker/hub"
 import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
-import { deriveHeadroom } from "@/session/worker/dispatch"
 import { reapSupport } from "@/session/worker/pid-registry"
 import { sessionWorkerInit } from "../../lib/session-worker-init"
 import { pollUntil } from "../../lib/poll"
 import { SessionBusyError } from "@/session/worker/execute"
 import { withTmpdirInstance } from "../../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../../lib/effect"
-import { sid } from "../../lib/async"
+import { flush, sid } from "../../lib/async"
+import { createRecordingScheduler } from "../../lib/scheduler"
 import { withParts } from "../../lib/session-parts"
 import { createFakeExecutorPool } from "../../lib/fake-worker-pool"
 
@@ -545,67 +545,6 @@ describe("12 — exactly one flag-on cancel idle per case (ON ≡ OFF)", () => {
     )
   })
 
-  it.live("queued-but-not-dispatched: the hub publishes the single idle, matching flag-off", () => {
-    const holderID = sid("ses_holder")
-    const queuedID = sid("ses_queued")
-    const onCalls: StatusCall[] = []
-    const offCalls: StatusCall[] = []
-    // One live worker holds `holderID`; `queuedID` is admitted with no worker.
-    const pool = createFakeExecutorPool(1, { mode: "blocking", value: withParts(holderID) })
-    const hub = createSessionHub({
-      pool,
-      cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort, graceMs: 5_000 }),
-    })
-
-    const flagOn = withTmpdirInstance()(
-      Effect.gen(function* () {
-        const state = yield* SessionRunState.Service
-        const holder = yield* state
-          .ensureRunning(holderID, Effect.succeed(withParts(holderID)), Effect.succeed(withParts(holderID)))
-          .pipe(Effect.exit, Effect.forkChild)
-        yield* pollWithTimeout(Effect.sync(runningState(hub, holderID)), "holder session never reached running")
-        const queued = yield* state
-          .ensureRunning(queuedID, Effect.succeed(withParts(queuedID)), Effect.succeed(withParts(queuedID)))
-          .pipe(Effect.exit, Effect.forkChild)
-        yield* pollWithTimeout(
-          Effect.sync(() => (hub.dispatcher.queuedCount === 1 ? true : undefined)),
-          "session was never queued",
-        )
-        const outcome = yield* state.cancel(queuedID)
-        yield* Fiber.join(queued)
-        // Release the holder so the scope can close.
-        yield* state.cancel(holderID)
-        yield* Fiber.join(holder)
-        return outcome
-      }).pipe(
-        Effect.provide(recordingRunStateLayer(onCalls)),
-        Effect.provideService(SessionHubService, hub),
-        Effect.provide(flagsOn),
-      ),
-    )
-
-    const flagOff = withTmpdirInstance()(
-      Effect.gen(function* () {
-        const state = yield* SessionRunState.Service
-        yield* state.cancel(queuedID)
-      }).pipe(Effect.provide(recordingRunStateLayer(offCalls))),
-    )
-
-    return Effect.all([flagOn, flagOff]).pipe(
-      Effect.map(([outcome]) => {
-        // No worker ran the queued session, so the hub-side is the only emitter.
-        expect(outcome).toMatchObject({
-          sessionID: queuedID,
-          mode: "terminated",
-          winner: "cancel",
-          acknowledged: false,
-        })
-        expect(idleOf(onCalls)).toEqual([{ sessionID: queuedID, status: { type: "idle" } }])
-        expect(idleOf(offCalls)).toEqual(idleOf(onCalls))
-      }),
-    )
-  })
-
   it.live("idle/no-op: the hub publishes the single idle, matching flag-off", () => {
     const sessionID = sid("ses_idle_one")
     const onCalls: StatusCall[] = []
@@ -663,13 +602,13 @@ describe("W4 — parent cancel settles every child to exactly one idle", () => {
   /** A work/onInterrupt pair a test never inspects; `ensureRunning` needs both. */
   const work = (sessionID: SessionID) => Effect.succeed(withParts(sessionID))
 
-  it.live("a registry-linked child the hub never dispatched still reaches one idle", () => {
+  it.live("a linked child the hub never dispatched still reaches one idle", () => {
     const parentID = sid("ses_w4_parent")
     const childID = sid("ses_w4_child")
     const calls: StatusCall[] = []
     const { publisher, published } = recordingPublisher()
-    // Only the parent runs on a worker; the child is a registered but never
-    // dispatched subagent, so no worker can publish its idle.
+    // Only the parent runs on a worker; the child is linked but never
+    // dispatched, so no worker can publish its idle.
     const pool = createFakeExecutorPool(1, {
       mode: "blocking",
       value: withParts(parentID),
@@ -680,11 +619,12 @@ describe("W4 — parent cancel settles every child to exactly one idle", () => {
     const hub = createSessionHub({
       pool,
       events: publisher,
-      cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort, graceMs: 5_000 }),
+      cancellation: () => ({
+        childrenOf: (id) => (id === parentID ? [childID] : []),
+        portFor: (worker) => pool.byID(worker.id)?.cancelPort,
+        graceMs: 5_000,
+      }),
     })
-    hub.jobs.start({ id: parentID, type: "task" })
-    hub.jobs.start({ id: childID, type: "task", parentID })
-    hub.jobs.linkChild(parentID, childID)
 
     return withTmpdirInstance()(
       Effect.gen(function* () {
@@ -707,9 +647,9 @@ describe("W4 — parent cancel settles every child to exactly one idle", () => {
         expect(idles.filter((call) => call.sessionID === parentID)).toBeArrayOfSize(1)
         // The child never ran, so run-state's cascade fallback is its only idle.
         expect(idles.filter((call) => call.sessionID === childID)).toBeArrayOfSize(1)
-        // The parent's cancel is reported once; the child's job is marked too.
+        // The parent's cancel is reported once; the child's fallback idle is
+        // the only thing the hub reports for it.
         expect(published.map((event) => event.type)).toEqual(["session.cancelled"])
-        expect(hub.jobs.get(childID)?.status).toBe("cancelled")
       }),
     )
   })
@@ -798,7 +738,7 @@ const productionHubWithLog = (options: {
   })
 
 describe("W12 observability — hub construction resolution", () => {
-  test("A1 logs the resolved pool with count, override, parallelism and headroom", async () => {
+  test("A1 logs the resolved pool with count, override and parallelism (no warm headroom)", async () => {
     const { log, lines } = recordingLog()
     const hub = productionHubWithLog({ count: 4, env: {}, log })
     try {
@@ -807,7 +747,8 @@ describe("W12 observability — hub construction resolution", () => {
       expect(line.fields.override).toBe(false)
       expect(typeof line.fields.availableParallelism).toBe("number")
       expect(line.fields.availableParallelism as number).toBeGreaterThan(0)
-      expect(line.fields.headroom).toBe(deriveHeadroom(4))
+      // v2 has no headroom reserve: per-session workers materialize on demand.
+      expect("headroom" in line.fields).toBe(false)
     } finally {
       await hub.terminateAll()
     }
@@ -942,5 +883,75 @@ describe("W12 production wiring — the production hub layer emits the narrative
         }),
       ).pipe(Effect.provide(Logger.layer([logger]))),
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Retired worker port disposal — a reap/cancel retires the worker AND tears down
+// its hub-side port servers; only `terminateAll` used to dispose them.
+// ---------------------------------------------------------------------------
+
+describe("retired worker hub-side port disposal", () => {
+  /** Minimal backends: only the egress disposer matters to these tests. */
+  const egressBackends = (disposed: number[]) => ({
+    writer: {} as never,
+    broker: {} as never,
+    egress: (workerID: number, port: MessagePort) => {
+      port.start()
+      return () => disposed.push(workerID)
+    },
+  })
+
+  test("cancel disposes the worker's egress server", async () => {
+    const pool = createFakeExecutorPool(1, { mode: "blocking" })
+    const disposed: number[] = []
+    const hub = createSessionHub({ pool, ports: egressBackends(disposed) })
+    const sessionID = sid("ses_dispose_cancel")
+    const channel = new MessageChannel()
+    try {
+      const running = hub.ensureRunning(sessionID)
+      await flush()
+      const worker = pool.spawned[0]
+      hub.attachWorkerPorts(worker.id, { egress: channel.port1 })
+      expect(disposed).toEqual([])
+
+      await hub.cancel(sessionID)
+      await expect(running).rejects.toBeDefined()
+
+      expect(disposed).toEqual([worker.id])
+    } finally {
+      channel.port1.close()
+      channel.port2.close()
+      await hub.terminateAll()
+    }
+  })
+
+  test("reap disposes the worker's egress server", async () => {
+    const pool = createFakeExecutorPool(1)
+    const scheduler = createRecordingScheduler()
+    const disposed: number[] = []
+    const hub = createSessionHub({
+      pool,
+      ports: egressBackends(disposed),
+      schedule: scheduler.schedule,
+      reapMs: 1_000,
+    })
+    const sessionID = sid("ses_dispose_reap")
+    const channel = new MessageChannel()
+    try {
+      await hub.ensureRunning(sessionID)
+      await flush()
+      const worker = pool.spawned[0]
+      hub.attachWorkerPorts(worker.id, { egress: channel.port1 })
+
+      scheduler.pending().find((timer) => timer.delayMs === 1_000)!.run()
+      await flush()
+
+      expect(disposed).toEqual([worker.id])
+    } finally {
+      channel.port1.close()
+      channel.port2.close()
+      await hub.terminateAll()
+    }
   })
 })

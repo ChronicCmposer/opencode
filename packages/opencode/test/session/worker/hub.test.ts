@@ -1,13 +1,12 @@
 // Phase 12.1–12.4 — pure hub, admission & HTTP/SSE liveness.
 //
-// The hub is the composition of the Phase 4 dispatcher (scheduling, admission,
-// headroom, crash handling), the Phase 5 executor pool, and the Phase 11
+// The hub is the composition of the per-session dispatcher (one lazily
+// materialized worker per session, crash handling), the executor pool, and the
 // cooperative cancel path. These tests drive the hub over REAL Bun worker
 // isolates and assert the four Phase 12 properties:
 //
 //   12.1 the hub executes zero sessions (work runs in a worker isolate);
-//   12.2 admission admits K + headroom respecting depth; the awaiting parent
-//        retains its slot;
+//   12.2 each session is admitted on its own worker (no queue/headroom split);
 //   12.3 the hub loop stays I/O-only while K sessions run;
 //   12.4 HTTP ingress + SSE stay functional while K sessions run.
 
@@ -54,7 +53,6 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { Database } from "@opencode-ai/core/database/database"
 import { GlobalBus } from "@/bus/global"
 import { SessionCancelledError, WorkerCrashedError } from "@/session/worker/dispatch"
-import { createJobClient, jobPortFromMessagePort, type JobPort } from "@/session/worker/job-client"
 import type {
   ExecutorRun,
   ExecutorSessionWorker,
@@ -134,7 +132,6 @@ describe("12.1 the hub executes zero sessions", () => {
       const llm = yield* TestLLMServer
       yield* llm.text("hub-zero")
       const pool = createBunExecutorWorkerPool({
-        k: 1,
         entry: SESSION_WORKER,
         timeoutMs: 15_000,
         // `sessionWorkerInit` defaults the model identity (`providerID`/`modelID`/
@@ -161,25 +158,19 @@ describe("12.1 the hub executes zero sessions", () => {
   )
 })
 
-describe("12.2 admission admits K + headroom respecting depth", () => {
-  test("K busy queues; a depth-1 child spawns headroom; the parent retains its slot", async () => {
-    const pool = createBunExecutorWorkerPool({ k: 1, entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
+describe("12.2 per-session admission", () => {
+  test("parent, sibling and depth-1 child run concurrently on distinct workers", async () => {
+    const pool = createBunExecutorWorkerPool({ entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
     const hub = createSessionHub({ pool })
     try {
       const parent = hub.dispatcher.dispatch({ sessionID: sid("ses_parent"), depth: 0 })
-      await pollUntil(() => hub.dispatcher.registry.get(sid("ses_parent"))?.state === "running", {
-        message: "parent never ran",
-      })
-
       const sibling = hub.dispatcher.dispatch({ sessionID: sid("ses_sib"), depth: 0 })
-      await pollUntil(() => hub.dispatcher.queuedCount === 1, { message: "sibling never queued" })
-      expect(hub.dispatcher.queuedCount).toBe(1)
-      expect(hub.dispatcher.headroomSlotCount).toBe(0)
-
       const child = hub.dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 })
-      await pollUntil(() => hub.dispatcher.headroomSlotCount === 1, { message: "headroom never spawned" })
 
-      // The awaiting parent keeps its foreground slot while the child runs in headroom.
+      await pollUntil(() => hub.dispatcher.busySlotCount === 3, { message: "sessions never ran" })
+      expect(hub.dispatcher.queuedCount).toBe(0)
+      // One worker per session: three sessions, three isolates.
+      expect(pool.workers).toHaveLength(3)
       expect(hub.dispatcher.registry.get(sid("ses_parent"))?.state).toBe("running")
       expect(hub.dispatcher.registry.get(sid("ses_child"))?.state).toBe("running")
 
@@ -193,7 +184,7 @@ describe("12.2 admission admits K + headroom respecting depth", () => {
 
 describe("12.3 the hub loop is I/O-only", () => {
   test("a hub timer keeps firing while K sessions run in workers", async () => {
-    const pool = createBunExecutorWorkerPool({ k: 2, entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
+    const pool = createBunExecutorWorkerPool({ entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
     const hub = createSessionHub({ pool })
     try {
       let ticks = 0
@@ -214,7 +205,7 @@ describe("12.3 the hub loop is I/O-only", () => {
 
 describe("12.4 HTTP ingress + SSE stay functional", () => {
   test("health + SSE respond while K sessions run", async () => {
-    const pool = createBunExecutorWorkerPool({ k: 2, entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
+    const pool = createBunExecutorWorkerPool({ entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
     const hub = createSessionHub({ pool })
     const server = Bun.serve({
       port: 0,
@@ -439,7 +430,7 @@ describe("12.x executor transport buffering", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Production wiring: job-port hookup, lazy pool, cancel, layer lifecycle.
+// Production wiring: lazy pool, cancel, layer lifecycle.
 // ---------------------------------------------------------------------------
 
 /** An in-memory executor worker that completes instantly and records termination. */
@@ -467,9 +458,8 @@ class ImmediateWorker implements ExecutorWorker {
 }
 
 /** A lazy pool whose workers are recorded so a test can observe materialisation. */
-const trackedLazyPool = (k: number, created: ImmediateWorker[]) =>
+const trackedLazyPool = (created: ImmediateWorker[]) =>
   createLazyExecutorWorkerPool({
-    k,
     create: (id) => {
       const worker = new ImmediateWorker(id)
       created.push(worker)
@@ -598,36 +588,10 @@ const recordingSchedule = () => {
   return { schedule, pending: () => timers.filter((timer) => !timer.cancelled) }
 }
 
-describe("11 pool job-port hookup", () => {
-  test("the hub hands its job-port sink to a pool factory and a job round-trips", async () => {
-    let sink: ((workerID: number, port: MessagePort) => void) | undefined
-    const hub = createSessionHub({
-      pool: (onJobPort) => {
-        sink = onJobPort
-        return trackedLazyPool(1, [])
-      },
-    })
-
-    expect(typeof sink).toBe("function")
-
-    const channel = new MessageChannel()
-    const client = createJobClient(jobPortFromMessagePort(channel.port2))
-    sink!(1, channel.port1)
-
-    await client.start({ id: "ses_job", type: "task" })
-    expect(hub.jobs.get("ses_job")?.status).toBe("running")
-    await client.complete("ses_job", "done")
-    expect(hub.jobs.get("ses_job")?.output).toBe("done")
-
-    client.dispose()
-    await hub.terminateAll()
-  })
-})
-
 describe("12 lazy pool", () => {
   test("constructing the hub spawns no workers until the first dispatch", async () => {
     const created: ImmediateWorker[] = []
-    const hub = createSessionHub({ pool: trackedLazyPool(2, created) })
+    const hub = createSessionHub({ pool: trackedLazyPool(created) })
 
     expect(created).toHaveLength(0)
 
@@ -706,7 +670,7 @@ describe("hub startShell payload forwarding", () => {
 
 describe("13 cooperative cancel within grace", () => {
   test("cancelWithGrace stops a running session on a real worker", async () => {
-    const pool = createBunExecutorWorkerPool({ k: 1, entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
+    const pool = createBunExecutorWorkerPool({ entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
     const hub = createSessionHub({ pool, cancellation: (p) => createWorkerCancellation(p, { graceMs: 5_000 }) })
     try {
       const running = hub.dispatcher.dispatch({ sessionID: sid("ses_cancel"), depth: 0 })
@@ -725,44 +689,35 @@ describe("13 cooperative cancel within grace", () => {
 })
 
 // ---------------------------------------------------------------------------
-// W11 — production depth plumbing: a session registered in the hub job registry
-// at depth ≥ 1 must dispatch on the on-demand headroom path. Before the hub
-// passed `depthOf` into `createSessionDispatch`, every production dispatch
-// resolved `depth: 0`, so a real child was scheduled as a foreground root and
-// the headroom/child-queue paths (`dispatch.ts`) never ran.
+// W11 — production depth plumbing: a depth ≥ 1 child must materialize its own
+// per-session worker. Depth rides the run metadata; scheduling has no split.
 // ---------------------------------------------------------------------------
 
 describe("W11 production depth plumbing", () => {
-  test("a depth ≥ 1 child admitted through the hub selects the headroom kind", async () => {
+  test("a depth ≥ 1 child admitted through the hub materializes its own worker", async () => {
     const childID = sid("ses_w11_depth_child")
     const created: ImmediateWorker[] = []
-    const hub = createSessionHub({ pool: trackedLazyPool(1, created) })
+    const hub = createSessionHub({ pool: trackedLazyPool(created) })
     try {
-      // A subagent child, linked to a parent at depth 1, is the production shape
-      // the hub registry holds (`subagent.dispatchSubagent` registers it this way).
-      hub.jobs.start({ id: childID, type: "task", parentID: sid("ses_w11_depth_parent"), depth: 1 })
-
       const result = await hub.ensureRunning(childID)
 
       expect(result.sessionID).toBe(childID)
-      // depth ≥ 1 → headroom; the single foreground worker must not be reused, so
-      // the hub grows the headroom pool (and materialises an isolate for it).
-      expect(hub.dispatcher.headroomSlotCount).toBe(1)
-      expect(created.length).toBeGreaterThan(0)
+      // Depth rides the run metadata; scheduling has no headroom split.
+      expect(created).toHaveLength(1)
     } finally {
       await hub.terminateAll()
     }
   })
 
-  test("a depth 0 root still runs on the foreground pool (no headroom)", async () => {
+  test("a depth 0 root also materializes its own worker", async () => {
     const sessionID = sid("ses_w11_root")
     const created: ImmediateWorker[] = []
-    const hub = createSessionHub({ pool: trackedLazyPool(1, created) })
+    const hub = createSessionHub({ pool: trackedLazyPool(created) })
     try {
       const result = await hub.ensureRunning(sessionID)
 
       expect(result.sessionID).toBe(sessionID)
-      expect(hub.dispatcher.headroomSlotCount).toBe(0)
+      expect(created).toHaveLength(1)
     } finally {
       await hub.terminateAll()
     }
@@ -877,7 +832,7 @@ describe("W11 production egress mesh", () => {
 describe("14 makeSessionHubNode", () => {
   test("provides SessionHubService and terminates the pool on scope close", async () => {
     const created: ImmediateWorker[] = []
-    const node = makeSessionHubNode({ pool: trackedLazyPool(1, created) })
+    const node = makeSessionHubNode({ pool: trackedLazyPool(created) })
 
     await Effect.runPromise(
       Effect.scoped(
@@ -897,22 +852,14 @@ describe("14 makeSessionHubNode", () => {
 })
 
 describe("15 layer lifecycle / leak", () => {
-  test("closing the layer scope terminates every worker and disposes job ports", async () => {
+  test("closing the layer scope terminates every per-session worker", async () => {
     const created: ImmediateWorker[] = []
-    let jobPortDisposed = false
-    const fakePort: JobPort = {
-      post: () => {},
-      onMessage: () => () => {
-        jobPortDisposed = true
-      },
-    }
 
     await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
-          const context = yield* Layer.build(createSessionHubLayer({ pool: trackedLazyPool(2, created) }))
+          const context = yield* Layer.build(createSessionHubLayer({ pool: trackedLazyPool(created) }))
           const hub = Context.get(context, SessionHubService)
-          hub.attachJobPort(1, fakePort)
           yield* Effect.promise(() =>
             Promise.all([hub.ensureRunning(sid("ses_life_1")), hub.ensureRunning(sid("ses_life_2"))]),
           )
@@ -922,7 +869,6 @@ describe("15 layer lifecycle / leak", () => {
 
     expect(created).toHaveLength(2)
     expect(created.every((worker) => worker.terminated)).toBe(true)
-    expect(jobPortDisposed).toBe(true)
   })
 })
 
@@ -945,7 +891,7 @@ describe("35a worker port serving", () => {
   }
 
   test("serves a worker's writer port against the hub writer", async () => {
-    const hub = createSessionHub({ pool: trackedLazyPool(1, []), ports: { writer: hubWriter, broker: {} as never } })
+    const hub = createSessionHub({ pool: trackedLazyPool([]), ports: { writer: hubWriter, broker: {} as never } })
     const channel = new MessageChannel()
     const dispose = hub.attachWorkerPorts(1, { writer: channel.port1 })
     const client = createWorkerWriterClient(channel.port2)
@@ -965,7 +911,7 @@ describe("35a worker port serving", () => {
 
   test("serves the hub-proxy authorities over a worker control port", async () => {
     const hub = createSessionHub({
-      pool: trackedLazyPool(1, []),
+      pool: trackedLazyPool([]),
       ports: { writer: hubWriter, broker: {} as never, hubProxy: { "sessionStatus.get": () => "pong" } },
     })
     const channel = new MessageChannel()
@@ -987,7 +933,7 @@ describe("35a worker port serving", () => {
   })
 
   test("returns idempotent disposers and is a no-op without backends", () => {
-    const hub = createSessionHub({ pool: trackedLazyPool(1, []) })
+    const hub = createSessionHub({ pool: trackedLazyPool([]) })
     const writerChannel = new MessageChannel()
     const proxyChannel = new MessageChannel()
     const disposePorts = hub.attachWorkerPorts(1, { writer: writerChannel.port1 })
@@ -1005,7 +951,7 @@ describe("35a worker port serving", () => {
 
 describe("42 crash/respawn end-to-end", () => {
   test("killing a worker mid-dispatch respawns it and completes the next session", async () => {
-    const pool = createBunExecutorWorkerPool({ k: 1, entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
+    const pool = createBunExecutorWorkerPool({ entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
     const hub = createSessionHub({ pool })
     try {
       const first = hub.dispatcher.dispatch({ sessionID: sid("ses_crash"), depth: 0 })
@@ -1130,7 +1076,6 @@ const portPoolFactory =
   (captured: CapturedPorts, emitPorts: boolean): ProductionPoolFactory =>
   (resolveInit, sinks) =>
     createLazyExecutorWorkerPool({
-      k: 1,
       create: async (id) => {
         captured.capabilities = (await resolveInit()).capabilities
         captured.created.push(id)
@@ -1150,7 +1095,6 @@ const hubProxyPoolFactory =
   (captured: CapturedPorts): ProductionPoolFactory =>
   (resolveInit, sinks) =>
     createLazyExecutorWorkerPool({
-      k: 1,
       create: async (id) => {
         captured.capabilities = (await resolveInit()).capabilities
         captured.created.push(id)
@@ -1587,7 +1531,7 @@ describe("Q22 hub event sink", () => {
 describe("Q9/Q23 session.cancelled", () => {
   test("the hub publishes session.cancelled with the CancelOutcome fields", async () => {
     const { publisher, published } = recordingPublisher()
-    const pool = createBunExecutorWorkerPool({ k: 1, entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
+    const pool = createBunExecutorWorkerPool({ entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
     const hub = createSessionHub({
       pool,
       events: publisher,
@@ -1713,28 +1657,31 @@ const rejectionOf = async (promise: Promise<unknown>): Promise<unknown> => {
 }
 
 describe("W2 cancellation authorities", () => {
-  test("childrenOf defaults to the job registry and onCancelled marks jobs cancelled", async () => {
+  test("an explicit childrenOf drives the children-first cascade", async () => {
+    const parentID = sid("ses_parent")
+    const childID = sid("ses_child")
+    const cancelled: string[] = []
     const pool = new ControllablePool(1, "resolve")
-    // No explicit childrenOf/onCancelled: the hub must default to its job registry.
-    const hub = createSessionHub({ pool, cancellation: {} })
+    const hub = createSessionHub({
+      pool,
+      cancellation: {
+        childrenOf: (id) => (id === parentID ? [childID] : []),
+        onCancelled: (event) => cancelled.push(event.sessionID),
+      },
+    })
     try {
-      hub.jobs.start({ id: "ses_parent", type: "task" })
-      hub.jobs.start({ id: "ses_child", type: "task", parentID: "ses_parent" })
-      hub.jobs.linkChild("ses_parent", "ses_child")
-
-      const parent = rejectionOf(hub.dispatcher.dispatch({ sessionID: sid("ses_parent"), depth: 0 }))
-      const child = rejectionOf(hub.dispatcher.dispatch({ sessionID: sid("ses_child"), depth: 1 }))
-      await pollUntil(() => hub.dispatcher.registry.get(sid("ses_child"))?.state === "running", {
+      const parent = rejectionOf(hub.dispatcher.dispatch({ sessionID: parentID, depth: 0 }))
+      const child = rejectionOf(hub.dispatcher.dispatch({ sessionID: childID, depth: 1 }))
+      await pollUntil(() => hub.dispatcher.registry.get(childID)?.state === "running", {
         message: "child never started",
       })
 
-      await hub.cancel(sid("ses_parent"))
+      await hub.cancel(parentID)
 
-      // Children-first cascade reached the child, and both jobs are terminal.
+      // Children-first cascade reached the child; both sessions settled.
       expect(await child).toBeInstanceOf(SessionCancelledError)
       expect(await parent).toBeInstanceOf(SessionCancelledError)
-      expect(hub.jobs.get("ses_child")?.status).toBe("cancelled")
-      expect(hub.jobs.get("ses_parent")?.status).toBe("cancelled")
+      expect(cancelled).toEqual([childID, parentID])
     } finally {
       await hub.terminateAll()
     }
@@ -1751,7 +1698,6 @@ describe("W2 session model threading", () => {
       const captured: SessionWorkerInit[] = []
       const poolFactory: ProductionPoolFactory = (resolveInit) =>
         createLazyExecutorWorkerPool({
-          k: 1,
           create: async (id) => {
             captured.push(await resolveInit())
             return new ImmediateWorker(id)
@@ -1832,13 +1778,12 @@ describe("W4 per-session worker model", () => {
         resolvedSessions.push(String(sessionID))
         return sessionWorkerInit({ model: { modelID: `model-${sessionID}` } })
       },
-      count: 1,
       entry: new URL("../../fixture/session-execute-worker.ts", import.meta.url),
       workKind: "instant",
       timeoutMs: 15_000,
     })
     try {
-      const [worker] = pool.workers
+      const worker = pool.spawn()
       await worker.execute({ sessionID: sid("ses_first"), depth: 0 })
       expect(pool.resultFor(sid("ses_first"))?.sessionID).toBe(sid("ses_first"))
 
@@ -1875,7 +1820,6 @@ describe("Fix 1 per-session working directory", () => {
     (resolveInit) => {
       const results = new Map<SessionID, SessionExecutionResult>()
       return createLazyExecutorWorkerPool({
-        k: 1,
         create: (id) => ({
           id,
           alive: true,
@@ -2009,7 +1953,6 @@ describe("W4 plugin effect shipping", () => {
       const captured: SessionWorkerInit[] = []
       const poolFactory: ProductionPoolFactory = (resolveInit) =>
         createLazyExecutorWorkerPool({
-          k: 1,
           create: async (id) => {
             captured.push(await resolveInit())
             return new ImmediateWorker(id)
@@ -2254,7 +2197,6 @@ describe("Fix 1 workerID threading", () => {
     await withGlobalFakeWorker(async () => {
       const pool = createProductionWorkerPool({
         init: () => sessionWorkerInit(),
-        count: 2,
         entry: "fake://workerid",
         workKind: "instant",
         timeoutMs: 5_000,
@@ -2263,7 +2205,8 @@ describe("Fix 1 workerID threading", () => {
         // Fire both runs but never await: the fake isolate never replies, and the
         // only thing under test is the `workerData` the pool hands to `new Worker`.
         // Terminating the pool below rejects these pending runs (all caught).
-        for (const [index, worker] of pool.workers.entries()) {
+        const workers = Array.from({ length: 2 }, () => pool.spawn())
+        for (const [index, worker] of workers.entries()) {
           void worker.execute({ sessionID: sid(`ses_wid_${index}`), depth: 0 }).catch(() => undefined)
         }
         await pollUntil(() => FakeWorker.instances.length === 2, { message: "workers never spawned" })
@@ -2308,7 +2251,6 @@ describe("Fix 2 real plugin hook input", () => {
       const captured: SessionWorkerInit[] = []
       const poolFactory: ProductionPoolFactory = (resolveInit) =>
         createLazyExecutorWorkerPool({
-          k: 1,
           create: async (id) => {
             captured.push(await resolveInit())
             return new ImmediateWorker(id)
@@ -2410,20 +2352,18 @@ describe("W4 cancelWithReport", () => {
   test("a cooperatively settled child needs no fallback idle; the parent's outcome is returned", async () => {
     const parentID = sid("ses_rep_parent")
     const childID = sid("ses_rep_child")
-    // Two workers: the parent keeps its foreground slot, the child runs in headroom.
+    // Two per-session workers: the parent and the child each own one.
     const pool = new ControllablePool(2, "resolve", true)
     const hub = createSessionHub({
       pool,
       cancellation: {
+        childrenOf: (id) => (id === parentID ? [childID] : []),
         portFor: (worker) => (worker as ControllableWorker).cancelPort,
         graceMs: 500,
         schedule: neverSchedule,
       },
     })
     try {
-      hub.jobs.start({ id: parentID, type: "task" })
-      hub.jobs.start({ id: childID, type: "task", parentID })
-      hub.jobs.linkChild(parentID, childID)
 
       const parent = rejectionOf(hub.dispatcher.dispatch({ sessionID: parentID, depth: 0 }))
       const child = rejectionOf(hub.dispatcher.dispatch({ sessionID: childID, depth: 1 }))
@@ -2451,15 +2391,13 @@ describe("W4 cancelWithReport", () => {
     const hub = createSessionHub({
       pool,
       cancellation: {
+        childrenOf: (id) => (id === parentID ? [childID] : []),
         portFor: (worker) => (worker as ControllableWorker).cancelPort,
         graceMs: 500,
         schedule: neverSchedule,
       },
     })
     try {
-      hub.jobs.start({ id: parentID, type: "task" })
-      hub.jobs.start({ id: childID, type: "task", parentID })
-      hub.jobs.linkChild(parentID, childID)
 
       const parent = rejectionOf(hub.dispatcher.dispatch({ sessionID: parentID, depth: 0 }))
       await pollUntil(() => hub.dispatcher.registry.get(parentID)?.state === "running", {
@@ -2485,15 +2423,13 @@ describe("W4 cancelWithReport", () => {
       pool,
       log,
       cancellation: {
+        childrenOf: (id) => (id === parentID ? [childID] : []),
         portFor: (worker) => (worker as ControllableWorker).cancelPort,
         graceMs: 500,
         schedule: neverSchedule,
       },
     })
     try {
-      hub.jobs.start({ id: parentID, type: "task" })
-      hub.jobs.start({ id: childID, type: "task", parentID })
-      hub.jobs.linkChild(parentID, childID)
 
       const parent = rejectionOf(hub.dispatcher.dispatch({ sessionID: parentID, depth: 0 }))
       await pollUntil(() => hub.dispatcher.registry.get(parentID)?.state === "running", {
@@ -2603,24 +2539,19 @@ describe("W12 observability — rebind and ports", () => {
 
   test("E1 logs each connected hub port under its worker id", async () => {
     const { log, lines } = recordingLog()
-    const hub = createSessionHub({ pool: trackedLazyPool(1, []), log })
-    const job = new MessageChannel()
+    const hub = createSessionHub({ pool: trackedLazyPool([]), log })
     const writer = new MessageChannel()
     const broker = new MessageChannel()
     const hubProxy = new MessageChannel()
     try {
-      hub.attachJobPort(3, jobPortFromMessagePort(job.port1))
       hub.attachWorkerPorts(4, { writer: writer.port1, broker: broker.port1 })
       hub.attachHubProxyPort(5, hubProxy.port1)
 
       const connected = lines.filter((entry) => entry.message === workerLogMessage("ports connected"))
       const portsByWorker = new Map(connected.map((entry) => [entry.fields.workerID, entry.fields.ports]))
-      expect(portsByWorker.get(3)).toEqual(["job"])
       expect(portsByWorker.get(4)).toEqual(["writer", "broker"])
       expect(portsByWorker.get(5)).toEqual(["hub-proxy"])
     } finally {
-      job.port1.close()
-      job.port2.close()
       writer.port1.close()
       writer.port2.close()
       broker.port1.close()
@@ -2644,7 +2575,7 @@ describe("dbwal-12-07 hub wiring — B1/D2 forward log through production paths"
   test("B1 spawnBunExecutorWorker forwards log into createExecutorWorker", async () => {
     await withGlobalFakeWorker(async () => {
       const { log, lines } = recordingLog()
-      const worker = spawnBunExecutorWorker(7, { k: 1, entry: "fake://spawn", workKind: "slow", log })
+      const worker = spawnBunExecutorWorker(7, { entry: "fake://spawn", workKind: "slow", log })
       try {
         expect(lineFor(lines, "worker spawning").fields).toEqual({ workerID: 7, kind: "slow", reason: "initial" })
       } finally {
@@ -2727,15 +2658,15 @@ describe("liveness watchdog wiring", () => {
     await withGlobalFakeWorker(async () => {
       const pool = createProductionWorkerPool({
         init: () => sessionWorkerInit(),
-        count: 1,
         entry: "fake://idle-timeout",
         workKind: "instant",
         runIdleTimeoutMs: 25,
       })
       try {
+        const worker = pool.spawn()
         // The fake isolate never replies, so only a watchdog that actually reached
         // the worker can reject this instead of hanging.
-        await expect(pool.workers[0].execute({ sessionID: sid("ses_idle"), depth: 0 })).rejects.toBeInstanceOf(
+        await expect(worker.execute({ sessionID: sid("ses_idle"), depth: 0 })).rejects.toBeInstanceOf(
           SessionWorkerReplyTimeoutError,
         )
       } finally {

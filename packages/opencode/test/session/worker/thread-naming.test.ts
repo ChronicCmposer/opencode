@@ -1,54 +1,33 @@
-// WS5 — dynamic session-worker thread naming (slot lifecycle).
+// Session-worker thread naming lifecycle (slice N).
 //
-// The session worker advertises which session slot it serves through its OS
-// thread name: idle/boot `ocs<slot>`, running `ocs<slot>:<last6 of sessionID>`,
-// reset to `ocs<slot>` on every terminal (settle, cooperative cancel,
-// interrupt). Naming is Linux-only and fail-soft; these tests read the kernel's
-// per-thread `comm` file, so they skip loudly when `/proc` is unavailable.
+// A worker advertises the session it serves through its OS thread name:
 //
-// Two contracts:
-//   * the PRODUCTION entry names its slot at boot (spawned via the shared
-//     session-worker harness, with a `workerID`);
-//   * the run lifecycle transitions the name and resets it on settle AND on a
-//     cooperative cancel (driven through the dedicated thread-name fixture,
-//     which mirrors the production executor wiring).
+//   idle    `ocs:<last 6 of sessionID>`
+//   running `ocs:<last 6 of sessionID>!`
+//
+// `createThreadNamer` owns the lifecycle over the pure grammar: boot/bind
+// advertises idle, a run start advertises running, and every terminal (settle,
+// cooperative cancel, interrupt) advertises idle again. The lifecycle tests
+// inject a recording `setName`, so they are deterministic and never read `/proc`.
+//
+// The boot test spawns the real production entry with a bound `sessionID` and
+// waits on its published `ready` frame plus the resulting thread name. Linux
+// `/proc` is the only probe, so the test skips loudly elsewhere.
 
 import { describe, expect, test } from "bun:test"
-import { existsSync, readFileSync, readdirSync } from "node:fs"
-import type { SessionID } from "@/session/schema"
-import {
-  createExecutorWorker,
-  type ExecutorWorker,
-  type SessionExecutorInbound,
-  type SessionExecutorOutbound,
-} from "@/session/worker/execute"
+import { existsSync, readdirSync, readFileSync } from "node:fs"
 import { sessionThreadName } from "@/session/worker/thread-name"
+import { createThreadNamer } from "@/session/worker/thread-naming"
 import { pollUntil } from "../../lib/poll"
 import { bootSessionWorker } from "../../lib/session-worker-harness"
 import { sessionWorkerInit } from "../../lib/session-worker-init"
-import { adaptTransport } from "../../lib/transport"
-import { createWorkerHarness, type HarnessWorker, type WorkerHarness } from "../../lib/worker-harness"
 
 const TASK_DIR = "/proc/self/task"
-// Same predicate as the readers below: the test can only observe thread names
-// when this exact directory is listable.
 const procAvailable = existsSync(TASK_DIR)
 
-/** Distinct slots per test so a lingering thread cannot satisfy another test. */
-const BOOT_SLOT = 9
-const DYNAMIC_SLOT = 2
-const CANCEL_SLOT = 3
-
-const FIXTURE_ENTRY = new URL("../../fixture/thread-name-worker.ts", import.meta.url)
-
-/** The OS thread name of `tid`, or `undefined` if the thread is gone. */
-function threadName(tid: number): string | undefined {
-  try {
-    return readFileSync(`${TASK_DIR}/${tid}/comm`, "utf8").trim()
-  } catch {
-    return undefined
-  }
-}
+/** Unique last-6 suffix, so a lingering thread cannot satisfy another test. */
+const SESSION_ID = "ses_boot_worker_a2c0de"
+const IDLE_NAME = "ocs:a2c0de"
 
 /** Every thread name currently visible for this process. */
 function threadNames(): string[] {
@@ -63,98 +42,93 @@ function threadNames(): string[] {
   return names
 }
 
-/** Resolve once a thread with `name` exists anywhere in the process. */
-function waitForAnyThreadNamed(name: string): Promise<void> {
+/** Resolve once a thread with `name` exists, else fail loudly with the names seen. */
+function waitForThreadName(name: string): Promise<void> {
   return pollUntil(() => threadNames().includes(name), {
-    timeoutMs: 3000,
+    timeoutMs: 5000,
     message: `no thread named "${name}" appeared in ${TASK_DIR}; saw ${JSON.stringify(threadNames())}`,
   })
 }
 
-/** Resolve once thread `tid`'s OS name is exactly `name`. */
-function waitForThreadNamed(tid: number, name: string): Promise<void> {
-  return pollUntil(() => threadName(tid) === name, {
-    timeoutMs: 3000,
-    message: `thread ${tid} never became "${name}"; saw "${threadName(tid)}"`,
+/** A namer whose writes are recorded instead of hitting the OS thread name. */
+function recordingNamer() {
+  const names: string[] = []
+  const namer = createThreadNamer({ setName: (name) => names.push(name) })
+  return { names, namer }
+}
+
+describe("session.worker.thread-naming lifecycle", () => {
+  test("bind -> idle, run -> running, every terminal -> idle", () => {
+    const { names, namer } = recordingNamer()
+
+    namer.onBind(SESSION_ID)
+    namer.onRunStart(SESSION_ID)
+    namer.onIdle() // settle
+    namer.onRunStart(SESSION_ID)
+    namer.onIdle() // cooperative cancel
+    namer.onRunStart(SESSION_ID)
+    namer.onIdle() // interrupt
+
+    expect(names).toEqual([
+      "ocs:a2c0de",
+      "ocs:a2c0de!",
+      "ocs:a2c0de",
+      "ocs:a2c0de!",
+      "ocs:a2c0de",
+      "ocs:a2c0de!",
+      "ocs:a2c0de",
+    ])
   })
-}
 
-interface FixtureWorker {
-  readonly worker: ExecutorWorker
-  /** The fixture thread's real OS tid (from its `ready` frame). */
-  readonly osTid: number
-  terminate(): Promise<number>
-}
+  test("a run start binds the run's session even without an explicit boot bind", () => {
+    const { names, namer } = recordingNamer()
 
-/** Spawn the thread-name fixture on `harness` and read its real OS tid. */
-async function bootFixture(harness: WorkerHarness, slot: number, id: number): Promise<FixtureWorker> {
-  const handle: HarnessWorker<SessionExecutorOutbound, SessionExecutorInbound> = harness.spawn(FIXTURE_ENTRY, {
-    workerData: { workerID: slot },
+    namer.onRunStart(SESSION_ID)
+    namer.onIdle()
+
+    expect(names).toEqual(["ocs:a2c0de!", "ocs:a2c0de"])
   })
-  const ready = await handle.waitFor("ready", { timeoutMs: 15_000 })
-  return {
-    worker: createExecutorWorker({ id, transport: adaptTransport(handle) }),
-    osTid: ready.threadId,
-    terminate: () => handle.terminate(),
-  }
-}
 
-describe("WS5 — dynamic session-worker thread naming", () => {
-  test.skipIf(!procAvailable)("boots the production worker named ocs<slot>", async () => {
-    const handle = await bootSessionWorker({ init: { ...sessionWorkerInit(), workerID: BOOT_SLOT } })
+  test("rebinding follows the latest session, so idle never restores a stale one", () => {
+    const { names, namer } = recordingNamer()
+    const next = "ses_second_worker_987654"
+
+    namer.onBind(SESSION_ID)
+    namer.onRunStart(next)
+    namer.onIdle()
+
+    expect(names).toEqual(["ocs:a2c0de", "ocs:987654!", "ocs:987654"])
+  })
+
+  test("idle before any bind is a no-op", () => {
+    const { names, namer } = recordingNamer()
+
+    expect(() => namer.onIdle()).not.toThrow()
+    expect(names).toEqual([])
+  })
+
+  test("dispose drops the binding without throwing or writing a stale name", () => {
+    const { names, namer } = recordingNamer()
+
+    namer.onBind(SESSION_ID)
+    namer.onRunStart(SESSION_ID)
+
+    expect(() => namer.onDispose()).not.toThrow()
+    expect(() => namer.onDispose()).not.toThrow()
+    expect(() => namer.onIdle()).not.toThrow()
+
+    expect(names).toEqual(["ocs:a2c0de", "ocs:a2c0de!"])
+  })
+
+  test.skipIf(!procAvailable)("boots the production worker with the bound session's idle name", async () => {
+    const handle = await bootSessionWorker({
+      init: { ...sessionWorkerInit(), sessionID: SESSION_ID },
+    })
     try {
-      await waitForAnyThreadNamed(sessionThreadName(BOOT_SLOT))
+      await waitForThreadName(IDLE_NAME)
+      expect(sessionThreadName(SESSION_ID)).toBe(IDLE_NAME)
     } finally {
       await handle.terminate()
-    }
-  })
-
-  test.skipIf(!procAvailable)(
-    "transitions ocs<slot> -> ocs<slot>:<last6> during a run and resets on settle",
-    async () => {
-      const harness = createWorkerHarness({ timeoutMs: 15_000 })
-      try {
-        const fixture = await bootFixture(harness, DYNAMIC_SLOT, 1)
-        try {
-          expect(threadName(fixture.osTid)).toBe(sessionThreadName(DYNAMIC_SLOT))
-
-          const sessionID = "ses_dynamic_settle_abcdef" as SessionID
-          const running = sessionThreadName(DYNAMIC_SLOT, sessionID)
-          const run = fixture.worker.execute({ sessionID, depth: 0 })
-
-          await waitForThreadNamed(fixture.osTid, running)
-          await run
-          await waitForThreadNamed(fixture.osTid, sessionThreadName(DYNAMIC_SLOT))
-        } finally {
-          await fixture.terminate()
-        }
-      } finally {
-        await harness.dispose()
-      }
-    },
-  )
-
-  test.skipIf(!procAvailable)("resets to ocs<slot> after a cooperative cancel", async () => {
-    const harness = createWorkerHarness({ timeoutMs: 15_000 })
-    try {
-      const fixture = await bootFixture(harness, CANCEL_SLOT, 1)
-      try {
-        expect(threadName(fixture.osTid)).toBe(sessionThreadName(CANCEL_SLOT))
-
-        const sessionID = "ses_dynamic_cancel_abcdef" as SessionID
-        // The cancel settles the run with an interrupt, so `execute` rejects;
-        // this test only cares that the thread name returns to idle.
-        const run = fixture.worker.execute({ sessionID, depth: 0 }).catch(() => undefined)
-
-        await waitForThreadNamed(fixture.osTid, sessionThreadName(CANCEL_SLOT, sessionID))
-        await fixture.worker.cancel(sessionID)
-        await run
-        await waitForThreadNamed(fixture.osTid, sessionThreadName(CANCEL_SLOT))
-      } finally {
-        await fixture.terminate()
-      }
-    } finally {
-      await harness.dispose()
     }
   })
 })

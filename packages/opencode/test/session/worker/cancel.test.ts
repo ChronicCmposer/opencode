@@ -26,11 +26,11 @@ import {
   type CancellationConfig,
   type SessionRun,
   type SessionWorker,
-  type WorkerKind,
   type WorkerPool,
 } from "@/session/worker/dispatch"
 import { createWorkerHarness } from "../../lib/worker-harness"
 import { capture, flush, sid } from "../../lib/async"
+import { createFakeWorkerPool, type FakeSessionWorker } from "../../lib/fake-worker-pool"
 import { createListenerPair } from "../../lib/port-pair"
 import { createRecordingScheduler } from "../../lib/scheduler"
 import type { WorkerLogger } from "@/session/worker/log"
@@ -299,23 +299,20 @@ class CooperativeWorker implements SessionWorker {
 class PortPool implements WorkerPool {
   readonly workers: CooperativeWorker[]
   readonly spawned: CooperativeWorker[] = []
-  readonly kind = new Map<number, WorkerKind>()
 
   constructor(
     k: number,
-    cooperative = true,
+    private readonly cooperative = true,
   ) {
     this.workers = Array.from({ length: k }, (_, index) => this.make(index + 1, cooperative))
-    for (const worker of this.workers) this.kind.set(worker.id, "foreground")
   }
 
   private make(id: number, cooperative: boolean): CooperativeWorker {
     return new CooperativeWorker(id, cooperative)
   }
 
-  spawn(kind: WorkerKind): SessionWorker {
-    const worker = this.make(100 + this.spawned.length, true)
-    this.kind.set(worker.id, kind)
+  spawn(): SessionWorker {
+    const worker = this.make(100 + this.spawned.length, this.cooperative)
     this.spawned.push(worker)
     return worker
   }
@@ -351,17 +348,19 @@ describe("11.4 graceful cancel reuses the worker; terminate path replaces it", (
     expect(outcome).toMatchObject({ mode: "cooperative", winner: "cancel", acknowledged: true })
     expect(await run).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
 
-    // 11.4: the worker was NOT terminated and is reused for the next session.
-    expect(pool.workers[0].alive).toBe(true)
-    expect(pool.workers[0].terminateCount).toBe(0)
-    expect(pool.spawned).toHaveLength(0)
+    // 11.4: the per-session worker was NOT terminated and is reused by the
+    // same session's next turn.
+    const worker = pool.spawned[0]
+    expect(pool.spawned).toHaveLength(1)
+    expect(worker.alive).toBe(true)
+    expect(worker.terminateCount).toBe(0)
     expect(dispatcher.registry.has(sid("ses_1"))).toBe(false)
     expect(cancelled).toEqual(["ses_1:cooperative"])
 
-    const next = dispatcher.dispatch({ sessionID: sid("ses_2") })
+    const next = dispatcher.dispatch({ sessionID: sid("ses_1") })
     await flush()
-    expect(pool.workers[0].runs.map((entry) => entry.sessionID)).toEqual([sid("ses_1"), sid("ses_2")])
-    pool.workers[0].finish(sid("ses_2"))
+    expect(worker.runs.map((entry) => entry.sessionID)).toEqual([sid("ses_1"), sid("ses_1")])
+    worker.finish(sid("ses_1"))
     await next
   })
 
@@ -391,10 +390,11 @@ describe("11.4 graceful cancel reuses the worker; terminate path replaces it", (
     expect(await run).toEqual({ ok: false, error: expect.any(SessionCancelledError) })
     // The controller terminates once; the dispatcher may re-terminate the same
     // slot idempotently, so only "at least one terminate" is contractual here.
-    expect(pool.workers[0].terminateCount).toBeGreaterThanOrEqual(1)
-    expect(pool.workers[0].alive).toBe(false)
+    expect(pool.spawned[0].terminateCount).toBeGreaterThanOrEqual(1)
+    expect(pool.spawned[0].alive).toBe(false)
     expect(reaped).toHaveLength(1)
-    // 11.6: a fresh worker respawns into the freed slot and is ready for reuse.
+    // 11.6: the terminated session worker is dropped; a later dispatch lazily
+    // spawns a fresh one.
     expect(pool.spawned).toHaveLength(1)
     expect(cancelled).toEqual([{ mode: "terminated", resumeFromDb: true }])
     expect(dispatcher.registry.size).toBe(0)
@@ -493,7 +493,7 @@ class CompletingPool implements WorkerPool {
 
 describe("11.9 completion wins the cancel race (Q11)", () => {
   test("a run that completes during the grace returns completed and the caller resolves", async () => {
-    const pool = new CompletingPool(1)
+    const pool = new CompletingPool(0)
     const cancelled: string[] = []
     const dispatcher = createDispatcher({
       pool,
@@ -514,10 +514,59 @@ describe("11.9 completion wins the cancel race (Q11)", () => {
     // A2: the caller is reconciled with the reported winner — completion wins, so
     // the dispatch promise RESOLVES (capture reports `{ ok: true }`).
     expect(await run).toEqual({ ok: true, value: undefined })
-    // The run completed on its own: the worker was neither terminated nor replaced.
-    expect(pool.workers[0].alive).toBe(true)
-    expect(pool.spawned).toHaveLength(0)
+    // The run completed on its own: the per-session worker was neither
+    // terminated nor replaced.
+    expect(pool.spawned).toHaveLength(1)
+    expect(pool.spawned[0].alive).toBe(true)
     expect(cancelled).toEqual(["ses_1:completed"])
+  })
+})
+
+// M5: a prompt dispatched while a cancel owns the grace window must not be
+// promoted onto the worker the cancel is about to terminate.
+describe("M5 cancel-vs-new-dispatch race", () => {
+  test("a prompt arriving during grace runs cleanly on a fresh worker", async () => {
+    const pool = createFakeWorkerPool(1, { onCancel: "ignore" })
+    const scheduler = createRecordingScheduler<CancelScheduler>()
+    const dispatcher = createDispatcher({
+      pool,
+      cancellation: {
+        portFor: (worker) => (worker as FakeSessionWorker).cancelPort,
+        graceMs: 500,
+        schedule: scheduler.schedule,
+        reap: () => {},
+      },
+    })
+
+    const runA = capture(dispatcher.dispatch({ sessionID: sid("ses_race"), depth: 0 }))
+    await flush()
+    const workerA = pool.spawned[0]
+
+    // Run A ignores the cooperative checkpoint; the grace timer is still armed.
+    const cancel = dispatcher.cancelWithGrace(sid("ses_race"))
+    await flush()
+
+    // Prompt B arrives during the grace window.
+    const runB = capture(dispatcher.dispatch({ sessionID: sid("ses_race"), depth: 1 }))
+    await flush()
+    expect(workerA.runs.map((run) => run.depth)).toEqual([0])
+
+    // Grace expires: A is terminated. B must not be started on A's corpse.
+    scheduler.pending().find((timer) => timer.delayMs === 500)?.run()
+    await cancel
+    await flush()
+
+    expect(await runA).toMatchObject({ ok: false, error: expect.any(SessionCancelledError) })
+    expect(workerA.alive).toBe(false)
+
+    // B starts on a fresh worker and settles normally (no "terminated" rejection).
+    expect(pool.spawned).toHaveLength(2)
+    const workerB = pool.spawned[1]
+    expect(workerB.runs.map((run) => run.depth)).toEqual([1])
+    workerB.finish(sid("ses_race"))
+    expect(await runB).toEqual({ ok: true, value: undefined })
+
+    await dispatcher.terminateAll()
   })
 })
 

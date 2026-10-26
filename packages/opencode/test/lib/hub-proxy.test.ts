@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import { buildHubProxyHandlers } from "@/session/worker/hub"
 import type { MessagesTransformInput, MessagesTransformOutput } from "@/session/worker/plugin-host"
+import type { SessionSpawnRequest } from "@/session/worker/subagent"
+import { MessageID } from "@/session/schema"
 import { sid } from "./async"
+import { withParts } from "./session-parts"
 import { instantRunner, recordingHubAuthorities, serveHubProxyFor } from "./hub-proxy"
 
 describe("instantRunner", () => {
@@ -49,6 +52,24 @@ describe("recordingHubAuthorities", () => {
 
     await expect(Effect.runPromise(authorities.sessionStatus.get(sid("ses_1")))).resolves.toEqual({ type: "busy" })
     expect(calls).toEqual([{ method: "sessionStatus.get", args: [sid("ses_1")] }])
+  })
+
+  test("records a sessionSpawn override under the session.spawn wire method", async () => {
+    const { authorities, calls } = recordingHubAuthorities({
+      sessionSpawn: async (request) => ({
+        childID: request.childID ?? request.parentID,
+        result: withParts(request.parentID),
+      }),
+    })
+    const request: SessionSpawnRequest = {
+      parentID: sid("ses_parent"),
+      childID: sid("ses_child"),
+      type: "task",
+      prompt: { messageID: MessageID.ascending(), sessionID: sid("ses_child"), parts: [{ type: "text", text: "hi" }] },
+    }
+
+    await expect(authorities.sessionSpawn!(request)).resolves.toMatchObject({ childID: sid("ses_child") })
+    expect(calls).toEqual([{ method: "session.spawn", args: [request] }])
   })
 
   test("records a messagesTransform override and returns its value across the port", async () => {

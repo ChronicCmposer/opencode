@@ -1,0 +1,123 @@
+// One global spawn permit for per-session workers.
+//
+// A Bun `Worker` costs a thread and boots asynchronously. To keep a burst of
+// first prompts from spawning every session at once, the hub serializes
+// `new Worker` behind this single permit and releases it only when the spawned
+// worker has booted (its first frame / ready handshake). Waiters queue FIFO and
+// are never rejected by the gate while they wait; the only rejection is the
+// acquisition timeout, which fails that one spawn instead of the session.
+//
+// Integration (owned by the hub/execute wiring, not this module):
+//
+//   const permit = await gate.acquire()
+//   try {
+//     worker = new Worker(...)
+//     await workerReady
+//     permit.ready()
+//   } catch (error) {
+//     permit.fail(error)
+//   }
+//
+// `acquire` resolves before the worker is constructed, so the caller already
+// holds the acquisition when `fail` runs. `fail` therefore releases the permit
+// (and the spawn failure travels through the caller's `catch`); the gate never
+// rejects a granted acquisition. Releasing twice, or calling `ready` after
+// `fail`, is a no-op.
+
+export interface SpawnGateOptions {
+  /**
+   * How long an `acquire` may wait for the permit before its spawn attempt
+   * fails. A positive, finite number of milliseconds.
+   */
+  readonly timeoutMs: number
+}
+
+export interface SpawnPermit {
+  /** Release the permit after the worker's boot-ready handshake. Idempotent. */
+  ready(): void
+  /** Release the permit after a failed spawn. Idempotent. */
+  fail(error: unknown): void
+}
+
+export interface SpawnGateHandle {
+  /** Wait for the one global permit, resolving in FIFO order. */
+  acquire(): Promise<SpawnPermit>
+}
+
+/** A spawn could not obtain the global permit within the configured timeout. */
+export class SpawnGateTimeoutError extends Error {
+  readonly timeoutMs: number
+
+  constructor(timeoutMs: number) {
+    super(`spawn gate: no worker spawn permit became available within ${timeoutMs}ms`)
+    this.name = "SpawnGateTimeoutError"
+    this.timeoutMs = timeoutMs
+  }
+}
+
+interface Waiter {
+  readonly resolve: (permit: SpawnPermit) => void
+  readonly reject: (error: Error) => void
+  readonly timer: ReturnType<typeof setTimeout>
+}
+
+export function createSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
+  const timeoutMs = requireTimeout(options.timeoutMs)
+  const waiters: Waiter[] = []
+  let held = false
+
+  const permit = (): SpawnPermit => {
+    let released = false
+    const release = (): void => {
+      if (released) return
+      released = true
+      held = false
+      const waiter = waiters.shift()
+      if (waiter === undefined) return
+      clearTimeout(waiter.timer)
+      granted(waiter.resolve)
+    }
+    return {
+      ready: release,
+      fail: release,
+    }
+  }
+
+  // Admit one waiter as the new holder. The permit is created only after
+  // `held` flips, so a grant can never race a second grant.
+  const granted = (resolve: (permit: SpawnPermit) => void): void => {
+    held = true
+    resolve(permit())
+  }
+
+  return {
+    acquire() {
+      if (!held) {
+        held = true
+        return Promise.resolve(permit())
+      }
+      return new Promise<SpawnPermit>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const index = waiters.indexOf(waiter)
+          if (index === -1) return
+          waiters.splice(index, 1)
+          reject(new SpawnGateTimeoutError(timeoutMs))
+        }, timeoutMs)
+        // The acquisition deadline is a shutdown guard, not work: never keep the
+        // process alive waiting for a permit nobody will release.
+        timer.unref?.()
+        const waiter: Waiter = { resolve, reject, timer }
+        waiters.push(waiter)
+      })
+    },
+  }
+}
+
+function requireTimeout(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`spawn gate: timeoutMs must be a positive finite number, received ${value}`)
+  }
+  return value
+}
+
+export * as SpawnGate from "./spawn-gate"

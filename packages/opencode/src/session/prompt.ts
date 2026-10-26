@@ -51,9 +51,10 @@ import { Process } from "@/util/process"
 import { reconcileInPlace } from "@/util/reconcile"
 import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
-import { TaskTool, type TaskPromptOps, type TaskSubagentDispatch } from "@/tool/task"
+import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
-import { SubagentDispatchProxyService, type SubagentDispatchProxy } from "./worker/subagent"
+import { SessionDepth } from "./depth"
+import { DispatchOrigin } from "./origin"
 import type { CancelOutcome } from "./worker/cancel"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -141,39 +142,20 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
     const { db } = database
-    // The hub-proxy subagent-dispatch RPC is in the caller's context only in a
-    // worker that reaches a hub control plane; resolve it once per layer instance
-    // (mirrors `run-state.ts`'s flag-on seam). Absent means the inline/flag-off
-    // behaviour: no subagent dispatch seam.
-    const subagentDispatchIfEnabled: Effect.Effect<SubagentDispatchProxy | undefined> = yield* Effect.cached(
-      Effect.gen(function* () {
-        const dispatch = yield* Effect.serviceOption(SubagentDispatchProxyService)
-        return Option.isNone(dispatch) ? undefined : dispatch.value
-      }),
-    )
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
-      const dispatch = yield* subagentDispatchIfEnabled
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID).pipe(Effect.asVoid),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
-        // Route a subagent child through the hub dispatcher at depth ≥ 1 via the
-        // hub-proxy RPC, instead of running it inline. The hub dispatcher is the
-        // physical-headroom and `subagent_depth` authority, so an over-deep or
-        // headroom-full child comes back as a status-bearing job. A transport
-        // fault is a defect (the port is the only channel back).
-        ...(dispatch === undefined
-          ? {}
-          : {
-              dispatchSubagent: (request: TaskSubagentDispatch) =>
-                dispatch.dispatchSubagent(request).pipe(Effect.orDie),
-            }),
       } satisfies TaskPromptOps
     })
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
-      return yield* state.cancel(sessionID)
+      return yield* cancelSessionTree({
+        children: (id) => sessions.children(id),
+        cancelOne: (id) => state.cancel(id),
+      })(sessionID)
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -1020,6 +1002,8 @@ const layer = Layer.effect(
       "SessionPrompt.prompt",
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      const limit = (yield* config.get()).subagent_depth ?? 1
+      assertSpawnDepth(session.metadata, limit)
       yield* revert.cleanup(session)
       const message = yield* createUserMessage(input)
       yield* sessions.touch(input.sessionID)
@@ -1034,7 +1018,7 @@ const layer = Layer.effect(
       }
 
       if (input.noReply === true) return message
-      return yield* loop({ sessionID: input.sessionID })
+      return yield* loop({ sessionID: input.sessionID, origin: input.origin })
     })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
@@ -1051,6 +1035,7 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+        assertSpawnDepth(session.metadata, (yield* config.get()).subagent_depth ?? 1)
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1356,7 +1341,12 @@ const layer = Layer.effect(
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        runLoop(input.sessionID),
+        input.origin,
+      )
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
@@ -1505,6 +1495,38 @@ const layer = Layer.effect(
   }),
 )
 
+/**
+ * Reject a session whose explicit `metadata.depth` exceeds `subagent_depth`.
+ * Depth is persisted at spawn, so this single check covers every prompt path
+ * (direct, worker-carried, resumed loop) without walking the parent chain.
+ */
+export function assertSpawnDepth(metadata: unknown, limit: number): void {
+  const depth = SessionDepth.spawnDepth(metadata)
+  if (!SessionDepth.exceedsSubagentDepth(depth, limit)) return
+  throw new Error(SessionDepth.subagentDepthMessage(limit))
+}
+
+/**
+ * Cancel a session tree children-first. Implicit children (delegate/metadata)
+ * are still linked through `Session.children`, so they cascade even though their
+ * depth stays 0. The visited set makes a corrupt/cyclic parent edge terminate.
+ */
+export function cancelSessionTree(deps: {
+  children: (sessionID: SessionID) => Effect.Effect<ReadonlyArray<{ readonly id: SessionID }>>
+  cancelOne: (sessionID: SessionID) => Effect.Effect<CancelOutcome | undefined>
+}) {
+  return Effect.fnUntraced(function* (sessionID: SessionID) {
+    const visit = (id: SessionID, seen: Set<SessionID>): Effect.Effect<CancelOutcome | undefined> =>
+      Effect.gen(function* () {
+        if (seen.has(id)) return undefined
+        seen.add(id)
+        for (const child of yield* deps.children(id)) yield* visit(child.id, seen)
+        return yield* deps.cancelOne(id)
+      })
+    return yield* visit(sessionID, new Set())
+  })
+}
+
 const ModelRef = Schema.Struct({
   providerID: ProviderV2.ID,
   modelID: ModelV2.ID,
@@ -1523,6 +1545,12 @@ export const PromptInput = Schema.Struct({
   format: Schema.optional(SessionV1.Format),
   system: Schema.optional(Schema.String),
   variant: Schema.optional(Schema.String),
+  /**
+   * Who asked for this prompt. The HTTP payload omits it (a direct prompt is a
+   * user action); a spawned background child carries `"auto"` so a dead worker
+   * fails fast instead of respawning forever.
+   */
+  origin: Schema.optional(DispatchOrigin),
   parts: Schema.Array(
     Schema.Union([
       SessionV1.TextPartInput,
@@ -1536,6 +1564,7 @@ export type PromptInput = Schema.Schema.Type<typeof PromptInput>
 
 export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput")({
   sessionID: SessionID,
+  origin: Schema.optional(DispatchOrigin),
 }) {}
 
 export const ShellInput = Schema.Struct({
