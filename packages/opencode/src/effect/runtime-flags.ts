@@ -29,14 +29,45 @@ const SESSION_WORKERS_ENV = "OPENCODE_EXPERIMENTAL_SESSION_WORKERS"
 const UMBRELLA_ENV = "OPENCODE_EXPERIMENTAL"
 
 /**
- * The canonical parser for the session-worker rollout flag. The dedicated flag
- * wins when it parses as a boolean; otherwise it falls back to the umbrella
- * `OPENCODE_EXPERIMENTAL`, which itself defaults to `false`. Shared by the
- * graph decision (`SessionWorkerNodes.sessionWorkersEnabled`) and the runtime
- * gate below, so the two cannot disagree on how a value is interpreted.
+ * The ONE resolver for the session-worker rollout flag. The dedicated flag wins
+ * when it parses as a boolean; otherwise it falls back to the umbrella
+ * `OPENCODE_EXPERIMENTAL`, which itself defaults to `false`.
+ *
+ * Every surface resolves through this function — the graph decision
+ * (`SessionWorkerNodes.sessionWorkersEnabled`) and the Config-backed runtime flag
+ * (`experimentalSessionWorkers` below) — so they cannot disagree on how a value
+ * is interpreted. `experimentalSessionWorkersFromEnv` is the historical alias.
  */
-export const experimentalSessionWorkersFromEnv = (env: Record<string, string | undefined> = process.env): boolean =>
-  parseBoolean(env[SESSION_WORKERS_ENV]) ?? parseBoolean(env[UMBRELLA_ENV]) ?? false
+export function resolveSessionWorkersFlag(env: Record<string, string | undefined> = process.env): boolean {
+  return parseBoolean(env[SESSION_WORKERS_ENV]) ?? parseBoolean(env[UMBRELLA_ENV]) ?? false
+}
+
+/** Historical alias for {@link resolveSessionWorkersFlag}; the same function. */
+export const experimentalSessionWorkersFromEnv = resolveSessionWorkersFlag
+
+/**
+ * The mismatch diagnostic between the two flag OBSERVATIONS.
+ *
+ * The graph is frozen at module load from `process.env`, while the runtime
+ * service resolves through the ambient `ConfigProvider`. When a provider override
+ * flips the flag the two disagree: the hub is present but the runtime gate says
+ * off (wasted but harmless), or the runtime gate says on while the graph omitted
+ * the hub (sessions silently fall back in-process). Returns a descriptive message
+ * for the bootstrap to log, or `undefined` when aligned.
+ */
+export function sessionWorkersFlagMismatch(input: {
+  readonly graphEnabled: boolean
+  readonly runtimeEnabled: boolean
+}): string | undefined {
+  if (input.graphEnabled === input.runtimeEnabled) return undefined
+  const state = (enabled: boolean) => (enabled ? "on" : "off")
+  return (
+    `session-worker flag mismatch: the graph gate is ${state(input.graphEnabled)} ` +
+    `but the runtime flag is ${state(input.runtimeEnabled)} — the graph is frozen at ` +
+    `process start while the runtime service follows the active ConfigProvider. ` +
+    `Sessions would take the wrong execution path; make the provider agree with the environment.`
+  )
+}
 
 /**
  * Read an optional string from the ConfigProvider. A missing *or* unparseable
@@ -51,16 +82,16 @@ const optionalString = (name: string): Config.Config<Option.Option<string>> =>
 
 /**
  * The session-worker rollout flag as a `Config`. It resolves through the ambient
- * ConfigProvider but parses through {@link experimentalSessionWorkersFromEnv},
- * so the Config and the graph predicate stay in lockstep — including malformed
- * values, where both recover rather than the Config path failing.
+ * ConfigProvider but parses through {@link resolveSessionWorkersFlag}, so the
+ * Config and the graph predicate stay in lockstep — including malformed values,
+ * where both recover rather than the Config path failing.
  */
 const experimentalSessionWorkersConfig: Config.Config<boolean> = Config.all({
   dedicated: optionalString(SESSION_WORKERS_ENV),
   umbrella: optionalString(UMBRELLA_ENV),
 }).pipe(
   Config.map((values) =>
-    experimentalSessionWorkersFromEnv({
+    resolveSessionWorkersFlag({
       [SESSION_WORKERS_ENV]: Option.getOrUndefined(values.dedicated),
       [UMBRELLA_ENV]: Option.getOrUndefined(values.umbrella),
     }),

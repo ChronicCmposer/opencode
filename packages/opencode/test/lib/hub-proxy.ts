@@ -26,10 +26,12 @@ import { SessionStatus } from "@/session/status"
 export const instantRunner: HubProxyRunner = (effect) => Effect.runPromise(effect)
 
 /** A served hub-proxy pair: the worker-side client plus a combined disposer. */
-export interface ServedHubProxy {
+export interface ServedHubProxy extends AsyncDisposable {
   readonly client: HubProxyClient
-  /** Stop serving, dispose the client, and close both channel ports. */
+  /** Stop serving, dispose the client, and close both channel ports (idempotent). */
   dispose(): void
+  /** Alias for {@link dispose}, for callers that use the resource-ownership idiom. */
+  close(): void
 }
 
 /** Serve `handlers` on a fresh channel and return the client end. */
@@ -37,14 +39,20 @@ export function serveHubProxyFor(handlers: HubProxyHandlers): ServedHubProxy {
   const channel = new MessageChannel()
   const disposeServer = serveHubProxy(handlers, channel.port2)
   const client = createHubProxyClient(channel.port1)
+  let disposed = false
+  const dispose = (): void => {
+    if (disposed) return
+    disposed = true
+    disposeServer()
+    client.dispose()
+    channel.port1.close()
+    channel.port2.close()
+  }
   return {
     client,
-    dispose() {
-      disposeServer()
-      client.dispose()
-      channel.port1.close()
-      channel.port2.close()
-    },
+    dispose,
+    close: dispose,
+    [Symbol.asyncDispose]: async () => dispose(),
   }
 }
 

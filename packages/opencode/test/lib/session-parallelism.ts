@@ -85,11 +85,43 @@ export interface ParallelSessionReport {
 type WorkerOutbound = SessionExecutorOutbound | { readonly type: "ports"; readonly egress: MessagePort }
 type WorkerInbound = SessionExecutorInbound
 
+/** The executor boot handshake a spawned session worker reports before it accepts work. */
+export interface WorkerBoot {
+  readonly threadId: number
+  /** The worker's transferred egress port; absent only on a degraded boot. */
+  readonly egress: MessagePort | undefined
+}
+
+/**
+ * The narrow `waitFor` view a boot handshake needs (a real `HarnessWorker`
+ * satisfies it). Generic over the frame type so a worker whose outbound union is
+ * broader than `WorkerOutbound` still fits; the handshake narrows by `type`.
+ */
+export interface WorkerBootSource<TMessage extends { readonly type: string } = WorkerOutbound> {
+  waitFor(
+    match: (message: TMessage) => boolean,
+    options?: { readonly timeoutMs?: number },
+  ): Promise<TMessage>
+}
+
+interface ReadyFrame {
+  readonly type: "ready"
+  readonly threadId: number
+}
+
+interface PortsFrame {
+  readonly type: "ports"
+  readonly egress: MessagePort
+}
+
+const isReadyFrame = (message: { readonly type: string }): message is ReadyFrame => message.type === "ready"
+const isPortsFrame = (message: { readonly type: string }): message is PortsFrame => message.type === "ports"
+
 /** A spawned worker plus the single promise that resolves its bootstrap handshake. */
 interface SpawnedWorker {
   readonly worker: ExecutorWorker
   /** Resolves once the worker reported `ready` AND transferred its egress port. */
-  readonly spawn: Promise<{ readonly threadId: number; readonly egress: MessagePort | undefined }>
+  readonly spawn: Promise<WorkerBoot>
 }
 
 /**
@@ -144,6 +176,26 @@ function executorTransport(handle: HarnessWorker<WorkerOutbound, WorkerInbound>)
   }
 }
 
+/**
+ * Await the executor boot handshake — `ready` plus the `ports` transfer — and
+ * resolve it to plain data so callers never depend on frame ordering. Both
+ * frames are required: a worker that reports `ready` without its relay ports
+ * cannot accept dispatched work, so the wait fails loud instead of hanging.
+ */
+export async function waitForWorkerBoot<TMessage extends { readonly type: string }>(
+  handle: WorkerBootSource<TMessage>,
+  options: { readonly timeoutMs?: number } = {},
+): Promise<WorkerBoot> {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  const [ready, ports] = await Promise.all([
+    handle.waitFor(isReadyFrame, { timeoutMs }),
+    handle.waitFor(isPortsFrame, { timeoutMs }),
+  ])
+  if (!isReadyFrame(ready)) throw new Error('worker boot: expected a "ready" frame')
+  if (!isPortsFrame(ports)) throw new Error('worker boot: expected a "ports" frame')
+  return { threadId: ready.threadId, egress: ports.egress }
+}
+
 function spawnSessionWorker(
   harness: WorkerHarness,
   id: number,
@@ -152,13 +204,7 @@ function spawnSessionWorker(
   timeoutMs: number,
 ): SpawnedWorker {
   const handle = harness.spawn<WorkerOutbound, WorkerInbound>(entry, { env })
-  const spawn = Promise.all([
-    handle.waitFor((message) => message.type === "ready", { timeoutMs }),
-    handle.waitFor((message) => message.type === "ports", { timeoutMs }),
-  ]).then(([ready, ports]) => ({
-    threadId: ready.type === "ready" ? ready.threadId : 0,
-    egress: ports.type === "ports" ? ports.egress : undefined,
-  }))
+  const spawn = waitForWorkerBoot(handle, { timeoutMs })
   return {
     worker: createExecutorWorker({ id, transport: executorTransport(handle), workKind: MOCK_SSE_WORK_KIND, timeoutMs }),
     spawn,

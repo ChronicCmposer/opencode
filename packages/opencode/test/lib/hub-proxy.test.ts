@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 import { Effect } from "effect"
 import { buildHubProxyHandlers } from "@/session/worker/hub"
 import type { MessagesTransformInput, MessagesTransformOutput } from "@/session/worker/plugin-host"
@@ -33,6 +33,17 @@ describe("serveHubProxyFor", () => {
     } finally {
       served.dispose()
     }
+  })
+
+  test("dispose/close are idempotent and release the client exactly once", () => {
+    const served = serveHubProxyFor({})
+    const clientDispose = spyOn(served.client, "dispose")
+
+    served.dispose()
+    served.close()
+    served.dispose()
+
+    expect(clientDispose).toHaveBeenCalledTimes(1)
   })
 })
 

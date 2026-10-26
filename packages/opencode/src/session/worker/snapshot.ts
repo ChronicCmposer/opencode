@@ -88,8 +88,6 @@ export const createEpochSequence = (initial = 0): EpochSequence => {
 }
 
 export interface BuildWorkerSnapshotOptions {
-  /** Explicit worker count; defaults to the per-session reality of one. */
-  readonly workerCount?: number
   /** Injected clock; defaults to `Date.now`. */
   readonly clock?: () => number
   /**
@@ -158,7 +156,6 @@ export const buildWorkerSnapshot = Effect.fn("WorkerSnapshot.build")(function* (
     auth: authInfo,
     modelsDev: models,
     flags,
-    workerCount: options.workerCount ?? 1,
   } satisfies WorkerSnapshot
 })
 

@@ -1,16 +1,4 @@
-// Dependency-free Bun worker used by test/lib/boot-memory.test.ts (plan task 3.11).
-//
-// Reports a single readiness message so the hub can time the boot. Bun workers are
-// threads inside one process, so `rssBytes` here is the process-wide RSS, not a
-// per-thread figure; the harness records it as an observed sample.
-//
-// out: { type: "ready", workerId, rssBytes }
+// Boot-cost probe launcher; the probe body lives in `probe-worker.ts`.
+import { runProbe } from "./probe-worker"
 
-import { threadId } from "node:worker_threads"
-import { postToParent } from "./worker-scope"
-
-postToParent({
-  type: "ready",
-  workerId: threadId,
-  rssBytes: process.memoryUsage().rss,
-})
+await runProbe("boot")

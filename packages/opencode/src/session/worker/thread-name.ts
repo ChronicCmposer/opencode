@@ -25,7 +25,8 @@ export interface SessionThreadNameOptions {
  * `comm` limit.
  */
 export function sessionThreadName(sessionID: string, options?: SessionThreadNameOptions): string {
-  if (sessionID.length === 0) throw new Error("sessionThreadName requires a non-empty session id")
+  // An unbound/empty id is still a valid observation name (`ocs:`); naming is
+  // best-effort diagnostics and must never throw at boot.
   const idle = `ocs:${sessionID.slice(-6)}`
   return threadNameWithinLimit(options?.running === true ? `${idle}!` : idle)
 }

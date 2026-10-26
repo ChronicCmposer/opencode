@@ -1417,14 +1417,14 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
   /** Release the permit as boot-ready; idempotent per worker. */
   const releasePermit = (): void => {
     clearBootTimer()
-    permit?.ready()
+    permit?.release("ready")
     permit = undefined
   }
 
   /** Release the permit for a failed spawn (the caller surfaces the failure). */
   const failPermit = (error: unknown): void => {
     clearBootTimer()
-    permit?.fail(error)
+    permit?.release("failed", error)
     permit = undefined
   }
 
@@ -1524,7 +1524,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     booting = (async () => {
       const acquired = await gate.acquire()
       if (!alive) {
-        acquired.fail(new Error("session worker terminated before boot"))
+        acquired.release("failed", new Error("session worker terminated before boot"))
         return
       }
       permit = acquired
@@ -3002,7 +3002,7 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
       // The session's persisted model is authoritative; config/default only
       // applies when the dispatch carried no session model.
       model: model === undefined ? deps.initOptions?.model : { ...deps.initOptions?.model, session: model },
-      snapshot: { ...deps.initOptions?.snapshot, workerCount: deps.count, epochSequence: deps.epochSequence },
+      snapshot: { ...deps.initOptions?.snapshot, epochSequence: deps.epochSequence },
       plugins:
         pluginSources === undefined
           ? deps.initOptions?.plugins

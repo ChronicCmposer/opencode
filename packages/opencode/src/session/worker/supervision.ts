@@ -11,8 +11,10 @@
 // - a user-initiated dispatch always resets the session, because the user asked
 //   for it explicitly and the dispatcher will spawn a fresh worker.
 //
-// The clock and timer are injected so the policy is deterministic in tests and
-// never depends on wall-clock time (`Law of Atomic Predictability`).
+// The clock is injected so the policy is deterministic in tests and never
+// depends on wall-clock time (`Law of Atomic Predictability`). Backoff is pure
+// `retryAt` arithmetic: no timer is scheduled, so there is one authority for
+// when the window ends and no timer can outlive the state.
 
 import type { DispatchOrigin } from "@/session/origin"
 
@@ -46,8 +48,6 @@ export interface CrashDecision {
 export interface SupervisionOptions {
   /** Monotonic-ish clock in milliseconds; defaults to `Date.now`. */
   readonly now?: () => number
-  /** Timer seam returning a cancel handle; defaults to `setTimeout`/`clearTimeout`. */
-  readonly schedule?: (delayMs: number, run: () => void) => () => void
 }
 
 export interface Supervision {
@@ -95,12 +95,10 @@ interface SessionCrashState {
   dead: boolean
   /** When the backoff window ends; 0 means no backoff is pending. */
   retryAt: number
-  cancel: (() => void) | undefined
 }
 
 export function createSupervision(options: SupervisionOptions = {}): Supervision {
   const now = options.now ?? Date.now
-  const schedule = options.schedule ?? defaultSchedule
   const states = new Map<string, SessionCrashState>()
 
   const requireSessionID = (sessionID: string): void => {
@@ -109,28 +107,24 @@ export function createSupervision(options: SupervisionOptions = {}): Supervision
     }
   }
 
-  const clearTimer = (state: SessionCrashState): void => {
-    state.cancel?.()
-    state.cancel = undefined
+  /** End any pending backoff window. The single place `retryAt` is cleared. */
+  const clearBackoff = (state: SessionCrashState): void => {
+    state.retryAt = 0
   }
 
+  /** Drop every trace of a session. Used by healthy, forget and user dispatch. */
   const reset = (sessionID: string): void => {
-    const state = states.get(sessionID)
-    if (state !== undefined) clearTimer(state)
     states.delete(sessionID)
   }
 
   /**
    * Evict the least-recently-crashed session when a new one would exceed the
    * cap. `Map` preserves insertion order and `recordCrash` re-inserts, so the
-   * first key is the oldest history. A pending backoff timer is canceled with
-   * the entry so eviction cannot leave a timer behind.
+   * first key is the oldest history.
    */
   const evictOldest = (): void => {
     const oldest = states.keys().next().value
     if (oldest === undefined) return
-    const state = states.get(oldest)
-    if (state !== undefined) clearTimer(state)
     states.delete(oldest)
   }
 
@@ -149,8 +143,7 @@ export function createSupervision(options: SupervisionOptions = {}): Supervision
       if (state.dead) return { kind: "dead" }
       const remaining = state.retryAt - now()
       if (remaining <= 0) {
-        clearTimer(state)
-        state.retryAt = 0
+        clearBackoff(state)
         return { kind: "allow" }
       }
       return { kind: "backoff", delayMs: remaining }
@@ -159,21 +152,13 @@ export function createSupervision(options: SupervisionOptions = {}): Supervision
       requireSessionID(sessionID)
       const existing = states.get(sessionID)
       if (existing === undefined && states.size >= MAX_SUPERVISION_SESSIONS) evictOldest()
-      const state = existing ?? { attempts: 0, dead: false, retryAt: 0, cancel: undefined }
+      const state = existing ?? { attempts: 0, dead: false, retryAt: 0 }
       const attempts = state.attempts + 1
       const delayMs = crashBackoffMs(attempts)
       state.attempts = attempts
       state.dead = attempts >= CRASH_ATTEMPTS_BEFORE_DEAD
-      clearTimer(state)
-      if (state.dead) {
-        state.retryAt = 0
-      } else {
-        state.retryAt = now() + delayMs
-        state.cancel = schedule(delayMs, () => {
-          state.retryAt = 0
-          state.cancel = undefined
-        })
-      }
+      clearBackoff(state)
+      if (!state.dead) state.retryAt = now() + delayMs
       // Re-insert so the session becomes the most recent entry (LRU order).
       states.delete(sessionID)
       states.set(sessionID, state)
@@ -192,12 +177,6 @@ export function createSupervision(options: SupervisionOptions = {}): Supervision
       reset(sessionID)
     },
   }
-}
-
-function defaultSchedule(delayMs: number, run: () => void): () => void {
-  const timer = setTimeout(run, delayMs)
-  timer.unref?.()
-  return () => clearTimeout(timer)
 }
 
 export * as SupervisionModule from "./supervision"

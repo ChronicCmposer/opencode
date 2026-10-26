@@ -15,13 +15,16 @@ import { assertNonEmptyString, assertNonNegativeInteger, stringify } from "./ass
 import { createCapture, type CaptureHarness } from "./capture"
 import { deepFreeze } from "./deep-freeze"
 
-export interface DurableRow {
+export interface GoldenDurableRow {
   readonly aggregate_id: string
   readonly seq: number
   readonly type: string
   readonly data: unknown
   readonly owner_id?: string | null
 }
+
+/** @deprecated Use {@link GoldenDurableRow}; kept so existing imports keep compiling. */
+export type DurableRow = GoldenDurableRow
 
 export interface GoldenRow {
   readonly aggregate_id: string
@@ -59,7 +62,7 @@ export interface GoldenCapture {
   /** The underlying 3.3 capture timeline this helper records onto. */
   readonly capture: CaptureHarness
   /** Parse and record one durable row; throws on an invalid row. */
-  durable(row: DurableRow): GoldenRow
+  durable(row: GoldenDurableRow): GoldenRow
   readonly rows: ReadonlyArray<GoldenRow>
   /** Observed durable sequence in record order. */
   sequence(): ReadonlyArray<GoldenSequenceEntry>
@@ -86,7 +89,7 @@ const DURABLE_KIND = "durable"
 const COMPARED_FIELDS = ["type", "data", "owner_id"] as const
 
 /** Parse an untrusted durable row into a trusted `GoldenRow`, failing loudly. */
-function parseDurableRow(input: unknown): GoldenRow {
+function parseGoldenDurableRow(input: unknown): GoldenRow {
   if (input === null || typeof input !== "object") {
     throw new Error(`invalid durable row: expected an object (got ${stringify(input)})`)
   }
@@ -136,8 +139,8 @@ function canonicalize(rows: ReadonlyArray<GoldenRow>): GoldenSnapshot {
 export function createGoldenCapture(options: GoldenCaptureOptions = {}): GoldenCapture {
   const capture = options.capture ?? createCapture(options.clock ? { clock: options.clock } : {})
 
-  const durable = (row: DurableRow): GoldenRow => {
-    const parsed = parseDurableRow(row)
+  const durable = (row: GoldenDurableRow): GoldenRow => {
+    const parsed = parseGoldenDurableRow(row)
     capture.dbWrite(DURABLE_KIND, parsed)
     return parsed
   }
@@ -148,7 +151,7 @@ export function createGoldenCapture(options: GoldenCaptureOptions = {}): GoldenC
       .filter((record) => record.kind === DURABLE_KIND)
       // Records are parsed, not cast: a raw `db` record written directly onto
       // the shared timeline cannot smuggle an invalid row past `rows`/`snapshot`.
-      .map((record) => parseDurableRow(record.data))
+      .map((record) => parseGoldenDurableRow(record.data))
 
   return {
     capture,

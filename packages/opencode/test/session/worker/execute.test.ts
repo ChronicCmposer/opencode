@@ -14,8 +14,8 @@ import {
   createSessionExecutor,
   createSessionRunMachine,
   DEFAULT_WORK_KIND,
+  EXECUTOR_CANCEL_MODES,
   installSessionExecutor,
-  RESULTS_CAP,
   SessionBusyError,
   SessionWorkerReplyTimeoutError,
   UnknownWorkKindError,
@@ -322,6 +322,10 @@ describe("5.1 executor protocol", () => {
 
   test("DEFAULT_WORK_KIND is the production session work kind", () => {
     expect(DEFAULT_WORK_KIND).toBe("session")
+  })
+
+  test("the worker cancel vocabulary has no queued outcome", () => {
+    expect(EXECUTOR_CANCEL_MODES).toEqual(["cooperative", "terminate"])
   })
 })
 
@@ -938,6 +942,31 @@ describe("B2 run prompt transport", () => {
     expect(run).toBeDefined()
     if (run !== undefined) expect("prompt" in run).toBe(false)
   })
+
+  test("the dispatch depth rides the run frame", async () => {
+    const { transport, posted } = capturingTransport()
+    const worker = createExecutorWorker({ id: 1, transport, workKind: "session" })
+
+    await worker.execute({ sessionID: sid("ses_3"), depth: 3 })
+
+    const run = posted.find((message) => message.type === "run")
+    expect(run).toBeDefined()
+    if (run?.type === "run") expect(run.depth).toBe(3)
+  })
+
+  test("the worker consumes the frame depth at run start", () =>
+    withScope(async (scope) => {
+      const seen: Array<{ sessionID: SessionID; depth: number }> = []
+      const executor = createSessionExecutor({
+        machine: createSessionRunMachine({ scope }),
+        work: echoWork,
+        onRunStart: (sessionID, depth) => seen.push({ sessionID, depth }),
+      })
+
+      await executor.handle({ type: "run", id: 2, sessionID: sid("ses_1"), kind: "echo", depth: 2 })
+
+      expect(seen).toEqual([{ sessionID: sid("ses_1"), depth: 2 }])
+    }))
 })
 
 // ---------------------------------------------------------------------------
@@ -1014,23 +1043,28 @@ describe("Part 1 shell dispatch over the executor frame", () => {
   })
 })
 
-describe("A9 the per-session results map is bounded", () => {
-  test("re-dispatch refreshes recency and the oldest result is evicted at the cap", async () => {
+describe("A9 one last result per executor (no result map)", () => {
+  test("a later run replaces the previous session's result", async () => {
     const { transport } = replyingTransport()
     const worker = createExecutorWorker({ id: 1, transport, workKind: "session" })
 
-    for (let index = 0; index < RESULTS_CAP; index++) {
-      await worker.execute({ sessionID: sid(`ses_${index}`), depth: 0 })
-    }
-    // Refresh ses_0 so it is no longer the oldest.
-    await worker.execute({ sessionID: sid("ses_0"), depth: 0 })
-    // One more distinct session pushes the map past the cap.
-    await worker.execute({ sessionID: sid("ses_extra"), depth: 0 })
+    await worker.execute({ sessionID: sid("ses_first"), depth: 0 })
+    expect(worker.resultFor(sid("ses_first"))).toBeDefined()
 
-    expect(worker.resultFor(sid("ses_0"))).toBeDefined()
-    expect(worker.resultFor(sid("ses_extra"))).toBeDefined()
-    // ses_1 was the oldest live entry and is the eviction victim.
-    expect(worker.resultFor(sid("ses_1"))).toBeUndefined()
+    await worker.execute({ sessionID: sid("ses_second"), depth: 0 })
+
+    expect(worker.resultFor(sid("ses_first"))).toBeUndefined()
+    expect(worker.resultFor(sid("ses_second"))?.value).toBe(2)
+  })
+
+  test("re-running the bound session refreshes the one recorded result", async () => {
+    const { transport } = replyingTransport()
+    const worker = createExecutorWorker({ id: 1, transport, workKind: "session" })
+
+    await worker.execute({ sessionID: sid("ses_bound"), depth: 0 })
+    await worker.execute({ sessionID: sid("ses_bound"), depth: 0 })
+
+    expect(worker.resultFor(sid("ses_bound"))?.value).toBe(2)
   })
 })
 
@@ -1068,5 +1102,78 @@ describe("2.6 durable-egress write barrier", () => {
     await running
     expect(settled).toBe(true)
     expect(worker.resultFor(sid("ses_1"))).toBeDefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Addressed control errors (finding 5). A worker rejects `cancel` /
+// `assertNotBusy` / `hasActiveWork` with a structured `error` frame; the
+// executor must settle immediately (never wait out the deadline) and preserve
+// the remote tag so callers can branch on it.
+// ---------------------------------------------------------------------------
+
+describe("addressed control errors", () => {
+  /** A transport that answers the latest posted control frame with an error. */
+  function errorReply(tag?: string): {
+    readonly transport: ExecutorTransport
+    readonly posted: SessionExecutorInbound[]
+  } {
+    const posted: SessionExecutorInbound[] = []
+    return {
+      posted,
+      transport: {
+        post: (message) => posted.push(message),
+        waitFor: async () => {
+          const last = posted[posted.length - 1] as { readonly id: number }
+          return {
+            type: "error" as const,
+            id: last.id,
+            ...(tag === undefined ? {} : { tag }),
+            message: "remote control failed",
+          }
+        },
+        alive: true,
+        terminate: async () => 0,
+      },
+    }
+  }
+
+  /** The tag the executor surfaced, read defensively from a rejected promise. */
+  async function rejection(promise: Promise<unknown>): Promise<{ readonly tag?: unknown; readonly message: string }> {
+    try {
+      await promise
+    } catch (error) {
+      const tagged = error as { readonly _tag?: string; readonly tag?: string; readonly message?: string }
+      return { tag: tagged._tag ?? tagged.tag, message: tagged.message ?? String(error) }
+    }
+    throw new Error("expected the control request to reject")
+  }
+
+  test("cancel rejects immediately and preserves the remote tag", async () => {
+    const { transport } = errorReply("RemoteCancelFailed")
+    const worker = createExecutorWorker({ id: 1, transport })
+
+    const error = await rejection(worker.cancel(sid("ses_1")))
+
+    expect(error.tag).toBe("RemoteCancelFailed")
+    expect(error.message).toBe("remote control failed")
+  })
+
+  test("assertNotBusy rejects instead of answering a false busy probe", async () => {
+    const { transport } = errorReply("RemoteBusyProbeFailed")
+    const worker = createExecutorWorker({ id: 1, transport })
+
+    const error = await rejection(worker.assertNotBusy(sid("ses_1")))
+
+    expect(error.tag).toBe("RemoteBusyProbeFailed")
+  })
+
+  test("hasActiveWork preserves the remote tag (not a generic error)", async () => {
+    const { transport } = errorReply("RemoteActiveWorkFailed")
+    const worker = createExecutorWorker({ id: 1, transport })
+
+    const error = await rejection(worker.hasActiveWork!(sid("ses_1")))
+
+    expect(error.tag).toBe("RemoteActiveWorkFailed")
   })
 })

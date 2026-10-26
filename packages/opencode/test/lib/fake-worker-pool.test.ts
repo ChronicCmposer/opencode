@@ -1,13 +1,16 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 import { SessionCancelledError, WorkerCrashedError } from "@/session/worker/dispatch"
 import { capture, sid } from "./async"
 import {
   FakeExecutorWorker,
   FakePool,
   FakeSessionWorker,
+  FaultPool,
+  createFakeCancelPort,
   createFakeExecutorPool,
   createFakeWorkerPool,
 } from "./fake-worker-pool"
+import { createWorkerHarness } from "./worker-harness"
 
 const run = (sessionID: string) => ({ sessionID: sid(sessionID), depth: 0 })
 const execRun = (sessionID: string) => ({ sessionID: sid(sessionID), depth: 0 })
@@ -158,4 +161,86 @@ describe("FakePool", () => {
     expect(() => new FakePool(0)).toThrow(/invalid worker count/)
     expect(() => createFakeWorkerPool(-1)).toThrow(/invalid worker count/)
   })
+})
+
+describe("FaultPool", () => {
+  test("terminateAll terminates initial AND spawned workers exactly once", async () => {
+    await using harness = createWorkerHarness({ cores: 1, timeoutMs: 2000 })
+    const pool = new FaultPool(harness, 1)
+    pool.spawn()
+
+    const spies = [...pool.workers, ...pool.spawned].map((worker) => spyOn(worker, "terminate"))
+    await pool.terminateAll()
+
+    for (const spy of spies) expect(spy).toHaveBeenCalledTimes(1)
+    expect([...pool.workers, ...pool.spawned].every((worker) => !worker.alive)).toBe(true)
+  })
+})
+
+describe("FakeExecutorPool", () => {
+  test("terminateAll terminates initial AND spawned executor workers exactly once", async () => {
+    const pool = createFakeExecutorPool(1)
+    pool.spawn()
+    const workers = [...pool.workers, ...pool.spawned]
+    const spies = workers.map((worker) => spyOn(worker, "terminate"))
+
+    await pool.terminateAll()
+
+    for (const spy of spies) expect(spy).toHaveBeenCalledTimes(1)
+    expect(workers.every((worker) => !worker.alive)).toBe(true)
+  })
+})
+
+describe("createFakeCancelPort", () => {
+  test("acknowledges a cancel once and records the delivered frames", () => {
+    const acks: string[] = []
+    let cancels = 0
+    const port = createFakeCancelPort({
+      acknowledge: true,
+      onCancel: () => {
+        cancels++
+      },
+    })
+    port.onMessage((frame) => {
+      if (frame.type === "cancel-ack") acks.push(frame.sessionID)
+    })
+
+    port.notify({ type: "cancel", sessionID: "ses_1" })
+    port.notify({ type: "cancel", sessionID: "ses_2" })
+
+    expect(cancels).toBe(2)
+    expect(acks).toEqual(["ses_1", "ses_2"])
+    expect(port.sent.map((frame) => frame.type)).toEqual(["cancel", "cancel-ack", "cancel", "cancel-ack"])
+  })
+
+  test("an unacknowledging port stays silent", () => {
+    const port = createFakeCancelPort({ acknowledge: false })
+    const acked = spyOn({ onMessage: (_frame: unknown) => {} }, "onMessage")
+    port.onMessage(acked)
+
+    port.notify({ type: "cancel", sessionID: "ses_1" })
+
+    expect(acked).toHaveBeenCalledTimes(0)
+  })
+})
+
+describe("fake cancel-port parity", () => {
+  const families = [
+    ["FakeSessionWorker", () => new FakeSessionWorker(1, { mode: "cooperative" })],
+    ["FakeExecutorWorker", () => new FakeExecutorWorker(1, { mode: "blocking" })],
+  ] as const
+
+  for (const [name, make] of families) {
+    test(`${name} acknowledges a cancel exactly once`, () => {
+      const worker = make()
+      const acks: string[] = []
+      worker.cancelPort.onMessage((frame) => {
+        if (frame.type === "cancel-ack") acks.push(frame.sessionID)
+      })
+
+      worker.cancelPort.notify({ type: "cancel", sessionID: "ses_1" })
+
+      expect(acks).toEqual(["ses_1"])
+    })
+  }
 })

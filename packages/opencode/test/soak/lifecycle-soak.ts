@@ -18,7 +18,8 @@
 
 import { createExecutorWorkerPool, type ExecutorRun, type SessionExecutionResult } from "@/session/worker/execute"
 import { createSessionHub, type SessionHub } from "@/session/worker/hub"
-import { SESSION_WORKER_REAP_ENV, resolveSessionWorkerReapMs, type Scheduler } from "@/session/worker/dispatch"
+import { type Scheduler } from "@/session/worker/dispatch"
+import { REAP_MS_ENV, resolveReapMs } from "@/session/worker/pool"
 import { defaultSchedule } from "@/session/worker/port"
 import type { SessionID } from "@/session/schema"
 import { FakeExecutorWorker } from "../lib/fake-worker-pool"
@@ -160,16 +161,16 @@ function createHub(options: {
   readonly schedule: Scheduler
   readonly onSessionReleased: (sessionID: SessionID) => void
 }): SessionHub {
-  const previous = process.env[SESSION_WORKER_REAP_ENV]
-  process.env[SESSION_WORKER_REAP_ENV] = String(SOAK_REAP_MS)
+  const previous = process.env[REAP_MS_ENV]
+  process.env[REAP_MS_ENV] = String(SOAK_REAP_MS)
   try {
-    if (resolveSessionWorkerReapMs() !== SOAK_REAP_MS) {
-      throw new Error(`${SESSION_WORKER_REAP_ENV} did not resolve to ${SOAK_REAP_MS}`)
+    if (resolveReapMs() !== SOAK_REAP_MS) {
+      throw new Error(`${REAP_MS_ENV} did not resolve to ${SOAK_REAP_MS}`)
     }
     return createSessionHub(options)
   } finally {
-    if (previous === undefined) delete process.env[SESSION_WORKER_REAP_ENV]
-    else process.env[SESSION_WORKER_REAP_ENV] = previous
+    if (previous === undefined) delete process.env[REAP_MS_ENV]
+    else process.env[REAP_MS_ENV] = previous
   }
 }
 

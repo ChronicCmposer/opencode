@@ -92,7 +92,6 @@ export function workerSnapshot(overrides: Partial<WorkerSnapshot> = {}): WorkerS
     auth: {},
     modelsDev: {},
     flags: RuntimeFlags.parseInfo({}),
-    workerCount: 2,
     ...overrides,
   }
 }

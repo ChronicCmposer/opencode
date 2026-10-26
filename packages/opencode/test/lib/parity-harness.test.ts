@@ -17,7 +17,7 @@
 // authority does, exactly once. The duplication probe proves the bridge's
 // `HUB_PROXIED_EVENT_TYPES` drop, not just the absence of a local emit.
 
-import { describe, expect, it } from "bun:test"
+import { describe, expect, it, spyOn } from "bun:test"
 import { Effect, Layer, ManagedRuntime, Schema } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -65,7 +65,7 @@ import {
   readGolden,
   recordGolden,
   runParitySession,
-  type DurableRow,
+  type ParityDurableRow,
   type ParityResult,
   type ParityRunContext,
   type ParityRunner,
@@ -77,6 +77,7 @@ import { serveWriterPort, type HubWriter } from "@/session/writer/client"
 import { createWorkerWriterClient } from "@/session/worker/writer-client"
 import { createEventSink, type EventSink, type SinkEvent } from "./event-sink"
 import { startMockProvider, type MockProviderHandle } from "./mock-provider"
+import { withDeadline } from "./async"
 import { pollUntil } from "./poll"
 import { workerSnapshot } from "./snapshot"
 import { tmpdir } from "../fixture/fixture"
@@ -747,14 +748,14 @@ describe("real SessionPrompt.loop flag-ON ≡ flag-OFF (o1-w4 gap 1)", () => {
 // ---------------------------------------------------------------------------
 
 describe("durable-row parity", () => {
-  const rows: ReadonlyArray<DurableRow> = [
+  const rows: ReadonlyArray<ParityDurableRow> = [
     { table: "message", row: { id: "m1", role: "user", text: "hi" } },
     { table: "message", row: { id: "m2", role: "assistant", text: "hello" } },
     { table: "event", row: { id: "e1", type: "message.updated" } },
   ]
 
   const durableRunner =
-    (transform: (context: ParityRunContext) => ReadonlyArray<DurableRow>): ParityRunner =>
+    (transform: (context: ParityRunContext) => ReadonlyArray<ParityDurableRow>): ParityRunner =>
     (context) => {
       for (const entry of transform(context)) context.durable.add(entry.table, [entry.row])
     }
@@ -783,8 +784,8 @@ describe("durable-row parity", () => {
   })
 
   it("normalizes volatile columns before comparing", () => {
-    const off: ReadonlyArray<DurableRow> = [{ table: "message", row: { id: "m1", time: 1, text: "hi" } }]
-    const on: ReadonlyArray<DurableRow> = [{ table: "message", row: { id: "m2", time: 99, text: "hi" } }]
+    const off: ReadonlyArray<ParityDurableRow> = [{ table: "message", row: { id: "m1", time: 1, text: "hi" } }]
+    const on: ReadonlyArray<ParityDurableRow> = [{ table: "message", row: { id: "m2", time: 99, text: "hi" } }]
     const comparison = compareDurable(off, on, {
       normalize: ({ table, row }) => ({ table, text: row.text }),
     })
@@ -835,10 +836,7 @@ describe("writer head-of-line and backpressure", () => {
 
       // Commit: the queued read drains promptly and never deadlocks.
       await writer.commit(handle)
-      const value = await Promise.race([
-        read,
-        new Promise((_, reject) => setTimeout(() => reject(new Error("queued read deadlocked")), 2_000)),
-      ])
+      const value = await withDeadline(read, { timeoutMs: 2_000, message: "queued read deadlocked" })
       expect(readSettled).toBe(true)
       expect(Array.isArray(value)).toBe(true)
       expect(performance.now() - startedAt).toBeLessThan(2_000)
@@ -848,5 +846,43 @@ describe("writer head-of-line and backpressure", () => {
       channel.port1.close()
       channel.port2.close()
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Resource ownership: the E2E context owns a writer port, a hub-proxy channel
+// and an SQLite handle. Teardown must be idempotent and available to the
+// `await using` idiom, so a suite never leaks an isolate handle on the error
+// path either.
+// ---------------------------------------------------------------------------
+
+describe("E2E context resource ownership", () => {
+  it("close is idempotent and releases the writer exactly once", async () => {
+    await using tmp = await tmpdir()
+    const provider = { model: "mock", baseUrl: "http://127.0.0.1:1", apiKey: "test-key" } as MockProviderHandle
+    const ctx = createE2EContext({
+      snapshot: workerSnapshot({ directory: tmp.path }),
+      modelConfig: modelConfig(provider),
+    })
+    const writerDispose = spyOn(ctx.writer, "dispose")
+
+    await ctx.close()
+    await ctx.close()
+
+    expect(writerDispose).toHaveBeenCalledTimes(1)
+  })
+
+  it("is async-disposable so a failing test still tears it down", async () => {
+    await using tmp = await tmpdir()
+    const provider = { model: "mock", baseUrl: "http://127.0.0.1:1", apiKey: "test-key" } as MockProviderHandle
+    const ctx = createE2EContext({
+      snapshot: workerSnapshot({ directory: tmp.path }),
+      modelConfig: modelConfig(provider),
+    })
+    const writerDispose = spyOn(ctx.writer, "dispose")
+
+    await ctx[Symbol.asyncDispose]()
+
+    expect(writerDispose).toHaveBeenCalledTimes(1)
   })
 })

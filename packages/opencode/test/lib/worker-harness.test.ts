@@ -98,4 +98,15 @@ describe("worker harness", () => {
     const error = await worker.waitFor("error")
     expect(error.message).toBe("boom")
   })
+
+  test("close is an alias for dispose and is safe to call twice", async () => {
+    const harness = createWorkerHarness({ cores: 1 })
+    const worker = harness.spawn<WorkerMessage>(workerEntry)
+    await worker.received((message) => message.type === "ready")
+
+    await harness.close()
+    await harness.close()
+
+    expect(worker.alive).toBe(false)
+  })
 })

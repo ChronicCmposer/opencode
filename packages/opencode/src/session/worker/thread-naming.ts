@@ -7,10 +7,10 @@
 // names without touching `/proc`.
 //
 // C1 wiring (`session-worker.ts`):
-//   boot                 -> onBind(init.sessionID)
-//   execute onRunStart   -> onRunStart(sessionID)
+//   boot                 -> bind(init.sessionID or the worker slot)
+//   execute onRunStart   -> bind(sessionID, true)
 //   execute onIdle       -> onIdle()
-//   rebind a session     -> onBind(newSessionID) (already emits idle), then onIdle()
+//   rebind a session     -> bind(newSessionID, false)
 //   dispose              -> onDispose()
 
 import { sessionThreadName } from "./thread-name"
@@ -21,10 +21,11 @@ export interface ThreadNamerOptions {
 }
 
 export interface ThreadNamer {
-  /** Bind `sessionID` and advertise its idle name. */
-  onBind(sessionID: string): void
-  /** A run started for `sessionID`: bind it and advertise the running name. */
-  onRunStart(sessionID: string): void
+  /**
+   * The single lifecycle entry point: bind `sessionID` and advertise its name.
+   * `running` marks a live run (`!`); boot and rebind pass `false`.
+   */
+  bind(sessionID: string, running?: boolean): void
   /** The bound session reached a terminal state: advertise its idle name. */
   onIdle(): void
   /** Drop the binding so later lifecycle calls are no-ops. Never throws. */
@@ -35,16 +36,16 @@ export interface ThreadNamer {
 export function createThreadNamer(options: ThreadNamerOptions): ThreadNamer {
   let boundSessionID: string | undefined
 
+  const apply = (sessionID: string, running: boolean): void => {
+    boundSessionID = sessionID
+    options.setName(sessionThreadName(sessionID, { running }))
+  }
+
   return {
-    onBind(sessionID) {
-      boundSessionID = sessionID
-      options.setName(sessionThreadName(sessionID))
-    },
-    onRunStart(sessionID) {
-      // A run proves which session this worker serves; rebinding here keeps the
-      // next `onIdle()` honest even when the caller did not bind first.
-      boundSessionID = sessionID
-      options.setName(sessionThreadName(sessionID, { running: true }))
+    bind(sessionID, running = false) {
+      // A run proves which session this worker serves; binding here keeps the
+      // next `onIdle()` honest even when boot did not know the session.
+      apply(sessionID, running)
     },
     onIdle() {
       if (boundSessionID === undefined) return

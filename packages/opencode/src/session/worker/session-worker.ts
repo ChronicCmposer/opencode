@@ -45,10 +45,8 @@ import { createWorkerBrokerClient } from "./broker-client"
 import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
 import { workerLoggingLayer } from "./worker-logging"
 import { messageOf } from "./port"
-import { sessionThreadName } from "./thread-name"
-import { createThreadNamer } from "./thread-naming"
+import { createThreadNamer, type ThreadNamer } from "./thread-naming"
 import {
-  DEFAULT_WORK_KIND,
   UnknownWorkKindError,
   installSessionExecutor,
   type SessionExecutionResult,
@@ -74,7 +72,6 @@ import {
   reducedLlmLayer,
   reducedModelProviderLayer,
   refreshablePluginTools,
-  type BackgroundJobClientHandle,
   type BrokerClientHandle,
   type HubProxyClient,
   type HubProxyClients,
@@ -163,7 +160,7 @@ export interface SessionWorkerInit {
   readonly workerID?: number
   /**
    * The session this isolate is bound to at boot, when the hub knows it. Drives
-   * the thread-naming seam (`onBind`) before the first run arrives.
+   * the thread-naming seam (`bind`) before the first run arrives.
    */
   readonly sessionID?: string
   /**
@@ -316,7 +313,6 @@ export interface WorkerClients {
   /** The full egress client, so the production control-plane mesh is reachable. */
   readonly egress: WorkerEgressClient
   readonly broker: BrokerClientHandle
-  readonly backgroundJob: BackgroundJobClientHandle
 }
 
 /**
@@ -354,16 +350,7 @@ export function buildWorkerClients(
       ...(workerID === undefined ? {} : { workerID }),
       ...withLog,
     }),
-    backgroundJob: idleBackgroundJobClient,
   }
-}
-
-// The worker's `BackgroundJob` registry is process-local, so the reduced
-// `BackgroundJobClientHandle` seam has no hub counterpart anymore; it stays for
-// degraded boot wiring but is never read there.
-const idleBackgroundJobClient: BackgroundJobClientHandle = {
-  wait: async () => ({ timedOut: true }),
-  cancel: async () => {},
 }
 
 // ---------------------------------------------------------------------------
@@ -374,27 +361,6 @@ const idleBackgroundJobClient: BackgroundJobClientHandle = {
 export interface SessionWorkerBootstrap {
   /** Tear down the bootstrapped worker state. */
   dispose(): void
-  /**
-   * The hub-proxied plugin-tool abort seam (see {@link hubProxyPluginToolAbort}),
-   * built from the worker's single multiplexed control-port client. Absent on
-   * degraded boot; a consumer (the registry's tool-abort path) forwards an
-   * in-flight `(sessionID, callID)` here to unwind the hub-side execution.
-   */
-  readonly pluginToolAbort?: (input: { readonly sessionID: string; readonly callID: string }) => Promise<void>
-  /**
-   * The hub-proxied plugin-tool descriptor list (see
-   * {@link hubProxyPluginToolList}) — the lazy-refresh seam. Absent on degraded
-   * boot; a consumer re-fetches descriptors here when execution reports
-   * `UnknownPluginToolError` (a plugin reloaded mid-generation).
-   */
-  readonly pluginToolList?: () => Promise<readonly PluginToolDescriptor[]>
-  /**
-   * Re-fetch the descriptors from the hub and swap them into the worker's live
-   * `RemotePluginTools`. This is the lazy-refresh action for the design Q4 stale
-   * descriptor case: call it after `UnknownPluginToolError`, then re-register.
-   * Absent on degraded boot or when no plugin tools were shipped.
-   */
-  readonly refreshPluginTools?: () => Promise<void>
 }
 
 // ---------------------------------------------------------------------------
@@ -677,13 +643,9 @@ export function createWorkRegistry(factories: WorkFactories): SessionWorkFactory
   }
 }
 
-/** The production registry: `"session"` (and the legacy default) run session work. */
+/** The production registry: the protocol literal `"session"` runs session work. */
 export function productionWorkRegistry(session: SessionWork): SessionWorkFactory {
-  const factories: Record<string, SessionWork> = { session }
-  // Alias the legacy default kind when it differs, built dynamically so the
-  // computed key never statically collides with the `session` shorthand (TS1117).
-  if (DEFAULT_WORK_KIND !== "session") factories[DEFAULT_WORK_KIND] = session
-  return createWorkRegistry(factories)
+  return createWorkRegistry({ session })
 }
 
 // ---------------------------------------------------------------------------
@@ -696,7 +658,7 @@ export function productionWorkRegistry(session: SessionWork): SessionWorkFactory
  * still complete. Durable writes and egress are the hub's authority, so the
  * fallback reports a non-committed publish and emits nothing.
  */
-function directClients(backgroundJob: BackgroundJobClientHandle): WorkerClients {
+function directClients(): WorkerClients {
   // Degraded boot: there is no writer authority, so every write/transaction
   // primitive fails loud instead of silently returning `undefined`.
   const unavailable = (method: string) => async (): Promise<never> => {
@@ -725,7 +687,6 @@ function directClients(backgroundJob: BackgroundJobClientHandle): WorkerClients 
       dispose: () => {},
     },
     broker: { call: async () => null },
-    backgroundJob,
   }
 }
 
@@ -887,6 +848,14 @@ export interface BootstrapSessionWorkerOptions {
    * `log` reaches the reporter's E4 `pid report failed` line.
    */
   readonly pidReporterFactory?: ControlPidReporterFactory
+  /**
+   * Test seam: install (and capture the disposer of) the executor. Defaults to
+   * {@link installSessionExecutor}; bootstrap disposal always disposes it so the
+   * executor's owned scope finalizers run when the worker tears down.
+   */
+  readonly installExecutor?: typeof installSessionExecutor
+  /** Test seam: the thread-naming lifecycle; defaults to `setThreadName`. */
+  readonly threadNamer?: ThreadNamer
 }
 
 /**
@@ -934,10 +903,11 @@ export function bootstrapSessionWorker(
       createControlPidReporter(port, workerID, { log: forwarded }))
   // Thread-naming lifecycle seam (N slice): bind at boot when the hub shipped
   // the session, then toggle running/idle per run and clear on dispose.
-  const namer = createThreadNamer({ setName: setThreadName })
-  // Bind before the first run so a pre-run `onIdle`/dispose names the right
-  // session; the module boot already applied the same name from `workerData`.
-  if (init.sessionID !== undefined) namer.onBind(init.sessionID)
+  const namer = options.threadNamer ?? createThreadNamer({ setName: setThreadName })
+  // One boot write: bind the session the hub shipped (or the worker slot when
+  // the hub could not name one). `bind` is the only lifecycle entry point.
+  if (init.sessionID !== undefined) namer.bind(init.sessionID)
+  else if (init.workerID !== undefined) namer.bind(String(init.workerID))
   let clients: WorkerClients
   let hubProxies: HubProxyClients | undefined
   let pidReporter: PidReporterInterface | undefined
@@ -983,7 +953,7 @@ export function bootstrapSessionWorker(
     // two frame shapes). Only the full-port boot owns children.
     pidReporter = createPidReporter(hubProxyChannel.port1, reportedWorkerID(init, threadId), log)
   } else {
-    clients = directClients(idleBackgroundJobClient)
+    clients = directClients()
   }
 
   const config = modelConfig(init.model)
@@ -1026,11 +996,6 @@ export function bootstrapSessionWorker(
           ...(pluginToolAbort === undefined ? {} : { abort: pluginToolAbort }),
           ...(pluginToolList === undefined ? {} : { list: pluginToolList }),
         })
-  // The lazy-refresh action. No plugin/config reload signal reaches a live worker,
-  // so the registry calls this after `UnknownPluginToolError` (a stale descriptor)
-  // rather than on a push. It is the SAME `refreshFromHub` each remote definition
-  // exposes, so the bootstrap handle and the in-graph defs refresh identically.
-  const refreshPluginTools = pluginTools?.refreshFromHub
   // Pass the real hub-proxy clients so the reduced LLM sub-graph routes
   // `Permission` over the hub control port (never a silent mock); absent
   // (degraded boot) the sub-graph uses a fail-loud boundary. The same live
@@ -1061,7 +1026,10 @@ export function bootstrapSessionWorker(
     ...(usePrompt ? {} : { nodes: PIPELINE_SESSION_NODES }),
     snapshot: init.snapshot,
     env: init.env,
-    clients,
+    // PENDING hub-a: `node-table.ts`/`layer.ts` still declare an unused
+    // `BackgroundJobClientNode`; supply its inert handle here until that removal
+    // lands (the session worker owns its jobs through the process-local service).
+    clients: { ...clients, backgroundJob: { wait: async () => ({ timedOut: true }), cancel: async () => {} } },
     modelClient,
     backgroundJob: backgroundJobLayer,
     // The worker serves exactly one serialized model, so the reduced provider is
@@ -1098,7 +1066,8 @@ export function bootstrapSessionWorker(
     }),
   )
   const slot = init.workerID
-  installSessionExecutor(scope, {
+  const installExecutor = options.installExecutor ?? installSessionExecutor
+  const installed = installExecutor(scope, {
     work,
     threadId,
     // The control is registered when the first `run` resolves the worker's
@@ -1120,7 +1089,7 @@ export function bootstrapSessionWorker(
     ...(slot === undefined
       ? {}
       : {
-          onRunStart: (sessionID) => namer.onRunStart(sessionID),
+          onRunStart: (sessionID) => namer.bind(sessionID, true),
           onIdle: () => Effect.sync(() => namer.onIdle()),
         }),
   })
@@ -1128,13 +1097,13 @@ export function bootstrapSessionWorker(
   return {
     dispose() {
       namer.onDispose()
+      // Close the executor's owned scope so its runner-table fibers/finalizers
+      // settle with the worker instead of leaking past bootstrap disposal.
+      void installed.dispose().catch(() => undefined)
       // The registry scope outlives every run, so close it explicitly with the
       // worker bootstrap; a still-running job is interrupted with the isolate.
       void Effect.runPromise(Scope.close(backgroundJobScope, Exit.void)).catch(() => undefined)
     },
-    ...(pluginToolAbort === undefined ? {} : { pluginToolAbort }),
-    ...(pluginToolList === undefined ? {} : { pluginToolList }),
-    ...(refreshPluginTools === undefined ? {} : { refreshPluginTools }),
   }
 }
 
@@ -1164,9 +1133,7 @@ if (workerData !== null && workerData !== undefined) {
   // Adopt the shipped role BEFORE any heavy bootstrap, so a dynamic app-runtime
   // import during bootstrap sees `session` and never contributes a nested hub.
   setProcessRole(init.role)
-  // Name the OS thread for its slot before any heavy bootstrap. Fail-soft and
-  // Linux-only (see `@/util/thread-name`); skipped when the hub shipped no slot.
-  if (init.sessionID !== undefined) setThreadName(sessionThreadName(init.sessionID))
-  else if (init.workerID !== undefined) setThreadName(sessionThreadName(String(init.workerID)))
+  // Thread naming is owned by `bootstrapSessionWorker` (`namer.bind`), which
+  // writes the boot name exactly once; this entry only picks the role.
   bootstrapSessionWorker(init, globalThis as unknown as WorkerScope)
 }

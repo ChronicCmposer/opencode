@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { capture, flush, settleOf, sid } from "./async"
+import { capture, flush, settleOf, sid, withDeadline, awaitSignal } from "./async"
+import * as poll from "./poll"
 
 describe("async test primitives", () => {
   test("flush lets queued microtasks and zero-delay timers run", async () => {
@@ -45,5 +46,81 @@ describe("async test primitives", () => {
     const id = sid("ses_1")
     expect(id as string).toBe("ses_1")
     expect(typeof id).toBe("string")
+  })
+})
+
+describe("withDeadline", () => {
+  test("passes a value through when the promise settles in time", async () => {
+    await expect(withDeadline(Promise.resolve("done"), { timeoutMs: 50 })).resolves.toBe("done")
+  })
+
+  test("rejects with the caller message and runs onTimeout when the deadline fires", async () => {
+    let timedOut = 0
+    await expect(
+      withDeadline(new Promise(() => {}), {
+        timeoutMs: 5,
+        message: "worker boot stalled",
+        onTimeout: () => {
+          timedOut++
+        },
+      }),
+    ).rejects.toThrow("worker boot stalled")
+    expect(timedOut).toBe(1)
+  })
+
+  test("accepts the legacy (timeoutMs, message, onTimeout) positional form", async () => {
+    let timedOut = 0
+    await expect(
+      withDeadline(new Promise(() => {}), 5, "legacy timeout", () => {
+        timedOut++
+      }),
+    ).rejects.toThrow("legacy timeout")
+    expect(timedOut).toBe(1)
+  })
+
+  test("does not run onTimeout for a fast failure", async () => {
+    let timedOut = 0
+    await expect(
+      withDeadline(Promise.reject(new Error("boom")), {
+        timeoutMs: 50,
+        onTimeout: () => {
+          timedOut++
+        },
+      }),
+    ).rejects.toThrow("boom")
+    expect(timedOut).toBe(0)
+  })
+})
+
+describe("awaitSignal", () => {
+  test("resolves immediately for an already-aborted signal", async () => {
+    const controller = new AbortController()
+    controller.abort()
+    await expect(awaitSignal(controller.signal)).resolves.toBeUndefined()
+  })
+
+  test("resolves exactly when the signal aborts, not before", async () => {
+    const controller = new AbortController()
+    const order: string[] = []
+    const waiting = awaitSignal(controller.signal).then(() => order.push("aborted"))
+
+    await flush()
+    expect(order).toEqual([])
+
+    controller.abort()
+    await waiting
+    expect(order).toEqual(["aborted"])
+  })
+
+  test("fails loudly when the signal misses an optional deadline", async () => {
+    await expect(awaitSignal(new AbortController().signal, { timeoutMs: 5, message: "never aborted" })).rejects.toThrow(
+      "never aborted",
+    )
+  })
+})
+
+describe("poll consolidation", () => {
+  test("poll.ts re-exports the same pollUntil implementation", () => {
+    expect(poll.pollUntil).toBeTypeOf("function")
   })
 })

@@ -15,10 +15,9 @@ import { Schema } from "effect"
 import type { SessionID } from "@/session/schema"
 import type { PromptInput, ShellInput } from "@/session/prompt"
 import { defined } from "@/util/object"
-import { createSessionWorkerRegistry } from "./session-registry"
-import { createSessionRegistry, type SessionRegistry } from "./registry"
+import { createSessionWorkerRegistry, type SessionWorkerRegistry } from "./session-registry"
 import { defaultSchedule, messageOf } from "./port"
-import { DEFAULT_REAP_MS, REAP_MS_ENV, resolveReapMs } from "./pool"
+import { resolveReapMs } from "./pool"
 import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
 import { SessionWorkerReplyTimeoutError } from "./execute"
 import type { ExecutorRun, ExecutorSessionWorker, SessionRunMode } from "./execute"
@@ -26,25 +25,12 @@ import {
   createCancelController,
   createOutcomeGate,
   type CancelController,
-  type CancelMode,
   type CancelOutcome,
   type CancelPort,
   type CancelScheduler,
+  type Outcome,
   type OutcomeGate,
 } from "./cancel"
-
-/** Approved idle-reap window for a session worker. */
-export const DEFAULT_SESSION_WORKER_REAP_MS = DEFAULT_REAP_MS
-
-/** Environment override for {@link DEFAULT_SESSION_WORKER_REAP_MS}. */
-export const SESSION_WORKER_REAP_ENV = REAP_MS_ENV
-
-/** Resolve the idle-reap window via the shared pool resolver (one source of truth). */
-export function resolveSessionWorkerReapMs(
-  options: { readonly env?: Record<string, string | undefined> } = {},
-): number {
-  return resolveReapMs(options.env ?? process.env)
-}
 
 /** One session run: the key the worker executes, its subagent depth and its frame mode. */
 export type SessionRun = ExecutorRun
@@ -91,8 +77,31 @@ export class SessionCancelledError extends Schema.TaggedErrorClass<SessionCancel
   sessionID: Schema.String,
 }) {}
 
+/** Every terminal mode a cancelled run can report. There is no admission queue. */
+export const CANCELLED_MODES = ["cooperative", "terminated", "completed"] as const
+
 /** The terminal mode reported when a session is cancelled. */
-export type CancelledMode = CancelMode | "queued"
+export type CancelledMode = (typeof CANCELLED_MODES)[number]
+
+/** One session visited by a cascade, with the mode it settled in (if it had a run). */
+export interface CascadeDescendant {
+  readonly sessionID: SessionID
+  readonly mode: CancelledMode | undefined
+}
+
+/**
+ * The ordered settlement of a cancel request and its subagent tree.
+ *
+ * The report is the root's own outcome (so existing `CancelOutcome` consumers
+ * keep working) plus a depth-first, children-before-parent list of every
+ * descendant visited exactly once. A linked descendant that was never admitted
+ * is still reported, with `mode: undefined`.
+ */
+export interface CascadeReport extends CancelOutcome {
+  readonly sessionID: SessionID
+  readonly outcome: CancelOutcome
+  readonly descendants: ReadonlyArray<CascadeDescendant>
+}
 
 /** Emitted once when a session reaches its terminal cancelled state. */
 export interface CancelledEvent {
@@ -144,12 +153,12 @@ export interface DispatcherOptions {
 export interface Dispatcher extends AsyncDisposable {
   readonly busySlotCount: number
   readonly queuedCount: number
-  readonly registry: SessionRegistry
+  readonly registry: SessionWorkerRegistry<SessionWorker>
   /** The worker currently hosting `sessionID`'s active run, or `undefined` when idle. */
   workerForSession(sessionID: SessionID): number | undefined
   dispatch(request: DispatchRequest): Promise<void>
   cancel(sessionID: SessionID): Promise<void>
-  cancelWithGrace(sessionID: SessionID): Promise<CancelOutcome | undefined>
+  cancelWithGrace(sessionID: SessionID): Promise<CascadeReport | undefined>
   terminateAll(): Promise<void>
   dispose(): Promise<void>
 }
@@ -214,12 +223,11 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const log = options.log ?? noopWorkerLogger
   const writeBarrier = options.writeBarrier
   const schedule = options.schedule ?? defaultSchedule
-  const reapMs = options.reapMs ?? resolveSessionWorkerReapMs()
+  const reapMs = options.reapMs ?? resolveReapMs()
 
   // The session→worker map. Workers outlive runs (reuse across turns) until
   // idle-reap or terminal cancel disposes them.
   const workers = createSessionWorkerRegistry<SessionWorker>()
-  const reservations = createSessionRegistry()
   const byKey = new Map<SessionID, Pending>()
   const waitersByKey = new Map<SessionID, Pending[]>()
   const idleTimers = new Map<SessionID, () => void>()
@@ -269,13 +277,13 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const reapIfIdle = async (sessionID: SessionID): Promise<void> => {
     idleTimers.delete(sessionID)
     if (terminated || byKey.has(sessionID) || hasWaiters(sessionID)) return
-    const worker = workers.get(sessionID)
+    const worker = workers.worker(sessionID)
     if (worker === undefined) return
     const active = await hasActiveWork(worker, sessionID)
     // Re-check after the await: a new run or parked waiter must win, and a
     // retired/replaced worker must not be touched by this stale timer.
     if (terminated || byKey.has(sessionID) || hasWaiters(sessionID)) return
-    if (workers.get(sessionID) !== worker) return
+    if (workers.worker(sessionID) !== worker) return
     if (active) {
       // A running background job still owns this isolate; arm a fresh window
       // instead of retiring it. Its own completion is observed by the next probe.
@@ -293,7 +301,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
 
   const scheduleReap = (sessionID: SessionID): void => {
     clearIdle(sessionID)
-    if (terminated || workers.get(sessionID) === undefined) return
+    if (terminated || workers.worker(sessionID) === undefined) return
     idleTimers.set(
       sessionID,
       schedule(reapMs, () => {
@@ -350,8 +358,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const worker = workers.getOrCreate(pending.sessionID, (id) => pool.spawn(id))
     pending.startedAt = Date.now()
     pending.workerID = worker.id
-    reservations.reserve(pending.sessionID, worker.id)
-    reservations.markRunning(pending.sessionID)
+    workers.markRunning(pending.sessionID)
     log(workerLogMessage("session admitted"), {
       level: "INFO",
       sessionID: pending.sessionID,
@@ -393,12 +400,35 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     )
   }
 
+  /**
+   * Whether a run still owns its session. A cancelled or superseded run may
+   * settle its worker protocol arbitrarily late; only the run `byKey` points at
+   * may mutate the session maps, reservations, waiters, or worker.
+   */
+  const ownsSession = (pending: Pending): boolean => byKey.get(pending.sessionID) === pending
+
+  /**
+   * Settle a superseded run's own promise without touching shared session state.
+   * Its gate is claimed first so the stale run never hangs: if a cancel already
+   * claimed it the promise is settled, otherwise it is settled as cancelled.
+   */
+  const settleSuperseded = (pending: Pending): void => {
+    if (pending.gate.claim("cancel")) pending.reject(cancelled(pending.sessionID))
+  }
+
   const finalizeCompletion = (pending: Pending): void => {
     // A cancel owns this run's terminal decision: keep the run visible in `byKey`
     // so a prompt arriving mid-grace parks instead of starting on the worker the
     // cancel is about to retire. `cancelWithGrace` releases the exact run.
     if (pending.cancelPending) return
-    reservations.release(pending.sessionID)
+    // A newer run owns the session (cancel + immediate re-dispatch): settling this
+    // stale run must not release the successor's reservation, delete its `byKey`
+    // entry, retire its worker, or promote its waiters.
+    if (!ownsSession(pending)) {
+      settleSuperseded(pending)
+      return
+    }
+    workers.release(pending.sessionID)
     byKey.delete(pending.sessionID)
     log(workerLogMessage("session completed"), {
       level: "INFO",
@@ -415,7 +445,13 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     pending.markSettled()
     // Same ownership rule as `finalizeCompletion`: the cancel settles this run.
     if (pending.cancelPending) return
-    reservations.release(pending.sessionID)
+    // A late rejection from a cancelled/superseded run must not settle the
+    // successor that now owns this session.
+    if (!ownsSession(pending)) {
+      settleSuperseded(pending)
+      return
+    }
+    workers.release(pending.sessionID)
     byKey.delete(pending.sessionID)
     if (pending.gate.winner === "cancel") {
       pending.reject(cancelled(pending.sessionID))
@@ -423,7 +459,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       return
     }
     const timedOut = error instanceof SessionWorkerReplyTimeoutError
-    const worker = workers.get(pending.sessionID)
+    const worker = workers.worker(pending.sessionID)
     const crashed = error instanceof WorkerCrashedError || (worker !== undefined && !worker.alive)
     if (timedOut) {
       // A wedged isolate is retired, never requeued; cascade to its subagents.
@@ -490,6 +526,59 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     }
   }
 
+  /** How one cancelled run's terminal state is settled. */
+  interface CancelSettlement {
+    readonly mode: CancelledMode
+    readonly winner: Outcome
+    readonly worker: SessionWorker | undefined
+    /** Terminate and release the worker (the forced/immediate paths). */
+    readonly retires: boolean
+    /** Reap mirrored PGIDs when this settlement, not the controller, terminated. */
+    readonly reaps: boolean
+  }
+
+  /**
+   * The single settlement path for a cancelled run. `owned` is the exact run the
+   * request captured; shared state is only touched while it still owns `byKey`.
+   * Parked waiters are drained by the caller exactly once before any await, so a
+   * waiter that arrives during the grace window survives and is promoted here.
+   */
+  const settleCancelled = (
+    sessionID: SessionID,
+    owned: Pending | undefined,
+    settlement: CancelSettlement,
+  ): void => {
+    const { mode, winner, worker, retires, reaps } = settlement
+    const owns = owned !== undefined && ownsSession(owned)
+
+    if (owns) {
+      byKey.delete(sessionID)
+      if (workers.has(sessionID)) {
+        workers.markCancelling(sessionID)
+        workers.release(sessionID)
+      }
+    }
+
+    if (owns && retires) {
+      if (reaps && worker !== undefined) cancellation?.reap?.(worker)
+      retireWorker(sessionID)
+    }
+
+    if (owned !== undefined) {
+      if (winner === "completion" && owned.gate.claim("completion")) owned.resolve()
+      else {
+        owned.gate.claim("cancel")
+        owned.reject(cancelled(sessionID))
+      }
+    }
+
+    if (owned !== undefined) {
+      cancellation?.onCancelled?.({ sessionID, mode, workerID: worker?.id, resumeFromDb: true })
+    }
+
+    if (!byKey.has(sessionID)) nextWaiter(sessionID)
+  }
+
   /** Whether an in-flight run is the exact same run as a new request. */
   const isSameRun = (
     admitted: Pending,
@@ -534,43 +623,37 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     return pending.promise
   }
 
-  /** Remove one still-parked waiter for `sessionID` (never a running run). */
-  const removeQueued = (sessionID: SessionID): Pending | undefined => {
-    const waiters = waitersByKey.get(sessionID)
-    if (waiters === undefined || waiters.length === 0) return undefined
-    const [queued] = waiters.splice(0, 1)
-    if (waiters.length === 0) waitersByKey.delete(sessionID)
-    queued.gate.claim("cancel")
-    queued.reject(cancelled(sessionID))
-    return queued
-  }
-
   const cancel = async (sessionID: SessionID): Promise<void> => {
-    const error = cancelled(sessionID)
-    // A session's parked waiters are all cancelled with it; the running turn (if
-    // any) is cancelled below rather than left orphaned.
-    removeQueued(sessionID)
-    rejectWaiters(sessionID, error)
-
-    const admitted = byKey.get(sessionID)
-    if (admitted === undefined) return
-    reservations.markCancelling(sessionID)
-    // Claim the gate BEFORE terminating so the terminate-induced rejection is a
-    // cancellation, never a crash or a spurious run-failure line.
-    admitted.gate.claim("cancel")
-    rejectWaiters(sessionID, error)
-    byKey.delete(sessionID)
-    reservations.release(sessionID)
-    retireWorker(sessionID)
-    admitted.reject(error)
+    const owned = byKey.get(sessionID)
+    // Parked waiters belong to this session's terminal decision: drain them once,
+    // before the admitted run's worker settles.
+    rejectWaiters(sessionID, cancelled(sessionID))
+    if (owned === undefined) return
+    if (workers.has(sessionID)) workers.markCancelling(sessionID)
+    settleCancelled(sessionID, owned, {
+      mode: "terminated",
+      winner: "cancel",
+      worker: workers.worker(sessionID),
+      retires: true,
+      reaps: true,
+    })
   }
 
-  const cancelWithGrace = async (
+  interface CascadeAccumulator {
+    readonly seen: Set<SessionID>
+    readonly descendants: CascadeDescendant[]
+  }
+
+  /**
+   * Cascade one node: children first, then this session. `seen` is the single
+   * cycle guard, so a self-parent or a diamond edge visits each session once.
+   */
+  const cancelOne = async (
     sessionID: SessionID,
-    visited: ReadonlySet<SessionID> = new Set<SessionID>(),
+    cascade: CascadeAccumulator,
   ): Promise<CancelOutcome | undefined> => {
-    if (visited.has(sessionID)) return undefined
-    const seen = new Set(visited).add(sessionID)
+    if (cascade.seen.has(sessionID)) return undefined
+    cascade.seen.add(sessionID)
 
     const config = cancellation
     if (config === undefined) {
@@ -584,39 +667,38 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     // released, or have its worker retired.
     const owned = byKey.get(sessionID)
 
-    for (const child of config.childrenOf?.(sessionID) ?? []) await cancelWithGrace(child, seen)
+    for (const child of config.childrenOf?.(sessionID) ?? []) {
+      if (cascade.seen.has(child)) continue
+      const childOutcome = await cancelOne(child, cascade)
+      cascade.descendants.push({ sessionID: child, mode: childOutcome?.mode })
+    }
 
     // The run we meant to cancel already settled and something else owns the
     // session now: never cancel the newcomer.
     if (byKey.get(sessionID) !== owned) return undefined
+    if (owned === undefined) return undefined
 
-    const queued = removeQueued(sessionID)
+    // Drain waiters that exist at request time exactly once. A prompt that parks
+    // during the grace window is NOT drained here; `settleCancelled` promotes it
+    // onto a fresh worker after this cancel no longer owns the session.
     rejectWaiters(sessionID, cancelled(sessionID))
-    const admitted = owned
-    if (admitted === undefined) {
-      if (queued === undefined) return undefined
-      config.onCancelled?.({ sessionID, mode: "queued", workerID: undefined, resumeFromDb: true })
-      return { sessionID, mode: "terminated", winner: "cancel", acknowledged: false, durationMs: 0 }
-    }
 
-    reservations.markCancelling(sessionID)
-    const worker = workers.get(sessionID)
+    if (workers.has(sessionID)) workers.markCancelling(sessionID)
+    const worker = workers.worker(sessionID)
     const port = worker === undefined ? undefined : config.portFor?.(worker)
 
-    rejectWaiters(sessionID, cancelled(sessionID))
-
     if (worker === undefined || port === undefined) {
-      admitted.gate.claim("cancel")
-      byKey.delete(sessionID)
-      reservations.release(sessionID)
-      if (worker !== undefined) cancellation?.reap?.(worker)
-      retireWorker(sessionID)
-      admitted.reject(cancelled(sessionID))
-      config.onCancelled?.({ sessionID, mode: "terminated", workerID: worker?.id, resumeFromDb: true })
+      settleCancelled(sessionID, owned, {
+        mode: "terminated",
+        winner: "cancel",
+        worker,
+        retires: true,
+        reaps: true,
+      })
       return { sessionID, mode: "terminated", winner: "cancel", acknowledged: false, durationMs: 0 }
     }
 
-    admitted.cancelPending = true
+    owned.cancelPending = true
     let resolved: CancelOutcome = {
       sessionID,
       mode: "terminated",
@@ -625,31 +707,35 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       durationMs: 0,
     }
     try {
-      const outcome = await controllerFor(config, worker, port).cancel(sessionID, { complete: admitted.settled })
+      const outcome = await controllerFor(config, worker, port).cancel(sessionID, { complete: owned.settled })
       resolved =
-        outcome.mode === "cooperative" && !outcome.acknowledged && admitted.completed
+        outcome.mode === "cooperative" && !outcome.acknowledged && owned.completed
           ? { ...outcome, mode: "completed", winner: "completion" }
           : outcome
-
-      // Only release/retire the run captured before the await. A prompt that
-      // parked during the grace is resumed by `nextWaiter` below, on a fresh
-      // worker when the terminated path retired this one; a run that already
-      // owns `byKey` is left alone.
-      if (byKey.get(sessionID) === admitted) {
-        byKey.delete(sessionID)
-        reservations.release(sessionID)
-        if (resolved.mode === "terminated") retireWorker(sessionID)
-      }
-      config.onCancelled?.({ sessionID, mode: resolved.mode, workerID: worker.id, resumeFromDb: true })
       return resolved
     } finally {
-      admitted.cancelPending = false
-      if (resolved.winner === "completion") admitted.resolve()
-      else admitted.reject(cancelled(sessionID))
-      // Resume a prompt that arrived during the grace now that this cancel no
-      // longer owns the terminal decision. `nextWaiter` re-arms idle reaping
-      // when nothing is parked. If a newer run already owns `byKey`, leave it.
-      if (!byKey.has(sessionID)) nextWaiter(sessionID)
+      owned.cancelPending = false
+      // The controller terminates/reaps on the forced path; a cooperative or
+      // completed outcome keeps the worker. Only the captured run is released.
+      settleCancelled(sessionID, owned, {
+        mode: resolved.mode,
+        winner: resolved.winner,
+        worker,
+        retires: resolved.mode === "terminated",
+        reaps: false,
+      })
+    }
+  }
+
+  const cancelWithGrace = async (sessionID: SessionID): Promise<CascadeReport | undefined> => {
+    const cascade: CascadeAccumulator = { seen: new Set<SessionID>(), descendants: [] }
+    const outcome = await cancelOne(sessionID, cascade)
+    if (outcome === undefined) return undefined
+    return {
+      ...outcome,
+      sessionID,
+      outcome,
+      descendants: cascade.descendants,
     }
   }
 
@@ -664,7 +750,6 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     }
     byKey.clear()
     waitersByKey.clear()
-    reservations.clear()
     for (const controller of controllers.values()) controller.dispose()
     controllers.clear()
     const workersToTerminate = workers.entries().map((entry) => entry.worker)
@@ -683,8 +768,8 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       for (const waiters of waitersByKey.values()) count += waiters.length
       return count
     },
-    registry: reservations,
-    workerForSession: (sessionID) => reservations.get(sessionID)?.workerID,
+    registry: workers,
+    workerForSession: (sessionID) => workers.get(sessionID)?.workerID,
     dispatch,
     cancel,
     cancelWithGrace,

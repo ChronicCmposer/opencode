@@ -166,7 +166,6 @@ const snapshotLayers = Layer.mergeAll(
 )
 
 const buildSnapshot = (options: {
-  workerCount?: number
   clock?: () => number
   epoch?: number
   epochSequence?: ReturnType<typeof createEpochSequence>
@@ -175,11 +174,11 @@ const buildSnapshot = (options: {
 
 describe("buildWorkerSnapshot", () => {
   test("produces the layer snapshot shape from hub services", async () => {
-    const snapshot = await Effect.runPromise(buildSnapshot({ workerCount: 3, clock: () => 1000 }))
+    const snapshot = await Effect.runPromise(buildSnapshot({ clock: () => 1000 }))
 
     expect(snapshot.directory).toBe("/tmp/opencode-proj")
     expect(snapshot.directories).toEqual(hubDirectories)
-    expect(snapshot.workerCount).toBe(3)
+    expect("workerCount" in snapshot).toBe(false)
     expect(snapshot.flags.experimentalSessionWorkers).toBe(true)
     expect(snapshot.config).toEqual({ model: "test/model" })
     expect(snapshot.auth.anthropic).toEqual({ type: "api", key: "sk-secret" })
@@ -187,14 +186,8 @@ describe("buildWorkerSnapshot", () => {
     expect(typeof snapshot.epoch).toBe("number")
   })
 
-  test("defaults to one worker per session instead of sizing a pool", async () => {
-    const snapshot = await Effect.runPromise(buildSnapshot({ clock: () => 1000 }))
-
-    expect(snapshot.workerCount).toBe(1)
-  })
-
   test("is JSON-serializable (structured-clone friendly)", async () => {
-    const snapshot = await Effect.runPromise(buildSnapshot({ workerCount: 1, clock: () => 5 }))
+    const snapshot = await Effect.runPromise(buildSnapshot({ clock: () => 5 }))
 
     expect(JSON.parse(JSON.stringify(snapshot))).toEqual(snapshot)
   })
@@ -209,9 +202,9 @@ describe("snapshot epoch", () => {
 
   test("successive builds are strictly monotonic through one explicit holder", async () => {
     const epochSequence = createEpochSequence()
-    const first = await Effect.runPromise(buildSnapshot({ workerCount: 1, clock: () => 1_000, epochSequence }))
-    const second = await Effect.runPromise(buildSnapshot({ workerCount: 1, clock: () => 10, epochSequence }))
-    const third = await Effect.runPromise(buildSnapshot({ workerCount: 1, clock: () => 5, epochSequence }))
+    const first = await Effect.runPromise(buildSnapshot({ clock: () => 1_000, epochSequence }))
+    const second = await Effect.runPromise(buildSnapshot({ clock: () => 10, epochSequence }))
+    const third = await Effect.runPromise(buildSnapshot({ clock: () => 5, epochSequence }))
 
     expect(second.epoch).toBeGreaterThan(first.epoch)
     expect(third.epoch).toBeGreaterThan(second.epoch)
@@ -416,7 +409,7 @@ describe("buildSessionWorkerInit", () => {
 
   test("assembles a structured-cloneable init from snapshot + env + model", async () => {
     const init = await runInit({
-      snapshot: { workerCount: 2, clock: () => 100 },
+      snapshot: { clock: () => 100 },
       env: { base: {}, overlay: { A: "1" } },
     })
 
@@ -435,13 +428,13 @@ describe("buildSessionWorkerInit", () => {
       providerOptions: { baseURL: "https://api.example.com/v1", headers: { "x-provider": "1" } },
     })
     expect(init.snapshot.directory).toBe("/tmp/opencode-proj")
-    expect(init.snapshot.workerCount).toBe(2)
+    expect("workerCount" in init.snapshot).toBe(false)
     expect(assertStructuredCloneable(init)).toEqual(init)
   })
 
   test("carries the requested worker capabilities", async () => {
     const init = await runInit({
-      snapshot: { workerCount: 1, clock: () => 300 },
+      snapshot: { clock: () => 300 },
       capabilities: { sessionWorkerPorts: true },
     })
 
@@ -450,7 +443,7 @@ describe("buildSessionWorkerInit", () => {
   })
 
   test("the production entry accepts the built init", async () => {
-    const init = await runInit({ snapshot: { workerCount: 1, clock: () => 200 } })
+    const init = await runInit({ snapshot: { clock: () => 200 } })
 
     await using worker = await bootSessionWorker({ init, timeoutMs: 20_000 })
     expect(worker.ready.type).toBe("ready")
@@ -484,4 +477,13 @@ describe("createProductionWorkerPool", () => {
 
     await pool.terminateAll()
   }, 30_000)
+})
+
+describe("dispatch pool constants", () => {
+  test("dispatch does not re-export duplicate pool constants", async () => {
+    const dispatch = await import("@/session/worker/dispatch")
+    expect("DEFAULT_SESSION_WORKER_REAP_MS" in dispatch).toBe(false)
+    expect("SESSION_WORKER_REAP_ENV" in dispatch).toBe(false)
+    expect("resolveSessionWorkerReapMs" in dispatch).toBe(false)
+  })
 })

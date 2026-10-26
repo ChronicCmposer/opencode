@@ -33,7 +33,6 @@ const snapshot = (
     auth: {},
     modelsDev: {},
     flags: {},
-    workerCount: 1,
     ...overrides,
   }) as WorkerSnapshot
 

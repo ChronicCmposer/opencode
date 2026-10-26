@@ -10,6 +10,8 @@
 // `post` never mutates the poster, and unsubscribing mid-delivery does not skip
 // a peer subscriber because each delivery snapshots its subscriber set.
 
+import type { CancelFrame, CancelPort } from "@/session/worker/cancel"
+
 /** One side of a connected pair. */
 export interface ListenerPort<Frame> {
   /** Which side this endpoint is; useful in diagnostics. */
@@ -137,3 +139,28 @@ export function createListenerPair<Frame>(
 
 /** The default endpoint type, re-exported for callers that name it explicitly. */
 export type { FrameHandler }
+
+/** A cancellation pair: a hub-side {@link CancelPort} wired to the worker endpoint. */
+export interface CancelPair {
+  readonly hub: CancelPort
+  readonly worker: ListenerPort<CancelFrame>
+  /** Close both endpoints. */
+  close(): void
+}
+
+/**
+ * Build a typed cancel pair over {@link createListenerPair}: `hub.notify` posts a
+ * `CancelFrame` that the worker endpoint receives, and `hub.onMessage` observes
+ * frames (e.g. `cancel-ack`) posted back by the worker.
+ */
+export function createCancelPair(): CancelPair {
+  const pair = createListenerPair<CancelFrame>()
+  return {
+    hub: {
+      notify: (frame) => pair.hub.post(frame),
+      onMessage: (handler) => pair.hub.onMessage(handler),
+    },
+    worker: pair.worker,
+    close: () => pair.close(),
+  }
+}

@@ -9,20 +9,33 @@
 // This replaces the ambient `isMainThread` check that used to decide session-hub
 // graph membership: a session worker is a `session`, so a worker-hosted graph
 // never contributes the hub node (and never builds a nested hub).
+//
+// The role is FAIL CLOSED: an isolate that never declares one has NO authority.
+// The hub declares itself explicitly in `project/bootstrap.ts`; a worker
+// declares itself at its entry. Callers (e.g. graph membership) must treat an
+// unset role as "not hub", never as an implicit hub.
 
 import type { Role } from "@/session/worker/node-table"
 
 /** The canonical role list; the runtime guard at every parse boundary. */
 export const ROLES: readonly Role[] = ["session", "writer", "broker", "hub"]
 
-/** The role assumed when an isolate never sets one — the process main thread. */
-const DEFAULT_PROCESS_ROLE: Role = "hub"
-
 let currentRole: Role | undefined
 
-/** The calling isolate's process role; `"hub"` until {@link setProcessRole} runs. */
-export function processRole(): Role {
-  return currentRole ?? DEFAULT_PROCESS_ROLE
+/**
+ * The calling isolate's process role, or `undefined` when it has not declared
+ * one. Graph membership treats `undefined` as a non-hub and stays closed.
+ */
+export function processRole(): Role | undefined {
+  return currentRole
+}
+
+/** The calling isolate's role, failing loud when it never declared one. */
+export function requireProcessRole(): Role {
+  if (currentRole === undefined) {
+    throw new Error("process role is not set: declare it at the process entry before reading it")
+  }
+  return currentRole
 }
 
 /** Whether `value` is one of the declared {@link Role}s (a runtime boundary guard). */

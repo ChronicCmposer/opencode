@@ -53,11 +53,11 @@ const work: SessionWorkFactory = (kind) => {
 // Bind and advertise the idle name before announcing `ready`, exactly as the
 // production entry does from `init.sessionID`.
 const namer = createThreadNamer({ setName: setThreadName })
-namer.onBind(sessionID)
+namer.bind(sessionID)
 
 installSessionExecutor(scope, {
   work,
   threadId: currentThreadId() ?? 0,
-  onRunStart: (runSessionID) => namer.onRunStart(runSessionID),
+  onRunStart: (runSessionID) => namer.bind(runSessionID, true),
   onIdle: () => Effect.sync(() => namer.onIdle()),
 })

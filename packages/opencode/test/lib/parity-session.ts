@@ -12,6 +12,8 @@
 // deliver worker events (or hangs) is captured as `side.error`, never thrown, so
 // the suite stays green while a known-red goal waits for the fix.
 
+import { withDeadline } from "./async"
+import { compareMultisets, keyAt, multisetDifference, stableStringify } from "./compare"
 import { startMockProvider, type MockProviderHandle, type MockProviderOptions } from "./mock-provider"
 import {
   createEventSink,
@@ -37,10 +39,13 @@ export interface SessionScript {
 }
 
 /** One row read back from the durable store, tagged with its table. */
-export interface DurableRow {
+export interface ParityDurableRow {
   readonly table: string
   readonly row: Record<string, unknown>
 }
+
+/** @deprecated Use {@link ParityDurableRow}; kept so existing imports keep compiling. */
+export type DurableRow = ParityDurableRow
 
 /**
  * How a runner reports the durable rows its side wrote. The harness collects
@@ -91,7 +96,7 @@ export interface ParitySide {
   readonly events: ReadonlyArray<SinkEvent>
   readonly types: ReadonlyArray<string>
   /** The durable rows this side reported through {@link DurableRecorder}. */
-  readonly durable: ReadonlyArray<DurableRow>
+  readonly durable: ReadonlyArray<ParityDurableRow>
   /** The runner's failure message, or `undefined` when it completed. */
   readonly error: string | undefined
   readonly durationMs: number
@@ -110,31 +115,6 @@ export interface RunParitySessionOptions {
   readonly provider?: MockProviderOptions
   /** Per-side timeout. Defaults to 30000 ms. */
   readonly timeoutMs?: number
-}
-
-/** Reject `promise` with a descriptive error if it has not settled within `timeoutMs`. */
-function withTimeout(
-  promise: Promise<void>,
-  timeoutMs: number,
-  message: string,
-  onTimeout: () => void = () => {},
-): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      onTimeout()
-      reject(new Error(message))
-    }, timeoutMs)
-    promise.then(
-      () => {
-        clearTimeout(timer)
-        resolve()
-      },
-      (cause: unknown) => {
-        clearTimeout(timer)
-        reject(cause)
-      },
-    )
-  })
 }
 
 /** The label used in timeout/error messages for a flag state. */
@@ -168,7 +148,7 @@ async function runSide(
     sinks.push(sink)
     return sink
   }
-  const durable: DurableRow[] = []
+  const durable: ParityDurableRow[] = []
   const durableRecorder: DurableRecorder = {
     add: (table, rows) => {
       for (const row of rows) durable.push({ table, row })
@@ -201,9 +181,11 @@ async function runSide(
         signal: controller.signal,
       }),
     )
-    await withTimeout(run, timeoutMs, `parity ${flagLabel(flag)} run timed out after ${timeoutMs}ms`, () =>
-      controller.abort(),
-    )
+    await withDeadline(run, {
+      timeoutMs,
+      message: `parity ${flagLabel(flag)} run timed out after ${timeoutMs}ms`,
+      onTimeout: () => controller.abort(),
+    })
   } catch (cause) {
     error = cause instanceof Error ? cause.message : String(cause)
   }
@@ -285,53 +267,12 @@ function eventsOf(input: SequenceInput): ReadonlyArray<SinkEvent> {
   return isEventArray(input) ? input : input.events
 }
 
-/** Deterministic JSON with sorted object keys, so key order never spuriously diffs. */
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined"
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`
-  const record = value as Record<string, unknown>
-  const entries = Object.keys(record)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
-  return `{${entries.join(",")}}`
-}
-
 /** The default canonical form: `{type, properties}`, with ids ignored by default. */
 function canonicalKey(event: SinkEvent, ignoreIds: boolean): string {
   const shaped = ignoreIds
     ? { type: event.type, properties: event.properties }
     : { id: event.id, type: event.type, properties: event.properties }
   return stableStringify(shaped)
-}
-
-function keyAt(
-  events: ReadonlyArray<SinkEvent>,
-  index: number,
-  keyOf: (event: SinkEvent) => string,
-): string | undefined {
-  const event = events[index]
-  return event === undefined ? undefined : keyOf(event)
-}
-
-/** Items of `from` (multiset) whose key is not consumed by `other`. */
-function multisetDifference<T>(
-  from: ReadonlyArray<T>,
-  other: ReadonlyArray<T>,
-  keyOf: (item: T) => string,
-): T[] {
-  const remaining = new Map<string, number>()
-  for (const item of other) {
-    const key = keyOf(item)
-    remaining.set(key, (remaining.get(key) ?? 0) + 1)
-  }
-  const missing: T[] = []
-  for (const item of from) {
-    const key = keyOf(item)
-    const count = remaining.get(key) ?? 0
-    if (count > 0) remaining.set(key, count - 1)
-    else missing.push(item)
-  }
-  return missing
 }
 
 /**
@@ -368,14 +309,14 @@ export function compareSequences(
 // --- Durable-row comparison -------------------------------------------------
 
 /** A captured durable set, or an object that carries one (`ParitySide`). */
-export type DurableInput = ReadonlyArray<DurableRow> | { readonly durable: ReadonlyArray<DurableRow> }
+export type DurableInput = ReadonlyArray<ParityDurableRow> | { readonly durable: ReadonlyArray<ParityDurableRow> }
 
 export interface CompareDurableOptions {
   /**
    * Project a row to the comparable shape, dropping volatile columns
    * (timestamps, generated ids). Defaults to the whole `{ table, row }`.
    */
-  readonly normalize?: (row: DurableRow) => unknown
+  readonly normalize?: (row: ParityDurableRow) => unknown
 }
 
 export interface DurableComparison {
@@ -383,17 +324,17 @@ export interface DurableComparison {
   readonly offCount: number
   readonly onCount: number
   /** Rows present in `off` (multiset) with no counterpart in `on`. */
-  readonly missingInOn: ReadonlyArray<DurableRow>
+  readonly missingInOn: ReadonlyArray<ParityDurableRow>
   /** Rows present in `on` (multiset) with no counterpart in `off`. */
-  readonly missingInOff: ReadonlyArray<DurableRow>
+  readonly missingInOff: ReadonlyArray<ParityDurableRow>
 }
 
-function isDurableRowArray(input: DurableInput): input is ReadonlyArray<DurableRow> {
+function isParityDurableRowArray(input: DurableInput): input is ReadonlyArray<ParityDurableRow> {
   return Array.isArray(input)
 }
 
-function durableRowsOf(input: DurableInput): ReadonlyArray<DurableRow> {
-  return isDurableRowArray(input) ? input : input.durable
+function durableRowsOf(input: DurableInput): ReadonlyArray<ParityDurableRow> {
+  return isParityDurableRowArray(input) ? input : input.durable
 }
 
 /**
@@ -406,20 +347,16 @@ export function compareDurable(
   onInput: DurableInput,
   options: CompareDurableOptions = {},
 ): DurableComparison {
-  const normalize = options.normalize ?? ((row: DurableRow) => row)
-  const keyOf = (row: DurableRow) => stableStringify(normalize(row))
-  const off = durableRowsOf(offInput)
-  const on = durableRowsOf(onInput)
-
-  const missingInOn = multisetDifference(off, on, keyOf)
-  const missingInOff = multisetDifference(on, off, keyOf)
+  const comparison = compareMultisets(durableRowsOf(offInput), durableRowsOf(onInput), {
+    normalize: options.normalize ?? ((row) => row),
+  })
 
   return {
-    equal: off.length === on.length && missingInOn.length === 0 && missingInOff.length === 0,
-    offCount: off.length,
-    onCount: on.length,
-    missingInOn,
-    missingInOff,
+    equal: comparison.equal,
+    offCount: comparison.leftCount,
+    onCount: comparison.rightCount,
+    missingInOn: comparison.missingInRight,
+    missingInOff: comparison.missingInLeft,
   }
 }
 

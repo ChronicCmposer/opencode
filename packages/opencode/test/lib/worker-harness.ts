@@ -80,6 +80,7 @@ export interface WorkerHarness extends AsyncDisposable {
   ): HarnessWorker<TOut, TIn>
   readonly workers: ReadonlyArray<HarnessWorker>
   terminateAll(): Promise<void>
+  close(): Promise<void>
   dispose(): Promise<void>
 }
 
@@ -256,6 +257,10 @@ export function createWorkerHarness(options: WorkerHarnessOptions = {}): WorkerH
     await Promise.all(workers.filter((worker) => worker.alive).map((worker) => worker.terminate()))
   }
 
+  const dispose = async () => {
+    await Promise.all(workers.map((worker) => worker.terminate()))
+  }
+
   return {
     cores: count.cores,
     availableParallelism: count.availableParallelism,
@@ -264,9 +269,8 @@ export function createWorkerHarness(options: WorkerHarnessOptions = {}): WorkerH
       return workers.slice()
     },
     terminateAll,
-    dispose: async () => {
-      await Promise.all(workers.map((worker) => worker.terminate()))
-    },
+    close: dispose,
+    dispose,
     [Symbol.asyncDispose]: terminateAll,
   }
 }

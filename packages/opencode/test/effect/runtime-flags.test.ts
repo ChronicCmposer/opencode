@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { ConfigProvider, Effect, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { RuntimeFlags } from "../../src/effect/runtime-flags"
@@ -356,4 +356,60 @@ describe("RuntimeFlags", () => {
       expect(flags.disableClaudeCodeSkills).toBe(true)
     }),
   )
+})
+
+describe("session-worker rollout flag single source", () => {
+  // Every surface — the graph predicate and the runtime service — must resolve
+  // through this one function, so their interpretation can never drift.
+  test("resolveSessionWorkersFlag owns the dedicated/umbrella precedence", () => {
+    const resolve = RuntimeFlags.resolveSessionWorkersFlag
+    expect(resolve({})).toBe(false)
+    expect(resolve({ OPENCODE_EXPERIMENTAL: "true" })).toBe(true)
+    expect(resolve({ OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "true" })).toBe(true)
+    expect(resolve({ OPENCODE_EXPERIMENTAL: "true", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "false" })).toBe(false)
+    expect(resolve({ OPENCODE_EXPERIMENTAL: "false", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "true" })).toBe(true)
+    expect(resolve({ OPENCODE_EXPERIMENTAL: "true", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "nonsense" })).toBe(true)
+    expect(resolve({ OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "TRUE" })).toBe(false)
+  })
+
+  test("experimentalSessionWorkersFromEnv is the same resolver", () => {
+    expect(RuntimeFlags.experimentalSessionWorkersFromEnv).toBe(RuntimeFlags.resolveSessionWorkersFlag)
+  })
+
+  it.effect("the Config-backed runtime flag resolves through the same function", () =>
+    Effect.gen(function* () {
+      const envs: Record<string, string>[] = [
+        {},
+        { OPENCODE_EXPERIMENTAL: "true" },
+        { OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "true" },
+        { OPENCODE_EXPERIMENTAL: "true", OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "false" },
+        { OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "nonsense" },
+      ]
+      for (const env of envs) {
+        const flags = yield* readFlags.pipe(Effect.provide(fromConfig(env)))
+        expect(flags.experimentalSessionWorkers).toBe(RuntimeFlags.resolveSessionWorkersFlag(env))
+      }
+    }),
+  )
+
+  test("mismatch diagnostic is silent when aligned and names both sides when not", () => {
+    expect(
+      RuntimeFlags.sessionWorkersFlagMismatch({ graphEnabled: true, runtimeEnabled: true }),
+    ).toBeUndefined()
+    expect(
+      RuntimeFlags.sessionWorkersFlagMismatch({ graphEnabled: false, runtimeEnabled: false }),
+    ).toBeUndefined()
+
+    const graphOff = RuntimeFlags.sessionWorkersFlagMismatch({ graphEnabled: false, runtimeEnabled: true })
+    expect(graphOff).toContain("graph")
+    expect(graphOff).toContain("off")
+    expect(graphOff).toContain("runtime")
+    expect(graphOff).toContain("on")
+
+    const graphOn = RuntimeFlags.sessionWorkersFlagMismatch({ graphEnabled: true, runtimeEnabled: false })
+    expect(graphOn).toContain("graph")
+    expect(graphOn).toContain("on")
+    expect(graphOn).toContain("runtime")
+    expect(graphOn).toContain("off")
+  })
 })

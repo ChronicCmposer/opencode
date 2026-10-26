@@ -1,8 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { BackgroundJob as CoreBackgroundJob } from "@opencode-ai/core/background-job"
-import { Identifier } from "@opencode-ai/core/id/id"
 import { InstanceState } from "@/effect/instance-state"
-import { ObjectUtil } from "@/util/object"
 import { Cause, Effect, Layer, Scope } from "effect"
 
 export {

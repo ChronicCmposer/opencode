@@ -21,6 +21,7 @@ import { Permission } from "@/permission"
 import { Question } from "@/question"
 import { SessionStatus } from "@/session/status"
 import { InstanceRef } from "@/effect/instance-ref"
+import { processRole } from "@/effect/process-role"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Provider } from "@/provider/provider"
 import { collectNodeNames } from "@/session/worker/node-table"
@@ -153,6 +154,11 @@ describe("sessionWorkersEnabled agrees with runtime-flags for the same env", () 
       expect(sessionWorkersEnabled(env)).toBe(RuntimeFlags.experimentalSessionWorkersFromEnv(env))
     }
   })
+
+  test("the graph predicate IS the single resolver exported by runtime-flags", () => {
+    // One function, not two implementations that happen to agree.
+    expect(RuntimeFlags.resolveSessionWorkersFlag).toBe(RuntimeFlags.experimentalSessionWorkersFromEnv)
+  })
 })
 
 // The graph decision reads `process.env` at module-eval time, while the runtime
@@ -266,8 +272,8 @@ describe("sessionWorkerNodes", () => {
     expect(sessionWorkerNodes({ hubNode, enabled: false, role: "hub" })).toEqual([])
   })
 
-  test("defaults to the process role (hub in the main test process)", () => {
-    expect(sessionWorkerNodes({ hubNode, enabled: true })).toEqual([hubNode])
+  test("defaults to the process role, so an undeclared role keeps the gate closed", () => {
+    expect(sessionWorkerNodes({ hubNode, enabled: true })).toEqual(processRole() === "hub" ? [hubNode] : [])
   })
 })
 

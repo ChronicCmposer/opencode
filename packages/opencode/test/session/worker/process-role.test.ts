@@ -15,7 +15,7 @@ const PROCESS_ROLE_FIXTURE = new URL("../../fixture/process-role-worker.ts", imp
 
 interface RoleReport {
   readonly type: "result"
-  readonly defaultRole: string
+  readonly defaultRole: string | undefined
   readonly nodesBefore: number
   readonly roleAfter: string
   readonly nodesAfter: number
@@ -24,8 +24,12 @@ interface RoleReport {
 }
 
 describe("processRole", () => {
-  test("defaults to 'hub' in the (unset) main process", () => {
-    expect(processRole()).toBe("hub")
+  test("never assumes hub authority (fail closed when unset)", () => {
+    // The main test process declares `hub` via `project/bootstrap.ts`, so the
+    // explicit role is observable; an undeclared role is covered in the fresh
+    // isolate below, where the graph must contribute nothing.
+    const role = processRole()
+    expect(role === undefined || role === "hub").toBe(true)
   })
 
   test("is set-once per isolate and gates sessionWorkerNodes on 'hub'", async () => {
@@ -34,9 +38,9 @@ describe("processRole", () => {
       const worker = harness.spawn<RoleReport>(PROCESS_ROLE_FIXTURE)
       const report = await worker.waitFor("result")
 
-      // Fresh isolate: no role set yet, so the hub defaults in and the graph adds it.
-      expect(report.defaultRole).toBe("hub")
-      expect(report.nodesBefore).toBe(1)
+      // Fresh isolate: no role is assumed, so the hub gate stays closed.
+      expect(report.defaultRole).toBeUndefined()
+      expect(report.nodesBefore).toBe(0)
 
       // After the single set, the role and the graph decision follow.
       expect(report.roleAfter).toBe("session")

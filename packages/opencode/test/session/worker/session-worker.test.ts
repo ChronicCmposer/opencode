@@ -219,6 +219,12 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
     expect(hubProxy!.transfer).toHaveLength(1)
   })
 
+  test("the bootstrap handle exposes only disposal, not unread plugin-tool seams", () => {
+    const { scope } = fakeScope()
+    const handle = bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope)
+    expect(Object.keys(handle)).toEqual(["dispose"])
+  })
+
   test("degrades to the reduced pipeline without the capability", () => {
     const { frames, scope } = fakeScope()
     bootstrapSessionWorker(init(), scope)
@@ -240,6 +246,23 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
     expect(control).toBeInstanceOf(MessagePort)
     // writer + egress + egressControl + broker are all transferred.
     expect(ports!.transfer).toHaveLength(4)
+  })
+
+  test("dispose closes the installed executor (its scope finalizers run)", () => {
+    const { scope } = fakeScope()
+    let disposed = 0
+    const handle = bootstrapSessionWorker(init(), scope, {
+      installExecutor: () => ({
+        handle: async () => ({ type: "pong", id: 0 }),
+        dispose: async () => {
+          disposed += 1
+        },
+      }),
+    })
+
+    expect(disposed).toBe(0)
+    handle.dispose()
+    expect(disposed).toBe(1)
   })
 
   test("wires a real logger into the E2 client lifecycles (not the noop default)", () => {
@@ -302,7 +325,7 @@ describe("buildWorkerClients (step 22)", () => {
     return { writer, egress, broker }
   }
 
-  test("writer, egress and broker are required; the background job seam is process-local", () => {
+  test("writer, egress and broker are required; there is no job client field", () => {
     expect(() => buildWorkerClients({})).toThrow(MissingWorkerPortError)
     expect(() => buildWorkerClients({})).toThrow(/writer/)
 
@@ -310,14 +333,14 @@ describe("buildWorkerClients (step 22)", () => {
     expect(() => buildWorkerClients({ writer: channels.writer.port1 })).toThrow(/egress/)
     expect(() => buildWorkerClients({ writer: channels.writer.port1, egress: channels.egress.port1 })).toThrow(/broker/)
 
-    // No hub-side job registry remains, so the reduced client is always local
-    // and needs no transferred port.
+    // Background jobs are process-local, so the worker client bundle has no
+    // idle job handle at all.
     const clients = buildWorkerClients({
       writer: channels.writer.port1,
       egress: channels.egress.port1,
       broker: channels.broker.port1,
     })
-    expect(typeof clients.backgroundJob.wait).toBe("function")
+    expect("backgroundJob" in clients).toBe(false)
   })
 
   test("wires the four clients and round-trips writer publish/query over the port", async () => {
@@ -353,7 +376,6 @@ describe("buildWorkerClients (step 22)", () => {
     expect(typeof clients.writer.publish).toBe("function")
     expect(typeof clients.egress.emit).toBe("function")
     expect(typeof clients.broker.call).toBe("function")
-    expect(typeof clients.backgroundJob.wait).toBe("function")
 
     const result = await clients.writer.publish({
       id: "e1",
@@ -774,7 +796,7 @@ describe("createWorkRegistry (step 28)", () => {
     }
   })
 
-  test("the production registry runs session work for the session and legacy kinds", () => {
+  test("the production registry runs session work only for the protocol literal", () => {
     const registry = productionWorkRegistry(marker)
     expect(registry("session")).toBe(marker)
     expect(registry(DEFAULT_WORK_KIND)).toBe(marker)

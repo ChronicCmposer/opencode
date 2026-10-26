@@ -74,7 +74,7 @@ async function stop(dir: string) {
   await $`git fsmonitor--daemon stop`.cwd(dir).quiet().nothrow()
 }
 
-type TmpDirOptions<T> = {
+export type TmpDirOptions<T> = {
   git?: boolean
   config?: Partial<ConfigV1.Info>
   init?: (dir: string) => Promise<T>

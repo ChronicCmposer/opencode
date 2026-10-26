@@ -36,10 +36,10 @@ describe("createSpawnGate", () => {
     await tick()
     expect(secondState.settled).toBe(false)
 
-    first.ready()
+    first.release()
     const secondPermit = await second
     expect(secondPermit).toBeDefined()
-    secondPermit.ready()
+    secondPermit.release()
   })
 
   test("releases are not on acquire or construction", async () => {
@@ -52,12 +52,12 @@ describe("createSpawnGate", () => {
     expect(secondState.settled).toBe(false)
     expect(secondState.error).toBeUndefined()
 
-    first.ready()
+    first.release()
     const secondPermit = await second
-    secondPermit.ready()
+    secondPermit.release()
 
     const thirdPermit = await gate.acquire()
-    thirdPermit.ready()
+    thirdPermit.release()
   })
 
   test("queues concurrent acquisitions FIFO", async () => {
@@ -74,15 +74,15 @@ describe("createSpawnGate", () => {
       return permit
     })
 
-    first.ready()
+    first.release()
     const secondPermit = await second
     await tick()
     expect(order).toEqual(["second"])
 
-    secondPermit.ready()
+    secondPermit.release()
     const thirdPermit = await third
     expect(order).toEqual(["second", "third"])
-    thirdPermit.ready()
+    thirdPermit.release()
   })
 
   test("a waiter is not rejected while it waits", async () => {
@@ -94,29 +94,29 @@ describe("createSpawnGate", () => {
     await tick()
     expect(secondState.error).toBeUndefined()
 
-    first.ready()
+    first.release()
     const secondPermit = await second
     expect(secondState.error).toBeUndefined()
-    secondPermit.ready()
+    secondPermit.release()
   })
 
-  test("permit.fail releases the permit for the next waiter", async () => {
+  test("a failed release frees the permit for the next waiter", async () => {
     const gate = createSpawnGate({ timeoutMs: 1_000 })
     const first = await gate.acquire()
     const second = gate.acquire()
 
-    first.fail(new Error("worker boot failed"))
+    first.release("failed", new Error("worker boot failed"))
 
     const secondPermit = await second
-    secondPermit.ready()
+    secondPermit.release()
   })
 
-  test("ready and fail are idempotent", async () => {
+  test("release is idempotent", async () => {
     const gate = createSpawnGate({ timeoutMs: 1_000 })
     const first = await gate.acquire()
-    first.ready()
-    first.ready()
-    first.fail(new Error("late failure"))
+    first.release()
+    first.release()
+    first.release("failed", new Error("late failure"))
 
     const second = await gate.acquire()
     const third = gate.acquire()
@@ -125,16 +125,16 @@ describe("createSpawnGate", () => {
     await tick()
     expect(thirdState.settled).toBe(false)
 
-    second.ready()
+    second.release()
     const thirdPermit = await third
-    thirdPermit.ready()
+    thirdPermit.release()
   })
 
-  test("fail then ready releases once", async () => {
+  test("release with different outcomes still releases once", async () => {
     const gate = createSpawnGate({ timeoutMs: 1_000 })
     const first = await gate.acquire()
-    first.fail(new Error("worker boot failed"))
-    first.ready()
+    first.release("failed", new Error("worker boot failed"))
+    first.release()
 
     const second = await gate.acquire()
     const third = gate.acquire()
@@ -142,8 +142,8 @@ describe("createSpawnGate", () => {
     await tick()
     expect(thirdState.settled).toBe(false)
 
-    second.ready()
-    ;(await third).ready()
+    second.release()
+    ;(await third).release()
   })
 
   test("times out a waiting acquisition with a descriptive error", async () => {
@@ -160,9 +160,28 @@ describe("createSpawnGate", () => {
     expect((timeoutState.error as Error).message).toContain("20ms")
 
     // The timed-out waiter must not leak capacity.
-    first.ready()
+    first.release()
     const next = await gate.acquire()
-    next.ready()
+    next.release()
+  })
+
+  test("release accepts an optional outcome and the permit has no fail method", async () => {
+    const gate = createSpawnGate({ timeoutMs: 1_000 })
+
+    const first = await gate.acquire()
+    expect("fail" in first).toBe(false)
+    expect("ready" in first).toBe(false)
+    expect(typeof first.release).toBe("function")
+    first.release()
+
+    const second = await gate.acquire()
+    second.release("ready")
+
+    const third = await gate.acquire()
+    third.release("failed", new Error("worker boot failed"))
+
+    const fourth = await gate.acquire()
+    fourth.release()
   })
 
   test("rejects an invalid timeout at construction", () => {

@@ -41,6 +41,55 @@ export type FakeWorkerMode = "cooperative" | "finish" | "crash" | "fail"
 /** How a worker's cancel port settles the in-flight run. */
 export type FakeCancelOutcome = "resolve" | "reject" | "ignore"
 
+export interface FakeCancelPortOptions {
+  /** Whether a delivered `cancel` produces a `cancel-ack`. Defaults to `true`. */
+  readonly acknowledge?: boolean
+  /** Observed `cancel` delivery, including the session id it targets. */
+  readonly onCancel?: (sessionID: SessionID) => void
+}
+
+/**
+ * The fake's view of a cancellation control channel: {@link CancelPort} plus a
+ * `sent` log of every frame the fake emitted. This is the single implementation
+ * both fake worker families use, so their acknowledgement behavior cannot drift.
+ */
+export interface FakeCancelPort extends CancelPort {
+  /** Every frame emitted through {@link CancelPort.notify}, in order. */
+  readonly sent: ReadonlyArray<CancelFrame>
+}
+
+/**
+ * Build the shared fake cancel port. A `cancel` frame is recorded and, unless
+ * acknowledgements are disabled, answered with an accepted `cancel-ack` at once.
+ * `onCancel` runs after the ack so a worker's settle logic observes the same
+ * ordering as the real control channel.
+ */
+export function createFakeCancelPort(options: FakeCancelPortOptions = {}): FakeCancelPort {
+  const acknowledge = options.acknowledge ?? true
+  const sent: CancelFrame[] = []
+  const handlers = new Set<(frame: CancelFrame) => void>()
+
+  return {
+    notify: (frame) => {
+      if (frame.type !== "cancel") return
+      sent.push(frame)
+      if (acknowledge) {
+        const ack: CancelFrame = { type: "cancel-ack", sessionID: frame.sessionID, accepted: true }
+        sent.push(ack)
+        for (const handler of [...handlers]) handler(ack)
+      }
+      options.onCancel?.(frame.sessionID as SessionID)
+    },
+    onMessage: (handler) => {
+      handlers.add(handler)
+      return () => void handlers.delete(handler)
+    },
+    get sent() {
+      return sent.slice()
+    },
+  }
+}
+
 export interface FakeSessionWorkerOptions {
   /** Defaults to `"cooperative"`. */
   readonly mode?: FakeWorkerMode
@@ -81,8 +130,6 @@ export class FakeSessionWorker implements SessionWorker {
   private readonly pending = new Map<SessionID, PendingRun>()
   private readonly failure: () => unknown
   private readonly onCancel: FakeCancelOutcome
-  private readonly acknowledge: boolean
-  private readonly ackHandlers = new Set<(frame: CancelFrame) => void>()
 
   constructor(
     readonly id: number,
@@ -91,23 +138,11 @@ export class FakeSessionWorker implements SessionWorker {
     this.mode = options.mode ?? "cooperative"
     this.failure = options.failure ?? (() => new Error("fake session failure"))
     this.onCancel = options.onCancel ?? "resolve"
-    this.acknowledge = options.acknowledge ?? true
     this.backgroundWork = options.activeWork ?? false
-    this.cancelPort = {
-      notify: (frame) => {
-        if (frame.type !== "cancel") return
-        if (this.acknowledge) {
-          for (const handler of [...this.ackHandlers]) {
-            handler({ type: "cancel-ack", sessionID: frame.sessionID, accepted: true })
-          }
-        }
-        this.settleCancel(frame.sessionID as SessionID)
-      },
-      onMessage: (handler) => {
-        this.ackHandlers.add(handler)
-        return () => void this.ackHandlers.delete(handler)
-      },
-    }
+    this.cancelPort = createFakeCancelPort({
+      acknowledge: options.acknowledge,
+      onCancel: (sessionID) => this.settleCancel(sessionID),
+    })
   }
 
   /** Runs currently awaiting an explicit settle (only in `cooperative` mode). */
@@ -316,7 +351,10 @@ export class FaultPool implements WorkerPool {
     return worker
   }
 
-  async terminateAll(): Promise<void> {}
+  /** Terminate every initial and spawned worker; safe to call more than once. */
+  async terminateAll(): Promise<void> {
+    await Promise.all([...this.workers, ...this.spawned].map((worker) => worker.terminate()))
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -344,36 +382,28 @@ export interface FakeExecutorWorkerOptions {
 export class FakeExecutorWorker implements ExecutorWorker {
   readonly id: number
   readonly cancelPort: CancelPort
+  private aliveState = true
   private readonly mode: FakeExecutorMode
   private readonly value: unknown
   private readonly onCancel?: (sessionID: SessionID) => void
   private readonly results = new Map<SessionID, SessionExecutionResult>()
   private readonly pending = new Map<SessionID, () => void>()
-  private readonly ackHandlers = new Set<(frame: CancelFrame) => void>()
 
   constructor(id: number, options: FakeExecutorWorkerOptions = {}) {
     this.id = id
     this.mode = options.mode ?? "auto"
     this.value = options.value
     this.onCancel = options.onCancel
-    this.cancelPort = {
-      notify: (frame) => {
-        if (frame.type !== "cancel") return
-        this.onCancel?.(frame.sessionID as SessionID)
-        for (const handler of [...this.ackHandlers]) {
-          handler({ type: "cancel-ack", sessionID: frame.sessionID, accepted: true })
-        }
-        this.settle(frame.sessionID as SessionID)
+    this.cancelPort = createFakeCancelPort({
+      onCancel: (sessionID) => {
+        this.onCancel?.(sessionID)
+        this.settle(sessionID)
       },
-      onMessage: (handler) => {
-        this.ackHandlers.add(handler)
-        return () => void this.ackHandlers.delete(handler)
-      },
-    }
+    })
   }
 
   get alive(): boolean {
-    return true
+    return this.aliveState
   }
 
   execute(run: ExecutorRun): Promise<void> {
@@ -401,7 +431,9 @@ export class FakeExecutorWorker implements ExecutorWorker {
     return this.results.get(sessionID)
   }
 
-  async terminate(): Promise<void> {}
+  async terminate(): Promise<void> {
+    this.aliveState = false
+  }
 
   private record(sessionID: SessionID): void {
     this.results.set(sessionID, { sessionID, value: this.value })
@@ -449,7 +481,10 @@ export class FakeExecutorPool implements ExecutorWorkerPool {
     return worker
   }
 
-  async terminateAll(): Promise<void> {}
+  /** Terminate every initial and spawned worker; safe to call more than once. */
+  async terminateAll(): Promise<void> {
+    await Promise.all([...this.workers, ...this.spawned].map((worker) => worker.terminate()))
+  }
 
   byID(id: number): ExecutorWorker | undefined {
     return [...this.workers, ...this.spawned].find((worker) => worker.id === id)

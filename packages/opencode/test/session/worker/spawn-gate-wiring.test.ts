@@ -218,7 +218,7 @@ describe("spawn-gate wiring", () => {
       await flush()
       expect(FakeWorker.instances.map((worker) => worker.url)).toEqual(["fake://first"])
 
-      held.ready()
+      held.release()
       await flush()
       expect(FakeWorker.instances.map((worker) => worker.url)).toEqual(["fake://first", "fake://respawn"])
       const respawnWorker = FakeWorker.instances[1]!

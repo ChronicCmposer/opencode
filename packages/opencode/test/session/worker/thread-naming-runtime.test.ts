@@ -2,8 +2,8 @@
 //
 // `createThreadNamer` turns the pure grammar into the worker lifecycle:
 //
-//   onBind(sessionID)     -> idle    `ocs:<last6>`
-//   onRunStart(sessionID) -> running `ocs:<last6>!`
+//   bind(sessionID)       -> idle    `ocs:<last6>`
+//   bind(sessionID, true) -> running `ocs:<last6>!`
 //   onIdle()              -> idle form of the bound session (every terminal:
 //                            settle, cooperative cancel, interrupt)
 //   onDispose()           -> drops the binding; later calls never throw
@@ -29,12 +29,12 @@ describe("session.worker.thread-naming", () => {
   test("toggles idle -> running -> idle across the full run lifecycle", () => {
     const { names, namer } = recordingNamer()
 
-    namer.onBind(FIRST)
-    namer.onRunStart(FIRST)
+    namer.bind(FIRST)
+    namer.bind(FIRST, true)
     namer.onIdle() // settle
-    namer.onRunStart(FIRST)
+    namer.bind(FIRST, true)
     namer.onIdle() // cooperative cancel
-    namer.onRunStart(FIRST)
+    namer.bind(FIRST, true)
     namer.onIdle() // interrupt
 
     expect(names).toEqual([
@@ -51,11 +51,11 @@ describe("session.worker.thread-naming", () => {
   test("rebinding and running a different session never leaves a stale idle name", () => {
     const { names, namer } = recordingNamer()
 
-    namer.onBind(FIRST)
-    namer.onBind(SECOND)
-    namer.onRunStart(SECOND)
+    namer.bind(FIRST)
+    namer.bind(SECOND)
+    namer.bind(SECOND, true)
     namer.onIdle()
-    namer.onRunStart(FIRST)
+    namer.bind(FIRST, true)
     namer.onIdle()
 
     expect(names).toEqual([
@@ -78,8 +78,8 @@ describe("session.worker.thread-naming", () => {
   test("dispose drops the binding without throwing or leaving a stale write", () => {
     const { names, namer } = recordingNamer()
 
-    namer.onBind(FIRST)
-    namer.onRunStart(FIRST)
+    namer.bind(FIRST)
+    namer.bind(FIRST, true)
 
     expect(() => namer.onDispose()).not.toThrow()
     expect(() => namer.onDispose()).not.toThrow()

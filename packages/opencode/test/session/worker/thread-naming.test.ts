@@ -18,6 +18,7 @@ import { describe, expect, test } from "bun:test"
 import { existsSync, readdirSync, readFileSync } from "node:fs"
 import { sessionThreadName } from "@/session/worker/thread-name"
 import { createThreadNamer } from "@/session/worker/thread-naming"
+import { bootstrapSessionWorker } from "@/session/worker/session-worker"
 import { pollUntil } from "../../lib/poll"
 import { bootSessionWorker } from "../../lib/session-worker-harness"
 import { sessionWorkerInit } from "../../lib/session-worker-init"
@@ -61,12 +62,12 @@ describe("session.worker.thread-naming lifecycle", () => {
   test("bind -> idle, run -> running, every terminal -> idle", () => {
     const { names, namer } = recordingNamer()
 
-    namer.onBind(SESSION_ID)
-    namer.onRunStart(SESSION_ID)
+    namer.bind(SESSION_ID)
+    namer.bind(SESSION_ID, true)
     namer.onIdle() // settle
-    namer.onRunStart(SESSION_ID)
+    namer.bind(SESSION_ID, true)
     namer.onIdle() // cooperative cancel
-    namer.onRunStart(SESSION_ID)
+    namer.bind(SESSION_ID, true)
     namer.onIdle() // interrupt
 
     expect(names).toEqual([
@@ -83,7 +84,7 @@ describe("session.worker.thread-naming lifecycle", () => {
   test("a run start binds the run's session even without an explicit boot bind", () => {
     const { names, namer } = recordingNamer()
 
-    namer.onRunStart(SESSION_ID)
+    namer.bind(SESSION_ID, true)
     namer.onIdle()
 
     expect(names).toEqual(["ocs:a2c0de!", "ocs:a2c0de"])
@@ -93,11 +94,21 @@ describe("session.worker.thread-naming lifecycle", () => {
     const { names, namer } = recordingNamer()
     const next = "ses_second_worker_987654"
 
-    namer.onBind(SESSION_ID)
-    namer.onRunStart(next)
+    namer.bind(SESSION_ID)
+    namer.bind(next, true)
     namer.onIdle()
 
     expect(names).toEqual(["ocs:a2c0de", "ocs:987654!", "ocs:987654"])
+  })
+
+  test("bind(id, running) is the single lifecycle entry point", () => {
+    const { names, namer } = recordingNamer()
+
+    namer.bind(SESSION_ID)
+    namer.bind(SESSION_ID, true)
+    namer.onIdle()
+
+    expect(names).toEqual(["ocs:a2c0de", "ocs:a2c0de!", "ocs:a2c0de"])
   })
 
   test("idle before any bind is a no-op", () => {
@@ -110,8 +121,8 @@ describe("session.worker.thread-naming lifecycle", () => {
   test("dispose drops the binding without throwing or writing a stale name", () => {
     const { names, namer } = recordingNamer()
 
-    namer.onBind(SESSION_ID)
-    namer.onRunStart(SESSION_ID)
+    namer.bind(SESSION_ID)
+    namer.bind(SESSION_ID, true)
 
     expect(() => namer.onDispose()).not.toThrow()
     expect(() => namer.onDispose()).not.toThrow()
@@ -130,5 +141,19 @@ describe("session.worker.thread-naming lifecycle", () => {
     } finally {
       await handle.terminate()
     }
+  })
+
+  test("bootstrap writes the boot name exactly once through bind", () => {
+    const { names, namer } = recordingNamer()
+    const scope = { onmessage: null, postMessage: () => {} }
+
+    const handle = bootstrapSessionWorker(
+      { ...sessionWorkerInit(), sessionID: SESSION_ID },
+      scope,
+      { threadNamer: namer },
+    )
+    handle.dispose()
+
+    expect(names).toEqual(["ocs:a2c0de"])
   })
 })

@@ -13,16 +13,16 @@
 //   try {
 //     worker = new Worker(...)
 //     await workerReady
-//     permit.ready()
+//     permit.release("ready")
 //   } catch (error) {
-//     permit.fail(error)
+//     permit.release("failed", error)
 //   }
 //
 // `acquire` resolves before the worker is constructed, so the caller already
-// holds the acquisition when `fail` runs. `fail` therefore releases the permit
-// (and the spawn failure travels through the caller's `catch`); the gate never
-// rejects a granted acquisition. Releasing twice, or calling `ready` after
-// `fail`, is a no-op.
+// holds the acquisition when it releases. A failed spawn releases the permit
+// too (the failure travels through the caller's `catch`); the gate never
+// rejects a granted acquisition. `outcome`/`error` are diagnostic only — they
+// never change the release semantics — and releasing twice is a no-op.
 
 export interface SpawnGateOptions {
   /**
@@ -32,11 +32,17 @@ export interface SpawnGateOptions {
   readonly timeoutMs: number
 }
 
+/** Why a permit was released. Diagnostic only; both outcomes free the gate. */
+export type SpawnOutcome = "ready" | "failed"
+
 export interface SpawnPermit {
-  /** Release the permit after the worker's boot-ready handshake. Idempotent. */
-  ready(): void
-  /** Release the permit after a failed spawn. Idempotent. */
-  fail(error: unknown): void
+  /**
+   * Release the permit exactly once. Omit `outcome` (or pass `"ready"`) after a
+   * successful boot; pass `"failed"` (with the spawn `error`) after a failed
+   * spawn. Both paths free the next waiter; `error` is kept for diagnostics and
+   * is never re-thrown by the gate.
+   */
+  release(outcome?: SpawnOutcome, error?: unknown): void
 }
 
 export interface SpawnGateHandle {
@@ -77,10 +83,7 @@ export function createSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
       clearTimeout(waiter.timer)
       granted(waiter.resolve)
     }
-    return {
-      ready: release,
-      fail: release,
-    }
+    return { release }
   }
 
   // Admit one waiter as the new holder. The permit is created only after

@@ -22,7 +22,8 @@
 // worker. `sessionWorkerNodes` therefore also gates on the process role: only the
 // `hub` role contributes the node, so a worker-hosted graph (`session`) always
 // gets `[]`. The role is explicit per-isolate state (`@/effect/process-role`),
-// replacing the ambient `isMainThread` check.
+// replacing the ambient `isMainThread` check. The role is FAIL CLOSED: an isolate
+// that never declared one is not a hub, so the gate stays shut.
 //
 // Applied wiring (Wave 3):
 //
@@ -61,7 +62,8 @@ export interface SessionWorkerNodesOptions<N extends AnyNode = AnyNode> {
   /**
    * The process role to gate on. Defaults to {@link processRole}: only the
    * `hub` role contributes the hub node, so a worker-hosted graph (e.g. the app
-   * runtime pulled in by a session worker's module graph) always gets `[]`.
+   * runtime pulled in by a session worker's module graph) always gets `[]`, and
+   * an isolate that never declared a role stays closed too.
    */
   readonly role?: Role
 }

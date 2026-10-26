@@ -65,16 +65,10 @@ export interface SessionRunControl {
 
 /**
  * Production work kind. The worker registry (`session-worker.ts`
- * `productionWorkRegistry`) resolves `"session"` to the real reduced-layer
- * session work (and aliases this constant as a second key when it differs), so
- * the hub and worker agree.
- *
- * Typed as `string` (not the `"session"` literal) because the worker registry
- * builds its alias table with a computed key derived from this constant; a
- * literal type would make that key statically collide with the `session`
- * shorthand (TS1117).
+ * `productionWorkRegistry`) maps the literal `"session"` to the real
+ * reduced-layer session work, so the hub and worker agree.
  */
-export const DEFAULT_WORK_KIND: string = "session"
+export const DEFAULT_WORK_KIND = "session"
 
 /** Raised when a worker is asked for a work kind it has no factory for. */
 export class UnknownWorkKindError extends Schema.TaggedErrorClass<UnknownWorkKindError>()("UnknownWorkKindError", {
@@ -96,6 +90,27 @@ export class SessionWorkerReplyTimeoutError extends Error {
   constructor(readonly waitMs: number) {
     super(`timed out waiting for a session worker reply after ${waitMs}ms`)
     this.name = "SessionWorkerReplyTimeoutError"
+  }
+}
+
+/**
+ * A control request (`cancel` / `assertNotBusy` / `hasActiveWork`) that the
+ * worker answered with a structured `error` frame. The remote `tag` is preserved
+ * as both `tag` and `_tag`, so `errorTagOf` and callers that branch on Effect
+ * error tags see the worker's classification instead of a generic failure.
+ */
+export class SessionExecutorRequestError extends Error {
+  readonly tag: string | undefined
+  readonly _tag: string
+  constructor(
+    readonly requestID: number,
+    tag: string | undefined,
+    message: string,
+  ) {
+    super(message)
+    this.name = "SessionExecutorRequestError"
+    this.tag = tag
+    this._tag = tag ?? "SessionExecutorRequestError"
   }
 }
 
@@ -148,6 +163,8 @@ export type SessionExecutorInbound =
       readonly id: number
       readonly sessionID: SessionID
       readonly kind: string
+      /** Subagent depth carried from dispatch; observability only. */
+      readonly depth?: number
       /** The sub-agent prompt to persist before looping; absent for a plain run. */
       readonly prompt?: PromptInput
     }
@@ -156,6 +173,8 @@ export type SessionExecutorInbound =
       readonly id: number
       readonly sessionID: SessionID
       readonly kind: string
+      /** Subagent depth carried from dispatch; observability only. */
+      readonly depth?: number
       /** The shell command to run; carried so the worker resolves the real work. */
       readonly shell?: ShellInput
     }
@@ -222,6 +241,14 @@ const isAddressed = (message: SessionExecutorOutbound, id: number): boolean => "
 const requestIdOf = (message: unknown): number =>
   typeof (message as { readonly id?: unknown }).id === "number" ? (message as { readonly id: number }).id : 0
 
+/**
+ * The dispatch depth on a run frame. Only a finite non-negative integer is
+ * trusted; a malformed value falls back to 0 (a foreground root), matching
+ * dispatch's own default.
+ */
+const frameDepth = (message: { readonly depth?: number }): number =>
+  typeof message.depth === "number" && Number.isInteger(message.depth) && message.depth >= 0 ? message.depth : 0
+
 /** Shape any thrown/rejected value into a failed reply, preserving its `_tag`. */
 const failed = (id: number, error: unknown): SessionExecutorFailed => {
   const tag = errorTagOf(error)
@@ -246,11 +273,12 @@ export interface SessionExecutorOptions {
    */
   readonly activeWork?: (sessionID: SessionID) => Promise<boolean>
   /**
-   * Run-start seam: called once with the run's `sessionID` after the work is
-   * resolved and before it executes (e.g. to rename the worker's thread).
-   * Invoked fail-soft, so a throwing callback never unwinds or fails the run.
+   * Run-start seam: called once with the run's `sessionID` (and its dispatch
+   * depth, observability only) after the work is resolved and before it runs
+   * (e.g. to rename the worker's thread). Invoked fail-soft, so a throwing
+   * callback never unwinds or fails the run.
    */
-  readonly onRunStart?: (sessionID: SessionID) => void
+  readonly onRunStart?: (sessionID: SessionID, depth: number) => void
   /** Effect runner seam; defaults to `Effect.runPromise`. */
   readonly run?: SessionEffectRunner
 }
@@ -289,6 +317,7 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
     sessionID: SessionID,
     kind: string,
     mode: "run" | "startShell",
+    depth: number,
     prompt?: PromptInput,
     shell?: ShellInput,
   ): Promise<SessionExecutorOutbound> => {
@@ -300,7 +329,7 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
     }
     // Fail-soft: a throwing run-start callback must never unwind or fail the run.
     try {
-      options.onRunStart?.(sessionID)
+      options.onRunStart?.(sessionID, depth)
     } catch {
       // Intentionally swallowed — the seam is best-effort observability.
     }
@@ -327,9 +356,17 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
         await cancel(message.sessionID)
         return { type: "cancelled", id: message.id }
       case "run":
-        return runWork(message.id, message.sessionID, message.kind, "run", message.prompt)
+        return runWork(message.id, message.sessionID, message.kind, "run", frameDepth(message), message.prompt)
       case "startShell":
-        return runWork(message.id, message.sessionID, message.kind, "startShell", undefined, message.shell)
+        return runWork(
+          message.id,
+          message.sessionID,
+          message.kind,
+          "startShell",
+          frameDepth(message),
+          undefined,
+          message.shell,
+        )
       default:
         // An unrecognised frame still carries the caller's correlation id; echo
         // it so the sender can match the failure instead of waiting on id 0.
@@ -352,7 +389,7 @@ export interface SessionExecutorInstallOptions {
   /** Worker-local background-work probe; forwarded to the installed executor. */
   readonly activeWork?: (sessionID: SessionID) => Promise<boolean>
   /** Run-start seam; forwarded to the installed executor. */
-  readonly onRunStart?: (sessionID: SessionID) => void
+  readonly onRunStart?: (sessionID: SessionID, depth: number) => void
   readonly onIdle?: (sessionID: SessionID) => Effect.Effect<void>
   readonly onBusy?: (sessionID: SessionID) => Effect.Effect<void>
   readonly threadId?: number
@@ -497,13 +534,14 @@ export interface ExecutorCancelPortOptions {
 }
 
 /**
- * Terminal disposition of a worker cancel (observability D2). `"cooperative"`
- * means the worker accepted the cancel and will settle at a checkpoint;
- * `"terminate"` means it rejected it and the hub must terminate the isolate.
- * `"queued"` is the dispatch-level outcome for a session not yet on a worker, so
- * a worker's cancel port never emits it — it is part of the shared vocabulary.
+ * The cancel dispositions a worker's cancel port can report (observability D2):
+ * `"cooperative"` means the worker accepted the cancel and will settle at a
+ * checkpoint; `"terminate"` means it rejected it and the hub must terminate the
+ * isolate. A session not yet on a worker is a dispatch-level concern, so it can
+ * never reach this port (dispatch owns its own vocabulary).
  */
-export type ExecutorCancelMode = "cooperative" | "terminate" | "queued"
+export const EXECUTOR_CANCEL_MODES = ["cooperative", "terminate"] as const
+export type ExecutorCancelMode = (typeof EXECUTOR_CANCEL_MODES)[number]
 
 /**
  * Adapt an executor worker's request/reply `cancel` into the Phase-11
@@ -569,30 +607,11 @@ export interface ExecutorWorkerOptions {
   readonly log?: WorkerLogger
 }
 
-/** Cap on retained per-session run results; oldest distinct session evicted first. */
-export const RESULTS_CAP = 256
-
-/**
- * Record a run result under its session, keeping the map bounded to
- * {@link RESULTS_CAP}. Re-dispatching a session moves it to the end, so the
- * insertion order makes the oldest distinct session the eviction victim.
- */
-export function recordCappedResult(
-  results: Map<SessionID, SessionExecutionResult>,
-  sessionID: SessionID,
-  result: SessionExecutionResult,
-): void {
-  results.delete(sessionID)
-  results.set(sessionID, result)
-  if (results.size <= RESULTS_CAP) return
-  const oldest = results.keys().next().value
-  if (oldest !== undefined) results.delete(oldest)
-}
-
 /**
  * Post `build(id)` and await the first frame addressed to that id and accepted by
- * `accept`. The id comes from the caller's monotonic counter so every request is
- * correlated without a shared mutable field.
+ * `accept`, or a structured `error` frame for that id (which becomes a rejection
+ * carrying the remote tag). The id comes from the caller's monotonic counter so
+ * every request is correlated without a shared mutable field.
  */
 async function requestOn(
   transport: ExecutorTransport,
@@ -603,7 +622,12 @@ async function requestOn(
 ): Promise<SessionExecutorOutbound> {
   const id = nextId()
   transport.post(build(id))
-  return transport.waitFor((message) => isAddressed(message, id) && accept(message), wait)
+  const message = await transport.waitFor(
+    (candidate) => isAddressed(candidate, id) && (accept(candidate) || candidate.type === "error"),
+    wait,
+  )
+  if (message.type === "error") throw new SessionExecutorRequestError(message.id, message.tag, message.message)
+  return message
 }
 
 /**
@@ -673,13 +697,16 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
   const workKind = options.workKind ?? DEFAULT_WORK_KIND
   const waitOptions = options.timeoutMs === undefined ? undefined : { timeoutMs: options.timeoutMs }
   const runIdleTimeoutMs = options.runIdleTimeoutMs ?? 0
-  const results = new Map<SessionID, SessionExecutionResult>()
+  // One remembered result: a worker serves one session at a time, so the last
+  // settled run simply replaces the previous one (no map, no eviction policy).
+  let lastResult: SessionExecutionResult | undefined
   let nextRequestId = 1
   // One monotonic id source shared by every request and the liveness probe, so a
   // late reply can never be matched by a later request.
   const nextId = (): number => nextRequestId++
-  const recordResult = (sessionID: SessionID, result: SessionExecutionResult): void =>
-    recordCappedResult(results, sessionID, result)
+  const recordResult = (result: SessionExecutionResult): void => {
+    lastResult = result
+  }
 
   log(workerLogMessage("worker spawning"), {
     workerID: options.id,
@@ -709,6 +736,7 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
       id,
       sessionID: run.sessionID,
       kind: workKind,
+      depth: run.depth,
       ...(run.prompt === undefined || type !== "run" ? {} : { prompt: run.prompt }),
       ...(run.shell === undefined || type !== "startShell" ? {} : { shell: run.shell }),
     })
@@ -722,7 +750,7 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     // R4#16: do not resolve the run until its durable egress write is acked, so
     // the dispatcher cannot hand this worker the next run ahead of that write.
     await options.egressBarrier?.(run.sessionID)
-    recordResult(run.sessionID, message.result)
+    recordResult(message.result)
   }
 
   const cancel = async (sessionID: SessionID): Promise<void> => {
@@ -777,11 +805,10 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     ...(options.egressBarrier === undefined
       ? {}
       : { awaitEgress: (sessionID: SessionID) => Promise.resolve(options.egressBarrier?.(sessionID)) }),
-    resultFor: (sessionID) => results.get(sessionID),
+    resultFor: (sessionID) => (lastResult?.sessionID === sessionID ? lastResult : undefined),
     terminate: async () => {
-      // Evict recorded results with the isolate so the map cannot grow without
-      // bound across a long-lived pool.
-      results.clear()
+      // Drop the result with the isolate so a retired worker never leaks it.
+      lastResult = undefined
       await transport.terminate()
     },
   }

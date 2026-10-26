@@ -114,7 +114,6 @@ export const SESSION_ALLOWLIST: readonly NodeEntry[] = [
   ),
   entry("WriterClient", "@opencode/session-worker/WriterClient", ["session"], "worker-local"),
   entry("BrokerClient", "@opencode/session-worker/BrokerClient", ["session"], "broker-proxy"),
-  entry("BackgroundJobClient", "@opencode/session-worker/BackgroundJobClient", ["session"], "hub-proxy"),
   entry("SessionPipeline", "@opencode/session-worker/SessionPipeline", ["session"], "worker-local"),
   entry("ModelClient", "@opencode/session-worker/ModelClient", ["session"], "worker-local"),
   entry("WorkerSnapshot", "@opencode/session-worker/Snapshot", ["session"], "worker-local"),
@@ -157,7 +156,6 @@ export const SESSION_EXCLUDED: readonly NodeEntry[] = [
 export const WRITER_CLIENT_KEY = "@opencode/session-worker/WriterClient"
 export const EVENT_EGRESS_CLIENT_KEY = "@opencode/session-worker/EventEgressClient"
 export const BROKER_CLIENT_KEY = "@opencode/session-worker/BrokerClient"
-export const BACKGROUND_JOB_CLIENT_KEY = "@opencode/session-worker/BackgroundJobClient"
 
 /**
  * The worker's EventV2 → events-port bridge node. Worker-local (it subscribes to
@@ -171,7 +169,6 @@ export const SESSION_CLIENT_KEYS: readonly string[] = [
   WRITER_CLIENT_KEY,
   EVENT_EGRESS_CLIENT_KEY,
   BROKER_CLIENT_KEY,
-  BACKGROUND_JOB_CLIENT_KEY,
 ]
 
 /**

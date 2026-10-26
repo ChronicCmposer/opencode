@@ -1,4 +1,5 @@
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
+import { isMainThread } from "node:worker_threads"
 import { Plugin } from "../plugin"
 import { Format } from "../format"
 import { LSP } from "@/lsp/lsp"
@@ -9,10 +10,19 @@ import { InstanceState } from "@/effect/instance-state"
 import { Effect, Layer } from "effect"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { processRole, setProcessRole } from "@/effect/process-role"
+import { SessionWorkerNodes } from "@/session/worker/nodes"
 import { Service } from "./bootstrap-service"
 
 export { Service } from "./bootstrap-service"
 export type { Interface } from "./bootstrap-service"
+
+// The process main thread IS the hub: declare it explicitly, before any app
+// graph module evaluates its flag-gated membership. The role is fail-closed
+// (`effect/process-role.ts`), so without this declaration no isolate could ever
+// contribute the hub node. A worker isolate skips this branch; its entry adopts
+// the role from `workerData` instead.
+if (isMainThread && processRole() === undefined) setProcessRole("hub")
 
 const layer = Layer.effect(
   Service,
@@ -34,6 +44,21 @@ const layer = Layer.effect(
       yield* Effect.logInfo("session workers flag", {
         experimentalSessionWorkers: runtimeFlags.experimentalSessionWorkers,
       })
+      // The graph gate is frozen from `process.env`; the runtime flag follows the
+      // ConfigProvider. A disagreement means the hub graph and the runtime
+      // dispatch gate would take different paths, so diagnose it loudly instead
+      // of silently running sessions in-process (or leaving the hub unused).
+      const graphEnabled = SessionWorkerNodes.sessionWorkersEnabled()
+      const flagMismatch = RuntimeFlags.sessionWorkersFlagMismatch({
+        graphEnabled,
+        runtimeEnabled: runtimeFlags.experimentalSessionWorkers,
+      })
+      if (flagMismatch !== undefined) {
+        yield* Effect.logWarning(flagMismatch, {
+          graphEnabled,
+          runtimeEnabled: runtimeFlags.experimentalSessionWorkers,
+        })
+      }
       yield* Effect.logInfo("bootstrapping", { directory: ctx.directory })
       // everything depends on config so eager load it for nice traces
       yield* config.get()

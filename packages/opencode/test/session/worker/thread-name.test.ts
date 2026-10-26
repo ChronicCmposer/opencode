@@ -46,7 +46,24 @@ describe("session.worker.thread-name", () => {
     expect(Buffer.byteLength(name, "utf8")).toBeLessThanOrEqual(15)
   })
 
-  test("rejects an empty session id", () => {
-    expect(() => sessionThreadName("")).toThrow("session id")
+  test("an empty session id never throws (empty fingerprint)", () => {
+    expect(() => sessionThreadName("")).not.toThrow()
+    expect(sessionThreadName("")).toBe("ocs:")
+  })
+
+  test("clips on UTF-8 bytes without splitting a surrogate pair", () => {
+    const name = sessionThreadName("x".repeat(40) + "😀😀😀😀😀😀", { running: true })
+    // Prefix + fingerprint + bang cannot push past 15 bytes, and the clip must
+    // never leave a lone surrogate (which would be written as U+FFFD).
+    expect(Buffer.byteLength(name, "utf8")).toBeLessThanOrEqual(15)
+    expect(name).not.toContain("\uFFFD")
+    expect(name.isWellFormed()).toBe(true)
+  })
+
+  test("threadNameWithinLimit keeps whole code points under 15 bytes", () => {
+    const clipped = threadNameWithinLimit("ocs:" + "😀".repeat(10))
+    expect(clipped).toBe("ocs:😀😀")
+    expect(Buffer.byteLength(clipped, "utf8")).toBeLessThanOrEqual(15)
+    expect(clipped.isWellFormed()).toBe(true)
   })
 })

@@ -7,8 +7,8 @@
 //
 // This module builds that reduced layer from:
 //   * the allowlisted real nodes (default group `SESSION_NODES`);
-//   * four client nodes (`WriterClient` / `EventEgressClient` / `BrokerClient` /
-//     `BackgroundJobClient`) that proxy to the writer, egress and hub authorities;
+//   * three client nodes (`WriterClient` / `EventEgressClient` / `BrokerClient`)
+//     that proxy to the writer, egress and broker authorities;
 //   * an immutable per-worker `WorkerSnapshot` + `WorkerEnv` (plan decision 67/68);
 //   * boundary replacement layers for the excluded nodes (Database, MCP/LSP, Npm,
 //     ModelsDev, …), which production supplies from Phases 7/10. `SessionProjector`
@@ -91,7 +91,6 @@ import { BackgroundJob as CoreBackgroundJob } from "@opencode-ai/core/background
 import { buildLocationServiceMap } from "@opencode-ai/core/location-services"
 
 import {
-  BACKGROUND_JOB_CLIENT_KEY,
   BROKER_CLIENT_KEY,
   EVENT_BRIDGE_KEY,
   EVENT_EGRESS_CLIENT_KEY,
@@ -104,7 +103,13 @@ import type { WorkerDurableSubscription } from "./egress-client"
 import type { DurableCommit, MeshWorkerClient } from "@/session/egress/mesh"
 import type { EventV2Event } from "./frame"
 import { stringHeaders } from "./headers"
-import { HubProxyRemoteError, type HubProxyClient, type HubProxyMethod } from "./hub-proxy-wire"
+import {
+  HubProxyRemoteError,
+  type HubProxyClient,
+  type HubProxyHandlers,
+  type HubProxyMethod,
+  type HubProxyStreamHandler,
+} from "./hub-proxy-wire"
 import {
   remotePluginToolHooks,
   type PluginToolAbort,
@@ -216,17 +221,14 @@ function defineClientNode<Shape>(key: string) {
 const writerClient = defineClientNode<WriterClientHandle>(WRITER_CLIENT_KEY)
 const eventEgressClient = defineClientNode<EventEgressClientHandle>(EVENT_EGRESS_CLIENT_KEY)
 const brokerClient = defineClientNode<BrokerClientHandle>(BROKER_CLIENT_KEY)
-const backgroundJobClient = defineClientNode<BackgroundJobClientHandle>(BACKGROUND_JOB_CLIENT_KEY)
 
 export const WriterClientService = writerClient.Service
 export const EventEgressClientService = eventEgressClient.Service
 export const BrokerClientService = brokerClient.Service
-export const BackgroundJobClientService = backgroundJobClient.Service
 
 export const WriterClientNode = writerClient.node
 export const EventEgressClientNode = eventEgressClient.node
 export const BrokerClientNode = brokerClient.node
-export const BackgroundJobClientNode = backgroundJobClient.node
 
 // ---------------------------------------------------------------------------
 // Worker EventV2 bridge (spec Q6/Q13/Q15).
@@ -504,7 +506,12 @@ export function sessionSpawnClient(clients: HubProxyClients): HubProxyClient {
   return clients.subagent ?? clients.sessionStatus
 }
 
-/** Replacement layers for the three hub-resident authorities. */
+/**
+ * The hub-proxy authorities as REPLACEMENTS, never as appended root nodes: the
+ * authority services are already part of the declared graph, so replacing them by
+ * name keeps exactly one node per service key and makes the proxy implementation
+ * (not a duplicate root) the one that is built.
+ */
 export function hubProxyReplacements(clients: HubProxyClients): LayerNode.Replacements {
   return [
     [SessionStatusProxyNode, sessionStatusProxyLayer(clients.sessionStatus)],
@@ -513,8 +520,14 @@ export function hubProxyReplacements(clients: HubProxyClients): LayerNode.Replac
   ]
 }
 
-/** The three hub-proxy nodes as a spreadable group. */
-export const HUB_PROXY_NODES = LayerNode.group([SessionStatusProxyNode, PermissionProxyNode, QuestionProxyNode])
+/**
+ * The hub proxies not already composed by {@link sharedBoundaryReplacements}.
+ * `Permission` belongs to the shared snapshot/permission fragment both graphs
+ * install, so only the status/question authorities remain here.
+ */
+function hubAuthorityReplacements(clients: HubProxyClients): LayerNode.Replacements {
+  return hubProxyReplacements(clients).filter(([node]) => node.name !== Permission.node.name)
+}
 
 // ---------------------------------------------------------------------------
 // Immutable per-worker snapshot + environment overlay (plan decisions 67/68).
@@ -551,7 +564,6 @@ export interface WorkerSnapshot {
   readonly auth: Readonly<Record<string, unknown>>
   readonly modelsDev: Readonly<Record<string, ModelsDev.Provider>>
   readonly flags: RuntimeFlags.Info
-  readonly workerCount: number
 }
 
 /** An immutable environment overlay delivered to a worker (never `process.env`). */
@@ -940,6 +952,46 @@ export function localBackgroundJobLayer(): Layer.Layer<BackgroundJob.Service> {
 }
 
 /**
+ * The snapshot-backed and hub-authority fragments BOTH the full worker graph and
+ * the reduced in-worker `LLM` sub-graph compose. Single-sourcing them means a
+ * change to `Auth`/`Config`/`RuntimeFlags`/`Plugin`/`Permission` wiring can never
+ * land in one view only.
+ *
+ * `Permission` is a hub-resident authority: route it over the hub-proxy control
+ * port when the worker has one, otherwise fail loud (never a silent mock, which
+ * would let a denied tool run in a degraded isolate).
+ */
+export interface SharedBoundaryOptions {
+  readonly hubProxies?: HubProxyClients
+  readonly plugins?: WorkerPluginHost
+  readonly pluginTools?: RemotePluginTools
+}
+
+export function sharedBoundaryReplacements(
+  snapshot: WorkerSnapshot,
+  options: SharedBoundaryOptions = {},
+): LayerNode.Replacements {
+  return [
+    [Auth.node, snapshotAuthLayer(snapshot)],
+    [Config.node, snapshotConfigLayer(snapshot)],
+    // The hub resolved every runtime flag (including any per-layer override) and
+    // froze it into the snapshot; the worker serves that value rather than
+    // re-deriving from its own `process.env`.
+    [RuntimeFlags.node, snapshotRuntimeFlagsLayer(snapshot)],
+    // The worker owns `Plugin`: the hub loads plugins (decision 70), but the
+    // model-facing hooks run here. Replacing the real node for the whole graph
+    // means the global `Plugin` layer is never built in the isolate.
+    workerPluginReplacement(options.plugins, options.pluginTools),
+    [
+      Permission.node,
+      options.hubProxies === undefined
+        ? permissionBoundaryLayer()
+        : permissionProxyLayer(options.hubProxies.permission),
+    ],
+  ]
+}
+
+/**
  * Boundary replacements every session layer needs. `Database` is replaced so the
  * worker never opens SQLite (a real writer-proxy when a `writer` client is
  * supplied — plan decision 24); MCP/LSP are reached through the broker client
@@ -958,17 +1010,11 @@ export function boundaryReplacements(
   snapshot: WorkerSnapshot,
   writer?: WriterClientHandle,
   backgroundJob?: Layer.Layer<BackgroundJob.Service>,
+  boundaries: SharedBoundaryOptions = {},
 ): LayerNode.Replacements {
   return [
-    [Config.node, snapshotConfigLayer(snapshot)],
-    [Auth.node, snapshotAuthLayer(snapshot)],
+    ...sharedBoundaryReplacements(snapshot, boundaries),
     [ModelsDev.node, snapshotModelsDevLayer(snapshot)],
-    // The hub resolved every runtime flag (including any per-layer override) and
-    // froze it into the snapshot; the worker serves that value rather than
-    // re-deriving from its own `process.env`. Without this replacement the full
-    // session graph built the real RuntimeFlags node and re-read the environment,
-    // so a hub-only flag override never crossed the isolate boundary.
-    [RuntimeFlags.node, snapshotRuntimeFlagsLayer(snapshot)],
     [Database.node, writer === undefined ? databaseBoundaryLayer() : writerDatabaseLayer(writer)],
     // `SessionProjector` deliberately has NO boundary replacement: it runs IN the
     // worker. `Session.updateMessage`/`updatePart` publish durable events, and the
@@ -1611,20 +1657,10 @@ export function llmBoundaryReplacements(
   pluginTools?: RemotePluginTools,
 ): LayerNode.Replacements {
   return [
-    [Auth.node, snapshotAuthLayer(snapshot)],
-    [Config.node, snapshotConfigLayer(snapshot)],
+    ...sharedBoundaryReplacements(snapshot, { hubProxies, plugins, pluginTools }),
     [Provider.node, reducedModelProviderLayer(config)],
-    workerPluginReplacement(plugins, pluginTools),
-    // `Permission` is a hub-resident authority: route it over the hub-proxy
-    // control port when the worker has one, otherwise fail loud. Never a silent
-    // mock, which would let a denied tool run in a degraded isolate.
-    [
-      Permission.node,
-      hubProxies === undefined ? permissionBoundaryLayer() : permissionProxyLayer(hubProxies.permission),
-    ],
     [EventV2Bridge.node, eventV2BridgeBoundaryLayer()],
     [llmClient, llmClientBoundaryLayer()],
-    [RuntimeFlags.node, snapshotRuntimeFlagsLayer(snapshot)],
   ]
 }
 
@@ -1648,60 +1684,96 @@ export function reducedLlmLayer(
 // ---------------------------------------------------------------------------
 
 /**
- * The real session nodes a worker must contain, keyed by service key. The
- * groups below are derived from `REQUIRED_SESSION_NODE_KEYS` (node-table.ts)
- * through this map, so the layer and the node table cannot drift apart.
+ * The ONE ordered registration list for the real session nodes. The groups and
+ * the key→node registry are derived from it, so there is a single place to add
+ * a node; `REQUIRED_SESSION_NODE_KEYS` (node-table.ts) is the independent
+ * declaration of what must be present, checked at module init below.
  */
-const SESSION_NODE_BY_KEY: ReadonlyMap<string, LayerNode.AnyNode> = new Map<string, LayerNode.AnyNode>([
-  [Session.node.name, Session.node],
-  [SessionPrompt.node.name, SessionPrompt.node],
-  [SessionProcessor.node.name, SessionProcessor.node],
-  [SessionRunState.node.name, SessionRunState.node],
-  [SessionProjector.node.name, SessionProjector.node],
-  [SessionStatus.node.name, SessionStatus.node],
-  [SessionCompaction.node.name, SessionCompaction.node],
-  [SessionRevert.node.name, SessionRevert.node],
-  [SessionSummary.node.name, SessionSummary.node],
-  [Todo.node.name, Todo.node],
-  [LLM.node.name, LLM.node],
-  [Provider.node.name, Provider.node],
-  [Agent.node.name, Agent.node],
-  [Skill.node.name, Skill.node],
-  [Discovery.node.name, Discovery.node],
-  [ToolRegistry.node.name, ToolRegistry.node],
-  [Plugin.node.name, Plugin.node],
-  [Config.node.name, Config.node],
-  [Auth.node.name, Auth.node],
-  [RuntimeFlags.node.name, RuntimeFlags.node],
-  [Question.node.name, Question.node],
-  [Permission.node.name, Permission.node],
-  [Truncate.node.name, Truncate.node],
-  [Format.node.name, Format.node],
-  [Instruction.node.name, Instruction.node],
-  [SystemPrompt.node.name, SystemPrompt.node],
-  [Command.node.name, Command.node],
-  [Image.node.name, Image.node],
-  [EventV2Bridge.node.name, EventV2Bridge.node],
-  [EventV2.node.name, EventV2.node],
-  [Snapshot.node.name, Snapshot.node],
-  [llmClient.name, llmClient],
-])
+const SESSION_NODE_LIST = [
+  Session.node,
+  SessionPrompt.node,
+  SessionProcessor.node,
+  SessionRunState.node,
+  SessionProjector.node,
+  SessionStatus.node,
+  SessionCompaction.node,
+  SessionRevert.node,
+  SessionSummary.node,
+  Todo.node,
+  LLM.node,
+  Provider.node,
+  Agent.node,
+  Skill.node,
+  Discovery.node,
+  ToolRegistry.node,
+  Plugin.node,
+  Config.node,
+  Auth.node,
+  RuntimeFlags.node,
+  Question.node,
+  Permission.node,
+  Truncate.node,
+  Format.node,
+  Instruction.node,
+  SystemPrompt.node,
+  Command.node,
+  Image.node,
+  EventV2Bridge.node,
+  EventV2.node,
+  Snapshot.node,
+  llmClient,
+] as const
+
+/** The key→node registry, derived from the single registration list above. */
+export const SESSION_NODE_REGISTRY: ReadonlyMap<string, LayerNode.AnyNode> = new Map(
+  SESSION_NODE_LIST.map((node) => [node.name, node]),
+)
+
+/**
+ * Required-key parity, checked when this module initialises. A node added to the
+ * list but not to `REQUIRED_SESSION_NODE_KEYS` (or vice versa) is a table/layer
+ * drift that would otherwise surface only when a worker graph fails to build.
+ */
+function assertRequiredSessionNodeParity(): void {
+  const registered = [...SESSION_NODE_REGISTRY.keys()]
+  const missing = REQUIRED_SESSION_NODE_KEYS.filter((key) => !SESSION_NODE_REGISTRY.has(key))
+  const extra = registered.filter((key) => !REQUIRED_SESSION_NODE_KEYS.includes(key))
+  const duplicate =
+    registered.length === SESSION_NODE_LIST.length
+      ? []
+      : SESSION_NODE_LIST.map((node) => node.name).filter((name, index, all) => all.indexOf(name) !== index)
+  if (missing.length === 0 && extra.length === 0 && duplicate.length === 0) return
+  throw new Error(
+    "session-node registration drifted from REQUIRED_SESSION_NODE_KEYS" +
+      (missing.length === 0 ? "" : `: missing [${missing.join(", ")}]`) +
+      (extra.length === 0 ? "" : `: unrequired [${extra.join(", ")}]`) +
+      (duplicate.length === 0 ? "" : `: duplicate [${[...new Set(duplicate)].join(", ")}]`),
+  )
+}
+
+assertRequiredSessionNodeParity()
 
 /** Resolve a required session-node key; a missing registration fails loud. */
 function requiredSessionNode(key: string): LayerNode.AnyNode {
-  const node = SESSION_NODE_BY_KEY.get(key)
+  const node = SESSION_NODE_REGISTRY.get(key)
   if (node === undefined) throw new Error(`no session node is registered for required key "${key}"`)
   return node
 }
 
-/** The declared session-role allowlist group (real nodes). */
+/** The port-backed client nodes every session graph contains. */
+const SESSION_CLIENT_NODES = [WriterClientNode, EventEgressClientNode, BrokerClientNode] as const
+
+/** Worker-local infrastructure shared by the runnable and pipeline graphs. */
+const WORKER_INFRA_NODES = [WorkerEventBridgeNode, WorkerSnapshotNode, WorkerEnvNode] as const
+
+/** The real nodes every session graph must provide, in declaration order. */
+const REQUIRED_SESSION_NODES = REQUIRED_SESSION_NODE_KEYS.map(requiredSessionNode)
+
+/** The declared session-role allowlist group (real nodes + client/egress infra). */
 export const SESSION_NODES = LayerNode.group([
-  ...REQUIRED_SESSION_NODE_KEYS.map(requiredSessionNode),
+  ...REQUIRED_SESSION_NODES,
   WorkerEventBridgeNode,
-  WriterClientNode,
-  EventEgressClientNode,
-  BrokerClientNode,
-  BackgroundJobClientNode,
+  ...SESSION_CLIENT_NODES,
 ])
 
 /**
@@ -1712,21 +1784,16 @@ export const SESSION_NODES = LayerNode.group([
  * clean and fails closed on any unclassified reachable node.
  */
 export const RUNNABLE_SESSION_NODES = LayerNode.group([
-  ...REQUIRED_SESSION_NODE_KEYS.map(requiredSessionNode),
+  ...REQUIRED_SESSION_NODES,
   SessionPipelineNode,
-  WorkerEventBridgeNode,
-  WriterClientNode,
-  EventEgressClientNode,
-  BrokerClientNode,
-  BackgroundJobClientNode,
-  WorkerSnapshotNode,
-  WorkerEnvNode,
+  ...WORKER_INFRA_NODES,
+  ...SESSION_CLIENT_NODES,
 ])
 
 /**
  * The reduced pipeline subset: the one-shot `SessionPipeline` seam, runtime
- * flags and the four client nodes. `ModelClient` is the injectable model seam,
- * so a test can point it at the mock provider. Retained as an explicit,
+ * flags and the worker infrastructure. `ModelClient` is the injectable model
+ * seam, so a test can point it at the mock provider. Retained as an explicit,
  * lightweight graph for pipeline-only tests; the production default is the full
  * runnable session graph (`RUNNABLE_SESSION_NODES`), which now boots against the
  * functional boundary layers.
@@ -1734,10 +1801,7 @@ export const RUNNABLE_SESSION_NODES = LayerNode.group([
 export const PIPELINE_SESSION_NODES = LayerNode.group([
   SessionPipelineNode,
   RuntimeFlags.node,
-  WriterClientNode,
-  EventEgressClientNode,
-  BrokerClientNode,
-  BackgroundJobClientNode,
+  ...SESSION_CLIENT_NODES,
   WorkerSnapshotNode,
   WorkerEnvNode,
 ])
@@ -1811,26 +1875,29 @@ export interface SessionWorkerLayer {
  */
 export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWorkerLayer {
   const base = options.nodes ?? RUNNABLE_SESSION_NODES
-  const root = options.hubProxies === undefined ? base : LayerNode.group([base, HUB_PROXY_NODES])
+  // Hub-proxy authorities are REPLACEMENTS over nodes the base graph already
+  // contains (SessionStatus/Permission/Question); appending a second proxy group
+  // would duplicate those service keys in the root.
   const replacements: LayerNode.Replacements = [
     [WriterClientNode, writerClient.layer(options.clients.writer)],
     [EventEgressClientNode, eventEgressClient.layer(options.clients.egress)],
     [BrokerClientNode, brokerClient.layer(options.clients.broker)],
-    [BackgroundJobClientNode, backgroundJobClient.layer(options.clients.backgroundJob)],
     [WorkerSnapshotNode, Layer.succeed(WorkerSnapshotService, options.snapshot)],
     [WorkerEnvNode, Layer.succeed(WorkerEnvService, options.env)],
     [ModelClientNode, options.modelClient],
-    // The worker graph owns `Plugin`: the hub loads plugins (decision 70), but
-    // the model-facing hooks run here. Replace the real node for the whole graph
-    // so it is never built in the isolate.
-    workerPluginReplacement(options.plugins, options.pluginTools),
-    ...boundaryReplacements(options.snapshot, options.clients.writer, options.backgroundJob),
-    ...(options.hubProxies === undefined ? [] : hubProxyReplacements(options.hubProxies)),
+    // The shared fragment owns `Plugin` and `Permission`; the full graph adds
+    // the remaining hub authorities (SessionStatus/Question) as replacements.
+    ...boundaryReplacements(options.snapshot, options.clients.writer, options.backgroundJob, {
+      ...(options.hubProxies === undefined ? {} : { hubProxies: options.hubProxies }),
+      ...(options.plugins === undefined ? {} : { plugins: options.plugins }),
+      ...(options.pluginTools === undefined ? {} : { pluginTools: options.pluginTools }),
+    }),
+    ...(options.hubProxies === undefined ? [] : hubAuthorityReplacements(options.hubProxies)),
     ...(options.replacements ?? []),
   ]
 
-  assertSessionLayer(root, replacements)
-  const built = AppNodeBuilderV1.build(root, replacements)
+  assertSessionLayer(base, replacements)
+  const built = AppNodeBuilderV1.build(base, replacements)
   // `PidReporter` is not a graph node: the shell tool reads it optionally at
   // execution time, so merging it keeps degraded graphs (no reporter) building
   // unchanged while the production graph sees the control-port reporter.
@@ -1847,7 +1914,7 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
   // (the file sink + minimum level), so merging it leaves the graph and its
   // node-table assertion untouched. Absent keeps the layer unchanged.
   const withLogging = options.logging === undefined ? layer : Layer.merge(layer, options.logging)
-  return { root, replacements, layer: withLogging }
+  return { root: base, replacements, layer: withLogging }
 }
 
 export * as SessionWorkerLayer from "./layer"

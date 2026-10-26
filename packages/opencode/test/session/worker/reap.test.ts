@@ -3,23 +3,19 @@
 // prompt. A new dispatch lazily spawns a fresh worker.
 
 import { describe, expect, test } from "bun:test"
-import {
-  createDispatcher,
-  DEFAULT_SESSION_WORKER_REAP_MS,
-  resolveSessionWorkerReapMs,
-  SESSION_WORKER_REAP_ENV,
-} from "@/session/worker/dispatch"
+import { createDispatcher } from "@/session/worker/dispatch"
+import { DEFAULT_REAP_MS, REAP_MS_ENV, resolveReapMs } from "@/session/worker/pool"
 import { createFakeWorkerPool } from "../../lib/fake-worker-pool"
 import { createRecordingScheduler } from "../../lib/scheduler"
 import { flush, sid } from "../../lib/async"
 
 describe("session worker reap", () => {
   test("resolves the reap env inline with a 5 minute default", () => {
-    expect(DEFAULT_SESSION_WORKER_REAP_MS).toBe(300_000)
-    expect(resolveSessionWorkerReapMs({ env: {} })).toBe(300_000)
-    expect(resolveSessionWorkerReapMs({ env: { [SESSION_WORKER_REAP_ENV]: "1000" } })).toBe(1000)
-    expect(resolveSessionWorkerReapMs({ env: { [SESSION_WORKER_REAP_ENV]: "0" } })).toBe(300_000)
-    expect(resolveSessionWorkerReapMs({ env: { [SESSION_WORKER_REAP_ENV]: "nope" } })).toBe(300_000)
+    expect(DEFAULT_REAP_MS).toBe(300_000)
+    expect(resolveReapMs({})).toBe(300_000)
+    expect(resolveReapMs({ [REAP_MS_ENV]: "1000" })).toBe(1000)
+    expect(resolveReapMs({ [REAP_MS_ENV]: "0" })).toBe(300_000)
+    expect(resolveReapMs({ [REAP_MS_ENV]: "nope" })).toBe(300_000)
   })
 
   test("an idle worker is terminated and removed after the window; re-dispatch spawns fresh", async () => {

@@ -17,15 +17,24 @@ import { writeFileSync } from "node:fs"
 const THREAD_COMM_PATH = "/proc/thread-self/comm"
 
 /** The kernel's `comm` field holds at most 15 bytes. */
-const THREAD_COMM_MAX = 15
+const THREAD_COMM_MAX_BYTES = 15
 
 /**
- * Clip `name` to the kernel's 15-byte `comm` limit. Pure and total, so callers
- * can compose names freely (see `sessionThreadName`) without re-checking the
- * limit at every call site.
+ * Clip `name` to the kernel's 15-byte `comm` limit, counting UTF-8 bytes and
+ * keeping whole code points. Clipping stops before the first code point that
+ * would exceed the budget, so a surrogate pair is never split (a lone surrogate
+ * would be written as U+FFFD) and the kernel never rejects the name for length.
+ * Pure and total, so callers can compose names freely (see `sessionThreadName`).
  */
 export function threadNameWithinLimit(name: string): string {
-  return name.slice(0, THREAD_COMM_MAX)
+  // `toWellFormed` removes lone surrogates from the input itself, so the result
+  // is always a well-formed UTF-16 string safe for `writeFileSync`.
+  let clipped = ""
+  for (const char of name.toWellFormed()) {
+    if (Buffer.byteLength(clipped + char, "utf8") > THREAD_COMM_MAX_BYTES) break
+    clipped += char
+  }
+  return clipped
 }
 
 /**

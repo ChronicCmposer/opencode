@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { createListenerPair, type ListenerPort } from "./port-pair"
+import { createCancelPair, createListenerPair, type ListenerPort } from "./port-pair"
+import type { CancelFrame } from "@/session/worker/cancel"
 
 interface Frame {
   readonly type: string
@@ -92,5 +93,18 @@ describe("createListenerPair", () => {
     pair.worker.post({ type: "from-worker" })
 
     expect(seen).toEqual([pair.worker])
+  })
+})
+
+describe("createCancelPair", () => {
+  test("hub.notify delivers a typed cancel frame to the worker side", () => {
+    const pair = createCancelPair()
+    const seen: CancelFrame[] = []
+    pair.worker.onMessage((frame) => seen.push(frame))
+
+    pair.hub.notify({ type: "cancel", sessionID: "ses_1", reason: "user" })
+
+    expect(seen).toEqual([{ type: "cancel", sessionID: "ses_1", reason: "user" }])
+    pair.close()
   })
 })

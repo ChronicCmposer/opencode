@@ -6,6 +6,8 @@
 // and the key→worker reservation lifecycle.
 
 import { describe, expect, test } from "bun:test"
+import { existsSync, readdirSync, readFileSync } from "node:fs"
+import path from "node:path"
 import { Effect } from "effect"
 import type { SessionID } from "@/session/schema"
 import type { ShellInput } from "@/session/prompt"
@@ -13,6 +15,7 @@ import {
   createDispatcher,
   SessionCancelledError,
   WorkerCrashedError,
+  CANCELLED_MODES,
   type Dispatcher,
   type DispatchRequest,
   type WorkerPool,
@@ -241,6 +244,52 @@ describe("key→worker map lifecycle", () => {
     expect(await running).toMatchObject({ ok: false, error: expect.any(SessionCancelledError) })
     expect(dispatcher.registry.has(sid("ses_1"))).toBe(false)
     expect(pool.spawned[0].alive).toBe(false)
+    await dispatcher.terminateAll()
+  })
+
+  test("a deferred rejection from a cancelled run cannot settle the successor", async () => {
+    const rejections: Array<(error: unknown) => void> = []
+    const terminated: number[] = []
+    let nextID = 1
+    const pool: WorkerPool = {
+      spawn: () => {
+        const id = nextID++
+        return {
+          id,
+          alive: true,
+          execute: () => new Promise<void>((_resolve, reject) => void rejections.push(reject)),
+          terminate: async () => {
+            terminated.push(id)
+          },
+        }
+      },
+      terminateAll: async () => {},
+    }
+    const dispatcher = createDispatcher({ pool })
+
+    const first = capture(dispatcher.dispatch({ sessionID: sid("ses_1") }))
+    await flush()
+    await dispatcher.cancel(sid("ses_1"))
+    expect((await first).ok).toBe(false)
+
+    // The successor takes the session and spawns a fresh worker.
+    const second = capture(dispatcher.dispatch({ sessionID: sid("ses_1") }))
+    await flush()
+    expect(dispatcher.workerForSession(sid("ses_1"))).toBe(2)
+    expect(dispatcher.registry.has(sid("ses_1"))).toBe(true)
+
+    // The cancelled run's rejection is delivered late, after the successor owns it.
+    rejections[0](new Error("late failure from the cancelled run"))
+    await flush()
+
+    expect(dispatcher.workerForSession(sid("ses_1"))).toBe(2)
+    expect(dispatcher.registry.has(sid("ses_1"))).toBe(true)
+    expect(dispatcher.busySlotCount).toBe(1)
+    expect(terminated).toEqual([1])
+
+    rejections[1](new SessionCancelledError({ message: "cleanup", sessionID: sid("ses_1") }))
+    await flush()
+    expect((await second).ok).toBe(false)
     await dispatcher.terminateAll()
   })
 
@@ -812,6 +861,129 @@ describe("cancel claims the gate and drains waiters", () => {
   })
 })
 
+describe("single cancellation settlement", () => {
+  test("cancel settles the admitted run once: reap, event, waiter, and registry", async () => {
+    const pool = createFakeWorkerPool(1)
+    const reaped: number[] = []
+    const events: string[] = []
+    let waiterRejections = 0
+    const dispatcher = createDispatcher({
+      pool,
+      cancellation: {
+        reap: (worker) => reaped.push(worker.id),
+        onCancelled: (event) => events.push(`${event.sessionID}:${event.mode}`),
+      },
+    })
+
+    const run = capture(dispatcher.dispatch({ sessionID: sid("ses_matrix") }))
+    const waiter = dispatcher.dispatch({ sessionID: sid("ses_matrix"), depth: 1 })
+    waiter.catch(() => {
+      waiterRejections += 1
+    })
+    await flush()
+
+    await dispatcher.cancel(sid("ses_matrix"))
+    expect(await run).toMatchObject({ ok: false, error: expect.any(SessionCancelledError) })
+    await expect(waiter).rejects.toBeInstanceOf(SessionCancelledError)
+    await flush()
+
+    expect(waiterRejections).toBe(1)
+    expect(reaped).toEqual([pool.spawned[0].id])
+    expect(events).toEqual(["ses_matrix:terminated"])
+    expect(dispatcher.registry.size).toBe(0)
+    expect(dispatcher.queuedCount).toBe(0)
+    await dispatcher.terminateAll()
+  })
+
+  test("cancelWithGrace cooperative settles once without reaping", async () => {
+    const pool = createFakeWorkerPool(1, { onCancel: "resolve" })
+    const reaped: number[] = []
+    const events: string[] = []
+    let waiterRejections = 0
+    const dispatcher = createDispatcher({
+      pool,
+      cancellation: {
+        portFor: (worker) => (worker as FakeSessionWorker).cancelPort,
+        graceMs: 500,
+        schedule: createTestScheduler().schedule,
+        reap: (worker) => reaped.push(worker.id),
+        onCancelled: (event) => events.push(`${event.sessionID}:${event.mode}`),
+      },
+    })
+
+    const run = capture(dispatcher.dispatch({ sessionID: sid("ses_matrix") }))
+    const waiter = dispatcher.dispatch({ sessionID: sid("ses_matrix"), depth: 1 })
+    waiter.catch(() => {
+      waiterRejections += 1
+    })
+    await flush()
+
+    expect(await dispatcher.cancelWithGrace(sid("ses_matrix"))).toMatchObject({ mode: "cooperative" })
+    expect(await run).toMatchObject({ ok: false, error: expect.any(SessionCancelledError) })
+    await expect(waiter).rejects.toBeInstanceOf(SessionCancelledError)
+    await flush()
+
+    expect(waiterRejections).toBe(1)
+    expect(reaped).toEqual([])
+    expect(events).toEqual(["ses_matrix:cooperative"])
+    expect(dispatcher.registry.has(sid("ses_matrix"))).toBe(false)
+    expect(dispatcher.queuedCount).toBe(0)
+    await dispatcher.terminateAll()
+  })
+
+  test("cancelWithGrace forced settles once and reaps once", async () => {
+    const pool = createFakeWorkerPool(1, { onCancel: "ignore" })
+    const scheduler = createTestScheduler()
+    const reaped: number[] = []
+    const events: string[] = []
+    const dispatcher = createDispatcher({
+      pool,
+      cancellation: {
+        portFor: (worker) => (worker as FakeSessionWorker).cancelPort,
+        graceMs: 500,
+        schedule: scheduler.schedule,
+        reap: (worker) => reaped.push(worker.id),
+        onCancelled: (event) => events.push(`${event.sessionID}:${event.mode}`),
+      },
+    })
+
+    const run = capture(dispatcher.dispatch({ sessionID: sid("ses_matrix") }))
+    await flush()
+    const pending = dispatcher.cancelWithGrace(sid("ses_matrix"))
+    await flush()
+    scheduler
+      .pending()
+      .find((timer) => timer.delayMs === 500)
+      ?.run()
+
+    expect(await pending).toMatchObject({ mode: "terminated" })
+    expect(await run).toMatchObject({ ok: false, error: expect.any(SessionCancelledError) })
+    expect(reaped).toEqual([pool.spawned[0].id])
+    expect(events).toEqual(["ses_matrix:terminated"])
+    await dispatcher.terminateAll()
+  })
+
+  test("cancelling an idle session settles nothing and emits no event", async () => {
+    const pool = createFakeWorkerPool(1)
+    const reaped: number[] = []
+    const events: string[] = []
+    const dispatcher = createDispatcher({
+      pool,
+      cancellation: {
+        reap: (worker) => reaped.push(worker.id),
+        onCancelled: (event) => events.push(`${event.sessionID}:${event.mode}`),
+      },
+    })
+
+    await dispatcher.cancel(sid("ses_idle"))
+    expect(await dispatcher.cancelWithGrace(sid("ses_idle"))).toBeUndefined()
+    expect(events).toEqual([])
+    expect(reaped).toEqual([])
+    expect(dispatcher.registry.size).toBe(0)
+    await dispatcher.terminateAll()
+  })
+})
+
 describe("dedup key includes depth and prompt identity", () => {
   test("a same-session dispatch at a different depth parks instead of joining", async () => {
     const pool = createFakeWorkerPool(1)
@@ -878,6 +1050,114 @@ describe("per-session write barrier", () => {
 
     pool.spawned[1].finish(sid("ses_2"))
     await second
+    await dispatcher.terminateAll()
+  })
+})
+
+describe("dead admission queue", () => {
+  test("no source module imports the deleted worker queue", () => {
+    const dir = path.resolve(import.meta.dir, "../../../src/session/worker")
+    const offenders = readdirSync(dir)
+      .filter((file) => file.endsWith(".ts"))
+      .filter((file) =>
+        /from\s+["'](?:@\/session\/worker\/|\.\/)queue["']/.test(readFileSync(path.join(dir, file), "utf8")),
+      )
+
+    expect(offenders).toEqual([])
+    expect(existsSync(path.join(dir, "queue.ts"))).toBe(false)
+  })
+
+  test("the cancel vocabulary only lists reachable modes (no queued)", () => {
+    expect(CANCELLED_MODES).toEqual(["cooperative", "terminated", "completed"])
+  })
+})
+
+describe("cascade report", () => {
+  test("a cyclic tree visits each descendant exactly once and reports children first", async () => {
+    const pool = createFakeWorkerPool(3)
+    const parent = sid("ses_parent")
+    const child = sid("ses_child")
+    const grandchild = sid("ses_grandchild")
+    const events: string[] = []
+    const childrenOf = (sessionID: SessionID): ReadonlyArray<SessionID> =>
+      sessionID === parent
+        ? [child]
+        : sessionID === child
+          ? [grandchild]
+          : sessionID === grandchild
+            ? [parent]
+            : []
+    const dispatcher = createDispatcher({
+      pool,
+      cancellation: {
+        childrenOf,
+        onCancelled: (event) => events.push(event.sessionID),
+      },
+    })
+
+    const parentRun = capture(dispatcher.dispatch({ sessionID: parent }))
+    const childRun = capture(dispatcher.dispatch({ sessionID: child }))
+    const grandchildRun = capture(dispatcher.dispatch({ sessionID: grandchild }))
+    await flush()
+
+    const report = await dispatcher.cancelWithGrace(parent)
+
+    expect(report?.sessionID).toBe(parent)
+    expect(report?.mode).toBe("terminated")
+    expect(report?.outcome.sessionID).toBe(parent)
+    expect(report?.outcome.mode).toBe("terminated")
+    expect(report?.descendants.map((entry) => entry.sessionID)).toEqual([grandchild, child])
+    expect(report?.descendants.map((entry) => entry.mode)).toEqual(["terminated", "terminated"])
+    expect(events).toEqual([grandchild, child, parent])
+    for (const run of [parentRun, childRun, grandchildRun]) {
+      expect(await run).toMatchObject({ ok: false, error: expect.any(SessionCancelledError) })
+    }
+    await dispatcher.terminateAll()
+  })
+
+  test("a diamond edge and an idle descendant are reported once with their modes", async () => {
+    const pool = createFakeWorkerPool(2)
+    const parent = sid("ses_parent")
+    const childA = sid("ses_child_a")
+    // childB is linked but never admitted: it still appears in the report with
+    // no mode, and a cycle back to the parent must not revisit it.
+    const childB = sid("ses_child_b")
+    const childrenOf = (sessionID: SessionID): ReadonlyArray<SessionID> =>
+      sessionID === parent
+        ? [childA, childB]
+        : sessionID === childA
+          ? [childB, parent]
+          : []
+    const dispatcher = createDispatcher({ pool, cancellation: { childrenOf } })
+
+    const parentRun = capture(dispatcher.dispatch({ sessionID: parent }))
+    const childARun = capture(dispatcher.dispatch({ sessionID: childA }))
+    await flush()
+
+    const report = await dispatcher.cancelWithGrace(parent)
+
+    expect(report?.descendants).toEqual([
+      { sessionID: childB, mode: undefined },
+      { sessionID: childA, mode: "terminated" },
+    ])
+    expect(await parentRun).toMatchObject({ ok: false, error: expect.any(SessionCancelledError) })
+    expect(await childARun).toMatchObject({ ok: false, error: expect.any(SessionCancelledError) })
+    await dispatcher.terminateAll()
+  })
+
+  test("a self-parenting session terminates instead of recursing forever", async () => {
+    const pool = createFakeWorkerPool(1)
+    const self = sid("ses_self")
+    const dispatcher = createDispatcher({
+      pool,
+      cancellation: { childrenOf: (sessionID) => (sessionID === self ? [self] : []) },
+    })
+
+    const run = capture(dispatcher.dispatch({ sessionID: self }))
+    await flush()
+    const report = await dispatcher.cancelWithGrace(self)
+    expect(report?.descendants).toEqual([])
+    expect(await run).toMatchObject({ ok: false, error: expect.any(SessionCancelledError) })
     await dispatcher.terminateAll()
   })
 })
