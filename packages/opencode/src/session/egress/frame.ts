@@ -1,36 +1,38 @@
-// W2 — length-prefixed framing for the generic worker→hub event channel.
+// Worker event channel over the SHARED JSON transport (spec Q6/Q7/Q21, D15).
 //
-// The channel keeps its byte framing, but the body is now a shared
-// `WorkerFrameEnvelope` (events port) instead of the old `EgressEvent`:
+// The events port no longer uses a binary `[u32 length][body]` framing. Every
+// port message is exactly one shared `WorkerFrameEnvelope` JSON string, encoded
+// and parsed by `session/worker/frame.ts`; the events family (`event`/`end`/
+// `resync`/`ack`) is validated there too. This gives the worker one codec and
+// one bound across the events, writer, job, and hub-proxy ports.
 //
-//     [u32 big-endian body length][UTF-8 JSON body]
-//
-// Envelope validation is delegated to `session/worker/frame.ts` (the single
-// shared envelope, spec Q8/Q21/Q22/Q24), so the events `event` variant carries
-// the EventV2 event VERBATIM as `{ id, type, properties }` — there is no `data`
-// translation. The codec is total on the *framing* layer: `decodeFrames` returns
-// the complete frames plus any partial trailing bytes as `rest`, so a caller can
-// reassemble frames split across `MessagePort` deliveries. Anything well-framed
-// but structurally invalid (bad JSON, unknown version/port/kind) fails loud, so
-// illegal states never enter internal logic.
+// The `event` variant carries the EventV2 event VERBATIM as
+// `{ id, type, properties }` — there is no `data` translation and no per-frame
+// numeric header (so no `u32` length can overflow). Encoding rejects a frame or
+// a coalesced batch above 4 MiB with a typed `FrameTooLargeError` before it is
+// posted; decoding applies the same bound to untrusted input.
 
 import {
+  FrameTooLargeError,
+  MAX_WORKER_FRAME_BYTES,
   ProtocolError,
   UnsupportedFrameVersionError,
   WORKER_FRAME_VERSION,
+  assertWorkerFrameSize,
+  decodeWorkerFrame,
   encodeWorkerFrame,
   parseEventsFrame,
+  workerFrameByteLength,
   type EventsAckPayload,
   type EventsEventPayload,
   type EventsFrame,
   type EventsResyncPayload,
   type EventV2Event,
   type WorkerFrameEnvelope,
+  type AggregatePosition,
 } from "@/session/worker/frame"
 
-import type { WriterOrdinal } from "./ordinal"
-
-export { ProtocolError, UnsupportedFrameVersionError }
+export { FrameTooLargeError, ProtocolError, UnsupportedFrameVersionError }
 export type {
   EventsAckPayload,
   EventsEventPayload,
@@ -43,207 +45,55 @@ export type {
 /** The only frame version understood by this build (shared envelope version). */
 export const FRAME_VERSION = WORKER_FRAME_VERSION
 
-/** Writer-stamped durable metadata; identical in shape to `WriterOrdinal`. */
-export type DurableMeta = WriterOrdinal
+/** The single 4 MiB bound shared with every other worker port. */
+export const MAX_FRAME_BYTES = MAX_WORKER_FRAME_BYTES
+
+/** A coalesced batch may not exceed the same 4 MiB wire bound. */
+export const MAX_BATCH_BYTES = MAX_WORKER_FRAME_BYTES
 
 /**
- * The writer-stamped `(generation, ordinal)` a durable `event` frame carries, or
- * `undefined` for a non-durable delta / a non-`event` frame. This is the single
- * durability test the fan-out (backpressure) and receiver (ordering) share, so
- * both agree on exactly which frames may be dropped and which are ordered.
- *
- * Re-exported from the shared envelope (`session/worker/frame.ts`) so there is
- * exactly one implementation; the events-port codec simply surfaces it.
+ * A committed position in one aggregate's durable log. This is the ONLY durable
+ * identity on the wire: there is no sender-global ordinal (D12/D17). The shape
+ * is the shared envelope's, so the codec and the sender/receiver cannot drift.
  */
-export { durableMetaOf } from "@/session/worker/frame"
+export type { AggregatePosition }
 
-const HEADER_BYTES = 4
-const textEncoder = new TextEncoder()
-const textDecoder = new TextDecoder()
+/** Durable aggregate metadata carried by every durable `event` frame. */
+export type DurableMeta = AggregatePosition
 
 /**
- * Upper bound on a single frame body. The wire length is an untrusted `u32`, so
- * a corrupt or hostile header could otherwise claim up to 4 GiB and pin the
- * reassembly buffer forever. A length past this bound fails loud instead.
+ * The aggregate identity a durable `event` frame carries, or `undefined` for a
+ * non-durable delta / a non-`event` frame. Present only when BOTH `aggregateID`
+ * and `seq` are set; the shared parser rejects a half-specified identity, so it
+ * can never be mistaken for a delta.
  */
-export const MAX_FRAME_BYTES = 16 * 1024 * 1024
+export { durableAggregateMetaOf as durableMetaOf } from "@/session/worker/frame"
 
-/** Raised when the byte framing is wrong (truncated, multi-frame, or bad JSON). */
-export class MalformedFrameError extends Error {
-  constructor(message: string) {
-    super(`malformed egress frame: ${message}`)
-    this.name = "MalformedFrameError"
-  }
-}
-
-/** Encode one frame as `[u32 length][UTF-8 JSON]`. */
-export function encodeFrame(frame: WorkerFrameEnvelope): Uint8Array {
-  const body = textEncoder.encode(encodeWorkerFrame(frame))
-  const bytes = new Uint8Array(HEADER_BYTES + body.byteLength)
-  new DataView(bytes.buffer).setUint32(0, body.byteLength, false)
-  bytes.set(body, HEADER_BYTES)
-  return bytes
+/** Encode one frame as the shared envelope JSON string, enforcing the 4 MiB bound. */
+export function encodeFrame(frame: WorkerFrameEnvelope): string {
+  return assertWorkerFrameSize(encodeWorkerFrame(frame), MAX_FRAME_BYTES)
 }
 
 /**
- * Encode a batch of frames into ONE buffer, each length-prefixed in order, so a
- * coalesced delta batch is posted as a single zero-copy message.
+ * Encode a coalesced batch, one JSON string per frame, preserving order. The
+ * combined wire size is bounded by {@link MAX_BATCH_BYTES}: a batch too large to
+ * transport is a typed rejection rather than a silent split or a stalled flush.
  */
-export function encodeFrames(frames: readonly WorkerFrameEnvelope[]): Uint8Array {
+export function encodeFrames(frames: readonly WorkerFrameEnvelope[]): readonly string[] {
   const encoded = frames.map(encodeFrame)
-  const bytes = new Uint8Array(encoded.reduce((total, frame) => total + frame.byteLength, 0))
-  let offset = 0
-  for (const frame of encoded) {
-    bytes.set(frame, offset)
-    offset += frame.byteLength
-  }
-  return bytes
+  const total = encoded.reduce((sum, text) => sum + workerFrameByteLength(text), 0)
+  if (total > MAX_BATCH_BYTES) throw new FrameTooLargeError(total, MAX_BATCH_BYTES)
+  return encoded
 }
 
-/** Decode a complete single frame; fails loud on a partial, multi-frame, or unsupported frame. */
-export function decodeFrame(bytes: Uint8Array): EventsFrame {
-  if (bytes.byteLength < HEADER_BYTES) {
-    throw new MalformedFrameError(`truncated frame header: ${bytes.byteLength} of ${HEADER_BYTES} byte(s)`)
-  }
-  const length = readFrameLength(bytes, 0)
-  const total = HEADER_BYTES + length
-  if (bytes.byteLength < total) {
-    throw new MalformedFrameError(`truncated frame body: ${bytes.byteLength - HEADER_BYTES} of ${length} byte(s)`)
-  }
-  if (bytes.byteLength > total) {
-    throw new MalformedFrameError(`expected exactly 1 frame, got ${bytes.byteLength - total} trailing byte(s)`)
-  }
-  return parseBody(bytes.subarray(HEADER_BYTES, total))
+/** Decode one wire message (a JSON string) into a trusted events frame. */
+export function decodeFrame(text: string): EventsFrame {
+  return parseEventsFrame(decodeWorkerFrame(text))
 }
 
-export interface DecodedFrames {
-  readonly frames: readonly EventsFrame[]
-  /** Bytes of an incomplete trailing frame, to prepend to the next chunk. */
-  readonly rest: Uint8Array
-}
-
-/** A decoded frame plus the exact wire bytes it came from (for zero-copy fan-out). */
-export interface FrameChunk {
-  readonly frame: EventsFrame
-  readonly bytes: Uint8Array
-}
-
-export interface DecodedFrameChunks {
-  readonly frames: readonly FrameChunk[]
-  readonly rest: Uint8Array
-}
-
-/** Decode every complete frame in `bytes`, retaining each frame's raw bytes. */
-export function decodeFrameChunks(bytes: Uint8Array): DecodedFrameChunks {
-  const frames: FrameChunk[] = []
-  let offset = 0
-  while (offset + HEADER_BYTES <= bytes.byteLength) {
-    const length = readFrameLength(bytes, offset)
-    if (offset + HEADER_BYTES + length > bytes.byteLength) break
-    const view = bytes.subarray(offset, offset + HEADER_BYTES + length)
-    frames.push({
-      frame: parseBody(bytes.subarray(offset + HEADER_BYTES, offset + HEADER_BYTES + length)),
-      bytes: view,
-    })
-    offset += HEADER_BYTES + length
-  }
-  // `rest` must not alias the caller's buffer: a later mutation or reuse of the
-  // chunk would silently corrupt the bytes we hand to the next decode.
-  return { frames, rest: bytes.slice(offset) }
-}
-
-/** Decode every complete frame in `bytes`; a partial trailing frame is returned as `rest`. */
-export function decodeFrames(bytes: Uint8Array): DecodedFrames {
-  const { frames, rest } = decodeFrameChunks(bytes)
-  return { frames: frames.map((chunk) => chunk.frame), rest }
-}
-
-/**
- * Incremental reassembly buffer for the length-prefixed codec.
- *
- * A frame may be split across deliveries and one delivery may carry several
- * frames; a caller appends each chunk and receives the frames completed so far.
- * Bytes accumulate in one preallocated, geometrically-grown buffer rather than a
- * fresh concatenation per chunk, so a large frame delivered in many small pieces
- * reassembles in linear time instead of quadratic. Each completed frame's wire
- * bytes are copied out, because the internal buffer is reused for later chunks.
- */
-export interface FrameDecoder {
-  /** Append `chunk` and return the frames it completed, in order. */
-  push(chunk: Uint8Array): readonly FrameChunk[]
-  /** Bytes buffered for an as-yet incomplete frame. */
-  readonly pending: number
-  /** Discard every buffered byte (after a fatal error). */
-  reset(): void
-}
-
-export function createFrameDecoder(initialCapacity = 1024): FrameDecoder {
-  let buffer = new Uint8Array(initialCapacity < HEADER_BYTES ? HEADER_BYTES : initialCapacity)
-  let used = 0
-
-  const grow = (needed: number): void => {
-    let capacity = buffer.byteLength
-    while (capacity < needed) capacity *= 2
-    const grown = new Uint8Array(capacity)
-    grown.set(buffer.subarray(0, used))
-    buffer = grown
-  }
-
-  return {
-    push(chunk) {
-      if (used + chunk.byteLength > buffer.byteLength) grow(used + chunk.byteLength)
-      buffer.set(chunk, used)
-      used += chunk.byteLength
-
-      const frames: FrameChunk[] = []
-      let offset = 0
-      while (used - offset >= HEADER_BYTES) {
-        const length = readFrameLength(buffer, offset)
-        const total = HEADER_BYTES + length
-        if (used - offset < total) break
-        frames.push({
-          frame: parseBody(buffer.subarray(offset + HEADER_BYTES, offset + total)),
-          // Copy out: the buffer region is reclaimed for the next frame.
-          bytes: buffer.slice(offset, offset + total),
-        })
-        offset += total
-      }
-      if (offset > 0) {
-        buffer.copyWithin(0, offset, used)
-        used -= offset
-      }
-      return frames
-    },
-    get pending() {
-      return used
-    },
-    reset() {
-      used = 0
-    },
-  }
-}
-
-/** Read the big-endian body length at `offset`, failing loud past {@link MAX_FRAME_BYTES}. */
-function readFrameLength(bytes: Uint8Array, offset: number): number {
-  const length = new DataView(bytes.buffer, bytes.byteOffset + offset, HEADER_BYTES).getUint32(0, false)
-  if (length > MAX_FRAME_BYTES) {
-    throw new MalformedFrameError(`frame length ${length} exceeds the ${MAX_FRAME_BYTES}-byte maximum`)
-  }
-  return length
-}
-
-/** Parse the framed body as an events-port frame; malformed bodies fail loud. */
-function parseBody(body: Uint8Array): EventsFrame {
-  return parseEventsFrame(parseJson(body))
-}
-
-/** Parse the JSON body, translating the syntax error into the codec's own error type. */
-function parseJson(body: Uint8Array): unknown {
-  try {
-    return JSON.parse(textDecoder.decode(body))
-  } catch (error) {
-    throw new MalformedFrameError(`invalid JSON body: ${error instanceof Error ? error.message : String(error)}`)
-  }
+/** Decode a batch of wire messages, in order. */
+export function decodeFrames(texts: readonly string[]): readonly EventsFrame[] {
+  return texts.map(decodeFrame)
 }
 
 export * as EgressFrameCodec from "./frame"

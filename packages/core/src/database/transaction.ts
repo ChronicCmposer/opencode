@@ -8,6 +8,7 @@
 // ambiguous (non-busy) commit failure.
 
 import type { Connection } from "./connection"
+import { isNativeSqliteError } from "./busy"
 
 export interface BusyRetryConfig {
   /** Additional attempts after the first one. */
@@ -36,15 +37,13 @@ function isBusyCode(code: string): boolean {
  * either form.
  */
 export function isBusyError(error: unknown): boolean {
-  if (typeof error !== "object" || error === null) return false
-  const candidate = error as {
-    readonly code?: unknown
-    readonly sqliteCode?: unknown
-    readonly message?: unknown
-  }
-  if (typeof candidate.sqliteCode === "string" && isBusyCode(candidate.sqliteCode)) return true
-  if (typeof candidate.code === "string" && isBusyCode(candidate.code)) return true
-  const message = candidate.message
+  // m17: classify on the native driver shape only. A plain Error whose message
+  // says "database is locked" (a proxy, a wrapper, a user error) is not a
+  // recoverable SQLite lock and must surface unchanged instead of being retried.
+  if (!isNativeSqliteError(error)) return false
+  if (typeof error.sqliteCode === "string" && isBusyCode(error.sqliteCode)) return true
+  if (typeof error.code === "string" && isBusyCode(error.code)) return true
+  const message = error.message
   return (
     typeof message === "string" &&
     (message.includes("SQLITE_BUSY") || message.includes("SQLITE_LOCKED") || message.includes("database is locked"))

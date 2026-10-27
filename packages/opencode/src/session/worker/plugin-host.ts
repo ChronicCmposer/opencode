@@ -1,4 +1,4 @@
-// Phase 6.3 — worker-hosted plugin hooks (plan decision line 70).
+// Worker-hosted plugin hooks.
 //
 // Plugins split across the process boundary: the hub hosts adapters, global
 // events and auth; the *worker* hosts the model-facing hooks (`chat.params`,
@@ -59,6 +59,18 @@ export interface ToolAfterOutput {
   metadata: unknown
 }
 
+/** Mutable environment map the `shell.env` hook rewrites. */
+export interface ShellEnvOutput {
+  env: Record<string, string>
+}
+
+/** Mutable tool description/schema the `tool.definition` hook rewrites. */
+export interface ToolDefinitionOutput {
+  description: string
+  parameters: unknown
+  jsonSchema: unknown
+}
+
 export interface SystemTransformInput {
   readonly sessionID?: string
   readonly model?: unknown
@@ -92,6 +104,8 @@ export interface WorkerPluginHooks {
     input: MessagesTransformInput,
     output: MessagesTransformOutput,
   ) => void | Promise<void>
+  readonly "shell.env"?: (input: unknown, output: ShellEnvOutput) => void | Promise<void>
+  readonly "tool.definition"?: (input: unknown, output: ToolDefinitionOutput) => void | Promise<void>
 }
 
 /**
@@ -131,6 +145,12 @@ export interface WorkerPlugin {
    * function hooks; absent for the in-process function-hook path.
    */
   readonly resolved?: ResolvedWorkerPluginEffect
+  /**
+   * The hub-proxy hooks this plugin declares. Their functions live on the hub
+   * (they cannot cross the isolate), so the worker forwards each dispatch over
+   * the control port instead of dropping them.
+   */
+  readonly proxied?: readonly string[]
 }
 
 export interface WorkerPluginHost {
@@ -141,6 +161,27 @@ export interface WorkerPluginHost {
   toolAfter(input: unknown, output: ToolAfterOutput): Promise<ToolAfterOutput>
   systemTransform(input: SystemTransformInput, output: SystemTransformOutput): Promise<SystemTransformOutput>
   messagesTransform(input: MessagesTransformInput, output: MessagesTransformOutput): Promise<MessagesTransformOutput>
+  shellEnv(input: unknown, output: ShellEnvOutput): Promise<ShellEnvOutput>
+  toolDefinition(input: unknown, output: ToolDefinitionOutput): Promise<ToolDefinitionOutput>
+}
+
+/**
+ * Forwards one hub-proxied hook to the hub, where the real plugin function
+ * runs. The worker only ships the clone-safe `(name, input, output)` payload.
+ */
+export type WorkerPluginHubHook = (name: string, input: unknown, output: unknown) => Promise<unknown>
+
+export interface WorkerPluginHostOptions {
+  readonly systemTransform?: (
+    input: SystemTransformInput,
+    output: SystemTransformOutput,
+  ) => Promise<SystemTransformOutput>
+  readonly messagesTransform?: (
+    input: MessagesTransformInput,
+    output: MessagesTransformOutput,
+  ) => Promise<MessagesTransformOutput>
+  /** The single hub-proxy bridge for every routed-but-hub-owned hook. */
+  readonly hubHook?: WorkerPluginHubHook
 }
 
 /** Raised when two plugins share a name (fail loud). */
@@ -211,16 +252,7 @@ function applyResolvedHeaders(plugins: readonly WorkerPlugin[], output: ChatHead
 
 export function createWorkerPluginHost(
   plugins: readonly WorkerPlugin[],
-  options?: {
-    readonly systemTransform?: (
-      input: SystemTransformInput,
-      output: SystemTransformOutput,
-    ) => Promise<SystemTransformOutput>
-    readonly messagesTransform?: (
-      input: MessagesTransformInput,
-      output: MessagesTransformOutput,
-    ) => Promise<MessagesTransformOutput>
-  },
+  options?: WorkerPluginHostOptions,
 ): WorkerPluginHost {
   const names = plugins.map((plugin) => plugin.name)
   const seen = new Set<string>()
@@ -235,8 +267,10 @@ export function createWorkerPluginHost(
       applyResolvedParams(plugins, await runHook(plugins, (hooks) => hooks["chat.params"], input, output)),
     chatHeaders: async (input, output) =>
       applyResolvedHeaders(plugins, await runHook(plugins, (hooks) => hooks["chat.headers"], input, output)),
-    toolBefore: (input, output) => runHook(plugins, (hooks) => hooks["tool.execute.before"], input, output),
-    toolAfter: (input, output) => runHook(plugins, (hooks) => hooks["tool.execute.after"], input, output),
+    toolBefore: (input, output) =>
+      forwardHook(plugins, (hooks) => hooks["tool.execute.before"], "tool.execute.before", input, output, options),
+    toolAfter: (input, output) =>
+      forwardHook(plugins, (hooks) => hooks["tool.execute.after"], "tool.execute.after", input, output, options),
     // Plugin function hooks run first (registration order), then the injected
     // hub-resolved transform; absent both, the output passes through unchanged.
     systemTransform: async (input, output) => {
@@ -246,8 +280,8 @@ export function createWorkerPluginHost(
         input,
         output,
       )
-      if (options?.systemTransform === undefined) return transformed
-      return options.systemTransform(input, transformed)
+      if (options?.systemTransform !== undefined) return options.systemTransform(input, transformed)
+      return forwardHook(plugins, () => undefined, "experimental.chat.system.transform", input, transformed, options)
     },
     // Same composition as `systemTransform`: worker-local function hooks first,
     // then the injected hub-resolved transform; absent both, the output passes
@@ -259,10 +293,50 @@ export function createWorkerPluginHost(
         input,
         output,
       )
-      if (options?.messagesTransform === undefined) return transformed
-      return options.messagesTransform(input, transformed)
+      if (options?.messagesTransform !== undefined) return options.messagesTransform(input, transformed)
+      return forwardHook(plugins, () => undefined, "experimental.chat.messages.transform", input, transformed, options)
+    },
+    shellEnv: (input, output) =>
+      forwardHook(plugins, (hooks) => hooks["shell.env"], "shell.env", input, output, options),
+    // `parameters` is an Effect Schema on the worker, which cannot cross the
+    // isolate. The hook's model-facing effect is description + JSON schema, so
+    // those (clone-safe) fields are forwarded; the worker's local `parameters`
+    // stays authoritative. The real plugin still runs on the hub, never here.
+    toolDefinition: async (input, output) => {
+      const local = await runHook(plugins, (hooks) => hooks["tool.definition"], input, output)
+      const forward = options?.hubHook
+      if (forward === undefined) return local
+      const result = (await forward("tool.definition", input, {
+        description: local.description,
+        jsonSchema: local.jsonSchema,
+      })) as { readonly description?: unknown; readonly jsonSchema?: unknown }
+      return {
+        ...local,
+        description: typeof result.description === "string" ? result.description : local.description,
+        jsonSchema: "jsonSchema" in result ? result.jsonSchema : local.jsonSchema,
+      }
     },
   }
+}
+
+/**
+ * Run a worker-local function hook (if the in-process source carries one), then
+ * forward the result to the hub bridge. Absent a bridge the local result passes
+ * through by identity; the hub hook is never a silent no-op because the route
+ * table only classifies a name as `hub-proxy` when the hub owns it.
+ */
+async function forwardHook<TInput, TOutput>(
+  plugins: readonly WorkerPlugin[],
+  select: (hooks: WorkerPluginHooks) => ((input: TInput, output: TOutput) => void | Promise<void>) | undefined,
+  name: string,
+  input: TInput,
+  output: TOutput,
+  options: WorkerPluginHostOptions | undefined,
+): Promise<TOutput> {
+  const local = await runHook(plugins, select, input, output)
+  const forward = options?.hubHook
+  if (forward === undefined) return local
+  return (await forward(name, input, local)) as TOutput
 }
 
 export * as WorkerPluginHostModule from "./plugin-host"

@@ -216,7 +216,7 @@ const layer = Layer.effect(
       const data = yield* projectV2.resolve(AbsolutePath.make(directory))
       const worktree = data.id === ProjectV2.ID.make("global") && !data.vcs ? "/" : data.directory
 
-      // Phase 2: upsert
+      // Upsert the project row.
       const projectID = ProjectV2.ID.make(data.id)
       yield* migrateProjectId(data.previous ? ProjectV2.ID.make(data.previous) : undefined, projectID)
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)

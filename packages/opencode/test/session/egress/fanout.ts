@@ -5,7 +5,7 @@
 //
 // The hub is the only place frames are encoded: `publish` encodes a frame ONCE
 // and queues the same byte buffer for every subscriber, so an SSE client receives
-// bytes rather than a re-serialized object.
+// JSON text rather than a re-serialized object.
 //
 // Backpressure is per subscriber and never blocks the publisher: each subscriber
 // holds at most `bound` (default 256) frames. On overflow the OLDEST non-durable
@@ -15,8 +15,8 @@
 // drains. A durable boundary is therefore never dropped silently; an overflow
 // surfaces `EgressStreamOverflowError` to the subscriber's stream.
 
-import { decodeFrame, encodeFrame } from "@/session/egress/frame"
-import { type EventsFrame, durableMetaOf } from "@/session/worker/frame"
+import { decodeFrame, durableMetaOf, encodeFrame } from "@/session/egress/frame"
+import type { EventsFrame } from "@/session/worker/frame"
 
 /** Per-client egress bound. */
 export const SUBSCRIBER_BOUND = 256
@@ -29,12 +29,12 @@ export class SubscriberOverflowError extends Error {
 }
 
 interface QueuedFrame {
-  readonly bytes: Uint8Array
+  readonly text: string
   readonly durable: boolean
 }
 
 /**
- * A durable event is an `event` frame carrying BOTH `generation` and `ordinal`
+ * A durable event is an `event` frame carrying BOTH `aggregateID` and `seq`
  * (frame metadata, not event fields); a non-durable delta carries neither.
  * Shares the receiver's {@link durableMetaOf} test so backpressure and commit
  * ordering agree on exactly which frames may be dropped.
@@ -51,7 +51,7 @@ export interface FanoutSubscriber {
   /** Remove and decode up to `limit` frames, oldest first. Default: all. */
   drain(limit?: number): readonly EventsFrame[]
   /** Remove and return up to `limit` raw frame buffers, oldest first. Default: all. */
-  drainBytes(limit?: number): readonly Uint8Array[]
+  drainBytes(limit?: number): readonly string[]
   /** Drop every queued non-durable frame, keeping durable boundaries (terminate). */
   dropNonDurable(): void
   /** Drop everything queued for this subscriber. */
@@ -71,11 +71,11 @@ export interface Fanout {
   unsubscribe(id: string): void
   publish(frame: EventsFrame): PublishResult
   /**
-   * Fan out ALREADY-ENCODED frame bytes: the bytes received from a worker are
+   * Fan out ALREADY-ENCODED frame text: the JSON received from a worker is
    * handed to every subscriber verbatim, with no hub re-encode. `frame` is only
    * consulted to classify durables for backpressure.
    */
-  publishBytes(bytes: Uint8Array, frame: EventsFrame): PublishResult
+  publishBytes(text: string, frame: EventsFrame): PublishResult
   /**
    * Terminal broadcast: drop every subscriber's non-durable frames, then deliver
    * `frame` to all of them unconditionally (bypassing the bound, so an `end`
@@ -89,7 +89,7 @@ export interface Fanout {
 
 export interface FanoutOptions {
   readonly bound?: number
-  readonly encode?: (frame: EventsFrame) => Uint8Array
+  readonly encode?: (frame: EventsFrame) => string
 }
 
 interface SubscriberState {
@@ -114,21 +114,21 @@ export function createFanout(options: FanoutOptions = {}): Fanout {
   const states = new Map<string, SubscriberState>()
   let encodeCount = 0
 
-  const enqueue = (state: SubscriberState, bytes: Uint8Array, durable: boolean): EnqueueOutcome => {
+  const enqueue = (state: SubscriberState, text: string, durable: boolean): EnqueueOutcome => {
     if (state.queue.length < bound) {
-      state.queue.push({ bytes, durable })
+      state.queue.push({ text, durable })
       return { outcome: "enqueued" }
     }
     const oldestNonDurable = state.queue.findIndex((entry) => !entry.durable)
     if (oldestNonDurable === -1) return { outcome: durable ? "dropped-durable" : "dropped-delta" }
     state.queue.splice(oldestNonDurable, 1)
-    state.queue.push({ bytes, durable })
+    state.queue.push({ text, durable })
     return { outcome: "enqueued" }
   }
 
-  const drainBytes = (state: SubscriberState, limit?: number): Uint8Array[] => {
+  const drainBytes = (state: SubscriberState, limit?: number): string[] => {
     const count = limit === undefined ? state.queue.length : Math.min(limit, state.queue.length)
-    const drained = state.queue.splice(0, count).map((entry) => entry.bytes)
+    const drained = state.queue.splice(0, count).map((entry) => entry.text)
     if (state.queue.length < bound) state.overflowed = false
     return drained
   }
@@ -146,7 +146,7 @@ export function createFanout(options: FanoutOptions = {}): Fanout {
         return state.overflowed
       },
       drainBytes: (limit) => drainBytes(state, limit),
-      drain: (limit) => drainBytes(state, limit).map((bytes) => decodeFrame(bytes)),
+      drain: (limit) => drainBytes(state, limit).map((text) => decodeFrame(text)),
       dropNonDurable: () => {
         const durable = state.queue.filter((entry) => entry.durable)
         state.queue.length = 0
@@ -161,13 +161,13 @@ export function createFanout(options: FanoutOptions = {}): Fanout {
     return created
   }
 
-  const publishBytes = (bytes: Uint8Array, frame: EventsFrame): PublishResult => {
+  const publishBytes = (text: string, frame: EventsFrame): PublishResult => {
     const durable = isDurable(frame)
     const overflowed: string[] = []
     const droppedDeltas: string[] = []
     let delivered = 0
     for (const state of states.values()) {
-      const outcome = enqueue(state, bytes, durable)
+      const outcome = enqueue(state, text, durable)
       if (outcome.outcome === "enqueued") {
         delivered++
         continue
@@ -195,19 +195,19 @@ export function createFanout(options: FanoutOptions = {}): Fanout {
       states.delete(id)
     },
     publish(frame) {
-      const bytes = encode(frame)
+      const text = encode(frame)
       encodeCount++
-      return publishBytes(bytes, frame)
+      return publishBytes(text, frame)
     },
     publishBytes,
     finalize(frame) {
-      const bytes = encode(frame)
+      const text = encode(frame)
       encodeCount++
       const durable = isDurable(frame)
       for (const state of states.values()) {
         const kept = state.queue.filter((entry) => entry.durable)
         state.queue.length = 0
-        state.queue.push(...kept, { bytes, durable })
+        state.queue.push(...kept, { text, durable })
       }
     },
     get subscribers() {

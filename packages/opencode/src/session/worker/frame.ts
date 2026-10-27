@@ -36,6 +36,8 @@
 // `event`), never fields on the event itself.
 
 import { Schema } from "effect"
+import { decodeEventsFrameBody, type EventsFrameBody } from "@/util/events-frame-schema"
+import { PrototypePollutionError, parseJson as parseSafeJson } from "@/util/safe-json"
 import type { WriterOrdinal } from "@/session/egress/ordinal"
 
 /** The only envelope version understood by this build. */
@@ -75,9 +77,20 @@ export interface EventV2Event {
   readonly properties: unknown
 }
 
+/** The durable position of an event within one aggregate. */
+export interface AggregatePosition {
+  readonly aggregateID: string
+  /** Monotonic sequence within `aggregateID`. */
+  readonly seq: number
+}
+
 /** `kind: "event"` payload: the event plus optional writer-stamped delivery metadata. */
 export interface EventsEventPayload {
   readonly event: EventV2Event
+  /** Aggregate the durable event belongs to; frame metadata, not an event field. */
+  readonly aggregateID?: string
+  /** Per-aggregate durable sequence; frame metadata, not an event field. */
+  readonly seq?: number
   /** Writer generation for durable ordinals; frame metadata, not an event field. */
   readonly generation?: number
   /** Writer ordinal for durable events; frame metadata, not an event field. */
@@ -294,10 +307,30 @@ export function jsonErrorOf(error: unknown): string {
 // Codec + parsing
 // ---------------------------------------------------------------------------
 
-/** Serialise a frame to its JSON wire text. Inverse of `decodeWorkerFrame`. */
-export function encodeWorkerFrame(frame: WorkerFrameEnvelope): string {
+/**
+ * Serialise a frame to its JSON wire text. Inverse of `decodeWorkerFrame`.
+ * `strict` (the default) walks the payload with a replacer so a function or
+ * symbol is rejected instead of silently dropped. The events hot path opts out
+ * and uses plain `JSON.stringify`; boundaries that carry untrusted reply values
+ * call {@link assertJsonRepresentable} explicitly.
+ */
+export function encodeWorkerFrame(frame: WorkerFrameEnvelope, options: { readonly strict?: boolean } = {}): string {
   try {
-    return JSON.stringify(frame, rejectNonJson)
+    return options.strict === false ? JSON.stringify(frame) : JSON.stringify(frame, rejectNonJson)
+  } catch (error) {
+    if (error instanceof ProtocolError) throw error
+    throw new ProtocolError(`frame is not JSON-serialisable (not structured-cloneable): ${jsonErrorOf(error)}`)
+  }
+}
+
+/**
+ * Assert a value survives JSON encoding without silently dropping anything
+ * (functions, symbols) — used on untrusted reply payloads, not the frame hot
+ * path. Bigints throw from `JSON.stringify` itself.
+ */
+export function assertJsonRepresentable(value: unknown): void {
+  try {
+    JSON.stringify(value, rejectNonJson)
   } catch (error) {
     if (error instanceof ProtocolError) throw error
     throw new ProtocolError(`frame is not JSON-serialisable (not structured-cloneable): ${jsonErrorOf(error)}`)
@@ -312,9 +345,9 @@ function rejectNonJson(_key: string, value: unknown): unknown {
   return value
 }
 
-/** The exact UTF-8 size of one encoded worker frame. */
+/** The exact UTF-8 size of one encoded worker frame (no encoder allocation). */
 export function workerFrameByteLength(text: string): number {
-  return new TextEncoder().encode(text).byteLength
+  return Buffer.byteLength(text, "utf8")
 }
 
 /** Reject an over-bound message before it is posted or parsed. */
@@ -343,6 +376,9 @@ const WorkerFrameSchema = Schema.Struct({
   payload: Schema.optional(Schema.Unknown),
 })
 
+/** Decoder built once at module load, not per frame. */
+const decodeWorkerFrameEnvelope = Schema.decodeUnknownSync(WorkerFrameSchema)
+
 /**
  * Decode an untrusted message once with Effect Schema. The envelope is the shared
  * boundary: after this decode its `v`, `port`, `kind` and optional `id` are
@@ -354,7 +390,7 @@ export function parseWorkerFrame(input: unknown): WorkerFrameEnvelope {
 
   let parsed: typeof WorkerFrameSchema.Type
   try {
-    parsed = Schema.decodeUnknownSync(WorkerFrameSchema)(input)
+    parsed = decodeWorkerFrameEnvelope(input)
   } catch (error) {
     throw new ProtocolError(`frame does not match the worker envelope: ${jsonErrorOf(error)}`)
   }
@@ -380,24 +416,24 @@ export function parseEventsFrame(input: unknown): EventsFrame {
   }
 
   const id = frame.id
-  switch (frame.kind) {
+  const body = parseEventsBody(frame)
+  switch (body.kind) {
     case "event":
       return {
         v: WORKER_FRAME_VERSION,
         port: "events",
         kind: "event",
-        payload: parseEventsEventPayload(frame.payload),
+        payload: { ...body.payload, ...durableAggregateFieldsOf(frame.payload) },
         ...correlation(id),
       }
     case "end":
-      if (frame.payload !== undefined) throw new ProtocolError(`frame "end" must not carry a payload`)
       return { v: WORKER_FRAME_VERSION, port: "events", kind: "end", ...correlation(id) }
     case "resync":
       return {
         v: WORKER_FRAME_VERSION,
         port: "events",
         kind: "resync",
-        ...(frame.payload === undefined ? {} : { payload: parseResyncPayload(frame.payload) }),
+        ...(body.payload === undefined ? {} : { payload: body.payload }),
         ...correlation(id),
       }
     case "ack":
@@ -405,11 +441,25 @@ export function parseEventsFrame(input: unknown): EventsFrame {
         v: WORKER_FRAME_VERSION,
         port: "events",
         kind: "ack",
-        ...(frame.payload === undefined ? {} : { payload: parseAckPayload(frame.payload) }),
+        ...(body.payload === undefined ? {} : { payload: body.payload }),
         ...correlation(id),
       }
-    default:
-      throw new ProtocolError(`unknown events frame kind ${JSON.stringify(frame.kind)}`)
+  }
+}
+
+/**
+ * Decode the `{ kind, payload }` family once with the shared events Schema. The
+ * envelope is already trusted; a body that fails the Schema is still a typed
+ * protocol rejection, never a raw Schema error escaping the boundary.
+ */
+function parseEventsBody(frame: WorkerFrameEnvelope): EventsFrameBody {
+  try {
+    return decodeEventsFrameBody({
+      kind: frame.kind,
+      ...(frame.payload === undefined ? {} : { payload: frame.payload }),
+    })
+  } catch (error) {
+    throw new ProtocolError(`events frame body does not match the schema: ${jsonErrorOf(error)}`)
   }
 }
 
@@ -419,6 +469,13 @@ export function parseEventsFrame(input: unknown): EventsFrame {
  * neither, so this is the single durability test shared by the sender, the
  * fan-out backpressure policy, and the receiver's commit-ordering check.
  */
+export function durableAggregateMetaOf(frame: EventsFrame): AggregatePosition | undefined {
+  if (frame.kind !== "event") return undefined
+  const { aggregateID, seq } = frame.payload
+  if (aggregateID === undefined || seq === undefined) return undefined
+  return { aggregateID, seq }
+}
+
 export function durableMetaOf(frame: EventsFrame): WriterOrdinal | undefined {
   if (frame.kind !== "event") return undefined
   const { generation, ordinal } = frame.payload
@@ -431,76 +488,53 @@ function correlation(id: number | undefined): { id?: number } {
   return id === undefined ? {} : { id }
 }
 
-function parseEventsEventPayload(value: unknown): EventsEventPayload {
-  if (!isRecord(value)) {
-    throw new ProtocolError(`events "event" payload must be an object (got ${JSON.stringify(value)})`)
-  }
-  const event = parseEventV2(value["event"])
-  const generation = parseOptionalInteger(value["generation"], "generation")
-  const ordinal = parseOptionalInteger(value["ordinal"], "ordinal")
-  return {
-    event,
-    ...(generation === undefined ? {} : { generation }),
-    ...(ordinal === undefined ? {} : { ordinal }),
-  }
-}
-
 /**
- * Validate the verbatim EventV2 event `{ id, type, properties }`. The
- * `properties` value is passed through by reference — no `data` translation.
+ * The transport durability metadata carried beside the event. The body Schema
+ * owns `event` / `generation` / `ordinal`; `(aggregateID, seq)` is the wire
+ * position and is validated here as one pair. A half-specified pair would make a
+ * frame "almost durable", so it is rejected rather than dropped.
  */
-function parseEventV2(value: unknown): EventV2Event {
-  if (!isRecord(value)) throw new ProtocolError(`event must be an object (got ${JSON.stringify(value)})`)
-
-  const id = value["id"]
-  if (typeof id !== "string") throw new ProtocolError(`field "event.id" must be a string (got ${JSON.stringify(id)})`)
-
-  const type = value["type"]
-  if (typeof type !== "string") {
-    throw new ProtocolError(`field "event.type" must be a string (got ${JSON.stringify(type)})`)
+function durableAggregateFieldsOf(value: unknown): { aggregateID?: string; seq?: number } {
+  if (!isRecord(value)) return {}
+  const aggregateID = parseOptionalAggregateID(value["aggregateID"])
+  const seq = parseOptionalSeq(value["seq"])
+  if ((aggregateID === undefined) !== (seq === undefined)) {
+    throw new ProtocolError("durable event must carry both aggregateID and seq, or neither")
   }
-
-  if (!("properties" in value)) {
-    throw new ProtocolError(`field "event.properties" is missing (EventV2 events carry { id, type, properties })`)
+  return {
+    ...(aggregateID === undefined ? {} : { aggregateID }),
+    ...(seq === undefined ? {} : { seq }),
   }
-
-  return { id, type, properties: value["properties"] }
 }
 
-function parseResyncPayload(value: unknown): EventsResyncPayload {
-  if (!isRecord(value)) {
-    throw new ProtocolError(`events "resync" payload must be an object (got ${JSON.stringify(value)})`)
-  }
-  const pattern = value["pattern"]
-  if (pattern !== undefined && typeof pattern !== "string") {
-    throw new ProtocolError(`field "pattern" must be a string (got ${JSON.stringify(pattern)})`)
-  }
-  return pattern === undefined ? {} : { pattern }
-}
-
-function parseAckPayload(value: unknown): EventsAckPayload {
-  if (!isRecord(value)) {
-    throw new ProtocolError(`events "ack" payload must be an object (got ${JSON.stringify(value)})`)
-  }
-  const count = value["count"]
-  if (count !== undefined && (typeof count !== "number" || !Number.isInteger(count) || count < 0)) {
-    throw new ProtocolError(`field "count" must be a non-negative integer (got ${JSON.stringify(count)})`)
-  }
-  return count === undefined ? {} : { count }
-}
-
-function parseOptionalInteger(value: unknown, field: string): number | undefined {
+function parseOptionalAggregateID(value: unknown): string | undefined {
   if (value === undefined) return undefined
-  if (typeof value !== "number" || !Number.isInteger(value)) {
-    throw new ProtocolError(`field "${field}" must be an integer (got ${JSON.stringify(value)})`)
+  if (typeof value !== "string" || value.length === 0) {
+    throw new ProtocolError(`field "aggregateID" must be a non-empty string (got ${JSON.stringify(value)})`)
   }
   return value
 }
 
+function parseOptionalSeq(value: unknown): number | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new ProtocolError(`field "seq" must be a non-negative integer (got ${JSON.stringify(value)})`)
+  }
+  return value
+}
+
+/**
+ * Decode untrusted wire text through the shared boundary guard. It rejects
+ * prototype-reaching keys at any depth and translates invalid JSON to one typed
+ * error; both become this module's `ProtocolError` so callers see one taxonomy.
+ */
 function parseJson(text: string): unknown {
   try {
-    return JSON.parse(text)
+    return parseSafeJson(text)
   } catch (error) {
+    if (error instanceof PrototypePollutionError) {
+      throw new ProtocolError(`frame JSON rejected at the boundary: ${jsonErrorOf(error)}`)
+    }
     throw new ProtocolError(`frame is not valid JSON: ${jsonErrorOf(error)}`)
   }
 }

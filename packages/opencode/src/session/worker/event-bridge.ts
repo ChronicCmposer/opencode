@@ -34,8 +34,11 @@ import type { EventV2Event } from "./frame"
 /** The events-port sink: hand one verbatim worker event to the transport. */
 export interface WorkerEventSink {
   readonly emit: (event: EventV2Event) => void
-  /** Durable events bypass coalescing; omitted sinks fall back to `emit`. */
-  readonly emitDurable?: (event: EventV2Event) => void
+  /**
+   * Durable events bypass coalescing and carry their committed aggregate
+   * `(aggregateID, seq)`; omitted sinks fall back to `emit`.
+   */
+  readonly emitDurable?: (event: EventV2Event, meta: { readonly aggregateID: string; readonly seq: number }) => void
 }
 
 /** A live worker-event subscription. */
@@ -90,8 +93,9 @@ export function createWorkerEventBridge(
       if (disposed) return
       if (!isForwardable(event)) return
       const wire = toEventV2Event(event)
-      if (event.durable !== undefined && sink.emitDurable !== undefined) sink.emitDurable(wire)
-      else sink.emit(wire)
+      if (event.durable !== undefined && sink.emitDurable !== undefined) {
+        sink.emitDurable(wire, { aggregateID: event.durable.aggregateID, seq: event.durable.seq })
+      } else sink.emit(wire)
     }
 
     const unsubscribe = yield* events.listen((event) => Effect.sync(() => forward(event)))

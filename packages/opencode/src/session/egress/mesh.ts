@@ -1,4 +1,4 @@
-// Phase 8.9 + 8.10 + 8.11 — EventV2 cross-isolate mesh (plan tasks 8.9–8.11).
+// EventV2 cross-isolate mesh.
 //
 // `events.listen` is isolate-local, so a worker's `durable()` subscribers can
 // only be woken by the hub. The hub keeps a registry keyed by `(worker, pattern)`
@@ -11,14 +11,13 @@
 // worker keeps receiving.
 
 import { createControlLink, isNonNegativeInteger, type ControlInbound, type ControlOutbound } from "./control"
-import type { EventV2Event } from "./frame"
-import type { WriterOrdinal } from "./ordinal"
+import type { AggregatePosition, EventV2Event } from "./frame"
 
-/** Per-worker subscription backlog bound (plan decision line 87). */
+/** Per-worker subscription backlog bound. */
 export const MESH_SUBSCRIPTION_BOUND = 256
 
 export interface DurableCommit {
-  readonly meta: WriterOrdinal
+  readonly meta: AggregatePosition
   readonly event: EventV2Event
 }
 

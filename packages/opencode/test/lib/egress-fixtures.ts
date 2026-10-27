@@ -19,6 +19,6 @@ export const durable = (id: string, type = "message.updated"): EventV2Event => (
 /** Wrap one non-durable delta event into its `event` frame. */
 export const deltasFrame = (id: string): EventsFrame => eventFrame({ event: delta(id) })
 
-/** Build a durable `event` frame carrying commit metadata at generation 1. */
-export const durableFrame = (id: string, ordinal: number): EventsFrame =>
-  eventFrame({ event: durable(id), generation: 1, ordinal })
+/** Build a durable `event` frame carrying aggregate `(aggregateID, seq)` identity. */
+export const durableFrame = (id: string, seq: number, aggregateID = "agg"): EventsFrame =>
+  eventFrame({ event: durable(id), aggregateID, seq } as Parameters<typeof eventFrame>[0])

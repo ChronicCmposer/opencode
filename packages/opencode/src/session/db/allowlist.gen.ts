@@ -7,6 +7,9 @@
 
 export const SCHEMA_VERSION = 1
 
+/** Hash of the shipped SQL bodies; changing a statement changes this value. */
+export const SCHEMA_BODY_HASH = "7924b2716663e11bf0d16cd1710cbb57587369225626cf8dc7b8d662b92f9c86"
+
 export const SCHEMA_TABLES: readonly string[] = Object.freeze([
   "account",
   "account_state",
@@ -21,6 +24,7 @@ export const SCHEMA_TABLES: readonly string[] = Object.freeze([
   "permission",
   "project",
   "project_directory",
+  "schema_meta",
   "session",
   "session_context_epoch",
   "session_input",
@@ -85,3 +89,5 @@ export const SCHEMA_MIGRATION_IDS: readonly string[] = Object.freeze([
   "20260622202450_simplify_session_input",
   "20261026000000_tool_call_ledger",
 ])
+
+export * as TableAllowlist from "./allowlist.gen"

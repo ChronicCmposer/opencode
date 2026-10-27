@@ -68,13 +68,13 @@ describe("worker egress client framing round-trip", () => {
     createEgressReceiver({ port: channel.port2, onFrame: (frame) => frames.push(frame) })
     const client = createWorkerEgressClient(channel.port1)
 
-    client.emitDurable(durable("d1"), { generation: 1, ordinal: 1 })
-    client.emitDurable(durable("d2"), { generation: 1, ordinal: 2 })
+    client.emitDurable(durable("d1"), { aggregateID: "agg", seq: 1 })
+    client.emitDurable(durable("d2"), { aggregateID: "agg", seq: 2 })
 
     await pollUntil(() => frames.length === 2)
     expect(frames).toEqual([
-      eventFrame({ event: durable("d1"), generation: 1, ordinal: 1 }),
-      eventFrame({ event: durable("d2"), generation: 1, ordinal: 2 }),
+      eventFrame({ event: durable("d1"), aggregateID: "agg", seq: 1 } as Parameters<typeof eventFrame>[0]),
+      eventFrame({ event: durable("d2"), aggregateID: "agg", seq: 2 } as Parameters<typeof eventFrame>[0]),
     ])
     client.dispose()
   })
@@ -93,7 +93,7 @@ describe("worker egress client adapts the mesh control link", () => {
     client.mesh?.onDurable((commit) => commits.push(commit))
     await client.mesh?.listen("message.updated")
 
-    mesh.publish({ meta: { generation: 1, ordinal: 1 }, event: durable("d1") })
+    mesh.publish({ meta: { aggregateID: "agg", seq: 1 }, event: durable("d1") })
 
     await pollUntil(() => commits.length === 1)
     expect(commits[0]?.event.id).toBe("d1")
@@ -112,7 +112,7 @@ describe("worker egress client adapts the mesh control link", () => {
     client.mesh?.onDurable((commit) => commits.push(commit))
     await client.mesh?.listen("*")
 
-    mesh.publish({ meta: { generation: 1, ordinal: 1 }, event: durable("d1") })
+    mesh.publish({ meta: { aggregateID: "agg", seq: 1 }, event: durable("d1") })
     await pollUntil(() => commits.length === 1)
     expect(mesh.outstanding("w1")).toBe(1)
 
@@ -121,7 +121,7 @@ describe("worker egress client adapts the mesh control link", () => {
     client.mesh?.acknowledgeDelivery()
     await pollUntil(() => mesh.outstanding("w1") === 0)
 
-    mesh.publish({ meta: { generation: 1, ordinal: 2 }, event: durable("d2") })
+    mesh.publish({ meta: { aggregateID: "agg", seq: 2 }, event: durable("d2") })
     await pollUntil(() => commits.length === 2)
     expect(commits.map((commit) => commit.event.id)).toEqual(["d1", "d2"])
 
@@ -141,8 +141,8 @@ describe("worker egress client adapts the mesh control link", () => {
     await client.mesh?.listen("*")
 
     // The first delivery occupies the only slot; the second overflows to resync.
-    mesh.publish({ meta: { generation: 1, ordinal: 1 }, event: durable("d1") })
-    mesh.publish({ meta: { generation: 1, ordinal: 2 }, event: durable("d2") })
+    mesh.publish({ meta: { aggregateID: "agg", seq: 1 }, event: durable("d1") })
+    mesh.publish({ meta: { aggregateID: "agg", seq: 2 }, event: durable("d2") })
 
     await pollUntil(() => resyncs.length === 1)
     expect(resyncs).toEqual(["*"])
@@ -177,7 +177,7 @@ describe("worker egress client drives durable mesh subscriptions", () => {
       mesh.subscriptions().some((s) => s.workerId === "w1" && s.pattern === "message.updated"),
     )
 
-    mesh.publish({ meta: { generation: 1, ordinal: 1 }, event: durable("d1") })
+    mesh.publish({ meta: { aggregateID: "agg", seq: 1 }, event: durable("d1") })
 
     await pollUntil(() => commits.length === 1)
     expect(commits[0]?.event.id).toBe("d1")
@@ -205,8 +205,8 @@ describe("worker egress client drives durable mesh subscriptions", () => {
     await pollUntil(() => mesh.subscriptions().length === 1)
 
     // The first delivery occupies the only slot; the second overflows to resync.
-    mesh.publish({ meta: { generation: 1, ordinal: 1 }, event: durable("d1") })
-    mesh.publish({ meta: { generation: 1, ordinal: 2 }, event: durable("d2") })
+    mesh.publish({ meta: { aggregateID: "agg", seq: 1 }, event: durable("d1") })
+    mesh.publish({ meta: { aggregateID: "agg", seq: 2 }, event: durable("d2") })
 
     await pollUntil(() => resyncs.length === 1)
     expect(resyncs).toEqual(["*"])

@@ -1,4 +1,4 @@
-// Phase 6.1 / 6.2 / 6.5 — reduced session-worker AppLayer.
+// Reduced session-worker AppLayer.
 //
 // The hub composes ~47 nodes (`src/effect/app-runtime.ts`). A session worker
 // must compose a *reduced* graph: the session pipeline, its model-facing
@@ -10,7 +10,7 @@
 //   * the allowlisted real nodes (default group `SESSION_NODES`);
 //   * two client nodes (`WriterClient` / `EventEgressClient`) that reach the
 //     worker's WAL-backed writer seam and the egress authority;
-//   * an immutable per-worker `WorkerSnapshot` + `WorkerEnv` (plan decision 67/68);
+//   * an immutable per-worker `WorkerSnapshot` + `WorkerEnv`;
 //   * boundary replacement layers for the excluded nodes (Database, MCP/LSP, Npm,
 //     ModelsDev, …). `Database` is replaced by the per-worker WAL connection
 //     (`WorkerDbNode`); `SessionProjector` is NOT replaced: it runs in-worker so
@@ -133,10 +133,12 @@ import type {
   ChatParamsOutput,
   MessagesTransformInput,
   MessagesTransformOutput,
+  ShellEnvOutput,
   SystemTransformInput,
   SystemTransformOutput,
   ToolAfterOutput,
   ToolBeforeOutput,
+  ToolDefinitionOutput,
   WorkerPluginHost,
 } from "./plugin-host"
 import { WorkerDb, databaseLayer, type WorkerDatabase } from "./db"
@@ -182,8 +184,8 @@ export interface WriterClientHandle extends Partial<WriterTransactionHandle> {
 export interface EventEgressClientHandle {
   /** Forward one EventV2 event VERBATIM; the egress transport frames it. */
   readonly emit: (event: EventV2Event) => void
-  /** Forward a durable boundary event; defaults to the transport's ordinal. */
-  readonly emitDurable?: (event: EventV2Event) => void
+  /** Forward a durable boundary event with its aggregate `(aggregateID, seq)`. */
+  readonly emitDurable?: (event: EventV2Event, meta: { readonly aggregateID: string; readonly seq: number }) => void
   /**
    * The mesh control-plane client, present exactly when the worker was given a
    * control port. It is the single source of truth for "can this worker receive
@@ -381,7 +383,7 @@ export const WorkerEventBridgeNode = LayerNode.make({
 })
 
 // ---------------------------------------------------------------------------
-// Hub-proxy nodes (plan decision 64): `SessionStatus` / `Permission` /
+// Hub-proxy nodes: `SessionStatus` / `Permission` /
 // `Question` are hub-resident authorities. A worker reaches them with a
 // blocking RPC over its control port; the proxy services satisfy the *real*
 // hub service interfaces, so a session graph that depends on them composes
@@ -540,7 +542,7 @@ function hubAuthorityReplacements(clients: HubProxyClients): LayerNode.Replaceme
 }
 
 // ---------------------------------------------------------------------------
-// Immutable per-worker snapshot + environment overlay (plan decisions 67/68).
+// Immutable per-worker snapshot + environment overlay.
 // ---------------------------------------------------------------------------
 
 export interface WorkerSnapshot {
@@ -666,9 +668,16 @@ const pipelineLayer = Layer.effect(
           }
           // The committed `session.text` is a durable boundary (5.5), so prefer
           // the transport's durable path when the handle offers one: it carries
-          // a writer ordinal and bypasses delta coalescing. A handle without it
-          // (the reduced test stubs / degraded boot) falls back to `emit`.
-          if (egress.emitDurable !== undefined) egress.emitDurable(boundary)
+          // the commit's aggregate `(aggregateID, seq)` and bypasses delta
+          // coalescing. A committed publish always has a sequence; a null one is
+          // a broken writer contract, never a silently non-durable event.
+          if (published.seq === null) {
+            return yield* Effect.fail(
+              new Error(`committed publish for aggregate ${input.sessionID} returned no sequence`),
+            )
+          }
+          if (egress.emitDurable !== undefined)
+            egress.emitDurable(boundary, { aggregateID: input.sessionID, seq: published.seq })
           else egress.emit(boundary)
         }
         return {
@@ -1226,7 +1235,7 @@ export function boundaryReplacements(
 }
 
 // ---------------------------------------------------------------------------
-// In-worker LLM (plan decision 20): the stream stays in the isolate. A worker
+// In-worker LLM: the stream stays in the isolate. A worker
 // builds a *reduced* `Provider` from its serializable model snapshot and runs
 // the real `LLM` node over it. Nothing proxies the `Response`/`ReadableStream`.
 // ---------------------------------------------------------------------------
@@ -1543,6 +1552,8 @@ const WORKER_DISPATCHED_HOOKS: ReadonlySet<string> = new Set([
   "chat.headers",
   "tool.execute.before",
   "tool.execute.after",
+  "shell.env",
+  "tool.definition",
   "experimental.chat.system.transform",
   "experimental.chat.messages.transform",
 ])
@@ -1580,6 +1591,10 @@ function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknow
       return host.toolBefore(input, output as ToolBeforeOutput)
     case "tool.execute.after":
       return host.toolAfter(input, output as ToolAfterOutput)
+    case "shell.env":
+      return host.shellEnv(input, output as ShellEnvOutput)
+    case "tool.definition":
+      return host.toolDefinition(input, output as ToolDefinitionOutput)
     case "experimental.chat.system.transform":
       return host.systemTransform(input as SystemTransformInput, output as SystemTransformOutput)
     case "experimental.chat.messages.transform":
@@ -2017,7 +2032,7 @@ export interface SessionLayerOptions {
   /** Model seam; required because the layer never talks to a real provider by default. */
   readonly modelClient: Layer.Layer<ModelClient>
   /**
-   * Hub-resident authority proxies (plan decision 64). When supplied, the
+   * Hub-resident authority proxies. When supplied, the
    * `SessionStatus` / `Permission` / `Question` hub-proxy nodes join the graph
    * and their services are provided over the ports.
    */

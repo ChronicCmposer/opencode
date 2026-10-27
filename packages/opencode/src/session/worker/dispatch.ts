@@ -187,6 +187,8 @@ export interface DispatcherOptions {
   readonly writeBarrier?: (sessionID: SessionID) => Promise<void> | undefined
   /** Hub-side cleanup when a session's worker is retired (reap/cancel/crash). */
   readonly onSessionReleased?: (sessionID: SessionID, workerID?: number) => void
+  /** Invoked synchronously when a run actually starts (not when it parks). */
+  readonly onRunStart?: (sessionID: SessionID) => void
   /** Persist the D8 payload before the crash is returned to the caller. */
   readonly recordCrash?: (payload: WorkerCrashed) => void
   /** Ledger context for a crash whose isolate could not report it. */
@@ -375,11 +377,14 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
    * cancel controller and terminate the isolate. Idempotent, so a crash that
    * already killed the worker is harmless.
    */
-  const retireWorker = (sessionID: SessionID): SessionWorker | undefined => {
+  const retireWorker = (
+    sessionID: SessionID,
+    retireOptions: { readonly keepController?: boolean } = {},
+  ): SessionWorker | undefined => {
     clearIdle(sessionID)
     const worker = workers.dispose(sessionID)
     if (worker === undefined) return undefined
-    disposeController(worker.id)
+    if (retireOptions.keepController !== true) disposeController(worker.id)
     void worker.terminate().catch(() => undefined)
     pool.releaseSession?.(sessionID, worker.id)
     options.onSessionReleased?.(sessionID, worker.id)
@@ -408,6 +413,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       return
     }
     clearIdle(pending.sessionID)
+    options.onRunStart?.(pending.sessionID)
     const worker = workers.getOrCreate(pending.sessionID, (id) => pool.spawn(id))
     pending.startedAt = Date.now()
     pending.workerID = worker.id
@@ -545,8 +551,19 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
 
   const fail = (pending: Pending, error: unknown): void => {
     pending.markSettled()
-    // Same ownership rule as `finalizeCompletion`: the cancel settles this run.
-    if (pending.cancelPending) return
+    // A dead isolate must never survive a cancel that owns this run: the cancel
+    // settles the terminal decision, but retirement and the child cascade still
+    // belong to this crash. Otherwise the next turn reuses a dead worker.
+    if (pending.cancelPending) {
+      const dead = workers.worker(pending.sessionID)
+      if (dead !== undefined && !dead.alive) {
+        crashChildren(pending.sessionID)
+        // The cancel controller still owns the graceful settlement; retiring the
+        // isolate must not dispose it out from under the in-flight request.
+        retireWorker(pending.sessionID, { keepController: true })
+      }
+      return
+    }
     // A late rejection from a cancelled/superseded run must not settle the
     // successor that now owns this session.
     if (!ownsSession(pending)) {
@@ -556,6 +573,11 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     workers.release(pending.sessionID)
     byKey.delete(pending.sessionID)
     if (pending.gate.winner === "cancel") {
+      const dead = workers.worker(pending.sessionID)
+      if (dead !== undefined && !dead.alive) {
+        crashChildren(pending.sessionID)
+        retireWorker(pending.sessionID, { keepController: true })
+      }
       pending.reject(cancelled(pending.sessionID))
       nextWaiter(pending.sessionID)
       return

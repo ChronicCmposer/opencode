@@ -46,7 +46,7 @@ describe("resolveBuildHash", () => {
     const logged: Array<{ message: string; level: string | undefined }> = []
     const resolved = resolveBuildHash({
       definedHash: "build-hash",
-      env: { OPENCODE_BUILD_HASH_OVERRIDE: "local-hash" },
+      env: { OPENCODE_DEV: "1", OPENCODE_BUILD_HASH_OVERRIDE: "local-hash" },
       log: (message, _fields, level) => logged.push({ message, level }),
     })
 
@@ -57,7 +57,7 @@ describe("resolveBuildHash", () => {
 
     const status = buildHashStatus({
       definedHash: "build-hash",
-      env: { OPENCODE_BUILD_HASH_OVERRIDE: "local-hash" },
+      env: { OPENCODE_DEV: "1", OPENCODE_BUILD_HASH_OVERRIDE: "local-hash" },
       log: () => {},
     })
     expect(status).toMatchObject({
@@ -72,6 +72,46 @@ describe("resolveBuildHash", () => {
     const resolved = resolveBuildHash({ env: {} })
     expect(resolved.source).toBe("dev")
     expect(resolved.hash).toMatch(/^[0-9a-f]{64}$/)
+  })
+})
+
+
+describe("production override gate", () => {
+  test("a packaged build ignores the override, stays on the build hash, and logs at error", () => {
+    const logged: Array<{ message: string; level: string | undefined }> = []
+    const resolved = resolveBuildHash({
+      definedHash: "build-hash",
+      env: { OPENCODE_BUILD_HASH_OVERRIDE: "local-hash" },
+      log: (message, _fields, level) => logged.push({ message, level }),
+    })
+    expect(resolved).toMatchObject({ hash: "build-hash", source: "build", override: false })
+    expect(logged).toHaveLength(1)
+    expect(logged[0]?.level).toBe("error")
+    expect(logged[0]?.message).toContain("ignored")
+
+    expect(
+      buildHashStatus({ definedHash: "build-hash", env: { OPENCODE_BUILD_HASH_OVERRIDE: "local-hash" } }),
+    ).toMatchObject({ buildHash: "build-hash", source: "build", override: false })
+  })
+
+  test("NODE_ENV=production also ignores the override even without a build hash", () => {
+    const resolved = resolveBuildHash({
+      env: { NODE_ENV: "production", OPENCODE_BUILD_HASH_OVERRIDE: "local-hash" },
+    })
+    expect(resolved.source).toBe("dev")
+    expect(resolved.override).toBe(false)
+    expect(resolved.hash).not.toBe("local-hash")
+  })
+
+  test("development and test builds honour the override", () => {
+    expect(
+      resolveBuildHash({ env: { OPENCODE_DEV: "1", OPENCODE_BUILD_HASH_OVERRIDE: "local" } }),
+    ).toMatchObject({ hash: "local", source: "override", override: true })
+    expect(resolveBuildHash({ env: { OPENCODE_BUILD_HASH_OVERRIDE: "local" } })).toMatchObject({
+      hash: "local",
+      source: "override",
+      override: true,
+    })
   })
 })
 

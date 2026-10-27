@@ -29,9 +29,9 @@ const eventLayer = EventV2.layerWith().pipe(Layer.provide(databaseStub))
 const DURABLE_TYPE = SessionV1.Event.MessageRemoved.type
 const sessionID = "ses_durable_wake"
 
-const commit = (ordinal: number, type: string = DURABLE_TYPE): DurableCommit => ({
-  meta: { generation: 1, ordinal },
-  event: { id: `evt_${ordinal}`, type, properties: { sessionID, ordinal } },
+const commit = (seq: number, type: string = DURABLE_TYPE): DurableCommit => ({
+  meta: { aggregateID: sessionID, seq },
+  event: { id: `evt_${seq}`, type, properties: { sessionID, ordinal: seq } },
 })
 
 /** A recording stub for the two seams `republishDurableCommit` drives. */
@@ -91,7 +91,7 @@ describe("republishDurableCommit", () => {
   test("a known durable commit missing its aggregate field fails loud", () => {
     const { events } = recordingEvents()
     const malformed: DurableCommit = {
-      meta: { generation: 1, ordinal: 6 },
+      meta: { aggregateID: sessionID, seq: 6 },
       event: { id: "evt_6", type: DURABLE_TYPE, properties: { ordinal: 6 } },
     }
 

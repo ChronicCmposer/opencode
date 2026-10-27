@@ -83,6 +83,69 @@ describe("bounded per-session delta queue", () => {
     expect(queue.dropped).toBe(1)
   })
 
+  test("sequences deltas per aggregate, so interleaved aggregates never look gapped", () => {
+    const { queue, deltas } = queueHarness(8)
+
+    queue.pushDelta({ aggregateID: "a", event: event("a1") })
+    queue.pushDelta({ aggregateID: "b", event: event("b1") })
+    queue.pushDelta({ aggregateID: "a", event: event("a2") })
+    queue.pushDelta({ aggregateID: "b", event: event("b2") })
+    queue.pushDelta({ aggregateID: "a", event: event("a3") })
+    queue.flush()
+
+    // Each aggregate's subscription sees a contiguous 1..n cursor of its own;
+    // a shared global ordinal would give `a` 1,3,5 and look gapped.
+    expect(
+      deltas
+        .filter((delta) => delta.aggregateID === "a")
+        .map((delta) => delta.seq),
+    ).toEqual([1, 2, 3])
+    expect(
+      deltas
+        .filter((delta) => delta.aggregateID === "b")
+        .map((delta) => delta.seq),
+    ).toEqual([1, 2])
+    expect(queue.lastSeqOf("a")).toBe(3)
+    expect(queue.lastSeqOf("b")).toBe(2)
+    expect(queue.lastSeq).toBe(3)
+  })
+
+  test("the per-aggregate cursor survives across flushes and drops", () => {
+    const { queue, deltas } = queueHarness(2)
+    queue.pushDelta({ aggregateID: "a", event: event("a1") })
+    queue.pushDelta({ aggregateID: "b", event: event("b1") })
+    // Bound 2: pushing `a2` first drops the oldest (`a1`), so `a` restarts at 1.
+    queue.pushDelta({ aggregateID: "a", event: event("a2") })
+    queue.flush()
+    expect(deltas.map((delta) => [delta.aggregateID, delta.seq])).toEqual([
+      ["b", 1],
+      ["a", 1],
+    ])
+
+    queue.pushDelta({ aggregateID: "a", event: event("a3") })
+    queue.flush()
+    expect(deltas.at(-1)).toMatchObject({ aggregateID: "a", seq: 2, event: { id: "a3" } })
+    expect(queue.lastSeqOf("a")).toBe(2)
+    expect(queue.lastSeqOf("b")).toBe(1)
+  })
+
+  test("coalescing keys are an O(1) Map lookup, not a linear scan", () => {
+    // Every key is unique, so the pending set grows to the bound. A `findIndex`
+    // scan would compare against all pending deltas on every push (quadratic
+    // here: ~1.25B comparisons); the Map index makes each push O(1). The bound
+    // is deliberately generous so the assertion measures complexity, not speed.
+    const bound = 50_000
+    const { queue } = queueHarness(bound)
+    const started = performance.now()
+    for (let index = 0; index < bound; index++) {
+      queue.pushDelta({ aggregateID: "a", coalesceKey: `unique-${index}`, event: event(`e${index}`) })
+    }
+    const elapsed = performance.now() - started
+    expect(elapsed).toBeLessThan(2_000)
+    expect(queue.pending).toBe(bound)
+    expect(queue.coalesced).toBe(0)
+  })
+
   test("rejects an invalid durable identity at the boundary", () => {
     const { queue } = queueHarness(DELTA_QUEUE_BOUND)
     expect(() => queue.pushDurable({ aggregateID: "", seq: 1, event: event("bad") })).toThrow(/aggregateID/)
@@ -187,6 +250,60 @@ describe("delta subscription gap detection and resync", () => {
     releaseSnapshot()
     await settleSnapshotChain()
     expect(delivered).toEqual(["durable-1", "durable-3", "durable-4"])
+  })
+
+  test("a throwing durable handler does not poison later snapshots or deliveries", async () => {
+    const delivered: string[] = []
+    const snapshotCalls: number[] = []
+    const errors: string[] = []
+    const subscription = createDeltaSubscription({
+      aggregateID: "s1",
+      snapshot: async (_aggregateID, seq) => {
+        snapshotCalls.push(seq)
+        return [event(`snapshot-${seq}`)]
+      },
+      onDelta: () => undefined,
+      onDurable: (durable) => {
+        delivered.push(durable.event.id)
+        if (durable.event.id === "boom") throw new Error("durable handler exploded")
+      },
+      onError: (error) => errors.push(error.message),
+    })
+
+    // Gap at 2: heals at 1 and then delivers the durable, whose handler throws.
+    subscription.receiveDurable({ aggregateID: "s1", seq: 2, event: event("boom") })
+    await settleSnapshotChain()
+    expect(errors).toEqual(["durable handler exploded"])
+
+    // A later gap must still heal: the failed link must not poison the chain.
+    subscription.receiveDurable({ aggregateID: "s1", seq: 5, event: event("after") })
+    await settleSnapshotChain()
+
+    expect(snapshotCalls).toEqual([0, 2])
+    expect(delivered).toEqual(["boom", "after"])
+    expect(subscription.healing).toBe(0)
+  })
+
+  test("a throwing snapshot callback still decrements `healing`", async () => {
+    const subscription = createDeltaSubscription({
+      aggregateID: "s1",
+      snapshot: async () => {
+        throw new Error("snapshot failed")
+      },
+      onDelta: () => undefined,
+      onDurable: (durable) => {
+        if (durable.event.id === "second") throw new Error("still alive")
+      },
+      onError: (error) => {
+        throw new Error(`onError exploded: ${error.message}`)
+      },
+    })
+
+    // The snapshot rejects and `onError` itself throws: neither may reject the
+    // chain or leak the `healing` counter.
+    subscription.receiveDurable({ aggregateID: "s1", seq: 2, event: event("first") })
+    await settleSnapshotChain()
+    expect(subscription.healing).toBe(0)
   })
 
   test("rejects a delivery for another aggregate at the boundary", () => {

@@ -26,8 +26,14 @@ export interface ToolRoute extends ToolRef {
   readonly host: ToolHost
 }
 
-/** Sources whose implementation only the hub is allowed to run. */
-const HUB_SOURCES: ReadonlySet<ToolSource> = new Set(["mcp", "lsp", "remote-plugin"])
+/**
+ * Sources whose implementation only the hub is allowed to run.
+ *
+ * `remote-plugin` is deliberately absent: a remote plugin tool is a worker-local
+ * *forwarding stub* whose call crosses to the hub, so the stub itself executes
+ * in the worker and must stay routable there.
+ */
+const HUB_SOURCES: ReadonlySet<ToolSource> = new Set(["mcp", "lsp"])
 
 /** The host that owns tools from `source`. */
 export function hostForSource(source: ToolSource): ToolHost {
@@ -67,6 +73,42 @@ export function runsOn(route: ToolRoute, host: ToolHost = hostForRole()): boolea
  */
 export function sourceForRegistryTool(id: string): ToolSource {
   return id === "lsp" ? "lsp" : "builtin"
+}
+
+export interface RoutingSource {
+  readonly path: string
+  readonly text: string
+}
+
+/** Files that know their graph role for reasons other than tool routing. */
+const NON_ROUTING_ROLE_READERS: ReadonlySet<string> = new Set(["session/worker/nodes.ts"])
+const ROUTING_PATH = "tool/route.ts"
+
+/**
+ * Find every source file that re-implements the tool-host decision.
+ *
+ * The guard walks the whole file text, not just its leading token, so a nested
+ * local predicate (inside a function, ternary or conditional) is found exactly
+ * like a top-level one. It flags two shapes:
+ *
+ * - a local definition of a routing predicate (`hostForSource`, `routeTool`, ...);
+ * - any other call to `processRole()` outside the one allowed reader.
+ *
+ * Graph-role reads unrelated to tools (`sessionWorkerNodes`) are allowlisted.
+ */
+export function findSecondRoutingPredicates(sources: readonly RoutingSource[]): readonly string[] {
+  const offenders: string[] = []
+  for (const source of sources) {
+    if (source.path === ROUTING_PATH) continue
+    if (NON_ROUTING_ROLE_READERS.has(source.path)) continue
+    const definesPredicate =
+      /(?:function\s+|const\s+|let\s+|var\s+)(?:hostForSource|hostForRole|routeTool|runsOn|sourceForRegistryTool)\b/.test(
+        source.text,
+      )
+    const readsRole = /\bprocessRole\s*\(/.test(source.text)
+    if (definesPredicate || readsRole) offenders.push(source.path)
+  }
+  return offenders.sort()
 }
 
 export * as ToolRoute from "./route"

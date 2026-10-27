@@ -1,4 +1,4 @@
-// fix2-ws3 — the explicit per-isolate process role.
+// The explicit per-isolate process role.
 //
 // The process role is a property of the ISOLATE, not of a graph. The process
 // main thread is the `hub`; each session-worker isolate adopts the role its
@@ -18,7 +18,7 @@
 import type { Role } from "@/session/worker/node-table"
 
 /** The canonical role list; the runtime guard at every parse boundary. */
-export const ROLES: readonly Role[] = ["session", "writer", "broker", "hub"]
+export const ROLES: readonly Role[] = ["session", "hub"]
 
 let currentRole: Role | undefined
 

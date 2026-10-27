@@ -68,6 +68,10 @@ describe("worker hook route table", () => {
     expect(WORKER_HOOK_ROUTES["chat.headers"]).toBe("worker-hosted")
     expect(WORKER_HOOK_ROUTES["tool.execute.before"]).toBe("hub-proxy")
     expect(WORKER_HOOK_ROUTES["tool.execute.after"]).toBe("hub-proxy")
+    // D19: the shell tool and the tool registry invoke these in a worker, but the
+    // plugin instance lives on the hub, so they are hub-routed, never local.
+    expect(WORKER_HOOK_ROUTES["shell.env"]).toBe("hub-proxy")
+    expect(WORKER_HOOK_ROUTES["tool.definition"]).toBe("hub-proxy")
     expect(WORKER_HOOK_ROUTES["experimental.chat.system.transform"]).toBe("hub-proxy")
     expect(WORKER_HOOK_ROUTES["experimental.chat.messages.transform"]).toBe("hub-proxy")
     // The hub resolves the small model before a worker exists; the worker never
@@ -77,8 +81,6 @@ describe("worker hook route table", () => {
     for (const name of [
       "chat.message",
       "command.execute.before",
-      "shell.env",
-      "tool.definition",
       "experimental.session.compacting",
       "experimental.compaction.autocontinue",
       "experimental.text.complete",
@@ -95,9 +97,9 @@ describe("worker hook route table", () => {
   })
 
   test("an unsupported invoked hook is a typed admission failure", () => {
-    const error = pluginHookAdmissionError("configured", { "shell.env": async () => {} })
+    const error = pluginHookAdmissionError("configured", { "chat.message": async () => {} })
     expect(error).toBeInstanceOf(UnsupportedPluginHookError)
-    expect(error?.hook).toBe("shell.env")
+    expect(error?.hook).toBe("chat.message")
   })
 
   test("an unclassified function hook throws instead of falling through", () => {

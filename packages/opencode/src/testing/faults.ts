@@ -1,4 +1,4 @@
-// Test-only fault-injection seams (plan task 3.7).
+// Test-only fault-injection seams.
 //
 // WHY THIS EXISTS
 //   Some failure modes the pool/writer must survive are unreachable on demand:
@@ -37,7 +37,7 @@
 //   "Compiled out of production": the hooks early-exit on a cached plan; a
 //   future build-time `define` may inline `activeFaults()` to the disabled plan.
 //
-// USAGE AT A CALL SITE (Phase 4.7 / 7.8 / 7.9 / 7.13)
+// USAGE AT A CALL SITE
 //   import { Faults } from "@/testing/faults"
 //
 //   yield* Effect.sync(() => Faults.crashWorker("writer:commit"))       // may hard-exit

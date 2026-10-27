@@ -1,26 +1,36 @@
-// W2 — framed worker event channel codec (spec Q6/Q7/Q21).
+// W2 — worker event channel codec over the SHARED JSON transport (D15).
 //
-// The egress channel keeps its `[u32 big-endian length][UTF-8 JSON body]` framing,
-// but the body is now a shared `WorkerFrameEnvelope` (events port): the EventV2
-// event crosses VERBATIM as `{ id, type, properties }` — there is no `data`
-// translation. An unknown envelope version or a malformed body fails loud.
+// The egress channel no longer carries a binary `[u32 length][body]` frame. Each
+// port message IS one shared `WorkerFrameEnvelope` JSON string, encoded and
+// decoded by `session/worker/frame.ts`, so the worker events port, the writer
+// port, and the hub-proxy port share one codec and one 4 MiB bound.
+//
+// The EventV2 event crosses VERBATIM as `{ id, type, properties }` — there is no
+// `data` translation. An unknown envelope version, a malformed body, or a
+// frame/batch above 4 MiB fails loud with a typed error; there is no numeric
+// length header to overflow.
 
 import { describe, expect, test } from "bun:test"
 import {
+  FrameTooLargeError,
+  MAX_BATCH_BYTES,
   MAX_FRAME_BYTES,
-  MalformedFrameError,
   decodeFrame,
   decodeFrames,
   encodeFrame,
+  encodeFrames,
   type EventsFrame,
 } from "@/session/egress/frame"
 import {
+  MAX_WORKER_FRAME_BYTES,
   ProtocolError,
   UnsupportedFrameVersionError,
   ackFrame,
   endFrame,
+  encodeWorkerFrame,
   eventFrame,
   resyncFrame,
+  workerFrameByteLength,
 } from "@/session/worker/frame"
 
 const event = { id: "evt_1", type: "message.part.delta", properties: { sessionID: "s1", delta: "héllo 🌍" } }
@@ -30,7 +40,28 @@ function asEventFrame(frame: EventsFrame): Extract<EventsFrame, { readonly kind:
   return frame
 }
 
-describe("egress frame codec (events envelope)", () => {
+/** Valid JSON frame text padded to exactly `bytes` UTF-8 bytes (ASCII padding). */
+function frameTextOfByteLength(bytes: number): string {
+  const prefix = '{"v":1,"port":"events","kind":"event","payload":{"event":{"id":"e","type":"t","properties":{"pad":"'
+  const suffix = '"}}}}'
+  return prefix + "x".repeat(bytes - prefix.length - suffix.length) + suffix
+}
+
+describe("egress frame codec (shared JSON transport)", () => {
+  test("the shared 4 MiB bound is the single egress bound", () => {
+    expect(MAX_FRAME_BYTES).toBe(MAX_WORKER_FRAME_BYTES)
+    expect(MAX_BATCH_BYTES).toBe(MAX_WORKER_FRAME_BYTES)
+    expect(MAX_FRAME_BYTES).toBe(4 * 1024 * 1024)
+  })
+
+  test("encodes one frame as a JSON string, not a binary length-prefixed buffer", () => {
+    const frame = eventFrame({ event })
+    const text = encodeFrame(frame)
+    expect(typeof text).toBe("string")
+    expect(text.startsWith("{")).toBe(true)
+    expect(JSON.parse(text)).toEqual(frame)
+  })
+
   test("round-trips an event frame with the verbatim {id,type,properties}", () => {
     const frame = eventFrame({ event })
     const decoded = decodeFrame(encodeFrame(frame))
@@ -51,100 +82,87 @@ describe("egress frame codec (events envelope)", () => {
     }
   })
 
-  test("is byte-exact: decode then re-encode yields identical bytes", () => {
-    const frame = eventFrame({ event, generation: 2, ordinal: 7 })
-    const bytes = encodeFrame(frame)
-    expect(encodeFrame(decodeFrame(bytes))).toEqual(bytes)
+  test("decode then re-encode yields identical text", () => {
+    const frame = eventFrame({ event, aggregateID: "agg", seq: 7 } as Parameters<typeof eventFrame>[0])
+    const text = encodeFrame(frame)
+    expect(encodeFrame(decodeFrame(text))).toBe(text)
   })
 
-  test("prefixes the body with a big-endian u32 byte length", () => {
-    const frame = endFrame()
-    const bytes = encodeFrame(frame)
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-    expect(view.getUint32(0, false)).toBe(bytes.byteLength - 4)
-    expect(JSON.parse(new TextDecoder().decode(bytes.subarray(4)))).toEqual(frame)
+  test("encodes a batch in order as one JSON string per frame", () => {
+    const frames = [eventFrame({ event }), endFrame()]
+    const encoded = encodeFrames(frames)
+    expect(encoded).toHaveLength(2)
+    expect(encoded.every((text) => typeof text === "string")).toBe(true)
+    expect(decodeFrames(encoded)).toEqual(frames)
   })
 
-  test("decodes concatenated frames in order", () => {
-    const first = eventFrame({ event })
-    const second = endFrame()
-    const joined = new Uint8Array([...encodeFrame(first), ...encodeFrame(second)])
-    const { frames, rest } = decodeFrames(joined)
-    expect(frames).toEqual([first, second])
-    expect(rest.byteLength).toBe(0)
+  test("accepts a frame exactly at the 4 MiB bound", () => {
+    const text = frameTextOfByteLength(MAX_FRAME_BYTES)
+    expect(workerFrameByteLength(text)).toBe(MAX_FRAME_BYTES)
+    expect(decodeFrame(text).kind).toBe("event")
   })
 
-  test("retains a partial trailing frame as rest and resumes when completed", () => {
-    const frame = eventFrame({ event })
-    const bytes = encodeFrame(frame)
-    const partial = bytes.subarray(0, bytes.byteLength - 3)
-    const first = decodeFrames(partial)
-    expect(first.frames).toEqual([])
-    expect(first.rest).toEqual(partial)
-
-    const completed = new Uint8Array([...first.rest, ...bytes.subarray(bytes.byteLength - 3)])
-    expect(decodeFrames(completed).frames).toEqual([frame])
+  test("rejects a per-frame payload over 4 MiB with a typed rejection", () => {
+    const text = frameTextOfByteLength(MAX_FRAME_BYTES + 1)
+    expect(() => decodeFrame(text)).toThrow(FrameTooLargeError)
   })
 
-  test("a header-only buffer is rest, not a frame", () => {
-    const bytes = encodeFrame(endFrame())
-    expect(decodeFrames(bytes.subarray(0, 4))).toEqual({ frames: [], rest: bytes.subarray(0, 4) })
+  test("rejects an over-bound frame at encode time, before it is posted", () => {
+    const huge = eventFrame({ event: { id: "big", type: "t", properties: { pad: "x".repeat(MAX_FRAME_BYTES) } } })
+    let caught: unknown
+    try {
+      encodeFrame(huge)
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBeInstanceOf(FrameTooLargeError)
   })
 
-  test("the returned rest is a copy, not a view of the input buffer", () => {
-    const bytes = encodeFrame(eventFrame({ event }))
-    const partial = bytes.slice(0, bytes.byteLength - 3)
-    const { rest } = decodeFrames(partial)
-    partial.fill(0)
-    expect(rest).toEqual(bytes.subarray(0, bytes.byteLength - 3))
+  test("rejects a batch whose total wire size exceeds 4 MiB with a typed rejection", () => {
+    // Two individually valid frames whose combined UTF-8 size is over the bound.
+    const first = frameTextOfByteLength(MAX_FRAME_BYTES - 8)
+    let caught: unknown
+    try {
+      encodeFrames([decodeFrame(first), endFrame()])
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBeInstanceOf(FrameTooLargeError)
   })
 
   test("fails loud on an unsupported envelope version", () => {
-    expect(() => decodeFrame(rawFrame({ v: 2, port: "events", kind: "end" }))).toThrow(UnsupportedFrameVersionError)
+    expect(() => decodeFrame(JSON.stringify({ v: 2, port: "events", kind: "end" }))).toThrow(
+      UnsupportedFrameVersionError,
+    )
   })
 
   test("fails loud on a frame from another port", () => {
-    expect(() => decodeFrame(rawFrame({ v: 1, port: "writer", kind: "end" }))).toThrow(ProtocolError)
+    expect(() => decodeFrame(JSON.stringify({ v: 1, port: "writer", kind: "end" }))).toThrow(ProtocolError)
   })
 
   test("fails loud on an event missing properties (no `data` fallback)", () => {
     expect(() =>
-      decodeFrame(rawFrame({ v: 1, port: "events", kind: "event", payload: { event: { id: "e", type: "t" } } })),
+      decodeFrame(JSON.stringify({ v: 1, port: "events", kind: "event", payload: { event: { id: "e", type: "t" } } })),
     ).toThrow(ProtocolError)
   })
 
   test("fails loud on a body that is not valid JSON", () => {
-    expect(() => decodeFrame(rawBody("{not json"))).toThrow(MalformedFrameError)
+    expect(() => decodeFrame("{not json")).toThrow(ProtocolError)
   })
 
-  test("decodeFrame rejects a buffer carrying more than one frame", () => {
-    const joined = new Uint8Array([...encodeFrame(endFrame()), ...encodeFrame(endFrame())])
-    expect(() => decodeFrame(joined)).toThrow(MalformedFrameError)
+  test("fails loud on a non-string message", () => {
+    expect(() => decodeFrame(new Uint8Array([1, 2, 3]) as unknown as string)).toThrow(ProtocolError)
   })
 
-  test("decodeFrame rejects a truncated frame", () => {
-    const bytes = encodeFrame(endFrame())
-    expect(() => decodeFrame(bytes.subarray(0, bytes.byteLength - 1))).toThrow(MalformedFrameError)
+  test("rejects a producer-side duplicate frame text is not silently merged", () => {
+    // Each message is exactly one frame: decoding a concatenation must fail
+    // instead of splitting it on a numeric header.
+    const joined = encodeFrame(endFrame()) + encodeFrame(endFrame())
+    expect(() => decodeFrame(joined)).toThrow(ProtocolError)
   })
 
-  test("fails loud on a body length past MAX_FRAME_BYTES instead of pinning rest", () => {
-    // A corrupt `u32` length must not be treated as an incomplete frame; that
-    // would retain the buffer as `rest` forever.
-    const bytes = new Uint8Array(4)
-    new DataView(bytes.buffer).setUint32(0, MAX_FRAME_BYTES + 1, false)
-    expect(() => decodeFrames(bytes)).toThrow(MalformedFrameError)
-    expect(() => decodeFrame(bytes)).toThrow(MalformedFrameError)
+  test("encodeWorkerFrame is the single serialiser (byte-exact parity)", () => {
+    const frame = eventFrame({ event })
+    expect(encodeFrame(frame)).toBe(encodeWorkerFrame(frame))
   })
 })
-
-function rawBody(text: string): Uint8Array {
-  const body = new TextEncoder().encode(text)
-  const bytes = new Uint8Array(4 + body.byteLength)
-  new DataView(bytes.buffer).setUint32(0, body.byteLength, false)
-  bytes.set(body, 4)
-  return bytes
-}
-
-function rawFrame(body: unknown): Uint8Array {
-  return rawBody(JSON.stringify(body))
-}

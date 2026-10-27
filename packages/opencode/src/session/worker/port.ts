@@ -1,4 +1,4 @@
-// Phase 9/11 — shared worker port plumbing.
+// Shared worker port plumbing.
 //
 // The cancel control channel (`cancel.ts`), the writer relay
 // all adapt a real
@@ -108,34 +108,59 @@ export interface WorkerFrameCarrier {
  * another port or with a mismatched payload discriminant fails loud instead of
  * being blindly cast. There is no structured-clone fallback.
  */
+export interface WorkerFrameChannelOptions {
+  /**
+   * Host-boundary containment: receive a decode failure as a typed error instead
+   * of an exception escaping the message listener. When supplied, the channel
+   * isolates itself after the first failure (no further frames are delivered),
+   * so one malformed worker frame can never take the host down.
+   */
+  readonly onProtocolError?: (error: unknown) => void
+}
+
 export function workerFrameChannel<Frame extends WorkerFrameCarrier>(
   port: MessagePort,
   portName: WorkerFramePort,
+  options: WorkerFrameChannelOptions = {},
 ): FrameChannel<Frame> {
   const channel = portFromMessagePort<string>(port)
   return {
     post: (frame) => {
-      const text = encodeWorkerFrame({
-        v: WORKER_FRAME_VERSION,
-        port: portName,
-        kind: frame.kind,
-        ...(frame.id === undefined ? {} : { id: frame.id }),
-        payload: frame,
-      })
+      const text = encodeWorkerFrame(
+        {
+          v: WORKER_FRAME_VERSION,
+          port: portName,
+          kind: frame.kind,
+          ...(frame.id === undefined ? {} : { id: frame.id }),
+          payload: frame,
+        },
+        // The events port is the throughput hot path: plain stringify, no
+        // replacer walk. Control ports stay strict and reject dropped values.
+        { strict: portName !== "events" },
+      )
       channel.post(assertWorkerFrameSize(text))
     },
-    onMessage: (handler) =>
-      channel.onMessage((data) => {
-        const envelope = decodeWorkerFrame(data)
-        if (envelope.port !== portName) {
-          throw new ProtocolError(`expected worker port "${portName}" (got ${JSON.stringify(envelope.port)})`)
+    onMessage: (handler) => {
+      let unsubscribe = (): void => {}
+      unsubscribe = channel.onMessage((data) => {
+        try {
+          const envelope = decodeWorkerFrame(data)
+          if (envelope.port !== portName) {
+            throw new ProtocolError(`expected worker port "${portName}" (got ${JSON.stringify(envelope.port)})`)
+          }
+          const payload = envelope.payload
+          if (!isRecord(payload) || payload["kind"] !== envelope.kind) {
+            throw new ProtocolError(`frame "${envelope.kind}" is missing a matching payload`)
+          }
+          handler(payload as Frame)
+        } catch (error) {
+          if (options.onProtocolError === undefined) throw error
+          unsubscribe()
+          options.onProtocolError(error)
         }
-        const payload = envelope.payload
-        if (!isRecord(payload) || payload["kind"] !== envelope.kind) {
-          throw new ProtocolError(`frame "${envelope.kind}" is missing a matching payload`)
-        }
-        handler(payload as Frame)
-      }),
+      })
+      return unsubscribe
+    },
   }
 }
 

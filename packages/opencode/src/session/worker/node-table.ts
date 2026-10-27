@@ -1,4 +1,4 @@
-// Phase 6.3 / 6.5 — session-role node table (plan decision lines 58, 152).
+// Session-role node table.
 //
 // The real `AppLayer` (`src/effect/app-runtime.ts`) composes ~47 nodes in one
 // flat group. Session workers must run a *reduced* graph: they own the session
@@ -11,7 +11,7 @@
 // nodes (e.g. `session-projector`) use an explicit `name`; both are covered.
 
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-export type Role = "session" | "writer" | "broker" | "hub"
+export type Role = "session" | "hub"
 
 /**
  * Where a node's side effects must live.
@@ -23,7 +23,7 @@ export type Role = "session" | "writer" | "broker" | "hub"
 export type Boundary = "worker-local" | "hub-proxy" | "excluded"
 
 export interface NodeEntry {
-  /** Human name used by the plan/task (e.g. `Session`, `Database`). */
+  /** Human name used by callers (e.g. `Session`, `Database`). */
   readonly label: string
   /** `LayerNode.Node.name` / service key. */
   readonly key: string
@@ -43,7 +43,7 @@ const entry = (
 /** The per-worker DB service key; `layer.ts` and `db.ts` share this constant. */
 export const WORKER_DB_KEY = "@opencode/session-worker/Db"
 
-/** The approved session-role allowlist (task list, plan line 58). */
+/** The approved session-role allowlist. */
 export const SESSION_ALLOWLIST: readonly NodeEntry[] = [
   entry("Session", "@opencode/Session", ["session"], "worker-local"),
   entry("SessionPrompt", "@opencode/SessionPrompt", ["session"], "worker-local"),
@@ -71,7 +71,7 @@ export const SESSION_ALLOWLIST: readonly NodeEntry[] = [
   entry("Truncate", "@opencode/Truncate", ["session"], "worker-local"),
   entry("Format", "@opencode/Format", ["session"], "worker-local"),
   entry("RuntimeFlags", "@opencode/RuntimeFlags", ["session"], "worker-local"),
-  // Real session-pipeline dependencies (task 29): the reduced worker layer must
+  // Real session-pipeline dependencies: the reduced worker layer must
   // be able to run the V1 `SessionPrompt` loop, not just the toy pipeline.
   entry("SessionStatus", "@opencode/SessionStatus", ["session"], "hub-proxy", "hub-resident authority"),
   entry("SessionCompaction", "@opencode/SessionCompaction", ["session"], "worker-local"),
@@ -129,7 +129,7 @@ export const SESSION_ALLOWLIST: readonly NodeEntry[] = [
   entry("Observability", "observability", ["session"], "worker-local"),
 ]
 
-/** Nodes that must NEVER be instantiated inside a session worker (task exclusions). */
+/** Nodes that must NEVER be instantiated inside a session worker (exclusions). */
 export const SESSION_EXCLUDED: readonly NodeEntry[] = [
   entry("Database", "@opencode/v2/storage/Database", ["hub"], "excluded", "hub migrates; each worker opens its own WAL connection"),
   entry("LSP", "@opencode/LSP", ["hub"], "excluded", "hub-only; workers never spawn"),
@@ -141,10 +141,10 @@ export const SESSION_EXCLUDED: readonly NodeEntry[] = [
   entry("Installation", "@opencode/Installation", ["hub"], "excluded"),
   entry("Npm", "@opencode/Npm", ["hub"], "excluded", "no npm install in workers"),
   entry("ModelsDev", "@opencode/ModelsDev", ["hub"], "excluded", "hub-only catalog refresh"),
-  // Residual nodes reachable from the real `SessionPrompt` graph (task 29). They
-  // are hub/writer/infra-owned, so they are classified `excluded` and
+  // Residual nodes reachable from the real `SessionPrompt` graph. They
+  // are hub/infra-owned, so they are classified `excluded` and
   // supplied by boundary replacements rather than left fail-closed `unknown`.
-  entry("Storage", "@opencode/Storage", ["hub", "writer"], "excluded", "writer-owned storage"),
+  entry("Storage", "@opencode/Storage", ["hub"], "excluded", "hub-owned storage"),
   entry("Git", "@opencode/Git", ["hub"], "excluded", "hub-owned VCS"),
   entry("BackgroundJob", "@opencode/BackgroundJob", ["hub"], "excluded", "hub-resident job registry"),
   entry("Global", "@opencode/Global", ["hub"], "excluded", "process-global state"),
@@ -171,14 +171,14 @@ export const EVENT_EGRESS_CLIENT_KEY = "@opencode/session-worker/EventEgressClie
  */
 export const EVENT_BRIDGE_KEY = "@opencode/session-worker/EventBridge"
 
-/** Client nodes the session layer MUST contain (task 6.5: writer RPC client present). */
+/** Client nodes the session layer MUST contain. */
 export const SESSION_CLIENT_KEYS: readonly string[] = [
   WRITER_CLIENT_KEY,
   EVENT_EGRESS_CLIENT_KEY,
 ]
 
 /**
- * The real session-pipeline services a worker must run (task 29). Every key is
+ * The real session-pipeline services a worker must run. Every key is
  * allowlisted, so a reduced layer built from this set passes `assertSessionLayer`.
  * `RUNNABLE_SESSION_NODES` (`layer.ts`) is derived from this list, so the keys
  * are the single source of truth and the table and the layer cannot drift.
@@ -353,7 +353,7 @@ export function validateSessionLayer(
   }
 }
 
-/** Raised when a session layer violates the node table (fail loud, task 6.5). */
+/** Raised when a session layer violates the node table (fail loud). */
 export class SessionLayerViolationError extends Error {
   readonly report: SessionLayerReport
   constructor(report: SessionLayerReport) {

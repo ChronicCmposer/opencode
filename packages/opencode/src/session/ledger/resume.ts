@@ -86,18 +86,40 @@ export interface AutoResumeController {
   readonly reset: (sessionID: string) => void
 }
 
-export function createAutoResumeController(): AutoResumeController {
+export interface AutoResumeControllerOptions {
+  /** Maximum sessions retained; the oldest attempt count evicts. Defaults to 1024. */
+  readonly maxSessions?: number
+}
+
+export function createAutoResumeController(options: AutoResumeControllerOptions = {}): AutoResumeController & {
+  readonly size: number
+} {
+  const maxSessions = options.maxSessions ?? 1024
+  if (!Number.isInteger(maxSessions) || maxSessions < 1) {
+    throw new Error(`invalid auto-resume session bound: ${maxSessions}`)
+  }
   const attempts = new Map<string, number>()
+  const remember = (sessionID: string, value: number): number => {
+    attempts.delete(sessionID)
+    attempts.set(sessionID, value)
+    while (attempts.size > maxSessions) {
+      const oldest = attempts.keys().next().value
+      if (oldest === undefined) break
+      attempts.delete(oldest)
+    }
+    return value
+  }
   return {
     attempts: (sessionID) => attempts.get(sessionID) ?? 0,
     decide: (input) => decideAutoResume({ ...input, attempts: attempts.get(input.sessionID) ?? 0 }),
     record(sessionID) {
-      const next = (attempts.get(sessionID) ?? 0) + 1
-      attempts.set(sessionID, next)
-      return next
+      return remember(sessionID, (attempts.get(sessionID) ?? 0) + 1)
     },
     reset(sessionID) {
       attempts.delete(sessionID)
+    },
+    get size() {
+      return attempts.size
     },
   }
 }

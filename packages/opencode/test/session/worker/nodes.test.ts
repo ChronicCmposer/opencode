@@ -259,8 +259,11 @@ describe("sessionWorkerNodes", () => {
   // a worker graph contributes no hub, so no nested hub can clobber its thread name.
   test("returns an empty list for a non-hub process role even when enabled", () => {
     expect(sessionWorkerNodes({ hubNode, enabled: true, role: "session" })).toEqual([])
-    expect(sessionWorkerNodes({ hubNode, enabled: true, role: "writer" })).toEqual([])
-    expect(sessionWorkerNodes({ hubNode, enabled: true, role: "broker" })).toEqual([])
+    // An omitted role delegates to the ambient role, which is not necessarily
+    // "unset": the test process imports the hub bootstrap, so it is `hub`.
+    expect(sessionWorkerNodes({ hubNode, enabled: true, role: undefined })).toEqual(
+      sessionWorkerNodes({ hubNode, enabled: true, role: processRole() }),
+    )
   })
 
   test("returns the hub node for the hub role when enabled", () => {

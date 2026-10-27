@@ -1,4 +1,4 @@
-// Phase 11.5 — hub-side mirrored PID/PGID registry (plan decision line 52).
+// Hub-side mirrored PID/PGID registry.
 //
 // 3.10 proved `terminate()` reaps no children: whatever a worker spawned stays
 // alive as an orphan when the isolate is torn down. The hub therefore mirrors

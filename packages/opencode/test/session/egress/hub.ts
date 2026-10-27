@@ -4,8 +4,8 @@
 // production route, so it lives under `test/` and backs the hub/worker-egress
 // stream tests only.
 //
-// Ties a worker's dedicated egress port to a byte fan-out and exposes one async
-// byte stream per SSE client. The hub — not the worker — owns termination: on
+// Ties a worker's dedicated egress port to a JSON fan-out and exposes one async
+// JSON stream per SSE client. The hub — not the worker — owns termination: on
 // `close` it drops buffered non-durable frames, emits a terminal `end`, and
 // closes the egress + control ports. Durable frames are delivered as they arrive
 // (immediate flush worker-side), so termination never reorders or loses a
@@ -47,14 +47,14 @@ export interface EgressHub {
   /** Non-end frames delivered from the worker. */
   readonly frames: number
   readonly closed: boolean
-  /** The async byte stream an SSE route writes for one client. */
-  stream(subscriberId: string): AsyncIterable<Uint8Array>
+  /** The async JSON stream an SSE route writes for one client. */
+  stream(subscriberId: string): AsyncIterable<string>
   /** Drop non-durable, emit `end`, close ports; idempotent (worker `end` or terminate). */
   close(): void
 }
 
 const END_FRAME = endFrame()
-/** The terminal frame's wire bytes, handed to subscribers that arrive after termination. */
+/** The terminal frame's wire JSON, handed to subscribers that arrive after termination. */
 const END_BYTES = encodeFrame(END_FRAME)
 
 function createNotifier() {
@@ -98,9 +98,9 @@ export function createEgressHub(options: EgressHubOptions): EgressHub {
 
   receiver = createEgressReceiver({
     port: options.egressPort,
-    onFrame: (frame, bytes) => {
+    onFrame: (frame, text) => {
       frames++
-      fanout.publishBytes(bytes, frame)
+      fanout.publishBytes(text, frame)
       notifier.notify()
     },
     onEnd: finish,

@@ -1,5 +1,5 @@
 // Production producer for the immutable per-worker `WorkerSnapshot`
-// (plan decisions 67/68).
+//.
 //
 // A session worker runs against a frozen copy of the hub's configuration: it
 // never reads config files, `process.env` or the auth store on its own. The hub

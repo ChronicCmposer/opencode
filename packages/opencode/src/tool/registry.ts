@@ -53,6 +53,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { MCP } from "@/mcp"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { McpCatalog } from "@/mcp/catalog"
+import { sourceForRegistryTool, type ToolSource } from "./route"
 import {
   isRemotePluginToolDefinition,
   type PluginToolExecuteResult,
@@ -75,9 +76,13 @@ type ReadDef = Tool.InferDef<typeof ReadTool>
 type State = {
   custom: Tool.Def[]
   builtin: Tool.Def[]
+  sources: Map<string, ToolSource>
   task: TaskDef
   read: ReadDef
 }
+
+/** A registry tool plus the source that its routing decision derives from. */
+export type RegisteredTool = Tool.Def & { readonly source: ToolSource }
 
 export interface Interface {
   readonly ids: () => Effect.Effect<string[]>
@@ -88,7 +93,7 @@ export interface Interface {
     modelID: ModelV2.ID
     agent: Agent.Info
     permission?: PermissionV1.Ruleset
-  }) => Effect.Effect<Tool.Def[]>
+  }) => Effect.Effect<RegisteredTool[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ToolRegistry") {}
@@ -126,6 +131,7 @@ const layer = Layer.effect(
     const state = yield* InstanceState.make<State>(
       Effect.fn("ToolRegistry.state")(function* (ctx) {
         const custom: Tool.Def[] = []
+        const sources = new Map<string, ToolSource>()
 
         function fromPlugin(id: string, def: ToolDefinition): Tool.Def {
           // Plugin tools still expose Zod args publicly; keep that compatibility
@@ -191,7 +197,9 @@ const layer = Layer.effect(
           const mod = yield* Effect.promise(() => import(pathToFileURL(match).href))
           for (const [id, def] of Object.entries(mod)) {
             if (!isPluginTool(def)) continue
-            custom.push(fromPlugin(id === "default" ? namespace : `${namespace}_${id}`, def))
+            const toolID = id === "default" ? namespace : `${namespace}_${id}`
+            custom.push(fromPlugin(toolID, def))
+            sources.set(toolID, "file")
           }
         }
 
@@ -205,9 +213,11 @@ const layer = Layer.effect(
             if (isRemotePluginToolDefinition(def)) {
               remoteToolIds.add(id)
               custom.push(fromRemotePluginTool(id, def, () => InstanceState.invalidate(state)))
+              sources.set(id, "remote-plugin")
               continue
             }
             custom.push(fromPlugin(id, def))
+            sources.set(id, "plugin")
           }
         }
 
@@ -255,10 +265,14 @@ const layer = Layer.effect(
         ]
 
         assertRemoteToolIdsAreUnique(remoteToolIds, custom, builtin)
+        for (const def of builtin) {
+          if (!sources.has(def.id)) sources.set(def.id, sourceForRegistryTool(def.id))
+        }
 
         return {
           custom,
           builtin,
+          sources,
           task: tool.task,
           read: tool.read,
         }
@@ -334,6 +348,7 @@ const layer = Layer.effect(
               : undefined
           return {
             id: tool.id,
+            source: (yield* InstanceState.get(state)).sources.get(tool.id) ?? sourceForRegistryTool(tool.id),
             description: [
               output.description,
               tool.id === TaskTool.id ? yield* describeTask(input.agent) : undefined,

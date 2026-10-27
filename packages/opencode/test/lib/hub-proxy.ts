@@ -70,6 +70,7 @@ export interface RecordingHubAuthorityOverrides {
   readonly sessionSpawn?: HubProxyAuthorities["sessionSpawn"]
   readonly systemTransform?: HubProxyAuthorities["systemTransform"]
   readonly messagesTransform?: HubProxyAuthorities["messagesTransform"]
+  readonly pluginTrigger?: HubProxyAuthorities["pluginTrigger"]
   readonly pluginTool?: HubProxyAuthorities["pluginTool"]
 }
 
@@ -163,6 +164,7 @@ export function recordingHubAuthorities(
   const sessionSpawn = overrides.sessionSpawn
   const systemTransform = overrides.systemTransform
   const messagesTransform = overrides.messagesTransform
+  const pluginTrigger = overrides.pluginTrigger
   const pluginTool = overrides.pluginTool
   const authorities: HubProxyAuthorities = {
     sessionStatus,
@@ -195,6 +197,12 @@ export function recordingHubAuthorities(
     ) => {
       calls.push({ method: "messagesTransform", args: [input, output] })
       return messagesTransform === undefined ? Promise.resolve(output) : messagesTransform(input, output)
+    },
+    // Always present: absent an override it records the call and returns `output`
+    // unchanged (the handler's own no-plugin pass-through).
+    pluginTrigger: (name: string, input: unknown, output: unknown) => {
+      calls.push({ method: "pluginTrigger", args: [name, input, output] })
+      return pluginTrigger === undefined ? Promise.resolve(output) : pluginTrigger(name, input, output)
     },
     // Unlike the transforms there is no identity fallback: an execute with no
     // authority must reject, so this key is only present when an override is.

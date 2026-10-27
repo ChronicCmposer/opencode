@@ -1,13 +1,12 @@
-// Phase 8.13 — dedicated control channel (plan task 8.13).
+// Dedicated control channel.
 //
 // Cancel, `listen`, durable-wake and resync must never queue behind a burst of
 // delta frames, so a SEPARATE `MessagePort` carries control traffic for every
-// worker (plan decision line 88). This module is the shared request/reply +
+// worker. This module is the shared request/reply +
 // notification plumbing both ends use; the concrete EventV2 mesh protocol lives
 // in `mesh.ts`.
 
-import type { EventV2Event } from "./frame"
-import type { WriterOrdinal } from "./ordinal"
+import type { AggregatePosition, EventV2Event } from "./frame"
 
 /**
  * Permissive control-frame envelope: the transport base every frame satisfies.
@@ -23,7 +22,7 @@ export interface ControlEnvelope {
 }
 
 /**
- * Every typed control frame (plan task 8.13).
+ * Every typed control frame.
  *
  * `id` is present on requests and their replies; `durable` / `resync` are
  * hub→worker pushes; `durable.ack` / `resync.ack` acknowledge them back.
@@ -34,7 +33,7 @@ export type ControlFrame =
   | { readonly type: "listen"; readonly id: number; readonly pattern: string }
   | { readonly type: "unlisten"; readonly id: number; readonly pattern: string }
   | { readonly type: "listen.ok"; readonly id: number }
-  | { readonly type: "durable"; readonly meta: WriterOrdinal; readonly event: EventV2Event }
+  | { readonly type: "durable"; readonly meta: AggregatePosition; readonly event: EventV2Event }
   | { readonly type: "resync"; readonly pattern: string }
   | { readonly type: "durable.ack"; readonly count: number }
   | { readonly type: "resync.ack"; readonly pattern?: string }
@@ -113,9 +112,15 @@ function isEventV2(value: unknown): value is EventV2Event {
   return isControlRecord(value) && typeof value.id === "string" && typeof value.type === "string" && "properties" in value
 }
 
-/** The writer-stamped `{ generation, ordinal }` a `durable` frame must carry. */
-function isWriterOrdinalShape(value: unknown): value is WriterOrdinal {
-  return isControlRecord(value) && Number.isInteger(value.generation) && Number.isInteger(value.ordinal)
+/** The `{ aggregateID, seq }` durable identity a `durable` frame must carry. */
+function isAggregatePositionShape(value: unknown): value is AggregatePosition {
+  return (
+    isControlRecord(value) &&
+    typeof value.aggregateID === "string" &&
+    value.aggregateID.length > 0 &&
+    Number.isInteger(value.seq) &&
+    (value.seq as number) >= 1
+  )
 }
 
 /** True when `data` carries one of the typed frame discriminants. */
@@ -127,7 +132,7 @@ function isKnownControlType(data: unknown): boolean {
  * Parse an untrusted port message into a trusted {@link ControlFrame}.
  *
  * Every KNOWN variant is validated field-by-field — a numeric `id`, a string
- * `pattern`, a `{ generation, ordinal }` / EventV2 `{ id, type, properties }`
+ * `pattern`, an `{ aggregateID, seq }` / EventV2 `{ id, type, properties }`
  * body, a non-negative-integer ack `count` — and rebuilt as a correctly-typed
  * union member, so a frame with a malformed body never enters internal logic as a
  * trusted frame: it returns `undefined` and the caller surfaces it loudly. An
@@ -162,7 +167,7 @@ function parseControlFrame(data: unknown): ControlFrame | undefined {
         : { type: "unlisten", id, pattern: data.pattern }
     }
     case "durable":
-      return isWriterOrdinalShape(data.meta) && isEventV2(data.event)
+      return isAggregatePositionShape(data.meta) && isEventV2(data.event)
         ? { type: "durable", meta: data.meta, event: data.event }
         : undefined
     case "resync":

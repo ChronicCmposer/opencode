@@ -13,7 +13,11 @@ import { Truncate } from "@/tool/truncate"
 import { Plugin } from "@/plugin"
 import type { TaskPromptOps } from "@/tool/task"
 import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
+import { createToolCallLedger, ToolCallNotStartedError, type ToolCallLedgerHandle } from "./ledger/tool-call"
+import type { LifecycleReporting } from "./ledger/lifecycle"
+import { Faults } from "@/testing/faults"
+import { WorkerDb } from "./worker/db"
 import { Session } from "./session"
 import { SessionProcessor } from "./processor"
 import { PartID } from "./schema"
@@ -44,6 +48,14 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
+  /**
+   * The durable tool-call ledger. A worker boot passes a handle over its own WAL
+   * connection; absent, the per-worker `WorkerDb` connection is used when the
+   * graph provides one. A hub process (no worker connection) records nothing.
+   */
+  ledger?: ToolCallLedgerHandle
+  /** The hub-observed run truth; mirrors in-flight calls for auto-resume when supplied. */
+  lifecycle?: Pick<LifecycleReporting, "toolStarted" | "toolFinished">
 }) {
   const tools: Record<string, AITool> = {}
   const run = yield* EffectBridge.make()
@@ -58,6 +70,65 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   // the presence of a client or a layer node.
   const toolHost = ToolRoute.hostForRole()
   const available = (ref: ToolRoute.ToolRef) => ToolRoute.runsOn(ToolRoute.routeTool(ref), toolHost)
+
+  // The ledger row is the durable truth a crash is recovered from. Resolve it
+  // once per tool set: an explicit handle wins, otherwise the worker's own WAL
+  // connection backs it. The hub has neither, so it records nothing.
+  const ledger = yield* Effect.gen(function* () {
+    if (input.ledger !== undefined) return input.ledger
+    const workerDb = yield* Effect.serviceOption(WorkerDb)
+    if (Option.isNone(workerDb)) return undefined
+    // The reduced graph binds `WorkerDb` to a fail-loud boundary when no worker
+    // database is supplied (degraded boot, in-process tests). That boundary is
+    // not a ledger connection; absent a real worker DB the tool path keeps its
+    // previous no-ledger behavior instead of failing every call.
+    const connection = workerDb.value.connection
+    if (typeof connection?.all !== "function" || typeof connection?.run !== "function") return undefined
+    return createToolCallLedger(connection)
+  })
+
+  const finishToolCall = (callID: string, outcome: "ok" | "error"): void | Promise<void> => {
+    if (ledger !== undefined) {
+      try {
+        ledger.finish({ callID, sessionID: input.session.id, outcome })
+      } catch (error) {
+        // A finish after a duplicate start (or a replayed result) must not turn a
+        // successful tool into a failure; a real ledger fault still surfaces.
+        if (!(error instanceof ToolCallNotStartedError)) throw error
+      }
+    }
+    return input.lifecycle?.toolFinished(input.session.id, callID)
+  }
+
+  /**
+   * Record `started` before the effect and `finished` after it. This is a plain
+   * statement on the worker connection, never a `BEGIN`, so a tool that already
+   * owns a transaction (or finishes its result after this wire-up) composes
+   * instead of nesting. A defect/interrupt between the two leaves the row
+   * `started` — the indeterminate state recovery refuses to auto-retry.
+   */
+  const withToolLedger = <A, E, R>(tool: string, callID: string, effect: Effect.Effect<A, E, R>) => {
+    if (ledger === undefined && input.lifecycle === undefined) return effect
+    return Effect.gen(function* () {
+      if (ledger !== undefined) {
+        ledger.start({ callID, sessionID: input.session.id, tool, sideEffecting: true })
+      }
+      // Wait for the hub to observe the start BEFORE the effect runs: a crash
+      // between the two must leave an indeterminate call recovery refuses to
+      // replay. The durable ledger row is written first for the same reason.
+      const started = input.lifecycle?.toolStarted(input.session.id, callID, true)
+      if (started !== undefined) yield* Effect.promise(() => started)
+      Faults.crashWorker("tool:effect")
+      return yield* effect.pipe(
+        Effect.tap(() => Effect.promise(() => Promise.resolve(finishToolCall(callID, "ok")))),
+        Effect.catch((error) =>
+          Effect.promise(() => Promise.resolve(finishToolCall(callID, "error"))).pipe(
+            Effect.flatMap(() => Effect.fail(error)),
+          ),
+        ),
+      )
+    })
+  }
 
   const context = (args: Record<string, unknown>, options: ToolExecutionOptions): Tool.Context => ({
     sessionID: input.session.id,
@@ -99,40 +170,44 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       agent: input.agent,
       permission: input.session.permission,
     })) {
-      if (!available({ id: item.id, source: ToolRoute.sourceForRegistryTool(item.id) })) continue
+      if (!available({ id: item.id, source: item.source ?? ToolRoute.sourceForRegistryTool(item.id) })) continue
       const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))
       tools[item.id] = tool({
         description: item.description,
         inputSchema: jsonSchema(schema),
         execute(args, options) {
           return run.promise(
-            Effect.gen(function* () {
-              const ctx = context(args, options)
-              yield* plugin.trigger(
-                "tool.execute.before",
-                { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
-                { args },
-              )
-              const result = yield* item.execute(args, ctx)
-              const output = {
-                ...result,
-                attachments: result.attachments?.map((attachment) => ({
-                  ...attachment,
-                  id: PartID.ascending(),
-                  sessionID: ctx.sessionID,
-                  messageID: input.processor.message.id,
-                })),
-              }
-              yield* plugin.trigger(
-                "tool.execute.after",
-                { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
-                output,
-              )
-              if (options.abortSignal?.aborted) {
-                yield* input.processor.completeToolCall(options.toolCallId, output)
-              }
-              return output
-            }),
+            withToolLedger(
+              item.id,
+              options.toolCallId,
+              Effect.gen(function* () {
+                const ctx = context(args, options)
+                yield* plugin.trigger(
+                  "tool.execute.before",
+                  { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
+                  { args },
+                )
+                const result = yield* item.execute(args, ctx)
+                const output = {
+                  ...result,
+                  attachments: result.attachments?.map((attachment) => ({
+                    ...attachment,
+                    id: PartID.ascending(),
+                    sessionID: ctx.sessionID,
+                    messageID: input.processor.message.id,
+                  })),
+                }
+                yield* plugin.trigger(
+                  "tool.execute.after",
+                  { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
+                  output,
+                )
+                if (options.abortSignal?.aborted) {
+                  yield* input.processor.completeToolCall(options.toolCallId, output)
+                }
+                return output
+              }),
+            ),
           )
         },
       })
@@ -173,68 +248,72 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       ),
       execute(args, opts) {
         return run.promise(
-          Effect.gen(function* () {
-            const parsed = parseListMcpResourcesArgs(args)
-            const ctx = context(toRecord(args), opts)
-            const clients = yield* mcp.clients()
-            const resourceServers = Object.entries(clients)
-              .filter((entry) => !!entry[1].getServerCapabilities()?.resources)
-              .map((entry) => entry[0])
-              .sort((a, b) => a.localeCompare(b))
-            if (parsed.server && !resourceServers.includes(parsed.server)) {
-              throw new Error(
-                resourceServers.length === 0
-                  ? `MCP server "${parsed.server}" does not support resources`
-                  : `MCP server "${parsed.server}" does not support resources. Available resource servers: ${resourceServers.join(", ")}`,
+          withToolLedger(
+            spec.tool,
+            opts.toolCallId,
+            Effect.gen(function* () {
+              const parsed = parseListMcpResourcesArgs(args)
+              const ctx = context(toRecord(args), opts)
+              const clients = yield* mcp.clients()
+              const resourceServers = Object.entries(clients)
+                .filter((entry) => !!entry[1].getServerCapabilities()?.resources)
+                .map((entry) => entry[0])
+                .sort((a, b) => a.localeCompare(b))
+              if (parsed.server && !resourceServers.includes(parsed.server)) {
+                throw new Error(
+                  resourceServers.length === 0
+                    ? `MCP server "${parsed.server}" does not support resources`
+                    : `MCP server "${parsed.server}" does not support resources. Available resource servers: ${resourceServers.join(", ")}`,
+                )
+              }
+              const permissionPatterns = parsed.server
+                ? [`mcp:${parsed.server}:*`]
+                : resourceServers.map((server) => `mcp:${server}:*`)
+              yield* plugin.trigger(
+                "tool.execute.before",
+                { tool: spec.tool, sessionID: ctx.sessionID, callID: opts.toolCallId },
+                { args },
               )
-            }
-            const permissionPatterns = parsed.server
-              ? [`mcp:${parsed.server}:*`]
-              : resourceServers.map((server) => `mcp:${server}:*`)
-            yield* plugin.trigger(
-              "tool.execute.before",
-              { tool: spec.tool, sessionID: ctx.sessionID, callID: opts.toolCallId },
-              { args },
-            )
-            yield* ctx.ask({
-              permission: "read",
-              metadata: parsed.server ? { server: parsed.server } : {},
-              patterns: permissionPatterns,
-              always: permissionPatterns,
-            })
+              yield* ctx.ask({
+                permission: "read",
+                metadata: parsed.server ? { server: parsed.server } : {},
+                patterns: permissionPatterns,
+                always: permissionPatterns,
+              })
 
-            const items = Object.values(yield* spec.fetch(parsed.server))
-            const filtered = items
-              .filter((item) => !parsed.server || item.client === parsed.server)
-              .toSorted((a, b) => spec.sortKey(a).localeCompare(spec.sortKey(b)))
-            const content = JSON.stringify({ [spec.resultKey]: filtered.map(formatMcpResourceEntry) }, null, 2)
-            const bounded = yield* Truncate.boundResult(
-              truncate,
-              {
-                output: content,
-                metadata: {
-                  count: filtered.length,
-                  servers: resourceServers,
-                  ...(parsed.server ? { server: parsed.server } : {}),
+              const items = Object.values(yield* spec.fetch(parsed.server))
+              const filtered = items
+                .filter((item) => !parsed.server || item.client === parsed.server)
+                .toSorted((a, b) => spec.sortKey(a).localeCompare(spec.sortKey(b)))
+              const content = JSON.stringify({ [spec.resultKey]: filtered.map(formatMcpResourceEntry) }, null, 2)
+              const bounded = yield* Truncate.boundResult(
+                truncate,
+                {
+                  output: content,
+                  metadata: {
+                    count: filtered.length,
+                    servers: resourceServers,
+                    ...(parsed.server ? { server: parsed.server } : {}),
+                  },
                 },
-              },
-              input.agent,
-            )
-            const output = {
-              title: parsed.server ? `${spec.title}: ${parsed.server}` : spec.title,
-              metadata: bounded.metadata,
-              output: bounded.output,
-            }
-            yield* plugin.trigger(
-              "tool.execute.after",
-              { tool: spec.tool, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
-              output,
-            )
-            if (opts.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(opts.toolCallId, output)
-            }
-            return output
-          }),
+                input.agent,
+              )
+              const output = {
+                title: parsed.server ? `${spec.title}: ${parsed.server}` : spec.title,
+                metadata: bounded.metadata,
+                output: bounded.output,
+              }
+              yield* plugin.trigger(
+                "tool.execute.after",
+                { tool: spec.tool, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
+                output,
+              )
+              if (opts.abortSignal?.aborted) {
+                yield* input.processor.completeToolCall(opts.toolCallId, output)
+              }
+              return output
+            }),
+          ),
         )
       },
     })
@@ -262,8 +341,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       ),
       execute(args, opts) {
         return run.promise(
-          Effect.gen(function* () {
-            const parsed = parseReadMcpResourceArgs(args)
+          withToolLedger(
+            MCP_RESOURCE_TOOLS.read,
+            opts.toolCallId,
+            Effect.gen(function* () {
+              const parsed = parseReadMcpResourceArgs(args)
             const ctx = context(toRecord(args), opts)
             const clients = yield* mcp.clients()
             const client = clients[parsed.server]
@@ -322,7 +404,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               yield* input.processor.completeToolCall(opts.toolCallId, output)
             }
             return output
-          }),
+            }),
+          ),
         )
       },
     })
@@ -369,8 +452,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       item.inputSchema = jsonSchema(transformed)
       item.execute = (args, opts) =>
         run.promise(
-          Effect.gen(function* () {
-            const ctx = context(args, opts)
+          withToolLedger(
+            key,
+            opts.toolCallId,
+            Effect.gen(function* () {
+              const ctx = context(args, opts)
             yield* plugin.trigger(
               "tool.execute.before",
               { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },
@@ -455,7 +541,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               yield* input.processor.completeToolCall(opts.toolCallId, output)
             }
             return output
-          }),
+            }),
+          ),
         )
       tools[key] = item
     }

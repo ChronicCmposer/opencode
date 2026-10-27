@@ -6,8 +6,12 @@ import { LSP } from "@/lsp/lsp"
 import * as LSPServer from "@/lsp/server"
 import { TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
+import { LspTool } from "@/tool/lsp"
+import { ToolRoute } from "@/tool/route"
 
 const it = testEffect(LayerNode.compile(LSP.node))
+
+const fakeServerPath = path.join(__dirname, "../fixture/lsp/fake-lsp-server.js")
 
 describe("LSP service lifecycle", () => {
   let spawnSpy: ReturnType<typeof spyOn>
@@ -128,6 +132,73 @@ describe("LSP service lifecycle", () => {
         yield* lsp.init()
       }),
     ),
+  )
+})
+
+describe("LSP tool parity and child lifecycle", () => {
+  test("the LSP tool stays hub-only and is not deleted", () => {
+    expect(LspTool.id).toBe("lsp")
+    const source = ToolRoute.sourceForRegistryTool("lsp")
+    expect(source).toBe("lsp")
+    expect(ToolRoute.hostForSource(source)).toBe("hub")
+    expect(ToolRoute.runsOn(ToolRoute.routeTool({ id: "lsp", source }), "worker")).toBe(false)
+  })
+
+  it.instance(
+    "repeated and concurrent first use reuses one language-server client",
+    () =>
+      LSP.Service.use((lsp) =>
+        Effect.gen(function* () {
+          const dir = (yield* TestInstance).directory
+          const file = path.join(dir, "cardinality.repro")
+          yield* Effect.promise(() => Bun.write(file, "sample\n"))
+
+          yield* Effect.all([lsp.touchFile(file), lsp.touchFile(file), lsp.touchFile(file)], {
+            concurrency: "unbounded",
+          })
+          yield* lsp.touchFile(file)
+
+          const status = yield* lsp.status()
+          expect(status.filter((entry) => entry.id === "fake")).toHaveLength(1)
+        }),
+      ),
+    {
+      config: {
+        lsp: {
+          fake: { command: [process.execPath, fakeServerPath], extensions: [".repro"] },
+        },
+      },
+    },
+  )
+
+  it.instance(
+    "a cancelled and a failed call leave the one hub client reusable (no leak or duplicate)",
+    () =>
+      LSP.Service.use((lsp) =>
+        Effect.gen(function* () {
+          const dir = (yield* TestInstance).directory
+          const file = path.join(dir, "cancel.repro")
+          yield* Effect.promise(() => Bun.write(file, "sample\n"))
+          yield* lsp.touchFile(file)
+
+          yield* lsp
+            .hover({ file, line: 0, character: 0 })
+            .pipe(Effect.timeout("10 millis"), Effect.orElseSucceed(() => []))
+          yield* lsp.hover({ file, line: 0, character: 0 }).pipe(Effect.orElseSucceed(() => []))
+
+          const status = yield* lsp.status()
+          expect(status.filter((entry) => entry.id === "fake")).toHaveLength(1)
+          // A subsequent call still succeeds against the same client.
+          yield* lsp.touchFile(file)
+        }),
+      ),
+    {
+      config: {
+        lsp: {
+          fake: { command: [process.execPath, fakeServerPath], extensions: [".repro"] },
+        },
+      },
+    },
   )
 })
 

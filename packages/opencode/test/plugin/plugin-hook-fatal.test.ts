@@ -84,8 +84,8 @@ describe("configured plugin hook route", () => {
       withProject(
         [
           "export default async () => ({",
-          '  "shell.env": (_input, output) => {',
-          '    output.env.TERM = "plugin"',
+          '  "chat.message": (_input, output) => {',
+          '    output.parts ??= []',
           "  },",
           "})",
           "",
@@ -97,7 +97,7 @@ describe("configured plugin hook route", () => {
           expect(Cause.hasDies(exit.cause)).toBe(true)
           const defect = exit.cause.reasons.filter(Cause.isDieReason).at(0)?.defect
           expect(defect).toBeInstanceOf(UnsupportedPluginHookError)
-          expect((defect as UnsupportedPluginHookError).hook).toBe("shell.env")
+          expect((defect as UnsupportedPluginHookError).hook).toBe("chat.message")
         }),
       ),
     15_000,

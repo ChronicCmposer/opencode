@@ -5,7 +5,6 @@
 // only process that migrates; a worker refuses a schema whose `user_version` or
 // migration journal differs from the build it runs.
 
-import { createHash } from "node:crypto"
 import { Context, Effect, Layer, Schema } from "effect"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { Database as DatabaseService } from "@opencode-ai/core/database/database"
@@ -14,11 +13,18 @@ import { openConnection, type Connection, type QueryParams, type WriteOutcome } 
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import type { SQLQueryBindings } from "bun:sqlite"
-import { migrationStatements } from "@/session/writer/migration.statements.gen"
+import {
+  SCHEMA_BODY_HASH,
+  SCHEMA_MIGRATION_IDS,
+  SCHEMA_TABLES,
+  SCHEMA_VERSION,
+  WORKER_WRITABLE_TABLES,
+} from "@/session/db/allowlist.gen"
+import { hashIdentity, readPersistedBodyHash } from "@/session/db/identity"
+import { deriveSessionScopedTables } from "@/session/db/derive"
 import { WORKER_DB_KEY } from "./node-table"
 
-/** The build's schema version. The hub bumps this when migrations change. */
-export const SCHEMA_VERSION = 1
+export { SCHEMA_VERSION, WORKER_WRITABLE_TABLES, deriveSessionScopedTables }
 
 export interface SchemaIdentity {
   readonly version: number
@@ -134,39 +140,14 @@ export interface WorkerDatabase {
 export type SchemaConnection = Pick<Connection, "all" | "exec"> &
   Partial<Pick<Connection, "pragma">>
 
-// Tables that carry a `session_id` foreign key are worker-writable (D6). Every
-// other table is hub-only. `assertWorkerTableOwnership` derives this list from
-// the live schema, so a table that gains or loses `session_id` without an update
-// here fails the gate.
-export const WORKER_WRITABLE_TABLES: readonly string[] = Object.freeze([
-  "message",
-  "part",
-  "session_context_epoch",
-  "session_input",
-  "session_message",
-  "session_share",
-  "todo",
-  "tool_call",
-  "worker_crash",
-])
-
-export const HUB_ONLY_TABLES: readonly string[] = Object.freeze([
-  "account",
-  "account_state",
-  "control_account",
-  "credential",
-  "data_migration",
-  "event",
-  "event_sequence",
-  "migration",
-  "permission",
-  "project",
-  "project_directory",
-  "session",
-  "workspace",
-])
-
+// Tables that carry an actual foreign-key path to the `session` aggregate are
+// worker-writable (D6). The generated allowlist is the single source; the live
+// schema is re-derived at boot so a drifted table set fails the gate.
+const DURABLE_LOG_TABLES: ReadonlySet<string> = new Set(["event", "event_sequence"])
 const WORKER_WRITABLE_TABLE_SET: ReadonlySet<string> = new Set(WORKER_WRITABLE_TABLES)
+export const HUB_ONLY_TABLES: readonly string[] = Object.freeze(
+  SCHEMA_TABLES.filter((table) => !WORKER_WRITABLE_TABLE_SET.has(table) && !DURABLE_LOG_TABLES.has(table)),
+)
 const HUB_ONLY_TABLE_SET: ReadonlySet<string> = new Set(HUB_ONLY_TABLES)
 
 /**
@@ -193,45 +174,49 @@ const DDL_KEYWORDS: ReadonlySet<string> = new Set([
 
 const WRITE_KEYWORDS: ReadonlySet<string> = new Set(["delete", "insert", "replace", "update"])
 
-const MIGRATION_ID =
-  /INSERT\s+OR\s+IGNORE\s+INTO\s+`?migration`?\s*\(\s*id\s*,\s*time_completed\s*\)\s*VALUES\s*\(\s*'([^']+)'/gi
-
 export function currentSchemaIdentity(): SchemaIdentity {
-  const ids: string[] = []
-  for (const statement of migrationStatements) {
-    MIGRATION_ID.lastIndex = 0
-    const match = MIGRATION_ID.exec(statement)
-    if (match?.[1] !== undefined) ids.push(match[1])
+  return {
+    version: SCHEMA_VERSION,
+    contentHash: hashIdentity({
+      version: SCHEMA_VERSION,
+      ids: SCHEMA_MIGRATION_IDS,
+      bodyHash: SCHEMA_BODY_HASH,
+    }),
   }
-  return { version: SCHEMA_VERSION, contentHash: contentHash(ids) }
 }
 
 export function schemaIdentity(connection: SchemaConnection): SchemaIdentity {
+  const version = readUserVersion(connection)
   return {
-    version: readUserVersion(connection),
-    contentHash: contentHash(readMigrationIDs(connection)),
+    version,
+    contentHash: hashIdentity({
+      version,
+      ids: readMigrationIDs(connection),
+      bodyHash: readPersistedBodyHash(connection),
+    }),
   }
 }
 
 /** The hub's migration completion marker: `user_version` becomes the build version. */
 export function markSchemaIdentity(connection: SchemaConnection): void {
   const expected = currentSchemaIdentity()
-  const observed = schemaIdentity(connection)
-  if (expected.contentHash !== observed.contentHash) throw new SchemaMismatch({ expected, observed })
-  connection.exec(`PRAGMA user_version = ${expected.version}`)
-}
-
-/** Every table with a `session_id` column, derived from the live schema. */
-export function deriveSessionScopedTables(connection: SchemaConnection): readonly string[] {
-  const tables = connection.all<{ readonly name: string }>(
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+  connection.exec(
+    `INSERT OR REPLACE INTO schema_meta (id, content_hash) VALUES ('schema', '${SCHEMA_BODY_HASH}')`,
   )
-  const scoped: string[] = []
-  for (const { name } of tables) {
-    const columns = connection.all<{ readonly name: string }>(`PRAGMA table_info(${quoteIdentifier(name)})`)
-    if (columns.some((column) => column.name === "session_id")) scoped.push(name)
+  // Verify the journal and body at the *expected* version, then write the
+  // marker version itself.
+  const content = {
+    version: expected.version,
+    contentHash: hashIdentity({
+      version: expected.version,
+      ids: readMigrationIDs(connection),
+      bodyHash: readPersistedBodyHash(connection),
+    }),
   }
-  return Object.freeze(scoped)
+  if (expected.contentHash !== content.contentHash) {
+    throw new SchemaMismatch({ expected, observed: schemaIdentity(connection) })
+  }
+  connection.exec(`PRAGMA user_version = ${expected.version}`)
 }
 
 /** Fail loud when the generated worker allowlist no longer matches the schema. */
@@ -320,7 +305,7 @@ function makeWorkerDatabase(filename: string, identity: SchemaIdentity, connecti
   const all = <Row = Record<string, unknown>>(sql: string, params: QueryParams = []) =>
     Effect.try({
       try: () => {
-        assertNoDdl(sql)
+        assertWorkerStatement(sql)
         return guarded.all<Row>(sql, params)
       },
       catch: asWorkerDatabaseError,
@@ -354,10 +339,22 @@ function guard(connection: Connection): WorkerConnection {
       return connection.closed
     },
     query: <Row>(sql: string) => ({
-      all: (...params: SQLQueryBindings[]) => connection.all<Row>(sql, params),
-      values: (...params: SQLQueryBindings[]) => connection.values(sql, params),
-      get: (...params: SQLQueryBindings[]) => connection.all<Row>(sql, params)[0] ?? null,
-      run: (...params: SQLQueryBindings[]) => connection.run(sql, params),
+      all: (...params: SQLQueryBindings[]) => {
+        assertWorkerStatement(sql)
+        return connection.all<Row>(sql, params)
+      },
+      values: (...params: SQLQueryBindings[]) => {
+        assertWorkerStatement(sql)
+        return connection.values(sql, params)
+      },
+      get: (...params: SQLQueryBindings[]) => {
+        assertWorkerStatement(sql)
+        return connection.all<Row>(sql, params)[0] ?? null
+      },
+      run: (...params: SQLQueryBindings[]) => {
+        assertWorkerStatement(sql)
+        return connection.run(sql, params)
+      },
     }),
     all: <Row>(sql: string, params: QueryParams = []) => {
       assertWorkerStatement(sql)
@@ -372,10 +369,13 @@ function guard(connection: Connection): WorkerConnection {
       return connection.run(sql, params)
     },
     exec: (sql) => {
-      assertNoDdl(sql)
+      assertWorkerStatement(sql)
       connection.exec(sql)
     },
-    pragma: (name) => connection.pragma(name),
+    pragma: (name) => {
+      assertReadOnlyPragma(name)
+      return connection.pragma(name)
+    },
     journalMode: () => connection.journalMode(),
     close: () => connection.close(),
   }
@@ -394,43 +394,235 @@ function workerRunner(connection: WorkerConnection): SqliteNativeRunner {
   }
 }
 
+// The single worker SQL boundary: classify by statement kind (not the leading
+// token), reject multi-statement SQL, CTE-DML, DDL, and non-read-only pragmas,
+// then enforce table ownership on writes (C9/D14/D21).
 function assertWorkerStatement(sql: string): void {
-  const keyword = firstKeyword(sql)
+  if (hasMultipleStatements(sql)) {
+    throw new WorkerStatementRejectedError({ reason: "multiple statements are hub-only" })
+  }
+  const stripped = stripComments(sql)
+  const keyword = statementKeyword(stripped)
+  if (keyword === "pragma") {
+    assertReadOnlyPragma(pragmaName(stripped))
+    return
+  }
   if (DDL_KEYWORDS.has(keyword)) throw new WorkerStatementRejectedError({ reason: `DDL "${keyword}" is hub-only` })
   if (!WRITE_KEYWORDS.has(keyword)) return
-  const table = writtenTable(sql)
+  const table = writtenTable(stripped)
   if (table === undefined) {
     throw new WorkerStatementRejectedError({ reason: `cannot classify the table of "${sql.trim().slice(0, 80)}"` })
   }
   if (SESSION_ROOT_TABLES.has(table)) return
+  // Durable log writes are the worker Bus's own connection (C2/D13); ownership
+  // and sequence fencing are enforced by the Bus lease before it writes.
+  if (DURABLE_LOG_TABLES.has(table)) return
   if (HUB_ONLY_TABLE_SET.has(table)) throw new HubOnlyTableError({ table })
   if (!WORKER_WRITABLE_TABLE_SET.has(table)) {
     throw new WorkerStatementRejectedError({ reason: `table "${table}" is not worker-writable` })
   }
 }
 
-function assertNoDdl(sql: string): void {
-  const keyword = firstKeyword(sql)
-  if (DDL_KEYWORDS.has(keyword)) throw new WorkerStatementRejectedError({ reason: `DDL "${keyword}" is hub-only` })
+const READ_ONLY_PRAGMAS: ReadonlySet<string> = new Set([
+  "busy_timeout",
+  "compile_options",
+  "database_list",
+  "foreign_keys",
+  "index_info",
+  "index_list",
+  "integrity_check",
+  "journal_mode",
+  "schema_version",
+  "synchronous",
+  "table_info",
+  "table_list",
+  "user_version",
+  "wal_autocheckpoint",
+])
+
+function pragmaName(sql: string): string {
+  return /^\s*pragma\s+([^;]+)/i.exec(sql)?.[1]?.trim() ?? ""
+}
+
+function assertReadOnlyPragma(name: string): void {
+  const normalized = name.trim()
+  if (normalized.includes("=")) {
+    throw new WorkerStatementRejectedError({ reason: `pragma "${name}" is read-only in a worker` })
+  }
+  const key = normalized.split(/[\s(]/)[0]?.toLowerCase() ?? ""
+  if (!READ_ONLY_PRAGMAS.has(key)) {
+    throw new WorkerStatementRejectedError({ reason: `pragma "${key}" is not worker-readable` })
+  }
+}
+
+/** Remove line/block comments outside quoted strings and identifiers. */
+function stripComments(sql: string): string {
+  let out = ""
+  let index = 0
+  while (index < sql.length) {
+    const char = sql[index]
+    if (char === "'" || char === '"' || char === "`") {
+      out += char
+      index += 1
+      while (index < sql.length) {
+        const next = sql[index]
+        out += next
+        if (next === char) {
+          if (sql[index + 1] === char) {
+            out += sql[index + 1]
+            index += 2
+            continue
+          }
+          index += 1
+          break
+        }
+        index += 1
+      }
+      continue
+    }
+    if (char === "[") {
+      out += char
+      index += 1
+      while (index < sql.length) {
+        const next = sql[index]
+        out += next
+        index += 1
+        if (next === "]") break
+      }
+      continue
+    }
+    if (char === "-" && sql[index + 1] === "-") {
+      while (index < sql.length && sql[index] !== "\n") index += 1
+      continue
+    }
+    if (char === "/" && sql[index + 1] === "*") {
+      index += 2
+      while (index < sql.length && !(sql[index] === "*" && sql[index + 1] === "/")) index += 1
+      index += 2
+      continue
+    }
+    out += char
+    index += 1
+  }
+  return out
+}
+
+/** True when a top-level `;` is followed by another statement. */
+function hasMultipleStatements(sql: string): boolean {
+  let depth = 0
+  let index = 0
+  while (index < sql.length) {
+    const char = sql[index]
+    if (char === "'" || char === '"' || char === "`") {
+      index += 1
+      while (index < sql.length) {
+        if (sql[index] === char) {
+          if (sql[index + 1] === char) {
+            index += 2
+            continue
+          }
+          index += 1
+          break
+        }
+        index += 1
+      }
+      continue
+    }
+    if (char === "[") {
+      index += 1
+      while (index < sql.length && sql[index] !== "]") index += 1
+      index += 1
+      continue
+    }
+    if (char === "-" && sql[index + 1] === "-") {
+      while (index < sql.length && sql[index] !== "\n") index += 1
+      continue
+    }
+    if (char === "/" && sql[index + 1] === "*") {
+      index += 2
+      while (index < sql.length && !(sql[index] === "*" && sql[index + 1] === "/")) index += 1
+      index += 2
+      continue
+    }
+    if (char === "(") depth += 1
+    else if (char === ")") depth = Math.max(0, depth - 1)
+    else if (char === ";" && depth === 0) {
+      const rest = stripComments(sql.slice(index + 1)).replace(/[\s;]+/g, "")
+      if (rest.length > 0) return true
+    }
+    index += 1
+  }
+  return false
+}
+
+/** Top-level words outside parentheses/strings; used for statement kind. */
+function topLevelWords(sql: string): string[] {
+  const words: string[] = []
+  let depth = 0
+  let index = 0
+  let current = ""
+  const flush = () => {
+    if (current.length > 0 && depth === 0) words.push(current.toLowerCase())
+    current = ""
+  }
+  while (index < sql.length) {
+    const char = sql[index]
+    if (char === "'" || char === '"' || char === "`") {
+      flush()
+      index += 1
+      while (index < sql.length) {
+        if (sql[index] === char) {
+          if (sql[index + 1] === char) {
+            index += 2
+            continue
+          }
+          index += 1
+          break
+        }
+        index += 1
+      }
+      continue
+    }
+    if (char === "(") {
+      flush()
+      depth += 1
+    } else if (char === ")") {
+      flush()
+      depth = Math.max(0, depth - 1)
+    } else if (/[A-Za-z_]/.test(char)) {
+      current += char
+    } else {
+      flush()
+    }
+    index += 1
+  }
+  flush()
+  return words
+}
+
+const STATEMENT_KINDS: ReadonlySet<string> = new Set([...WRITE_KEYWORDS, "select"])
+
+function statementKeyword(sql: string): string {
+  const words = topLevelWords(sql)
+  const first = words[0] ?? ""
+  if (first !== "with") return first
+  const kind = words.slice(1).find((word) => STATEMENT_KINDS.has(word))
+  return kind ?? first
 }
 
 function writtenTable(sql: string): string | undefined {
   const normalized = sql.trim().replace(/\s+/g, " ")
   const patterns = [
-    /^insert\s+(?:or\s+\w+\s+)?into\s+([`"\[\].\w]+)/i,
-    /^replace\s+(?:into\s+)?([`"\[\].\w]+)/i,
-    /^update\s+(?:or\s+\w+\s+)?([`"\[\].\w]+)/i,
-    /^delete\s+from\s+([`"\[\].\w]+)/i,
+    /\binsert\s+(?:or\s+\w+\s+)?into\s+([`"\[\].\w]+)/i,
+    /\breplace\s+(?:into\s+)?([`"\[\].\w]+)/i,
+    /\bupdate\s+(?:or\s+\w+\s+)?([`"\[\].\w]+)/i,
+    /\bdelete\s+from\s+([`"\[\].\w]+)/i,
   ]
   for (const pattern of patterns) {
     const match = pattern.exec(normalized)
     if (match?.[1] !== undefined) return bareTable(match[1])
   }
   return undefined
-}
-
-function firstKeyword(sql: string): string {
-  return sql.trim().split(/\s+/)[0]?.toLowerCase() ?? ""
 }
 
 function bareTable(token: string): string {
@@ -451,10 +643,6 @@ function readMigrationIDs(connection: SchemaConnection): readonly string[] {
   } catch {
     return []
   }
-}
-
-function contentHash(ids: readonly string[]): string {
-  return createHash("sha256").update([...ids].sort().join("\n")).digest("hex")
 }
 
 function sameIdentity(left: SchemaIdentity, right: SchemaIdentity): boolean {

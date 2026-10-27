@@ -9,7 +9,11 @@ import { describe, expect, test } from "bun:test"
 import { createSpawnGate, SpawnGateTimeoutError } from "@/session/worker/spawn-gate"
 import { createBunExecutorTransport, spawnBunExecutorWorker } from "@/session/worker/hub"
 import type { SessionExecutorInbound } from "@/session/worker/execute"
+import { resolveBuildHash } from "@/session/worker/build-hash"
 import { flush, settleOf, sid } from "../../lib/async"
+
+/** A valid boot-ready frame for a fake isolate (must carry the hub build hash). */
+const ready = (threadId: number) => ({ type: "ready", threadId, buildHash: resolveBuildHash({ env: {} }).hash })
 
 class FakeWorker {
   static instances: FakeWorker[] = []
@@ -88,7 +92,7 @@ describe("spawn-gate wiring", () => {
       expect(firstWorker.posted).toEqual([runFrame(1, "ses_first")])
 
       // The first isolate boots; only now may the second construct.
-      firstWorker.emit({ type: "ready", threadId: 1 })
+      firstWorker.emit(ready(1))
       await flush()
 
       expect(FakeWorker.instances).toHaveLength(2)
@@ -96,7 +100,7 @@ describe("spawn-gate wiring", () => {
       expect(secondWorker.url).toBe("fake://second")
       expect(secondWorker.posted).toEqual([runFrame(2, "ses_second")])
 
-      secondWorker.emit({ type: "ready", threadId: 2 })
+      secondWorker.emit(ready(2))
       await flush()
       expect((await firstReady).ok).toBe(true)
       expect((await secondReady).ok).toBe(true)
@@ -158,6 +162,23 @@ describe("spawn-gate wiring", () => {
     })
   })
 
+  test("a ready frame with the wrong build hash fails the spawn loud", async () => {
+    await withFakeWorker(async () => {
+      const gate = createSpawnGate({ timeoutMs: 1_000 })
+      const transport = createBunExecutorTransport({ entry: "fake://wrong-hash", spawnGate: gate })
+      const run = settleOf(transport.waitFor(() => true))
+      transport.post(runFrame(1, "ses_hash"))
+      await flush()
+      FakeWorker.instances[0]!.emit({ type: "ready", threadId: 1, buildHash: "not-the-hub-hash" })
+
+      const settled = await run
+      expect(settled.ok).toBe(false)
+      if (!settled.ok) expect(String(settled.error)).toContain("build mismatch")
+      expect(transport.alive).toBe(false)
+      await transport.terminate()
+    })
+  })
+
   test("a spawn timeout fails the spawn, not later sessions", async () => {
     await withFakeWorker(async () => {
       const gate = createSpawnGate({ timeoutMs: 20 })
@@ -176,7 +197,7 @@ describe("spawn-gate wiring", () => {
 
       // The timeout released nothing it did not hold: boot-ready still frees the
       // permit, and the next session spawns normally.
-      holderWorker.emit({ type: "ready", threadId: 1 })
+      holderWorker.emit(ready(1))
       await flush()
 
       const next = createBunExecutorTransport({ entry: "fake://next", spawnGate: gate })
@@ -186,7 +207,7 @@ describe("spawn-gate wiring", () => {
         "fake://holder",
         "fake://next",
       ])
-      FakeWorker.instances[1]!.emit({ type: "ready", threadId: 2 })
+      FakeWorker.instances[1]!.emit(ready(2))
       await flush()
       await holder.terminate()
       await next.terminate()
@@ -200,7 +221,7 @@ describe("spawn-gate wiring", () => {
       const firstRun = settleOf(first.execute({ sessionID: sid("ses_first"), depth: 0 }))
       await flush()
       const firstWorker = FakeWorker.instances[0]!
-      firstWorker.emit({ type: "ready", threadId: 1 })
+      firstWorker.emit(ready(1))
 
       // Crash the isolate and retire it, as the dispatcher does at-most-once.
       firstWorker.fail("isolate crashed")
@@ -222,7 +243,7 @@ describe("spawn-gate wiring", () => {
       await flush()
       expect(FakeWorker.instances.map((worker) => worker.url)).toEqual(["fake://first", "fake://respawn"])
       const respawnWorker = FakeWorker.instances[1]!
-      respawnWorker.emit({ type: "ready", threadId: 2 })
+      respawnWorker.emit(ready(2))
       const run = respawnWorker.posted[0] as { readonly id: number }
       respawnWorker.emit({ type: "done", id: run.id, result: { sessionID: "ses_respawn" } })
       expect((await respawnRun).ok).toBe(true)
@@ -250,7 +271,7 @@ describe("spawn-gate wiring", () => {
       await flush()
       expect(FakeWorker.instances.map((worker) => worker.url)).toEqual(["fake://next"])
 
-      FakeWorker.instances[0]!.emit({ type: "ready", threadId: 1 })
+      FakeWorker.instances[0]!.emit(ready(1))
       await flush()
       await next.terminate()
     })
@@ -274,11 +295,11 @@ describe("spawn-gate wiring", () => {
       await flush()
       expect(FakeWorker.instances).toHaveLength(1)
 
-      firstWorker.emit({ type: "ready", threadId: 1 })
+      firstWorker.emit(ready(1))
       await flush()
       expect(FakeWorker.instances.map((worker) => worker.url)).toEqual(["fake://first", "fake://second"])
 
-      FakeWorker.instances[1]!.emit({ type: "ready", threadId: 2 })
+      FakeWorker.instances[1]!.emit(ready(2))
       await flush()
       await first.terminate()
       await second.terminate()
@@ -313,7 +334,7 @@ describe("spawn-gate wiring", () => {
       await flush()
       expect(FakeWorker.instances.map((worker) => worker.url)).toEqual(["fake://hung", "fake://next"])
 
-      FakeWorker.instances[1]!.emit({ type: "ready", threadId: 2 })
+      FakeWorker.instances[1]!.emit(ready(2))
       await flush()
       await next.terminate()
     })

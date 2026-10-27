@@ -1,11 +1,11 @@
-// Phase 12 — the pure hub (plan tasks 12.1–12.4, decisions lines 57/60).
+// The pure hub.
 //
 // The hub is the composition of three landed layers:
 //   * the per-session `Dispatcher` — one worker per session, reused across turns
 //     and idle-reaped, with the active key→worker map;
-//   * the Phase 5 executor pool — workers whose run-state machine lives inside
+//   * the executor pool — workers whose run-state machine lives inside
 //     the isolate (`execute.ts`);
-//   * the Phase 11 cooperative cancel path — `cancelWithGrace`.
+//   * the cooperative cancel path — `cancelWithGrace`.
 //
 // It owns NO session execution: every session runs in a worker isolate, the hub
 // only schedules and forwards control. `SessionHubService` is the Effect service
@@ -34,7 +34,8 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Project } from "@opencode-ai/schema/project"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { attachMeshWorker, createEgressMesh, type DurableCommit, type EgressMesh } from "@/session/egress/mesh"
-import { durableMetaOf, type EventV2Event, type EventsAckPayload, type EventsResyncPayload } from "./frame"
+import { type EventV2Event, type EventsAckPayload, type EventsResyncPayload } from "./frame"
+import { durableMetaOf } from "@/session/egress/frame"
 import { createLiveEventPublisher, instanceLocation, EventV2Bridge, type LiveEventPublisher } from "@/event-v2-bridge"
 import type { EventV2 } from "@opencode-ai/core/event"
 import { StateCache } from "@opencode-ai/core/bus"
@@ -52,6 +53,15 @@ import {
   type SessionWorker,
 } from "./dispatch"
 import type { SessionSpawnRequest, SessionSpawnResult } from "./subagent"
+import { createLifecycleTracker, type LifecycleTracker } from "@/session/ledger/lifecycle"
+import { decideAutoResume, type AutoResumeDecision } from "@/session/ledger/resume"
+import {
+  RUN_BARRIER_TIMEOUT_MS,
+  RunBarrierTimeout,
+  createRunBarrier,
+  type RunBarrier,
+  type RunBarrierPhases,
+} from "@/session/run-barrier"
 import {
   createExecutorCancelPort,
   createExecutorWorker,
@@ -67,7 +77,15 @@ import {
   type SessionExecutorOutbound,
   type WorkerSpawnReason,
 } from "./execute"
-import { resolveCancelGraceMs, type CancelOutcome } from "./cancel"
+import {
+  BOOT_CANCELLED,
+  createBootLifecycle,
+  resolveCancelGraceMs,
+  type BootCancelResult,
+  type BootLifecycle,
+  type BootTelemetry,
+  type CancelOutcome,
+} from "./cancel"
 import { createSpawnGate, type SpawnGateHandle, type SpawnPermit } from "./spawn-gate"
 import { resolveSessionWorkerIdleTimeoutMs, WORKER_COUNT_ENV } from "./pool"
 import { createEpochSequence, makeInstanceContext, type EpochSequence } from "./snapshot"
@@ -88,6 +106,7 @@ import {
   type PidReportEntry,
 } from "./pid-registry"
 import { Plugin } from "@/plugin"
+import { UnsupportedPluginHookError, isHubProxyHook } from "@/plugin/routes"
 import type {
   MessagesTransformInput,
   MessagesTransformOutput,
@@ -97,6 +116,7 @@ import type {
 } from "./plugin-host"
 import type { HubProxyHandlers, HubProxyStreamHandler } from "./hub-proxy-wire"
 import { serveHubProxy } from "./hub-proxy-wire"
+import { BuildMismatch, verifyReadyBuild } from "./build-hash"
 import type {
   PluginToolDescriptor,
   PluginToolExecuteInput,
@@ -112,9 +132,17 @@ import { sessionThreadName } from "@/session/worker/thread-name"
 import { Session } from "@/session/session"
 import { Truncate } from "@/tool/truncate"
 import { pluginToolJsonSchema } from "@/tool/registry"
+import { MCP } from "@/mcp"
+import { McpCatalog } from "@/mcp/catalog"
+import { LspTool, Parameters as LspParameters } from "@/tool/lsp"
+import DESCRIPTION_LSP from "@/tool/lsp.txt"
+import { ToolJsonSchema } from "@/tool/json-schema"
+import type { Tool as ToolDef } from "@/tool/tool"
+import { LSP } from "@/lsp/lsp"
 import { Agent } from "@/agent/agent"
 import type { ShellInput } from "@/session/prompt"
-import { recordAsync } from "@/session/ledger/crash"
+import { isWorkerCrashPhase, recordAsync } from "@/session/ledger/crash"
+import { ensureProductionSchema } from "@/session/db/schema"
 
 /**
  * Advisory hub cache. Entries are keyed by `(aggregateID, seq)` and fenced by the
@@ -216,6 +244,14 @@ export interface CancelReport {
 /** The hub surface `run-state.ts` consumes when the rollout flag is on. */
 export interface SessionHub {
   readonly dispatcher: Dispatcher
+  /**
+   * The hub-observed run lifecycle truth (last committed message, in-flight tool
+   * calls, barrier phases). The tool/commit paths feed it; the crash path reads
+   * it synchronously and auto-resume applies its policy.
+   */
+  readonly lifecycle: LifecycleTracker
+  /** The per-session run barrier the next run waits on. */
+  readonly barrier: RunBarrier
   /**
    * The advisory hub cache. Never authoritative: the durable database and log
    * remain the only truth (D14). It is empty on construction (a restart starts
@@ -421,6 +457,24 @@ export interface SessionHubOptions {
    * fabricate one.
    */
   readonly onWorkerCrashed?: (payload: WorkerCrashed) => void | Promise<void>
+  /**
+   * The run lifecycle truth shared with the tool/commit paths. Absent creates a
+   * fresh bounded tracker owned by this hub.
+   */
+  readonly lifecycle?: LifecycleTracker
+  /** The run barrier. Absent creates the production 5 s barrier. */
+  readonly barrier?: RunBarrier
+  /** Barrier phases for a session; defaults to the lifecycle tracker's phases. */
+  readonly barrierPhases?: (sessionID: SessionID) => RunBarrierPhases
+  /**
+   * Re-dispatch after an allowed auto-resume. The production layer re-enters
+   * `ensureRunning`; absent means the caller still observes the decision but
+   * owns the replay.
+   */
+  readonly resumeRun?: (
+    decision: Extract<AutoResumeDecision, { resume: true }>,
+    payload: WorkerCrashed,
+  ) => void | Promise<void>
   /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
   readonly log?: WorkerLogger
 }
@@ -556,9 +610,9 @@ export function serveEventsPort(
     port,
     onFrame: (frame) => {
       if (frame.kind !== "event") return
-      // The canonical durability test (present only when BOTH `generation` and
-      // `ordinal` are set), shared with the receiver and fan-out so the three
-      // never drift on exactly which frames are durable.
+      // The canonical durability test (present only when BOTH `aggregateID` and
+      // `seq` are set), shared with the receiver and fan-out so the three never
+      // drift on exactly which frames are durable.
       const meta = durableMetaOf(frame)
       sink.event(frame.payload.event, { durable: meta !== undefined })
       if (meta === undefined || onDurable === undefined) return
@@ -573,7 +627,7 @@ export function serveEventsPort(
 }
 
 // ---------------------------------------------------------------------------
-// Production hub-proxy handlers (plan decision 64).
+// Production hub-proxy handlers.
 // ---------------------------------------------------------------------------
 
 /**
@@ -613,6 +667,16 @@ export interface HubProxyAuthorities {
     input: MessagesTransformInput,
     output: MessagesTransformOutput,
   ) => Promise<MessagesTransformOutput>
+  /**
+   * Optional hub-proxied plugin trigger. The worker never invokes a hook the hub
+   * owns (`tool.execute.before/after`, `shell.env`, `tool.definition`, the two
+   * experimental transforms); it forwards `(name, input, output)` here, where the
+   * real plugin instance runs under the worker's session context. Absent means
+   * the output passes through unchanged (no configured plugin). The authority
+   * rejects a hook whose route is not `hub-proxy`, so a worker cannot smuggle an
+   * unsupported trigger across the port.
+   */
+  readonly pluginTrigger?: (name: string, input: unknown, output: unknown) => Promise<unknown>
   /**
    * Optional plugin-tool execute authority. The worker cannot run a plugin tool's
    * `execute` (the plugin instance lives on the hub), so it forwards the call
@@ -686,6 +750,12 @@ export function buildHubProxyHandlers(authorities: HubProxyAuthorities, run: Hub
       authorities.messagesTransform === undefined
         ? (output as MessagesTransformOutput)
         : authorities.messagesTransform(input as MessagesTransformInput, output as MessagesTransformOutput),
+    // Always served: a worker forwards every hub-proxied hook through this one
+    // method. Absent an authority (no configured plugin) the output is unchanged.
+    pluginTrigger: (name, input, output) =>
+      authorities.pluginTrigger === undefined
+        ? output
+        : authorities.pluginTrigger(name as string, input, output),
     // Always served, but with no identity fallback: an execute has no result to
     // hand back, so an absent authority is a descriptive rejection — never an
     // "unknown hub-proxy method" (that would mask a missing wiring, not a typo).
@@ -757,6 +827,29 @@ export function messagesTransformAuthority(options: {
     return Option.isNone(plugin)
       ? Promise.resolve(output)
       : options.run(plugin.value.trigger("experimental.chat.messages.transform", input, output))
+  }
+}
+
+/**
+ * Build the hub-resident authority for the worker's hub-proxied plugin hook
+ * bridge. The worker ships only `(name, input, output)`; the hub owns the plugin
+ * functions and runs the real trigger under the worker's session context. A name
+ * whose route is not `hub-proxy` is rejected with
+ * {@link UnsupportedPluginHookError}: the bridge is not a generic plugin RPC and
+ * a worker may never invoke an unsupported hook through it.
+ */
+export function pluginTriggerAuthority(options: {
+  readonly plugin: () => Option.Option<Plugin.Interface>
+  readonly run: HubProxyRunner
+}): NonNullable<HubProxyAuthorities["pluginTrigger"]> {
+  return (name, input, output) => {
+    if (!isHubProxyHook(name)) {
+      return Promise.reject(new UnsupportedPluginHookError({ plugin: "worker", hook: name }))
+    }
+    const plugin = options.plugin()
+    return Option.isNone(plugin)
+      ? Promise.resolve(output)
+      : options.run(plugin.value.trigger(name as never, input as never, output as never))
   }
 }
 
@@ -842,6 +935,81 @@ export function createPluginToolAbortRegistry(): PluginToolAbortRegistry {
 /** The hub-resident services the plugin-tool authority reads from context. */
 type PluginToolServices = Permission.Service | Truncate.Service | Agent.Service | Session.Service
 
+/** The clone-safe LSP tool descriptor the hub ships to a worker. */
+const LSP_TOOL_ID = "lsp"
+interface HubToolDescriptor extends PluginToolDescriptor {
+  readonly source: "plugin" | "mcp" | "lsp"
+}
+
+function lspToolDescriptor(): PluginToolDescriptor {
+  return {
+    id: LSP_TOOL_ID,
+    description: DESCRIPTION_LSP,
+    jsonSchema: ToolJsonSchema.fromSchema(LspParameters as never),
+  }
+}
+
+function mcpToolJsonSchema(definition: { readonly inputSchema: unknown }): PluginToolDescriptor["jsonSchema"] {
+  const schema = definition.inputSchema as { properties?: Record<string, unknown> } | undefined
+  return {
+    ...(schema ?? {}),
+    type: "object" as const,
+    properties: schema?.properties ?? {},
+    additionalProperties: false as const,
+  } as PluginToolDescriptor["jsonSchema"]
+}
+
+/**
+ * Module-level projection of the hub's MCP catalog plus the LSP tool into the
+ * same clone-safe descriptor shape plugin tools use. A worker registers these as
+ * forwarding stubs; the hub authority (below) executes them with its own MCP/LSP
+ * services under the worker's captured session context.
+ */
+export async function resolveContextHubToolDescriptors(
+  context: Context.Context<never> | undefined,
+): Promise<readonly HubToolDescriptor[]> {
+  const descriptors: HubToolDescriptor[] = []
+  for (const descriptor of await resolveContextPluginToolDescriptors(context)) {
+    descriptors.push({ ...descriptor, source: "plugin" })
+  }
+  if (context === undefined) return descriptors
+  const mcp = Context.getOption(context, MCP.Service)
+  if (Option.isSome(mcp)) {
+    const tools = await Effect.runPromise(Effect.provide(mcp.value.tools(), context))
+    for (const [id, entry] of Object.entries(tools)) {
+      descriptors.push({
+        id,
+        description: entry.def.description ?? "",
+        jsonSchema: mcpToolJsonSchema(entry.def),
+        source: "mcp",
+      })
+    }
+  }
+  const flags = Context.getOption(context, RuntimeFlags.Service)
+  if (Option.isNone(flags) || flags.value.experimentalLspTool) {
+    descriptors.push({ ...lspToolDescriptor(), source: "lsp" })
+  }
+  return descriptors
+}
+
+/** Convert a raw MCP call result into the clone-safe plugin-tool result shape. */
+function mcpToolResult(result: unknown): { output: string; metadata: unknown; attachments?: unknown[] } {
+  const content = (result as { content?: ReadonlyArray<Record<string, unknown>> } | undefined)?.content ?? []
+  const textParts: string[] = []
+  const attachments: unknown[] = []
+  for (const item of content) {
+    if (item.type === "text" && typeof item.text === "string") textParts.push(item.text)
+    else if (item.type === "image" && typeof item.data === "string" && typeof item.mimeType === "string") {
+      attachments.push({ type: "file", mime: item.mimeType, url: `data:${item.mimeType};base64,${item.data}` })
+    }
+  }
+  return {
+    output: textParts.join("\n\n"),
+    metadata: (result as { metadata?: unknown } | undefined)?.metadata ?? {},
+    ...(attachments.length === 0 ? {} : { attachments }),
+  }
+}
+
 /** Every typed failure a plugin-tool execute can raise. */
 type PluginToolFailure = UnknownPluginToolError | InvalidPluginToolArgsError | PluginToolNotSerializableError
 
@@ -896,6 +1064,83 @@ function assertCloneable(toolID: string, field: string, value: unknown): void {
 }
 
 /**
+ * Execute a hub-owned MCP or LSP tool a worker forwarded over the plugin-tool
+ * channel. The worker owns no MCP/LSP child process, so this is the single hub
+ * execution point (`session/tools.ts` only decides *which* host). An unknown id
+ * reports `UnknownPluginToolError` so the worker's stale-descriptor refresh path
+ * is unchanged.
+ */
+const executeHubTool = (
+  input: PluginToolExecuteInput,
+  emit: PluginToolProgressSink,
+): Effect.Effect<PluginToolExecuteResult, UnknownPluginToolError, PluginToolServices> =>
+  Effect.gen(function* () {
+    const permission = yield* Permission.Service
+    const truncate = yield* Truncate.Service
+    const agents = yield* Agent.Service
+    const sessions = yield* Session.Service
+    const instance = yield* InstanceRef
+    const agentInfo = yield* agents.get(input.agent)
+    const sessionInfo = yield* sessions.get(input.sessionID as SessionID).pipe(Effect.orDie)
+    const bridge = yield* EffectBridge.make()
+    const abort = new AbortController()
+    const ask = (request: { permission: string; patterns: string[]; always: string[]; metadata: Record<string, unknown> }) =>
+      bridge.promise(
+        permission
+          .ask({
+            ...request,
+            sessionID: input.sessionID as SessionID,
+            tool: { messageID: input.messageID, callID: input.callID },
+            ruleset: Permission.merge(agentInfo.permission, sessionInfo.permission ?? []),
+          })
+          .pipe(Effect.orDie),
+      )
+
+    if (input.toolID === LSP_TOOL_ID) {
+      const lsp = yield* Effect.serviceOption(LSP.Service)
+      if (Option.isNone(lsp)) return yield* Effect.fail(new UnknownPluginToolError(input.toolID))
+      const ctx: ToolDef.Context = {
+        sessionID: input.sessionID as SessionID,
+        messageID: input.messageID as never,
+        agent: input.agent,
+        abort: abort.signal,
+        callID: input.callID,
+        messages: [],
+        metadata: (update) => Effect.sync(() => emit({ title: update.title, metadata: update.metadata })),
+        ask: (request) => Effect.promise(() => Promise.resolve(ask(request as never))),
+      }
+      const info = yield* LspTool
+      const tool = yield* info.init()
+      const result = yield* tool.execute(input.args as never, ctx)
+      return { title: result.title, output: result.output, metadata: result.metadata }
+    }
+
+    const mcp = yield* Effect.serviceOption(MCP.Service)
+    if (Option.isNone(mcp)) return yield* Effect.fail(new UnknownPluginToolError(input.toolID))
+    const entry = (yield* mcp.value.tools())[input.toolID]
+    if (entry === undefined) return yield* Effect.fail(new UnknownPluginToolError(input.toolID))
+    const tool = McpCatalog.convertTool(entry.def, entry.client, entry.timeout)
+    yield* Effect.promise(() => ask({ permission: input.toolID, patterns: ["*"], always: ["*"], metadata: {} }))
+    const raw = yield* Effect.promise(() =>
+      (tool.execute as (args: unknown, options: { abortSignal: AbortSignal }) => Promise<unknown>)(input.args, {
+        abortSignal: abort.signal,
+      }),
+    )
+    const converted = mcpToolResult(raw)
+    const bounded = yield* Truncate.boundResult(
+      truncate,
+      { output: converted.output, metadata: converted.metadata as Record<string, unknown> },
+      agentInfo,
+    )
+    return {
+      title: "",
+      output: bounded.output,
+      metadata: bounded.metadata,
+      ...(converted.attachments === undefined ? {} : { attachments: converted.attachments }),
+    }
+  }) as Effect.Effect<PluginToolExecuteResult, UnknownPluginToolError, PluginToolServices>
+
+/**
  * Run one plugin tool on the hub: locate its definition, validate the forwarded
  * args, reconstruct the `PluginToolContext` the plugin expects, execute, then
  * normalize, bound (once) and sanitize the result exactly like the registry's
@@ -913,7 +1158,9 @@ function pluginToolExecute(
       ? undefined
       : findPluginToolDefinition(yield* current.value.list(), input.toolID)
     if (definition === undefined) {
-      return yield* Effect.fail(new UnknownPluginToolError(input.toolID))
+      return yield* executeHubTool(input, emit).pipe(
+        Effect.catchTag("UnknownPluginToolError", () => Effect.fail(new UnknownPluginToolError(input.toolID))),
+      )
     }
     validatePluginToolArgs(input.toolID, definition, input.args)
     const bridge = yield* EffectBridge.make()
@@ -1214,7 +1461,12 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   const log = options.log ?? noopWorkerLogger
   const cache = options.cache ?? new StateCache<unknown>()
   const db = options.db
-  const onWorkerCrashed = options.onWorkerCrashed
+  // Persist every typed crash through the hub's off-loop executor unless the
+  // caller supplied its own sink; a hub with no executor has no sink. The
+  // payload returned to the caller is the same value (no sync hub SQL here).
+  const onWorkerCrashed =
+    options.onWorkerCrashed ??
+    (db === undefined ? undefined : (payload: WorkerCrashed) => recordAsync(db, payload).then(() => undefined))
 
   const surfaceWorkerCrash = async (error: unknown, sessionID: SessionID): Promise<void> => {
     const payload = workerCrashedFrom(error)
@@ -1297,7 +1549,28 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
    */
   function hubProxyHandlersFor(workerID: number): HubProxyHandlers | undefined {
     const backends = portBackends()
-    return backends?.hubProxyFor?.(workerID) ?? backends?.hubProxy
+    const handlers = backends?.hubProxyFor?.(workerID) ?? backends?.hubProxy
+    if (handlers === undefined) return undefined
+    // The hub owns the lifecycle truth. Serving these on every control port (not
+    // only the production authority map) means a worker's real prompt/tool path
+    // reports commit/tool/phase into the same tracker the crash path reads.
+    return {
+      ...handlers,
+      "lifecycle.commit": (sessionID, messageID) => {
+        lifecycle.commit(String(sessionID), String(messageID))
+        lifecycle.phase(String(sessionID), "commit")
+      },
+      "lifecycle.phase": (sessionID, phase) => {
+        if (isWorkerCrashPhase(phase)) lifecycle.phase(String(sessionID), phase)
+      },
+      "lifecycle.toolStarted": (sessionID, callID, sideEffecting) => {
+        lifecycle.toolStarted(String(sessionID), String(callID), sideEffecting !== false)
+        lifecycle.phase(String(sessionID), "tool")
+      },
+      "lifecycle.toolFinished": (sessionID, callID) => {
+        lifecycle.toolFinished(String(sessionID), String(callID))
+      },
+    }
   }
 
   /**
@@ -1342,8 +1615,57 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
             baseOnCancelled?.(event)
           },
         }
+  const lifecycle = options.lifecycle ?? createLifecycleTracker()
+  const barrier = options.barrier ?? createRunBarrier()
+  const barrierPhases = options.barrierPhases ?? ((sessionID: SessionID) => lifecycle.phases(sessionID))
+
+  /**
+   * The dispatcher holds a completed run's slot until the four commit-side
+   * phases settle. The run loop ending proves commits/projectors/promotion
+   * landed; tools still in flight are what the barrier actually waits for.
+   */
+  const runBarrier = async (sessionID: SessionID): Promise<void> => {
+    await options.writeBarrier?.(sessionID)
+    lifecycle.settlePhase(sessionID, "commits")
+    lifecycle.settlePhase(sessionID, "projectors")
+    lifecycle.settlePhase(sessionID, "promotion")
+    if (lifecycle.indeterminate(sessionID).length === 0) lifecycle.settlePhase(sessionID, "tools")
+    await barrier.wait(sessionID, barrierPhases(sessionID))
+  }
+
+  /** A timed-out barrier refuses the next run until an explicit reset. */
+  const admitBarrier = (sessionID: SessionID): void => {
+    const state = barrier.state(sessionID)
+    if (state === "timed-out") throw new RunBarrierTimeout(sessionID, RUN_BARRIER_TIMEOUT_MS)
+    if (state === "cancelled" || state === "failed") barrier.reset(sessionID)
+  }
+
   dispatcher = createDispatcher({
     pool,
+    crashState: (sessionID) => lifecycle.crashState(sessionID),
+    recordCrash: (payload) => lifecycle.observeCrash(payload),
+    resumeDecision: (payload) =>
+      decideAutoResume({
+        sessionID: payload.sessionID,
+        phase: payload.phase,
+        attempts: lifecycle.attempts(payload.sessionID),
+        cancelled: lifecycle.cancelled(payload.sessionID),
+        lastCommittedMessageID: payload.lastCommittedMessageID,
+        indeterminate: lifecycle.indeterminate(payload.sessionID),
+      }),
+    onAutoResume: (decision, payload) => {
+      lifecycle.recordAttempt(decision.sessionID)
+      if (options.resumeRun !== undefined) {
+        void Promise.resolve(options.resumeRun(decision, payload)).catch(() => undefined)
+        return
+      }
+      void dispatch
+        .ensureRunning(decision.sessionID as SessionID)
+        .then(() => lifecycle.resetAttempts(decision.sessionID))
+        .catch(() => undefined)
+    },
+    writeBarrier: runBarrier,
+    onRunStart: (sessionID) => lifecycle.beginRun(sessionID),
     onSessionReleased: (sessionID, workerID) => {
       // Retirement (reap/cancel/crash) disposes this worker's hub-side port
       // servers immediately, rather than leaving them alive until shutdown.
@@ -1352,7 +1674,6 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     },
     ...defined({
       cancellation,
-      writeBarrier: options.writeBarrier,
       reapMs: options.reapMs,
       schedule: options.schedule,
       log,
@@ -1370,10 +1691,15 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     sessionOfWorker: (workerID) => dispatcher.registry.sessionsOn(workerID)[0],
     attachWorkerPorts: ports.attachWorkerPorts,
     attachHubProxyPort: ports.attachHubProxyPort,
+    lifecycle,
+    barrier,
     ensureRunning: async (sessionID, origin) => {
       onDispatch?.(sessionID)
+      admitBarrier(sessionID)
       try {
-        return await dispatch.ensureRunning(sessionID, undefined, origin)
+        const result = await dispatch.ensureRunning(sessionID, undefined, origin)
+        lifecycle.resetAttempts(sessionID)
+        return result
       } catch (error) {
         await surfaceWorkerCrash(error, sessionID)
         throw error
@@ -1381,17 +1707,34 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     },
     startShell: async (sessionID, shell) => {
       onDispatch?.(sessionID)
+      admitBarrier(sessionID)
       try {
-        return await dispatch.startShell(sessionID, shell)
+        const result = await dispatch.startShell(sessionID, shell)
+        lifecycle.resetAttempts(sessionID)
+        return result
       } catch (error) {
         await surfaceWorkerCrash(error, sessionID)
         throw error
       }
     },
     assertNotBusy: (sessionID) => dispatch.assertNotBusy(sessionID),
-    cancel: async (sessionID) => (await cancelReporter.cancelWithReport(sessionID)).outcome,
-    cancelWithReport: cancelReporter.cancelWithReport,
-    cancelAll: () => dispatch.cancelAll(),
+    cancel: async (sessionID) => {
+      lifecycle.cancel(sessionID)
+      barrier.cancel(sessionID)
+      return (await cancelReporter.cancelWithReport(sessionID)).outcome
+    },
+    cancelWithReport: async (sessionID) => {
+      lifecycle.cancel(sessionID)
+      barrier.cancel(sessionID)
+      return cancelReporter.cancelWithReport(sessionID)
+    },
+    cancelAll: async () => {
+      for (const entry of dispatcher.registry.entries()) {
+        lifecycle.cancel(entry.sessionID)
+        barrier.cancel(entry.sessionID)
+      }
+      return dispatch.cancelAll()
+    },
     async terminateAll() {
       ports.disposeAll()
       await dispatcher.terminateAll()
@@ -1428,6 +1771,14 @@ export interface BunExecutorTransportOptions {
   readonly onHubProxyPort?: (port: MessagePort) => void
   /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
   readonly log?: WorkerLogger
+  /** Boot-cancellation telemetry: a cancel win or a death during abort. */
+  readonly onBootTelemetry?: (event: BootTelemetry) => void
+  /**
+   * Boot-stage phase reporting: `boot` before the isolate is constructed,
+   * `materialize` when its validated `ready` handshake acknowledges the real
+   * graph. The session worker then owns stream/tool/commit phases.
+   */
+  readonly onPhase?: (phase: "boot" | "materialize") => void
   /** Hub slot id for diagnostics (a boot/import failure is reported under it). */
   readonly workerID?: number
   /**
@@ -1483,9 +1834,16 @@ function parseBootFrame(data: unknown): BootFrame | undefined {
     readonly egressControl?: unknown
   }
   if (frame.type === "ready") {
-    return typeof frame.threadId === "number"
-      ? { kind: "ready" }
-      : { kind: "invalid", reason: "boot-ready frame without a numeric threadId" }
+    if (typeof frame.threadId !== "number") {
+      return { kind: "invalid", reason: "boot-ready frame without a numeric threadId" }
+    }
+    try {
+      verifyReadyBuild(frame)
+    } catch (error) {
+      if (error instanceof BuildMismatch) return { kind: "invalid", reason: error.message }
+      return { kind: "invalid", reason: "boot-ready frame failed build-hash verification" }
+    }
+    return { kind: "ready" }
   }
   if (frame.type === "ports") {
     const ports: { -readonly [K in keyof WorkerTransferredPorts]: MessagePort | undefined } = {
@@ -1537,7 +1895,11 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
   let worker: Worker | undefined
   let booting: Promise<void> | undefined
   let bootTimer: ReturnType<typeof setTimeout> | undefined
-  let permit: SpawnPermit | undefined
+  let bootLifecycle: BootLifecycle<Worker> | undefined
+  // A cancel that arrives while the boot is still waiting for the global permit.
+  let waitingCancel:
+    | { readonly promise: Promise<BootCancelResult>; readonly resolve: (result: BootCancelResult) => void }
+    | undefined
   // Posts that arrived before the gate granted a permit; flushed in order once
   // the isolate exists so a caller's `post`/`waitFor` pair is never reordered.
   const queued: SessionExecutorInbound[] = []
@@ -1567,18 +1929,26 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     bootTimer = undefined
   }
 
-  /** Release the permit as boot-ready; idempotent per worker. */
-  const releasePermit = (): void => {
-    clearBootTimer()
-    permit?.release("ready")
-    permit = undefined
+  /** Cancel a boot that is still waiting for the global permit (no permit held yet). */
+  const cancelWhileWaiting = (): Promise<BootCancelResult> => {
+    if (waitingCancel === undefined) {
+      let resolve!: (result: BootCancelResult) => void
+      const promise = new Promise<BootCancelResult>((settle) => {
+        resolve = settle
+      })
+      waitingCancel = { promise, resolve }
+    }
+    return waitingCancel.promise
   }
 
-  /** Release the permit for a failed spawn (the caller surfaces the failure). */
-  const failPermit = (error: unknown): void => {
-    clearBootTimer()
-    permit?.release("failed", error)
-    permit = undefined
+  /**
+   * Cancel the active boot interval. A boot that already started (the run was
+   * handed the worker) yields to normal cancellation, so this resolves `undefined`.
+   */
+  const cancelBoot = (): Promise<BootCancelResult | undefined> => {
+    if (bootLifecycle !== undefined) return bootLifecycle.cancel()
+    if (booting !== undefined) return cancelWhileWaiting()
+    return Promise.resolve(undefined)
   }
 
   /** Remove and return the first buffered frame matching `predicate`, if any. */
@@ -1590,12 +1960,24 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     return messages.splice(index, 1)[0]
   }
 
+  /**
+   * Tear down the isolate that owns the active boot interval. A booting/ready
+   * lifecycle terminates the partial isolate itself (releasing the permit once);
+   * a started worker is terminated directly.
+   */
+  const teardownBooted = (created: Worker): void => {
+    if (bootLifecycle !== undefined && (bootLifecycle.state === "booting" || bootLifecycle.state === "ready")) {
+      void bootLifecycle.cancel().catch(() => undefined)
+      return
+    }
+    void created.terminate()
+  }
+
   const connect = (created: Worker): void => {
     /** Fail one spawn loud on a malformed boot/port frame, then tear the isolate down. */
     const failProtocol = (reason: string): void => {
       const error = new Error(`session worker protocol error: ${reason}`)
       alive = false
-      failPermit(error)
       created.onmessage = null
       created.onerror = null
       log(workerLogMessage("worker boot failed"), {
@@ -1604,7 +1986,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
         message: error.message,
       })
       failWaiters(error)
-      void created.terminate()
+      teardownBooted(created)
     }
 
     created.onmessage = (event: MessageEvent) => {
@@ -1625,7 +2007,12 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
         options.onHubProxyPort?.(bootFrame.port)
         return
       }
-      if (bootFrame?.kind === "ready") releasePermit()
+      if (bootFrame?.kind === "ready") {
+        options.onPhase?.("materialize")
+        // The permit is released as boot-ready only through the lifecycle's
+        // `onRun`; a cancelled boot refuses the start and drops the frame.
+        if (bootLifecycle !== undefined && !bootLifecycle.start(created)) return
+      }
       const message = event.data as SessionExecutorOutbound
       // Offer the frame to a waiting caller BEFORE buffering, so a matching reply
       // can never be evicted by the capacity cap. A frame is consumed by exactly
@@ -1644,7 +2031,6 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
 
     created.onerror = (event: ErrorEvent) => {
       alive = false
-      failPermit(event.error ?? new Error(event.message))
       // Detach so a terminating worker cannot re-enter this handler, then fail
       // every waiter and tear the isolate down.
       created.onmessage = null
@@ -1664,8 +2050,83 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
         message,
       })
       failWaiters(new Error(message, cause === undefined ? undefined : { cause }))
-      void created.terminate()
+      teardownBooted(created)
     }
+
+    // A worker that exits on its own (a hard crash, `process.exit`, an OOM kill)
+    // reports `close`, not `error`. Without this a dead isolate would only be
+    // noticed when the run reply times out, losing the crash phase truth.
+    created.addEventListener?.("close", (event: Event) => {
+      if (!alive) return
+      alive = false
+      created.onmessage = null
+      created.onerror = null
+      const code = (event as Event & { readonly code?: number }).code
+      failWaiters(new Error(`session worker exited with code ${code ?? "unknown"}`))
+      teardownBooted(created)
+    })
+  }
+
+  /**
+   * Own one boot interval: the acquired permit is held until the validated
+   * `ready` frame starts the run, or released exactly once when the boot is
+   * cancelled/failed. The lifecycle terminates a partially materialized isolate
+   * and reports the typed boot outcome to the cancel caller.
+   */
+  const startBoot = (acquired: SpawnPermit): void => {
+    let created: Worker | undefined
+    const lifecycle = createBootLifecycle<Worker>({
+      permit: acquired,
+      materialize: async (signal) => {
+        if (signal.aborted) throw new Error("session worker boot aborted")
+        // Arm the deadline before construction so a synchronous `new Worker`
+        // throw still releases the global permit (the rejection path below).
+        bootTimer = setTimeout(() => {
+          bootTimer = undefined
+          const error = new Error(`session worker boot timeout after ${bootTimeoutMs}ms`)
+          alive = false
+          queued.length = 0
+          failWaiters(error)
+          void lifecycle.cancel().catch(() => undefined)
+        }, bootTimeoutMs)
+        bootTimer.unref?.()
+        options.onPhase?.("boot")
+        created = constructWorker()
+        worker = created
+        connect(created)
+        for (const message of queued.splice(0)) created.postMessage(message)
+        return created
+      },
+      terminate: async (partial) => {
+        worker = undefined
+        if (partial !== undefined) await partial.terminate()
+      },
+      onRun: () => {
+        // The validated ready handshake is the one boot-ready permit release.
+        clearBootTimer()
+        acquired.release("ready")
+      },
+      onTelemetry: options.onBootTelemetry,
+    })
+    bootLifecycle = lifecycle
+    void lifecycle.ready.then(
+      (result) => {
+        if (result === BOOT_CANCELLED) {
+          // A cancelled boot is terminal for this transport: the run it was
+          // materializing must settle instead of waiting out its deadline.
+          alive = false
+          queued.length = 0
+          failWaiters(new Error("session worker boot cancelled"))
+        }
+      },
+      (error: unknown) => {
+        const failure = error instanceof Error ? error : new Error(String(error))
+        clearBootTimer()
+        alive = false
+        queued.length = 0
+        failWaiters(failure)
+      },
+    )
   }
 
   /**
@@ -1678,40 +2139,33 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       const acquired = await gate.acquire()
       if (!alive) {
         acquired.release("failed", new Error("session worker terminated before boot"))
+        if (waitingCancel !== undefined) {
+          const waiting = waitingCancel
+          waitingCancel = undefined
+          waiting.resolve(BOOT_CANCELLED)
+        }
         return
       }
-      permit = acquired
-      // Arm the deadline before construction so a synchronous `new Worker`
-      // throw still releases the global permit: the catch below fails it, and
-      // `failPermit` clears this timer. `created` stays optional for that path.
-      let created: Worker | undefined
-      bootTimer = setTimeout(() => {
-        bootTimer = undefined
-        const error = new Error(`session worker boot timeout after ${bootTimeoutMs}ms`)
-        failPermit(error)
+      if (waitingCancel !== undefined) {
+        const waiting = waitingCancel
+        waitingCancel = undefined
+        acquired.release("failed")
         alive = false
         queued.length = 0
-        if (created === undefined) {
-          failWaiters(error)
-          return
-        }
-        created.onmessage = null
-        created.onerror = null
-        worker = undefined
-        failWaiters(error)
-        void created.terminate()
-      }, bootTimeoutMs)
-      bootTimer.unref?.()
-      created = constructWorker()
-      worker = created
-      connect(created)
-      for (const message of queued.splice(0)) created.postMessage(message)
+        failWaiters(new Error("session worker boot cancelled"))
+        options.onBootTelemetry?.({ type: "boot-cancelled", phase: "boot" })
+        waiting.resolve(BOOT_CANCELLED)
+        return
+      }
+      startBoot(acquired)
     })().catch((error) => {
       const failure = error instanceof Error ? error : new Error(String(error))
-      // Release exactly once on every boot failure, including a constructor
-      // throw. `failPermit` is idempotent (it clears `permit`) and disarms the
-      // timer armed above.
-      failPermit(failure)
+      // A cancelled waiter must settle even when the permit acquisition failed.
+      if (waitingCancel !== undefined) {
+        const waiting = waitingCancel
+        waitingCancel = undefined
+        waiting.resolve(BOOT_CANCELLED)
+      }
       if (!alive) return
       alive = false
       queued.length = 0
@@ -1774,12 +2228,23 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     get alive() {
       return alive
     },
+    cancelBoot,
     async terminate(code = 0): Promise<number> {
       if (!alive) return code
       alive = false
       queued.length = 0
-      failPermit(new Error("session worker terminated during spawn"))
       failWaiters(new Error("session worker terminated"))
+      // A booting/ready interval still owns the permit: cancelling it terminates
+      // the partial isolate and releases the permit exactly once. A boot still
+      // waiting for the permit resolves its waiter so the next acquisition frees.
+      if (bootLifecycle !== undefined && (bootLifecycle.state === "booting" || bootLifecycle.state === "ready")) {
+        await bootLifecycle.cancel().catch(() => undefined)
+        return code
+      }
+      if (bootLifecycle === undefined && booting !== undefined) {
+        void cancelWhileWaiting()
+        return code
+      }
       const current = worker
       worker = undefined
       if (current === undefined) return code
@@ -1813,6 +2278,10 @@ export interface BunExecutorWorkerPoolOptions {
   readonly reason?: WorkerSpawnReason
   /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
   readonly log?: WorkerLogger
+  /** Boot-cancellation telemetry: a cancel win or a death during abort. */
+  readonly onBootTelemetry?: (event: BootTelemetry) => void
+  /** Boot-stage phase reporting for the isolate. */
+  readonly onPhase?: (phase: "boot" | "materialize") => void
   /** One global spawn permit; forwarded to the transport so cold spawns serialize. */
   readonly spawnGate?: SpawnGateHandle
   /** Boot-ready deadline; see {@link BunExecutorTransportOptions.bootTimeoutMs}. */
@@ -1841,6 +2310,8 @@ export function spawnBunExecutorWorker(id: number, options: BunExecutorWorkerPoo
       workerID: id,
       spawnGate: options.spawnGate,
       bootTimeoutMs: options.bootTimeoutMs,
+      onBootTelemetry: options.onBootTelemetry,
+      ...(options.onPhase === undefined ? {} : { onPhase: options.onPhase }),
       onWorkerPorts:
         onWorkerPorts === undefined ? undefined : (ports: WorkerTransferredPorts) => onWorkerPorts(id, ports),
       onHubProxyPort: onHubProxyPort === undefined ? undefined : (port: MessagePort) => onHubProxyPort(id, port),
@@ -1912,6 +2383,7 @@ function createMaterializingExecutorWorker(
     },
     execute: async (run) => (await materialize(run.sessionID, state)).execute(run),
     cancel: (sessionID) => (state.inner === undefined ? Promise.resolve() : state.inner.cancel(sessionID)),
+    cancelBoot: () => state.inner?.cancelBoot?.() ?? Promise.resolve(undefined),
     assertNotBusy: (sessionID) =>
       state.inner === undefined ? Promise.resolve(false) : state.inner.assertNotBusy(sessionID),
     resultFor: (sessionID) => state.inner?.resultFor(sessionID),
@@ -2070,6 +2542,10 @@ export interface ProductionWorkerPoolOptions {
   readonly bootTimeoutMs?: number
   /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
   readonly log?: WorkerLogger
+  /** Boot-cancellation telemetry: a cancel win or a death during abort. */
+  readonly onBootTelemetry?: (event: BootTelemetry) => void
+  /** Boot-stage phase reporting for the session this isolate is bound to. */
+  readonly onPhase?: (sessionID: SessionID, phase: "boot" | "materialize") => void
 }
 
 /** Build one isolate for `sessionID` under a fixed worker id. */
@@ -2173,6 +2649,10 @@ export function createProductionWorkerPool(options: ProductionWorkerPoolOptions)
         sessionID,
         spawnGate: options.spawnGate,
         bootTimeoutMs: options.bootTimeoutMs,
+        onBootTelemetry: options.onBootTelemetry,
+        ...(options.onPhase === undefined
+          ? {}
+          : { onPhase: (phase: "boot" | "materialize") => options.onPhase?.(sessionID, phase) }),
         onWorkerPorts: options.onWorkerPorts,
         onHubProxyPort: options.onHubProxyPort,
       }),
@@ -2433,7 +2913,7 @@ export interface ProductionPortBackendsOptions {
   readonly egressMeshBound?: number
   /**
    * Handlers for the three hub-proxy authorities served over the worker control
-   * port (plan decision 64). Supplied by `productionSessionHubLayer`, which
+   * port. Supplied by `productionSessionHubLayer`, which
    * yields the real `SessionStatus` / `Permission` / `Question` services.
    */
   readonly hubProxy?: HubProxyHandlers
@@ -2466,7 +2946,7 @@ export interface ProductionPortBackends extends WorkerPortBackends {
  */
 export function buildProductionPortBackends(options: ProductionPortBackendsOptions = {}): ProductionPortBackends {
   // ONE mesh per hub: every worker's transferred `egressControl` port attaches
-  // here, and the durable commit path publishes to it (plan task 8.10/8.11).
+  // here, and the durable commit path publishes to it.
   const egressMesh = createEgressMesh(options.egressMeshBound === undefined ? {} : { bound: options.egressMeshBound })
   return {
     egressMesh,
@@ -2535,13 +3015,18 @@ export interface ProductionSessionHubOptions {
    */
   readonly egressBarrier?: (sessionID: SessionID) => Promise<void> | undefined
   /**
-   * Worker-port backends (plan tasks 8/17/19/24), ready or lazily built. When
+   * Worker-port backends, ready or lazily built. When
    * present the resolved init advertises `capabilities.sessionWorkerPorts` and the
    * hub serves the ports.
    */
   readonly ports?: WorkerPortBackendsSource
   /** Off-loop hub SQL fallback; see `SessionHubOptions.db`. */
   readonly db?: DbExecutor
+  /**
+   * SQLite file the hub owns schema-ensure for. When present the hub applies the
+   * shipped migrations (with zero live workers) before it can spawn anything.
+   */
+  readonly databasePath?: string
   /** Advisory cache shared with the port backends (never authoritative). */
   readonly cache?: HubTruthCache
   /** Persist/surface the typed D8 payload (see `SessionHubOptions.onWorkerCrashed`). */
@@ -2573,6 +3058,8 @@ export interface ProductionSessionHubOptions {
   readonly bootTimeoutMs?: number
   /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
   readonly log?: WorkerLogger
+  /** Boot-cancellation telemetry: a cancel win or a death during abort. */
+  readonly onBootTelemetry?: (event: BootTelemetry) => void
 }
 
 /** Reaping is best-effort teardown: a failed kill must not block cancellation. */
@@ -2628,6 +3115,12 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   const log = options.log ?? noopWorkerLogger
   // One permit serializes every cold isolate spawn for this hub (and every
   // crash respawn, because the pool retains the same handle).
+  // Schema-ensure runs before the pool exists and therefore before any spawn:
+  // there are zero live workers, and `BEGIN IMMEDIATE` serializes concurrent
+  // hubs. The real production layer always passes the resolved database path.
+  if (options.databasePath !== undefined) {
+    ensureProductionSchema({ filename: options.databasePath, liveWorkers: 0 })
+  }
   const spawnGate =
     options.spawnGate ?? createSpawnGate({ timeoutMs: options.spawnTimeoutMs ?? DEFAULT_SPAWN_GATE_TIMEOUT_MS })
   // No worker is spawned until a session dispatches; `workerCount` is diagnostic
@@ -2655,6 +3148,9 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   })
   // The hub is assigned after the pool is built; port transfers arrive only on
   // dispatch (post-assignment), so the deferred reference is safe.
+  // One lifecycle tracker owned by this hub: the pool reports boot/materialize,
+  // workers report stream/tool/commit, and the dispatcher's crash path reads it.
+  const lifecycle = createLifecycleTracker()
   let hub: SessionHub | undefined
   const sinks: WorkerPoolSinks = {
     onWorkerPorts: (workerID, ports) => hub?.attachWorkerPorts(workerID, ports),
@@ -2679,6 +3175,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
       : createProductionWorkerPool({
           init: resolveInit,
           log,
+          onPhase: (sessionID, phase) => lifecycle.phase(sessionID, phase),
           ...defined({
             entry: describedEntry.entry,
             timeoutMs: options.timeoutMs,
@@ -2692,6 +3189,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
             // fire it twice per retirement.
             spawnGate,
             bootTimeoutMs: options.bootTimeoutMs,
+            onBootTelemetry: options.onBootTelemetry,
           }),
           ...sinks,
         })
@@ -2715,6 +3213,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   hub = createSessionHub({
     pool,
     log,
+    lifecycle,
     ...defined({
       ports: options.ports,
       db: options.db,
@@ -3023,6 +3522,15 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
       plugin: () => (context === undefined ? Option.none() : Context.getOption(context, Plugin.Service)),
       run: runHubProxyFor(context),
     })
+  // The worker-facing bridge for every routed-but-hub-owned hook. The plugin
+  // instance lives on the hub, so the worker only ships a clone-safe payload.
+  const pluginTriggerFor = (
+    context: Context.Context<never> | undefined,
+  ): NonNullable<HubProxyAuthorities["pluginTrigger"]> =>
+    pluginTriggerAuthority({
+      plugin: () => (context === undefined ? Option.none() : Context.getOption(context, Plugin.Service)),
+      run: runHubProxyFor(context),
+    })
   // The per-hub in-flight plugin-tool abort registry. Owned here because the
   // plugin-tool authority (below) is the only registrar, and the hub cancel path
   // reaches it through the resolver's `abortPluginTools`.
@@ -3043,13 +3551,14 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
     question: authorities.question,
     systemTransform: systemTransformFor(context),
     messagesTransform: messagesTransformFor(context),
+    pluginTrigger: pluginTriggerFor(context),
     // The worker forwards plugin-tool executes here; the definition (and its
     // plugin instance) stays on the hub. `registerAbort` keys each in-flight call
     // so the hub cancel path / `pluginTool.abort` can unwind it.
     pluginTool: pluginToolFor(context),
     // The lazy descriptor refresh: descriptors shipped at init go stale when a
     // plugin reloads, so the worker re-fetches them here.
-    pluginToolList: () => resolveContextPluginToolDescriptors(context),
+    pluginToolList: () => resolveContextHubToolDescriptors(context),
     // Best-effort per-call abort the worker may request directly.
     pluginToolAbort: (input) => pluginToolAborts.abort(input.sessionID, input.callID),
     sessionSpawn: sessionSpawnFor(context),
@@ -3111,7 +3620,7 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
     // The clone-safe projection of every plugin tool the worker may call. The
     // `execute` stays on the hub (this worker's control port reaches the
     // `pluginTool.execute` authority above); only the descriptor crosses.
-    const pluginTools = await resolveContextPluginToolDescriptors(context)
+    const pluginTools = await resolveContextHubToolDescriptors(context)
     const initOptions: BuildSessionWorkerInitOptions = {
       ...deps.initOptions,
       // The session's persisted model is authoritative; config/default only
@@ -3210,7 +3719,7 @@ export function productionSessionHubLayer(
         Effect.map((info) => info.subagent_depth ?? 1),
         Effect.catchCause(() => Effect.succeed(1)),
       )
-      // The hub-proxy authorities (plan decision 64) a worker reaches over its
+      // The hub-proxy authorities a worker reaches over its
       // control port. The handlers run on the HUB, under the dispatching
       // instance's context (the hub runtime is global).
       const sessionStatus = yield* SessionStatus.Service
@@ -3235,9 +3744,14 @@ export function productionSessionHubLayer(
       // One advisory cache for the hub, its durable-event sink, and shutdown. It
       // starts cold (no persisted prompt state) and is never authoritative.
       const cache = options.cache ?? new StateCache<unknown>()
-      // The off-loop SQL fallback for hub queries. Construction spawns nothing;
-      // the executor's thread starts on the first query.
-      const db = options.db ?? createDbExecutor({ filename: options.databasePath ?? Database.path() })
+      // Construction spawns nothing; the executor's thread starts on the first
+      // query. The same resolved path is handed to the hub so schema-ensure
+      // migrates the exact file it opens.
+      const databasePath = options.databasePath ?? Database.path()
+      // The schema gate above has already created/migrated this file, so the
+      // executor probes it with `create: false`: a missing or unmigrated
+      // database is refused without leaving a stray file behind.
+      const db = options.db ?? createDbExecutor({ filename: databasePath, create: false })
       // The hub is assigned after the pool is built; the resolver's per-worker
       // lookups run lazily on the first port attach (post-assignment), so the
       // deferred reference is safe.
@@ -3274,6 +3788,7 @@ export function productionSessionHubLayer(
       const hub = createProductionSessionHub({
         ...options,
         count,
+        databasePath,
         init: resolvers.resolveInit,
         ports,
         db,

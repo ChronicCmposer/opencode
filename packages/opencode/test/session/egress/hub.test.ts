@@ -42,13 +42,10 @@ describe("egress hub over MessagePort", () => {
     hub.close()
   })
 
-  test("reassembles a frame split across two port deliveries", async () => {
+  test("delivers a raw JSON frame posted directly to the egress port", async () => {
     const { hub, channel } = setup()
     const subscriber = hub.fanout.subscribe("c")
-    const bytes = encodeFrame(durableFrame("d", 1))
-    const split = bytes.byteLength - 5
-    channel.port1.postMessage(bytes.subarray(0, split))
-    channel.port1.postMessage(bytes.subarray(split))
+    channel.port1.postMessage(encodeFrame(durableFrame("d", 1)))
     await pollUntil(() => hub.frames === 1)
     expect(hub.receiver.pendingBytes).toBe(0)
     expect(subscriber.drain()).toEqual([durableFrame("d", 1)])
@@ -58,18 +55,18 @@ describe("egress hub over MessagePort", () => {
   test("preserves commit order for durable frames", async () => {
     const { hub, sender } = setup()
     const subscriber = hub.fanout.subscribe("c")
-    sender.pushDurable(durable("a"), { generation: 1, ordinal: 1 })
-    sender.pushDurable(durable("b"), { generation: 1, ordinal: 2 })
+    sender.pushDurable(durable("a"), { aggregateID: "agg", seq: 1 })
+    sender.pushDurable(durable("b"), { aggregateID: "agg", seq: 2 })
     await pollUntil(() => hub.frames === 2)
     const frames = subscriber.drain()
-    expect(frames.map((frame) => (frame.kind === "event" ? frame.payload.ordinal ?? -1 : -1))).toEqual([1, 2])
+    expect(frames.map((frame) => (frame.kind === "event" ? frame.payload.seq ?? -1 : -1))).toEqual([1, 2])
     hub.close()
   })
 
   test("fails loud on an out-of-order durable ordinal", async () => {
     const { hub, sender } = setup()
-    sender.pushDurable(durable("a"), { generation: 1, ordinal: 2 })
-    sender.pushDurable(durable("b"), { generation: 1, ordinal: 1 })
+    sender.pushDurable(durable("a"), { aggregateID: "agg", seq: 2 })
+    sender.pushDurable(durable("b"), { aggregateID: "agg", seq: 1 })
     await pollUntil(() => hub.receiver.lastError !== undefined)
     expect(hub.receiver.lastError?.message).toContain("out-of-order")
   })
@@ -78,7 +75,7 @@ describe("egress hub over MessagePort", () => {
     const { hub, sender } = setup()
     const consumer = await startConsumer(hub, "sse")
     sender.pushDelta(delta("1"))
-    sender.pushDurable(durable("done"), { generation: 1, ordinal: 1 })
+    sender.pushDurable(durable("done"), { aggregateID: "agg", seq: 1 })
     sender.end()
     await consumer.done
     expect(consumer.frames).toEqual([deltasFrame("1"), durableFrame("done", 1), endFrame()])
@@ -89,7 +86,7 @@ describe("egress hub over MessagePort", () => {
     const { hub, sender } = setup({ maxBatch: 1 })
     const subscriber = hub.fanout.subscribe("sse")
     sender.pushDelta(delta("dropped"))
-    sender.pushDurable(durable("kept"), { generation: 1, ordinal: 1 })
+    sender.pushDurable(durable("kept"), { aggregateID: "agg", seq: 1 })
     await pollUntil(() => hub.frames === 2)
     hub.close()
     expect(subscriber.drain()).toEqual([durableFrame("kept", 1), endFrame()])
@@ -129,8 +126,8 @@ describe("egress hub over MessagePort", () => {
     const sender = createEgressSender({ port: channel.port1 })
     // Occupy the only slot and never drain, so the second durable saturates it.
     const occupied = hub.fanout.subscribe("c")
-    sender.pushDurable(durable("a"), { generation: 1, ordinal: 1 })
-    sender.pushDurable(durable("b"), { generation: 1, ordinal: 2 })
+    sender.pushDurable(durable("a"), { aggregateID: "agg", seq: 1 })
+    sender.pushDurable(durable("b"), { aggregateID: "agg", seq: 2 })
     await pollUntil(() => hub.frames === 2)
     expect(occupied.overflowed).toBe(true)
 

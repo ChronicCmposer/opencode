@@ -38,6 +38,8 @@ import { LLM } from "./llm"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "@/tool/shell/id"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { LifecycleLedger } from "./ledger/lifecycle"
+import { Faults } from "@/testing/faults"
 import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
@@ -1052,6 +1054,9 @@ const layer = Layer.effect(
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
         assertSpawnDepth(session.metadata, (yield* config.get()).subagent_depth ?? 1)
+        // The worker reports lifecycle truth to the hub before each effect it
+        // guards; outside a session worker (flag-off hub) this is undefined.
+        const lifecycle = LifecycleLedger.reporting()
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1190,6 +1195,7 @@ const layer = Layer.effect(
               bypassAgentCheck,
               messages: msgs,
               promptOps,
+              ...(lifecycle === undefined ? {} : { lifecycle }),
             }).pipe(
               Effect.provideService(Plugin.Service, plugin),
               Effect.provideService(Permission.Service, permission),
@@ -1233,6 +1239,8 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            if (lifecycle !== undefined) yield* Effect.promise(() => lifecycle.phase(sessionID, "stream"))
+            Faults.crashWorker("prompt:stream")
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1248,6 +1256,10 @@ const layer = Layer.effect(
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
             })
+            // `handle.process` has written the assistant step durably (step-finish
+            // / completion); record it before any later effect can crash.
+            if (lifecycle !== undefined) yield* Effect.promise(() => lifecycle.commit(sessionID, handle.message.id))
+            Faults.crashWorker("prompt:commit")
 
             if (structured !== undefined) {
               handle.message.structured = structured

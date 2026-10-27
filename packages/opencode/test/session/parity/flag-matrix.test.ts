@@ -52,7 +52,7 @@ describe("status projection", () => {
   test("a development override is visible in status", () => {
     const logs: string[] = []
     const build = buildHashStatus({
-      env: { OPENCODE_BUILD_HASH_OVERRIDE: "dev-hash" },
+      env: { OPENCODE_DEV: "1", OPENCODE_BUILD_HASH_OVERRIDE: "dev-hash" },
       definedHash: "build-hash",
       log: (message) => void logs.push(message),
     })

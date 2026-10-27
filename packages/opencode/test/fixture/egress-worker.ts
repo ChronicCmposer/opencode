@@ -25,6 +25,7 @@ interface Command {
   readonly type: string
   readonly id?: string
   readonly ordinal?: number
+  readonly aggregateID?: string
   readonly count?: number
   readonly pattern?: string
 }
@@ -36,7 +37,7 @@ function messageOf(error: unknown): string {
 const egressChannel = new MessageChannel()
 const controlChannel = new MessageChannel()
 const egressControlChannel = new MessageChannel()
-const sender = createEgressSender({ port: egressChannel.port1, generation: 1 })
+const sender = createEgressSender({ port: egressChannel.port1 })
 const control = createControlLink(controlChannel.port1)
 const mesh = createMeshWorkerClient(egressControlChannel.port1)
 
@@ -61,7 +62,7 @@ const handleCommand = (message: Command): void => {
     case "durable":
       sender.pushDurable(
         { id: message.id ?? "", type: "message.updated", properties: { id: message.id } },
-        { generation: 1, ordinal: message.ordinal ?? 0 },
+        { aggregateID: message.aggregateID ?? "agg", seq: message.ordinal ?? 1 },
       )
       return
     case "flood": {

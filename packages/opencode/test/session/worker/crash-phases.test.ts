@@ -1,3 +1,8 @@
+// UNIT-SCOPED crash-payload policy: the dispatcher receives an injected
+// `crashState` so the phase matrix can be exercised deterministically. The real
+// end-to-end phase wiring (real worker + real hub lifecycle, no injected state)
+// is `test/integration/lifecycle-production.test.ts`.
+
 import { describe, expect, test } from "bun:test"
 import { createBunSqliteConnection } from "@/session/writer/connection"
 import { createDispatcher, ParentCrashedError, SessionCancelledError, WorkerCrashedError } from "@/session/worker/dispatch"

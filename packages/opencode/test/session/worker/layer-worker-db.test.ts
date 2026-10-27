@@ -8,7 +8,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { afterEach, describe, expect, test } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Effect, Exit, Layer, Scope } from "effect"
 import { sql } from "drizzle-orm"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { Session } from "@/session/session"
@@ -30,6 +30,7 @@ import {
   type SessionLayerOptions,
 } from "@/session/worker/layer"
 import { collectNodeNames, REQUIRED_SESSION_NODE_KEYS } from "@/session/worker/node-table"
+import { createSessionWork } from "@/session/worker/session-worker"
 import { workerSnapshot } from "../../lib/snapshot"
 
 const directories: string[] = []
@@ -121,6 +122,32 @@ describe("per-worker DB node (W1.1)", () => {
     expect(result.same).toBe(true)
     expect(result.id).toBe(SessionID.make("session-a"))
     expect(database.connection.closed).toBe(true)
+  })
+
+  test("two consecutive runs on one worker keep the per-worker DB open (C3)", async () => {
+    const filename = temporaryDatabase()
+    migrated(filename)
+    const database = await workerDatabase(filename)
+    const layerOptions = options(database)
+    const built = buildSessionWorkerLayer(layerOptions)
+    const workerScope = Effect.runSync(Scope.make())
+    const work = createSessionWork({
+      layer: built.layer,
+      scope: workerScope,
+      writer: layerOptions.clients.writer,
+      threadId: 1,
+      prompt: false,
+      readMessages: () => Effect.succeed([]),
+    })
+
+    try {
+      await Effect.runPromise(work(SessionID.make("session-a")))
+      expect(database.connection.closed).toBe(false)
+      await Effect.runPromise(work(SessionID.make("session-a")))
+      expect(database.connection.closed).toBe(false)
+    } finally {
+      await Effect.runPromise(Scope.close(workerScope, Exit.void))
+    }
   })
 
   test("hub-only writes fail loud through the worker Database", async () => {

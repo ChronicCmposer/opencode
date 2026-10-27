@@ -1,4 +1,4 @@
-// Phase 4.8 — key→worker map lifecycle (plan task 4.8, plan line 61).
+// Key→worker map lifecycle.
 //
 // The hub's only per-key state: a `SessionID`→worker reservation. The state
 // machine is `reserved → running → cancelling`; the terminal `idle`/`released`

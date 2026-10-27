@@ -1,12 +1,12 @@
-// W2 — worker-side egress sender over the events envelope (spec Q7/Q16).
+// W2 — worker-side egress sender over the shared JSON events transport (Q7/Q16).
 //
-// The sender turns coalesced batches of `event` frames into ONE length-prefixed,
-// versioned byte buffer posted with a transferred buffer (zero-copy). Durable
-// frames bypass the coalescing window and are stamped with a monotonic
+// The sender turns coalesced batches of `event` frames into shared-envelope JSON
+// strings, one port message per frame, bounded at 4 MiB per frame and per batch.
+// Durable frames bypass the coalescing window and are stamped with a monotonic
 // `(generation, ordinal)` when no writer meta is supplied.
 
 import { describe, expect, test } from "bun:test"
-import { decodeFrames } from "@/session/egress/frame"
+import { FrameTooLargeError, decodeFrame } from "@/session/egress/frame"
 import { createEgressSender } from "@/session/egress/sender"
 import { type EventV2Event, ackFrame, endFrame, eventFrame } from "@/session/worker/frame"
 import { pollUntil } from "../../lib/poll"
@@ -17,20 +17,20 @@ const deltaEvent = (id: string, text?: string): EventV2Event => ({
   properties: text === undefined ? { id } : { id, text },
 })
 
-function asBytes(data: unknown): Uint8Array {
-  if (data instanceof Uint8Array) return data
-  throw new Error(`expected a Uint8Array chunk, got ${Object.prototype.toString.call(data)}`)
+function asText(data: unknown): string {
+  if (typeof data === "string") return data
+  throw new Error(`expected a JSON string, got ${Object.prototype.toString.call(data)}`)
 }
 
-function captureRaw(channel: MessageChannel): Uint8Array[] {
-  const chunks: Uint8Array[] = []
-  channel.port2.onmessage = (event: MessageEvent) => chunks.push(asBytes(event.data))
+function captureRaw(channel: MessageChannel): string[] {
+  const chunks: string[] = []
+  channel.port2.onmessage = (event: MessageEvent) => chunks.push(asText(event.data))
   channel.port2.start()
   return chunks
 }
 
 describe("egress sender", () => {
-  test("posts a coalesced delta batch as ONE buffer carrying every event frame", async () => {
+  test("posts a coalesced delta batch as one JSON message per event frame", async () => {
     const channel = new MessageChannel()
     const chunks = captureRaw(channel)
     const sender = createEgressSender({ port: channel.port1, maxBatch: 3 })
@@ -39,8 +39,8 @@ describe("egress sender", () => {
     sender.pushDelta(deltaEvent("b", "lo "))
     sender.pushDelta(deltaEvent("c", "world"))
 
-    await pollUntil(() => chunks.length === 1)
-    expect(decodeFrames(chunks[0]).frames).toEqual([
+    await pollUntil(() => chunks.length === 3)
+    expect(chunks.map(decodeFrame)).toEqual([
       eventFrame({ event: deltaEvent("a", "Hel") }),
       eventFrame({ event: deltaEvent("b", "lo ") }),
       eventFrame({ event: deltaEvent("c", "world") }),
@@ -54,30 +54,40 @@ describe("egress sender", () => {
 
     const first = { id: "d1", type: "message.updated", properties: {} }
     const second = { id: "d2", type: "message.updated", properties: {} }
-    sender.pushDurable(first)
-    sender.pushDurable(second)
+    sender.pushDurable(first, { aggregateID: "agg", seq: 1 })
+    sender.pushDurable(second, { aggregateID: "agg", seq: 2 })
 
     await pollUntil(() => chunks.length === 4)
     // Each durable hand-off is followed by an ack frame carrying the durable count.
-    expect(chunks.map((chunk) => decodeFrames(chunk).frames)).toEqual([
-      [eventFrame({ event: first, generation: 1, ordinal: 1 })],
-      [ackFrame({ count: 1 })],
-      [eventFrame({ event: second, generation: 1, ordinal: 2 })],
-      [ackFrame({ count: 1 })],
+    expect(chunks.map(decodeFrame)).toEqual([
+      eventFrame({ event: first, aggregateID: "agg", seq: 1 } as Parameters<typeof eventFrame>[0]),
+      ackFrame({ count: 1 }),
+      eventFrame({ event: second, aggregateID: "agg", seq: 2 } as Parameters<typeof eventFrame>[0]),
+      ackFrame({ count: 1 }),
     ])
   })
 
-  test("an explicit writer meta overrides the fallback ordinal", async () => {
+  test("an explicit aggregate meta is stamped on the durable frame", async () => {
     const channel = new MessageChannel()
     const chunks = captureRaw(channel)
     const sender = createEgressSender({ port: channel.port1 })
 
     const event = { id: "d", type: "message.updated", properties: {} }
-    sender.pushDurable(event, { generation: 4, ordinal: 9 })
+    sender.pushDurable(event, { aggregateID: "s1", seq: 9 })
 
     await pollUntil(() => chunks.length === 2)
-    expect(decodeFrames(chunks[0]).frames[0]).toEqual(eventFrame({ event, generation: 4, ordinal: 9 }))
-    expect(decodeFrames(chunks[1]).frames[0]).toEqual(ackFrame({ count: 1 }))
+    expect(decodeFrame(chunks[0]!)).toEqual(
+      eventFrame({ event, aggregateID: "s1", seq: 9 } as Parameters<typeof eventFrame>[0]),
+    )
+    expect(decodeFrame(chunks[1]!)).toEqual(ackFrame({ count: 1 }))
+  })
+
+  test("rejects an over-bound durable before posting it", () => {
+    const channel = new MessageChannel()
+    const sender = createEgressSender({ port: channel.port1 })
+    const huge = { id: "big", type: "message.updated", properties: { pad: "x".repeat(4 * 1024 * 1024) } }
+    expect(() => sender.pushDurable(huge, { aggregateID: "agg", seq: 1 })).toThrow(FrameTooLargeError)
+    channel.port1.close()
   })
 
   test("a delta-only batch is not acked", async () => {
@@ -89,11 +99,8 @@ describe("egress sender", () => {
     sender.end()
 
     await pollUntil(() => chunks.length === 2)
-    // Only the delta batch and the end frame — no ack for non-durable deltas.
-    expect(chunks.flatMap((chunk) => decodeFrames(chunk).frames)).toEqual([
-      eventFrame({ event: deltaEvent("a") }),
-      endFrame(),
-    ])
+    // Only the delta frame and the end frame — no ack for non-durable deltas.
+    expect(chunks.map(decodeFrame)).toEqual([eventFrame({ event: deltaEvent("a") }), endFrame()])
   })
 
   test("end flushes buffered deltas then posts the end frame", async () => {
@@ -106,10 +113,7 @@ describe("egress sender", () => {
     sender.end()
 
     await pollUntil(() => chunks.length === 2)
-    expect(chunks.flatMap((chunk) => decodeFrames(chunk).frames)).toEqual([
-      eventFrame({ event: deltaEvent("a") }),
-      endFrame(),
-    ])
+    expect(chunks.map(decodeFrame)).toEqual([eventFrame({ event: deltaEvent("a") }), endFrame()])
     expect(sender.ended).toBe(true)
   })
 })

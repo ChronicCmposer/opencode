@@ -41,7 +41,7 @@ export const layer = Layer.effect(
     const background = yield* BackgroundJob.Service
     const status = yield* SessionStatus.Service
 
-    // Phase 12 flag-on seam: when `experimentalSessionWorkers` is on AND the hub
+    // Flag-on seam: when `experimentalSessionWorkers` is on AND the hub
     // pool layer is present, the run-state machine lives in a worker isolate and
     // every method delegates to the hub (`session/worker/hub.ts`). Both services
     // are resolved from the CALLER's context (not the layer's declared deps), so
@@ -60,7 +60,7 @@ export const layer = Layer.effect(
 
     // The run-state machine is the portable `Runner` table shared with the
     // session worker (`session/worker/execute.ts`): flag off it lives here in
-    // the hub, flag on it lives inside the worker isolate (plan decision 18).
+    // the hub, flag on it lives inside the worker isolate.
     const state = yield* InstanceState.make(
       Effect.fn("SessionRunState.state")(function* () {
         const scope = yield* Scope.Scope

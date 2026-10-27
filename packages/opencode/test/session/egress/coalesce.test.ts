@@ -16,7 +16,7 @@ const deltaEvent = (id: string, text?: string): EventV2Event => ({
   properties: text === undefined ? { id } : { id, text },
 })
 
-const durableMeta: DurableMeta = { generation: 1, ordinal: 1 }
+const durableMeta: DurableMeta = { aggregateID: "agg", seq: 1 }
 
 /** Read the streamed `text` out of an event frame, failing loud on a wrong shape. */
 function textOf(frame: EventsFrame): string {
@@ -131,7 +131,7 @@ describe("delta coalescer over event frames", () => {
     coalescer.pushDurable(durable, durableMeta)
     expect(batches).toEqual([
       [eventFrame({ event: deltaEvent("a") })],
-      [eventFrame({ event: durable, generation: 1, ordinal: 1 })],
+      [eventFrame({ event: durable, aggregateID: "agg", seq: 1 } as Parameters<typeof eventFrame>[0])],
     ])
   })
 
@@ -139,11 +139,11 @@ describe("delta coalescer over event frames", () => {
     const { batches, coalescer } = setup()
     const first = { id: "d1", type: "message.updated", properties: {} }
     const second = { id: "d2", type: "message.updated", properties: {} }
-    coalescer.pushDurable(first, { generation: 1, ordinal: 1 })
-    coalescer.pushDurable(second, { generation: 1, ordinal: 2 })
+    coalescer.pushDurable(first, { aggregateID: "agg", seq: 1 })
+    coalescer.pushDurable(second, { aggregateID: "agg", seq: 2 })
     expect(batches).toEqual([
-      [eventFrame({ event: first, generation: 1, ordinal: 1 })],
-      [eventFrame({ event: second, generation: 1, ordinal: 2 })],
+      [eventFrame({ event: first, aggregateID: "agg", seq: 1 } as Parameters<typeof eventFrame>[0])],
+      [eventFrame({ event: second, aggregateID: "agg", seq: 2 } as Parameters<typeof eventFrame>[0])],
     ])
   })
 

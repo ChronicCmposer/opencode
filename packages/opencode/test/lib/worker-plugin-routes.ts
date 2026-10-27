@@ -1,15 +1,11 @@
 // PENDING-plugin (W4.1) — test-side plugin route pass-through.
 //
-// `WORKER_HOOK_ROUTES` currently classifies `tool.definition` and
-// `experimental.session.compacting` as unsupported, although the real
-// `ToolRegistry`/compaction paths always trigger them. The fatal-admission
-// contract is covered by `test/lib/rollout-matrix.test.ts` and
-// `test/session/parity/flag-matrix.test.ts`; worker suites that exercise prompt
-// turns need the six dispatched hooks to reach their supplied host while the
-// un-routed triggers pass through unchanged.
-//
-// Remove this helper (and its uses) when `src/plugin/routes.ts` gains routes for
-// the remaining invoked hooks.
+// The fatal-admission contract is covered by `test/lib/rollout-matrix.test.ts`
+// and `test/session/parity/flag-matrix.test.ts`; worker suites that exercise
+// prompt turns need the routed hooks to reach their supplied host while the
+// genuinely unsupported triggers (`chat.message`, compaction, text completion)
+// pass through unchanged. Hub-proxied hooks delegate to the host exactly as the
+// production `workerPluginReplacement` does.
 
 import { Effect, Layer } from "effect"
 import { Plugin } from "@/plugin"
@@ -39,6 +35,10 @@ export function pluginPassThroughLayer(
         return run("toolBefore")
       case "tool.execute.after":
         return run("toolAfter")
+      case "shell.env":
+        return run("shellEnv")
+      case "tool.definition":
+        return run("toolDefinition")
       case "experimental.chat.system.transform":
         return run("systemTransform")
       case "experimental.chat.messages.transform":

@@ -11,7 +11,7 @@ import { MessageID, PartID, SessionID } from "@/session/schema"
 import { SessionProcessor } from "@/session/processor"
 import { SessionTools } from "@/session/tools"
 import { Tool } from "@/tool/tool"
-import { ToolRegistry } from "@/tool/registry"
+import { ToolRegistry, type RegisteredTool } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
 import { Plugin } from "@/plugin"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -77,6 +77,7 @@ const layer = Layer.mergeAll(
         Effect.succeed([
           {
             id: "timing",
+            source: "builtin" as const,
             description: "updates metadata more than once",
             parameters: Schema.Struct({}),
             jsonSchema: { type: "object", properties: {} },
@@ -86,7 +87,7 @@ const layer = Layer.mergeAll(
                 yield* ctx.metadata({ metadata: { output: "second" } })
                 return { title: "timing", metadata: {}, output: "done" }
               }),
-          } satisfies Tool.Def,
+          } satisfies RegisteredTool,
         ]),
     }),
   ),

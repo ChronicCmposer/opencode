@@ -106,7 +106,7 @@ describe("egress across a worker isolate", () => {
     await pollWorker(() => hub.frames === 2)
     const frames = subscriber.drain()
     expect(
-      frames.map((frame) => (frame.kind === "event" ? [frame.payload.ordinal ?? -1, frame.payload.event.id] : [-1, ""])),
+      frames.map((frame) => (frame.kind === "event" ? [frame.payload.seq ?? -1, frame.payload.event.id] : [-1, ""])),
     ).toEqual([
       [1, "d1"],
       [2, "d2"],
@@ -169,7 +169,7 @@ describe("egress across a worker isolate", () => {
     await worker.waitFor("mesh.listen.ok")
     expect(mesh.subscriptions()).toEqual([{ workerId: "w1", pattern: "message.*" }])
 
-    mesh.publish({ meta: { generation: 1, ordinal: 1 }, event: durable("m1") })
+    mesh.publish({ meta: { aggregateID: "agg", seq: 1 }, event: durable("m1") })
     const wake = await worker.waitFor("mesh.durable")
     expect(wake.id).toBe("m1")
     expect(mesh.outstanding("w1")).toBe(1)
@@ -186,9 +186,9 @@ describe("egress across a worker isolate", () => {
     await worker.waitFor("mesh.listen.ok")
 
     // The first commit occupies the only backlog slot; the second overflows.
-    mesh.publish({ meta: { generation: 1, ordinal: 1 }, event: durable("m1") })
+    mesh.publish({ meta: { aggregateID: "agg", seq: 1 }, event: durable("m1") })
     await worker.waitFor("mesh.durable")
-    mesh.publish({ meta: { generation: 1, ordinal: 2 }, event: durable("m2") })
+    mesh.publish({ meta: { aggregateID: "agg", seq: 2 }, event: durable("m2") })
 
     const resync = await worker.waitFor("mesh.resync")
     expect(resync.pattern).toBe("message.*")
@@ -228,8 +228,8 @@ describe("control frame variant validation", () => {
       { type: "listen", id: 1, pattern: 2 }, // non-string pattern
       { type: "unlisten", id: 1 }, // no pattern
       { type: "listen.ok" }, // no id
-      { type: "durable", meta: { generation: 1 }, event: durable("d") }, // malformed ordinal
-      { type: "durable", meta: { generation: 1, ordinal: 1 }, event: { id: "d", type: "t" } }, // no properties
+      { type: "durable", meta: { aggregateID: "agg" }, event: durable("d") }, // missing seq
+      { type: "durable", meta: { aggregateID: "agg", seq: 1 }, event: { id: "d", type: "t" } }, // no properties
       { type: "resync" }, // no pattern
       { type: "resync", pattern: 3 }, // non-string pattern
       { type: "durable.ack", count: -1 }, // negative count
@@ -245,7 +245,7 @@ describe("control frame variant validation", () => {
       { type: "listen", id: 3, pattern: "message.*" },
       { type: "unlisten", id: 4, pattern: "message.*" },
       { type: "listen.ok", id: 5 },
-      { type: "durable", meta: { generation: 1, ordinal: 1 }, event: durable("d") },
+      { type: "durable", meta: { aggregateID: "agg", seq: 1 }, event: durable("d") },
       { type: "resync", pattern: "message.*" },
       { type: "durable.ack", count: 0 },
       { type: "resync.ack" },
@@ -342,7 +342,7 @@ describe("control link liveness", () => {
 
     // Outbound (hub → worker): a resync push and a durable wake.
     hub.notify({ type: "resync", pattern: "message.*" })
-    hub.notify({ type: "durable", meta: { generation: 1, ordinal: 1 }, event: durable("wake") })
+    hub.notify({ type: "durable", meta: { aggregateID: "agg", seq: 1 }, event: durable("wake") })
     // Inbound (worker → hub): the matching acknowledgements.
     worker.notify({ type: "durable.ack", count: 2 })
     worker.notify({ type: "resync.ack", pattern: "message.*" })

@@ -52,7 +52,7 @@ describe("worker durable subscription failure", () => {
     // The listen failed, but simulate the hub having registered the pattern
     // independently: the durable push must not reach the stale subscription.
     mesh.listen("w1", "message.updated")
-    mesh.publish({ meta: { generation: 1, ordinal: 1 }, event: durable("d1") })
+    mesh.publish({ meta: { aggregateID: "agg", seq: 1 }, event: durable("d1") })
     // The push is still acknowledged by the mesh wiring, so outstanding drains.
     await pollUntil(() => mesh.outstanding("w1") === 0)
 

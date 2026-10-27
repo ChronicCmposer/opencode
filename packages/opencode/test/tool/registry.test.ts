@@ -15,6 +15,7 @@ import { Agent } from "@/agent/agent"
 import { InstanceState } from "@/effect/instance-state"
 
 import { ToolJsonSchema } from "@/tool/json-schema"
+import { ToolRoute } from "@/tool/route"
 import { MessageID, SessionID } from "@/session/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -516,6 +517,25 @@ describe("tool.registry", () => {
       // The hub-computed schema passes through verbatim; no local decoder.
       expect(loaded.jsonSchema).toEqual(remoteDescriptors[0].jsonSchema as Tool.Def["jsonSchema"])
       expect(loaded.parameters).toBe(Schema.Unknown)
+    }),
+  )
+
+  // Step 44: a remote stub's constructed source matches the opinionated route
+  // table exactly — the stub itself runs in the worker and forwards the call.
+  withRemotePlugin.instance("the constructed source for a remote stub is remote-plugin", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      const remote = tools.find((tool) => tool.id === "remote_compress")
+
+      expect(remote?.source).toBe("remote-plugin")
+      expect(ToolRoute.hostForSource(remote!.source)).toBe("worker")
+      expect(ToolRoute.runsOn(ToolRoute.routeTool({ id: remote!.id, source: remote!.source }), "worker")).toBe(true)
     }),
   )
 

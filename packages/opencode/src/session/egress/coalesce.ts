@@ -7,7 +7,8 @@
 //   * `pushDelta`  — buffers a non-durable event frame; flushes on idle (window
 //                    elapsed) or on threshold (batch full).
 //   * `pushDurable`— flushes buffered deltas first, then emits the durable frame
-//                    immediately. Durable events are never coalesced/reordered.
+//                    immediately. Durable events are never coalesced/reordered,
+//                    and every one carries its aggregate `(aggregateID, seq)`.
 //   * `end`        — flushes buffered deltas, then emits the `end` frame.
 //
 // The clock and timer are injected so the window is deterministic in tests, and
@@ -122,7 +123,9 @@ export function createCoalescer(options: CoalescerOptions): Coalescer {
     pushDurable(event, meta) {
       if (ended) throw new CoalescerEndedError()
       flush()
-      onBatch([eventFrame({ event, generation: meta.generation, ordinal: meta.ordinal })])
+      onBatch([
+        eventFrame({ event, aggregateID: meta.aggregateID, seq: meta.seq } as Parameters<typeof eventFrame>[0]),
+      ])
     },
     flush,
     end() {

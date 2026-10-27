@@ -22,7 +22,7 @@ import { durable } from "../../lib/egress-fixtures"
 import { pollUntil } from "../../lib/poll"
 
 const commit = (id: string, type: string, ordinal: number): DurableCommit => ({
-  meta: { generation: 1, ordinal },
+  meta: { aggregateID: "agg", seq: ordinal },
   event: durable(id, type),
 })
 

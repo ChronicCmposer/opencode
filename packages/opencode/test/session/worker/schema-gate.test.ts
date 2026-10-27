@@ -11,6 +11,7 @@ import { Database as BunDatabase } from "bun:sqlite"
 import { afterEach, describe, expect, test } from "bun:test"
 import { openConnection, type Connection } from "@opencode-ai/core/database/connection"
 import { migrationStatements } from "@/session/writer/migration.statements.gen"
+import { hashStatements } from "@/session/db/identity"
 import {
   LiveWorkersError,
   SchemaMismatch,
@@ -18,9 +19,10 @@ import {
   currentSchemaIdentity,
   markSchemaIdentity,
   migrate,
+  migrationContentHash,
   openGatedConnection,
   schemaIdentity,
-} from "@/session/db"
+} from "@/session/db/schema"
 
 const directories: string[] = []
 const connections: Connection[] = []
@@ -170,6 +172,53 @@ describe("hub migration (W1.6 / D7)", () => {
       schema: connection.all("SELECT type, name, sql FROM sqlite_master ORDER BY type, name"),
       version: Number(connection.pragma("user_version")),
     }).toEqual(before)
+  })
+
+  test("a statement failure after the DDL rolls the whole migration back", () => {
+    const filename = databasePath()
+    const connection = open(filename)
+    const failing = [...migrationStatements, "THIS IS NOT VALID SQL"]
+
+    expect(() => migrate({ connection, liveWorkers: 0, statements: failing })).toThrow()
+
+    // DDL and the marker are in the same BEGIN IMMEDIATE: neither survives.
+    expect(connection.all("SELECT name FROM sqlite_master WHERE type = 'table'")).toEqual([])
+    expect(schemaIdentity(connection).version).toBe(0)
+    expect(schemaIdentity(connection).contentHash).not.toBe(currentSchemaIdentity().contentHash)
+  })
+
+  test("a crashed migration is retryable into a consistent marked schema", () => {
+    const filename = databasePath()
+    const connection = open(filename)
+
+    expect(() =>
+      migrate({ connection, liveWorkers: 0, statements: [...migrationStatements, "THIS IS NOT VALID SQL"] }),
+    ).toThrow()
+    expect(schemaIdentity(connection).version).toBe(0)
+
+    expect(migrate({ connection, liveWorkers: 0 })).toEqual(currentSchemaIdentity())
+    expect(schemaIdentity(connection)).toEqual(currentSchemaIdentity())
+    expect(openGatedConnection({ filename }).connection.close()).toBeUndefined()
+  })
+
+  test("changing a SQL body without changing the journal ids changes the hash", () => {
+    const ids = ["20260101000000_first", "20260102000000_second"]
+    const before = hashStatements(["CREATE TABLE a (id TEXT PRIMARY KEY)"])
+    const after = hashStatements(["CREATE TABLE a (id TEXT PRIMARY KEY, extra TEXT)"])
+    expect(after).not.toBe(before)
+
+    expect(migrationContentHash({ version: 1, ids, bodyHash: before })).not.toBe(
+      migrationContentHash({ version: 1, ids, bodyHash: after }),
+    )
+  })
+
+  test("a gated open of a missing database is refused without creating the file", () => {
+    const filename = databasePath()
+    expect(fs.existsSync(filename)).toBe(false)
+
+    expect(() => openGatedConnection({ filename })).toThrow()
+
+    expect(fs.existsSync(filename)).toBe(false)
   })
 
   test("a fresh worker gate refuses an unmigrated database", () => {

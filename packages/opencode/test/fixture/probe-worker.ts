@@ -85,7 +85,7 @@ async function runProcessRole(): Promise<void> {
   const nodesAfter = sessionWorkerNodes({ hubNode, enabled: true }).length
 
   // A conflicting re-set must fail loud; re-setting the same role is a no-op.
-  const conflict = capture(() => setProcessRole("writer"))
+  const conflict = capture(() => setProcessRole("hub"))
   const sameRole = capture(() => setProcessRole("session"))
 
   postToParent({ type: "ready" })
@@ -97,8 +97,11 @@ async function runProcessRole(): Promise<void> {
  * `WorkerOptions.name` at creation. Posts the executor `ready` frame, then idles
  * so the test can read the OS thread name; teardown is the only stop.
  */
-function runNoName(): void {
-  postToParent({ type: "ready", threadId: 0 })
+async function runNoName(): Promise<void> {
+  // The production transport verifies the ready-frame build hash, so this
+  // no-name probe still sends a valid handshake (it only avoids self-naming).
+  const { readyFrame } = await import("@/session/worker/build-hash")
+  postToParent(readyFrame(0))
   setInterval(() => {}, 1 << 30)
 }
 

@@ -3,7 +3,9 @@ import os from "node:os"
 import path from "node:path"
 import { Database as BunDatabase } from "bun:sqlite"
 import { afterEach, describe, expect, test } from "bun:test"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
+import { Event } from "@opencode-ai/schema/event"
+import { Bus } from "@opencode-ai/core/bus"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { migrationStatements } from "@/session/writer/migration.statements.gen"
 import {
@@ -206,6 +208,54 @@ describe("worker table ownership (W1.5 / D6)", () => {
     expect(database.connection.query("SELECT name FROM sqlite_master WHERE name = 'worker_owned'").all()).toEqual([])
   })
 
+  test("session.permission is hub-only while the hub connection can still write it (C9/D14)", async () => {
+    const filename = temporaryDatabase()
+    migrated(filename)
+    const database = await open(filename)
+
+    const rejected = await Effect.runPromise(
+      database.run("UPDATE permission SET action = 'allow' WHERE id = 'missing'").pipe(Effect.flip),
+    )
+    expect(rejected).toBeInstanceOf(HubOnlyTableError)
+    expect((rejected as HubOnlyTableError).table).toBe("permission")
+
+    const hub = openConnection({ filename })
+    try {
+      hub.run(
+        "INSERT INTO permission (id, project_id, action, resource, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?)",
+        ["permission-hub", "project-1", "allow", "*", 1, 1],
+      )
+    } finally {
+      hub.close()
+    }
+    expect(await Effect.runPromise(database.all("SELECT id FROM permission"))).toEqual([{ id: "permission-hub" }])
+  })
+
+  test("the worker Bus publishes durable events through the guarded connection (C2)", async () => {
+    const filename = temporaryDatabase()
+    migrated(filename)
+    const database = await open(filename)
+    const Note = Event.define({
+      type: "test.worker.db.note",
+      durable: { version: 1, aggregate: "sessionID" },
+      schema: { sessionID: Schema.String, text: Schema.String },
+    })
+    const bus = Bus.create({ connection: database.connection, ownerID: "gen-1", definitions: [Note] })
+    expect(bus.claim("session-a")).toEqual({ aggregateID: "session-a", ownerID: "gen-1", seq: -1 })
+
+    const published = bus.publish([{ definition: Note, data: { sessionID: "session-a", text: "durable" } }])
+    expect(published[0]?.durable?.seq).toBe(0)
+    expect(database.connection.all("SELECT aggregate_id, seq, owner_id FROM event_sequence")).toEqual([
+      { aggregate_id: "session-a", seq: 0, owner_id: "gen-1" },
+    ])
+    expect(database.connection.all<{ count: number }>("SELECT COUNT(*) AS count FROM event")).toEqual([{ count: 1 }])
+
+    const stale = Bus.create({ connection: database.connection, ownerID: "gen-2", definitions: [Note] })
+    expect(() => stale.publish([{ definition: Note, data: { sessionID: "session-a", text: "stolen" } }])).toThrow(
+      Bus.StaleOwnerError,
+    )
+  })
+
   test("a worker may read hub-owned state and write its own session tables", async () => {
     const filename = temporaryDatabase()
     migrated(filename)
@@ -219,5 +269,103 @@ describe("worker table ownership (W1.5 / D6)", () => {
       ),
     )
     expect(await Effect.runPromise(database.all("SELECT id FROM message"))).toEqual([{ id: "message-z" }])
+  })
+})
+
+describe("worker SQL guard bypass matrix (C9 / D14 / D21)", () => {
+  const errorOf = async (effect: Effect.Effect<unknown, unknown>) =>
+    Effect.runPromise(effect.pipe(Effect.flip)) as Promise<unknown>
+
+  test("query(...).run cannot bypass the table guard", async () => {
+    const filename = temporaryDatabase()
+    migrated(filename)
+    const database = await open(filename)
+    const statement = database.connection.query("INSERT INTO permission (id) VALUES (?)")
+    expect(() => statement.run("nope")).toThrow(HubOnlyTableError)
+    expect(database.connection.query("SELECT COUNT(*) AS count FROM permission").all()).toEqual([{ count: 0 }])
+  })
+
+  test("a commented write cannot hide behind the comment", async () => {
+    const filename = temporaryDatabase()
+    migrated(filename)
+    const database = await open(filename)
+    expect(() =>
+      database.connection.query("/* leading */ INSERT INTO permission (id) VALUES (?)").run("nope"),
+    ).toThrow(HubOnlyTableError)
+    expect(() =>
+      database.connection.query("-- leading\nUPDATE permission SET id = 'nope'").run(),
+    ).toThrow(HubOnlyTableError)
+  })
+
+  test("CTE writes are classified by their write statement", async () => {
+    const filename = temporaryDatabase()
+    migrated(filename)
+    const database = await open(filename)
+
+    const insert = await errorOf(
+      database.run("WITH x AS (SELECT 1) INSERT INTO permission (id) SELECT 'nope' FROM x"),
+    )
+    expect(insert).toBeInstanceOf(HubOnlyTableError)
+    expect((insert as HubOnlyTableError).table).toBe("permission")
+
+    const update = await errorOf(database.run("WITH x AS (SELECT 1) UPDATE permission SET id = 'nope'"))
+    expect(update).toBeInstanceOf(HubOnlyTableError)
+
+    const remove = await errorOf(database.run("WITH x AS (SELECT 1) DELETE FROM permission"))
+    expect(remove).toBeInstanceOf(HubOnlyTableError)
+  })
+
+  test("multiple statements are rejected even when the first is a read", async () => {
+    const filename = temporaryDatabase()
+    migrated(filename)
+    const database = await open(filename)
+
+    const exec = (() => {
+      try {
+        database.connection.exec("SELECT 1; DROP TABLE message")
+      } catch (cause) {
+        return cause
+      }
+    })()
+    expect(exec).toBeInstanceOf(WorkerStatementRejectedError)
+    expect(database.connection.query("SELECT name FROM sqlite_master WHERE name = 'message'").all()).toEqual([
+      { name: "message" },
+    ])
+
+    const all = (() => {
+      try {
+        database.connection.all("SELECT 1; DROP TABLE message")
+      } catch (cause) {
+        return cause
+      }
+    })()
+    expect(all).toBeInstanceOf(WorkerStatementRejectedError)
+  })
+
+  test("pragmas are read-only and never writable_schema or user_version", async () => {
+    const filename = temporaryDatabase()
+    migrated(filename)
+    const database = await open(filename)
+
+    expect(() => database.connection.all("PRAGMA writable_schema")).toThrow(WorkerStatementRejectedError)
+    expect(() => database.connection.all("PRAGMA user_version = 5")).toThrow(WorkerStatementRejectedError)
+    expect(() => database.connection.pragma("writable_schema = 1")).toThrow(WorkerStatementRejectedError)
+    expect(() => database.connection.pragma("user_version = 5")).toThrow(WorkerStatementRejectedError)
+    expect(Number(database.connection.pragma("user_version"))).toBe(currentSchemaIdentity().version)
+  })
+
+  test("ordinary reads, writes, and a trailing semicolon still work", async () => {
+    const filename = temporaryDatabase()
+    migrated(filename)
+    const database = await open(filename)
+
+    expect(await Effect.runPromise(database.all("SELECT COUNT(*) AS count FROM session;"))).toEqual([{ count: 2 }])
+    await Effect.runPromise(
+      database.run(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+        ["message-guard", "session-a", 1, 1, "{}"],
+      ),
+    )
+    expect(await Effect.runPromise(database.all("SELECT id FROM message"))).toEqual([{ id: "message-guard" }])
   })
 })

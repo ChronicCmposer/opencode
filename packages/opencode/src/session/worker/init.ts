@@ -2,7 +2,7 @@
 // (`{ snapshot, env, model }`) and the serializable pieces it is built from.
 //
 // The hub ships one structured-cloned `SessionWorkerInit` per worker generation:
-//   * `snapshot` — {@link buildWorkerSnapshot} (plan decisions 67/68);
+//   * `snapshot` — {@link buildWorkerSnapshot};
 //   * `env` — an immutable overlay merged onto the inherited environment;
 //   * `model` — a plain-data model bootstrap ({@link resolveWorkerModel}).
 //
@@ -32,6 +32,7 @@ import { CHAT_PARAM_KEYS } from "./plugin-host"
 import {
   UnclassifiedPluginHookError,
   UnsupportedPluginHookError,
+  isHubProxyHook,
   pluginHookAdmissionError,
 } from "@/plugin/routes"
 import type {
@@ -294,7 +295,7 @@ export const resolveWorkerModel = Effect.fn("WorkerModel.resolve")(function* (op
 })
 
 // ---------------------------------------------------------------------------
-// Plugin effect resolution (Phase 6.3 / plan decision 70)
+// Plugin effect resolution
 // ---------------------------------------------------------------------------
 
 /**
@@ -482,7 +483,19 @@ export const resolveWorkerPlugins = Effect.fn("WorkerPlugins.resolve")(function*
         kind: nonCloneable.kind,
       })
     }
-    plugins.push({ name: source.name, hooks: {}, resolved })
+    // A hub-proxied hook's function cannot cross the isolate, but it is not
+    // dropped: the worker forwards each dispatch to the hub over the control
+    // port. Record which hooks take that path so the assembly never claims an
+    // empty hook set for a routed hook.
+    const proxied = Object.entries(source.hooks)
+      .filter(([name, value]) => typeof value === "function" && isHubProxyHook(name))
+      .map(([name]) => name)
+    plugins.push({
+      name: source.name,
+      hooks: {},
+      resolved,
+      ...(proxied.length === 0 ? {} : { proxied }),
+    })
   }
   return plugins
 })

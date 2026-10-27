@@ -1,4 +1,4 @@
-// W2.5 — per-Session run barrier (D18).
+// Per-Session run barrier (D18).
 //
 // A run is not finished when the model loop stops. Before the next run may be
 // admitted, one Session must observe four things:
@@ -32,7 +32,7 @@ export interface RunBarrierOutcome {
   readonly status: "drained" | "cancelled"
 }
 
-export type RunBarrierState = "idle" | "draining" | "drained" | "timed-out" | "cancelled"
+export type RunBarrierState = "idle" | "draining" | "drained" | "timed-out" | "cancelled" | "failed"
 
 /** Injectable timer seam, so the bound is deterministic in tests. */
 export interface RunBarrierScheduler {
@@ -82,6 +82,11 @@ export interface RunBarrierOptions {
   /** Barrier bound; defaults to {@link RUN_BARRIER_TIMEOUT_MS}. */
   readonly timeoutMs?: number
   readonly scheduler?: RunBarrierScheduler
+  /**
+   * Maximum Session states retained. Terminal sessions evict LRU once the cap is
+   * reached; a draining barrier is never evicted. Defaults to 1024.
+   */
+  readonly maxSessions?: number
 }
 
 export interface RunBarrier {
@@ -92,6 +97,8 @@ export interface RunBarrier {
   state(sessionID: string): RunBarrierState
   /** Clear a timed-out/cancelled/drained state so a later run may be admitted. */
   reset(sessionID: string): void
+  /** Number of retained Session states (bounded). */
+  readonly size: number
 }
 
 interface ActiveBarrier {
@@ -104,11 +111,33 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
     throw new Error(`invalid run barrier timeout: ${timeoutMs} (expected a positive integer)`)
   }
   const scheduler = options.scheduler ?? defaultScheduler
+  const maxSessions = options.maxSessions ?? 1024
+  if (!Number.isInteger(maxSessions) || maxSessions < 1) {
+    throw new Error(`invalid run barrier session bound: ${maxSessions}`)
+  }
 
   const states = new Map<string, RunBarrierState>()
+  const failures = new Map<string, Error>()
   const active = new Map<string, ActiveBarrier>()
 
   const stateOf = (sessionID: string): RunBarrierState => states.get(sessionID) ?? "idle"
+
+  /** Insert/refresh LRU order, then evict the oldest evictable state. */
+  const remember = (sessionID: string, state: RunBarrierState): void => {
+    states.delete(sessionID)
+    states.set(sessionID, state)
+    if (state !== "failed") failures.delete(sessionID)
+    while (states.size > maxSessions) {
+      let evicted = false
+      for (const [key, value] of states) {
+        if (key === sessionID || value === "draining") continue
+        states.delete(key)
+        evicted = true
+        break
+      }
+      if (!evicted) break
+    }
+  }
 
   return {
     wait(sessionID, phases) {
@@ -116,11 +145,14 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
 
       const state = stateOf(sessionID)
       if (state === "timed-out") return Promise.reject(new RunBarrierTimeout(sessionID, timeoutMs))
+      if (state === "failed") {
+        return Promise.reject(failures.get(sessionID) ?? new RunBarrierError(`run barrier for session ${sessionID} previously failed`))
+      }
       // A cancelled Session does not start a next run either; reset re-admits it.
       if (state === "cancelled") return Promise.resolve({ sessionID, status: "cancelled" })
       if (state === "draining") return Promise.reject(new RunBarrierBusyError(sessionID))
 
-      states.set(sessionID, "draining")
+      remember(sessionID, "draining")
 
       return new Promise<RunBarrierOutcome>((resolve, reject) => {
         let settled = false
@@ -132,7 +164,7 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
           if (timer !== undefined) scheduler.cancel(timer)
           timer = undefined
           active.delete(sessionID)
-          states.set(sessionID, outcome.status)
+          remember(sessionID, outcome.status)
           resolve(outcome)
         }
 
@@ -142,7 +174,9 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
           if (timer !== undefined) scheduler.cancel(timer)
           timer = undefined
           active.delete(sessionID)
-          states.set(sessionID, "timed-out")
+          const state: RunBarrierState = error instanceof RunBarrierTimeout ? "timed-out" : "failed"
+          if (state === "failed") failures.set(sessionID, error)
+          remember(sessionID, state)
           reject(error)
         }
 
@@ -175,16 +209,20 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
       const current = active.get(sessionID)
       if (current) {
         // `settleCancelled` is idempotent via the `settled` flag in `wait`.
-        states.set(sessionID, "cancelled")
+        remember(sessionID, "cancelled")
         current.settleCancelled()
         return
       }
-      states.set(sessionID, "cancelled")
+      remember(sessionID, "cancelled")
     },
     state: stateOf,
     reset(sessionID) {
       if (active.has(sessionID)) throw new RunBarrierBusyError(sessionID)
       states.delete(sessionID)
+      failures.delete(sessionID)
+    },
+    get size() {
+      return states.size
     },
   }
 }

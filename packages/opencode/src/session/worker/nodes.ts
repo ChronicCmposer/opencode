@@ -1,4 +1,4 @@
-// TDD steps 34–35 — flag-gated graph membership for the session-worker pool.
+// Flag-gated graph membership for the session-worker pool.
 //
 // The production app graphs (`effect/app-runtime.ts` `AppLayer` and
 // `server/routes/instance/httpapi/server.ts` `app`) list layer nodes statically. The
@@ -25,7 +25,7 @@
 // replacing the ambient `isMainThread` check. The role is FAIL CLOSED: an isolate
 // that never declared one is not a hub, so the gate stays shut.
 //
-// Applied wiring (Wave 3):
+// Applied wiring:
 //
 // ```ts
 // // packages/opencode/src/effect/app-runtime.ts — inside AppLayer's group, after

@@ -736,15 +736,15 @@ describe("W11 production egress mesh", () => {
           encodeFrame(
             eventFrame({
               event: { id: `evt_${ordinal}`, type: "session.message", properties: { ordinal } },
-              generation: 1,
-              ordinal,
+              aggregateID: "agg",
+              seq: ordinal,
             }),
           ),
         )
       }
 
       await pollUntil(() => resyncs.length === 1, { message: "mesh never overflowed to a resync" })
-      expect(commits.map((commit) => commit.meta.ordinal)).toEqual([1, 2])
+      expect(commits.map((commit) => commit.meta.seq)).toEqual([1, 2])
       expect(resyncs).toEqual(["*"])
       // The hub still republishes every durable event live-only (the mesh is an
       // additive wakeup channel, not a replacement for the event surface).
@@ -756,13 +756,13 @@ describe("W11 production egress mesh", () => {
         encodeFrame(
           eventFrame({
             event: { id: "evt_4", type: "session.message", properties: { ordinal: 4 } },
-            generation: 1,
-            ordinal: 4,
+            aggregateID: "agg",
+            seq: 4,
           }),
         ),
       )
       await pollUntil(() => commits.length === 3, { message: "ack never freed a delivery slot" })
-      expect(commits.map((commit) => commit.meta.ordinal)).toEqual([1, 2, 4])
+      expect(commits.map((commit) => commit.meta.seq)).toEqual([1, 2, 4])
     } finally {
       mesh.dispose()
       dispose()
@@ -1290,8 +1290,8 @@ describe("Q22 hub event sink", () => {
         encodeFrame(
           eventFrame({
             event: { id: "evt_d", type: "message.part.updated", properties: { part: 1 } },
-            generation: 3,
-            ordinal: 9,
+            aggregateID: "agg",
+            seq: 9,
           }),
         ),
       )

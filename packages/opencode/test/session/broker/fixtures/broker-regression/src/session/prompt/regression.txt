@@ -1,0 +1,2 @@
+Synthetic regression fixture: a non-.ts asset naming a removed broker symbol.
+createWorkerBrokerClient()

@@ -31,10 +31,13 @@ export const WORKER_HOOK_ROUTES = {
   "experimental.chat.system.transform": "hub-proxy",
   "experimental.chat.messages.transform": "hub-proxy",
   "experimental.provider.small_model": "hub-proxy",
+  // The worker's shell tool and tool registry dispatch these, but the real
+  // plugin instance lives on the hub, so they are forwarded over the control
+  // port (D19: never invoked in a worker, never silently skipped).
+  "shell.env": "hub-proxy",
+  "tool.definition": "hub-proxy",
   "chat.message": "unsupported",
   "command.execute.before": "unsupported",
-  "shell.env": "unsupported",
-  "tool.definition": "unsupported",
   "experimental.session.compacting": "unsupported",
   "experimental.compaction.autocontinue": "unsupported",
   "experimental.text.complete": "unsupported",
@@ -84,6 +87,12 @@ export function workerHookRoute(name: string): WorkerHookRoute | undefined {
 export function isDeclaredOnlyHook(name: string): boolean {
   return declaredOnlyHooks.has(name)
 }
+
+/** Whether `name` is served by the hub and forwarded over the control port. */
+export function isHubProxyHook(name: string): boolean {
+  return workerHookRoute(name) === "hub-proxy"
+}
+
 
 /**
  * The first admission problem in one plugin's hooks, if any. Function-valued

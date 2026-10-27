@@ -82,7 +82,12 @@ describe("busy classification", () => {
     expect(isBusyError({ code: "SQLITE_BUSY" })).toBe(true)
     expect(isBusyError({ code: "SQLITE_BUSY_SNAPSHOT" })).toBe(true)
     expect(isBusyError({ sqliteCode: "SQLITE_LOCKED_SHAREDCACHE" })).toBe(true)
-    expect(isBusyError(new Error("database is locked"))).toBe(true)
+
+    // m17: a bare message is not a native SQLite error shape, so it is never
+    // retried (a proxy/network "database is locked" must surface unchanged).
+    expect(isBusyError(new Error("database is locked"))).toBe(false)
+    expect(isBusyError({ message: "SQLITE_BUSY: database is locked" })).toBe(false)
+    expect(isBusyError({ name: "SQLiteError", message: "database is locked" })).toBe(true)
   })
 
   test("does not classify constraints, missing tables, or non-objects as busy", () => {

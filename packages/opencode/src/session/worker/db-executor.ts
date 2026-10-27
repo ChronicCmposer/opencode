@@ -7,7 +7,8 @@
 // measured fallback; workers keep their own WAL connection.
 
 import { Database, type SQLQueryBindings } from "bun:sqlite"
-import { isMainThread, parentPort, workerData } from "node:worker_threads"
+import { isMainThread, parentPort, threadId, workerData } from "node:worker_threads"
+import { resolveWalConfig, walPragmas } from "@opencode-ai/core/database/pragmas"
 import { resolveWorkerEntry } from "./port"
 
 export type DbParams = ReadonlyArray<unknown> | Record<string, unknown>
@@ -33,6 +34,8 @@ export interface DbExecutor {
   query(sql: string, params?: DbParams): Promise<ReadonlyArray<Record<string, unknown>>>
   transaction(statements: ReadonlyArray<DbStatement>): Promise<ReadonlyArray<DbTransactionResult>>
   close(): Promise<void>
+  /** The isolate's real thread id; `0` until the ready frame arrives. */
+  readonly threadId: number
 }
 
 type DbExecutorRequest =
@@ -49,6 +52,10 @@ interface DbExecutorFailure {
   readonly message: string
   readonly code?: string | number
   readonly sqliteCode?: string
+  /** The original transaction failure, when a rollback also failed. */
+  readonly cause?: DbExecutorFailure
+  /** The follow-up ROLLBACK failure, when a rollback also failed. */
+  readonly rollbackCause?: DbExecutorFailure
 }
 
 type DbExecutorResponse =
@@ -84,6 +91,47 @@ export class DbExecutorRemoteError extends Error {
   }
 }
 
+/**
+ * A request deadline elapsed. The transaction may have committed before the
+ * response was lost, so the result is indeterminate: the thread is retired and
+ * the caller must not blindly retry a non-idempotent body.
+ */
+export class DbExecutorTimeoutError extends Error {
+  readonly tag = "DB_EXECUTOR_TIMEOUT"
+  readonly indeterminate = true
+  constructor(message: string) {
+    super(message)
+    this.name = "DbExecutorTimeoutError"
+  }
+}
+
+/**
+ * A transaction body failed and the follow-up `ROLLBACK` also failed. The
+ * original failure is preserved as `cause`; the rollback failure is attached as
+ * `rollbackCause`; the executor is poisoned because the transaction state is
+ * unknown.
+ */
+export class DbExecutorRollbackError extends Error {
+  readonly tag = "DB_EXECUTOR_ROLLBACK_FAILED"
+  override readonly cause: Error
+  readonly rollbackCause: DbExecutorRemoteError
+  constructor(original: DbExecutorFailure, rollback: DbExecutorFailure) {
+    super(original.message)
+    this.name = "DbExecutorRollbackError"
+    this.cause = new DbExecutorRemoteError(original)
+    this.rollbackCause = new DbExecutorRemoteError(rollback)
+  }
+}
+
+/** A prior failed rollback left the connection unusable; no work may follow. */
+export class DbExecutorPoisonedError extends Error {
+  readonly tag = "DB_EXECUTOR_POISONED"
+  constructor() {
+    super("database executor is poisoned by a failed rollback")
+    this.name = "DbExecutorPoisonedError"
+  }
+}
+
 export interface DbExecutorOptions {
   /** SQLite filename opened inside the executor thread. */
   readonly filename: string
@@ -95,12 +143,18 @@ export interface DbExecutorOptions {
   readonly entry?: string | URL
   readonly env?: Record<string, string | undefined>
   readonly name?: string
+  /**
+   * Create the database file when absent. A gated probe passes `false` so a
+   * missing or unmigrated database is refused without leaving a stray file.
+   */
+  readonly create?: boolean
 }
 
 export interface DbExecutorWorkerData {
   readonly kind: "db-executor"
   readonly filename: string
   readonly pragmas?: ReadonlyArray<string>
+  readonly create?: boolean
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000
@@ -108,6 +162,21 @@ const DEFAULT_TIMEOUT_MS = 30_000
 function nativeBindings(params: DbParams | undefined): SQLQueryBindings[] {
   if (params === undefined) return []
   return (Array.isArray(params) ? [...params] : [params]) as SQLQueryBindings[]
+}
+
+class RollbackFailure extends Error {
+  readonly tag = "DB_EXECUTOR_ROLLBACK_FAILED"
+  constructor(
+    readonly original: unknown,
+    readonly rollback: unknown,
+  ) {
+    super(errorMessage(original))
+    this.name = "DbExecutorRollbackError"
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function failureOf(error: unknown): DbExecutorFailure {
@@ -118,12 +187,24 @@ function failureOf(error: unknown): DbExecutorFailure {
     readonly code?: unknown
     readonly sqliteCode?: unknown
   }
+  const rollback =
+    error instanceof RollbackFailure
+      ? { cause: failureOf(error.original), rollbackCause: failureOf(error.rollback) }
+      : {}
   return {
     name: typeof candidate.name === "string" ? candidate.name : "Error",
     message: typeof candidate.message === "string" ? candidate.message : String(error),
     ...(typeof candidate.code === "string" || typeof candidate.code === "number" ? { code: candidate.code } : {}),
     ...(typeof candidate.sqliteCode === "string" ? { sqliteCode: candidate.sqliteCode } : {}),
+    ...rollback,
   }
+}
+
+function remoteErrorOf(failure: DbExecutorFailure): Error {
+  if (failure.cause !== undefined && failure.rollbackCause !== undefined) {
+    return new DbExecutorRollbackError(failure.cause, failure.rollbackCause)
+  }
+  return new DbExecutorRemoteError(failure)
 }
 
 function runStatement(db: Database, statement: DbStatement): DbRunResult {
@@ -138,7 +219,13 @@ function runTransaction(db: Database, statements: ReadonlyArray<DbStatement>): R
     db.exec("COMMIT")
     return results
   } catch (error) {
-    db.exec("ROLLBACK")
+    try {
+      db.exec("ROLLBACK")
+    } catch (rollbackError) {
+      // The original failure is the cause; the failed rollback is attached so
+      // neither is lost. The message handler poisons the thread afterwards.
+      throw new RollbackFailure(error, rollbackError)
+    }
     throw error
   }
 }
@@ -157,11 +244,20 @@ function execute(db: Database, request: DbExecutorRequest): unknown {
 function startWorkerThread(data: DbExecutorWorkerData): void {
   const transport = parentPort
   if (transport === null) throw new Error("db executor worker started without a parent port")
-  const db = new Database(data.filename, { create: true })
+  const db = new Database(data.filename, { create: data.create ?? true })
   try {
     for (const pragma of data.pragmas ?? []) db.exec(pragma)
-    transport.postMessage({ type: "ready", threadId: 0 } satisfies DbExecutorResponse)
+    let poisoned = false
+    transport.postMessage({ type: "ready", threadId } satisfies DbExecutorResponse)
     transport.on("message", (message: DbExecutorRequest) => {
+      if (poisoned) {
+        transport.postMessage({
+          type: "failure",
+          id: message.id,
+          error: failureOf(new DbExecutorPoisonedError()),
+        } satisfies DbExecutorResponse)
+        return
+      }
       try {
         const value = execute(db, message)
         transport.postMessage({
@@ -170,6 +266,15 @@ function startWorkerThread(data: DbExecutorWorkerData): void {
           value,
         } satisfies DbExecutorResponse)
       } catch (error) {
+        if (error instanceof RollbackFailure) {
+          // The transaction state is unknown; never reuse this handle.
+          poisoned = true
+          try {
+            db.close()
+          } catch {
+            // The handle may already be unusable.
+          }
+        }
         transport.postMessage({
           type: "failure",
           id: message.id,
@@ -228,10 +333,16 @@ const terminateWorker = async (worker: Worker | undefined): Promise<void> => {
 export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
   const entry = options.entry ?? resolveDbExecutorEntry({ env: options.env })
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  // Applied inside the worker before the ready frame; the default is the shared
+  // WAL tuning (journal mode, synchronous, cache, foreign keys, size cap) plus a
+  // driver-level busy timeout, so a concurrently held write lock waits instead
+  // of surfacing SQLITE_BUSY immediately.
+  const pragmas = options.pragmas ?? walPragmas(resolveWalConfig(options.env))
   let worker: Worker | undefined
   let ready: Promise<void> | undefined
   let closed = false
   let nextId = 1
+  let executorThreadId = 0
   const pending = new Map<number, PendingRequest>()
 
   const failPending = (error: unknown): void => {
@@ -259,14 +370,19 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
         workerData: {
           kind: "db-executor",
           filename: options.filename,
-          ...(options.pragmas === undefined ? {} : { pragmas: options.pragmas }),
+          pragmas,
+          ...(options.create === undefined ? {} : { create: options.create }),
         } satisfies DbExecutorWorkerData,
       } as unknown as WorkerOptions
       const spawned = new Worker(entry, workerOptions)
       worker = spawned
       spawned.onmessage = (event: MessageEvent<DbExecutorResponse>) => {
+        // A retired worker's late frames must never settle a request for, or
+        // resolve, a replacement thread.
+        if (worker !== spawned) return
         const message = event.data
         if (message.type === "ready") {
+          executorThreadId = message.threadId
           resolve()
           return
         }
@@ -275,9 +391,10 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
         pending.delete(message.id)
         if (request.timer !== undefined) clearTimeout(request.timer)
         if (message.type === "result") request.resolve(message.value)
-        else request.reject(new DbExecutorRemoteError(message.error))
+        else request.reject(remoteErrorOf(message.error))
       }
       spawned.onerror = (event) => {
+        if (worker !== spawned) return
         const error = new DbExecutorCrashedError(
           `db executor worker failed: ${event.message || "unknown worker error"}`,
         )
@@ -285,7 +402,7 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
         reject(error)
       }
       spawned.addEventListener("close", () => {
-        if (closed) return
+        if (closed || worker !== spawned) return
         const error = new DbExecutorCrashedError("db executor worker exited")
         retire(error)
         reject(error)
@@ -304,8 +421,15 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
       const timer =
         timeoutMs > 0
           ? setTimeout(() => {
-              pending.delete(id)
-              reject(new DbExecutorCrashedError(`db executor request ${id} timed out after ${timeoutMs}ms`))
+              // A deadline is indeterminate: the transaction may have committed
+              // before the response was lost. Retire the whole thread so a retry
+              // starts on a fresh connection and no half-open transaction is
+              // reused. Unlike a crash, callers can tell this apart by type.
+              retire(
+                new DbExecutorTimeoutError(
+                  `db executor request ${id} timed out after ${timeoutMs}ms; the transaction may have committed`,
+                ),
+              )
             }, timeoutMs)
           : undefined
       pending.set(id, { resolve, reject, timer })
@@ -336,6 +460,9 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
       })) as Promise<ReadonlyArray<Record<string, unknown>>>,
     transaction: (statements) =>
       request((id) => ({ type: "transaction", id, statements })) as Promise<ReadonlyArray<DbTransactionResult>>,
+    get threadId() {
+      return executorThreadId
+    },
     async close() {
       if (closed) return
       closed = true

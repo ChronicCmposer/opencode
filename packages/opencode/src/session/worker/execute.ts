@@ -1,4 +1,4 @@
-// Phase 5 — session execution seam (plan tasks 5.1–5.7).
+// Session execution seam.
 //
 // The run-state machine (`Runner` per session key) MOVES INTO the worker; the
 // hub keeps only the key→worker map + admission (owned by `dispatch.ts`). This
@@ -17,9 +17,10 @@ import type { Latch } from "effect"
 import { Runner } from "@/effect/runner"
 import type { SessionID } from "@/session/schema"
 import type { PromptInput, ShellInput } from "@/session/prompt"
-import type { CancelFrame, CancelPort } from "./cancel"
+import type { BootCancelResult, CancelFrame, CancelPort } from "./cancel"
 import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
 import { errorTagOf, messageOf } from "./port"
+import { readyFrame, type ReadyBuildFrame } from "./build-hash"
 import type { DispatchOrigin } from "@/session/origin"
 import {
   createSupervision,
@@ -50,7 +51,7 @@ export type SessionWorkFactory = (kind: string) => SessionWork
 
 /**
  * The run control the worker-local `SessionRunState` exposes to the executor
- * (Phase 4). The executor's own machine (table A) is only an outer `ensureRunning`
+ * The executor's own machine (table A) is only an outer `ensureRunning`
  * guard; the real `SessionPrompt.loop` runs on the worker-local `SessionRunState`
  * runner (table B). Routing `cancel`/`assertNotBusy` here makes cancel actually
  * interrupt the loop — and makes `assertNotBusy` tell the truth after a cancel.
@@ -183,10 +184,7 @@ export type SessionExecutorInbound =
   | { readonly type: "hasActiveWork"; readonly id: number; readonly sessionID: SessionID }
   | { readonly type: "ping"; readonly id: number }
 
-export interface SessionExecutorReady {
-  readonly type: "ready"
-  readonly threadId: number
-}
+export type SessionExecutorReady = ReadyBuildFrame
 export interface SessionExecutorPong {
   readonly type: "pong"
   readonly id: number
@@ -384,7 +382,7 @@ export interface ExecutorWorkerScope {
 
 export interface SessionExecutorInstallOptions {
   readonly work: SessionWorkFactory
-  /** Worker-local run control; forwarded to the installed executor (Phase 4). */
+  /** Worker-local run control; forwarded to the installed executor. */
   readonly control?: SessionRunControl
   /** Worker-local background-work probe; forwarded to the installed executor. */
   readonly activeWork?: (sessionID: SessionID) => Promise<boolean>
@@ -437,7 +435,7 @@ export function installSessionExecutor(
     )
   }
 
-  scope.postMessage({ type: "ready", threadId: options.threadId ?? 0 })
+  scope.postMessage(readyFrame(options.threadId ?? 0))
   return {
     handle: executor.handle,
     dispose: async () => {
@@ -498,6 +496,12 @@ export interface ExecutorTransport {
   ): Promise<SessionExecutorOutbound>
   readonly alive: boolean
   terminate(code?: number): Promise<number>
+  /**
+   * Cancel the pre-ready boot interval. Resolves the typed boot outcome when a
+   * cancel wins, `undefined` once the run started (normal cancel applies), or
+   * when the transport boots eagerly. Absent means no boot accounting.
+   */
+  cancelBoot?(): Promise<BootCancelResult | undefined>
 }
 
 export interface ExecutorWorker extends ExecutorSessionWorker {
@@ -518,6 +522,12 @@ export interface ExecutorWorker extends ExecutorSessionWorker {
    * remain valid; `createExecutorWorker` always provides it.
    */
   readonly cancelPort?: CancelPort
+  /**
+   * Cancel a worker that is still booting (the spawn permit is held, the ready
+   * handshake has not started the run). Resolves the typed boot outcome, or
+   * `undefined` when the run already started. Optional so test fakes remain valid.
+   */
+  cancelBoot?(): Promise<BootCancelResult | undefined>
   /**
    * Per-session write barrier (R4#16): resolves once the run's durable egress
    * write is acked. The dispatcher awaits it before releasing the worker to its
@@ -753,7 +763,13 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     recordResult(message.result)
   }
 
+  const cancelBoot = (): Promise<BootCancelResult | undefined> =>
+    transport.cancelBoot?.() ?? Promise.resolve(undefined)
+
   const cancel = async (sessionID: SessionID): Promise<void> => {
+    // A cancel that lands before the ready handshake wins the boot interval; the
+    // queued run never starts, so no worker-side cancel frame is sent.
+    if ((await cancelBoot()) !== undefined) return
     await request(
       (id) => ({ type: "cancel", id, sessionID }),
       (reply) => reply.type === "cancelled",
@@ -799,6 +815,7 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     },
     execute,
     cancel,
+    cancelBoot,
     cancelPort,
     assertNotBusy,
     hasActiveWork,
@@ -942,7 +959,7 @@ export interface SessionDispatchOptions {
 
 /**
  * The hub-side surface `SessionRunState` will delegate to when the rollout flag
- * is on (Phase 6 wires it into the layer). Scheduling, admission and the
+ * is on (wired into the layer). Scheduling, admission and the
  * key→worker map come from `dispatch.ts`; `assertNotBusy` is answered by the
  * owning worker.
  */

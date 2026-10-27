@@ -1,7 +1,7 @@
 // Best-effort OS thread naming for human observability.
 //
 // Linux exposes a per-thread name at `/proc/thread-self/comm`. Each opencode
-// isolate (writer `ocw`, broker `ocb`, hub `och`) calls `setThreadName` from
+// isolate (hub `och`, session workers by session id) calls `setThreadName` from
 // inside its own thread so `ps -T`, `top -H` and friends label the thread
 // instead of showing it as the process name. `/proc/thread-self` is a symlink
 // to the CALLING thread's `/proc/<pid>/task/<tid>`; `/proc/self` would name the

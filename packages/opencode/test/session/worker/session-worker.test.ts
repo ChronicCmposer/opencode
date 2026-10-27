@@ -290,6 +290,38 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
     expect(disposed).toBe(1)
   })
 
+  test("dispose rejects pending hub-proxy calls and removes egress listeners (M8)", async () => {
+    const { scope } = fakeScope()
+    const recorder = recordingLogger()
+    let client: import("@/session/worker/hub-proxy-wire").HubProxyClient | undefined
+    const handle = bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope, {
+      log: recorder.log,
+      observeHubProxy: (observed) => {
+        client = observed
+      },
+    })
+    expect(client).toBeDefined()
+
+    const call = client!.call("sessionStatus.get", []).then(
+      () => "resolved",
+      () => "rejected",
+    )
+    const stillPending = await Promise.race([
+      call,
+      new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 50)),
+    ])
+    expect(stillPending).toBe("pending")
+
+    handle.dispose()
+
+    const settled = await Promise.race([
+      call,
+      new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 200)),
+    ])
+    expect(settled).toBe("rejected")
+    expect(recorder.lines.map((entry) => entry.message)).toContain(workerLogMessage("egress closed"))
+  })
+
   test("wires a real logger into the E2 client lifecycles (not the noop default)", () => {
     const { scope } = fakeScope()
     const recorder = recordingLogger()
@@ -1018,7 +1050,7 @@ describe("worker event bridge wiring (Q6/Q13/Q15)", () => {
       },
       onmessage: null as ((event: { data: unknown }) => void) | null,
     }
-    bootstrapSessionWorker(
+    const bootstrap = bootstrapSessionWorker(
       {
         snapshot: workerSnapshot(),
         env: { values: {} },
@@ -1036,9 +1068,21 @@ describe("worker event bridge wiring (Q6/Q13/Q15)", () => {
       },
       scope,
     )
-    const ports = frames.find((frame) => (frame.data as { type?: string }).type === "ports")
-    expect(ports).toBeDefined()
-    expect((ports!.data as { egress?: unknown }).egress).toBeInstanceOf(MessagePort)
+    try {
+      const ports = frames.find((frame) => (frame.data as { type?: string }).type === "ports")
+      expect(ports).toBeDefined()
+      expect((ports!.data as { egress?: unknown }).egress).toBeInstanceOf(MessagePort)
+    } finally {
+      // This is a real bootstrap (graph, DB, event bridge). Dispose it and close
+      // every transferred port so the worker never outlives the test and poisons
+      // a later E2E run that starts its own model loop.
+      for (const frame of frames) {
+        for (const value of Object.values(frame.data as Record<string, unknown>)) {
+          if (value instanceof MessagePort) value.close()
+        }
+      }
+      bootstrap.dispose()
+    }
   })
 })
 

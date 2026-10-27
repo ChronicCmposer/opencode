@@ -11,7 +11,7 @@ export { SCHEMA_TABLES, WORKER_WRITABLE_TABLES }
 
 /**
  * The durable log is written by the Bus, not by session-scoped DML, so it is not
- * part of the generated `session_id` allowlist. W1.7 owns its access rule.
+ * part of the generated `session_id` allowlist. The Bus owns its access rule.
  */
 export const DURABLE_LOG_TABLES: readonly string[] = Object.freeze(["event", "event_sequence"])
 
@@ -88,9 +88,24 @@ export function assertTableAllowlist(connection: SqliteQuery): void {
   }
 }
 
+/**
+ * Boot/migration parity gate for the generated worker table set. Unlike the full
+ * allowlist assertion this tolerates unrelated installer tables, but any drift in
+ * the session-scoped (worker-writable) set is fatal.
+ */
+export function assertWorkerTableParity(connection: SqliteQuery): void {
+  const observed = deriveSessionScopedTables(connection)
+  const sessionScoped = drift(WORKER_WRITABLE_TABLES, observed)
+  if (sessionScoped.missing.length > 0 || sessionScoped.unexpected.length > 0) {
+    throw new TableAllowlistDriftError({ sessionScoped, tables: { missing: [], unexpected: [] } })
+  }
+}
+
 /** Session-scoped DML target. Durable-log writes are governed by the Bus contract. */
 export function isWorkerWritable(table: string): boolean {
   return workerTables.has(table)
 }
 
 export type { SqliteQuery }
+
+export * as Ownership from "./ownership"

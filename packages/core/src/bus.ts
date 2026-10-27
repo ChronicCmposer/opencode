@@ -3,6 +3,7 @@ export * as Bus from "./bus"
 import { Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import { decodeDurablePayload, type SerializedEvent } from "./event"
+import { BusyExhaustedError, isBusyError } from "./database/transaction"
 
 /**
  * The synchronous connection a Bus writes through. It matches the worker
@@ -305,19 +306,59 @@ const writeEvents = (
   return payloads
 }
 
-const inImmediateTransaction = <T>(connection: Connection, work: () => T): T => {
-  connection.exec("BEGIN IMMEDIATE")
-  try {
-    const result = work()
-    connection.exec("COMMIT")
-    return result
-  } catch (error) {
+// Busy retry budget (D5/W1.2): the whole `BEGIN IMMEDIATE … COMMIT` unit is the
+// retry boundary, so a busy statement can never leave a half-open transaction.
+const BUSY_RETRIES = 5
+const BUSY_BASE_DELAY_MS = 10
+const BUSY_MAX_DELAY_MS = 1_000
+
+function sleepSync(ms: number): void {
+  if (ms <= 0) return
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+function backoff(failedAttempt: number): number {
+  return Math.min(BUSY_BASE_DELAY_MS * 10 ** (failedAttempt - 1), BUSY_MAX_DELAY_MS)
+}
+
+/**
+ * A busy COMMIT did not commit and the transaction is still open, so re-issue
+ * COMMIT in place; replaying the body could duplicate effects.
+ */
+function commit(connection: Connection): void {
+  for (let attempt = 1; ; attempt += 1) {
     try {
-      connection.exec("ROLLBACK")
-    } catch {
-      // The original failure is authoritative; the connection stays suspect.
+      connection.exec("COMMIT")
+      return
+    } catch (error) {
+      if (!isBusyError(error)) throw error
+      if (attempt > BUSY_RETRIES) throw new BusyExhaustedError(attempt, error)
+      sleepSync(backoff(attempt))
     }
-    throw error
+  }
+}
+
+const inImmediateTransaction = <T>(connection: Connection, work: () => T): T => {
+  for (let attempt = 1; ; attempt += 1) {
+    let begun = false
+    try {
+      connection.exec("BEGIN IMMEDIATE")
+      begun = true
+      const result = work()
+      commit(connection)
+      return result
+    } catch (error) {
+      if (begun) {
+        try {
+          connection.exec("ROLLBACK")
+        } catch {
+          // The original failure is authoritative; the connection stays suspect.
+        }
+      }
+      if (!isBusyError(error)) throw error
+      if (attempt > BUSY_RETRIES) throw new BusyExhaustedError(attempt, error)
+      sleepSync(backoff(attempt))
+    }
   }
 }
 

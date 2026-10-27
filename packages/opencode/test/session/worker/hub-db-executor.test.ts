@@ -1,8 +1,16 @@
 import { describe, expect, test } from "bun:test"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { threadId as mainThreadId } from "node:worker_threads"
+import { Database as BunDatabase } from "bun:sqlite"
 import {
   createDbExecutor,
   DbExecutorClosedError,
+  DbExecutorCrashedError,
   DbExecutorRemoteError,
+  DbExecutorRollbackError,
+  DbExecutorTimeoutError,
   type DbExecutor,
 } from "@/session/worker/db-executor"
 
@@ -107,5 +115,153 @@ describe("db executor", () => {
       (error: unknown) => (error instanceof DbExecutorClosedError ? "closed" : String(error)),
     )
     expect(outcome).toBe("closed")
+  })
+})
+
+function tempDatabase(): { filename: string; directory: string } {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-db-executor-"))
+  return { filename: path.join(directory, "opencode.db"), directory }
+}
+
+describe("db executor hardening", () => {
+  test("opens with WAL and the resolved busy timeout before the first request", async () => {
+    const { filename, directory } = tempDatabase()
+    const executor = createDbExecutor({ filename, env: { OPENCODE_DB_BUSY_TIMEOUT_MS: "1234" } })
+    try {
+      await executor.query("SELECT 1 AS n")
+      const mode = await executor.query("PRAGMA journal_mode")
+      const busy = await executor.query("PRAGMA busy_timeout")
+      expect(mode).toEqual([{ journal_mode: "wal" }])
+      expect(busy).toEqual([{ timeout: 1234 }])
+    } finally {
+      await executor.close()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test("waits for a held write lock instead of failing immediately", async () => {
+    const { filename, directory } = tempDatabase()
+    const holder = new BunDatabase(filename)
+    holder.exec("PRAGMA journal_mode = WAL")
+    holder.exec("CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT)")
+    holder.exec("BEGIN IMMEDIATE")
+
+    const executor = createDbExecutor({ filename })
+    try {
+      const release = setTimeout(() => {
+        try {
+          holder.exec("ROLLBACK")
+        } catch {
+          // The holder was already released.
+        }
+      }, 120)
+      const inserted = await executor.run("INSERT INTO item (name) VALUES (?)", ["kept"])
+      clearTimeout(release)
+      expect(inserted.changes).toBe(1)
+      expect(await executor.query("SELECT name FROM item")).toEqual([{ name: "kept" }])
+    } finally {
+      try {
+        holder.exec("ROLLBACK")
+      } catch {
+        // Already released.
+      }
+      holder.close()
+      await executor.close()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test("a request deadline is indeterminate and retires the thread", async () => {
+    const executor = createDbExecutor({ filename: ":memory:", timeoutMs: 50 })
+    try {
+      await executor.query("SELECT 1 AS n")
+      const firstThread = executor.threadId
+      const outcome = await executor.query(BURN_SQL).then(
+        () => "resolved",
+        (error: unknown) =>
+          error instanceof DbExecutorTimeoutError
+            ? { kind: "timeout" as const, indeterminate: error.indeterminate }
+            : { kind: "other" as const, error },
+      )
+      expect(outcome).toEqual({ kind: "timeout", indeterminate: true })
+      // The timed-out thread is gone; the next request opens a fresh one.
+      expect(await executor.query("SELECT 2 AS n")).toEqual([{ n: 2 }])
+      expect(executor.threadId).toBeGreaterThan(0)
+      expect(executor.threadId).not.toBe(firstThread)
+    } finally {
+      await executor.close()
+    }
+  })
+
+  test("a genuine worker crash is a crash, not a timeout", async () => {
+    const executor = createDbExecutor({
+      filename: ":memory:",
+      timeoutMs: 1_000,
+      entry: new URL("../../fixture/db-executor-crash.ts", import.meta.url),
+    })
+    try {
+      const outcome = await executor.query("SELECT 1 AS n").then(
+        () => "resolved",
+        (error: unknown) => error,
+      )
+      expect(outcome).toBeInstanceOf(DbExecutorCrashedError)
+      expect(outcome).not.toBeInstanceOf(DbExecutorTimeoutError)
+    } finally {
+      await executor.close()
+    }
+  })
+
+  test("a failed rollback preserves the original cause and poisons the executor", async () => {
+    const executor = createDbExecutor({ filename: ":memory:" })
+    try {
+      await executor.run("CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+      const outcome = await executor
+        .transaction([
+          { sql: "INSERT INTO item (name) VALUES (?)", params: ["dup"] },
+          { sql: "INSERT OR ROLLBACK INTO item (name) VALUES (?)", params: ["dup"] },
+        ])
+        .then(
+          () => "resolved",
+          (error: unknown) => error,
+        )
+      expect(outcome).toBeInstanceOf(DbExecutorRollbackError)
+      const error = outcome as DbExecutorRollbackError
+      expect(String((error.cause as Error).message)).toContain("UNIQUE constraint failed")
+      expect(String(error.rollbackCause.message)).toContain("no transaction is active")
+      // The transaction state is unknown: the executor refuses further work.
+      const next = await executor.query("SELECT 1 AS n").then(
+        () => "resolved",
+        (failure: unknown) => (failure as Error).name,
+      )
+      expect(next).toBe("DbExecutorPoisonedError")
+    } finally {
+      await executor.close()
+    }
+  })
+
+  test("reports the real isolate thread id, not 0", async () => {
+    const executor = createDbExecutor({ filename: ":memory:" })
+    try {
+      await executor.query("SELECT 1 AS n")
+      expect(executor.threadId).toBeGreaterThan(0)
+      expect(executor.threadId).not.toBe(mainThreadId)
+    } finally {
+      await executor.close()
+    }
+  })
+
+  test("a create:false probe refuses a missing file without creating it", async () => {
+    const { filename, directory } = tempDatabase()
+    const executor = createDbExecutor({ filename, create: false })
+    try {
+      await executor.query("SELECT 1 AS n")
+      throw new Error("expected the probe to refuse a missing database")
+    } catch (error) {
+      expect(error).toBeInstanceOf(DbExecutorCrashedError)
+    } finally {
+      await executor.close()
+      expect(fs.existsSync(filename)).toBe(false)
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
   })
 })

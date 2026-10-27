@@ -1,14 +1,14 @@
-// Phase 8.5 — writer-stamped, generation-scoped global ordinal (plan task 8.5).
+// Writer-stamped, generation-scoped global ordinal.
 //
 // PHASE 7 DEPENDENCY (interface assumption, documented):
-//   The single-writer Worker (Phase 7) is responsible for stamping a global,
+//   The single-writer Worker is responsible for stamping a global,
 //   monotonically increasing `ordinal` at commit, scoped to a `generation`.
 //   `generation` is bumped whenever the writer is respawned (crash/resupervision),
 //   so ordinals from a dead writer can never be compared against a live one.
 //   The egress frame carries `{generation, ordinal}` as plain `number` fields;
-//   no schema change (plan decision line 66).
+//   no schema change.
 //
-//   Until Phase 7 lands we expose `OrdinalSource` as the seam the writer will
+//   We expose `OrdinalSource` as the seam the writer will
 //   implement, plus `createMonotonicOrdinalSource` as a deterministic fallback.
 //
 // Ordering is `(generation, ordinal)` lexicographic: a higher generation always
@@ -20,7 +20,7 @@ export interface WriterOrdinal {
   readonly ordinal: number
 }
 
-/** The seam the Phase 7 writer implements; `next()` stamps one committed event. */
+/** The seam the writer implements; `next()` stamps one committed event. */
 export interface OrdinalSource {
   next(): WriterOrdinal
 }
@@ -39,7 +39,7 @@ export interface MonotonicOrdinalOptions {
 }
 
 /**
- * Deterministic stand-in for the Phase 7 writer ordinal: increments the ordinal
+ * Deterministic stand-in for the writer ordinal: increments the ordinal
  * by one per call within a fixed generation.
  */
 export function createMonotonicOrdinalSource(options: MonotonicOrdinalOptions = {}): OrdinalSource {

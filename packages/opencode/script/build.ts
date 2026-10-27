@@ -15,7 +15,7 @@ const generated = await import("./generate.ts")
 
 import { Script } from "@opencode-ai/script"
 import pkg from "../package.json"
-import { computeBuildHash } from "../src/session/worker/build-hash.ts"
+import { hashWorkerBundle } from "../src/session/worker/build-hash.ts"
 
 const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
@@ -24,10 +24,15 @@ const sourcemapsFlag = process.argv.includes("--sourcemaps")
 const plugin = createSolidTransformPlugin()
 const skipEmbedWebUi = process.argv.includes("--skip-embed-web-ui")
 
-// The session-worker build identity: entry bundle bytes plus the protocol schema
-// version. Plugins and runtime configuration are intentionally excluded.
-const sessionWorkerBuildHash = computeBuildHash({
-  entryBundle: await Bun.file(path.join(dir, "src/session/worker/session-worker.ts")).arrayBuffer(),
+// The session-worker build identity: hash the EMITTED worker module graph (the
+// entry plus every transitive chunk), not the entry source text. Files outside
+// the graph (plugins, runtime config) are intentionally excluded.
+const sessionWorkerBuildHash = await hashWorkerBundle({
+  entrypoint: "./src/session/worker/session-worker.ts",
+  cwd: dir,
+  tsconfig: "./tsconfig.json",
+  external: ["node-gyp"],
+  plugins: [plugin],
 })
 
 const createEmbeddedWebUIBundle = async () => {

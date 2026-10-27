@@ -1,5 +1,4 @@
-// Phase 11 — terminate-based cancel (plan tasks 11.3, 11.5, 11.9; decisions
-// lines 45, 48, 49).
+// Terminate-based cancel.
 //
 // Synchronous JavaScript cannot be preempted inside a thread, and 3.10 proved
 // `terminate()` runs no finalizers. Cancellation is therefore terminate-based:

@@ -79,6 +79,8 @@ describe("worker messages.transform dispatch", () => {
       chatHeaders: async (_input, output) => output,
       toolBefore: async (_input, output) => output,
       toolAfter: async (_input, output) => output,
+      shellEnv: async (_input, output) => output,
+      toolDefinition: async (_input, output) => output,
       systemTransform: async (_input, output) => output,
       messagesTransform: async (input, output) => {
         calls.push({ input, output })

@@ -1,7 +1,7 @@
-// Phase 12 — production session-worker entry.
+// Production session-worker entry.
 //
 // This is the isolate the hub's `createBunExecutorWorkerPool` spawns. It builds
-// the reduced session layer (`buildSessionWorkerLayer`, Phase 6), wires the
+// the reduced session layer (`buildSessionWorkerLayer`), wires the
 // the egress client and its own WAL database, installs a process-local
 // background-job registry, and installs the executor with the real session work
 // kind.
@@ -46,6 +46,7 @@ import { Durable } from "@opencode-ai/schema/durable-event-manifest"
 import { openWriterConnection } from "@/session/writer/connection"
 import { createWorkerEgressClient, type WorkerEgressClient } from "./egress-client"
 import { openWorkerDatabase, type WorkerConnection, type WorkerDatabase } from "./db"
+import { createProxyReporting, installReporting } from "@/session/ledger/lifecycle"
 import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
 import { workerLoggingLayer } from "./worker-logging"
 import { messageOf } from "./port"
@@ -65,6 +66,7 @@ import {
   type SystemTransformInput,
   type SystemTransformOutput,
   type WorkerPlugin,
+  type WorkerPluginHubHook,
 } from "./plugin-host"
 import {
   SessionPipeline,
@@ -166,7 +168,7 @@ export interface SessionWorkerInit {
    */
   readonly sessionID?: string
   /**
-   * Worker-hosted plugin hooks (Phase 6.3, plan decision 70): the hub owns plugin
+   * Worker-hosted plugin hooks: the hub owns plugin
    * loading but the model-facing `chat.params`/`chat.headers` hooks run in the
    * isolate. Supplied when the hub can hand the loaded hooks across (in-process
    * tests today); absent means the reduced LLM uses its no-op pass-through.
@@ -313,13 +315,39 @@ function writerQuery(connection: WriterQueryConnection, method: string, sql: str
  * retained WAL helper for standalone callers (tests, legacy boot).
  */
 export function createWorkerDatabaseWriter(
-  options: { workerID?: number; filename?: string; connection?: WorkerConnection } = {},
+  options: {
+    workerID?: number
+    filename?: string
+    connection?: WorkerConnection
+    /** The session this generation owns; claimed (or reclaimed) at generation start. */
+    sessionID?: string
+  } = {},
 ): WorkerWriterClient {
   const connection = options.connection ?? openWriterConnection(options.filename ?? Database.path())
   const ownerID = `worker-${options.workerID ?? threadId}-${process.pid}-${randomUUID()}`
   const bus = Bus.create({ connection, ownerID })
   const transactions = new Set<string>()
   let nextTransaction = 1
+
+  // C8: claim the session lease when the generation starts. A lease held by a
+  // dead earlier generation is reclaimed only at the observed sequence, which
+  // the Bus verifies inside one `BEGIN IMMEDIATE`, so a raced commit fences the
+  // reclaim instead of being dropped.
+  const adopt = (aggregateID: string): void => {
+    const owner = bus.ownerOf(aggregateID)
+    if (owner === undefined) {
+      bus.claim(aggregateID)
+      return
+    }
+    if (owner === ownerID) return
+    bus.reclaim({
+      aggregateID,
+      expectedOwnerID: owner,
+      expectedSeq: bus.latest(aggregateID),
+      nextOwnerID: ownerID,
+    })
+  }
+  if (options.sessionID !== undefined) adopt(options.sessionID)
 
   const requireTransaction = (handle: string): void => {
     if (!transactions.has(handle)) throw new Error(`unknown or spent transaction handle "${handle}"`)
@@ -414,7 +442,12 @@ export interface WorkerClients {
  */
 export function buildWorkerClients(
   ports: WorkerClientPorts,
-  options: { workerID?: number; log?: WorkerLogger; database?: WorkerDatabase } = {},
+  options: {
+    workerID?: number
+    log?: WorkerLogger
+    database?: WorkerDatabase
+    sessionID?: string
+  } = {},
 ): WorkerClients {
   const egress = requirePort(ports.egress, "egress")
   const workerID = options.workerID
@@ -423,6 +456,7 @@ export function buildWorkerClients(
     writer: createWorkerDatabaseWriter({
       ...(workerID === undefined ? {} : { workerID }),
       ...(options.database === undefined ? {} : { connection: options.database.connection }),
+      ...(options.sessionID === undefined ? {} : { sessionID: options.sessionID }),
     }),
     egress: createWorkerEgressClient(egress, {
       ...(ports.egressControl === undefined ? {} : { controlPort: ports.egressControl }),
@@ -581,8 +615,25 @@ export function writerReadMessages(
 }
 
 export interface SessionWorkOptions {
-  /** The compiled reduced session layer the work runs against. */
-  readonly layer: Layer.Layer<unknown, unknown>
+  /**
+   * The worker-lifetime graph context. When present, every run provides these
+   * already-built services instead of rebuilding (and disposing) the layer, so
+   * the per-worker DB connection survives across turns (C3).
+   */
+  readonly context?: Context.Context<unknown>
+  /**
+   * The compiled reduced session layer the work runs against. Used by callers
+   * that do not prebuild a worker-lifetime context; the layer is built and
+   * disposed per run.
+   */
+  readonly layer?: Layer.Layer<unknown, unknown>
+  /**
+   * Worker-lifetime scope for `layer`. When supplied (production), the layer is
+   * built once on this scope and its context is reused by every run; closing the
+   * scope disposes the graph, including the worker DB connection. Omitted (test
+   * half), the layer is built and disposed per run.
+   */
+  readonly scope?: Scope.Scope
   /** The writer client, for reading persisted messages in-worker. */
   readonly writer: WriterClientHandle
   readonly threadId: number
@@ -601,7 +652,7 @@ export interface SessionWorkOptions {
    */
   readonly instance?: InstanceContext
   /**
-   * Register the worker-local run control (Phase 4). When the graph provides
+   * Register the worker-local run control. When the graph provides
    * `SessionRunState`, `run` resolves it and hands over a `SessionRunControl`
    * whose `cancel`/`busy` reach the real `SessionPrompt.loop` runner (table B),
    * so an executor cancel actually stops the loop (and `assertNotBusy` stops
@@ -623,8 +674,28 @@ export interface SessionWorkOptions {
  * loop — instead of the bare `loop` that expects the row to already exist.
  */
 export function createSessionWork(options: SessionWorkOptions): SessionWork {
+  if (options.context === undefined && options.layer === undefined) {
+    throw new Error("createSessionWork requires a worker-lifetime context or a per-run layer")
+  }
+  // Built on first use so `bootstrapSessionWorker` stays synchronous: the async
+  // graph build happens inside the first run, on the worker-lifetime scope.
+  let builtContext: Context.Context<unknown> | undefined
+  const resolveContext = (runScope: Scope.Scope): Effect.Effect<Context.Context<unknown>> =>
+    Effect.suspend(() => {
+      if (options.context !== undefined) return Effect.succeed(options.context)
+      if (builtContext !== undefined) return Effect.succeed(builtContext)
+      const layer = options.layer as Layer.Layer<unknown, unknown>
+      const build =
+        options.scope === undefined
+          ? Layer.buildWithScope(layer, runScope)
+          : Layer.buildWithScope(layer, options.scope)
+      return Effect.map(build.pipe(Effect.orDie), (context) => {
+        if (options.scope !== undefined) builtContext = context
+        return context
+      })
+    })
   return (sessionID, carriedPrompt, carriedShell) => {
-    const run = Effect.gen(function* () {
+    const body = Effect.gen(function* () {
       if (options.registerControl !== undefined) {
         const runState = yield* Effect.serviceOption(SessionRunState.Service)
         if (Option.isSome(runState)) {
@@ -666,17 +737,22 @@ export function createSessionWork(options: SessionWorkOptions): SessionWork {
       const pipeline = yield* SessionPipeline
       const result = yield* pipeline.run({ sessionID, messages })
       return { sessionID, value: { ...result, threadId: options.threadId } } satisfies SessionExecutionResult
-    }).pipe(
-      // A failed run is logged once, through the worker logger (the layer is
-      // provided below, so the sink captures it), before the cause is re-raised.
-      // Interrupts (a cooperative cancel) are not failures and are not logged.
-      Effect.tapCauseIf(
-        (cause) => Cause.hasFails(cause) || Cause.hasDies(cause),
-        (cause) => Effect.logError("session worker run failed", { sessionID, cause: Cause.pretty(cause) }),
-      ),
-      Effect.provide(options.layer),
-      Effect.orDie,
-    )
+    })
+    const run = Effect.scopedWith((runScope) =>
+      Effect.gen(function* () {
+        const context = yield* resolveContext(runScope)
+        return yield* body.pipe(
+          // A failed run is logged once, through the worker logger (the run's
+          // context provides the logging sink), before the cause is re-raised.
+          // Interrupts (a cooperative cancel) are not failures and are not logged.
+          Effect.tapCauseIf(
+            (cause) => Cause.hasFails(cause) || Cause.hasDies(cause),
+            (cause) => Effect.logError("session worker run failed", { sessionID, cause: Cause.pretty(cause) }),
+          ),
+          Effect.provide(context),
+        )
+      }),
+    ).pipe(Effect.orDie)
     // The layer build (and any fiber it forks) must see the worker's ambient
     // instance context, so `InstanceState`-backed services resolve a directory.
     return options.instance === undefined ? run : Effect.provideService(run, InstanceRef, options.instance)
@@ -852,6 +928,22 @@ export function hubProxyMessagesTransform(
 }
 
 /**
+ * The hub-proxied plugin-hook bridge: forwards every routed-but-hub-owned hook
+ * (`tool.execute.before/after`, `shell.env`, `tool.definition`, the experimental
+ * transforms) to the hub authority over the control port, where the real plugin
+ * instance runs. The worker ships only `(name, input, output)`; the reply is the
+ * mutated output. A hook whose route is not `hub-proxy` is rejected hub-side, so
+ * this cannot become a generic plugin RPC.
+ *
+ * Returns `undefined` when the worker has no hub client (degraded boot), so the
+ * plugin host forwards no hook and each output passes through unchanged.
+ */
+export function hubProxyPluginTrigger(hubProxy: HubProxyClient | undefined): WorkerPluginHubHook | undefined {
+  if (hubProxy === undefined) return undefined
+  return (name, input, output) => hubProxy.call("pluginTrigger", [name, input, output])
+}
+
+/**
  * The hub-proxied plugin-tool executor: forwards a worker tool call to the hub
  * authority over the same multiplexed control port, where the plugin's real
  * `execute` runs and returns a clone-safe result. Every hub authority
@@ -934,6 +1026,11 @@ export interface BootstrapSessionWorkerOptions {
   readonly installExecutor?: typeof installSessionExecutor
   /** Test seam: the thread-naming lifecycle; defaults to `setThreadName`. */
   readonly threadNamer?: ThreadNamer
+  /**
+   * Test seam: observe the hub-proxy control client bootstrap installs. Lets a
+   * test prove `dispose()` rejects its in-flight calls (M8).
+   */
+  readonly observeHubProxy?: (client: HubProxyClient) => void
 }
 
 /**
@@ -988,6 +1085,7 @@ export function bootstrapSessionWorker(
   else if (init.workerID !== undefined) namer.bind(String(init.workerID))
   let clients: WorkerClients
   let database: WorkerDatabase | undefined
+  let hubProxyClient: HubProxyClient | undefined
   let hubProxies: HubProxyClients | undefined
   let pidReporter: PidReporterInterface | undefined
   // The real `SessionPrompt` loop needs the worker's own WAL connection and an
@@ -1015,15 +1113,26 @@ export function bootstrapSessionWorker(
         egress: egressChannel.port1,
         egressControl: egressControlChannel.port1,
       },
-      { workerID: reportedWorkerID(init, threadId), log, database },
+      {
+        workerID: reportedWorkerID(init, threadId),
+        log,
+        database,
+        ...(init.sessionID === undefined ? {} : { sessionID: init.sessionID }),
+      },
     )
     // The hub serves the `SessionStatus` / `Permission` / `Question`
     // authorities over one control port; a single multiplexing client backs all
     // three proxies (each call is correlated by the client's own request id).
     const hubProxyChannel = new MessageChannel()
     scope.postMessage({ type: "hub-proxy", port: hubProxyChannel.port2 }, [transferable(hubProxyChannel.port2)])
-    const hubProxyClient = createHubProxyClient(hubProxyChannel.port1)
-    hubProxies = { sessionStatus: hubProxyClient, permission: hubProxyClient, question: hubProxyClient }
+    const client = createHubProxyClient(hubProxyChannel.port1)
+    hubProxyClient = client
+    options.observeHubProxy?.(client)
+    hubProxies = { sessionStatus: client, permission: client, question: client }
+    // The real prompt runs in this isolate; report the durable lifecycle facts
+    // (commit, tool start/finish, phase) to the hub tracker over the same
+    // control port before the effects they guard.
+    installReporting(createProxyReporting((method, args) => client.call(method as never, args)))
     // The shell tool's detached children are reaped by the hub, so the same
     // control port carries their `pid-report` frames (the hub distinguishes the
     // two frame shapes). Only the full-port boot owns children.
@@ -1041,6 +1150,7 @@ export function bootstrapSessionWorker(
   // array passes through unchanged.
   const systemTransform = hubProxySystemTransform(hubProxies?.sessionStatus)
   const messagesTransform = hubProxyMessagesTransform(hubProxies?.sessionStatus)
+  const hubHook = hubProxyPluginTrigger(hubProxies?.sessionStatus)
   // The executor, abort and list seams all ride the SAME multiplexed control
   // client (`hubProxies.sessionStatus`): the hub distinguishes the methods, so no
   // second port is opened. The abort/list seams are surfaced on the bootstrap
@@ -1054,6 +1164,7 @@ export function bootstrapSessionWorker(
       : createWorkerPluginHost(init.plugins, {
           ...(systemTransform === undefined ? {} : { systemTransform }),
           ...(messagesTransform === undefined ? {} : { messagesTransform }),
+          ...(hubHook === undefined ? {} : { hubHook }),
         })
   // Hub-executed plugin tools need BOTH the clone-safe descriptors the hub
   // shipped and the hub-port executor. A descriptor without an executor (or the
@@ -1130,12 +1241,19 @@ export function bootstrapSessionWorker(
     logging,
   })
 
+  // Build the graph exactly once on a worker-lifetime scope. Every turn provides
+  // the cached context (the per-worker DB included) and only its own run scope;
+  // the old per-run `Effect.provide(layer)` disposed the DB after the first turn
+  // (C3). The scope is closed by `dispose()`.
+  const workerScope = Effect.runSync(Scope.make())
+
   // The worker-local run control is registered once the first `run` resolves the
   // worker's `SessionRunState`; the executor proxy reads it live.
   let control: SessionRunControl | undefined
   const work = productionWorkRegistry(
     createSessionWork({
       layer: runtime.layer,
+      scope: workerScope,
       writer: clients.writer,
       threadId,
       prompt: usePrompt,
@@ -1176,6 +1294,7 @@ export function bootstrapSessionWorker(
 
   return {
     dispose() {
+      installReporting(undefined)
       namer.onDispose()
       // Close the executor's owned scope so its runner-table fibers/finalizers
       // settle with the worker instead of leaking past bootstrap disposal.
@@ -1183,6 +1302,13 @@ export function bootstrapSessionWorker(
       // The registry scope outlives every run, so close it explicitly with the
       // worker bootstrap; a still-running job is interrupted with the isolate.
       void Effect.runPromise(Scope.close(backgroundJobScope, Exit.void)).catch(() => undefined)
+      // Dispose the worker's outbound clients first: pending hub-proxy calls
+      // reject instead of hanging past termination, and the egress listeners
+      // are removed before the graph/connection teardown (M8).
+      hubProxyClient?.dispose()
+      clients.egress.dispose()
+      // Close the worker-lifetime graph scope (DB/egress/bridge finalizers).
+      void Effect.runPromise(Scope.close(workerScope, Exit.void)).catch(() => undefined)
       // The worker's one WAL connection is owned by bootstrap, not the graph
       // scope finalizer alone; close is idempotent.
       if (database !== undefined) Effect.runSync(database.close)

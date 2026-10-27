@@ -1,18 +1,17 @@
 // W2 — worker-side egress client over the events envelope (spec Q6/Q7/Q21).
 //
 // The reduced session-worker graph talks to the hub event channel through a
-// dedicated, transferred `MessagePort` (plan decisions 40/45). This module is the
+// dedicated, transferred `MessagePort`. This module is the
 // adapter that turns the worker's EventV2 events into framed bytes on the wire:
 //
 //   * the DATA plane is `createEgressSender` (`egress/sender.ts`) — coalescing
-//     non-durable deltas and length-prefixed, versioned frames posted with a
-//     transferred buffer (zero-copy);
+//     non-durable deltas and posting shared-envelope JSON frames;
 //   * the CONTROL plane is `createMeshWorkerClient` (`egress/mesh.ts`) over a
 //     SEPARATE port, so durable wakeups and resync never queue behind deltas.
 //
 // Events cross VERBATIM as `{ id, type, properties }` — there is no `data`
 // translation. `emit` maps to a coalesced non-durable delta; `emitDurable`
-// forwards an explicit writer-stamped `meta` and bypasses coalescing.
+// requires the commit's aggregate `(aggregateID, seq)` and bypasses coalescing.
 
 import type { EventV2Event } from "@/session/worker/frame"
 
@@ -29,8 +28,6 @@ import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
 import { connectPeer, messageOf, peerLifecycle } from "./port"
 
 export interface WorkerEgressClientOptions {
-  /** Writer generation used by the durable ordinal fallback; passed to the sender. */
-  readonly generation?: number
   /** Delta coalescing window in ms; passed to the sender. */
   readonly windowMs?: number
   /** Eager delta flush threshold; passed to the sender. */
@@ -70,10 +67,11 @@ export interface WorkerEgressClient {
   emit(event: EventV2Event): void
   /**
    * Emit a DURABLE boundary event — one that must be observable exactly once and
-   * never dropped. `meta` defaults to the sender's writer ordinal. A committed
-   * `session.text` boundary is durable, so callers must prefer this over `emit`.
+   * never dropped. Its aggregate `(aggregateID, seq)` is mandatory; there is no
+   * sender-global ordinal fallback. A committed `session.text` boundary is
+   * durable, so callers must prefer this over `emit`.
    */
-  emitDurable(event: EventV2Event, meta?: DurableMeta): void
+  emitDurable(event: EventV2Event, meta: DurableMeta): void
   /** Flush buffered deltas, then emit the `end` frame (idempotent). */
   end(): void
   /** Number of deltas currently buffered by the coalescer. */
@@ -130,7 +128,6 @@ function buildEgressClient(port: MessagePort, options: WorkerEgressClientOptions
   const workerID = options.workerID
   const sender: EgressSender = createEgressSender({
     port,
-    ...(options.generation === undefined ? {} : { generation: options.generation }),
     ...(options.windowMs === undefined ? {} : { windowMs: options.windowMs }),
     ...(options.maxBatch === undefined ? {} : { maxBatch: options.maxBatch }),
     ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),

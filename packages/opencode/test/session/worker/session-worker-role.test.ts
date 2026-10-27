@@ -38,7 +38,7 @@ describe("parseSessionWorkerInit — role", () => {
   })
 
   test("accepts every declared process role", () => {
-    for (const role of ["session", "writer", "broker", "hub"] as const) {
+    for (const role of ["session", "hub"] as const) {
       expect(parseSessionWorkerInit(payload({ role })).role).toBe(role)
     }
   })

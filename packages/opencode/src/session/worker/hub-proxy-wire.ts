@@ -9,6 +9,8 @@
 // `serveHubProxy` workaround.
 
 import { createRequestChannel, errorTagOf, messageOf, workerFrameChannel } from "./port"
+import { ProtocolError, assertJsonRepresentable } from "./frame"
+import { parseJson as parseSafeJson } from "@/util/safe-json"
 import type { SessionSpawnRequest, SessionSpawnResult } from "./subagent"
 
 export type HubProxyRequest = {
@@ -69,10 +71,15 @@ export type HubProxyMethod =
   | "question.list"
   | "systemTransform"
   | "messagesTransform"
+  | "pluginTrigger"
   | "pluginTool.execute"
   | "pluginTool.list"
   | "pluginTool.abort"
   | "session.spawn"
+  | "lifecycle.commit"
+  | "lifecycle.phase"
+  | "lifecycle.toolStarted"
+  | "lifecycle.toolFinished"
 
 /** A typed failure returned by a hub authority across the port. */
 export class HubProxyRemoteError extends Error {
@@ -214,7 +221,7 @@ function errorDataOf(error: unknown): unknown {
     const fields = Object.entries(error).filter(([key]) => !UNSERIALISED_ERROR_FIELDS.has(key))
     if (fields.length === 0) return undefined
     const text = JSON.stringify(Object.fromEntries(fields))
-    return text === undefined ? undefined : JSON.parse(text)
+    return text === undefined ? undefined : parseSafeJson(text)
   } catch {
     return undefined
   }
@@ -241,14 +248,36 @@ function ownLookup<T>(record: Readonly<Record<string, T>> | undefined, key: stri
  * its {@link HubProxyStreamHandler}, which may `emit` correlated events before
  * replying. Omitting `streaming` leaves the two-argument behaviour unchanged.
  */
+export interface ServeHubProxyOptions {
+  /**
+   * Host-boundary containment: a malformed inbound frame is reported here as a
+   * typed error and the poisoned control channel is isolated instead of
+   * throwing out of the host's listener.
+   */
+  readonly onProtocolError?: (error: unknown) => void
+}
+
 export function serveHubProxy(
   handlers: HubProxyHandlers,
   port: MessagePort,
   streaming?: Readonly<Record<string, HubProxyStreamHandler>>,
+  options: ServeHubProxyOptions = {},
 ): () => void {
-  const channel = workerFrameChannel<HubProxyFrame>(port, "hub-proxy")
+  const channel = workerFrameChannel<HubProxyFrame>(port, "hub-proxy", {
+    ...(options.onProtocolError === undefined ? {} : { onProtocolError: options.onProtocolError }),
+  })
   return channel.onMessage((frame) => {
     if (frame.kind !== "request") return
+    // Validate the untrusted request payload before touching any handler. An id
+    // is the only correlation handle, so an invalid one cannot be answered: it
+    // is a typed protocol error (contained by the host boundary). Invalid args
+    // or an empty method CAN be correlated, so they get exactly one error reply.
+    const id = frame.id
+    if (typeof id !== "number" || !Number.isInteger(id) || id < 0) {
+      throw new ProtocolError(`hub-proxy request id must be a non-negative integer (got ${JSON.stringify(id)})`)
+    }
+    const method = frame.method
+    const args = frame.args
     const reply = (payload: HubProxyReply): void => {
       try {
         channel.post(payload)
@@ -270,13 +299,35 @@ export function serveHubProxy(
         }
       }
     }
-    const succeed = (value: unknown): void => reply({ kind: "reply", id: frame.id, ok: true, value: value ?? null })
+    if (typeof method !== "string" || method.length === 0) {
+      reply({ kind: "reply", id, ok: false, message: `hub-proxy request ${id} method must be a non-empty string` })
+      return
+    }
+    if (!Array.isArray(args)) {
+      reply({ kind: "reply", id, ok: false, message: `hub-proxy request ${id} args must be an array` })
+      return
+    }
+    const succeed = (value: unknown): void => {
+      const safe = value ?? null
+      try {
+        assertJsonRepresentable(safe)
+      } catch {
+        reply({
+          kind: "reply",
+          id,
+          ok: false,
+          message: `hub-proxy reply value for id ${id} is not JSON-serialisable (not structured-cloneable)`,
+        })
+        return
+      }
+      reply({ kind: "reply", id, ok: true, value: safe })
+    }
     const fail = (error: unknown): void => {
       const tag = errorTagOf(error)
       const data = errorDataOf(error)
       reply({
         kind: "reply",
-        id: frame.id,
+        id,
         ok: false,
         message: messageOf(error),
         ...(tag === undefined ? {} : { tag }),
@@ -286,35 +337,36 @@ export function serveHubProxy(
     // `emit` pushes an unsolicited event correlated to this request. A
     // non-cloneable payload reuses the reply path's fail-loud recovery so the
     // worker learns the real cause instead of silently losing the event.
-    const emit = (method: string, payload: unknown): void => {
+    const emit = (eventMethod: string, payload: unknown): void => {
       try {
-        channel.post({ kind: "event", id: frame.id, method, payload })
+        assertJsonRepresentable(payload)
+        channel.post({ kind: "event", id, method: eventMethod, payload })
       } catch {
         reply({
           kind: "reply",
-          id: frame.id,
+          id,
           ok: false,
-          message: `hub-proxy event payload for id ${frame.id} is not JSON-serialisable (not structured-cloneable)`,
+          message: `hub-proxy event payload for id ${id} is not JSON-serialisable (not structured-cloneable)`,
         })
       }
     }
     // Own-property guard: a bare lookup would resolve inherited `Object.prototype`
     // members (`toString`, `valueOf`, ...) to functions and bypass the miss below.
     // A streaming method wins over a plain handler of the same name.
-    const streamHandler = ownLookup(streaming, frame.method)
+    const streamHandler = ownLookup(streaming, method)
     if (streamHandler !== undefined) {
       Promise.resolve()
-        .then(() => streamHandler({ emit }, frame.args))
+        .then(() => streamHandler({ emit }, args))
         .then(succeed, fail)
       return
     }
-    const handler = Object.hasOwn(handlers, frame.method) ? handlers[frame.method as HubProxyMethod] : undefined
+    const handler = Object.hasOwn(handlers, method) ? handlers[method as HubProxyMethod] : undefined
     if (handler === undefined) {
-      reply({ kind: "reply", id: frame.id, ok: false, message: `unknown hub-proxy method "${frame.method}"` })
+      reply({ kind: "reply", id, ok: false, message: `unknown hub-proxy method "${method}"` })
       return
     }
     Promise.resolve()
-      .then(() => handler(...frame.args))
+      .then(() => handler(...args))
       .then(succeed, fail)
   })
 }
