@@ -8,7 +8,7 @@
 export const SCHEMA_VERSION = 1
 
 /** Hash of the shipped SQL bodies; changing a statement changes this value. */
-export const SCHEMA_BODY_HASH = "7924b2716663e11bf0d16cd1710cbb57587369225626cf8dc7b8d662b92f9c86"
+export const SCHEMA_BODY_HASH = "039a8b9910e09afbfe76194d9054076e1c97af8f110e599e0c9df8c414ce84cf"
 
 export const SCHEMA_TABLES: readonly string[] = Object.freeze([
   "account",
@@ -87,6 +87,7 @@ export const SCHEMA_MIGRATION_IDS: readonly string[] = Object.freeze([
   "20260622142730_simplify_session_context_epoch",
   "20260622170816_reset_v2_session_state",
   "20260622202450_simplify_session_input",
+  "20261027032116_add_worker_lease",
   "20261026000000_tool_call_ledger",
 ])
 

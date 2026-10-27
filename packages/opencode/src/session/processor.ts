@@ -25,6 +25,7 @@ import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { LLMError, UnknownProviderReason, Usage, type LLMEvent } from "@opencode-ai/llm"
+import { Faults } from "@/testing/faults"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
@@ -44,6 +45,13 @@ export class ToolCallDuringSummaryError extends Schema.TaggedErrorClass<ToolCall
   }
 }
 
+/**
+ * The durable settlement of one tool call: finish the `tool_call` row and drop
+ * the hub-observed in-flight entry. It runs inside the same transaction as the
+ * result part, so a crash leaves either both or neither.
+ */
+export type ToolSettlement = (outcome: "ok" | "error") => Effect.Effect<void>
+
 export interface Handle {
   readonly message: SessionV1.Assistant
   readonly updateToolCall: (
@@ -59,6 +67,14 @@ export interface Handle {
       attachments?: SessionV1.FilePart[]
     },
   ) => Effect.Effect<void>
+  /**
+   * Hold a successful tool call's settlement until its result commits. The tool
+   * wrapper registers this after the effect returns; `completeToolCall` invokes
+   * it inside the result transaction, so success can never settle before its
+   * durable result exists. Optional only for reduced test handles; the real
+   * processor always provides it.
+   */
+  readonly registerToolSettlement?: (toolCallID: string, settle: ToolSettlement) => void
   readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
 }
 
@@ -141,6 +157,30 @@ const layer = Layer.effect(
         if (done) yield* Deferred.succeed(done, undefined).pipe(Effect.ignore)
       })
 
+      // A successful tool call is settled by `completeToolCall`, not by the tool
+      // wrapper: the registration bridges the two so the ledger finish can share
+      // the result transaction. Every path that commits a terminal part drains it.
+      const settlements = new Map<string, ToolSettlement>()
+      const registerToolSettlement = (toolCallID: string, settle: ToolSettlement): void => {
+        settlements.set(toolCallID, settle)
+      }
+      const takeToolSettlement = (toolCallID: string): ToolSettlement | undefined => {
+        const settle = settlements.get(toolCallID)
+        settlements.delete(toolCallID)
+        return settle
+      }
+      const settleRegistered = Effect.fnUntraced(function* (toolCallID: string, outcome: "ok" | "error") {
+        const settle = takeToolSettlement(toolCallID)
+        if (settle === undefined) return
+        // Ledger bookkeeping must never turn a committed result into a run
+        // failure; the durable row is the only thing callers can rely on.
+        yield* settle(outcome).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("tool settlement failed", { toolCallID, outcome, cause }),
+          ),
+        )
+      })
+
       const readToolCall = Effect.fn("SessionProcessor.readToolCall")(function* (toolCallID: string) {
         const call = ctx.toolcalls[toolCallID]
         if (!call) return undefined
@@ -182,8 +222,13 @@ const layer = Layer.effect(
         },
       ) {
         const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") return
-        yield* session.updatePart({
+        if (!match || match.part.state.status !== "running") {
+          // The abort path may have written the result early; a later AI SDK
+          // result event still has to drain the pending settlement.
+          yield* settleRegistered(toolCallID, "ok")
+          return
+        }
+        const completed: SessionV1.ToolPart = {
           ...match.part,
           state: {
             status: "completed",
@@ -194,14 +239,32 @@ const layer = Layer.effect(
             time: { start: match.part.state.time.start, end: Date.now() },
             attachments: output.attachments,
           },
-        })
+        }
+        // The result part and the success settlement commit together on the
+        // worker's one connection. A crash at any point in this transaction rolls
+        // both back, leaving the call `started` (indeterminate) instead of a
+        // finished call whose result was lost and would be replayed.
+        yield* database.db
+          .transaction(
+            () =>
+              Effect.gen(function* () {
+                yield* session.updatePart(completed)
+                yield* settleRegistered(toolCallID, "ok")
+                Faults.crashWorker("tool:settled")
+              }),
+            { behavior: "immediate" },
+          )
+          .pipe(Effect.orDie)
         yield* settleToolCall(toolCallID)
       })
 
       const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
         const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") return false
-        yield* session.updatePart({
+        if (!match || match.part.state.status !== "running") {
+          yield* settleRegistered(toolCallID, "error")
+          return false
+        }
+        const failed: SessionV1.ToolPart = {
           ...match.part,
           state: {
             status: "error",
@@ -211,7 +274,17 @@ const layer = Layer.effect(
             metadata: match.part.state.metadata,
             time: { start: match.part.state.time.start, end: Date.now() },
           },
-        })
+        }
+        yield* database.db
+          .transaction(
+            () =>
+              Effect.gen(function* () {
+                yield* session.updatePart(failed)
+                yield* settleRegistered(toolCallID, "error")
+              }),
+            { behavior: "immediate" },
+          )
+          .pipe(Effect.orDie)
         if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
           ctx.blocked = ctx.shouldBreak
         }
@@ -735,6 +808,7 @@ const layer = Layer.effect(
         },
         updateToolCall,
         completeToolCall,
+        registerToolSettlement,
         process,
       } satisfies Handle
     })

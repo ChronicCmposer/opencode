@@ -75,7 +75,10 @@ export const migrationStatements: readonly string[] = Object.freeze([
         CREATE TABLE IF NOT EXISTS \`event_sequence\` (
           \`aggregate_id\` text PRIMARY KEY,
           \`seq\` integer NOT NULL,
-          \`owner_id\` text
+          \`owner_id\` text,
+          \`worker_owner_id\` text,
+          \`worker_heartbeat_at\` integer,
+          \`worker_expires_at\` integer
         );
       `,
   `
@@ -321,5 +324,6 @@ export const migrationStatements: readonly string[] = Object.freeze([
   `INSERT OR IGNORE INTO \`migration\` (id, time_completed) VALUES ('20260622142730_simplify_session_context_epoch', 0)`,
   `INSERT OR IGNORE INTO \`migration\` (id, time_completed) VALUES ('20260622170816_reset_v2_session_state', 0)`,
   `INSERT OR IGNORE INTO \`migration\` (id, time_completed) VALUES ('20260622202450_simplify_session_input', 0)`,
+  `INSERT OR IGNORE INTO \`migration\` (id, time_completed) VALUES ('20261027032116_add_worker_lease', 0)`,
   `INSERT OR IGNORE INTO \`migration\` (id, time_completed) VALUES ('20261026000000_tool_call_ledger', 0)`,
 ])

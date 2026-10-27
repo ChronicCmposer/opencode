@@ -169,6 +169,11 @@ export function createLifecycleTracker(options: LifecycleTrackerOptions = {}): L
     },
     toolFinished(sessionID, callID) {
       const record = touch(requireSession(sessionID))
+      if (typeof callID !== "string" || callID.length === 0) {
+        throw new Error("tool call id must be a non-empty string")
+      }
+      // Idempotent by construction: a late duplicate finish (or a recovered
+      // stale call) cannot decrement another call or double-resolve the phase.
       record.inFlight.delete(callID)
       if (record.inFlight.size === 0) record.phases.tools.resolve()
     },

@@ -13,7 +13,7 @@ import { Truncate } from "@/tool/truncate"
 import { Plugin } from "@/plugin"
 import type { TaskPromptOps } from "@/tool/task"
 import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
-import { Effect, Option } from "effect"
+import { Effect, Exit, Option } from "effect"
 import { createToolCallLedger, ToolCallNotStartedError, type ToolCallLedgerHandle } from "./ledger/tool-call"
 import type { LifecycleReporting } from "./ledger/lifecycle"
 import { Faults } from "@/testing/faults"
@@ -44,7 +44,14 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
   model: Provider.Model
   session: Session.Info
-  processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+  processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall"> & {
+    /**
+     * Optional because a caller may supply a reduced processor (tests, degraded
+     * boot). When present, a successful call is settled at the durable result
+     * commit instead of at the tool effect's exit.
+     */
+    readonly registerToolSettlement?: SessionProcessor.Handle["registerToolSettlement"]
+  }
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
@@ -87,47 +94,91 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     return createToolCallLedger(connection)
   })
 
-  const finishToolCall = (callID: string, outcome: "ok" | "error"): void | Promise<void> => {
-    if (ledger !== undefined) {
-      try {
-        ledger.finish({ callID, sessionID: input.session.id, outcome })
-      } catch (error) {
-        // A finish after a duplicate start (or a replayed result) must not turn a
-        // successful tool into a failure; a real ledger fault still surfaces.
-        if (!(error instanceof ToolCallNotStartedError)) throw error
+  /**
+   * Settle the durable row and the hub-observed in-flight entry exactly once.
+   * Settlement is bookkeeping: a ledger/port fault must never replace the tool's
+   * own result or failure, so it is logged and swallowed.
+   */
+  const settleToolCall = (callID: string, outcome: "ok" | "error"): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      if (ledger !== undefined) {
+        try {
+          ledger.finish({ callID, sessionID: input.session.id, outcome })
+        } catch (error) {
+          // A finish after a duplicate start (or a replayed result) must not turn
+          // a successful tool into a failure.
+          if (!(error instanceof ToolCallNotStartedError)) {
+            yield* Effect.logError("tool ledger finish failed", {
+              callID,
+              sessionID: input.session.id,
+              error,
+            })
+          }
+        }
       }
-    }
-    return input.lifecycle?.toolFinished(input.session.id, callID)
-  }
+      const finished = input.lifecycle?.toolFinished(input.session.id, callID)
+      if (finished !== undefined) yield* Effect.promise(() => finished)
+    })
 
   /**
-   * Record `started` before the effect and `finished` after it. This is a plain
-   * statement on the worker connection, never a `BEGIN`, so a tool that already
-   * owns a transaction (or finishes its result after this wire-up) composes
-   * instead of nesting. A defect/interrupt between the two leaves the row
-   * `started` — the indeterminate state recovery refuses to auto-retry.
+   * Record `started` before the effect and settle it on every exit path. A
+   * successful call is **not** settled here: its result part has not committed
+   * yet, and a crash between this point and that commit must leave the row
+   * `started` (indeterminate) instead of `finished` with no result. The
+   * processor finishes it inside the result transaction. Typed failures,
+   * defects and interruptions settle `error` immediately so a cancelled tool
+   * releases the barrier's `tools` phase.
+   *
+   * The row is a plain statement on the worker connection, never a `BEGIN`, so a
+   * tool that already owns a transaction composes instead of nesting.
    */
   const withToolLedger = <A, E, R>(tool: string, callID: string, effect: Effect.Effect<A, E, R>) => {
     if (ledger === undefined && input.lifecycle === undefined) return effect
+    // Only settle a call this wrapper actually recorded: a duplicate `start`
+    // throws before the row exists and must not finish someone else's call.
+    let recorded = false
     return Effect.gen(function* () {
+      recorded = false
       if (ledger !== undefined) {
         ledger.start({ callID, sessionID: input.session.id, tool, sideEffecting: true })
       }
+      recorded = true
       // Wait for the hub to observe the start BEFORE the effect runs: a crash
       // between the two must leave an indeterminate call recovery refuses to
       // replay. The durable ledger row is written first for the same reason.
       const started = input.lifecycle?.toolStarted(input.session.id, callID, true)
       if (started !== undefined) yield* Effect.promise(() => started)
       Faults.crashWorker("tool:effect")
-      return yield* effect.pipe(
-        Effect.tap(() => Effect.promise(() => Promise.resolve(finishToolCall(callID, "ok")))),
-        Effect.catch((error) =>
-          Effect.promise(() => Promise.resolve(finishToolCall(callID, "error"))).pipe(
-            Effect.flatMap(() => Effect.fail(error)),
+      const value = yield* effect
+      // The side effect has happened but its durable result has not: a crash
+      // here must leave the row `started`, so recovery reports indeterminate and
+      // never replays the effect. Settlement is deferred past this point.
+      Faults.crashWorker("tool:result")
+      return value
+    }).pipe(
+      Effect.onExit((exit) => {
+        if (!recorded) return Effect.void
+        if (Exit.isSuccess(exit)) {
+          // Success settles only with its durable result. Without a processor
+          // hook (reduced caller) fall back to settling here, the previous
+          // behaviour, rather than leaking a `started` row.
+          if (input.processor.registerToolSettlement !== undefined) {
+            input.processor.registerToolSettlement(callID, (outcome) => settleToolCall(callID, outcome))
+            return Effect.void
+          }
+          return settleToolCall(callID, "ok").pipe(
+            Effect.catchCause((cause) =>
+              Effect.logError("tool call settlement failed", { callID, sessionID: input.session.id, cause }),
+            ),
+          )
+        }
+        return settleToolCall(callID, "error").pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("tool call settlement failed", { callID, sessionID: input.session.id, cause }),
           ),
-        ),
-      )
-    })
+        )
+      }),
+    )
   }
 
   const context = (args: Record<string, unknown>, options: ToolExecutionOptions): Tool.Context => ({

@@ -13,8 +13,11 @@
 //
 // The barrier is per Session and bounded at 5 s. Expiry raises the typed
 // `RunBarrierTimeout` and leaves the Session in `timed-out`, so the next run is
-// refused until an explicit `reset`. Cancellation wins: once `cancel` is called
-// the barrier settles as cancelled even if every phase has already resolved.
+// refused until an explicit `reset` (an operator retry) or `abandon` (recovery
+// for a barrier whose owning run/worker is gone and can never settle). A live
+// worker keeps the refusal: timed-out is not a free pass. Cancellation wins:
+// once `cancel` is called the barrier settles as cancelled even if every phase
+// has already resolved.
 
 /** The hard bound every per-Session barrier is subject to. */
 export const RUN_BARRIER_TIMEOUT_MS = 5000
@@ -97,6 +100,12 @@ export interface RunBarrier {
   state(sessionID: string): RunBarrierState
   /** Clear a timed-out/cancelled/drained state so a later run may be admitted. */
   reset(sessionID: string): void
+  /**
+   * Forget a barrier whose owning run can no longer settle (its worker was
+   * retired by a crash or terminate). Refuses a still-draining barrier: a live
+   * run keeps ownership of its drain. Idempotent.
+   */
+  abandon(sessionID: string): void
   /** Number of retained Session states (bounded). */
   readonly size: number
 }
@@ -217,6 +226,14 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
     },
     state: stateOf,
     reset(sessionID) {
+      if (active.has(sessionID)) throw new RunBarrierBusyError(sessionID)
+      states.delete(sessionID)
+      failures.delete(sessionID)
+    },
+    abandon(sessionID) {
+      if (sessionID.length === 0) throw new RunBarrierError("run barrier requires a non-empty sessionID")
+      // A live drain still owns the phases; abandoning it would let the next run
+      // overtake work that is genuinely in flight.
       if (active.has(sessionID)) throw new RunBarrierBusyError(sessionID)
       states.delete(sessionID)
       failures.delete(sessionID)

@@ -34,7 +34,7 @@ export type ControlFrame =
   | { readonly type: "unlisten"; readonly id: number; readonly pattern: string }
   | { readonly type: "listen.ok"; readonly id: number }
   | { readonly type: "durable"; readonly meta: AggregatePosition; readonly event: EventV2Event }
-  | { readonly type: "resync"; readonly pattern: string }
+  | { readonly type: "resync"; readonly pattern: string; readonly meta?: AggregatePosition }
   | { readonly type: "durable.ack"; readonly count: number }
   | { readonly type: "resync.ack"; readonly pattern?: string }
 
@@ -119,7 +119,7 @@ function isAggregatePositionShape(value: unknown): value is AggregatePosition {
     typeof value.aggregateID === "string" &&
     value.aggregateID.length > 0 &&
     Number.isInteger(value.seq) &&
-    (value.seq as number) >= 1
+    (value.seq as number) >= 0
   )
 }
 
@@ -170,8 +170,13 @@ function parseControlFrame(data: unknown): ControlFrame | undefined {
       return isAggregatePositionShape(data.meta) && isEventV2(data.event)
         ? { type: "durable", meta: data.meta, event: data.event }
         : undefined
-    case "resync":
-      return typeof data.pattern === "string" ? { type: "resync", pattern: data.pattern } : undefined
+    case "resync": {
+      if (typeof data.pattern !== "string") return undefined
+      if (data.meta === undefined) return { type: "resync", pattern: data.pattern }
+      return isAggregatePositionShape(data.meta)
+        ? { type: "resync", pattern: data.pattern, meta: data.meta }
+        : undefined
+    }
     case "durable.ack":
       return isNonNegativeInteger(data.count) ? { type: "durable.ack", count: data.count } : undefined
     case "resync.ack":

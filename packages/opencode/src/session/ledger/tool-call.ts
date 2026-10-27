@@ -144,20 +144,38 @@ export function finish(connection: LedgerConnection, input: FinishInput): ToolCa
   return rowFromRecord(stored)
 }
 
+/** Distinguishes concurrent savepoints on one connection. */
+let savepointSequence = 0
+
 /**
  * Run the result write and the ledger finish atomically. A failure anywhere rolls
  * both back, so a crash between them leaves the orphaned `started` row instead of
  * a finished call whose result was lost.
+ *
+ * The pair is scoped with a `SAVEPOINT`, never a raw `BEGIN`/`COMMIT`: the worker
+ * connection is shared with the Drizzle transaction abstraction, and another
+ * fiber may already own an open transaction. A savepoint composes with that
+ * owner (it never nests or commits it); with no outer transaction, `RELEASE`
+ * commits the pair itself. This is the same serialized connection the durable
+ * result uses, so the result and `tool_call.finished` cannot diverge.
  */
 export function finishWithResult<T>(connection: LedgerConnection, input: FinishInput, result: () => T): T {
-  connection.exec("BEGIN IMMEDIATE")
+  const savepoint = `tool_call_finish_${++savepointSequence}`
+  connection.exec(`SAVEPOINT ${savepoint}`)
   try {
     finish(connection, input)
     const value = result()
-    connection.exec("COMMIT")
+    connection.exec(`RELEASE ${savepoint}`)
     return value
   } catch (error) {
-    connection.exec("ROLLBACK")
+    // Restore the savepoint's starting state without ever touching an outer
+    // transaction. The original failure is the one the caller must see.
+    try {
+      connection.exec(`ROLLBACK TO ${savepoint}`)
+      connection.exec(`RELEASE ${savepoint}`)
+    } catch {
+      // A failed rollback leaves the outer transaction's fate with its owner.
+    }
     throw error
   }
 }

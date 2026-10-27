@@ -4,7 +4,12 @@ import type { EventV2 } from "../event"
 export const EventSequenceTable = sqliteTable("event_sequence", {
   aggregate_id: text().notNull().primaryKey(),
   seq: integer().notNull(),
+  /** v1 sync owner (workspace id). Written only by `EventV2.claim`/sync replay. */
   owner_id: text(),
+  /** Worker-generation lease owner; independent of the sync owner. */
+  worker_owner_id: text(),
+  worker_heartbeat_at: integer(),
+  worker_expires_at: integer(),
 })
 
 export const EventTable = sqliteTable(

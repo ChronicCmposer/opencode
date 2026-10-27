@@ -107,6 +107,7 @@ import {
 import { createWorkerEventBridge, DURABLE_WAKEUP_METADATA_KEY } from "./event-bridge"
 import type { WorkerDurableSubscription } from "./egress-client"
 import type { DurableCommit, MeshWorkerClient } from "@/session/egress/mesh"
+import { createDeltaSubscription, type SnapshotReader } from "@/session/egress/delta"
 import type { EventV2Event } from "./frame"
 import { stringHeaders } from "./headers"
 import {
@@ -292,6 +293,16 @@ function durableAggregateOf(commit: DurableCommit): string | undefined {
   return aggregateID
 }
 
+/** Wake one aggregate's `durable()` subscribers so they re-read SQLite. */
+function wakeAggregate(
+  events: Pick<EventV2.Interface, "wakeDurable">,
+  aggregateID: string,
+): void {
+  const wakeDurable = events.wakeDurable
+  if (wakeDurable === undefined) return
+  Effect.runSync(wakeDurable(aggregateID))
+}
+
 /**
  * Bridge one hub-delivered durable commit into the worker's in-isolate EventV2.
  * The commit already durably committed in the hub writer, so it is republished
@@ -322,11 +333,9 @@ export function republishDurableCommit(
   // `durable()` subscribers only need waking so their aggregate stream re-reads
   // and observes it. A reduced handle without the seam, or a commit whose type
   // this build does not know, skips the wake.
-  const wakeDurable = events.wakeDurable
-  if (wakeDurable === undefined) return
   const aggregateID = durableAggregateOf(commit)
   if (aggregateID === undefined) return
-  Effect.runSync(wakeDurable(aggregateID))
+  wakeAggregate(events, aggregateID)
 }
 
 /**
@@ -340,19 +349,110 @@ export function republishDurableCommit(
  * no-op. This is a legitimate topology, never an error — only a DIRECT
  * `subscribeDurable` call without a control port fails loud.
  */
+/** The EventV2 seams a durable wakeup needs; `durable` enables gap detection. */
+type WakeupEvents = Pick<EventV2.Interface, "publishLive" | "wakeDurable"> &
+  Partial<Pick<EventV2.Interface, "durable">>
+
+/**
+ * Read a database snapshot for one aggregate through the production durable
+ * stream. `takeUntil` is what makes the read terminate: the snapshot cursor is a
+ * commit that already exists in SQLite, so the scan stops at it instead of
+ * waiting on the live tail.
+ */
+function durableSnapshotOf(events: WakeupEvents): SnapshotReader | undefined {
+  const durable = events.durable
+  if (durable === undefined) return undefined
+  return async (aggregateID, seq) => {
+    if (seq === 0) return []
+    const payloads = await Effect.runPromise(
+      durable({ aggregateID, after: -1 }).pipe(
+        Stream.takeUntil((payload) => (payload.durable?.seq ?? -1) >= seq),
+        Stream.runCollect,
+      ),
+    )
+    return Array.from(payloads).map((payload) => ({
+      id: payload.id,
+      type: payload.type,
+      properties: payload.data,
+    }))
+  }
+}
+
+/**
+ * Wire the worker's durable wakeups. A handle with no subscription surface, or
+ * with no mesh control plane (the hub-less / degraded topology, e.g. the
+ * in-process parity harness), cannot be woken durably: the bridge is simply not
+ * wired and the returned disposer is a no-op. This is a legitimate topology,
+ * never an error — only a DIRECT `subscribeDurable` call without a control port
+ * fails loud.
+ *
+ * When the event service exposes `durable()`, each aggregate's delivered
+ * sequence is ALSO tracked with the delta-resync machinery: a mesh gap (a commit
+ * that never arrived, not just an overflow resync) produces a typed `Resync` and
+ * reads the database snapshot at the last confirmed position. The wake then makes
+ * the isolate's own `durable()` subscribers re-read the same log, so the session
+ * heals without closing the control plane.
+ */
 export function wireDurableWakeups(
-  events: Pick<EventV2.Interface, "publishLive" | "wakeDurable">,
+  events: WakeupEvents,
   egress: Pick<EventEgressClientHandle, "subscribeDurable" | "mesh">,
 ): () => void {
   const subscribe = egress.subscribeDurable
   if (subscribe === undefined || egress.mesh === undefined) return () => {}
-  return subscribe({
+  const seen = new Set<string>()
+  const snapshot = durableSnapshotOf(events)
+  const trackers = new Map<string, { receiveDurable: (commit: DurableCommit) => void }>()
+
+  const trackerFor = (aggregateID: string): { receiveDurable: (commit: DurableCommit) => void } | undefined => {
+    if (snapshot === undefined) return undefined
+    const existing = trackers.get(aggregateID)
+    if (existing !== undefined) return existing
+    const subscription = createDeltaSubscription({
+      aggregateID,
+      snapshot,
+      onDelta: () => {},
+      // The commit already crossed live in `onDurable`; this subscription exists
+      // only to detect a gap and heal it from the snapshot.
+      onDurable: () => {},
+      // The wake heals the isolate's own `durable()` subscribers; the snapshot
+      // read above is the DB observation that proves the position is readable.
+      onResync: () => wakeAggregate(events, aggregateID),
+    })
+    const tracker = {
+      receiveDurable: (commit: DurableCommit) =>
+        subscription.receiveDurable({
+          aggregateID: commit.meta.aggregateID,
+          seq: commit.meta.seq,
+          event: commit.event,
+        }),
+    }
+    trackers.set(aggregateID, tracker)
+    return tracker
+  }
+
+  const unsubscribe = subscribe({
     pattern: WORKER_DURABLE_WAKE_PATTERN,
-    onDurable: (commit) => republishDurableCommit(events, commit),
-    // A resync means the hub dropped a delivery under backpressure; the worker's
-    // next durable read catches it up, so there is nothing to replay here.
-    onResync: () => {},
+    onDurable: (commit) => {
+      const aggregateID = commit.meta.aggregateID
+      seen.add(aggregateID)
+      republishDurableCommit(events, commit)
+      trackerFor(aggregateID)?.receiveDurable(commit)
+    },
+    // A resync means the hub dropped a delivery (overflow or receiver gap). With
+    // an exact position, wake that aggregate so its `durable()` stream re-reads
+    // SQLite; without one, wake everything this worker has observed.
+    onResync: (_pattern, position) => {
+      if (position !== undefined) {
+        wakeAggregate(events, position.aggregateID)
+        return
+      }
+      for (const aggregateID of seen) wakeAggregate(events, aggregateID)
+    },
   })
+  return () => {
+    trackers.clear()
+    unsubscribe()
+  }
 }
 
 /**

@@ -36,7 +36,8 @@ export interface MeshPublishResult {
 /** Hub → worker transport for the mesh; the hub passes these to `attach`. */
 export interface MeshSink {
   sendDurable(commit: DurableCommit): void
-  sendResync(pattern: string): void
+  /** Ask one pattern to resync; `position` is the commit that overflowed. */
+  sendResync(pattern: string, position?: AggregatePosition): void
 }
 
 export interface EgressMesh {
@@ -96,13 +97,14 @@ export function createEgressMesh(options: EgressMeshOptions = {}): EgressMesh {
   const resync = new Map<string, Set<string>>()
 
   /** Pure read: does NOT create a subscription entry for `workerId`. */
-  const firstMatchingPattern = (workerId: string, type: string): string | undefined => {
+  const matchingPatterns = (workerId: string, type: string): string[] => {
     const patterns = subscriptions.get(workerId)
-    if (!patterns) return undefined
+    if (!patterns) return []
+    const matched: string[] = []
     for (const pattern of patterns) {
-      if (matchesMeshPattern(pattern, type)) return pattern
+      if (matchesMeshPattern(pattern, type)) matched.push(pattern)
     }
-    return undefined
+    return matched
   }
 
   const flagResync = (workerId: string, pattern: string): void => {
@@ -140,14 +142,18 @@ export function createEgressMesh(options: EgressMeshOptions = {}): EgressMesh {
       const delivered: string[] = []
       const dropped: string[] = []
       for (const workerId of subscriptions.keys()) {
-        const pattern = firstMatchingPattern(workerId, commit.event.type)
-        if (pattern === undefined) continue
+        const patterns = matchingPatterns(workerId, commit.event.type)
+        if (patterns.length === 0) continue
         const sink = sinks.get(workerId)
         const pending = outstanding.get(workerId) ?? 0
         if (pending >= bound) {
           dropped.push(workerId)
-          flagResync(workerId, pattern)
-          if (sink) bestEffort(() => sink.sendResync(pattern))
+          // EVERY matching subscription has a gap in its own stream, so every one
+          // is resynced with the commit that was dropped for this worker.
+          for (const pattern of patterns) {
+            flagResync(workerId, pattern)
+            if (sink) bestEffort(() => sink.sendResync(pattern, commit.meta))
+          }
           continue
         }
         // A delivery counts only once its push succeeded: a closed or failing
@@ -227,7 +233,12 @@ export function attachMeshWorker(mesh: EgressMesh, workerId: string, port: Messa
   const detach = mesh.attach(workerId, {
     sendDurable: (commit) =>
       link.notify({ type: "durable", meta: commit.meta, event: commit.event } satisfies ControlOutbound),
-    sendResync: (pattern) => link.notify({ type: "resync", pattern } satisfies ControlOutbound),
+    sendResync: (pattern, position) =>
+      link.notify({
+        type: "resync",
+        pattern,
+        ...(position === undefined ? {} : { meta: position }),
+      } satisfies ControlOutbound),
   })
 
   const replyOk = (frame: ControlInbound): void => {
@@ -267,7 +278,7 @@ export interface MeshWorkerClient {
   unlisten(pattern: string): Promise<void>
   /** Wake registered `durable()` subscribers for a matching committed event. */
   onDurable(handler: (commit: DurableCommit) => void): void
-  onResync(handler: (pattern: string) => void): void
+  onResync(handler: (pattern: string, position?: AggregatePosition) => void): void
   /** Tell the hub that `count` delivered commits were processed (frees backlog slots). */
   acknowledgeDelivery(count?: number): void
   /** Tell the hub that the named pattern's resync completed. */
@@ -279,7 +290,7 @@ export interface MeshWorkerClient {
 export function createMeshWorkerClient(port: MessagePort): MeshWorkerClient {
   const link = createControlLink(port)
   let durableHandler: ((commit: DurableCommit) => void) | undefined
-  let resyncHandler: ((pattern: string) => void) | undefined
+  let resyncHandler: ((pattern: string, position?: AggregatePosition) => void) | undefined
 
   link.onMessage((frame) => {
     if (frame.type === "durable") {
@@ -287,7 +298,7 @@ export function createMeshWorkerClient(port: MessagePort): MeshWorkerClient {
       return
     }
     if (frame.type === "resync" && typeof frame.pattern === "string") {
-      resyncHandler?.(frame.pattern)
+      resyncHandler?.(frame.pattern, frame.meta)
     }
   })
 

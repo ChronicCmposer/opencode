@@ -41,6 +41,7 @@ import { setThreadName } from "@/util/thread-name"
 import type { InstanceContext } from "@/project/instance-context"
 import { Provider } from "@/provider/provider"
 import { Bus } from "@opencode-ai/core/bus"
+import { EventV2 } from "@opencode-ai/core/event"
 import * as Database from "@opencode-ai/core/database/database"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
 import { openWriterConnection } from "@/session/writer/connection"
@@ -325,15 +326,19 @@ export function createWorkerDatabaseWriter(
 ): WorkerWriterClient {
   const connection = options.connection ?? openWriterConnection(options.filename ?? Database.path())
   const ownerID = `worker-${options.workerID ?? threadId}-${process.pid}-${randomUUID()}`
-  const bus = Bus.create({ connection, ownerID })
+  // The event service commits durable events in this isolate; stamp it with the
+  // same generation lease so a stale generation's durable write is fenced.
+  EventV2.setWorkerLeaseOwner(ownerID)
+  const bus = Bus.create({ connection, ownerID, leaseTimeoutMs: 30_000 })
   const transactions = new Set<string>()
   let nextTransaction = 1
 
-  // C8: claim the session lease when the generation starts. A lease held by a
-  // dead earlier generation is reclaimed only at the observed sequence, which
-  // the Bus verifies inside one `BEGIN IMMEDIATE`, so a raced commit fences the
-  // reclaim instead of being dropped.
-  const adopt = (aggregateID: string): void => {
+  // C8/P0: claim only the worker-generation lease. The v1 sync owner
+  // (`event_sequence.owner_id`) belongs to sync replication and is never
+  // rewritten here. A lease held by a live generation is refused; a dead
+  // generation is reclaimed only at the observed sequence inside one
+  // `BEGIN IMMEDIATE`, so a raced commit fences the reclaim instead of losing it.
+  const claimWorkerLease = (aggregateID: string): void => {
     const owner = bus.ownerOf(aggregateID)
     if (owner === undefined) {
       bus.claim(aggregateID)
@@ -347,7 +352,7 @@ export function createWorkerDatabaseWriter(
       nextOwnerID: ownerID,
     })
   }
-  if (options.sessionID !== undefined) adopt(options.sessionID)
+  if (options.sessionID !== undefined) claimWorkerLease(options.sessionID)
 
   const requireTransaction = (handle: string): void => {
     if (!transactions.has(handle)) throw new Error(`unknown or spent transaction handle "${handle}"`)
@@ -385,7 +390,11 @@ export function createWorkerDatabaseWriter(
       connection.exec("ROLLBACK")
       transactions.delete(handle)
     },
-    dispose: () => connection.close(),
+    dispose: () => {
+      if (options.sessionID !== undefined) bus.release(options.sessionID)
+      EventV2.setWorkerLeaseOwner(undefined)
+      connection.close()
+    },
   }
 }
 

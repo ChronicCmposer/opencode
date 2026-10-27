@@ -59,7 +59,7 @@ export interface DeltaSnapshot extends AggregatePosition {
   readonly events: readonly EventV2Event[]
 }
 
-type SnapshotReader = (aggregateID: string, seq: number) => Promise<readonly EventV2Event[]>
+export type SnapshotReader = (aggregateID: string, seq: number) => Promise<readonly EventV2Event[]>
 
 export interface DeltaQueueOptions {
   /** Maximum pending deltas; defaults to {@link DELTA_QUEUE_BOUND}. */

@@ -54,6 +54,13 @@ export interface EgressReceiverOptions {
   /** Called once on the first framing/ordering error; the receiver then stops. */
   readonly onError?: (error: Error) => void
   /**
+   * Durable-gap policy: when supplied, a gap/out-of-order frame is surfaced here
+   * (with the position that arrived and the last accepted one) and the port
+   * STAYS OPEN so the consumer can heal from a database snapshot. Without it the
+   * receiver keeps its fail-loud contract and closes the port.
+   */
+  readonly onDurableGap?: (got: AggregatePosition, last: AggregatePosition) => void
+  /**
    * Backpressure signal: when it returns `true`, non-durable deltas are dropped
    * (and a resync surfaced) instead of delivered. Durable events always deliver.
    */
@@ -115,7 +122,19 @@ export function createEgressReceiver(options: EgressReceiverOptions): EgressRece
   const handleEvent = (frame: EventFrame, text: string): void => {
     const meta = durableMetaOf(frame)
     if (meta) {
-      assertDurableOrder(meta, lastByAggregate.get(meta.aggregateID))
+      const last = lastByAggregate.get(meta.aggregateID)
+      if (last !== undefined) {
+        try {
+          assertDurableOrder(meta, last)
+        } catch (error) {
+          // A gap is recoverable when the consumer owns a resync policy: surface
+          // it and keep the stream alive. A stale/duplicate frame is still
+          // idempotent downstream, so it is delivered once.
+          if (!(error instanceof DurableOrderError) || options.onDurableGap === undefined) throw error
+          resyncs++
+          options.onDurableGap(meta, last)
+        }
+      }
       lastByAggregate.set(meta.aggregateID, meta)
       received++
       options.onFrame(frame, text)

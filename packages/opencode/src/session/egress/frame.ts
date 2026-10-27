@@ -69,6 +69,49 @@ export type DurableMeta = AggregatePosition
  */
 export { durableAggregateMetaOf as durableMetaOf } from "@/session/worker/frame"
 
+/**
+ * A resync's optional durable position. The shared events body schema owns the
+ * `pattern`; the aggregate identity rides beside it as forward-compatible
+ * payload metadata (exactly like `event` frames), so an older peer that ignores
+ * it still resyncs by pattern.
+ */
+export interface DurableResyncPayload extends EventsResyncPayload {
+  readonly aggregateID?: string
+  readonly seq?: number
+}
+
+/** A decoded `resync` frame with the optional aggregate position restored. */
+export type ResyncFrame = Omit<Extract<EventsFrame, { readonly kind: "resync" }>, "payload"> & {
+  readonly payload?: DurableResyncPayload
+}
+
+/** Every decoded events frame; `resync` may carry the aggregate position. */
+export type DecodedEventsFrame = Exclude<EventsFrame, { readonly kind: "resync" }> | ResyncFrame
+
+/** Build a `resync` frame asking a peer to heal the exact `(aggregateID, seq)`. */
+export function resyncWithPositionFrame(payload: DurableResyncPayload): WorkerFrameEnvelope {
+  return { v: WORKER_FRAME_VERSION, port: "events", kind: "resync", payload }
+}
+
+/** Parse the trailing aggregate position on a resync payload, failing loud on half a pair. */
+function durablePositionOf(value: unknown): AggregatePosition | undefined {
+  if (typeof value !== "object" || value === null) return undefined
+  const record = value as Record<string, unknown>
+  const aggregateID = record["aggregateID"]
+  const seq = record["seq"]
+  if (aggregateID === undefined && seq === undefined) return undefined
+  if (aggregateID === undefined || seq === undefined) {
+    throw new ProtocolError("resync must carry both aggregateID and seq, or neither")
+  }
+  if (typeof aggregateID !== "string" || aggregateID.length === 0) {
+    throw new ProtocolError(`resync aggregateID must be a non-empty string (got ${JSON.stringify(aggregateID)})`)
+  }
+  if (typeof seq !== "number" || !Number.isInteger(seq) || seq < 0) {
+    throw new ProtocolError(`resync seq must be a non-negative integer (got ${JSON.stringify(seq)})`)
+  }
+  return { aggregateID, seq }
+}
+
 /** Encode one frame as the shared envelope JSON string, enforcing the 4 MiB bound. */
 export function encodeFrame(frame: WorkerFrameEnvelope): string {
   return assertWorkerFrameSize(encodeWorkerFrame(frame), MAX_FRAME_BYTES)
@@ -86,13 +129,23 @@ export function encodeFrames(frames: readonly WorkerFrameEnvelope[]): readonly s
   return encoded
 }
 
-/** Decode one wire message (a JSON string) into a trusted events frame. */
-export function decodeFrame(text: string): EventsFrame {
-  return parseEventsFrame(decodeWorkerFrame(text))
+/**
+ * Decode one wire message (a JSON string) into a trusted events frame. The
+ * shared parser validates the body; the raw envelope is still available for
+ * forward-compatible metadata the body schema does not own, so a resync's
+ * `(aggregateID, seq)` position is restored here rather than dropped.
+ */
+export function decodeFrame(text: string): DecodedEventsFrame {
+  const envelope = decodeWorkerFrame(text)
+  const frame = parseEventsFrame(envelope)
+  if (frame.kind !== "resync") return frame
+  const position = durablePositionOf(envelope.payload)
+  if (position === undefined) return frame
+  return { ...frame, payload: { ...frame.payload, ...position } }
 }
 
 /** Decode a batch of wire messages, in order. */
-export function decodeFrames(texts: readonly string[]): readonly EventsFrame[] {
+export function decodeFrames(texts: readonly string[]): readonly DecodedEventsFrame[] {
   return texts.map(decodeFrame)
 }
 

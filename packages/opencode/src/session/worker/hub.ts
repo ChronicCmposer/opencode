@@ -34,8 +34,12 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Project } from "@opencode-ai/schema/project"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { attachMeshWorker, createEgressMesh, type DurableCommit, type EgressMesh } from "@/session/egress/mesh"
-import { type EventV2Event, type EventsAckPayload, type EventsResyncPayload } from "./frame"
-import { durableMetaOf } from "@/session/egress/frame"
+import {
+  durableAggregateMetaOf,
+  type EventV2Event,
+  type EventsAckPayload,
+} from "./frame"
+import { encodeFrame, resyncWithPositionFrame, type DurableResyncPayload } from "@/session/egress/frame"
 import { createLiveEventPublisher, instanceLocation, EventV2Bridge, type LiveEventPublisher } from "@/event-v2-bridge"
 import type { EventV2 } from "@opencode-ai/core/event"
 import { StateCache } from "@opencode-ai/core/bus"
@@ -54,7 +58,7 @@ import {
 } from "./dispatch"
 import type { SessionSpawnRequest, SessionSpawnResult } from "./subagent"
 import { createLifecycleTracker, type LifecycleTracker } from "@/session/ledger/lifecycle"
-import { decideAutoResume, type AutoResumeDecision } from "@/session/ledger/resume"
+import { decideAutoResume, type AutoResumeDecision, type IndeterminateCall } from "@/session/ledger/resume"
 import {
   RUN_BARRIER_TIMEOUT_MS,
   RunBarrierTimeout,
@@ -538,12 +542,21 @@ export interface HubEventSink {
   /**
    * Republish one worker event live-only. `durable` marks an event whose commit
    * already happened in the worker, so the hub cache must drop the aggregate.
+   * `aggregateID`/`seq` are the frame's committed identity; when present they are
+   * authoritative for cache invalidation (the payload is not re-parsed to guess).
    */
-  event(event: EventV2Event, options?: { readonly durable?: boolean }): void
+  event(
+    event: EventV2Event,
+    options?: {
+      readonly durable?: boolean
+      readonly aggregateID?: string
+      readonly seq?: number
+    },
+  ): void
   /** The worker signalled end-of-stream. */
   end(): void
-  /** A backpressure resync: a non-durable delta was dropped; durable events continue. */
-  resync(payload?: EventsResyncPayload): void
+  /** A resync: a delta was dropped or a durable sequence gapped; durable events continue. */
+  resync(payload?: DurableResyncPayload): void
   /** A delivery acknowledgement. */
   ack(payload?: EventsAckPayload): void
   /** Whether the worker signalled end-of-stream. */
@@ -562,11 +575,13 @@ export function createHubEventSink(options: HubEventSinkOptions): HubEventSink {
   let acks = 0
   return {
     event(event, meta) {
-      // The event crosses verbatim as `{ id, type, properties }`; the frame's
-      // `generation`/`ordinal` metadata is deliberately not republished.
+      // The event crosses verbatim as `{ id, type, properties }`; transport-only
+      // identity stays on the frame and is never fabricated onto the event.
       publisher.publish({ id: event.id, type: event.type, data: event.properties })
       if (meta?.durable !== true) return
-      const aggregateID = aggregateOf(event)
+      // Prefer the committed frame identity: the payload's `sessionID` can name a
+      // different aggregate than the one the commit actually advanced.
+      const aggregateID = meta.aggregateID ?? aggregateOf(event)
       if (aggregateID !== undefined) cache?.invalidate(aggregateID)
     },
     end() {
@@ -595,10 +610,12 @@ export function createHubEventSink(options: HubEventSinkOptions): HubEventSink {
  * `WorkerFrameEnvelope` frames, backpressure-aware), routing every decoded frame
  * to `sink`. A malformed frame fails loud: the receiver closes the port.
  *
- * A writer-stamped durable event (`generation` + `ordinal`) is additionally
+ * A durable event identified by its aggregate `(aggregateID, seq)` is additionally
  * handed to `onDurable` — the hub's cross-isolate mesh commit path, so another
  * worker's `events.durable()` subscribers wake. The live republish is unchanged:
- * the mesh is an additive wakeup channel, never a re-commit.
+ * the mesh is an additive wakeup channel, never a re-commit. A per-aggregate
+ * sequence gap is surfaced as a resync (and sent back to the worker) instead of
+ * failing the port, so the stream heals from the worker's DB snapshot.
  */
 export function serveEventsPort(
   port: MessagePort,
@@ -613,10 +630,26 @@ export function serveEventsPort(
       // The canonical durability test (present only when BOTH `aggregateID` and
       // `seq` are set), shared with the receiver and fan-out so the three never
       // drift on exactly which frames are durable.
-      const meta = durableMetaOf(frame)
-      sink.event(frame.payload.event, { durable: meta !== undefined })
+      const meta = durableAggregateMetaOf(frame)
+      sink.event(frame.payload.event, {
+        durable: meta !== undefined,
+        ...(meta === undefined ? {} : { aggregateID: meta.aggregateID, seq: meta.seq }),
+      })
       if (meta === undefined || onDurable === undefined) return
       onDurable({ meta, event: frame.payload.event })
+    },
+    // A worker that skipped a durable sequence is healed by its OWN database
+    // snapshot, not by closing the port: surface the resync on the sink and ask
+    // the worker (back over the same bidirectional events port) to re-read the
+    // aggregate at the exact observed position.
+    onDurableGap: (got) => {
+      sink.resync({ aggregateID: got.aggregateID, seq: got.seq })
+      try {
+        port.postMessage(encodeFrame(resyncWithPositionFrame({ aggregateID: got.aggregateID, seq: got.seq })))
+      } catch (error) {
+        // The peer may already be gone; the sink counter still records the gap.
+        onError?.(error instanceof Error ? error : new Error(String(error)))
+      }
     },
     onEnd: () => sink.end(),
     onResync: (payload) => sink.resync(payload),
@@ -1633,10 +1666,54 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     await barrier.wait(sessionID, barrierPhases(sessionID))
   }
 
-  /** A timed-out barrier refuses the next run until an explicit reset. */
+  /**
+   * Sessions whose owning generation was retired (crash, hard terminate, idle
+   * reap). Its in-flight tool calls can never settle, so the next admitted run
+   * releases them instead of letting them time out its barrier. Only a lost
+   * generation grants that release: a live run's calls always hold the barrier.
+   */
+  const lostGenerations = new Set<SessionID>()
+
+  /**
+   * A retired generation can never run `dispose()` (crash, hard terminate), so
+   * its worker lease would otherwise stay live until the 30 s TTL and the
+   * immediate successor's `Bus.reclaim` would fail with `Bus.LeaseConflict`.
+   * Retirement is the authoritative "this generation is dead" signal, so mark
+   * its lease expired here. A live generation is never retired, so this can
+   * never steal a live lease.
+   */
+  const releaseRetiredLease = (sessionID: SessionID): void => {
+    if (db === undefined) return
+    void db
+      .run(
+        "UPDATE event_sequence SET worker_expires_at = 0 WHERE aggregate_id = ? AND worker_expires_at IS NOT NULL",
+        [sessionID],
+      )
+      .catch((error: unknown) => {
+        log(workerLogMessage("retired lease release failed"), {
+          level: "WARN",
+          sessionID,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      })
+  }
+
+  /**
+   * A timed-out barrier refuses the next run while its worker is still alive
+   * (the run may still settle). Once that worker has been retired — a crash or a
+   * hard terminate — no fiber can ever settle the phases, so the stale barrier is
+   * abandoned instead of wedging the Session forever with `RunBarrierTimeout`.
+   */
   const admitBarrier = (sessionID: SessionID): void => {
     const state = barrier.state(sessionID)
-    if (state === "timed-out") throw new RunBarrierTimeout(sessionID, RUN_BARRIER_TIMEOUT_MS)
+    if (state === "timed-out") {
+      if (dispatcher.registry.worker(sessionID) === undefined) {
+        lostGenerations.add(sessionID)
+        barrier.abandon(sessionID)
+        return
+      }
+      throw new RunBarrierTimeout(sessionID, RUN_BARRIER_TIMEOUT_MS)
+    }
     if (state === "cancelled" || state === "failed") barrier.reset(sessionID)
   }
 
@@ -1644,15 +1721,35 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     pool,
     crashState: (sessionID) => lifecycle.crashState(sessionID),
     recordCrash: (payload) => lifecycle.observeCrash(payload),
-    resumeDecision: (payload) =>
-      decideAutoResume({
-        sessionID: payload.sessionID,
-        phase: payload.phase,
-        attempts: lifecycle.attempts(payload.sessionID),
-        cancelled: lifecycle.cancelled(payload.sessionID),
-        lastCommittedMessageID: payload.lastCommittedMessageID,
-        indeterminate: lifecycle.indeterminate(payload.sessionID),
-      }),
+    resumeDecision: (payload) => {
+      const decide = (indeterminate: readonly IndeterminateCall[]) =>
+        decideAutoResume({
+          sessionID: payload.sessionID,
+          phase: payload.phase,
+          attempts: lifecycle.attempts(payload.sessionID),
+          cancelled: lifecycle.cancelled(payload.sessionID),
+          lastCommittedMessageID: payload.lastCommittedMessageID,
+          indeterminate,
+        })
+      // The durable `tool_call` rows are the crash truth. The tracker is only a
+      // mirror: a worker can die between its durable write and the report, and a
+      // finished row whose report was lost must not falsely block resume.
+      if (db === undefined) return decide(lifecycle.indeterminate(payload.sessionID))
+      return db
+        .query(
+          "SELECT call_id, side_effecting FROM tool_call WHERE session_id = ? AND state = 'started' ORDER BY time_started, call_id",
+          [payload.sessionID],
+        )
+        .then((rows) =>
+          decide(
+            rows.map((row) => ({
+              callID: String(row.call_id),
+              sideEffecting: Number(row.side_effecting) === 1,
+            })),
+          ),
+        )
+        .catch(() => decide(lifecycle.indeterminate(payload.sessionID)))
+    },
     onAutoResume: (decision, payload) => {
       lifecycle.recordAttempt(decision.sessionID)
       if (options.resumeRun !== undefined) {
@@ -1665,8 +1762,23 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
         .catch(() => undefined)
     },
     writeBarrier: runBarrier,
-    onRunStart: (sessionID) => lifecycle.beginRun(sessionID),
+    onRunStart: (sessionID) => {
+      // A lost generation's calls can never settle. Release them into the OLD
+      // phases first (so the fresh `tools` phase below is not pre-resolved and
+      // still gates calls started during this run), then start the generation.
+      if (lostGenerations.delete(sessionID)) {
+        for (const call of lifecycle.indeterminate(sessionID)) lifecycle.toolFinished(sessionID, call.callID)
+      }
+      lifecycle.beginRun(sessionID)
+    },
     onSessionReleased: (sessionID, workerID) => {
+      // This generation can never settle another phase: the next run must not
+      // inherit its in-flight calls.
+      lostGenerations.add(sessionID)
+      // The retired generation's lease is dead even when its isolate never ran
+      // `dispose()` (crash/terminate). Mark it reclaimable before the successor
+      // boots; this `run` is queued ahead of the resume decision's ledger read.
+      releaseRetiredLease(sessionID)
       // Retirement (reap/cancel/crash) disposes this worker's hub-side port
       // servers immediately, rather than leaving them alive until shutdown.
       if (workerID !== undefined) ports.disposeWorker(workerID)

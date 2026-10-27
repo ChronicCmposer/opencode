@@ -199,8 +199,12 @@ export interface DispatcherOptions {
   }
   /** Observe every typed crash payload after it is recorded. */
   readonly onCrash?: (payload: WorkerCrashed) => void
-  /** Apply the ledger/cap/cancel guard to a crash payload. */
-  readonly resumeDecision?: (payload: WorkerCrashed) => AutoResumeDecision
+  /**
+   * Apply the ledger/cap/cancel guard to a crash payload. A promise defers the
+   * terminal rejection until the durable ledger read finishes, so callers never
+   * observe a crash before its resume decision.
+   */
+  readonly resumeDecision?: (payload: WorkerCrashed) => AutoResumeDecision | Promise<AutoResumeDecision>
   /** Observe an allowed auto-resume; re-dispatch stays with the hub owner. */
   readonly onAutoResume?: (decision: Extract<AutoResumeDecision, { resume: true }>, payload: WorkerCrashed) => void
 }
@@ -549,6 +553,22 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     }
   }
 
+  /**
+   * Settle one crash after its resume decision is known. The decision is part of
+   * the crash outcome: a durable ledger read must finish before the run rejects,
+   * otherwise a caller could re-dispatch and race the decision.
+   */
+  const settleCrash = (
+    pending: Pending,
+    failure: WorkerCrashedError,
+    payload: WorkerCrashed,
+    decision: AutoResumeDecision | undefined,
+  ): void => {
+    pending.reject(failure)
+    if (decision?.resume === true) options.onAutoResume?.(decision, payload)
+    nextWaiter(pending.sessionID)
+  }
+
   const fail = (pending: Pending, error: unknown): void => {
     pending.markSettled()
     // A dead isolate must never survive a cancel that owns this run: the cancel
@@ -601,25 +621,31 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       })
       options.recordCrash?.(payload)
       options.onCrash?.(payload)
-      pending.reject(
-        new WorkerCrashedError({
-          message:
-            error instanceof WorkerCrashedError
-              ? error.message
-              : `worker ${payload.workerID} crashed: ${payload.reason}`,
-          workerID: payload.workerID,
-          sessionID: payload.sessionID,
-          phase: payload.phase,
-          lastCommittedMessageID: payload.lastCommittedMessageID,
-          inFlightCallIDs: payload.inFlightCallIDs,
-          reason: payload.reason,
-          cause: error instanceof WorkerCrashedError ? (error.cause ?? error) : error,
-        }),
-      )
+      const failure = new WorkerCrashedError({
+        message:
+          error instanceof WorkerCrashedError
+            ? error.message
+            : `worker ${payload.workerID} crashed: ${payload.reason}`,
+        workerID: payload.workerID,
+        sessionID: payload.sessionID,
+        phase: payload.phase,
+        lastCommittedMessageID: payload.lastCommittedMessageID,
+        inFlightCallIDs: payload.inFlightCallIDs,
+        reason: payload.reason,
+        cause: error instanceof WorkerCrashedError ? (error.cause ?? error) : error,
+      })
       crashChildren(pending.sessionID)
       retireWorker(pending.sessionID)
       const decision = options.resumeDecision?.(payload)
-      if (decision?.resume === true) options.onAutoResume?.(decision, payload)
+      if (decision instanceof Promise) {
+        void decision.then(
+          (resolved) => settleCrash(pending, failure, payload, resolved),
+          () => settleCrash(pending, failure, payload, undefined),
+        )
+        return
+      }
+      settleCrash(pending, failure, payload, decision)
+      return
     } else {
       log(workerLogMessage("worker run failed"), {
         level: "ERROR",

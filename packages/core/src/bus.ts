@@ -24,6 +24,12 @@ export interface Options {
   readonly connection: Connection
   /** Worker-generation lease stamped onto every aggregate this Bus writes. */
   readonly ownerID: string
+  /**
+   * Worker lease TTL in milliseconds. Zero/absent means no time-based expiry
+   * (legacy callers); production workers set a positive TTL so a reclaim from a
+   * live generation is refused until the lease expires or is released.
+   */
+  readonly leaseTimeoutMs?: number
   /** Definitions used to decode stored events; defaults to the global durable manifest. */
   readonly definitions?: ReadonlyArray<Event.Definition>
   readonly cache?: CacheInvalidation
@@ -52,6 +58,8 @@ export interface ReclaimInput {
   /** Last sequence the reclaimer observed; a newer value means a commit raced the reclaim. */
   readonly expectedSeq: number
   readonly nextOwnerID: string
+  /** Clock for a live-lease decision; defaults to `Date.now()`. */
+  readonly now?: number
 }
 
 export interface Transaction {
@@ -75,6 +83,10 @@ export interface Interface {
   readonly read: (input: { readonly aggregateID: string; readonly after?: number }) => readonly Event.Payload[]
   readonly claim: (aggregateID: string, nextOwnerID?: string) => Lease
   readonly reclaim: (input: ReclaimInput) => Lease
+  /** Renew this generation's lease; a stale owner cannot extend it. */
+  readonly heartbeat: (aggregateID: string) => void
+  /** Mark this generation's lease dead so a successor can reclaim it. */
+  readonly release: (aggregateID: string) => void
 }
 
 export class InvalidDurableEventError extends Schema.TaggedErrorClass<InvalidDurableEventError>()(
@@ -118,9 +130,28 @@ const RESERVE_BLOCK = `
   RETURNING seq
 `
 
+/** With a separate worker lease the sync `owner_id` is never part of a write. */
+const RESERVE_BLOCK_WITH_WORKER_LEASE = `
+  INSERT INTO event_sequence (aggregate_id, seq)
+  VALUES (?, ?)
+  ON CONFLICT(aggregate_id) DO UPDATE SET
+    seq = event_sequence.seq + excluded.seq + 1
+  RETURNING seq
+`
+
 interface SequenceRow {
   readonly seq: number
+  /** v1 sync owner. */
   readonly ownerID: string | undefined
+  /** Worker-generation lease owner; undefined when this schema predates it. */
+  readonly workerOwnerID: string | undefined
+  readonly workerExpiresAt: number | undefined
+}
+
+/** A schema with the dedicated worker-lease columns (post `add_worker_lease`). */
+const supportsWorkerLease = (connection: Connection): boolean => {
+  const columns = connection.all("PRAGMA table_info(event_sequence)")
+  return columns.some((column) => column.name === "worker_owner_id")
 }
 
 interface PreparedEvent {
@@ -140,11 +171,22 @@ const parseSequence = (row: Record<string, unknown>): SequenceRow => {
   return {
     seq,
     ownerID: typeof row.owner_id === "string" ? row.owner_id : undefined,
+    workerOwnerID: typeof row.worker_owner_id === "string" ? row.worker_owner_id : undefined,
+    workerExpiresAt: typeof row.worker_expires_at === "number" ? row.worker_expires_at : undefined,
   }
 }
 
-const readSequence = (connection: Connection, aggregateID: string): SequenceRow | undefined => {
-  const row = connection.all("SELECT seq, owner_id FROM event_sequence WHERE aggregate_id = ?", [aggregateID])[0]
+const readSequence = (
+  connection: Connection,
+  aggregateID: string,
+  workerLease: boolean,
+): SequenceRow | undefined => {
+  const row = workerLease
+    ? connection.all(
+        "SELECT seq, owner_id, worker_owner_id, worker_expires_at FROM event_sequence WHERE aggregate_id = ?",
+        [aggregateID],
+      )[0]
+    : connection.all("SELECT seq, owner_id FROM event_sequence WHERE aggregate_id = ?", [aggregateID])[0]
   return row === undefined ? undefined : parseSequence(row)
 }
 
@@ -243,10 +285,30 @@ const requireUniqueIds = (events: ReadonlyArray<PreparedEvent>): void => {
   }
 }
 
-const requireWritableOwner = (current: SequenceRow | undefined, ownerID: string, aggregateID: string): void => {
-  if (current?.ownerID !== undefined && current.ownerID !== ownerID) {
+const requireWritableOwner = (
+  current: SequenceRow | undefined,
+  ownerID: string,
+  aggregateID: string,
+  workerLease: boolean,
+  now: number,
+): void => {
+  if (!workerLease) {
+    if (current?.ownerID !== undefined && current.ownerID !== ownerID) {
+      throw new StaleOwnerError({
+        message: `Aggregate ${aggregateID} is leased to ${current.ownerID}, not ${ownerID}`,
+      })
+    }
+    return
+  }
+  if (current?.workerOwnerID === undefined) return
+  if (current.workerOwnerID !== ownerID) {
     throw new StaleOwnerError({
-      message: `Aggregate ${aggregateID} is leased to ${current.ownerID}, not ${ownerID}`,
+      message: `Aggregate ${aggregateID} worker lease is held by ${current.workerOwnerID}, not ${ownerID}`,
+    })
+  }
+  if (current.workerExpiresAt !== undefined && current.workerExpiresAt <= now) {
+    throw new StaleOwnerError({
+      message: `Worker lease for aggregate ${aggregateID} expired for ${ownerID}`,
     })
   }
 }
@@ -257,16 +319,22 @@ const writeEvents = (
   projectors: ReadonlyMap<string, ReadonlyArray<Projector>>,
   inputs: PublishEvents,
   touched: Set<string> | undefined,
+  workerLease: boolean,
+  leaseTimeoutMs: number,
 ): readonly Event.Payload[] => {
   const prepared = inputs.map(prepareEvent)
   const aggregateID = requireSingleAggregate(prepared)
   requireUniqueIds(prepared)
 
-  const current = readSequence(connection, aggregateID)
-  requireWritableOwner(current, ownerID, aggregateID)
+  const now = Date.now()
+  const current = readSequence(connection, aggregateID, workerLease)
+  requireWritableOwner(current, ownerID, aggregateID, workerLease, now)
 
   const block = prepared.length
-  const lastSeq = requireSequence(connection.all(RESERVE_BLOCK, [aggregateID, block - 1, ownerID])[0])
+  const reservation = workerLease
+    ? connection.all(RESERVE_BLOCK_WITH_WORKER_LEASE, [aggregateID, block - 1])[0]
+    : connection.all(RESERVE_BLOCK, [aggregateID, block - 1, ownerID])[0]
+  const lastSeq = requireSequence(reservation)
   const firstSeq = lastSeq - block + 1
   if (firstSeq < 0) {
     throw new InvalidDurableEventError({
@@ -300,6 +368,14 @@ const writeEvents = (
       Event.versionedType(event.type, event.version),
       JSON.stringify(event.encoded),
     ])
+  }
+
+  if (workerLease) {
+    const expiresAt = leaseTimeoutMs > 0 ? now + leaseTimeoutMs : null
+    connection.run(
+      "UPDATE event_sequence SET worker_owner_id = ?, worker_heartbeat_at = ?, worker_expires_at = ? WHERE aggregate_id = ?",
+      [ownerID, now, expiresAt, aggregateID],
+    )
   }
 
   touched?.add(aggregateID)
@@ -404,11 +480,13 @@ export function create(options: Options): Interface {
   if (ownerID.length === 0) {
     throw new Error("Bus.create requires a non-empty ownerID")
   }
+  const leaseTimeoutMs = options.leaseTimeoutMs ?? 0
+  const workerLease = supportsWorkerLease(connection)
   const projectors = new Map<string, Projector[]>()
   const definitions = options.definitions === undefined ? undefined : Event.durable(options.definitions)
 
   const publishInTransaction = (events: PublishEvents): readonly Event.Payload[] =>
-    writeEvents(connection, ownerID, projectors, events, undefined)
+    writeEvents(connection, ownerID, projectors, events, undefined, workerLease, leaseTimeoutMs)
 
   const transaction = <T>(work: (tx: Transaction) => T): T => {
     const touched = new Set<string>()
@@ -416,7 +494,7 @@ export function create(options: Options): Interface {
       connection,
       all: connection.all.bind(connection),
       run: connection.run.bind(connection),
-      publish: (events) => writeEvents(connection, ownerID, projectors, events, touched),
+      publish: (events) => writeEvents(connection, ownerID, projectors, events, touched, workerLease, leaseTimeoutMs),
     }
     const result = inImmediateTransaction(connection, () => work(tx))
     for (const aggregateID of touched) cache?.invalidate(aggregateID)
@@ -439,9 +517,12 @@ export function create(options: Options): Interface {
     projectors.set(key, list)
   }
 
-  const latest = (aggregateID: string): number => readSequence(connection, aggregateID)?.seq ?? -1
+  const latest = (aggregateID: string): number => readSequence(connection, aggregateID, workerLease)?.seq ?? -1
 
-  const ownerOf = (aggregateID: string): string | undefined => readSequence(connection, aggregateID)?.ownerID
+  const ownerOf = (aggregateID: string): string | undefined => {
+    const current = readSequence(connection, aggregateID, workerLease)
+    return workerLease ? current?.workerOwnerID : current?.ownerID
+  }
 
   const read = (input: { readonly aggregateID: string; readonly after?: number }): readonly Event.Payload[] => {
     const rows = connection.all(
@@ -451,24 +532,51 @@ export function create(options: Options): Interface {
     return rows.map((row) => decodeDurablePayload(parseStoredEvent(row), definitions))
   }
 
+  const writeLease = (aggregateID: string, nextOwnerID: string): void => {
+    const now = Date.now()
+    const expiresAt = leaseTimeoutMs > 0 ? now + leaseTimeoutMs : null
+    connection.run(
+      "UPDATE event_sequence SET worker_owner_id = ?, worker_heartbeat_at = ?, worker_expires_at = ? WHERE aggregate_id = ?",
+      [nextOwnerID, now, expiresAt, aggregateID],
+    )
+  }
+
   const claim = (aggregateID: string, nextOwnerID: string = ownerID): Lease => {
     const lease = transaction(() => {
-      const current = readSequence(connection, aggregateID)
-      if (current?.ownerID !== undefined && current.ownerID !== nextOwnerID) {
-        throw new StaleOwnerError({
-          message: `Aggregate ${aggregateID} is leased to ${current.ownerID}, not ${nextOwnerID}`,
-        })
-      }
-      if (current === undefined) {
-        connection.run("INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (?, -1, ?)", [
-          aggregateID,
-          nextOwnerID,
-        ])
-      } else if (current.ownerID === undefined) {
+      const current = readSequence(connection, aggregateID, workerLease)
+      if (workerLease) {
+        if (current?.workerOwnerID !== undefined && current.workerOwnerID !== nextOwnerID) {
+          throw new StaleOwnerError({
+            message: `Aggregate ${aggregateID} worker lease is held by ${current.workerOwnerID}, not ${nextOwnerID}`,
+          })
+        }
+        if (current === undefined) {
+          connection.run("INSERT INTO event_sequence (aggregate_id, seq) VALUES (?, -1)", [aggregateID])
+        }
+        // Compatibility mirror: an unowned sequence advertises the current
+        // owner, but a real v1 sync owner is never overwritten.
         connection.run("UPDATE event_sequence SET owner_id = ? WHERE aggregate_id = ? AND owner_id IS NULL", [
           nextOwnerID,
           aggregateID,
         ])
+        writeLease(aggregateID, nextOwnerID)
+      } else {
+        if (current?.ownerID !== undefined && current.ownerID !== nextOwnerID) {
+          throw new StaleOwnerError({
+            message: `Aggregate ${aggregateID} is leased to ${current.ownerID}, not ${nextOwnerID}`,
+          })
+        }
+        if (current === undefined) {
+          connection.run("INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (?, -1, ?)", [
+            aggregateID,
+            nextOwnerID,
+          ])
+        } else if (current.ownerID === undefined) {
+          connection.run("UPDATE event_sequence SET owner_id = ? WHERE aggregate_id = ? AND owner_id IS NULL", [
+            nextOwnerID,
+            aggregateID,
+          ])
+        }
       }
       return { aggregateID, ownerID: nextOwnerID, seq: latest(aggregateID) }
     })
@@ -478,9 +586,38 @@ export function create(options: Options): Interface {
 
   const reclaim = (input: ReclaimInput): Lease => {
     const lease = transaction(() => {
-      const current = readSequence(connection, input.aggregateID)
+      const current = readSequence(connection, input.aggregateID, workerLease)
       if (current === undefined) {
         throw new UnknownAggregateError({ message: `Aggregate ${input.aggregateID} has no lease row` })
+      }
+      if (workerLease) {
+        if (current.workerOwnerID !== input.expectedOwnerID) {
+          throw new StaleOwnerError({
+            message: `Aggregate ${input.aggregateID} worker lease is held by ${current.workerOwnerID ?? "none"}, not ${input.expectedOwnerID}`,
+          })
+        }
+        if (current.seq !== input.expectedSeq) {
+          throw new LeaseConflictError({
+            message: `Aggregate ${input.aggregateID} advanced to sequence ${current.seq}; reclaim expected ${input.expectedSeq}`,
+          })
+        }
+        const now = input.now ?? Date.now()
+        if (current.workerExpiresAt !== undefined && current.workerExpiresAt > now) {
+          throw new LeaseConflictError({
+            message: `Worker lease for aggregate ${input.aggregateID} is still live until ${current.workerExpiresAt}; refusing reclaim from a live generation`,
+          })
+        }
+        const expiresAt = leaseTimeoutMs > 0 ? now + leaseTimeoutMs : null
+        const outcome = connection.run(
+          "UPDATE event_sequence SET worker_owner_id = ?, worker_heartbeat_at = ?, worker_expires_at = ? WHERE aggregate_id = ? AND worker_owner_id = ? AND seq = ?",
+          [input.nextOwnerID, now, expiresAt, input.aggregateID, input.expectedOwnerID, input.expectedSeq],
+        )
+        if (outcome.changes !== 1) {
+          throw new LeaseConflictError({
+            message: `Reclaim of ${input.aggregateID} did not match the observed worker lease`,
+          })
+        }
+        return { aggregateID: input.aggregateID, ownerID: input.nextOwnerID, seq: current.seq }
       }
       if (current.ownerID !== input.expectedOwnerID) {
         throw new StaleOwnerError({
@@ -507,6 +644,29 @@ export function create(options: Options): Interface {
     return lease
   }
 
+  const heartbeat = (aggregateID: string): void => {
+    if (!workerLease) return
+    const now = Date.now()
+    const expiresAt = leaseTimeoutMs > 0 ? now + leaseTimeoutMs : null
+    const outcome = connection.run(
+      "UPDATE event_sequence SET worker_heartbeat_at = ?, worker_expires_at = ? WHERE aggregate_id = ? AND worker_owner_id = ?",
+      [now, expiresAt, aggregateID, ownerID],
+    )
+    if (outcome.changes !== 1) {
+      throw new StaleOwnerError({
+        message: `Aggregate ${aggregateID} worker lease is not held by ${ownerID}`,
+      })
+    }
+  }
+
+  const release = (aggregateID: string): void => {
+    if (!workerLease) return
+    connection.run(
+      "UPDATE event_sequence SET worker_expires_at = 0 WHERE aggregate_id = ? AND worker_owner_id = ?",
+      [aggregateID, ownerID],
+    )
+  }
+
   return {
     connection,
     ownerID,
@@ -519,5 +679,7 @@ export function create(options: Options): Interface {
     read,
     claim,
     reclaim,
+    heartbeat,
+    release,
   }
 }

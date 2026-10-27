@@ -16,7 +16,7 @@
 import type { EventV2Event } from "@/session/worker/frame"
 
 import type { CoalescerScheduler } from "@/session/egress/coalesce"
-import type { DurableMeta } from "@/session/egress/frame"
+import { decodeFrame, type AggregatePosition, type DurableMeta } from "@/session/egress/frame"
 import {
   createMeshWorkerClient,
   matchesMeshPattern,
@@ -55,8 +55,12 @@ export interface WorkerDurableSubscription {
   readonly pattern: string
   /** Called for each matching durable commit; the delivery is acked once it returns. */
   readonly onDurable: (commit: DurableCommit) => void
-  /** Called when the hub reports this pattern overflowed; the resync is acked once it returns. */
-  readonly onResync?: (pattern: string) => void
+  /**
+   * Called when this pattern must resync: either it overflowed at the hub or the
+   * hub observed a gap in the worker's durable stream. `position` is the exact
+   * aggregate/sequence to heal from the database when known.
+   */
+  readonly onResync?: (pattern: string, position?: AggregatePosition) => void
 }
 
 export interface WorkerEgressClient {
@@ -137,6 +141,28 @@ function buildEgressClient(port: MessagePort, options: WorkerEgressClientOptions
   let meshWired = false
   let disposed = false
 
+  /**
+   * Does a local subscription need the resync for `pattern`? An exact match, a
+   * catch-all local subscription, or a catch-all resync all qualify; a gap
+   * resync with an aggregate position carries no subscription pattern at all, so
+   * every live subscription is told (its own predicate decides relevance).
+   */
+  const resyncTargets = (pattern: string | undefined): WorkerDurableSubscription[] => {
+    // A gap resync names no subscription pattern: every live subscription heals.
+    if (pattern === undefined) return [...subscriptions.values()]
+    // Otherwise the hub already fanned the resync out per registered pattern.
+    // Prefer the exact local entry; fall back to a local catch-all only when this
+    // worker did not register the pattern itself.
+    const exact = subscriptions.get(pattern)
+    if (exact !== undefined) return [exact]
+    return [...subscriptions.values()].filter((subscription) => subscription.pattern === "*")
+  }
+
+  /** Surface one resync to every matching subscription, without letting one throw starve the rest. */
+  const broadcastResync = (pattern: string | undefined, position: AggregatePosition | undefined): void => {
+    for (const subscription of resyncTargets(pattern)) subscription.onResync?.(subscription.pattern, position)
+  }
+
   // Wire the mesh link ONCE: the client multiplexes every local subscription
   // through the single `onDurable`/`onResync` handler the mesh link exposes.
   const wireMesh = (control: MeshWorkerClient): void => {
@@ -156,14 +182,38 @@ function buildEgressClient(port: MessagePort, options: WorkerEgressClientOptions
         control.acknowledgeDelivery()
       }
     })
-    control.onResync((pattern) => {
+    control.onResync((pattern, position) => {
       try {
-        subscriptions.get(pattern)?.onResync?.(pattern)
+        broadcastResync(pattern, position)
       } finally {
         control.acknowledgeResync(pattern)
       }
     })
   }
+
+  // The events data port is bidirectional: the hub sends a `resync` frame there
+  // when its receiver observed a durable sequence gap. Route it through the same
+  // subscription fan-out the mesh uses, so the worker heals from its DB snapshot.
+  const onDataMessage = (message: MessageEvent): void => {
+    if (typeof message.data !== "string") return
+    try {
+      const frame = decodeFrame(message.data)
+      if (frame.kind !== "resync") return
+      broadcastResync(
+        frame.payload?.pattern,
+        frame.payload?.aggregateID === undefined || frame.payload.seq === undefined
+          ? undefined
+          : { aggregateID: frame.payload.aggregateID, seq: frame.payload.seq },
+      )
+    } catch (error) {
+      log(workerLogMessage("egress resync frame rejected"), {
+        ...peerLifecycle("egress", workerID)("warn"),
+        reason: messageOf(error),
+      })
+    }
+  }
+  port.onmessage = onDataMessage
+  port.start()
 
   return {
     emit: (event) => sender.pushDelta(event),

@@ -178,6 +178,34 @@ describe("per-Session run barrier", () => {
     expect(barrier.state("s2")).toBe("drained")
   })
 
+  test("abandon re-admits a Session whose timed-out owner is gone", async () => {
+    const fake = createFakeScheduler()
+    const barrier = createRunBarrier({ scheduler: fake.scheduler })
+    const stuck = deferred()
+    const pending = barrier.wait("s1", phases({ promotion: stuck.promise }))
+    fake.advance(RUN_BARRIER_TIMEOUT_MS)
+    await expect(pending).rejects.toBeInstanceOf(RunBarrierTimeout)
+    expect(barrier.state("s1")).toBe("timed-out")
+
+    barrier.abandon("s1")
+    expect(barrier.state("s1")).toBe("idle")
+    expect(await barrier.wait("s1", phases())).toEqual({ sessionID: "s1", status: "drained" })
+    // Idempotent: a second recovery of the same dead barrier is harmless.
+    barrier.abandon("s1")
+  })
+
+  test("abandon refuses a barrier that is still draining", async () => {
+    const fake = createFakeScheduler()
+    const barrier = createRunBarrier({ scheduler: fake.scheduler })
+    const stuck = deferred()
+    const pending = barrier.wait("s1", phases({ tools: stuck.promise }))
+
+    expect(() => barrier.abandon("s1")).toThrow(RunBarrierBusyError)
+    expect(barrier.state("s1")).toBe("draining")
+    stuck.resolve()
+    expect(await pending).toEqual({ sessionID: "s1", status: "drained" })
+  })
+
   test("reset re-admits a Session after a timeout", async () => {
     const fake = createFakeScheduler()
     const barrier = createRunBarrier({ scheduler: fake.scheduler })

@@ -73,6 +73,27 @@ describe("event mesh registry", () => {
     expect(mesh.outstanding("w1")).toBe(1)
   })
 
+  test("overflow flags a resync for EVERY overlapping pattern, carrying the dropped position", () => {
+    const mesh = createEgressMesh({ bound: 1 })
+    const resyncs: Array<{ pattern: string; meta?: { aggregateID: string; seq: number } }> = []
+    mesh.attach("w1", {
+      sendDurable: () => {},
+      sendResync: (pattern, meta) => void resyncs.push({ pattern, ...(meta === undefined ? {} : { meta }) }),
+    })
+    mesh.listen("w1", "session.*")
+    mesh.listen("w1", "*")
+    mesh.publish(commit("e1", "session.message", 1))
+
+    const result = mesh.publish(commit("e2", "session.message", 2))
+
+    expect(result).toEqual({ delivered: [], dropped: ["w1"] })
+    expect(resyncs).toEqual([
+      { pattern: "session.*", meta: { aggregateID: "agg", seq: 2 } },
+      { pattern: "*", meta: { aggregateID: "agg", seq: 2 } },
+    ])
+    expect(mesh.outstanding("w1")).toBe(1)
+  })
+
   test("fans out to every subscribed worker", () => {
     const mesh = createEgressMesh()
     mesh.listen("w1", "session.*")
@@ -157,9 +178,9 @@ describe("event mesh transport over a control port", () => {
     const client = createMeshWorkerClient(channel.port1)
 
     const woken: string[] = []
-    const resyncs: string[] = []
+    const resyncs: Array<{ pattern: string; meta?: { aggregateID: string; seq: number } }> = []
     client.onDurable((c) => woken.push(c.event.id))
-    client.onResync((pattern) => resyncs.push(pattern))
+    client.onResync((pattern, meta) => resyncs.push({ pattern, ...(meta === undefined ? {} : { meta }) }))
 
     await client.listen("session.*")
     expect(mesh.subscriptions()).toEqual([{ workerId: "w1", pattern: "session.*" }])
@@ -171,7 +192,7 @@ describe("event mesh transport over a control port", () => {
     // Backlog bound is 1 and e1 is still un-acknowledged → the second commit overflows.
     mesh.publish(commit("e2", "session.message", 2))
     await pollUntil(() => resyncs.length === 1)
-    expect(resyncs).toEqual(["session.*"])
+    expect(resyncs).toEqual([{ pattern: "session.*", meta: { aggregateID: "agg", seq: 2 } }])
     expect(mesh.resyncPending).toEqual(["w1"])
 
     client.acknowledgeResync("session.*")

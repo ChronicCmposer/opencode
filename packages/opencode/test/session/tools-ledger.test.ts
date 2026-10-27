@@ -92,6 +92,8 @@ function layerWith(tool: RegisteredTool) {
   )
 }
 
+const settlements = new Map<string, (outcome: "ok" | "error") => Effect.Effect<void>>()
+
 const processor = {
   message: {
     id: messageID,
@@ -108,8 +110,23 @@ const processor = {
     time: { created: 1 },
   } satisfies SessionV1.Assistant,
   updateToolCall: () => Effect.succeed(undefined),
-  completeToolCall: () => Effect.void,
-} satisfies Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+  // Mirrors the processor's durable result commit: the registration is drained
+  // only when the result part is committed.
+  completeToolCall: (toolCallID: string) =>
+    Effect.gen(function* () {
+      const settle = settlements.get(toolCallID)
+      settlements.delete(toolCallID)
+      if (settle !== undefined) yield* settle("ok")
+    }),
+  registerToolSettlement: (toolCallID: string, settle: (outcome: "ok" | "error") => Effect.Effect<void>) => {
+    settlements.set(toolCallID, settle)
+  },
+} satisfies Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall" | "registerToolSettlement">
+
+/** Commit the result part, which is what settles a successful call. */
+function commitResult(toolCallID = callID) {
+  return Effect.runPromise(processor.completeToolCall(toolCallID))
+}
 
 function tool(execute: RegisteredTool["execute"]): RegisteredTool {
   return {
@@ -196,6 +213,17 @@ describe("tool-call ledger on the production tool path", () => {
       if (!execute) throw new Error("tool is missing execute")
       await run(execute)
 
+      // The effect returned, but no result part committed yet: the row must
+      // still be `started` so a crash here is indeterminate, not replayable.
+      expect(
+        database.connection.all("SELECT state, outcome FROM tool_call WHERE call_id = ? AND session_id = ?", [
+          callID,
+          String(sessionID),
+        ]),
+      ).toEqual([{ state: "started", outcome: null }])
+
+      await commitResult()
+
       expect(
         database.connection.all("SELECT state, outcome FROM tool_call WHERE call_id = ? AND session_id = ?", [
           callID,
@@ -208,7 +236,7 @@ describe("tool-call ledger on the production tool path", () => {
     }
   })
 
-  test("records started before the effect and finished after the effect", async () => {
+  test("records started before the effect and finishes only with the result commit", async () => {
     const { ledger } = ledgerForTest()
     let observed: string | undefined
     const execute = await resolveTool(
@@ -224,24 +252,47 @@ describe("tool-call ledger on the production tool path", () => {
     await run(execute)
 
     expect(observed).toBe("started")
+    // The side effect happened but its result has not committed: a crash here
+    // must leave the row `started` so recovery refuses to replay the effect.
+    expect(ledger.list(sessionID)).toEqual([
+      expect.objectContaining({ callID, sessionID, tool: "ledger", state: "started", outcome: null }),
+    ])
+    expect(ledger.indeterminate(sessionID)).toEqual([
+      expect.objectContaining({ callID, state: "indeterminate", sideEffecting: true }),
+    ])
+
+    await commitResult()
+
     expect(ledger.list(sessionID)).toEqual([
       expect.objectContaining({ callID, sessionID, tool: "ledger", state: "finished", outcome: "ok" }),
     ])
     expect(ledger.indeterminate(sessionID)).toEqual([])
   })
 
-  test("a crash between start and finish leaves an indeterminate row", async () => {
+  test("a hard crash between start and finish leaves an indeterminate row", () => {
     const { ledger } = ledgerForTest()
-    const execute = await resolveTool(
-      tool(() => Effect.die(new Error("simulated worker crash"))),
-      ledger,
-    )
+    // A process that dies between `start` and the exit handler writes nothing;
+    // the durable row is the only record, and recovery reads it as indeterminate.
+    ledger.start({ callID, sessionID: String(sessionID), tool: "ledger", sideEffecting: true })
 
-    await expect(run(execute)).rejects.toThrow()
     expect(ledger.list(sessionID)).toEqual([expect.objectContaining({ callID, state: "started", outcome: null })])
     expect(ledger.indeterminate(sessionID)).toEqual([
       expect.objectContaining({ callID, state: "indeterminate", sideEffecting: true }),
     ])
+  })
+
+  test("a defect finishes the row as error instead of blocking the run forever", async () => {
+    const { ledger } = ledgerForTest()
+    const execute = await resolveTool(
+      tool(() => Effect.die(new Error("simulated tool defect"))),
+      ledger,
+    )
+
+    await expect(run(execute)).rejects.toThrow()
+    expect(ledger.list(sessionID)).toEqual([
+      expect.objectContaining({ callID, state: "finished", outcome: "error" }),
+    ])
+    expect(ledger.indeterminate(sessionID)).toEqual([])
   })
 
   test("finish joins an open result transaction instead of nesting one", async () => {
@@ -250,8 +301,8 @@ describe("tool-call ledger on the production tool path", () => {
     const execute = await resolveTool(
       tool(() =>
         Effect.sync(() => {
-          // The tool owns the result transaction; the wrapper's finish must run
-          // inside it (a single UPDATE), never issue a nested BEGIN.
+          // The tool owns the result transaction; the result-commit finish must
+          // run inside it (a single UPDATE), never issue a nested BEGIN.
           connection.exec("BEGIN IMMEDIATE")
           connection.run("INSERT INTO note (id) VALUES (?)", ["result"])
           return { title: "ledger", metadata: {}, output: "done" }
@@ -261,6 +312,9 @@ describe("tool-call ledger on the production tool path", () => {
     )
 
     await run(execute)
+    expect(ledger.list(sessionID)[0]?.state).toBe("started")
+
+    await commitResult()
 
     // The finish is visible on the same open transaction and commits with it.
     expect(ledger.list(sessionID)[0]?.state).toBe("finished")

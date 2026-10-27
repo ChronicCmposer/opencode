@@ -47,6 +47,26 @@ export class InvalidDurableEventError extends Schema.TaggedErrorClass<InvalidDur
   },
 ) {}
 
+/** A durable write came from a generation that no longer holds the worker lease. */
+export class StaleOwnerError extends Schema.TaggedErrorClass<StaleOwnerError>()("EventV2.StaleOwner", {
+  message: Schema.String,
+}) {}
+
+/**
+ * The worker generation that owns durable writes in this isolate. A worker
+ * isolate runs exactly one generation, so a module-local current owner is
+ * sufficient; the hub never sets it and therefore keeps the v1 sync semantics.
+ */
+let workerLeaseOwner: string | undefined
+
+/** Durable writes renew the worker lease; a dead generation stops renewing. */
+const WORKER_LEASE_TTL_MS = 30_000
+
+/** Bind (or clear) the current worker-generation lease owner for durable writes. */
+export function setWorkerLeaseOwner(ownerID: string | undefined): void {
+  workerLeaseOwner = ownerID
+}
+
 /** A stored `event` row as the SQL layer presents it (before any decoding). */
 type StoredEventRow = {
   readonly id: ID
@@ -325,11 +345,59 @@ export const layerWith = (options?: LayerOptions) =>
                       () =>
                         Effect.gen(function* () {
                           const row = yield* db
-                            .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
+                            .select({
+                              seq: EventSequenceTable.seq,
+                              ownerID: EventSequenceTable.owner_id,
+                              workerOwnerID: EventSequenceTable.worker_owner_id,
+                              workerExpiresAt: EventSequenceTable.worker_expires_at,
+                            })
                             .from(EventSequenceTable)
                             .where(eq(EventSequenceTable.aggregate_id, aggregateID))
                             .get()
                             .pipe(Effect.orDie)
+                          if (workerLeaseOwner !== undefined) {
+                            const now = Date.now()
+                            if (
+                              row?.workerOwnerID !== undefined &&
+                              row.workerOwnerID !== workerLeaseOwner
+                            ) {
+                              yield* Effect.die(
+                                new StaleOwnerError({
+                                  message: `Aggregate ${aggregateID} worker lease is held by ${row.workerOwnerID}, not ${workerLeaseOwner}`,
+                                }),
+                              )
+                            }
+                            if (row?.workerExpiresAt != null && row.workerExpiresAt <= now) {
+                              yield* Effect.die(
+                                new StaleOwnerError({
+                                  message: `Worker lease for aggregate ${aggregateID} expired for ${workerLeaseOwner}`,
+                                }),
+                              )
+                            }
+                            // Claim or renew this generation's lease as part of
+                            // the same durable transaction.
+                            yield* db
+                              .insert(EventSequenceTable)
+                              .values([
+                                {
+                                  aggregate_id: aggregateID,
+                                  seq: row?.seq ?? -1,
+                                  worker_owner_id: workerLeaseOwner,
+                                  worker_heartbeat_at: now,
+                                  worker_expires_at: now + WORKER_LEASE_TTL_MS,
+                                },
+                              ])
+                              .onConflictDoUpdate({
+                                target: EventSequenceTable.aggregate_id,
+                                set: {
+                                  worker_owner_id: workerLeaseOwner,
+                                  worker_heartbeat_at: now,
+                                  worker_expires_at: now + WORKER_LEASE_TTL_MS,
+                                },
+                              })
+                              .run()
+                              .pipe(Effect.orDie)
+                          }
                           const latest = row?.seq ?? -1
                           const encoded = Schema.encodeUnknownSync(definition.data)(event.data) as Record<
                             string,
@@ -407,7 +475,15 @@ export const layerWith = (options?: LayerOptions) =>
                           if (commit) yield* commit(seq)
                           yield* db
                             .insert(EventSequenceTable)
-                            .values([{ aggregate_id: aggregateID, seq, owner_id: input?.ownerID }])
+                            .values([
+                              {
+                                aggregate_id: aggregateID,
+                                seq,
+                                owner_id: input?.ownerID,
+                                worker_owner_id: workerLeaseOwner,
+                                worker_heartbeat_at: workerLeaseOwner === undefined ? undefined : Date.now(),
+                              },
+                            ])
                             .onConflictDoUpdate({
                               target: EventSequenceTable.aggregate_id,
                               set: {
