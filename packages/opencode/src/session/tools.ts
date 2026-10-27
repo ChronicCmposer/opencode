@@ -137,6 +137,20 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     // Only settle a call this wrapper actually recorded: a duplicate `start`
     // throws before the row exists and must not finish someone else's call.
     let recorded = false
+    // Success and failure can race (an abort-path result commit inside the
+    // effect, then the processor's result event). The first settlement wins.
+    let settled = false
+    const settleOnce = (outcome: "ok" | "error"): Effect.Effect<void> =>
+      Effect.suspend(() => {
+        if (settled) return Effect.void
+        settled = true
+        return settleToolCall(callID, outcome).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("tool call settlement failed", { callID, sessionID: input.session.id, cause }),
+          ),
+        )
+      })
+    const registered = input.processor.registerToolSettlement !== undefined
     return Effect.gen(function* () {
       recorded = false
       if (ledger !== undefined) {
@@ -148,6 +162,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       // replay. The durable ledger row is written first for the same reason.
       const started = input.lifecycle?.toolStarted(input.session.id, callID, true)
       if (started !== undefined) yield* Effect.promise(() => started)
+      // Register before the effect, not after it: a tool that observes an
+      // aborted signal commits its result inside the effect, and that commit
+      // must be able to drain the settlement. On success the registration is
+      // left for the durable result commit; every other exit settles error.
+      if (registered) input.processor.registerToolSettlement!(callID, settleOnce)
       Faults.crashWorker("tool:effect")
       const value = yield* effect
       // The side effect has happened but its durable result has not: a crash
@@ -158,25 +177,12 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     }).pipe(
       Effect.onExit((exit) => {
         if (!recorded) return Effect.void
-        if (Exit.isSuccess(exit)) {
-          // Success settles only with its durable result. Without a processor
-          // hook (reduced caller) fall back to settling here, the previous
-          // behaviour, rather than leaking a `started` row.
-          if (input.processor.registerToolSettlement !== undefined) {
-            input.processor.registerToolSettlement(callID, (outcome) => settleToolCall(callID, outcome))
-            return Effect.void
-          }
-          return settleToolCall(callID, "ok").pipe(
-            Effect.catchCause((cause) =>
-              Effect.logError("tool call settlement failed", { callID, sessionID: input.session.id, cause }),
-            ),
-          )
-        }
-        return settleToolCall(callID, "error").pipe(
-          Effect.catchCause((cause) =>
-            Effect.logError("tool call settlement failed", { callID, sessionID: input.session.id, cause }),
-          ),
-        )
+        if (!Exit.isSuccess(exit)) return settleOnce("error")
+        // Success settles only with its durable result. Without a processor hook
+        // (reduced caller) fall back to settling here rather than leaking a
+        // `started` row.
+        if (registered) return Effect.void
+        return settleOnce("ok")
       }),
     )
   }

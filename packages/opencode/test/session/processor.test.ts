@@ -3,7 +3,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { Effect, Layer, Stream } from "effect"
+import { Effect, Exit, Fiber, Layer, Stream } from "effect"
 import path from "path"
 import type { Agent } from "../../src/agent/agent"
 import { Provider } from "@/provider/provider"
@@ -17,7 +17,7 @@ import { SessionStatus } from "../../src/session/status"
 import { SessionSummary } from "../../src/session/summary"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { provideTmpdirInstance } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { pollWithTimeout, testEffect } from "../lib/effect"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -195,6 +195,20 @@ const stepThenFinishLLM = Layer.succeed(
 const stepThenFinishEnv = LayerNode.compile(root, [...replacements, [LLM.node, stepThenFinishLLM]])
 const itStepThenFinish = testEffect(stepThenFinishEnv)
 
+// Emits a tool call and then hangs without a result, so interrupting the run
+// leaves a registered settlement pending when `cleanup` runs.
+const interruptToolLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(LLMEvent.toolCall({ id: "call-interrupt", name: "ledger", input: {} })).pipe(
+        Stream.concat(Stream.fromEffect(Effect.never)),
+      ),
+  }),
+)
+const interruptToolEnv = LayerNode.compile(root, [...replacements, [LLM.node, interruptToolLLM]])
+const itInterruptTool = testEffect(interruptToolEnv)
+
 const streamInput = (sessionID: SessionID, parent: SessionV1.User, model: Provider.Model): LLM.StreamInput => ({
   user: {
     id: parent.id,
@@ -255,6 +269,52 @@ itStepThenFinish.live("session.processor does not overwrite a step-finish reason
         expect(handle.message.finish).toBe("tool-calls")
         expect(stored.info.role).toBe("assistant")
         if (stored.info.role === "assistant") expect(stored.info.finish).toBe("tool-calls")
+      }),
+    { config: cfg },
+  ),
+)
+
+itInterruptTool.live("session.processor cleanup drains a registered settlement interrupted before its result", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const { processors, session } = yield* boot()
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "interrupt result")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = testModel
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        const outcomes: Array<"ok" | "error"> = []
+        handle.registerToolSettlement?.("call-interrupt", (outcome) =>
+          Effect.sync(() => {
+            outcomes.push(outcome)
+          }),
+        )
+
+        const run = yield* handle.process(streamInput(chat.id, parent, mdl)).pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          MessageV2.parts(msg.id).pipe(
+            Effect.provideService(Database.Service, database),
+            Effect.map((parts) => parts.find((part): part is SessionV1.ToolPart => part.type === "tool")),
+          ),
+          "timed out waiting for the tool part",
+        )
+        yield* Fiber.interrupt(run)
+
+        const exit = yield* Fiber.await(run)
+        const parts = yield* MessageV2.parts(msg.id)
+        const call = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(outcomes).toEqual(["error"])
+        expect(call?.state.status).toBe("error")
+        if (call?.state.status === "error") {
+          expect(call.state.error).toBe("Tool execution aborted")
+          expect(call.state.metadata?.interrupted).toBe(true)
+        }
       }),
     { config: cfg },
   ),

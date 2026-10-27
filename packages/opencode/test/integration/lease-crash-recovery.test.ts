@@ -9,11 +9,15 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { afterEach, describe, expect } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 import { Database } from "@opencode-ai/core/database/database"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { MessageID } from "@/session/schema"
-import { createProductionSessionHub, type SessionHub } from "@/session/worker/hub"
+import {
+  createProductionSessionHub,
+  releaseRetiredWorkerLease,
+  type SessionHub,
+} from "@/session/worker/hub"
 import { createDbExecutor } from "@/session/worker/db-executor"
 import { WorkerCrashedError } from "@/session/worker/dispatch"
 import { sessionWorkerInit } from "../lib/session-worker-init"
@@ -21,6 +25,7 @@ import { workerSnapshot } from "../lib/snapshot"
 import { TestLLMServer } from "../lib/llm-server"
 import { testEffect } from "../lib/effect"
 import { sid } from "../lib/async"
+import { pollUntil } from "../lib/poll"
 import { Effect } from "effect"
 
 const it = testEffect(TestLLMServer.layer)
@@ -74,6 +79,41 @@ function readLease(filename: string, sessionID: string): LeaseRow | undefined {
   }
 }
 
+describe("retired lease release is scoped to the retired generation", () => {
+  test("a delayed retirement release never zeroes a successor's live lease", async () => {
+    const { filename } = freshWorkspace()
+    await Effect.runPromise(migrateLikeProduction(filename))
+    const sessionID = "ses_scoped_release"
+    seedSession(filename, sessionID)
+
+    const connection = openConnection({ filename, busyTimeoutMs: 5_000 })
+    try {
+      connection.run(
+        "INSERT INTO event_sequence (aggregate_id, seq, worker_owner_id, worker_expires_at) VALUES (?, ?, ?, ?)",
+        [sessionID, 0, "worker-1-999-dead", Date.now() + 30_000],
+      )
+      // The successor reclaimed before the delayed retirement release ran.
+      connection.run(
+        "UPDATE event_sequence SET worker_owner_id = ?, worker_expires_at = ? WHERE aggregate_id = ?",
+        ["worker-2-888-live", Date.now() + 30_000, sessionID],
+      )
+    } finally {
+      connection.close()
+    }
+
+    const db = createDbExecutor({ filename, timeoutMs: 10_000 })
+    try {
+      const released = await releaseRetiredWorkerLease(db, sid(sessionID), "worker-1-999-dead")
+      expect(released).toBe(false)
+      const lease = readLease(filename, sessionID)
+      expect(lease?.worker_owner_id).toBe("worker-2-888-live")
+      expect(lease?.worker_expires_at).toBeGreaterThan(0)
+    } finally {
+      await db.close()
+    }
+  })
+})
+
 function dispatchPrompt(hub: SessionHub, sessionID: string, text: string): Promise<void> {
   return hub.dispatcher.dispatch({
     sessionID: sid(sessionID),
@@ -112,6 +152,7 @@ function startHub(input: {
   readonly filename: string
   readonly directory: string
   readonly env?: Record<string, string | undefined>
+  readonly cancellation?: { readonly graceMs?: number }
 }): RealHubFixture {
   const db = createDbExecutor({ filename: input.filename, timeoutMs: 10_000 })
   const hub = createProductionSessionHub({
@@ -128,6 +169,7 @@ function startHub(input: {
     env: { OPENCODE_DB: input.filename, ...(input.env ?? {}) },
     timeoutMs: 10_000,
     runIdleTimeoutMs: 3_000,
+    ...(input.cancellation === undefined ? {} : { cancellation: input.cancellation }),
     ports: {
       hubProxy: {
         "sessionStatus.get": () => ({ type: "idle" }),
@@ -178,7 +220,13 @@ describe("P0: a crashed generation's lease is reclaimed immediately", () => {
           expect(payload?.phase).toBe("tool")
 
           // The dead isolate never ran `dispose()`; retirement marked the lease
-          // reclaimable instead of leaving it live for 30 s.
+          // reclaimable instead of leaving it live for 30 s. The release is a
+          // hub-executor write, so wait for it to land.
+          yield* Effect.promise(() =>
+            pollUntil(() => readLease(filename, sessionID)?.worker_expires_at === 0, {
+              message: "retirement never released the dead lease",
+            }),
+          )
           const deadLease = readLease(filename, sessionID)
           expect(deadLease?.worker_owner_id).toEqual(expect.any(String))
           expect(deadLease?.worker_expires_at).toBe(0)
@@ -190,6 +238,49 @@ describe("P0: a crashed generation's lease is reclaimed immediately", () => {
           expect(successorLease?.worker_owner_id).toEqual(expect.any(String))
           expect(successorLease?.worker_owner_id).not.toBe(deadLease?.worker_owner_id)
           expect(successorLease?.worker_expires_at).toBeGreaterThan(0)
+        } finally {
+          yield* Effect.promise(() => fixture.dispose())
+        }
+      }),
+    30_000,
+  )
+})
+
+describe("P0: retirement release is ordered before the successor boots", () => {
+  it.live(
+    "a cancelled generation's release lands before an immediate re-dispatch",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const { filename, directory } = freshWorkspace()
+        const sessionID = "ses_lease_cancel_redispatch"
+        yield* migrateLikeProduction(filename)
+        seedSession(filename, sessionID)
+        // Turn one hangs so it can be cancelled while it owns the lease; turn
+        // two is queued for the immediate successor.
+        yield* llm.hang
+        yield* llm.text("after cancel")
+
+        const fixture = startHub({ llm, filename, directory, cancellation: { graceMs: 1 } })
+        try {
+          const firstRun = dispatchPrompt(fixture.hub, sessionID, "first").catch(() => undefined)
+          yield* llm.wait(1)
+          const retired = readLease(filename, sessionID)
+          expect(retired?.worker_owner_id).toEqual(expect.any(String))
+
+          const outcome = yield* Effect.promise(() => fixture.hub.cancel(sid(sessionID)))
+          // A hung generation cannot unwind inside the 1 ms grace, so cancel
+          // terminates and retires it (which is what releases the lease).
+          expect(outcome?.mode).toBe("terminated")
+          // Immediate re-dispatch: admission awaits the retired release, so the
+          // successor claims after the old lease is dead.
+          yield* Effect.promise(() => dispatchPrompt(fixture.hub, sessionID, "second"))
+          void firstRun
+
+          const successor = readLease(filename, sessionID)
+          expect(successor?.worker_owner_id).toEqual(expect.any(String))
+          expect(successor?.worker_owner_id).not.toBe(retired?.worker_owner_id)
+          expect(successor?.worker_expires_at).toBeGreaterThan(0)
         } finally {
           yield* Effect.promise(() => fixture.dispose())
         }

@@ -127,7 +127,7 @@ describe("egress receiver over event frames", () => {
     harness.close()
   })
 
-  test("a new aggregate accepts any positive seq as its first position", async () => {
+  test("a new aggregate accepts any non-negative seq as its first position", async () => {
     const harness = setup()
     harness.port1.postMessage(encodeFrame(durableFrameOf("a", "a", 9)))
     harness.port1.postMessage(encodeFrame(durableFrameOf("b", "b", 1)))
@@ -135,6 +135,35 @@ describe("egress receiver over event frames", () => {
     expect(harness.errors).toEqual([])
     expect(harness.receiver.lastDurable("b")).toEqual({ aggregateID: "b", seq: 1 })
     harness.close()
+  })
+
+  test("duplicate/stale durables are dropped without a resync or a cursor rewind", async () => {
+    const channel = new MessageChannel()
+    const frames: EventsFrame[] = []
+    const gaps: Array<[unknown, unknown]> = []
+    const receiver = createEgressReceiver({
+      port: channel.port2,
+      onFrame: (frame) => frames.push(frame),
+      onDurableGap: (got, last) => gaps.push([got, last]),
+    })
+    try {
+      channel.port1.postMessage(encodeFrame(durableFrameOf("b", "agg", 2)))
+      // Stale/duplicate frames arrive after the cursor advanced to 2.
+      channel.port1.postMessage(encodeFrame(durableFrameOf("a", "agg", 1)))
+      channel.port1.postMessage(encodeFrame(durableFrameOf("b2", "agg", 2)))
+      // A later contiguous frame proves the stale ones did not rewind the cursor.
+      channel.port1.postMessage(encodeFrame(durableFrameOf("c", "agg", 3)))
+      await pollUntil(() => receiver.received === 2)
+
+      expect(frames).toEqual([durableFrameOf("b", "agg", 2), durableFrameOf("c", "agg", 3)])
+      expect(gaps).toEqual([])
+      expect(receiver.resyncs).toBe(0)
+      expect(receiver.lastDurable("agg")).toEqual({ aggregateID: "agg", seq: 3 })
+      expect(receiver.lastError).toBeUndefined()
+    } finally {
+      receiver.close()
+      channel.port1.close()
+    }
   })
 
   test("backpressure drops non-durable deltas, keeps durables, and emits a resync", async () => {

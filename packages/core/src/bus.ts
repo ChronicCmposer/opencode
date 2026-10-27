@@ -290,7 +290,6 @@ const requireWritableOwner = (
   ownerID: string,
   aggregateID: string,
   workerLease: boolean,
-  now: number,
 ): void => {
   if (!workerLease) {
     if (current?.ownerID !== undefined && current.ownerID !== ownerID) {
@@ -306,11 +305,10 @@ const requireWritableOwner = (
       message: `Aggregate ${aggregateID} worker lease is held by ${current.workerOwnerID}, not ${ownerID}`,
     })
   }
-  if (current.workerExpiresAt !== undefined && current.workerExpiresAt <= now) {
-    throw new StaleOwnerError({
-      message: `Worker lease for aggregate ${aggregateID} expired for ${ownerID}`,
-    })
-  }
+  // A same-owner lease is renewable even after its TTL elapsed: the generation
+  // is still the writer, so the write below re-stamps `worker_expires_at`. A
+  // genuinely superseded owner never reaches here — the owner mismatch above
+  // fences it — so an expired lease can only be renewed by its own generation.
 }
 
 const writeEvents = (
@@ -328,7 +326,7 @@ const writeEvents = (
 
   const now = Date.now()
   const current = readSequence(connection, aggregateID, workerLease)
-  requireWritableOwner(current, ownerID, aggregateID, workerLease, now)
+  requireWritableOwner(current, ownerID, aggregateID, workerLease)
 
   const block = prepared.length
   const reservation = workerLease

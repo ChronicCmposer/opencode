@@ -363,7 +363,8 @@ function durableSnapshotOf(events: WakeupEvents): SnapshotReader | undefined {
   const durable = events.durable
   if (durable === undefined) return undefined
   return async (aggregateID, seq) => {
-    if (seq === 0) return []
+    // -1 is the only "before the first event" cursor; 0 is a real event.
+    if (seq < 0) return []
     const payloads = await Effect.runPromise(
       durable({ aggregateID, after: -1 }).pipe(
         Stream.takeUntil((payload) => (payload.durable?.seq ?? -1) >= seq),

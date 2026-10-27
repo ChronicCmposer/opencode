@@ -91,18 +91,11 @@ function asText(data: unknown): string {
   )
 }
 
-/**
- * Validate a durable's `(aggregateID, seq)` against the last accepted position
- * FOR THAT AGGREGATE. A repeated/lower seq is out-of-order; a seq that skips
- * ahead is a gap. Different aggregates have independent cursors, so interleaving
- * them is never a gap.
- */
-function assertDurableOrder(meta: AggregatePosition, last: AggregatePosition | undefined): void {
-  if (last === undefined) return
-  if (meta.seq <= last.seq) throw new DurableOrderError("out-of-order", meta, last)
-  if (meta.seq !== last.seq + 1) throw new DurableOrderError("gap", meta, last)
-}
-
+// Durable order is checked FOR EACH AGGREGATE: a repeated/lower seq is
+// out-of-order, a seq that skips ahead is a gap, and interleaving different
+// aggregates is never a gap. Duplicates/stale frames are dropped without a
+// resync when a gap policy exists (and fail loud otherwise); a gap surfaces the
+// policy and still advances the observed cursor.
 export function createEgressReceiver(options: EgressReceiverOptions): EgressReceiver {
   const { port } = options
   let received = 0
@@ -124,13 +117,20 @@ export function createEgressReceiver(options: EgressReceiverOptions): EgressRece
     if (meta) {
       const last = lastByAggregate.get(meta.aggregateID)
       if (last !== undefined) {
-        try {
-          assertDurableOrder(meta, last)
-        } catch (error) {
+        if (meta.seq <= last.seq) {
+          // A duplicate/stale frame is idempotent and must never rewind the
+          // per-aggregate cursor or trigger a resync. Without a gap policy the
+          // receiver keeps its fail-loud contract.
+          if (options.onDurableGap === undefined) {
+            throw new DurableOrderError("out-of-order", meta, last)
+          }
+          return
+        }
+        if (meta.seq !== last.seq + 1) {
           // A gap is recoverable when the consumer owns a resync policy: surface
-          // it and keep the stream alive. A stale/duplicate frame is still
-          // idempotent downstream, so it is delivered once.
-          if (!(error instanceof DurableOrderError) || options.onDurableGap === undefined) throw error
+          // it and keep the stream alive. The observed position still advances so
+          // the frames after the gap continue to deliver in order.
+          if (options.onDurableGap === undefined) throw new DurableOrderError("gap", meta, last)
           resyncs++
           options.onDurableGap(meta, last)
         }

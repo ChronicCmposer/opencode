@@ -160,7 +160,19 @@ function buildEgressClient(port: MessagePort, options: WorkerEgressClientOptions
 
   /** Surface one resync to every matching subscription, without letting one throw starve the rest. */
   const broadcastResync = (pattern: string | undefined, position: AggregatePosition | undefined): void => {
-    for (const subscription of resyncTargets(pattern)) subscription.onResync?.(subscription.pattern, position)
+    for (const subscription of resyncTargets(pattern)) {
+      try {
+        subscription.onResync?.(subscription.pattern, position)
+      } catch (error) {
+        // A throwing subscriber is a caller bug, but isolation matters more:
+        // every other subscription must still be told to heal.
+        log(workerLogMessage("egress resync subscriber failed"), {
+          ...peerLifecycle("egress", workerID)("warn"),
+          pattern: subscription.pattern,
+          reason: messageOf(error),
+        })
+      }
+    }
   }
 
   // Wire the mesh link ONCE: the client multiplexes every local subscription

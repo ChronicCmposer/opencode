@@ -696,8 +696,19 @@ const layer = Layer.effect(
 
         for (const toolCallID of Object.keys(ctx.toolcalls)) {
           const match = yield* readToolCall(toolCallID)
-          if (!match) continue
+          if (!match) {
+            // The part is gone but a settlement may still be parked: never leak
+            // a `started` row or an in-flight lifecycle entry.
+            yield* settleRegistered(toolCallID, "error")
+            continue
+          }
           const part = match.part
+          // A part already returned keeps its successful settlement; anything
+          // still running is being aborted and settles error. Draining here is
+          // what prevents an interrupted result from leaking a `started` row.
+          const returned = part.state.status === "completed"
+          yield* settleRegistered(toolCallID, returned ? "ok" : "error")
+          if (returned) continue
           const end = Date.now()
           const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
           yield* session.updatePart({
@@ -710,6 +721,11 @@ const layer = Layer.effect(
               time: { start: "time" in part.state ? part.state.time.start : end, end },
             },
           })
+        }
+        // Defensive: a registration whose part vanished before the loop snapshot
+        // must still be drained rather than leak its ledger row.
+        for (const toolCallID of [...settlements.keys()]) {
+          yield* settleRegistered(toolCallID, "error")
         }
         ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()

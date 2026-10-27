@@ -129,6 +129,34 @@ describe("worker generation owner lease (C8/P0)", () => {
     gen2.dispose()
   })
 
+  test("a same-owner lease renews on write after its TTL; a successor is still fenced", async () => {
+    const filename = migratedDatabase()
+    const first = await worker(filename)
+    const second = await worker(filename)
+
+    const gen1 = createWorkerDatabaseWriter({ connection: first.connection, workerID: 1, sessionID: "session-lease" })
+    expect((await gen1.publish(durable("gen-1"))).seq).toBe(0)
+
+    // The generation is still alive but its TTL elapsed (e.g. a long model turn
+    // between writes). The same writer must renew on its next write rather than
+    // self-fence.
+    first.connection.run("UPDATE event_sequence SET worker_expires_at = 0 WHERE aggregate_id = ?", ["session-lease"])
+    expect((await gen1.publish(durable("gen-1-after-ttl"))).seq).toBe(1)
+
+    const renewed = first.connection.all<{ worker_expires_at: number }>(
+      "SELECT worker_expires_at FROM event_sequence WHERE aggregate_id = ?",
+      ["session-lease"],
+    )[0]
+    expect(renewed?.worker_expires_at).toBeGreaterThan(0)
+
+    // The renewed lease is live, so the successor cannot steal it.
+    expect(() =>
+      createWorkerDatabaseWriter({ connection: second.connection, workerID: 2, sessionID: "session-lease" }),
+    ).toThrow(Bus.LeaseConflictError)
+
+    gen1.dispose()
+  })
+
   test("the sync owner is never rewritten by a worker claim", async () => {
     const filename = migratedDatabase()
     const first = await worker(filename)

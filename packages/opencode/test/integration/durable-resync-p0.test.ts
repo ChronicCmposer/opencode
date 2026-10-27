@@ -45,12 +45,12 @@ function migratedDatabase(): string {
     for (const statement of migrationStatements) connection.exec(statement)
     connection.run(
       "INSERT INTO event_sequence (aggregate_id, seq) VALUES (?, ?)",
-      [AGGREGATE, 3],
+      [AGGREGATE, 2],
     )
     for (const [seq, title] of [
-      [1, "initial title"],
-      [2, "first rename"],
-      [3, "mid-run rename"],
+      [0, "initial title"],
+      [1, "first rename"],
+      [2, "mid-run rename"],
     ] as const) {
       connection.run(
         "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)",
@@ -66,6 +66,30 @@ function migratedDatabase(): string {
 afterEach(() => {
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
 })
+
+/** Sequences are 0-based: the first durable event is seq 0, not seq 1. */
+function migratedDatabaseFromZero(): string {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-durable-resync-zero-"))
+  directories.push(directory)
+  const filename = path.join(directory, "opencode.db")
+  const connection = openConnection({ filename })
+  try {
+    for (const statement of migrationStatements) connection.exec(statement)
+    connection.run("INSERT INTO event_sequence (aggregate_id, seq) VALUES (?, ?)", [AGGREGATE, 1])
+    for (const [seq, title] of [
+      [0, "zero title"],
+      [1, "first rename"],
+    ] as const) {
+      connection.run(
+        "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)",
+        [`evt_${seq}`, AGGREGATE, seq, "session.updated", JSON.stringify({ sessionID: AGGREGATE, title })],
+      )
+    }
+  } finally {
+    connection.close()
+  }
+  return filename
+}
 
 /** The durable event a v1 `session.updated` (setTitle) publishes. */
 const rename = (seq: number): DurableDelivery => ({
@@ -100,18 +124,53 @@ describe("mid-run rename resyncs from the DB snapshot", () => {
 
       // The initial title landed, then the rename advanced the same aggregate.
       // The intermediate commit is missing on this stream.
-      subscription.receiveDurable(rename(1))
-      subscription.receiveDurable(rename(3))
+      subscription.receiveDurable(rename(0))
+      subscription.receiveDurable(rename(2))
       await pollUntil(() => snapshots.length === 1, { message: "gap never produced a DB snapshot" })
 
+      // Heal at `seq - 1` so the skipped commit (seq 1) is part of the snapshot.
       expect(resyncs).toEqual([{ type: "resync", aggregateID: AGGREGATE, seq: 1 }])
       expect(snapshots[0]?.seq).toBe(1)
-      expect(snapshots[0]?.events.map((event) => event.id)).toEqual(["evt_1"])
+      expect(snapshots[0]?.events.map((event) => event.id)).toEqual(["evt_0", "evt_1"])
 
-      // The stream is not closed: the next rename still streams.
-      subscription.receiveDurable(rename(4))
-      expect(delivered).toEqual(["evt_1", "evt_3", "evt_4"])
+      // The stream is not closed: the next rename still streams, and the
+      // already-delivered durable 2 is not snapshotted (no duplicate delivery).
+      subscription.receiveDurable(rename(3))
+      expect(delivered).toEqual(["evt_0", "evt_2", "evt_3"])
       expect(subscription.healing).toBe(0)
+    } finally {
+      connection.close()
+    }
+  })
+
+  test("cursor 0 is real and a first-durable gap heals through the zero event", async () => {
+    const filename = migratedDatabaseFromZero()
+    const connection = openConnection({ filename })
+    const resyncs: DeltaResync[] = []
+    const snapshots: DeltaSnapshot[] = []
+    const delivered: string[] = []
+    try {
+      const snapshot = createEventLogSnapshotReader(async (_method, sql, params) => {
+        return connection.all(sql, params)
+      })
+      const subscription = createDeltaSubscription({
+        aggregateID: AGGREGATE,
+        snapshot,
+        onDelta: () => {},
+        onDurable: (durable) => delivered.push(durable.event.id),
+        onResync: (resync) => resyncs.push(resync),
+        onSnapshot: (snap) => snapshots.push(snap),
+      })
+
+      // The first observed durable is seq 1: seq 0 is a skipped real event, so
+      // the snapshot must read at cursor 0 (not treat 0 as "unseen").
+      subscription.receiveDurable(rename(1))
+      await pollUntil(() => snapshots.length === 1, { message: "cursor-0 gap never snapshotted" })
+
+      expect(resyncs).toEqual([{ type: "resync", aggregateID: AGGREGATE, seq: 0 }])
+      expect(snapshots[0]?.seq).toBe(0)
+      expect(snapshots[0]?.events.map((event) => event.id)).toEqual(["evt_0"])
+      expect(delivered).toEqual(["evt_1"])
     } finally {
       connection.close()
     }

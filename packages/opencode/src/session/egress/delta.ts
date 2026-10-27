@@ -77,9 +77,9 @@ export interface DeltaQueue {
   flush(): void
   /** Number of deltas waiting to be sequenced. */
   readonly pending: number
-  /** Highest per-aggregate subscription sequence assigned (0 before the first flush). */
+  /** Highest per-aggregate subscription sequence assigned (-1 before the first flush). */
   readonly lastSeq: number
-  /** Last subscription sequence assigned for one aggregate (0 if none). */
+  /** Last subscription sequence assigned for one aggregate (-1 if none). */
   lastSeqOf(aggregateID: string): number
   /** Intermediate deltas replaced by a later delta with the same key. */
   readonly coalesced: number
@@ -101,10 +101,10 @@ function requireAggregateID(value: unknown): string {
   return value
 }
 
-/** Parse a positive integer sequence at the boundary; 0 is not a valid position. */
+/** Parse a non-negative integer sequence at the boundary; sequences are 0-based. */
 function requireSeq(value: unknown, field = "seq"): number {
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
-    throw new Error(`invalid ${field}: ${JSON.stringify(value)} (expected a positive integer)`)
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new Error(`invalid ${field}: ${JSON.stringify(value)} (expected a non-negative integer)`)
   }
   return value
 }
@@ -144,7 +144,7 @@ export function createDeltaQueue(options: DeltaQueueOptions): DeltaQueue {
     const batch = [...pending.values()]
     pending.clear()
     for (const delta of batch) {
-      const seq = (seqByAggregate.get(delta.aggregateID) ?? 0) + 1
+      const seq = (seqByAggregate.get(delta.aggregateID) ?? -1) + 1
       seqByAggregate.set(delta.aggregateID, seq)
       options.onDelta({ aggregateID: delta.aggregateID, seq, event: delta.event })
     }
@@ -193,12 +193,12 @@ export function createDeltaQueue(options: DeltaQueueOptions): DeltaQueue {
       return pending.size
     },
     get lastSeq() {
-      let max = 0
+      let max = -1
       for (const seq of seqByAggregate.values()) if (seq > max) max = seq
       return max
     },
     lastSeqOf(aggregateID) {
-      return seqByAggregate.get(aggregateID) ?? 0
+      return seqByAggregate.get(aggregateID) ?? -1
     },
     get coalesced() {
       return coalesced
@@ -235,8 +235,10 @@ export interface DeltaSubscription {
 
 export function createDeltaSubscription(options: DeltaSubscriptionOptions): DeltaSubscription {
   const aggregateID = requireAggregateID(options.aggregateID)
-  let lastDeltaSeq = 0
-  let lastDurableSeq = 0
+  // Sequences are 0-based, so "no position observed yet" is -1, never 0 (which
+  // is a real first event).
+  let lastDeltaSeq = -1
+  let lastDurableSeq = -1
   let resyncs = 0
   let stale = 0
   // Serialize resync snapshots so a burst of gaps cannot interleave a stale read
@@ -331,9 +333,10 @@ export function createDeltaSubscription(options: DeltaSubscriptionOptions): Delt
         deliverDurable(durable)
         return
       }
-      // A missing durable is a lost cursor, not a droppable delta: heal at the
-      // last confirmed position and then deliver this durable.
-      heal(previous)
+      // A missing durable is a lost cursor, not a droppable delta. Heal at
+      // `seq - 1` so the snapshot includes the skipped range `previous+1..seq-1`;
+      // the durable at `seq` itself is delivered below exactly once.
+      heal(seq - 1)
       deliverDurable(durable)
     },
     get lastDeltaSeq() {
@@ -389,11 +392,12 @@ function decodeData(value: unknown): unknown {
 export function createEventLogSnapshotReader(query: SnapshotQuery): SnapshotReader {
   return async (aggregateID, seq) => {
     const aggregate = requireAggregateID(aggregateID)
-    if (typeof seq !== "number" || !Number.isInteger(seq) || seq < 0) {
-      throw new Error(`invalid snapshot seq: ${JSON.stringify(seq)} (expected a non-negative integer)`)
+    if (typeof seq !== "number" || !Number.isInteger(seq) || seq < -1) {
+      throw new Error(`invalid snapshot seq: ${JSON.stringify(seq)} (expected an integer >= -1)`)
     }
-    // The empty log is a valid snapshot at cursor 0; do not hit the database.
-    if (seq === 0) return []
+    // -1 means "before the first event" and is the only empty snapshot. Cursor 0
+    // is a real event position and must be read.
+    if (seq < 0) return []
 
     const rows = await query("all", SNAPSHOT_SQL, [aggregate, seq])
     if (!Array.isArray(rows)) throw new Error("snapshot query returned a non-array result")

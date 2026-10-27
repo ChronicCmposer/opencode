@@ -93,4 +93,40 @@ describe("worker durable resync fan-out", () => {
       control.port2.close()
     }
   })
+
+  test("a throwing resync subscriber does not starve the others", async () => {
+    const data = new MessageChannel()
+    const control = new MessageChannel()
+    const client = createWorkerEgressClient(data.port1, { controlPort: control.port1 })
+    const mesh = createEgressMesh()
+    const attachment = attachMeshWorker(mesh, "w1", control.port2)
+    const seen: Seen[] = []
+    try {
+      client.subscribeDurable({
+        pattern: "session.*",
+        onDurable: () => {},
+        onResync: () => {
+          throw new Error("subscriber exploded")
+        },
+      })
+      client.subscribeDurable({
+        pattern: "*",
+        onDurable: () => {},
+        onResync: (pattern, meta) => seen.push({ pattern, ...positionOf(meta) }),
+      })
+      await pollUntil(() => mesh.subscriptions().length === 2)
+
+      data.port2.postMessage(encodeFrame(resyncWithPositionFrame({ aggregateID: "ses_title", seq: 3 })))
+
+      await pollUntil(() => seen.length === 1, { message: "a throwing subscriber starved the rest" })
+      expect(seen).toEqual([{ pattern: "*", aggregateID: "ses_title", seq: 3 }])
+    } finally {
+      client.dispose()
+      attachment.dispose()
+      data.port1.close()
+      data.port2.close()
+      control.port1.close()
+      control.port2.close()
+    }
+  })
 })

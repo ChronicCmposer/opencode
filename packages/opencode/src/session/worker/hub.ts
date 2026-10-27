@@ -1489,6 +1489,24 @@ function createCancelReporter(options: CancelReporterOptions): CancelReporter {
   }
 }
 
+/**
+ * Mark one retired generation's lease reclaimable, scoped to its exact
+ * `worker_owner_id`. A successor's live lease is never touched, so a retirement
+ * that lands after a reclaim cannot strand the new generation.
+ */
+export async function releaseRetiredWorkerLease(
+  db: DbExecutor,
+  sessionID: SessionID,
+  retiredOwnerID: string,
+): Promise<boolean> {
+  if (typeof retiredOwnerID !== "string" || retiredOwnerID.length === 0) return false
+  const result = await db.run(
+    "UPDATE event_sequence SET worker_expires_at = 0 WHERE aggregate_id = ? AND worker_owner_id = ? AND worker_expires_at IS NOT NULL",
+    [sessionID, retiredOwnerID],
+  )
+  return result.changes > 0
+}
+
 /** Compose the dispatcher + executor pool + cooperative cancel into one hub. */
 export function createSessionHub(options: SessionHubOptions): SessionHub {
   const log = options.log ?? noopWorkerLogger
@@ -1679,24 +1697,48 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
    * its worker lease would otherwise stay live until the 30 s TTL and the
    * immediate successor's `Bus.reclaim` would fail with `Bus.LeaseConflict`.
    * Retirement is the authoritative "this generation is dead" signal, so mark
-   * its lease expired here. A live generation is never retired, so this can
-   * never steal a live lease.
+   * its lease expired here. The update is scoped to the retired generation's
+   * exact `worker_owner_id`; a successor that already claimed the aggregate must
+   * never have its live lease zeroed.
    */
-  const releaseRetiredLease = (sessionID: SessionID): void => {
-    if (db === undefined) return
-    void db
-      .run(
-        "UPDATE event_sequence SET worker_expires_at = 0 WHERE aggregate_id = ? AND worker_expires_at IS NOT NULL",
-        [sessionID],
-      )
-      .catch((error: unknown) => {
-        log(workerLogMessage("retired lease release failed"), {
-          level: "WARN",
-          sessionID,
-          error: error instanceof Error ? error.message : String(error),
-        })
+  const retiredLeaseReleases = new Map<SessionID, Promise<void>>()
+
+  const queueRetiredLeaseRelease = (sessionID: SessionID, task: () => Promise<void>): Promise<void> => {
+    const previous = retiredLeaseReleases.get(sessionID) ?? Promise.resolve()
+    const next = previous.then(task).catch((error: unknown) => {
+      log(workerLogMessage("retired lease release failed"), {
+        level: "WARN",
+        sessionID,
+        error: error instanceof Error ? error.message : String(error),
       })
+    })
+    retiredLeaseReleases.set(sessionID, next)
+    void next.finally(() => {
+      if (retiredLeaseReleases.get(sessionID) === next) retiredLeaseReleases.delete(sessionID)
+    })
+    return next
   }
+
+  /**
+   * Release the retired generation's lease. The `workerID` prefix is its stable
+   * generation identity (`worker-<id>-<pid>-<uuid>`); the exact owner is read
+   * from the row and passed to the scoped update so a successor's lease is
+   * untouched even if it raced the retirement.
+   */
+  const releaseRetiredLease = (sessionID: SessionID, workerID?: number): Promise<void> => {
+    if (db === undefined || workerID === undefined) return Promise.resolve()
+    const generationPrefix = `worker-${workerID}-`
+    return queueRetiredLeaseRelease(sessionID, async () => {
+      const rows = await db.query("SELECT worker_owner_id FROM event_sequence WHERE aggregate_id = ?", [sessionID])
+      const owner = rows[0]?.worker_owner_id
+      if (typeof owner !== "string" || !owner.startsWith(generationPrefix)) return
+      await releaseRetiredWorkerLease(db, sessionID, owner)
+    })
+  }
+
+  /** Successor admission waits for the retired generation's release to land. */
+  const awaitRetiredLeaseRelease = (sessionID: SessionID): Promise<void> =>
+    retiredLeaseReleases.get(sessionID) ?? Promise.resolve()
 
   /**
    * A timed-out barrier refuses the next run while its worker is still alive
@@ -1777,8 +1819,8 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       lostGenerations.add(sessionID)
       // The retired generation's lease is dead even when its isolate never ran
       // `dispose()` (crash/terminate). Mark it reclaimable before the successor
-      // boots; this `run` is queued ahead of the resume decision's ledger read.
-      releaseRetiredLease(sessionID)
+      // boots; the next admission awaits this release (see `ensureRunning`).
+      void releaseRetiredLease(sessionID, workerID)
       // Retirement (reap/cancel/crash) disposes this worker's hub-side port
       // servers immediately, rather than leaving them alive until shutdown.
       if (workerID !== undefined) ports.disposeWorker(workerID)
@@ -1806,8 +1848,14 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     lifecycle,
     barrier,
     ensureRunning: async (sessionID, origin) => {
+      // Capture the caller's ambient context synchronously; awaiting first would
+      // resume outside this fiber and lose it.
       onDispatch?.(sessionID)
       admitBarrier(sessionID)
+      // A retired generation's release must land before its successor boots and
+      // claims the aggregate; otherwise the successor can be admitted against a
+      // still-live lease.
+      await awaitRetiredLeaseRelease(sessionID)
       try {
         const result = await dispatch.ensureRunning(sessionID, undefined, origin)
         lifecycle.resetAttempts(sessionID)
@@ -1820,6 +1868,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     startShell: async (sessionID, shell) => {
       onDispatch?.(sessionID)
       admitBarrier(sessionID)
+      await awaitRetiredLeaseRelease(sessionID)
       try {
         const result = await dispatch.startShell(sessionID, shell)
         lifecycle.resetAttempts(sessionID)

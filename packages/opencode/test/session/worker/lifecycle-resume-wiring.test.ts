@@ -194,3 +194,93 @@ describe("hub auto-resume wiring (C7 / D9)", () => {
     expect(decisions).toEqual([])
   })
 })
+
+describe("async resume ownership (C7 / D9)", () => {
+  test("a dispatch while the resume decision is pending parks instead of racing the crash", async () => {
+    const lifecycle = createLifecycleTracker()
+    const sessionID = sid("ses_pending_decision")
+    lifecycle.commit(sessionID, "msg_committed")
+    lifecycle.phase(sessionID, "stream")
+
+    let decisionStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      decisionStarted = resolve
+    })
+    let resolveRows!: (rows: ReadonlyArray<Record<string, unknown>>) => void
+    const pendingRows = new Promise<ReadonlyArray<Record<string, unknown>>>((resolve) => {
+      resolveRows = resolve
+    })
+    const db: DbExecutor = {
+      threadId: 0,
+      run: async () => ({ changes: 0, lastInsertRowid: 0 }),
+      query: async () => {
+        decisionStarted()
+        return pendingRows
+      },
+      transaction: async () => [],
+      close: async () => {},
+    }
+
+    const event = { starts: 0, active: 0, maxActive: 0 }
+    const spawned: ExecutorWorker[] = []
+    const pool: ExecutorWorkerPool = {
+      get workers() {
+        return spawned
+      },
+      spawn: () => {
+        const id = spawned.length + 1
+        const worker: ExecutorWorker = {
+          id,
+          alive: true,
+          async execute() {
+            event.starts += 1
+            event.active += 1
+            event.maxActive = Math.max(event.maxActive, event.active)
+            try {
+              if (event.starts === 1) {
+                throw new WorkerCrashedError({ message: `worker ${id} crashed`, workerID: id })
+              }
+            } finally {
+              event.active -= 1
+            }
+          },
+          async cancel() {},
+          async assertNotBusy() {
+            return false
+          },
+          resultFor: () => undefined,
+          async terminate() {},
+        }
+        spawned.push(worker)
+        return worker
+      },
+      async terminateAll() {},
+      byID: (id) => spawned.find((worker) => worker.id === id),
+      resultFor: () => undefined,
+    }
+
+    const hub = createSessionHub({ pool, lifecycle, resumeRun: () => {}, db })
+    try {
+      const crashed = hub.ensureRunning(sessionID).catch((error: unknown) => error)
+      await started
+
+      // The worker is retired and the durable decision is still pending. A
+      // different run must park behind the crashed generation, never start.
+      const parked = hub.dispatcher.dispatch({ sessionID, depth: 1 })
+      expect(event.starts).toBe(1)
+      expect(hub.dispatcher.queuedCount).toBe(1)
+
+      resolveRows([])
+      expect(await crashed).toBeInstanceOf(WorkerCrashedError)
+      await parked
+
+      // The decision settles the crash exactly once, then promotes the waiter.
+      expect(event.starts).toBe(2)
+      expect(event.maxActive).toBe(1)
+      expect(hub.dispatcher.queuedCount).toBe(0)
+    } finally {
+      resolveRows([])
+      await hub.terminateAll()
+    }
+  })
+})

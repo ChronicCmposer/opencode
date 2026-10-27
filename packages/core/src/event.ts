@@ -367,13 +367,10 @@ export const layerWith = (options?: LayerOptions) =>
                                 }),
                               )
                             }
-                            if (row?.workerExpiresAt != null && row.workerExpiresAt <= now) {
-                              yield* Effect.die(
-                                new StaleOwnerError({
-                                  message: `Worker lease for aggregate ${aggregateID} expired for ${workerLeaseOwner}`,
-                                }),
-                              )
-                            }
+                            // A same-owner lease renews on write even after its TTL
+                            // elapsed; the upsert below re-stamps the expiry. A
+                            // superseded generation is fenced by the owner mismatch
+                            // above, so an expired same-owner lease is never stolen.
                             // Claim or renew this generation's lease as part of
                             // the same durable transaction.
                             yield* db

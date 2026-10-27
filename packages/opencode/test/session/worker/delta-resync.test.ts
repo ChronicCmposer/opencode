@@ -47,8 +47,8 @@ describe("bounded per-session delta queue", () => {
     expect(queue.coalesced).toBe(1)
     expect(queue.dropped).toBe(0)
     expect(deltas.map((delta) => delta.event.id)).toEqual(["a2", "b1", "c1"])
-    expect(deltas.map((delta) => delta.seq)).toEqual([1, 2, 3])
-    expect(queue.lastSeq).toBe(3)
+    expect(deltas.map((delta) => delta.seq)).toEqual([0, 1, 2])
+    expect(queue.lastSeq).toBe(2)
   })
 
   test("drops the oldest intermediate deltas when the bound is reached", () => {
@@ -63,7 +63,7 @@ describe("bounded per-session delta queue", () => {
     expect(queue.coalesced).toBe(0)
     expect(queue.pending).toBe(0)
     expect(deltas.map((delta) => delta.event.id)).toEqual(["b", "c"])
-    expect(deltas.map((delta) => delta.seq)).toEqual([1, 2])
+    expect(deltas.map((delta) => delta.seq)).toEqual([0, 1])
   })
 
   test("never drops a durable event, even under delta overflow", () => {
@@ -93,21 +93,21 @@ describe("bounded per-session delta queue", () => {
     queue.pushDelta({ aggregateID: "a", event: event("a3") })
     queue.flush()
 
-    // Each aggregate's subscription sees a contiguous 1..n cursor of its own;
-    // a shared global ordinal would give `a` 1,3,5 and look gapped.
+    // Each aggregate's subscription sees a contiguous 0..n cursor of its own;
+    // a shared global ordinal would give `a` 0,2,4 and look gapped.
     expect(
       deltas
         .filter((delta) => delta.aggregateID === "a")
         .map((delta) => delta.seq),
-    ).toEqual([1, 2, 3])
+    ).toEqual([0, 1, 2])
     expect(
       deltas
         .filter((delta) => delta.aggregateID === "b")
         .map((delta) => delta.seq),
-    ).toEqual([1, 2])
-    expect(queue.lastSeqOf("a")).toBe(3)
-    expect(queue.lastSeqOf("b")).toBe(2)
-    expect(queue.lastSeq).toBe(3)
+    ).toEqual([0, 1])
+    expect(queue.lastSeqOf("a")).toBe(2)
+    expect(queue.lastSeqOf("b")).toBe(1)
+    expect(queue.lastSeq).toBe(2)
   })
 
   test("the per-aggregate cursor survives across flushes and drops", () => {
@@ -118,15 +118,15 @@ describe("bounded per-session delta queue", () => {
     queue.pushDelta({ aggregateID: "a", event: event("a2") })
     queue.flush()
     expect(deltas.map((delta) => [delta.aggregateID, delta.seq])).toEqual([
-      ["b", 1],
-      ["a", 1],
+      ["b", 0],
+      ["a", 0],
     ])
 
     queue.pushDelta({ aggregateID: "a", event: event("a3") })
     queue.flush()
-    expect(deltas.at(-1)).toMatchObject({ aggregateID: "a", seq: 2, event: { id: "a3" } })
-    expect(queue.lastSeqOf("a")).toBe(2)
-    expect(queue.lastSeqOf("b")).toBe(1)
+    expect(deltas.at(-1)).toMatchObject({ aggregateID: "a", seq: 1, event: { id: "a3" } })
+    expect(queue.lastSeqOf("a")).toBe(1)
+    expect(queue.lastSeqOf("b")).toBe(0)
   })
 
   test("coalescing keys are an O(1) Map lookup, not a linear scan", () => {
@@ -149,14 +149,53 @@ describe("bounded per-session delta queue", () => {
   test("rejects an invalid durable identity at the boundary", () => {
     const { queue } = queueHarness(DELTA_QUEUE_BOUND)
     expect(() => queue.pushDurable({ aggregateID: "", seq: 1, event: event("bad") })).toThrow(/aggregateID/)
-    expect(() => queue.pushDurable({ aggregateID: "s1", seq: 0, event: event("bad") })).toThrow(/seq/)
+    expect(() => queue.pushDurable({ aggregateID: "s1", seq: -1, event: event("bad") })).toThrow(/seq/)
     expect(() =>
       queue.pushDurable({ aggregateID: "s1", seq: 1.5, event: event("bad") }),
     ).toThrow(/seq/)
   })
+
+  test("accepts the zero-based first durable sequence", () => {
+    const { queue, durables } = queueHarness(DELTA_QUEUE_BOUND)
+    queue.pushDurable({ aggregateID: "s1", seq: 0, event: event("durable-0") })
+    expect(durables).toEqual([{ aggregateID: "s1", seq: 0, event: event("durable-0") }])
+  })
 })
 
 describe("delta subscription gap detection and resync", () => {
+  test("seq 0 is a real durable position, not an unseen sentinel", () => {
+    const durables: DurableDelivery[] = []
+    const subscription = createDeltaSubscription({
+      aggregateID: "s1",
+      snapshot: () => Promise.resolve([]),
+      onDelta: () => undefined,
+      onDurable: (durable) => durables.push(durable),
+    })
+
+    subscription.receiveDurable({ aggregateID: "s1", seq: 0, event: event("durable-0") })
+
+    expect(durables.map((durable) => durable.event.id)).toEqual(["durable-0"])
+    expect(subscription.lastDurableSeq).toBe(0)
+    expect(subscription.stale).toBe(0)
+  })
+
+  test("a first durable above 0 heals from cursor 0 and includes the zero event", async () => {
+    const snapshots: DeltaSnapshot[] = []
+    const subscription = createDeltaSubscription({
+      aggregateID: "s1",
+      snapshot: (_aggregateID, seq) => Promise.resolve(seq === 0 ? [event("event-0")] : [event("event-0"), event("event-1")]),
+      onDelta: () => undefined,
+      onDurable: () => undefined,
+      onSnapshot: (snapshot) => snapshots.push(snapshot),
+    })
+
+    subscription.receiveDurable({ aggregateID: "s1", seq: 1, event: event("durable-1") })
+    await settleSnapshotChain()
+
+    expect(snapshots).toHaveLength(1)
+    expect(snapshots[0]).toEqual({ aggregateID: "s1", seq: 0, events: [event("event-0")] })
+  })
+
   test("a delta gap emits typed Resync and a snapshot at the last durable seq", async () => {
     const deltas: DeltaDelivery[] = []
     const durables: DurableDelivery[] = []
@@ -176,24 +215,24 @@ describe("delta subscription gap detection and resync", () => {
       onSnapshot: (snapshot) => snapshots.push(snapshot),
     })
 
-    subscription.receiveDelta({ aggregateID: "s1", seq: 1, event: event("d1") })
-    subscription.receiveDurable({ aggregateID: "s1", seq: 1, event: event("durable-1") })
-    // seq 2 is lost in transit; the next delivered delta is seq 3.
-    subscription.receiveDelta({ aggregateID: "s1", seq: 3, event: event("d3") })
+    subscription.receiveDurable({ aggregateID: "s1", seq: 0, event: event("durable-0") })
+    subscription.receiveDelta({ aggregateID: "s1", seq: 0, event: event("d0") })
+    // Delta seq 1 is lost in transit; the next delivered delta is seq 2.
+    subscription.receiveDelta({ aggregateID: "s1", seq: 2, event: event("d2") })
     await settleSnapshotChain()
 
-    expect(resyncs).toEqual([{ type: "resync", aggregateID: "s1", seq: 1 }])
-    expect(snapshotCalls).toEqual([["s1", 1]])
+    expect(resyncs).toEqual([{ type: "resync", aggregateID: "s1", seq: 0 }])
+    expect(snapshotCalls).toEqual([["s1", 0]])
     expect(snapshots).toHaveLength(1)
     expect(snapshots[0]?.events.map((entry) => entry.id)).toEqual(["snapshot"])
-    expect(deltas.map((delta) => delta.event.id)).toEqual(["d1"])
-    expect(durables.map((durable) => durable.event.id)).toEqual(["durable-1"])
+    expect(deltas.map((delta) => delta.event.id)).toEqual(["d0"])
+    expect(durables.map((durable) => durable.event.id)).toEqual(["durable-0"])
 
     // Sequence resumes after the gapped frame was observed.
-    subscription.receiveDelta({ aggregateID: "s1", seq: 4, event: event("d4") })
-    expect(deltas.map((delta) => delta.event.id)).toEqual(["d1", "d4"])
-    expect(subscription.lastDeltaSeq).toBe(4)
-    expect(subscription.lastDurableSeq).toBe(1)
+    subscription.receiveDelta({ aggregateID: "s1", seq: 3, event: event("d3") })
+    expect(deltas.map((delta) => delta.event.id)).toEqual(["d0", "d3"])
+    expect(subscription.lastDeltaSeq).toBe(3)
+    expect(subscription.lastDurableSeq).toBe(0)
   })
 
   test("durable identity is (aggregateID, seq), independent of the delta sequence", async () => {
@@ -206,17 +245,17 @@ describe("delta subscription gap detection and resync", () => {
       onDurable: (durable) => durables.push(durable),
     })
 
-    subscription.receiveDurable({ aggregateID: "s1", seq: 1, event: event("durable-1") })
+    subscription.receiveDurable({ aggregateID: "s1", seq: 0, event: event("durable-0") })
+    subscription.receiveDelta({ aggregateID: "s1", seq: 0, event: event("delta-0") })
     subscription.receiveDelta({ aggregateID: "s1", seq: 1, event: event("delta-1") })
-    subscription.receiveDelta({ aggregateID: "s1", seq: 2, event: event("delta-2") })
-    subscription.receiveDurable({ aggregateID: "s1", seq: 2, event: event("durable-2") })
+    subscription.receiveDurable({ aggregateID: "s1", seq: 1, event: event("durable-1") })
     // A replayed durable at or below the durable cursor is idempotent.
-    subscription.receiveDurable({ aggregateID: "s1", seq: 2, event: event("durable-2-replay") })
+    subscription.receiveDurable({ aggregateID: "s1", seq: 1, event: event("durable-1-replay") })
 
-    expect(deltas.map((delta) => delta.event.id)).toEqual(["delta-1", "delta-2"])
-    expect(durables.map((durable) => durable.event.id)).toEqual(["durable-1", "durable-2"])
-    expect(subscription.lastDeltaSeq).toBe(2)
-    expect(subscription.lastDurableSeq).toBe(2)
+    expect(deltas.map((delta) => delta.event.id)).toEqual(["delta-0", "delta-1"])
+    expect(durables.map((durable) => durable.event.id)).toEqual(["durable-0", "durable-1"])
+    expect(subscription.lastDeltaSeq).toBe(1)
+    expect(subscription.lastDurableSeq).toBe(1)
     expect(subscription.stale).toBe(1)
   })
 
@@ -238,18 +277,21 @@ describe("delta subscription gap detection and resync", () => {
       onDurable: (durable) => delivered.push(durable.event.id),
     })
 
+    subscription.receiveDurable({ aggregateID: "s1", seq: 0, event: event("durable-0") })
     subscription.receiveDurable({ aggregateID: "s1", seq: 1, event: event("durable-1") })
     // Durable 2 is lost; 3 and 4 arrive while the healing snapshot is in flight.
     subscription.receiveDurable({ aggregateID: "s1", seq: 3, event: event("durable-3") })
     subscription.receiveDurable({ aggregateID: "s1", seq: 4, event: event("durable-4") })
 
-    expect(delivered).toEqual(["durable-1"])
+    expect(delivered).toEqual(["durable-0", "durable-1"])
     await settleSnapshotChain()
-    expect(snapshotCalls).toEqual([1])
+    // Healing at `seq - 1` includes the skipped durable 2, not just the last
+    // already-delivered position 1.
+    expect(snapshotCalls).toEqual([2])
 
     releaseSnapshot()
     await settleSnapshotChain()
-    expect(delivered).toEqual(["durable-1", "durable-3", "durable-4"])
+    expect(delivered).toEqual(["durable-0", "durable-1", "durable-3", "durable-4"])
   })
 
   test("a throwing durable handler does not poison later snapshots or deliveries", async () => {
@@ -279,7 +321,7 @@ describe("delta subscription gap detection and resync", () => {
     subscription.receiveDurable({ aggregateID: "s1", seq: 5, event: event("after") })
     await settleSnapshotChain()
 
-    expect(snapshotCalls).toEqual([0, 2])
+    expect(snapshotCalls).toEqual([1, 4])
     expect(delivered).toEqual(["boom", "after"])
     expect(subscription.healing).toBe(0)
   })
@@ -343,13 +385,23 @@ describe("durable snapshot reader", () => {
     ])
   })
 
-  test("returns no rows for a zero cursor without querying", async () => {
+  test("reads the zero cursor as a real position", async () => {
+    const calls: Array<readonly unknown[]> = []
+    const reader = createEventLogSnapshotReader(async (_method, _sql, params) => {
+      calls.push(params)
+      return [{ id: "e0", type: "message.updated", data: { id: "e0" } }]
+    })
+    expect(await reader("s1", 0)).toEqual([{ id: "e0", type: "message.updated", properties: { id: "e0" } }])
+    expect(calls).toEqual([["s1", 0]])
+  })
+
+  test("returns no rows for a before-first cursor without querying", async () => {
     let queries = 0
     const reader = createEventLogSnapshotReader(async () => {
       queries++
       return []
     })
-    expect(await reader("s1", 0)).toEqual([])
+    expect(await reader("s1", -1)).toEqual([])
     expect(queries).toBe(0)
   })
 })

@@ -168,8 +168,8 @@ async function resolveTool(
   return execute
 }
 
-function run(execute: Awaited<ReturnType<typeof resolveTool>>) {
-  return Promise.resolve(execute({}, { toolCallId: callID, abortSignal: new AbortController().signal, messages: [] }))
+function run(execute: Awaited<ReturnType<typeof resolveTool>>, abortSignal = new AbortController().signal) {
+  return Promise.resolve(execute({}, { toolCallId: callID, abortSignal, messages: [] }))
 }
 
 describe("tool-call ledger on the production tool path", () => {
@@ -293,6 +293,32 @@ describe("tool-call ledger on the production tool path", () => {
       expect.objectContaining({ callID, state: "finished", outcome: "error" }),
     ])
     expect(ledger.indeterminate(sessionID)).toEqual([])
+  })
+
+  test("a pre-aborted signal drains the settlement inside the tool effect", async () => {
+    const { ledger } = ledgerForTest()
+    settlements.delete(callID)
+    const execute = await resolveTool(
+      tool(() => Effect.succeed({ title: "ledger", metadata: {}, output: "done" })),
+      ledger,
+    )
+
+    const controller = new AbortController()
+    controller.abort()
+    await run(execute, controller.signal)
+
+    // The registration exists before the effect runs, so the abort-path result
+    // commit inside the effect drains it exactly once.
+    expect(settlements.has(callID)).toBe(false)
+    expect(ledger.list(sessionID)).toEqual([
+      expect.objectContaining({ callID, state: "finished", outcome: "ok" }),
+    ])
+
+    // A later AI SDK result event settles nothing a second time.
+    await commitResult()
+    expect(ledger.list(sessionID)).toEqual([
+      expect.objectContaining({ callID, state: "finished", outcome: "ok" }),
+    ])
   })
 
   test("finish joins an open result transaction instead of nesting one", async () => {

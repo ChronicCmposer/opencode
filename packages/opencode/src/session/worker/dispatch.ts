@@ -557,6 +557,11 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
    * Settle one crash after its resume decision is known. The decision is part of
    * the crash outcome: a durable ledger read must finish before the run rejects,
    * otherwise a caller could re-dispatch and race the decision.
+   *
+   * While that read is pending the run keeps `byKey`/worker ownership, so a
+   * dispatch parks instead of starting a concurrent run. If a cancel (or a
+   * partial settlement) took the session over in the meantime, this stale crash
+   * must only settle its own promise: never release or promote over the new run.
    */
   const settleCrash = (
     pending: Pending,
@@ -564,6 +569,12 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     payload: WorkerCrashed,
     decision: AutoResumeDecision | undefined,
   ): void => {
+    if (!ownsSession(pending)) {
+      pending.reject(failure)
+      return
+    }
+    workers.release(pending.sessionID)
+    byKey.delete(pending.sessionID)
     pending.reject(failure)
     if (decision?.resume === true) options.onAutoResume?.(decision, payload)
     nextWaiter(pending.sessionID)
@@ -590,9 +601,9 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       settleSuperseded(pending)
       return
     }
-    workers.release(pending.sessionID)
-    byKey.delete(pending.sessionID)
     if (pending.gate.winner === "cancel") {
+      workers.release(pending.sessionID)
+      byKey.delete(pending.sessionID)
       const dead = workers.worker(pending.sessionID)
       if (dead !== undefined && !dead.alive) {
         crashChildren(pending.sessionID)
@@ -607,6 +618,8 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const crashed = error instanceof WorkerCrashedError || (worker !== undefined && !worker.alive)
     if (timedOut) {
       // A wedged isolate is retired, never requeued; cascade to its subagents.
+      workers.release(pending.sessionID)
+      byKey.delete(pending.sessionID)
       pending.reject(error)
       void cancelWithGrace(pending.sessionID).catch(() => undefined)
       retireWorker(pending.sessionID)
@@ -654,6 +667,8 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
         error: describeFailure(error),
         cause: error,
       })
+      workers.release(pending.sessionID)
+      byKey.delete(pending.sessionID)
       pending.reject(error)
     }
     nextWaiter(pending.sessionID)
@@ -661,6 +676,9 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
 
   /** Start the next parked run for a session, or arm the idle-reap timer. */
   const nextWaiter = (sessionID: SessionID): void => {
+    // A settlement can admit a successor as a side effect (auto-resume dispatches
+    // synchronously). Never overwrite that live owner with a parked waiter.
+    if (byKey.has(sessionID)) return
     const waiters = waitersByKey.get(sessionID)
     if (waiters === undefined || waiters.length === 0) {
       scheduleReap(sessionID)
