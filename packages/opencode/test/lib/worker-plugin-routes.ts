@@ -3,7 +3,7 @@
 // The fatal-admission contract is covered by `test/lib/rollout-matrix.test.ts`
 // and `test/session/parity/flag-matrix.test.ts`; worker suites that exercise
 // prompt turns need the routed hooks to reach their supplied host while the
-// genuinely unsupported triggers (`chat.message`, compaction, text completion)
+// genuinely unsupported triggers (compaction, text completion, command hooks)
 // pass through unchanged. Hub-proxied hooks delegate to the host exactly as the
 // production `workerPluginReplacement` does.
 
@@ -31,6 +31,8 @@ export function pluginPassThroughLayer(
         return run("chatParams")
       case "chat.headers":
         return run("chatHeaders")
+      case "chat.message":
+        return run("chatMessage")
       case "tool.execute.before":
         return run("toolBefore")
       case "tool.execute.after":

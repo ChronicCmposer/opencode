@@ -44,7 +44,9 @@ describe("table ownership (W1.5 / D6)", () => {
     const connection = migrated()
     expect(deriveSessionScopedTables(connection)).toEqual([...WORKER_WRITABLE_TABLES])
     expect([...SCHEMA_TABLES]).toEqual(
-      connection.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").map((r) => r.name),
+      connection
+        .all<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        .map((r) => r.name),
     )
   })
 
@@ -73,7 +75,7 @@ describe("table ownership (W1.5 / D6)", () => {
 
     expect(error).toBeInstanceOf(TableAllowlistDriftError)
     expect((error as TableAllowlistDriftError).sessionScoped.unexpected).toContain("project")
-    expect(((error as Error).message)).toMatch(/session_id tables changed/)
+    expect((error as Error).message).toMatch(/session_id tables changed/)
   })
 
   test("removing a session_id table fails the gate", () => {
@@ -103,9 +105,10 @@ describe("table ownership (W1.5 / D6)", () => {
   })
 
   test("the durable log is not part of session-scoped ownership", () => {
-    expect(DURABLE_LOG_TABLES).toEqual(["event", "event_sequence"])
+    expect(DURABLE_LOG_TABLES).toEqual(["event", "event_sequence", "event_blob"])
     expect(WORKER_WRITABLE_TABLES).not.toContain("event")
     expect(WORKER_WRITABLE_TABLES).not.toContain("event_sequence")
+    expect(WORKER_WRITABLE_TABLES).not.toContain("event_blob")
   })
 
   test("the ledger tables cascade with the session aggregate", () => {

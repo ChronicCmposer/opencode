@@ -97,7 +97,11 @@ const part = (row: typeof PartTable.$inferSelect): Part =>
 const older = (row: Cursor) =>
   or(lt(MessageTable.time_created, row.time), and(eq(MessageTable.time_created, row.time), lt(MessageTable.id, row.id)))
 
-function hydrate(db: Database.Interface["db"], rows: (typeof MessageTable.$inferSelect)[]) {
+function hydrate(
+  db: Database.Interface["db"],
+  rows: (typeof MessageTable.$inferSelect)[],
+  sessionID: SessionID,
+) {
   const ids = rows.map((row) => row.id)
   const partByMessage = new Map<string, Part[]>()
   return Effect.gen(function* () {
@@ -105,7 +109,7 @@ function hydrate(db: Database.Interface["db"], rows: (typeof MessageTable.$infer
       const partRows = yield* db
         .select()
         .from(PartTable)
-        .where(inArray(PartTable.message_id, ids))
+        .where(and(eq(PartTable.session_id, sessionID), inArray(PartTable.message_id, ids)))
         .orderBy(PartTable.message_id, PartTable.id)
         .all()
         .pipe(Effect.orDie)
@@ -471,7 +475,7 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
 
   const more = rows.length > input.limit
   const slice = more ? rows.slice(0, input.limit) : rows
-  const items = yield* hydrate(db, slice)
+  const items = yield* hydrate(db, slice, input.sessionID)
   items.reverse()
   const tail = slice.at(-1)
   return {

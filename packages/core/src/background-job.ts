@@ -36,6 +36,37 @@ type Active = {
 type State = {
   jobs: SynchronizedRef.SynchronizedRef<Map<string, Active>>
   scope: Scope.Scope
+  /**
+   * Terminal jobs retained per registry. `0` retains none; `Infinity` is the
+   * explicit unbounded sentinel.
+   */
+  maxTerminalJobs: number
+}
+
+/**
+ * Default bound on terminal job snapshots kept for `list`/`get`. A foreground
+ * job settles as soon as its tool call returns, so without a bound a long-lived
+ * worker would grow its registry (and every `list`) without limit.
+ */
+export const DEFAULT_MAX_TERMINAL_JOBS = 100
+
+/** Raised when a start opts out of joining an already-running job id. */
+export class JobAlreadyRunningError extends Error {
+  readonly _tag = "JobAlreadyRunningError"
+
+  constructor(readonly id: string) {
+    super(`background job "${id}" is already running`)
+    this.name = "JobAlreadyRunningError"
+  }
+}
+
+export interface MakeOptions {
+  /**
+   * Terminal jobs to retain; defaults to {@link DEFAULT_MAX_TERMINAL_JOBS}.
+   * `0` retains none (terminal jobs disappear as soon as they settle) and
+   * `Infinity` keeps every terminal job without bound.
+   */
+  readonly maxTerminalJobs?: number
 }
 
 /**
@@ -66,6 +97,7 @@ type PromoteResult =
 
 type StartResult =
   | { readonly _tag: "existing"; readonly info: Info }
+  | { readonly _tag: "busy"; readonly info: Info }
   | { readonly _tag: "started"; readonly info: Info; readonly scope: Scope.Closeable; readonly token: object }
 
 type ExtendResult =
@@ -87,6 +119,12 @@ export type StartInput = {
   /** The subagent parent session; omitted for a root/foreground job. */
   parentID?: string
   onPromote?: Effect.Effect<void>
+  /**
+   * Fail with {@link JobAlreadyRunningError} instead of joining an existing
+   * running job with the same id. Use when the caller's `run` carries new work
+   * that a silent join would drop.
+   */
+  rejectIfRunning?: boolean
   run: Effect.Effect<string, unknown>
 }
 
@@ -108,7 +146,7 @@ export type WaitResult = {
 export interface Interface {
   readonly list: () => Effect.Effect<Info[]>
   readonly get: (id: string) => Effect.Effect<Info | undefined>
-  readonly start: (input: StartInput) => Effect.Effect<Info>
+  readonly start: (input: StartInput) => Effect.Effect<Info, JobAlreadyRunningError>
   readonly extend: (input: ExtendInput) => Effect.Effect<boolean>
   readonly wait: (input: WaitInput) => Effect.Effect<WaitResult>
   readonly waitForPromotion: (id: string) => Effect.Effect<Info>
@@ -153,259 +191,295 @@ function errorText(error: unknown) {
  * separate durable ownership slice rather than pretending this registry has
  * those semantics.
  */
-export const make = Effect.gen(function* () {
-  const state: State = {
-    jobs: yield* SynchronizedRef.make(new Map()),
-    scope: yield* Scope.Scope,
-  }
-
-  const settle = Effect.fn("BackgroundJob.settle")(function* (
-    id: string,
-    token: object,
-    sequence: number,
-    exit: Exit.Exit<string, unknown>,
-  ) {
-    const completed_at = yield* Clock.currentTimeMillis
-    const result = yield* SynchronizedRef.modify(state.jobs, (jobs): readonly [FinishResult, Map<string, Active>] => {
-      const job = jobs.get(id)
-      if (!job) return [{ _tag: "none" }, jobs]
-      if (job.token !== token) return [{ _tag: "none" }, jobs]
-      if (job.info.status !== "running") return [{ _tag: "observed", info: snapshot(job) }, jobs]
-      const pending = job.pending - 1
-      const output =
-        Exit.isSuccess(exit) && (!job.output || sequence > job.output.sequence)
-          ? { sequence, text: exit.value }
-          : job.output
-      if (Exit.isSuccess(exit) && pending > 0) {
-        return [{ _tag: "none" }, new Map(jobs).set(id, { ...job, pending, output })]
-      }
-      const status: Exclude<Status, "running"> = Exit.isSuccess(exit)
-        ? "completed"
-        : Cause.hasInterruptsOnly(exit.cause)
-          ? "cancelled"
-          : "error"
-      const next = {
-        ...job,
-        onPromote: undefined,
-        pending: 0,
-        output,
-        info: {
-          ...job.info,
-          status,
-          completed_at,
-          ...(output ? { output: output.text } : {}),
-          ...(Exit.isFailure(exit) ? { error: errorText(Cause.squash(exit.cause)) } : {}),
-        },
-      }
-      return [{ _tag: "settled", info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]
-    })
-    if (result._tag === "settled") {
-      yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
-      yield* Scope.close(result.scope, Exit.void).pipe(Effect.forkIn(state.scope, { startImmediately: true }))
+const makeWithOptions = (options: MakeOptions) =>
+  Effect.gen(function* () {
+    const state: State = {
+      jobs: yield* SynchronizedRef.make(new Map()),
+      scope: yield* Scope.Scope,
+      maxTerminalJobs: options.maxTerminalJobs ?? DEFAULT_MAX_TERMINAL_JOBS,
     }
-    return result._tag === "none" ? undefined : result.info
-  })
 
-  const fork = Effect.fn("BackgroundJob.fork")(function* (
-    scope: Scope.Scope,
-    id: string,
-    token: object,
-    sequence: number,
-    run: Effect.Effect<string, unknown>,
-  ) {
-    return yield* run.pipe(
-      Effect.matchCauseEffect({
-        onSuccess: (output) => settle(id, token, sequence, Exit.succeed(output)),
-        onFailure: (cause) => settle(id, token, sequence, Exit.failCause(cause)),
-      }),
-      Effect.asVoid,
-      Effect.forkIn(scope, { startImmediately: true }),
-    )
-  })
-
-  const list: Interface["list"] = Effect.fn("BackgroundJob.list")(function* () {
-    return Array.from((yield* SynchronizedRef.get(state.jobs)).values())
-      .map(snapshot)
-      .toSorted((a, b) => a.started_at - b.started_at)
-  })
-
-  const get: Interface["get"] = Effect.fn("BackgroundJob.get")(function* (id) {
-    const job = (yield* SynchronizedRef.get(state.jobs)).get(id)
-    if (!job) return
-    return snapshot(job)
-  })
-
-  const start: Interface["start"] = Effect.fn("BackgroundJob.start")(function* (input) {
-    return yield* Effect.uninterruptibleMask((restore) =>
-      Effect.gen(function* () {
-        const id = input.id ?? Identifier.ascending("job")
-        const started_at = yield* Clock.currentTimeMillis
-        const done = yield* Deferred.make<Info>()
-        const promoted = yield* Deferred.make<Info>()
-        const tail = yield* Deferred.make<void>()
-        const result = yield* SynchronizedRef.modifyEffect(
-          state.jobs,
-          Effect.fnUntraced(function* (jobs) {
-            const existing = jobs.get(id)
-            if (existing?.info.status === "running") {
-              return [{ _tag: "existing", info: snapshot(existing) }, jobs] as readonly [
-                StartResult,
-                Map<string, Active>,
-              ]
-            }
-            const scope = yield* Scope.fork(state.scope, "parallel")
-            const token = {}
-            const job = {
-              info: {
-                id,
-                type: input.type,
-                title: input.title,
-                status: "running" as const,
-                started_at,
-                metadata: input.metadata === undefined ? undefined : cloneMetadata(input.metadata),
-                ...(input.parentID === undefined ? {} : { parentID: input.parentID }),
-              },
-              done,
-              scope,
-              token,
-              pending: 1,
-              next: 1,
-              tail,
-              promoted,
-              onPromote: input.onPromote,
-            }
-            return [{ _tag: "started", info: snapshot(job), scope, token }, new Map(jobs).set(id, job)] as readonly [
-              StartResult,
-              Map<string, Active>,
-            ]
-          }),
+    /**
+     * Drop the oldest terminal jobs once the registry exceeds its retention bound.
+     * Running jobs are never evicted: their scope still owns live work, while a
+     * terminal entry is only a snapshot the caller can already have observed.
+     */
+    const pruneTerminalJobs = (jobs: Map<string, Active>): Map<string, Active> => {
+      if (state.maxTerminalJobs === Number.POSITIVE_INFINITY) return jobs
+      const terminal = Array.from(jobs.values()).filter((job) => job.info.status !== "running")
+      const excess = terminal.length - Math.max(0, state.maxTerminalJobs)
+      if (excess <= 0) return jobs
+      const evicted = terminal
+        .toSorted(
+          (left, right) =>
+            (left.info.completed_at ?? left.info.started_at) - (right.info.completed_at ?? right.info.started_at),
         )
-        if (result._tag === "started")
-          yield* fork(
-            result.scope,
-            id,
-            result.token,
-            0,
-            restore(input.run).pipe(Effect.ensuring(Deferred.succeed(tail, undefined))),
-          )
-        return result.info
-      }),
-    )
-  })
+        .slice(0, excess)
+      const next = new Map(jobs)
+      for (const job of evicted) next.delete(job.info.id)
+      return next
+    }
 
-  const extend: Interface["extend"] = Effect.fn("BackgroundJob.extend")(function* (input) {
-    return yield* Effect.uninterruptibleMask((restore) =>
-      Effect.gen(function* () {
-        const tail = yield* Deferred.make<void>()
-        const result = yield* SynchronizedRef.modify(
-          state.jobs,
-          (jobs): readonly [ExtendResult, Map<string, Active>] => {
-            const job = jobs.get(input.id)
-            if (!job || job.info.status !== "running") return [{ _tag: "notRunning" }, jobs]
-            return [
-              { _tag: "extended", previous: job.tail, scope: job.scope, tail, token: job.token, sequence: job.next },
-              new Map(jobs).set(input.id, {
-                ...job,
-                pending: job.pending + 1,
-                next: job.next + 1,
-                tail,
-              }),
-            ]
-          },
-        )
-        if (result._tag === "notRunning") return false
-        yield* fork(
-          result.scope,
-          input.id,
-          result.token,
-          result.sequence,
-          Deferred.await(result.previous).pipe(
-            Effect.andThen(restore(input.run)),
-            Effect.ensuring(Deferred.succeed(result.tail, undefined)),
-          ),
-        )
-        return true
-      }),
-    )
-  })
-
-  const wait: Interface["wait"] = Effect.fn("BackgroundJob.wait")(function* (input) {
-    const job = (yield* SynchronizedRef.get(state.jobs)).get(input.id)
-    if (!job) return { timedOut: false }
-    if (job.info.status !== "running") return { info: snapshot(job), timedOut: false }
-    if (input.timeout === undefined) return { info: yield* Deferred.await(job.done), timedOut: false }
-    if (input.timeout <= 0) return { info: snapshot(job), timedOut: true }
-    const info = yield* Deferred.await(job.done).pipe(Effect.timeoutOption(input.timeout))
-    if (info._tag === "Some") return { info: info.value, timedOut: false }
-    return { info: snapshot(job), timedOut: true }
-  })
-
-  const waitForPromotion: Interface["waitForPromotion"] = Effect.fn("BackgroundJob.waitForPromotion")(function* (id) {
-    const job = (yield* SynchronizedRef.get(state.jobs)).get(id)
-    if (!job || job.info.status !== "running") return yield* Effect.never
-    if (job.info.metadata?.background === true) return snapshot(job)
-    return yield* Deferred.await(job.promoted)
-  })
-
-  const promote: Interface["promote"] = Effect.fn("BackgroundJob.promote")(function* (id) {
-    const result = yield* SynchronizedRef.modifyEffect(
-      state.jobs,
-      Effect.fnUntraced(function* (jobs) {
+    const settle = Effect.fn("BackgroundJob.settle")(function* (
+      id: string,
+      token: object,
+      sequence: number,
+      exit: Exit.Exit<string, unknown>,
+    ) {
+      const completed_at = yield* Clock.currentTimeMillis
+      const result = yield* SynchronizedRef.modify(state.jobs, (jobs): readonly [FinishResult, Map<string, Active>] => {
         const job = jobs.get(id)
-        if (!job || job.info.status !== "running")
-          return [{ _tag: "none" }, jobs] as readonly [PromoteResult, Map<string, Active>]
-        if (job.info.metadata?.background === true)
-          return [{ _tag: "observed", info: snapshot(job) }, jobs] as readonly [PromoteResult, Map<string, Active>]
-        // Spreading a frozen metadata clone is safe and yields a fresh mutable
-        // object so the `background` flag can be added.
+        if (!job) return [{ _tag: "none" }, jobs]
+        if (job.token !== token) return [{ _tag: "none" }, jobs]
+        if (job.info.status !== "running") return [{ _tag: "observed", info: snapshot(job) }, jobs]
+        const pending = job.pending - 1
+        const output =
+          Exit.isSuccess(exit) && (!job.output || sequence > job.output.sequence)
+            ? { sequence, text: exit.value }
+            : job.output
+        if (Exit.isSuccess(exit) && pending > 0) {
+          return [{ _tag: "none" }, new Map(jobs).set(id, { ...job, pending, output })]
+        }
+        const status: Exclude<Status, "running"> = Exit.isSuccess(exit)
+          ? "completed"
+          : Cause.hasInterruptsOnly(exit.cause)
+            ? "cancelled"
+            : "error"
         const next = {
           ...job,
           onPromote: undefined,
+          pending: 0,
+          output,
           info: {
             ...job.info,
-            metadata: { ...job.info.metadata, background: true },
+            status,
+            completed_at,
+            ...(output ? { output: output.text } : {}),
+            ...(Exit.isFailure(exit) ? { error: errorText(Cause.squash(exit.cause)) } : {}),
           },
         }
         return [
-          { _tag: "promoted", info: snapshot(next), onPromote: job.onPromote, promoted: job.promoted },
-          new Map(jobs).set(id, next),
-        ] as readonly [PromoteResult, Map<string, Active>]
-      }),
-    )
-    if (result._tag === "promoted") {
-      yield* Deferred.succeed(result.promoted, result.info).pipe(Effect.ignore)
-      if (result.onPromote) yield* result.onPromote.pipe(Effect.ignore)
-    }
-    return result._tag === "none" ? undefined : result.info
-  })
-
-  const cancel: Interface["cancel"] = Effect.fn("BackgroundJob.cancel")(function* (id) {
-    const completed_at = yield* Clock.currentTimeMillis
-    const result = yield* SynchronizedRef.modify(state.jobs, (jobs): readonly [FinishResult, Map<string, Active>] => {
-      const job = jobs.get(id)
-      if (!job) return [{ _tag: "none" }, jobs]
-      if (job.info.status !== "running") return [{ _tag: "observed", info: snapshot(job) }, jobs]
-      const next = {
-        ...job,
-        onPromote: undefined,
-        pending: 0,
-        info: {
-          ...job.info,
-          status: "cancelled" as const,
-          completed_at,
-        },
+          { _tag: "settled", info: snapshot(next), done: job.done, scope: job.scope },
+          pruneTerminalJobs(new Map(jobs).set(id, next)),
+        ]
+      })
+      if (result._tag === "settled") {
+        yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
+        yield* Scope.close(result.scope, Exit.void).pipe(Effect.forkIn(state.scope, { startImmediately: true }))
       }
-      return [{ _tag: "settled", info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]
+      return result._tag === "none" ? undefined : result.info
     })
-    if (result._tag === "settled") {
-      yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
-      yield* Scope.close(result.scope, Exit.void)
-    }
-    return result._tag === "none" ? undefined : result.info
+
+    const fork = Effect.fn("BackgroundJob.fork")(function* (
+      scope: Scope.Scope,
+      id: string,
+      token: object,
+      sequence: number,
+      run: Effect.Effect<string, unknown>,
+    ) {
+      return yield* run.pipe(
+        Effect.matchCauseEffect({
+          onSuccess: (output) => settle(id, token, sequence, Exit.succeed(output)),
+          onFailure: (cause) => settle(id, token, sequence, Exit.failCause(cause)),
+        }),
+        Effect.asVoid,
+        Effect.forkIn(scope, { startImmediately: true }),
+      )
+    })
+
+    const list: Interface["list"] = Effect.fn("BackgroundJob.list")(function* () {
+      return Array.from((yield* SynchronizedRef.get(state.jobs)).values())
+        .map(snapshot)
+        .toSorted((a, b) => a.started_at - b.started_at)
+    })
+
+    const get: Interface["get"] = Effect.fn("BackgroundJob.get")(function* (id) {
+      const job = (yield* SynchronizedRef.get(state.jobs)).get(id)
+      if (!job) return
+      return snapshot(job)
+    })
+
+    const start: Interface["start"] = Effect.fn("BackgroundJob.start")(function* (input) {
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const id = input.id ?? Identifier.ascending("job")
+          const started_at = yield* Clock.currentTimeMillis
+          const done = yield* Deferred.make<Info>()
+          const promoted = yield* Deferred.make<Info>()
+          const tail = yield* Deferred.make<void>()
+          const result = yield* SynchronizedRef.modifyEffect(
+            state.jobs,
+            Effect.fnUntraced(function* (jobs) {
+              const existing = jobs.get(id)
+              if (existing?.info.status === "running") {
+                return [
+                  { _tag: input.rejectIfRunning === true ? "busy" : "existing", info: snapshot(existing) },
+                  jobs,
+                ] as readonly [StartResult, Map<string, Active>]
+              }
+              const scope = yield* Scope.fork(state.scope, "parallel")
+              const token = {}
+              const job = {
+                info: {
+                  id,
+                  type: input.type,
+                  title: input.title,
+                  status: "running" as const,
+                  started_at,
+                  metadata: input.metadata === undefined ? undefined : cloneMetadata(input.metadata),
+                  ...(input.parentID === undefined ? {} : { parentID: input.parentID }),
+                },
+                done,
+                scope,
+                token,
+                pending: 1,
+                next: 1,
+                tail,
+                promoted,
+                onPromote: input.onPromote,
+              }
+              return [{ _tag: "started", info: snapshot(job), scope, token }, new Map(jobs).set(id, job)] as readonly [
+                StartResult,
+                Map<string, Active>,
+              ]
+            }),
+          )
+          if (result._tag === "busy") return yield* Effect.fail(new JobAlreadyRunningError(id))
+          if (result._tag === "started")
+            yield* fork(
+              result.scope,
+              id,
+              result.token,
+              0,
+              restore(input.run).pipe(Effect.ensuring(Deferred.succeed(tail, undefined))),
+            )
+          return result.info
+        }),
+      )
+    })
+
+    const extend: Interface["extend"] = Effect.fn("BackgroundJob.extend")(function* (input) {
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const tail = yield* Deferred.make<void>()
+          const result = yield* SynchronizedRef.modify(
+            state.jobs,
+            (jobs): readonly [ExtendResult, Map<string, Active>] => {
+              const job = jobs.get(input.id)
+              if (!job || job.info.status !== "running") return [{ _tag: "notRunning" }, jobs]
+              return [
+                { _tag: "extended", previous: job.tail, scope: job.scope, tail, token: job.token, sequence: job.next },
+                new Map(jobs).set(input.id, {
+                  ...job,
+                  pending: job.pending + 1,
+                  next: job.next + 1,
+                  tail,
+                }),
+              ]
+            },
+          )
+          if (result._tag === "notRunning") return false
+          yield* fork(
+            result.scope,
+            input.id,
+            result.token,
+            result.sequence,
+            Deferred.await(result.previous).pipe(
+              Effect.andThen(restore(input.run)),
+              Effect.ensuring(Deferred.succeed(result.tail, undefined)),
+            ),
+          )
+          return true
+        }),
+      )
+    })
+
+    const wait: Interface["wait"] = Effect.fn("BackgroundJob.wait")(function* (input) {
+      const job = (yield* SynchronizedRef.get(state.jobs)).get(input.id)
+      if (!job) return { timedOut: false }
+      if (job.info.status !== "running") return { info: snapshot(job), timedOut: false }
+      if (input.timeout === undefined) return { info: yield* Deferred.await(job.done), timedOut: false }
+      if (input.timeout <= 0) return { info: snapshot(job), timedOut: true }
+      const info = yield* Deferred.await(job.done).pipe(Effect.timeoutOption(input.timeout))
+      if (info._tag === "Some") return { info: info.value, timedOut: false }
+      return { info: snapshot(job), timedOut: true }
+    })
+
+    const waitForPromotion: Interface["waitForPromotion"] = Effect.fn("BackgroundJob.waitForPromotion")(function* (id) {
+      const job = (yield* SynchronizedRef.get(state.jobs)).get(id)
+      if (!job || job.info.status !== "running") return yield* Effect.never
+      if (job.info.metadata?.background === true) return snapshot(job)
+      return yield* Deferred.await(job.promoted)
+    })
+
+    const promote: Interface["promote"] = Effect.fn("BackgroundJob.promote")(function* (id) {
+      const result = yield* SynchronizedRef.modifyEffect(
+        state.jobs,
+        Effect.fnUntraced(function* (jobs) {
+          const job = jobs.get(id)
+          if (!job || job.info.status !== "running")
+            return [{ _tag: "none" }, jobs] as readonly [PromoteResult, Map<string, Active>]
+          if (job.info.metadata?.background === true)
+            return [{ _tag: "observed", info: snapshot(job) }, jobs] as readonly [PromoteResult, Map<string, Active>]
+          // Spreading a frozen metadata clone is safe and yields a fresh mutable
+          // object so the `background` flag can be added.
+          const next = {
+            ...job,
+            onPromote: undefined,
+            info: {
+              ...job.info,
+              metadata: { ...job.info.metadata, background: true },
+            },
+          }
+          return [
+            { _tag: "promoted", info: snapshot(next), onPromote: job.onPromote, promoted: job.promoted },
+            new Map(jobs).set(id, next),
+          ] as readonly [PromoteResult, Map<string, Active>]
+        }),
+      )
+      if (result._tag === "promoted") {
+        yield* Deferred.succeed(result.promoted, result.info).pipe(Effect.ignore)
+        if (result.onPromote) yield* result.onPromote.pipe(Effect.ignore)
+      }
+      return result._tag === "none" ? undefined : result.info
+    })
+
+    const cancel: Interface["cancel"] = Effect.fn("BackgroundJob.cancel")(function* (id) {
+      const completed_at = yield* Clock.currentTimeMillis
+      const result = yield* SynchronizedRef.modify(state.jobs, (jobs): readonly [FinishResult, Map<string, Active>] => {
+        const job = jobs.get(id)
+        if (!job) return [{ _tag: "none" }, jobs]
+        if (job.info.status !== "running") return [{ _tag: "observed", info: snapshot(job) }, jobs]
+        const next = {
+          ...job,
+          onPromote: undefined,
+          pending: 0,
+          info: {
+            ...job.info,
+            status: "cancelled" as const,
+            completed_at,
+          },
+        }
+        return [
+          { _tag: "settled", info: snapshot(next), done: job.done, scope: job.scope },
+          pruneTerminalJobs(new Map(jobs).set(id, next)),
+        ]
+      })
+      if (result._tag === "settled") {
+        yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
+        yield* Scope.close(result.scope, Exit.void)
+      }
+      return result._tag === "none" ? undefined : result.info
+    })
+
+    return Service.of({ list, get, start, extend, wait, waitForPromotion, promote, cancel })
   })
 
-  return Service.of({ list, get, start, extend, wait, waitForPromotion, promote, cancel })
-})
+/** The default process-local registry (terminal retention at its standard bound). */
+export const make = makeWithOptions({})
+
+/** A registry with an explicit retention bound; `Infinity` keeps every terminal job. */
+export const makeWithRetention = makeWithOptions
 
 const layer = Layer.effect(Service, make)
 

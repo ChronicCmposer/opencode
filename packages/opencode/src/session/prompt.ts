@@ -59,6 +59,7 @@ import { SessionDepth } from "./depth"
 import { DispatchOrigin } from "./origin"
 import type { CancelOutcome } from "./worker/cancel"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { SessionSpawnProxyService } from "./worker/subagent"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -113,10 +114,10 @@ export type CancelResult = CancelOutcome & { readonly message?: SessionV1.WithPa
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<CancelResult | undefined>
-  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
-  readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
-  readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
-  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionRunState.RunError>
+  readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts, SessionRunState.RunError>
+  readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError | SessionRunState.RunError>
+  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionRunState.RunError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
 }
 
@@ -163,6 +164,13 @@ const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
+      // A bound worker owns no authority over another session's rows: it asks
+      // the hub to run the same children-first tree cancel there. The hub has no
+      // proxy, so the local cascade below stays the hub's authoritative path.
+      const proxy = yield* Effect.serviceOption(SessionSpawnProxyService)
+      if (Option.isSome(proxy) && proxy.value.cancel !== undefined) {
+        return yield* proxy.value.cancel(sessionID).pipe(Effect.orDie)
+      }
       const outcome = yield* cancelSessionTree({
         children: (id) => sessions.children(id),
         cancelOne: (id) => state.cancel(id),
@@ -1016,7 +1024,9 @@ const layer = Layer.effect(
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
+    const prompt: (
+      input: PromptInput,
+    ) => Effect.Effect<SessionV1.WithParts, Image.Error | SessionRunState.RunError> = Effect.fn(
       "SessionPrompt.prompt",
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
@@ -1366,9 +1376,9 @@ const layer = Layer.effect(
       },
     )
 
-    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
-      input: LoopInput,
-    ) {
+    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts, SessionRunState.RunError> = Effect.fn(
+      "SessionPrompt.loop",
+    )(function* (input: LoopInput) {
       return yield* state.ensureRunning(
         input.sessionID,
         lastAssistant(input.sessionID),
@@ -1377,7 +1387,9 @@ const layer = Layer.effect(
       )
     })
 
-    const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
+    const shell: (
+      input: ShellInput,
+    ) => Effect.Effect<SessionV1.WithParts, Session.BusyError | SessionRunState.RunError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
       const ready = yield* Latch.make()

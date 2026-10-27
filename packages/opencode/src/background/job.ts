@@ -4,6 +4,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { Cause, Effect, Layer, Scope } from "effect"
 
 export {
+  JobAlreadyRunningError,
   Service,
   type ExtendInput,
   type Info,

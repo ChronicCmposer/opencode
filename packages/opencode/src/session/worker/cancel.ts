@@ -80,7 +80,12 @@ export function createOutcomeGate(): OutcomeGate {
 
 // ---- hub-side controller ------------------------------------------------------
 
-export type CancelMode = "cooperative" | "terminated" | "completed"
+/**
+ * `boot` is the typed outcome of cancelling a run that had not completed its
+ * first boot: the boot lifecycle aborted the partial isolate and released the
+ * spawn permit, so there was never a run to cooperate with or terminate.
+ */
+export type CancelMode = "cooperative" | "terminated" | "completed" | "boot"
 
 export interface CancelOutcome {
   readonly sessionID: SessionID

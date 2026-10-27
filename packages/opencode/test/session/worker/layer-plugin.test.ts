@@ -217,7 +217,7 @@ describe("worker plugin host", () => {
         return yield* plugin.trigger(name as never, {} as never, { env: {} })
       }).pipe(Effect.provide(built.layer), Effect.exit)
 
-    const unsupported = await Effect.runPromise(trigger("chat.message"))
+    const unsupported = await Effect.runPromise(trigger("command.execute.before"))
     expect(Exit.isFailure(unsupported)).toBe(true)
     if (Exit.isFailure(unsupported)) {
       expect(Cause.squash(unsupported.cause)).toBeInstanceOf(UnsupportedPluginHookError)

@@ -37,7 +37,7 @@ import {
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError } from "../errors"
+import { PermissionNotFoundError, SessionBusyError as ApiSessionBusyError } from "../errors"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
@@ -86,6 +86,14 @@ export const toAbortOutcome = (outcome: SessionPrompt.CancelResult): typeof Abor
         sessionID: outcome.sessionID,
         mode: "completed",
         winner: "completion",
+        acknowledged: outcome.acknowledged,
+        durationMs: outcome.durationMs,
+      }
+    case "boot":
+      return {
+        sessionID: outcome.sessionID,
+        mode: "boot",
+        winner: "cancel",
         acknowledged: outcome.acknowledged,
         durationMs: outcome.durationMs,
       }
@@ -337,7 +345,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         },
         auto: ctx.payload.auto ?? false,
       })
-      yield* promptSvc.loop({ sessionID: ctx.params.sessionID })
+      yield* promptSvc
+        .loop({ sessionID: ctx.params.sessionID })
+        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
       return true
     })
 
@@ -392,7 +402,20 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof ShellPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      return yield* SessionError.mapBusy(promptSvc.shell({ ...ctx.payload, sessionID: ctx.params.sessionID }))
+      return yield* promptSvc.shell({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
+        Effect.catchTags({
+          SessionBusyError: (error) =>
+            Effect.fail(
+              new ApiSessionBusyError({
+                sessionID: error.sessionID,
+                message: `Session is busy: ${error.sessionID}`,
+              }),
+            ),
+          SessionCancelledError: () => Effect.fail(new HttpApiError.BadRequest({})),
+          WorkerCrashedError: () => Effect.fail(new HttpApiError.BadRequest({})),
+          SessionRunFailureError: () => Effect.fail(new HttpApiError.BadRequest({})),
+        }),
+      )
     })
 
     const revert = Effect.fn("SessionHttpApi.revert")(function* (ctx: {

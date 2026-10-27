@@ -12,8 +12,28 @@ import type { DispatchOrigin } from "./origin"
 import { SessionStatus } from "./status"
 import { SessionHubService, type SessionHub } from "./worker/hub"
 import { SessionBusyError, type SessionExecutionResult } from "./worker/execute"
+import { SessionCancelledError, WorkerCrashedError } from "./worker/dispatch"
 import type { CancelOutcome } from "./worker/cancel"
 import type { ShellInput } from "./prompt"
+
+/**
+ * A hub rejection that is neither a cancel nor a crash. It is still a typed
+ * failure (never a defect), so a broken control channel can be handled by the
+ * caller instead of tearing down the fiber's cause.
+ */
+export class SessionRunFailureError extends Schema.TaggedErrorClass<SessionRunFailureError>()(
+  "SessionRunFailureError",
+  {
+    message: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {}
+
+/**
+ * Every typed way a hub-hosted run can fail: a cancel, a worker crash, or an
+ * unexpected control-channel failure. None of these are defects.
+ */
+export type RunError = SessionCancelledError | WorkerCrashedError | SessionRunFailureError
 
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
@@ -23,14 +43,14 @@ export interface Interface {
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
     origin?: DispatchOrigin,
-  ) => Effect.Effect<SessionV1.WithParts>
+  ) => Effect.Effect<SessionV1.WithParts, RunError>
   readonly startShell: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
     ready?: Latch.Latch,
     shell?: ShellInput,
-  ) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
+  ) => Effect.Effect<SessionV1.WithParts, Session.BusyError | RunError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionRunState") {}
@@ -77,7 +97,15 @@ export const layer = Layer.effect(
     const assertNotBusy = Effect.fn("SessionRunState.assertNotBusy")(function* (sessionID: SessionID) {
       const hub = yield* hubIfEnabled
       if (hub !== undefined) {
-        if (yield* Effect.promise(() => hub.assertNotBusy(sessionID))) yield* busyError(sessionID)
+        // Fail closed: only the hub can prove a worker dead, and it reports that
+        // as `false`. A probe that throws is not proof of idleness, so the
+        // caller (SessionRevert) must not proceed; surface it as the domain
+        // busy error instead of swallowing it.
+        const busy = yield* Effect.tryPromise({
+          try: () => hub.assertNotBusy(sessionID),
+          catch: () => busyError(sessionID),
+        })
+        if (busy) yield* busyError(sessionID)
         return
       }
       const runners = yield* InstanceState.get(state)
@@ -89,8 +117,21 @@ export const layer = Layer.effect(
       if (hub !== undefined) {
         // The hub cancels the session; `SessionPrompt.cancel` has already walked
         // `Session.children` children-first, so this call only needs the
-        // session's own outcome and fallback idle.
-        const report = yield* Effect.promise(() => hub.cancelWithReport(sessionID))
+        // session's own outcome and fallback idle. A hub that fails to REPORT
+        // (e.g. its worker crashed while settling) must still yield a typed
+        // terminal outcome: cancellation already happened, only the report was
+        // lost.
+        const report = yield* Effect.tryPromise({
+          try: () => hub.cancelWithReport(sessionID),
+          catch: asRunError,
+        }).pipe(
+          Effect.catch(() =>
+            Effect.succeed({
+              outcome: unreportedCancelOutcome(sessionID),
+              descendants: [],
+            }),
+          ),
+        )
         yield* cancelBackgroundJobs(background, sessionID)
         // Single-idle authority, extended to the subagent cascade. The worker
         // publishes its own terminal idle only for a cooperative settle or a
@@ -110,7 +151,12 @@ export const layer = Layer.effect(
           const children = yield* session.value.children(sessionID)
           for (const child of children) {
             if (handled.has(child.id)) continue
-            const childOutcome = yield* Effect.promise(() => hub.cancel(child.id))
+            // A child cancel that fails to report is an unreported cancel too:
+            // the descendant still gets its fallback idle, never a defect.
+            const childOutcome = yield* Effect.tryPromise({
+              try: () => hub.cancel(child.id),
+              catch: asRunError,
+            }).pipe(Effect.catch(() => Effect.succeed(undefined)))
             if (!workerPublishedIdle(childOutcome)) yield* status.set(child.id, { type: "idle" })
           }
         }
@@ -135,9 +181,13 @@ export const layer = Layer.effect(
     ) {
       const hub = yield* hubIfEnabled
       if (hub !== undefined) {
-        return yield* Effect.promise(() => hub.ensureRunning(sessionID, origin)).pipe(
-          Effect.flatMap(parseSessionResult),
-        )
+        // A hub-hosted run reports cancel/crash/control failures through its
+        // promise rejection. Map them into the typed `RunError` channel so the
+        // caller can branch on them; never let a rejection become a defect.
+        return yield* Effect.tryPromise({
+          try: () => hub.ensureRunning(sessionID, origin),
+          catch: asRunError,
+        }).pipe(Effect.flatMap(parseSessionResult))
       }
       const runners = yield* InstanceState.get(state)
       return yield* runners.ensureRunning(sessionID, work, onInterrupt)
@@ -163,13 +213,10 @@ export const layer = Layer.effect(
         // worker-local `SessionBusyError`; map it onto the domain `Session.BusyError`.
         return yield* Effect.tryPromise({
           try: () => hub.startShell(sessionID, shell),
-          catch: (error) => error,
-        }).pipe(
-          Effect.flatMap(parseSessionResult),
-          Effect.catch((error) =>
-            error instanceof SessionBusyError ? Effect.fail(busyError(sessionID)) : Effect.die(error),
-          ),
-        )
+          // A worker-local `SessionBusyError` maps onto the domain
+          // `Session.BusyError`; every other failure is a typed run error.
+          catch: (error) => (error instanceof SessionBusyError ? busyError(sessionID) : asRunError(error)),
+        }).pipe(Effect.flatMap(parseSessionResult))
       }
       const runners = yield* InstanceState.get(state)
       return yield* runners
@@ -221,6 +268,24 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
 
 function busyError(sessionID: SessionID) {
   return new Session.BusyError({ sessionID })
+}
+
+/** Recognise the hub's typed rejections; everything else is a control failure. */
+function asRunError(error: unknown): RunError {
+  if (error instanceof SessionCancelledError || error instanceof WorkerCrashedError) return error
+  return new SessionRunFailureError({
+    message: error instanceof Error ? error.message : String(error),
+    cause: error,
+  })
+}
+
+/**
+ * The typed outcome of a cancel whose report was lost. The cancellation itself
+ * is terminal (the hub either retired the worker or never had a run), so report
+ * the conservative terminate outcome; the caller still writes the fallback idle.
+ */
+function unreportedCancelOutcome(sessionID: SessionID): CancelOutcome {
+  return { sessionID, mode: "terminated", winner: "cancel", acknowledged: false, durationMs: 0 }
 }
 
 /**

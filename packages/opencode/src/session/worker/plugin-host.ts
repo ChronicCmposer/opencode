@@ -7,11 +7,12 @@
 // tool args) without an RPC per call.
 //
 // Two further hooks, `experimental.chat.system.transform` and
+// `chat.message`, `experimental.chat.system.transform` and
 // `experimental.chat.messages.transform`, are HUB PROXIES rather than
 // hub-resolved effects: the worker runs any worker-local function hooks, then
 // forwards the structuredClone-safe payload to a hub-resident handler (the
-// injected `options.systemTransform` / `options.messagesTransform`) that owns
-// plugin loading. They cross the isolate as data by RPC, not as a serialized
+// injected `options.systemTransform` / `options.messagesTransform`) or the
+// generic hub bridge that owns plugin loading. They cross the isolate as data by RPC, not as a serialized
 // effect, because the real plugin function lives on the hub.
 //
 // Contract mirrors `@opencode-ai/plugin` `Hooks`: each hook receives an `input`
@@ -59,6 +60,12 @@ export interface ToolAfterOutput {
   metadata: unknown
 }
 
+/** Mutable user message + parts the `chat.message` hook rewrites. */
+export interface ChatMessageOutput {
+  message: unknown
+  parts: unknown[]
+}
+
 /** Mutable environment map the `shell.env` hook rewrites. */
 export interface ShellEnvOutput {
   env: Record<string, string>
@@ -94,6 +101,7 @@ export interface MessagesTransformOutput {
 export interface WorkerPluginHooks {
   readonly "chat.params"?: (input: unknown, output: ChatParamsOutput) => void | Promise<void>
   readonly "chat.headers"?: (input: unknown, output: ChatHeadersOutput) => void | Promise<void>
+  readonly "chat.message"?: (input: unknown, output: ChatMessageOutput) => void | Promise<void>
   readonly "tool.execute.before"?: (input: unknown, output: ToolBeforeOutput) => void | Promise<void>
   readonly "tool.execute.after"?: (input: unknown, output: ToolAfterOutput) => void | Promise<void>
   readonly "experimental.chat.system.transform"?: (
@@ -141,8 +149,9 @@ export interface WorkerPlugin {
   readonly name: string
   readonly hooks: WorkerPluginHooks
   /**
-   * A hub-resolved effect. Applied (in plugin order) after the plugin's own
-   * function hooks; absent for the in-process function-hook path.
+   * A hub-resolved effect, used as the degraded-boot fallback when no hub bridge
+   * is wired. With a bridge the real hook runs per request, so a model switch
+   * cannot freeze `chat.params`/`chat.headers` at the init model.
    */
   readonly resolved?: ResolvedWorkerPluginEffect
   /**
@@ -159,6 +168,7 @@ export interface WorkerPluginHost {
   chatHeaders(input: unknown, output: ChatHeadersOutput): Promise<ChatHeadersOutput>
   toolBefore(input: unknown, output: ToolBeforeOutput): Promise<ToolBeforeOutput>
   toolAfter(input: unknown, output: ToolAfterOutput): Promise<ToolAfterOutput>
+  chatMessage(input: unknown, output: ChatMessageOutput): Promise<ChatMessageOutput>
   systemTransform(input: SystemTransformInput, output: SystemTransformOutput): Promise<SystemTransformOutput>
   messagesTransform(input: MessagesTransformInput, output: MessagesTransformOutput): Promise<MessagesTransformOutput>
   shellEnv(input: unknown, output: ShellEnvOutput): Promise<ShellEnvOutput>
@@ -190,6 +200,28 @@ export class DuplicatePluginError extends Error {
     super(`duplicate plugin: ${name}`)
     this.name = "DuplicatePluginError"
   }
+}
+
+/**
+ * Raised when a hook replaces a field with a value that cannot be applied to the
+ * caller's reference (for example `parts` set to a string). Silently keeping the
+ * old value would make the hook's replacement vanish, so the mismatch fails at
+ * the hook boundary instead.
+ */
+export class NonContainerReplacementError extends Error {
+  constructor(
+    readonly field: string,
+    readonly kind: string,
+  ) {
+    super(`plugin replaced "${field}" with a ${kind}; the field requires a matching container`)
+    this.name = "NonContainerReplacementError"
+  }
+}
+
+function kindOf(value: unknown): string {
+  if (value === null) return "null"
+  if (Array.isArray(value)) return "array"
+  return typeof value
 }
 
 /**
@@ -250,6 +282,70 @@ function applyResolvedHeaders(plugins: readonly WorkerPlugin[], output: ChatHead
   return { ...output, headers }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Replace `target`'s contents with `source`'s without changing `target`'s
+ * identity, so a caller holding the original object observes the mutation. Only
+ * same-shaped containers are reconciled; a primitive/array/object mismatch
+ * returns `false` and the caller must assign the replacement.
+ */
+function replaceContents(target: unknown, source: unknown): boolean {
+  if (target === source) return true
+  if (Array.isArray(target) && Array.isArray(source)) {
+    target.splice(0, target.length, ...source)
+    return true
+  }
+  if (!isRecord(target) || !isRecord(source)) return false
+  for (const key of Object.keys(target)) {
+    if (!Object.hasOwn(source, key)) delete target[key]
+  }
+  for (const [key, value] of Object.entries(source)) target[key] = value
+  return true
+}
+
+/**
+ * Copy `source`'s fields onto `target` in place (arrays are spliced). A
+ * non-container replacement cannot be applied in place, so it fails loud rather
+ * than leaving the caller holding the unchanged object.
+ */
+function applyInPlace<T extends object>(target: T, source: unknown, field = "output"): T {
+  if (!replaceContents(target, source)) throw new NonContainerReplacementError(field, kindOf(source))
+  return target
+}
+
+/**
+ * Apply a `tool.execute.before` result in place. `output.args` is special: call
+ * sites keep a reference to the args object they passed in, so a hook that
+ * replaces `output.args` must have its new contents copied into that original
+ * object rather than handed back as a fresh reference the caller never reads.
+ */
+function applyToolBefore(output: ToolBeforeOutput, next: ToolBeforeOutput): ToolBeforeOutput {
+  if (next.args !== output.args && !replaceContents(output.args, next.args)) output.args = next.args
+  for (const key of Object.keys(output)) {
+    if (key !== "args" && !Object.hasOwn(next, key)) delete (output as unknown as Record<string, unknown>)[key]
+  }
+  for (const [key, value] of Object.entries(next)) {
+    if (key !== "args") (output as unknown as Record<string, unknown>)[key] = value
+  }
+  return output
+}
+
+/** Apply a `chat.message` result in place, keeping the caller's message/parts identity. */
+function applyChatMessage(output: ChatMessageOutput, next: ChatMessageOutput): ChatMessageOutput {
+  if (next.message !== output.message && !replaceContents(output.message, next.message)) output.message = next.message
+  // `parts` is typed as an array on the contract: a plugin that replaces it with
+  // a non-array cannot preserve the caller's reference, so fail loud instead of
+  // dropping the replacement. `output.parts` (not `next.parts`) is the shape
+  // that decides whether an in-place splice is possible.
+  if (next.parts !== output.parts && !replaceContents(output.parts, next.parts)) {
+    throw new NonContainerReplacementError("parts", kindOf(next.parts))
+  }
+  return output
+}
+
 export function createWorkerPluginHost(
   plugins: readonly WorkerPlugin[],
   options?: WorkerPluginHostOptions,
@@ -263,23 +359,55 @@ export function createWorkerPluginHost(
 
   return {
     names,
-    chatParams: async (input, output) =>
-      applyResolvedParams(plugins, await runHook(plugins, (hooks) => hooks["chat.params"], input, output)),
-    chatHeaders: async (input, output) =>
-      applyResolvedHeaders(plugins, await runHook(plugins, (hooks) => hooks["chat.headers"], input, output)),
-    toolBefore: (input, output) =>
-      forwardHook(plugins, (hooks) => hooks["tool.execute.before"], "tool.execute.before", input, output, options),
-    toolAfter: (input, output) =>
-      forwardHook(plugins, (hooks) => hooks["tool.execute.after"], "tool.execute.after", input, output, options),
+    // `chat.params` / `chat.headers` must resolve against the model of THIS
+    // request: a session can switch models mid-run, so the init-resolved diff is
+    // only a degraded-boot fallback. With a hub bridge the real hook runs per
+    // request and its returned mutation is applied to the caller's object.
+    chatParams: async (input, output) => {
+      const local = await runHook(plugins, (hooks) => hooks["chat.params"], input, output)
+      const forward = options?.hubHook
+      if (forward === undefined) return applyResolvedParams(plugins, local)
+      return applyInPlace(local, await forward("chat.params", input, local))
+    },
+    chatHeaders: async (input, output) => {
+      const local = await runHook(plugins, (hooks) => hooks["chat.headers"], input, output)
+      const forward = options?.hubHook
+      if (forward === undefined) return applyResolvedHeaders(plugins, local)
+      return applyInPlace(local, await forward("chat.headers", input, local))
+    },
+    toolBefore: async (input, output) =>
+      applyToolBefore(
+        output,
+        await forwardHook(
+          plugins,
+          (hooks) => hooks["tool.execute.before"],
+          "tool.execute.before",
+          input,
+          output,
+          options,
+        ),
+      ),
+    toolAfter: async (input, output) =>
+      applyInPlace(
+        output,
+        await forwardHook(
+          plugins,
+          (hooks) => hooks["tool.execute.after"],
+          "tool.execute.after",
+          input,
+          output,
+          options,
+        ),
+      ),
+    chatMessage: async (input, output) =>
+      applyChatMessage(
+        output,
+        await forwardHook(plugins, (hooks) => hooks["chat.message"], "chat.message", input, output, options),
+      ),
     // Plugin function hooks run first (registration order), then the injected
     // hub-resolved transform; absent both, the output passes through unchanged.
     systemTransform: async (input, output) => {
-      const transformed = await runHook(
-        plugins,
-        (hooks) => hooks["experimental.chat.system.transform"],
-        input,
-        output,
-      )
+      const transformed = await runHook(plugins, (hooks) => hooks["experimental.chat.system.transform"], input, output)
       if (options?.systemTransform !== undefined) return options.systemTransform(input, transformed)
       return forwardHook(plugins, () => undefined, "experimental.chat.system.transform", input, transformed, options)
     },
@@ -296,12 +424,17 @@ export function createWorkerPluginHost(
       if (options?.messagesTransform !== undefined) return options.messagesTransform(input, transformed)
       return forwardHook(plugins, () => undefined, "experimental.chat.messages.transform", input, transformed, options)
     },
-    shellEnv: (input, output) =>
-      forwardHook(plugins, (hooks) => hooks["shell.env"], "shell.env", input, output, options),
+    shellEnv: async (input, output) =>
+      applyInPlace(
+        output,
+        await forwardHook(plugins, (hooks) => hooks["shell.env"], "shell.env", input, output, options),
+      ),
     // `parameters` is an Effect Schema on the worker, which cannot cross the
     // isolate. The hook's model-facing effect is description + JSON schema, so
     // those (clone-safe) fields are forwarded; the worker's local `parameters`
     // stays authoritative. The real plugin still runs on the hub, never here.
+    // The result is applied to the caller's object in place: the registry reads
+    // `output` after the trigger and ignores the returned value.
     toolDefinition: async (input, output) => {
       const local = await runHook(plugins, (hooks) => hooks["tool.definition"], input, output)
       const forward = options?.hubHook
@@ -310,11 +443,11 @@ export function createWorkerPluginHost(
         description: local.description,
         jsonSchema: local.jsonSchema,
       })) as { readonly description?: unknown; readonly jsonSchema?: unknown }
-      return {
+      return applyInPlace(local, {
         ...local,
         description: typeof result.description === "string" ? result.description : local.description,
         jsonSchema: "jsonSchema" in result ? result.jsonSchema : local.jsonSchema,
-      }
+      })
     },
   }
 }

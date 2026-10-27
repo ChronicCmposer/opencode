@@ -23,7 +23,7 @@ import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import * as HttpSessionError from "../../src/server/routes/instance/httpapi/handlers/session-errors"
 import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/groups/experimental"
 import { AbortOutcome, SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
-import { toAbortOutcome } from "../../src/server/routes/instance/httpapi/handlers/session"
+import { resolveAbortOutcome, toAbortOutcome } from "../../src/server/routes/instance/httpapi/handlers/session"
 import { Session } from "@/session/session"
 import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from "../../src/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
@@ -441,6 +441,49 @@ describe("session HttpApi", () => {
         winner: "cancel",
         acknowledged: false,
         durationMs: 5001,
+      })
+    }),
+  )
+
+  it.effect("projects a first-boot cancel as a typed abort outcome", () =>
+    Effect.sync(() => {
+      const sessionID = SessionID.descending()
+      const outcome = toAbortOutcome({
+        sessionID,
+        mode: "boot",
+        winner: "cancel",
+        acknowledged: true,
+        durationMs: 3,
+      })
+
+      expect(Schema.encodeSync(AbortOutcome)(outcome)).toEqual({
+        sessionID,
+        mode: "boot",
+        winner: "cancel",
+        acknowledged: true,
+        durationMs: 3,
+      })
+    }),
+  )
+
+  it.effect("the abort handler entrypoint preserves the typed boot outcome", () =>
+    Effect.sync(() => {
+      const sessionID = SessionID.descending()
+      const outcome = resolveAbortOutcome(sessionID, {
+        sessionID,
+        mode: "boot",
+        winner: "cancel",
+        acknowledged: true,
+        durationMs: 7,
+      })
+
+      expect(outcome.mode).toBe("boot")
+      expect(Schema.encodeSync(AbortOutcome)(outcome)).toEqual({
+        sessionID,
+        mode: "boot",
+        winner: "cancel",
+        acknowledged: true,
+        durationMs: 7,
       })
     }),
   )

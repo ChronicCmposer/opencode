@@ -74,11 +74,11 @@ const resolve = (hooks: Record<string, unknown>) =>
 
 describe("worker plugin hook admission", () => {
   test("rejects an unsupported hook added after startup", async () => {
-    const result = await resolve({ "chat.message": async () => {} })
+    const result = await resolve({ "command.execute.before": async () => {} })
     expect(result._tag).toBe("Failure")
     if (result._tag !== "Failure") throw new Error("expected admission failure")
     expect(result.failure).toBeInstanceOf(UnsupportedPluginHookError)
-    expect((result.failure as UnsupportedPluginHookError).hook).toBe("chat.message")
+    expect((result.failure as UnsupportedPluginHookError).hook).toBe("command.execute.before")
   })
 
   test("rejects an unclassified hook added after startup", async () => {
@@ -104,11 +104,12 @@ describe("worker plugin hook admission", () => {
     const result = await resolve({
       "tool.execute.before": async () => {},
       "shell.env": async () => {},
+      "chat.message": async () => {},
     })
     expect(result._tag).toBe("Success")
     if (result._tag !== "Success") throw new Error("expected admission")
     expect(result.success.plugins?.[0]?.proxied).toEqual(
-      expect.arrayContaining(["tool.execute.before", "shell.env"]),
+      expect.arrayContaining(["tool.execute.before", "shell.env", "chat.message"]),
     )
   })
 

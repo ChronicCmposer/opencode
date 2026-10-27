@@ -5,19 +5,23 @@
 // are exercised in-process here.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
+import { Database } from "bun:sqlite"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { Effect, Latch, Layer, Option, Schema, Sink, Stream } from "effect"
+import { DateTime, Effect, Latch, Layer, Option, Schema, Sink, Stream } from "effect"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { openConnection } from "@opencode-ai/core/database/connection"
+import { Database as DatabaseService } from "@opencode-ai/core/database/database"
 import { AppProcess } from "@opencode-ai/core/process"
 import { RipgrepBinary } from "@opencode-ai/core/ripgrep/binary"
 import { workerAppProcessLayer } from "@/session/worker/app-process-report"
 import { ShellTool } from "@/tool/shell"
 import { EventV2 } from "@opencode-ai/core/event"
+import { Event } from "@opencode-ai/schema/event"
+import { SessionEvent } from "@opencode-ai/schema/session-event"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { BackgroundJob } from "@/background/job"
@@ -55,6 +59,7 @@ import {
   createBackgroundWorkProbe,
   createControlPidReporter,
   createSessionWork,
+  createWorkerDatabaseWriter,
   createWorkRegistry,
   hasRunningBackgroundJob,
   parseSessionWorkerInit,
@@ -65,6 +70,7 @@ import {
   writerReadMessages,
   type SessionWorkerInit,
   type SessionWorkerModel,
+  type WorkerWriterClient,
 } from "@/session/worker/session-worker"
 import { workerLogMessage } from "@/session/worker/log"
 import {
@@ -248,6 +254,90 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
     const { scope } = fakeScope()
     const handle = bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope)
     expect(Object.keys(handle)).toEqual(["dispose"])
+  })
+
+  test("a shutdown queued before boot is acknowledged before the DB/executor opens", () => {
+    const frames: Array<{ data: unknown; transfer: readonly Transferable[] }> = []
+    const scope = {
+      postMessage(data: unknown, transfer?: readonly Transferable[]) {
+        frames.push({ data, transfer: transfer ?? [] })
+      },
+      onmessage: null as ((event: { data: unknown }) => void) | null,
+      // Deliver the shutdown synchronously the moment the worker registers its
+      // listener. The listener must be registered before the DB opens, so this
+      // aborts the boot instead of losing the frame (or opening the WAL handle
+      // only to have the isolate terminated under it).
+      addEventListener(_type: "message", listener: (event: { data: unknown }) => void) {
+        listener({ data: { type: "shutdown", id: 7 } })
+      },
+      removeEventListener() {},
+    }
+
+    bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope)
+
+    const types = frameTypes(frames)
+    expect(types).toContain("shutdown-ack")
+    expect(types).not.toContain("ports")
+    expect(types).not.toContain("ready")
+    expect(frames.find((frame) => (frame.data as { type?: string }).type === "shutdown-ack")?.data).toEqual({
+      type: "shutdown-ack",
+      id: 7,
+    })
+  })
+
+  test("an orderly shutdown closes a pinned write transaction, a throwing disposal, and still acks", async () => {
+    const frames: Array<{ data: unknown; transfer: readonly Transferable[] }> = []
+    let listener: ((event: { data: unknown }) => void) | undefined
+    const scope = {
+      postMessage(data: unknown, transfer?: readonly Transferable[]) {
+        frames.push({ data, transfer: transfer ?? [] })
+      },
+      onmessage: null as ((event: { data: unknown }) => void) | null,
+      addEventListener(_type: "message", next: (event: { data: unknown }) => void) {
+        listener = next
+      },
+      removeEventListener() {},
+    }
+    let writer: WorkerWriterClient | undefined
+    const bootstrap = bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope, {
+      observeWriter: (handle) => {
+        writer = handle
+      },
+      // A client whose disposal throws must not skip the WAL close or the ack.
+      observeHubProxy: (client) => {
+        client.dispose = () => {
+          throw new Error("hub proxy dispose boom")
+        }
+      },
+    })
+    try {
+      expect(writer).toBeDefined()
+      // Pin a real write transaction on the worker's own WAL connection.
+      await writer!.begin()
+      listener?.({ data: { type: "shutdown", id: 21 } })
+      expect(frameTypes(frames)).toContain("shutdown-ack")
+      expect(frames.find((frame) => (frame.data as { type?: string }).type === "shutdown-ack")?.data).toEqual({
+        type: "shutdown-ack",
+        id: 21,
+      })
+      // The close rolled the pinned transaction back and released the handle, so
+      // a fresh connection can take the write lock without SQLITE_BUSY.
+      const probe = new Database(Flag.OPENCODE_DB as string)
+      try {
+        probe.exec("PRAGMA busy_timeout = 0")
+        expect(() => probe.exec("BEGIN IMMEDIATE")).not.toThrow()
+        probe.exec("ROLLBACK")
+      } finally {
+        probe.close()
+      }
+    } finally {
+      for (const frame of frames) {
+        for (const value of Object.values(frame.data as Record<string, unknown>)) {
+          if (value instanceof MessagePort) value.close()
+        }
+      }
+      bootstrap.dispose()
+    }
   })
 
   test("degrades to the reduced pipeline without the capability", () => {
@@ -437,6 +527,65 @@ describe("buildWorkerClients (step 22)", () => {
       for (const entry of connected) expect(entry.fields.workerID).toBe(4)
     } finally {
       clients.writer.dispose()
+    }
+  })
+})
+
+describe("worker database writer blob directory (D16)", () => {
+  const entries = (directory: string): string[] =>
+    fs.existsSync(directory) ? fs.readdirSync(directory).sort() : []
+
+  test("a custom-file worker publishes and removes oversized blobs in its own event-blobs", async () => {
+    // The fallback worker writer must derive D16 from the file it opened, never
+    // the global database. `Flag.OPENCODE_DB` is the suite's migrated global DB.
+    const globalBlobDir = path.join(path.dirname(Flag.OPENCODE_DB as string), "event-blobs")
+    const globalBefore = entries(globalBlobDir)
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-worker-blob-dir-"))
+    const filename = path.join(directory, "custom.db")
+    const setup = openConnection({ filename })
+    try {
+      for (const statement of migrationStatements) setup.exec(statement)
+      markSchemaIdentity(setup)
+    } finally {
+      setup.close()
+    }
+
+    const writer = createWorkerDatabaseWriter({ filename, workerID: 41 })
+    try {
+      const aggregateID = "session-blob-dir"
+      const published = await writer.publish({
+        id: Event.ID.create(),
+        type: SessionEvent.AgentSwitched.type,
+        aggregateID,
+        data: {
+          timestamp: DateTime.makeUnsafe(Date.now()),
+          sessionID: aggregateID,
+          messageID: "msg_blob_dir",
+          agent: `oversized:${"x".repeat(17 * 1024 * 1024)}`,
+        },
+      })
+      expect(published.committed).toBe(true)
+
+      const ownBlobDir = path.join(directory, "event-blobs")
+      expect(entries(ownBlobDir)).toHaveLength(1)
+      // The global database's sibling directory must never receive this file.
+      expect(entries(globalBlobDir)).toEqual(globalBefore)
+
+      // The production EventV2 deletion path over the same custom file collects
+      // the blob this worker published, again without touching the global dir.
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const events = yield* EventV2.Service
+            yield* events.remove(aggregateID)
+          }).pipe(Effect.provide(EventV2.layerWith()), Effect.provide(DatabaseService.layerFromPath(filename))),
+        ),
+      )
+      expect(entries(ownBlobDir)).toEqual([])
+      expect(entries(globalBlobDir)).toEqual(globalBefore)
+    } finally {
+      writer.dispose()
+      fs.rmSync(directory, { recursive: true, force: true })
     }
   })
 })

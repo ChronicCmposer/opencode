@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs"
+import type { Connection, WriteOutcome } from "@opencode-ai/core/database/connection"
+import { connectedRepository, type RepositoryValues, type WorkerRepository } from "@/session/worker/repository"
 import { LEDGER_SQL_FALLBACK } from "./sql/fallback.gen"
 
 export const TOOL_CALL_STATES = ["started", "finished", "indeterminate"] as const
@@ -6,15 +8,18 @@ export const TOOL_CALL_STATES = ["started", "finished", "indeterminate"] as cons
 export type ToolCallState = (typeof TOOL_CALL_STATES)[number]
 
 /**
- * The ledger's connection surface. It is deliberately structural: the Bus
- * connection, the worker WAL connection, and a transaction handle all satisfy it,
- * so a finish can run inside the same transaction as its durable result.
+ * The ledger's raw connection shape. It remains the hub/test seam (and the
+ * crash ledger's connection), but the tool-call writes themselves go through
+ * the typed repository: a `WorkerRepository` is the worker's only write path.
  */
-export interface LedgerConnection {
-  all(sql: string, params?: ReadonlyArray<unknown>): ReadonlyArray<Record<string, unknown>>
-  run(sql: string, params?: ReadonlyArray<unknown>): { readonly changes: number }
-  exec(sql: string): void
-}
+export type LedgerConnection = Connection
+
+/**
+ * The typed ledger surface. `WorkerRepository` is the worker's write path;
+ * `LedgerConnection` is accepted only so the hub and the ledger's unit tests can
+ * build an unbound repository over their own connection.
+ */
+export type ToolCallLedgerSource = WorkerRepository | LedgerConnection
 
 /**
  * The hub-only schema. A worker never executes DDL; tests and the migration
@@ -99,111 +104,136 @@ function rowFromRecord(record: Record<string, unknown>): ToolCallRow {
     state,
     outcome: record.outcome === null || record.outcome === undefined ? null : String(record.outcome),
     timeStarted: Number(record.time_started),
-    timeFinished: record.time_finished === null || record.time_finished === undefined ? null : Number(record.time_finished),
+    timeFinished:
+      record.time_finished === null || record.time_finished === undefined ? null : Number(record.time_finished),
   }
+}
+
+function isTypedRepository(source: ToolCallLedgerSource): source is WorkerRepository {
+  return "insert" in source && typeof source.insert === "function"
+}
+
+/**
+ * Resolve the typed write surface: a worker repository, or an unbound repository
+ * over a raw connection. Both carry the same savepoint-scoped `atomic`.
+ */
+function repositoryFor(source: ToolCallLedgerSource): WorkerRepository {
+  if (isTypedRepository(source)) return source
+  return connectedRepository(source)
+}
+
+function stored(repository: WorkerRepository, callID: string, sessionID: string): Record<string, unknown> {
+  const row = repository.select("tool_call", { call_id: callID, session_id: sessionID })[0]
+  if (row === undefined) throw new ToolCallLedgerError(`tool call ${callID} disappeared`)
+  return row as Record<string, unknown>
+}
+
+function startWith(repository: WorkerRepository, input: StartInput): ToolCallRow {
+  const callID = requireText(input.callID, "callID")
+  const sessionID = requireText(input.sessionID, "sessionID")
+  const tool = requireText(input.tool, "tool")
+  const where: RepositoryValues<"tool_call"> = { call_id: callID, session_id: sessionID }
+  if (repository.select("tool_call", where).length > 0) throw new ToolCallAlreadyStartedError(callID, sessionID)
+  repository.insert("tool_call", {
+    call_id: callID,
+    session_id: sessionID,
+    tool,
+    side_effecting: input.sideEffecting === false ? 0 : 1,
+    state: "started",
+    outcome: null,
+    time_started: input.timeStarted ?? Date.now(),
+  })
+  return rowFromRecord(stored(repository, callID, sessionID))
+}
+
+function finishWith(repository: WorkerRepository, input: FinishInput): ToolCallRow {
+  const callID = requireText(input.callID, "callID")
+  const sessionID = requireText(input.sessionID, "sessionID")
+  const outcome = requireText(input.outcome, "outcome")
+  const changed: WriteOutcome = repository.update(
+    "tool_call",
+    { state: "finished", outcome, time_finished: input.timeFinished ?? Date.now() },
+    { call_id: callID, session_id: sessionID, state: "started" },
+  )
+  if (changed.changes !== 1) throw new ToolCallNotStartedError(callID, sessionID)
+  return rowFromRecord(stored(repository, callID, sessionID))
 }
 
 /**
  * Mark a call started before its effect begins. A duplicate `(call_id, session)`
  * fails loud: replaying the effect is never the recovery path.
  */
-export function start(connection: LedgerConnection, input: StartInput): ToolCallRow {
-  const callID = requireText(input.callID, "callID")
-  const sessionID = requireText(input.sessionID, "sessionID")
-  const tool = requireText(input.tool, "tool")
-  const existing = connection.all("SELECT call_id FROM tool_call WHERE call_id = ? AND session_id = ?", [
-    callID,
-    sessionID,
-  ])
-  if (existing.length > 0) throw new ToolCallAlreadyStartedError(callID, sessionID)
-  connection.run(
-    "INSERT INTO tool_call (call_id, session_id, tool, side_effecting, state, outcome, time_started) VALUES (?, ?, ?, ?, 'started', NULL, ?)",
-    [callID, sessionID, tool, input.sideEffecting === false ? 0 : 1, input.timeStarted ?? Date.now()],
-  )
-  const stored = connection.all("SELECT * FROM tool_call WHERE call_id = ? AND session_id = ?", [callID, sessionID])[0]
-  if (stored === undefined) throw new ToolCallLedgerError(`tool call ${callID} disappeared after start`)
-  return rowFromRecord(stored)
+export function start(source: ToolCallLedgerSource, input: StartInput): ToolCallRow {
+  return startWith(repositoryFor(source), input)
 }
 
 /**
- * Finish a started call. This statement is meant to run inside the same
- * transaction as the durable result; use {@link finishWithResult} when the result
- * needs a transaction the ledger owns.
+ * Finish a started call. This write joins whatever transaction the worker's one
+ * connection already owns; use {@link finishWithResult} when the result needs a
+ * transaction the ledger owns.
  */
-export function finish(connection: LedgerConnection, input: FinishInput): ToolCallRow {
-  const callID = requireText(input.callID, "callID")
-  const sessionID = requireText(input.sessionID, "sessionID")
-  const outcome = requireText(input.outcome, "outcome")
-  const changed = connection.run(
-    "UPDATE tool_call SET state = 'finished', outcome = ?, time_finished = ? WHERE call_id = ? AND session_id = ? AND state = 'started'",
-    [outcome, input.timeFinished ?? Date.now(), callID, sessionID],
-  )
-  if (changed.changes !== 1) throw new ToolCallNotStartedError(callID, sessionID)
-  const stored = connection.all("SELECT * FROM tool_call WHERE call_id = ? AND session_id = ?", [callID, sessionID])[0]
-  if (stored === undefined) throw new ToolCallLedgerError(`tool call ${callID} disappeared after finish`)
-  return rowFromRecord(stored)
+export function finish(source: ToolCallLedgerSource, input: FinishInput): ToolCallRow {
+  return finishWith(repositoryFor(source), input)
 }
-
-/** Distinguishes concurrent savepoints on one connection. */
-let savepointSequence = 0
 
 /**
  * Run the result write and the ledger finish atomically. A failure anywhere rolls
  * both back, so a crash between them leaves the orphaned `started` row instead of
  * a finished call whose result was lost.
  *
- * The pair is scoped with a `SAVEPOINT`, never a raw `BEGIN`/`COMMIT`: the worker
- * connection is shared with the Drizzle transaction abstraction, and another
- * fiber may already own an open transaction. A savepoint composes with that
- * owner (it never nests or commits it); with no outer transaction, `RELEASE`
- * commits the pair itself. This is the same serialized connection the durable
- * result uses, so the result and `tool_call.finished` cannot diverge.
+ * The scope comes from the repository's savepoint capability, never a raw
+ * `BEGIN`/`COMMIT`: the worker connection is shared with the durable result
+ * transaction, and a nested savepoint composes with that owner. With no outer
+ * transaction the scope commits the pair itself.
  */
-export function finishWithResult<T>(connection: LedgerConnection, input: FinishInput, result: () => T): T {
-  const savepoint = `tool_call_finish_${++savepointSequence}`
-  connection.exec(`SAVEPOINT ${savepoint}`)
-  try {
-    finish(connection, input)
-    const value = result()
-    connection.exec(`RELEASE ${savepoint}`)
-    return value
-  } catch (error) {
-    // Restore the savepoint's starting state without ever touching an outer
-    // transaction. The original failure is the one the caller must see.
-    try {
-      connection.exec(`ROLLBACK TO ${savepoint}`)
-      connection.exec(`RELEASE ${savepoint}`)
-    } catch {
-      // A failed rollback leaves the outer transaction's fate with its owner.
-    }
-    throw error
-  }
+function finishWithResultWith<T>(repository: WorkerRepository, input: FinishInput, result: () => T): T {
+  return repository.atomic(() => {
+    finishWith(repository, input)
+    return result()
+  })
+}
+
+export function finishWithResult<T>(source: ToolCallLedgerSource, input: FinishInput, result: () => T): T {
+  return finishWithResultWith(repositoryFor(source), input, result)
 }
 
 /** Calls still in `started`: indeterminate work that is never auto-retried. */
-export function indeterminate(connection: LedgerConnection, sessionID: string): readonly ToolCallRow[] {
-  return connection
-    .all("SELECT * FROM tool_call WHERE session_id = ? AND state = 'started' ORDER BY time_started, call_id", [
-      requireText(sessionID, "sessionID"),
-    ])
-    .map((record) => ({ ...rowFromRecord(record), state: "indeterminate" as const }))
+function indeterminateWith(repository: WorkerRepository, sessionID: string): readonly ToolCallRow[] {
+  const required = requireText(sessionID, "sessionID")
+  const rows = repository
+    .select("tool_call", { session_id: required, state: "started" })
+    .map((record) => ({ ...rowFromRecord(record as Record<string, unknown>), state: "indeterminate" as const }))
+  return rows.sort((left, right) => left.timeStarted - right.timeStarted || left.callID.localeCompare(right.callID))
 }
 
-export function list(connection: LedgerConnection, sessionID: string): readonly ToolCallRow[] {
-  return connection
-    .all("SELECT * FROM tool_call WHERE session_id = ? ORDER BY time_started, call_id", [
-      requireText(sessionID, "sessionID"),
-    ])
-    .map(rowFromRecord)
+export function indeterminate(source: ToolCallLedgerSource, sessionID: string): readonly ToolCallRow[] {
+  return indeterminateWith(repositoryFor(source), sessionID)
 }
 
-export function hasSideEffectingStarted(connection: LedgerConnection, sessionID: string): boolean {
+function listWith(repository: WorkerRepository, sessionID: string): readonly ToolCallRow[] {
+  const required = requireText(sessionID, "sessionID")
+  const rows = repository
+    .select("tool_call", { session_id: required })
+    .map((record) => rowFromRecord(record as Record<string, unknown>))
+  return rows.sort((left, right) => left.timeStarted - right.timeStarted || left.callID.localeCompare(right.callID))
+}
+
+export function list(source: ToolCallLedgerSource, sessionID: string): readonly ToolCallRow[] {
+  return listWith(repositoryFor(source), sessionID)
+}
+
+function hasSideEffectingStartedWith(repository: WorkerRepository, sessionID: string): boolean {
   return (
-    connection.all(
-      "SELECT 1 AS present FROM tool_call WHERE session_id = ? AND state = 'started' AND side_effecting = 1 LIMIT 1",
-      [requireText(sessionID, "sessionID")],
-    ).length > 0
+    repository.select("tool_call", {
+      session_id: requireText(sessionID, "sessionID"),
+      state: "started",
+      side_effecting: 1,
+    }).length > 0
   )
+}
+
+export function hasSideEffectingStarted(source: ToolCallLedgerSource, sessionID: string): boolean {
+  return hasSideEffectingStartedWith(repositoryFor(source), sessionID)
 }
 
 export interface ToolCallLedgerHandle {
@@ -215,14 +245,15 @@ export interface ToolCallLedgerHandle {
   readonly hasSideEffectingStarted: (sessionID: string) => boolean
 }
 
-export function createToolCallLedger(connection: LedgerConnection): ToolCallLedgerHandle {
+export function createToolCallLedger(source: ToolCallLedgerSource): ToolCallLedgerHandle {
+  const repository = repositoryFor(source)
   return {
-    start: (input) => start(connection, input),
-    finish: (input) => finish(connection, input),
-    finishWithResult: (input, result) => finishWithResult(connection, input, result),
-    indeterminate: (sessionID) => indeterminate(connection, sessionID),
-    list: (sessionID) => list(connection, sessionID),
-    hasSideEffectingStarted: (sessionID) => hasSideEffectingStarted(connection, sessionID),
+    start: (input) => startWith(repository, input),
+    finish: (input) => finishWith(repository, input),
+    finishWithResult: (input, result) => finishWithResultWith(repository, input, result),
+    indeterminate: (sessionID) => indeterminateWith(repository, sessionID),
+    list: (sessionID) => listWith(repository, sessionID),
+    hasSideEffectingStarted: (sessionID) => hasSideEffectingStartedWith(repository, sessionID),
   }
 }
 

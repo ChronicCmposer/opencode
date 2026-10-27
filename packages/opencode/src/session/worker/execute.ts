@@ -479,6 +479,13 @@ export interface ExecutorSessionWorker {
    * Kept distinct from `assertNotBusy`, which gates a new prompt.
    */
   hasActiveWork?(sessionID: SessionID): Promise<boolean>
+  /**
+   * Cancel a worker that is still booting (the spawn permit is held, the ready
+   * handshake has not started the run). Resolves the typed boot outcome, or
+   * `undefined` when the run already started. Optional so minimal test fakes
+   * remain valid; `createExecutorWorker` always provides it.
+   */
+  cancelBoot?(): Promise<BootCancelResult | undefined>
 }
 
 /** The transport the hub adapter needs; a worker harness handle satisfies it. */
@@ -522,12 +529,6 @@ export interface ExecutorWorker extends ExecutorSessionWorker {
    * remain valid; `createExecutorWorker` always provides it.
    */
   readonly cancelPort?: CancelPort
-  /**
-   * Cancel a worker that is still booting (the spawn permit is held, the ready
-   * handshake has not started the run). Resolves the typed boot outcome, or
-   * `undefined` when the run already started. Optional so test fakes remain valid.
-   */
-  cancelBoot?(): Promise<BootCancelResult | undefined>
   /**
    * Per-session write barrier (R4#16): resolves once the run's durable egress
    * write is acked. The dispatcher awaits it before releasing the worker to its
@@ -1034,6 +1035,10 @@ export function createSessionDispatch(options: SessionDispatchOptions): SessionD
   }
 
   const assertNotBusy = async (sessionID: SessionID): Promise<boolean> => {
+    // A registry reservation (including a run still queued in `cap.acquire`)
+    // means the session owns a run even before it has a materialized isolate.
+    // The worker-local probe cannot see that queue, so it would report idle.
+    if (options.dispatcher.registry.get(sessionID) !== undefined) return true
     const worker = workerFor(sessionID)
     return worker === undefined ? false : worker.assertNotBusy(sessionID)
   }

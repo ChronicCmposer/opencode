@@ -11,8 +11,9 @@ import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
+import { SessionScopeError } from "../session/worker/subagent"
 import { Config } from "@/config/config"
-import { Effect, Exit, Schema, Scope } from "effect"
+import { Cause, Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
@@ -143,9 +144,34 @@ export const TaskTool = Tool.define(
         return yield* Effect.fail(new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`))
       }
 
-      const session = params.task_id
-        ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-        : undefined
+      const session = !params.task_id
+        ? undefined
+        : yield* sessions.get(SessionID.make(params.task_id)).pipe(
+            Effect.catchCause((cause) => {
+              // A bound worker's hub-scoped read refuses a foreign, sibling,
+              // ancestor or grandchild row. That is a scope rejection, not a
+              // missing session: never turn it into a fresh child.
+              if (Cause.squash(cause) instanceof SessionScopeError) {
+                return Effect.fail(
+                  new Error(
+                    `Task ${params.task_id} is not a direct child of this session; only direct children can be resumed`,
+                  ),
+                )
+              }
+              return Effect.succeed(undefined)
+            }),
+          )
+      // A resume may only reach a DIRECT child of this session. A descendant
+      // (grandchild) or a sibling is inside another run's authority; the hub
+      // spawn would reject it, but fail here before any permission ask or row
+      // work so the task never acts on an id it may not resume.
+      if (session !== undefined && session.parentID !== ctx.sessionID) {
+        return yield* Effect.fail(
+          new Error(
+            `Task ${params.task_id} is not a direct child of this session; only direct children can be resumed`,
+          ),
+        )
+      }
       const childPermission = deriveSubagentSessionPermission({
         parentSessionPermission: parent.permission ?? [],
         subagent: next,
@@ -169,6 +195,10 @@ export const TaskTool = Tool.define(
           parentID: ctx.sessionID,
           title: params.description + ` (@${next.name} subagent)`,
           agent: next.name,
+          // Stamp the depth the hub spawn will persist, before the child exists:
+          // a create that succeeds but whose spawn is refused still leaves a
+          // correctly-classified child, and the hub enforces the same value.
+          metadata: { depth: childDepth },
           permission: [
             ...childPermission,
             ...childToolDenies.filter(
@@ -275,13 +305,25 @@ export const TaskTool = Tool.define(
         )
       })
 
+      // The notification target is also the job id: a promoted job is only
+      // allowed to outlive this call once it has an id the parent can be
+      // notified through. No id means no background persistence.
+      const notificationID = nextSession.id
+      // The job always carries the id it would notify through; only promotion
+      // makes it outlive the call, so an unpromoted foreground job is consumed
+      // by its own wait while a background one has a durable notification key.
+      const jobMetadata = { ...metadata, notificationID }
+
+      const backgroundMetadata = {
+        ...metadata,
+        background: true,
+        jobId: notificationID,
+        notificationID,
+      }
+
       const updatedResult = () => ({
         title: params.description,
-        metadata: {
-          ...metadata,
-          background: true,
-          jobId: nextSession.id,
-        },
+        metadata: backgroundMetadata,
         output: renderOutput({
           sessionID: nextSession.id,
           state: "running",
@@ -290,13 +332,9 @@ export const TaskTool = Tool.define(
         }),
       })
 
-      const runningResult = (jobId: string) => ({
+      const runningResult = () => ({
         title: params.description,
-        metadata: {
-          ...metadata,
-          background: true,
-          jobId,
-        },
+        metadata: backgroundMetadata,
         output: renderOutput({
           sessionID: nextSession.id,
           state: "running",
@@ -305,22 +343,36 @@ export const TaskTool = Tool.define(
         }),
       })
 
-      const startJob = (work: Effect.Effect<string, unknown>) =>
-        background.start({
-          id: nextSession.id,
-          type: id,
-          title: params.description,
-          metadata,
-          parentID: ctx.sessionID,
-          onPromote: Effect.all([
-            ctx.metadata({
-              title: params.description,
-              metadata: { ...metadata, background: true, jobId: nextSession.id },
-            }),
-            notify(nextSession.id),
-          ]),
-          run: work.pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
-        })
+      // Every task is registered as a local job, foreground included, so the
+      // parent can promote an in-flight foreground subagent exactly as the
+      // historical SubagentJob contract allowed. Promotion installs the
+      // notification observer; an unpromoted foreground job settles and is
+      // consumed by the caller's own `wait`.
+      const startJob = (work: Effect.Effect<string, unknown>, options?: { rejectIfRunning?: boolean }) =>
+        background
+          .start({
+            id: nextSession.id,
+            type: id,
+            title: params.description,
+            metadata: jobMetadata,
+            parentID: ctx.sessionID,
+            ...(options?.rejectIfRunning === true ? { rejectIfRunning: true } : {}),
+            onPromote: Effect.all([
+              ctx.metadata({ title: params.description, metadata: backgroundMetadata }),
+              notify(notificationID),
+            ]),
+            run: work.pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
+          })
+          .pipe(
+            Effect.catchIf(
+              (error): error is BackgroundJob.JobAlreadyRunningError =>
+                error instanceof BackgroundJob.JobAlreadyRunningError,
+              (error) =>
+                Effect.fail(
+                  new Error(`task session ${error.id} is already running; wait for it to finish before resuming`),
+                ),
+            ),
+          )
 
       // A background child outlives this tool call, so the abort listener must be
       // installed before the early return — or a parent abort would leave the
@@ -349,11 +401,23 @@ export const TaskTool = Tool.define(
       // parent is notified through the existing background machinery. Foreground
       // awaits the spawn directly.
       if (runInBackground) {
-        if (yield* background.extend({ id: nextSession.id, run: runSpawn() })) return updatedResult()
+        if (yield* background.extend({ id: nextSession.id, run: runSpawn() })) {
+          // A foreground job has no background notification observer yet.
+          // Promote it through the same single `onPromote` path Ctrl+B uses:
+          // notifying here directly would let a later promotion deliver a
+          // second completion injection, and promotion also stamps the job as
+          // `background: true` for the hub mirror.
+          const extended = yield* background.get(nextSession.id)
+          if (extended && extended.metadata?.background !== true) {
+            yield* background.promote(nextSession.id)
+            yield* awaitBackgroundAbort()
+          }
+          return updatedResult()
+        }
         const info = yield* startJob(runSpawn())
-        yield* notify(info.id)
+        yield* notify(notificationID)
         yield* awaitBackgroundAbort()
-        return runningResult(info.id)
+        return runningResult()
       }
 
       const runCancel = yield* EffectBridge.make()
@@ -368,16 +432,52 @@ export const TaskTool = Tool.define(
           ctx.abort.addEventListener("abort", onAbort)
         }),
         () =>
-          runSpawn().pipe(
-            Effect.map((text) => ({
+          Effect.gen(function* () {
+            const info = yield* startJob(runSpawn(), { rejectIfRunning: true })
+            // Foreground races the child's own settlement against a promotion
+            // signal. `waitForPromotion` only resolves for a running job that a
+            // parent explicitly backgrounded; otherwise the wait wins.
+            const outcome = yield* Effect.raceFirst(
+              background
+                .wait({ id: info.id })
+                .pipe(Effect.map((waited) => ({ promoted: false as const, info: waited.info }))),
+              background
+                .waitForPromotion(info.id)
+                .pipe(Effect.map((promoted) => ({ promoted: true as const, info: promoted }))),
+            )
+            if (outcome.promoted || outcome.info?.metadata?.background === true) {
+              if (outcome.info?.id === undefined) {
+                return yield* Effect.fail(
+                  new Error("Background promotion has no notificationID; refusing to persist the subagent"),
+                )
+              }
+              // The foreground abort listener is removed when this tool call
+              // returns; a promoted child keeps running, so re-install the
+              // background listener or a later parent abort would orphan it.
+              yield* awaitBackgroundAbort()
+              return runningResult()
+            }
+            if (outcome.info?.status === "error") {
+              return yield* Effect.fail(new Error(outcome.info.error ?? "Task failed"))
+            }
+            if (outcome.info?.status === "cancelled") {
+              return yield* Effect.fail(new Error("Task cancelled"))
+            }
+            return {
               title: params.description,
               metadata,
-              output: renderOutput({ sessionID: nextSession.id, state: "completed", text }),
-            })),
-          ),
+              output: renderOutput({
+                sessionID: nextSession.id,
+                state: "completed",
+                text: outcome.info?.output ?? "",
+              }),
+            }
+          }),
         (_, exit) =>
           Effect.gen(function* () {
-            if (Exit.hasInterrupts(exit)) yield* cancel
+            if (Exit.hasInterrupts(exit)) {
+              yield* Effect.all([cancel, background.cancel(nextSession.id)], { discard: true })
+            }
           }).pipe(
             Effect.ensuring(
               Effect.sync(() => {

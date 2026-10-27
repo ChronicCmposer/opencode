@@ -29,11 +29,14 @@ import {
   createSessionHubLayer,
   createWorkerCancellation,
   describeSessionWorkerEntry,
+  DEFAULT_RUN_IDLE_TIMEOUT_MS,
   fallbackInstanceContext,
   makeSessionHubNode,
   productionSessionHubLayer,
   productionSessionHubNode,
+  resolveRunIdleTimeoutMs,
   resolveSessionWorkerEntry,
+  runIdleTimeoutWarning,
   serveEventsPort,
   spawnBunExecutorWorker,
   SESSION_CANCELLED_TYPE,
@@ -896,8 +899,18 @@ describe("42 crash/respawn end-to-end", () => {
       })
 
       const workerID = hub.dispatcher.registry.get(sid("ses_crash"))!.workerID!
+      // Attach the rejection handler before terminating: the orderly close takes
+      // a bounded tick, so an unobserved rejection would be reported as unhandled.
+      const crashed = first.then(
+        () => {
+          throw new Error("expected the killed run to reject")
+        },
+        (error: unknown) => {
+          expect(error).toBeInstanceOf(WorkerCrashedError)
+        },
+      )
       await pool.byID(workerID)!.terminate()
-      await expect(first).rejects.toBeInstanceOf(WorkerCrashedError)
+      await crashed
 
       const second = hub.dispatcher.dispatch({ sessionID: sid("ses_respawn"), depth: 0 })
       await pollUntil(() => hub.dispatcher.registry.get(sid("ses_respawn"))?.state === "running", {
@@ -1829,6 +1842,9 @@ describe("W4 plugin effect shipping", () => {
       const layer = productionSessionHubLayer({
         count: 1,
         poolFactory,
+        // This fake pool never transfers a hub-proxy port, so the worker has no
+        // per-request bridge and the init must ship the resolved boot diff.
+        ports: {},
         plugins: async () => [
           {
             name: "sampling",
@@ -2088,6 +2104,9 @@ describe("Fix 2 real plugin hook input", () => {
       const layer = productionSessionHubLayer({
         count: 1,
         poolFactory,
+        // This fake pool never transfers a hub-proxy port, so the worker has no
+        // per-request bridge and the init must resolve the boot diff eagerly.
+        ports: {},
         plugins: async () => [
           {
             name: "request",
@@ -2450,6 +2469,49 @@ describe("liveness watchdog wiring", () => {
     expect(resolveSessionWorkerIdleTimeoutMs({ env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "-5" } })).toBe(0)
     expect(resolveSessionWorkerIdleTimeoutMs({ env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "abc" } })).toBe(0)
     expect(resolveSessionWorkerIdleTimeoutMs({ env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "  " } })).toBe(0)
+  })
+
+  test("the default-on watchdog resolves malformed env to 60s, only explicit 0 disables, and it warns", () => {
+    expect(resolveRunIdleTimeoutMs({ env: {} })).toBe(DEFAULT_RUN_IDLE_TIMEOUT_MS)
+    expect(resolveRunIdleTimeoutMs({ env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "250" } })).toBe(250)
+    expect(resolveRunIdleTimeoutMs({ env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "0" } })).toBe(0)
+    expect(resolveRunIdleTimeoutMs({ env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "-5" } })).toBe(
+      DEFAULT_RUN_IDLE_TIMEOUT_MS,
+    )
+    expect(resolveRunIdleTimeoutMs({ env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "abc" } })).toBe(
+      DEFAULT_RUN_IDLE_TIMEOUT_MS,
+    )
+    expect(resolveRunIdleTimeoutMs({ env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "1.5" } })).toBe(
+      DEFAULT_RUN_IDLE_TIMEOUT_MS,
+    )
+    // A malformed override warns with the raw value and the safe fallback;
+    // absent/empty/valid/0 stay quiet.
+    expect(runIdleTimeoutWarning({ env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "abc" } })).toContain(
+      `invalid ${SESSION_WORKER_IDLE_TIMEOUT_ENV}: abc`,
+    )
+    expect(runIdleTimeoutWarning({ env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "0" } })).toBeUndefined()
+    expect(runIdleTimeoutWarning({ env: {} })).toBeUndefined()
+    expect(runIdleTimeoutWarning({ runIdleTimeoutMs: 0, env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "abc" } })).toBeUndefined()
+  })
+
+  test("createBunExecutorWorkerPool resolves the env override instead of passing undefined", async () => {
+    await withGlobalFakeWorker(async () => {
+      const pool = createBunExecutorWorkerPool({
+        entry: "fake://idle-default",
+        workKind: "instant",
+        env: { [SESSION_WORKER_IDLE_TIMEOUT_ENV]: "25" },
+      })
+      try {
+        const worker = pool.spawn()
+        // The fake never replies. Before the fix this factory forwarded
+        // `runIdleTimeoutMs: undefined`, disabling the watchdog (0) and hanging.
+        await expect(worker.execute({ sessionID: sid("ses_idle_default"), depth: 0 })).rejects.toBeInstanceOf(
+          SessionWorkerReplyTimeoutError,
+        )
+      } finally {
+        await pool.terminateAll()
+      }
+    })
   })
 
   test("createProductionWorkerPool threads runIdleTimeoutMs into the spawned worker", async () => {

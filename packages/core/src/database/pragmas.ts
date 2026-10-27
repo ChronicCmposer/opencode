@@ -17,6 +17,16 @@ export const DEFAULT_CHECKPOINT_INTERVAL_MS = 5 * 60 * 1000
 /** Default driver-level `busy_timeout` applied immediately after open. */
 export const DEFAULT_BUSY_TIMEOUT_MS = 5000
 
+/**
+ * Default page-cache budget for the hub's connection (64 MiB). A per-session
+ * worker connection must not inherit this: eight workers would reserve half a
+ * gigabyte of page cache. Worker connections use {@link DEFAULT_WORKER_CACHE_SIZE_KIB}.
+ */
+export const DEFAULT_CACHE_SIZE_KIB = 64_000
+
+/** Default page-cache budget for one per-session worker connection (8 MiB). */
+export const DEFAULT_WORKER_CACHE_SIZE_KIB = 8_192
+
 export interface WalConfig {
   readonly journalSizeLimitBytes: number
   readonly checkpointIntervalMs: number
@@ -49,6 +59,15 @@ export function resolveWalConfig(env: Environment = process.env): WalConfig {
   }
 }
 
+/**
+ * Page-cache budget for a per-session worker connection. `OPENCODE_DB_WORKER_CACHE_SIZE_KIB`
+ * overrides it; malformed/absent values fall back to 8 MiB, so a fleet of
+ * workers cannot multiply the hub's 64 MiB budget by the worker cap.
+ */
+export function resolveWorkerCacheSizeKib(env: Environment = process.env): number {
+  return parseInteger(env.OPENCODE_DB_WORKER_CACHE_SIZE_KIB, DEFAULT_WORKER_CACHE_SIZE_KIB, 1)
+}
+
 /** Bounded busy-retry budget for the main connection's SQL choke point. */
 export const DEFAULT_BUSY_RETRIES = 5
 export const DEFAULT_BUSY_BASE_DELAY_MS = 50
@@ -79,17 +98,24 @@ export function resolveBusyRetryConfig(env: Environment = process.env): BusyRetr
  * config (including `checkpointIntervalMs`, which the writer core consumes) and
  * override only the connection-specific busy timeout.
  */
-export type WalPragmaOptions = Partial<WalConfig>
+export interface WalPragmaOptions extends Partial<WalConfig> {
+  /** Page-cache budget in KiB; defaults to the hub budget (64 MiB). */
+  readonly cacheSizeKib?: number
+}
 
 /** Pragmas every connection applies immediately after open. */
 export function walPragmas(options: WalPragmaOptions = {}): string[] {
   const journalSizeLimitBytes = options.journalSizeLimitBytes ?? DEFAULT_JOURNAL_SIZE_LIMIT_BYTES
   const busyTimeoutMs = options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS
+  const cacheSizeKib = options.cacheSizeKib ?? DEFAULT_CACHE_SIZE_KIB
   return [
+    // Install the busy handler before switching the journal mode: the switch
+    // needs a lock, so without a timeout an open racing another handle's
+    // checkpoint fails immediately with SQLITE_BUSY instead of waiting.
+    `PRAGMA busy_timeout = ${busyTimeoutMs}`,
     "PRAGMA journal_mode = WAL",
     "PRAGMA synchronous = NORMAL",
-    `PRAGMA busy_timeout = ${busyTimeoutMs}`,
-    "PRAGMA cache_size = -64000",
+    `PRAGMA cache_size = -${cacheSizeKib}`,
     "PRAGMA foreign_keys = ON",
     `PRAGMA journal_size_limit = ${journalSizeLimitBytes}`,
   ]

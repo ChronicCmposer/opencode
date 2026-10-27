@@ -101,10 +101,14 @@ const AbortOutcomeCooperative = Schema.Struct({
 })
 const AbortOutcomeTerminated = abortOutcome("terminated", "cancel")
 const AbortOutcomeCompleted = abortOutcome("completed", "completion")
+// The first-boot cancel is its own typed outcome: the partial isolate was
+// aborted and the spawn permit released, so no run ever started.
+const AbortOutcomeBoot = abortOutcome("boot", "cancel")
 export const AbortOutcome = Schema.Union([
   AbortOutcomeCooperative,
   AbortOutcomeTerminated,
   AbortOutcomeCompleted,
+  AbortOutcomeBoot,
 ]).pipe(Schema.toTaggedUnion("mode"))
 
 export const SessionPaths = {

@@ -74,12 +74,14 @@ describe("worker hook route table", () => {
     expect(WORKER_HOOK_ROUTES["tool.definition"]).toBe("hub-proxy")
     expect(WORKER_HOOK_ROUTES["experimental.chat.system.transform"]).toBe("hub-proxy")
     expect(WORKER_HOOK_ROUTES["experimental.chat.messages.transform"]).toBe("hub-proxy")
+    // The worker prompt path invokes this on every message; the hub owns the
+    // plugin instance, so the trigger is proxied rather than rejected.
+    expect(WORKER_HOOK_ROUTES["chat.message"]).toBe("hub-proxy")
     // The hub resolves the small model before a worker exists; the worker never
     // dispatches this trigger.
     expect(WORKER_HOOK_ROUTES["experimental.provider.small_model"]).toBe("hub-proxy")
 
     for (const name of [
-      "chat.message",
       "command.execute.before",
       "experimental.session.compacting",
       "experimental.compaction.autocontinue",
@@ -97,9 +99,10 @@ describe("worker hook route table", () => {
   })
 
   test("an unsupported invoked hook is a typed admission failure", () => {
-    const error = pluginHookAdmissionError("configured", { "chat.message": async () => {} })
+    const error = pluginHookAdmissionError("configured", { "command.execute.before": async () => {} })
     expect(error).toBeInstanceOf(UnsupportedPluginHookError)
-    expect(error?.hook).toBe("chat.message")
+    expect(error?.hook).toBe("command.execute.before")
+    expect(pluginHookAdmissionError("configured", { "chat.message": async () => {} })).toBeUndefined()
   })
 
   test("an unclassified function hook throws instead of falling through", () => {

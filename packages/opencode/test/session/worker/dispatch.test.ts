@@ -1068,7 +1068,7 @@ describe("dead admission queue", () => {
   })
 
   test("the cancel vocabulary only lists reachable modes (no queued)", () => {
-    expect(CANCELLED_MODES).toEqual(["cooperative", "terminated", "completed"])
+    expect(CANCELLED_MODES).toEqual(["cooperative", "terminated", "completed", "boot"])
   })
 })
 
@@ -1173,6 +1173,42 @@ describe("cyclic subagent cascade", () => {
 
     const outcome = await dispatcher.cancelWithGrace(parent)
     expect(outcome).toBeUndefined()
+    await dispatcher.terminateAll()
+  })
+})
+
+describe("idle worker death", () => {
+  test("a dead idle worker is retired and replaced before the next dispatch", async () => {
+    const pool = createFakeWorkerPool(1)
+    const dispatcher = createDispatcher({ pool })
+
+    const first = dispatcher.dispatch({ sessionID: sid("ses_reuse") })
+    await flush()
+    const idle = pool.spawned[0]
+    idle.finish(sid("ses_reuse"))
+    await first
+
+    // The worker dies between turns while it is parked idle in the registry.
+    idle.alive = false
+    const originalTerminate = idle.terminate.bind(idle)
+    let terminated = 0
+    idle.terminate = async () => {
+      terminated += 1
+      await originalTerminate()
+    }
+
+    const second = dispatcher.dispatch({ sessionID: sid("ses_reuse") })
+    await flush()
+
+    // The dead handle is closed and a fresh worker materialized; the next run
+    // never executes on the dead isolate.
+    expect(terminated).toBe(1)
+    expect(pool.spawned).toHaveLength(2)
+    expect(pool.spawned[1]).not.toBe(idle)
+    expect(pool.spawned[1].runs.map((run) => run.sessionID)).toEqual([sid("ses_reuse")])
+
+    pool.spawned[1].finish(sid("ses_reuse"))
+    await second
     await dispatcher.terminateAll()
   })
 })

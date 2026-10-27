@@ -1,7 +1,8 @@
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Deferred, Effect } from "effect"
+import { Cause, Deferred, Effect, Exit } from "effect"
 import { BackgroundJob } from "@/background/job"
+import { BackgroundJob as CoreBackgroundJob } from "@opencode-ai/core/background-job"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(LayerNode.compile(BackgroundJob.node))
@@ -224,6 +225,113 @@ describe("background.job", () => {
 
       yield* Deferred.succeed(latch, undefined)
       expect((yield* jobs.wait({ id: job.id })).info?.output).toBe("done")
+    }),
+  )
+
+  it.instance("evicts the oldest terminal jobs at the retention bound", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const jobs = yield* CoreBackgroundJob.makeWithRetention({ maxTerminalJobs: 3 })
+        for (let index = 0; index < 6; index++) {
+          const job = yield* jobs.start({
+            id: `job_${index}`,
+            type: "test",
+            run: Effect.succeed(`done-${index}`),
+          })
+          yield* jobs.wait({ id: job.id })
+        }
+
+        const list = yield* jobs.list()
+        expect(list).toHaveLength(3)
+        expect(list.map((job) => job.id)).toEqual(["job_3", "job_4", "job_5"])
+      }),
+    ),
+  )
+
+  it.instance("never evicts a running job to stay under the retention bound", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const jobs = yield* CoreBackgroundJob.makeWithRetention({ maxTerminalJobs: 2 })
+        const running = yield* jobs.start({ id: "job_running", type: "test", run: Effect.never })
+        for (let index = 0; index < 5; index++) {
+          const job = yield* jobs.start({
+            id: `job_terminal_${index}`,
+            type: "test",
+            run: Effect.succeed(`done-${index}`),
+          })
+          yield* jobs.wait({ id: job.id })
+        }
+
+        const list = yield* jobs.list()
+        expect(list.map((job) => job.id)).toContain(running.id)
+        expect(list.filter((job) => job.status !== "running")).toHaveLength(2)
+        yield* jobs.cancel(running.id)
+      }),
+    ),
+  )
+
+  it.instance("retains no terminal jobs when the bound is zero", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const jobs = yield* CoreBackgroundJob.makeWithRetention({ maxTerminalJobs: 0 })
+        for (let index = 0; index < 3; index++) {
+          const job = yield* jobs.start({
+            id: `job_zero_${index}`,
+            type: "test",
+            run: Effect.succeed(`done-${index}`),
+          })
+          yield* jobs.wait({ id: job.id })
+        }
+
+        expect(yield* jobs.list()).toEqual([])
+        expect(yield* jobs.get("job_zero_2")).toBeUndefined()
+      }),
+    ),
+  )
+
+  it.instance("keeps every terminal job when the bound is Infinity", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const jobs = yield* CoreBackgroundJob.makeWithRetention({ maxTerminalJobs: Infinity })
+        for (let index = 0; index < 3; index++) {
+          const job = yield* jobs.start({
+            id: `job_unbounded_${index}`,
+            type: "test",
+            run: Effect.succeed(`done-${index}`),
+          })
+          yield* jobs.wait({ id: job.id })
+        }
+
+        expect((yield* jobs.list()).map((job) => job.id)).toEqual([
+          "job_unbounded_0",
+          "job_unbounded_1",
+          "job_unbounded_2",
+        ])
+      }),
+    ),
+  )
+
+  it.instance("rejects a start when the id is already running and the caller asks to fail busy", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const started = yield* Deferred.make<void>()
+      const id = "job_busy"
+      yield* jobs.start({
+        id,
+        type: "test",
+        run: Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+      })
+      yield* Deferred.await(started)
+
+      const exit = yield* jobs
+        .start({ id, type: "test", rejectIfRunning: true, run: Effect.succeed("duplicate") })
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(CoreBackgroundJob.JobAlreadyRunningError)
+      }
+      yield* jobs.cancel(id)
     }),
   )
 

@@ -13,6 +13,13 @@ export interface Interface {
   readonly ask: (input: PermissionV1.AskInput) => Effect.Effect<void, PermissionV1.Error>
   readonly reply: (input: PermissionV1.ReplyInput) => Effect.Effect<void, PermissionV1.NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<PermissionV1.Request>>
+  /**
+   * Cancel every pending request of one session. Used when the session's run is
+   * cancelled (or its worker retired): a blocked `ask` must fail with
+   * `RejectedError` and its pending entry must not outlive the run. Optional so
+   * lightweight test doubles remain structurally assignable.
+   */
+  readonly cancelSession?: (sessionID: PermissionV1.Request["sessionID"]) => Effect.Effect<void>
 }
 
 interface PendingEntry {
@@ -171,7 +178,23 @@ const layer = Layer.effect(
       return Array.from(pending.values(), (item) => item.info)
     })
 
-    return Service.of({ ask, reply, list })
+    const cancelSession = Effect.fn("Permission.cancelSession")(function* (
+      sessionID: PermissionV1.Request["sessionID"],
+    ) {
+      const { pending } = yield* InstanceState.get(state)
+      for (const [id, item] of [...pending.entries()]) {
+        if (item.info.sessionID !== sessionID) continue
+        pending.delete(id)
+        yield* events.publish(Event.Replied, {
+          sessionID: item.info.sessionID,
+          requestID: item.info.id,
+          reply: "reject",
+        })
+        yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
+      }
+    })
+
+    return Service.of({ ask, reply, list, cancelSession })
   }),
 )
 

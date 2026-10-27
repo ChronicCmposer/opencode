@@ -36,7 +36,10 @@ export const WORKER_HOOK_ROUTES = {
   // port (D19: never invoked in a worker, never silently skipped).
   "shell.env": "hub-proxy",
   "tool.definition": "hub-proxy",
-  "chat.message": "unsupported",
+  // The worker prompt path invokes this on every user message. The plugin
+  // instance lives on the hub, so the trigger is forwarded over the control
+  // port and its returned `{message, parts}` is reconciled in place.
+  "chat.message": "hub-proxy",
   "command.execute.before": "unsupported",
   "experimental.session.compacting": "unsupported",
   "experimental.compaction.autocontinue": "unsupported",
@@ -92,7 +95,6 @@ export function isDeclaredOnlyHook(name: string): boolean {
 export function isHubProxyHook(name: string): boolean {
   return workerHookRoute(name) === "hub-proxy"
 }
-
 
 /**
  * The first admission problem in one plugin's hooks, if any. Function-valued

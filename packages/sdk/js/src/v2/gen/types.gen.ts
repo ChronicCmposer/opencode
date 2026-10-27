@@ -315,6 +315,21 @@ export type ContentFilterError = {
   }
 }
 
+export type IncompleteStreamError = {
+  name: "IncompleteStreamError"
+  data: {
+    message: string
+  }
+}
+
+export type MaxStepsExceededError = {
+  name: "MaxStepsExceededError"
+  data: {
+    message: string
+    steps: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
 export type ApiError = {
   name: "APIError"
   data: {
@@ -347,6 +362,8 @@ export type AssistantMessage = {
     | StructuredOutputError
     | ContextOverflowError
     | ContentFilterError
+    | IncompleteStreamError
+    | MaxStepsExceededError
     | ApiError
   parentID: string
   modelID: string
@@ -1223,6 +1240,8 @@ export type GlobalEvent = {
             | StructuredOutputError
             | ContextOverflowError
             | ContentFilterError
+            | IncompleteStreamError
+            | MaxStepsExceededError
             | ApiError
         }
       }
@@ -2827,6 +2846,14 @@ export type OutputFormat1 =
       schema: JsonSchema
       retryCount?: number
     }
+
+export type MaxStepsExceededError1 = {
+  name: "MaxStepsExceededError"
+  data: {
+    message: string
+    steps: number | "NaN" | "Infinity" | "-Infinity"
+  }
+}
 
 export type SessionStatus2 = {
   id: string
@@ -5393,6 +5420,8 @@ export type SessionError = {
       | StructuredOutputError
       | ContextOverflowError
       | ContentFilterError
+      | IncompleteStreamError
+      | MaxStepsExceededError1
       | ApiError
   }
 }
@@ -6738,6 +6767,8 @@ export type EventSessionError = {
       | StructuredOutputError
       | ContextOverflowError
       | ContentFilterError
+      | IncompleteStreamError
+      | MaxStepsExceededError1
       | ApiError
   }
 }
@@ -9869,6 +9900,10 @@ export type SessionPromptData = {
     format?: OutputFormat
     system?: string
     variant?: string
+    /**
+     * Who asked for the dispatch: an explicit user prompt or background/auto work
+     */
+    origin?: "user" | "auto"
     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
   }
   path: {
@@ -10044,13 +10079,39 @@ export type SessionAbortResponses = {
   /**
    * Aborted session
    */
-  200: {
-    sessionID?: string
-    mode?: "cooperative" | "terminated" | "completed"
-    winner?: "cancel" | "completion"
-    acknowledged?: boolean
-    durationMs?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  }
+  200:
+    | {
+        sessionID: string
+        acknowledged: boolean
+        durationMs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        mode: "cooperative"
+        winner: "cancel"
+        message?: {
+          info: Message
+          parts: Array<Part>
+        }
+      }
+    | {
+        sessionID: string
+        acknowledged: boolean
+        durationMs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        mode: "terminated"
+        winner: "cancel"
+      }
+    | {
+        sessionID: string
+        acknowledged: boolean
+        durationMs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        mode: "completed"
+        winner: "completion"
+      }
+    | {
+        sessionID: string
+        acknowledged: boolean
+        durationMs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        mode: "boot"
+        winner: "cancel"
+      }
 }
 
 export type SessionAbortResponse = SessionAbortResponses[keyof SessionAbortResponses]
@@ -10222,6 +10283,10 @@ export type SessionPromptAsyncData = {
     format?: OutputFormat
     system?: string
     variant?: string
+    /**
+     * Who asked for the dispatch: an explicit user prompt or background/auto work
+     */
+    origin?: "user" | "auto"
     parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
   }
   path: {

@@ -74,19 +74,18 @@ describe("per-worker WAL connection (W1.1 / D5)", () => {
     const workerB = await open(filename)
 
     const write = (database: WorkerDatabase, id: string, sessionID: string) =>
-      database.run(
-        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
-        [id, sessionID, 1, 1, "{}"],
-      )
+      database.run("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)", [
+        id,
+        sessionID,
+        1,
+        1,
+        "{}",
+      ])
 
     await Effect.runPromise(
-      Effect.all(
-        [
-          write(workerA, "message-a", "session-a"),
-          write(workerB, "message-b", "session-b"),
-        ],
-        { concurrency: "unbounded" },
-      ),
+      Effect.all([write(workerA, "message-a", "session-a"), write(workerB, "message-b", "session-b")], {
+        concurrency: "unbounded",
+      }),
     )
 
     const rows = await Effect.runPromise(
@@ -120,7 +119,6 @@ describe("per-worker WAL connection (W1.1 / D5)", () => {
     native.close()
   })
 })
-
 
 describe("worker schema gate (W1.6 / D7)", () => {
   test("opens only when user_version and the migration journal match the build", async () => {
@@ -186,9 +184,7 @@ describe("worker table ownership (W1.5 / D6)", () => {
     migrated(filename)
     const database = await open(filename)
 
-    const error = await Effect.runPromise(
-      database.run("INSERT INTO permission (id) VALUES ('nope')").pipe(Effect.flip),
-    )
+    const error = await Effect.runPromise(database.run("INSERT INTO permission (id) VALUES ('nope')").pipe(Effect.flip))
 
     expect(error).toBeInstanceOf(HubOnlyTableError)
     expect(error._tag).toBe("WorkerDb.HubOnlyTableError")
@@ -240,17 +236,17 @@ describe("worker table ownership (W1.5 / D6)", () => {
       durable: { version: 1, aggregate: "sessionID" },
       schema: { sessionID: Schema.String, text: Schema.String },
     })
-    const bus = Bus.create({ connection: database.connection, ownerID: "gen-1", definitions: [Note] })
+    const bus = database.bus.create({ ownerID: "gen-1", definitions: [Note] })
     expect(bus.claim("session-a")).toEqual({ aggregateID: "session-a", ownerID: "gen-1", seq: -1 })
 
     const published = bus.publish([{ definition: Note, data: { sessionID: "session-a", text: "durable" } }])
     expect(published[0]?.durable?.seq).toBe(0)
-    expect(database.connection.all("SELECT aggregate_id, seq, owner_id FROM event_sequence")).toEqual([
-      { aggregate_id: "session-a", seq: 0, owner_id: "gen-1" },
+    expect(database.connection.all("SELECT aggregate_id, seq, owner_id, worker_owner_id FROM event_sequence")).toEqual([
+      { aggregate_id: "session-a", seq: 0, owner_id: "gen-1", worker_owner_id: "gen-1" },
     ])
     expect(database.connection.all<{ count: number }>("SELECT COUNT(*) AS count FROM event")).toEqual([{ count: 1 }])
 
-    const stale = Bus.create({ connection: database.connection, ownerID: "gen-2", definitions: [Note] })
+    const stale = database.bus.create({ ownerID: "gen-2", definitions: [Note] })
     expect(() => stale.publish([{ definition: Note, data: { sessionID: "session-a", text: "stolen" } }])).toThrow(
       Bus.StaleOwnerError,
     )
@@ -263,10 +259,13 @@ describe("worker table ownership (W1.5 / D6)", () => {
 
     expect(await Effect.runPromise(database.all("SELECT COUNT(*) AS count FROM session"))).toEqual([{ count: 2 }])
     await Effect.runPromise(
-      database.run(
-        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
-        ["message-z", "session-a", 2, 2, "{}"],
-      ),
+      database.run("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)", [
+        "message-z",
+        "session-a",
+        2,
+        2,
+        "{}",
+      ]),
     )
     expect(await Effect.runPromise(database.all("SELECT id FROM message"))).toEqual([{ id: "message-z" }])
   })
@@ -289,12 +288,12 @@ describe("worker SQL guard bypass matrix (C9 / D14 / D21)", () => {
     const filename = temporaryDatabase()
     migrated(filename)
     const database = await open(filename)
-    expect(() =>
-      database.connection.query("/* leading */ INSERT INTO permission (id) VALUES (?)").run("nope"),
-    ).toThrow(HubOnlyTableError)
-    expect(() =>
-      database.connection.query("-- leading\nUPDATE permission SET id = 'nope'").run(),
-    ).toThrow(HubOnlyTableError)
+    expect(() => database.connection.query("/* leading */ INSERT INTO permission (id) VALUES (?)").run("nope")).toThrow(
+      HubOnlyTableError,
+    )
+    expect(() => database.connection.query("-- leading\nUPDATE permission SET id = 'nope'").run()).toThrow(
+      HubOnlyTableError,
+    )
   })
 
   test("CTE writes are classified by their write statement", async () => {
@@ -302,9 +301,7 @@ describe("worker SQL guard bypass matrix (C9 / D14 / D21)", () => {
     migrated(filename)
     const database = await open(filename)
 
-    const insert = await errorOf(
-      database.run("WITH x AS (SELECT 1) INSERT INTO permission (id) SELECT 'nope' FROM x"),
-    )
+    const insert = await errorOf(database.run("WITH x AS (SELECT 1) INSERT INTO permission (id) SELECT 'nope' FROM x"))
     expect(insert).toBeInstanceOf(HubOnlyTableError)
     expect((insert as HubOnlyTableError).table).toBe("permission")
 
@@ -361,10 +358,13 @@ describe("worker SQL guard bypass matrix (C9 / D14 / D21)", () => {
 
     expect(await Effect.runPromise(database.all("SELECT COUNT(*) AS count FROM session;"))).toEqual([{ count: 2 }])
     await Effect.runPromise(
-      database.run(
-        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
-        ["message-guard", "session-a", 1, 1, "{}"],
-      ),
+      database.run("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)", [
+        "message-guard",
+        "session-a",
+        1,
+        1,
+        "{}",
+      ]),
     )
     expect(await Effect.runPromise(database.all("SELECT id FROM message"))).toEqual([{ id: "message-guard" }])
   })

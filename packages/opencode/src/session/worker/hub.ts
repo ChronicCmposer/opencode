@@ -13,12 +13,15 @@
 // pool-spawning layer node (`makeSessionHubNode`) provides it and tears the pool
 // down with the layer scope.
 
-import { Context, Effect, Fiber, Layer, Option } from "effect"
+import { Context, Deferred, Effect, Fiber, Layer, Option } from "effect"
 import { z } from "zod"
 import os from "node:os"
+import path from "node:path"
 import type { Hooks, ToolContext as PluginToolContext, ToolDefinition } from "@opencode-ai/plugin"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
+import { BackgroundJob } from "@opencode-ai/core/background-job"
+import type { Info as BackgroundJobInfo, Status as BackgroundJobStatus } from "@opencode-ai/core/background-job"
 import { Database } from "@opencode-ai/core/database/database"
 import { Auth } from "@/auth"
 import { Config } from "@/config/config"
@@ -29,22 +32,20 @@ import { EffectBridge } from "@/effect/bridge"
 import { SessionStatus } from "@/session/status"
 import { Permission } from "@/permission"
 import { Question } from "@/question"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import type { InstanceContext } from "@/project/instance-context"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Project } from "@opencode-ai/schema/project"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { attachMeshWorker, createEgressMesh, type DurableCommit, type EgressMesh } from "@/session/egress/mesh"
-import {
-  durableAggregateMetaOf,
-  type EventV2Event,
-  type EventsAckPayload,
-} from "./frame"
+import { durableAggregateMetaOf, type EventV2Event, type EventsAckPayload } from "./frame"
 import { encodeFrame, resyncWithPositionFrame, type DurableResyncPayload } from "@/session/egress/frame"
 import { createLiveEventPublisher, instanceLocation, EventV2Bridge, type LiveEventPublisher } from "@/event-v2-bridge"
 import type { EventV2 } from "@opencode-ai/core/event"
 import { StateCache } from "@opencode-ai/core/bus"
 import type { SessionID } from "@/session/schema"
 import { createDbExecutor, type DbExecutor } from "./db-executor"
+import { nextDepth, spawnDepth } from "@/session/depth"
 import type { DispatchOrigin } from "@/session/origin"
 import { defined } from "@/util/object"
 import { setThreadName } from "@/util/thread-name"
@@ -56,7 +57,15 @@ import {
   type DispatcherOptions,
   type SessionWorker,
 } from "./dispatch"
-import type { SessionSpawnRequest, SessionSpawnResult } from "./subagent"
+import {
+  SessionScopeError,
+  type SessionCancelRequest,
+  type SessionChildrenRequest,
+  type SessionCreateRequest,
+  type SessionGetRequest,
+  type SessionSpawnRequest,
+  type SessionSpawnResult,
+} from "./subagent"
 import { createLifecycleTracker, type LifecycleTracker } from "@/session/ledger/lifecycle"
 import { decideAutoResume, type AutoResumeDecision, type IndeterminateCall } from "@/session/ledger/resume"
 import {
@@ -91,7 +100,7 @@ import {
   type CancelOutcome,
 } from "./cancel"
 import { createSpawnGate, type SpawnGateHandle, type SpawnPermit } from "./spawn-gate"
-import { resolveSessionWorkerIdleTimeoutMs, WORKER_COUNT_ENV } from "./pool"
+import { SESSION_WORKER_IDLE_TIMEOUT_ENV, WORKER_COUNT_ENV } from "./pool"
 import { createEpochSequence, makeInstanceContext, type EpochSequence } from "./snapshot"
 import {
   buildSessionWorkerInit,
@@ -110,7 +119,7 @@ import {
   type PidReportEntry,
 } from "./pid-registry"
 import { Plugin } from "@/plugin"
-import { UnsupportedPluginHookError, isHubProxyHook } from "@/plugin/routes"
+import { UnsupportedPluginHookError, workerHookRoute } from "@/plugin/routes"
 import type {
   MessagesTransformInput,
   MessagesTransformOutput,
@@ -134,6 +143,7 @@ import type { SessionWorkerInit } from "./session-worker"
 import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
 import { sessionThreadName } from "@/session/worker/thread-name"
 import { Session } from "@/session/session"
+import type { SessionPrompt } from "@/session/prompt"
 import { Truncate } from "@/tool/truncate"
 import { pluginToolJsonSchema } from "@/tool/registry"
 import { MCP } from "@/mcp"
@@ -408,6 +418,13 @@ export interface SessionHubOptions {
    * model the worker init should resolve.
    */
   readonly onDispatch?: (sessionID: SessionID) => void
+  /**
+   * Resolve a session's subagent depth (`metadata.depth`) for the dispatch path.
+   * Depth 0 is a foreground root; a positive depth takes bounded child headroom
+   * so a parent awaiting a `task` child never deadlocks the running-worker cap.
+   * Values are clamped to a safe non-negative integer; absent/malformed is 0.
+   */
+  readonly depthOf?: (sessionID: SessionID) => number | undefined
   readonly cancellation?: CancellationSource
   /** Hub-side cleanup when a session's worker is retired (reap/cancel/crash). */
   readonly onSessionReleased?: (sessionID: SessionID) => void
@@ -681,6 +698,16 @@ export interface HubProxyAuthorities {
    */
   readonly sessionSpawn?: (request: SessionSpawnRequest) => Promise<SessionSpawnResult>
   /**
+   * Hub-side child-session scope. A bound worker's `Session.create`/`get`/
+   * `children` route here so the create/projection/read happens on the hub, not
+   * in the worker's single-session database. Each authority verifies the target
+   * belongs to the worker's own subtree.
+   */
+  readonly sessionCreate?: (request: SessionCreateRequest) => Promise<Session.Info>
+  readonly sessionGet?: (request: SessionGetRequest) => Promise<Session.Info | null>
+  readonly sessionChildren?: (request: SessionChildrenRequest) => Promise<readonly Session.Info[]>
+  readonly sessionCancel?: (request: SessionCancelRequest) => Promise<CancelOutcome | undefined>
+  /**
    * Optional system-prompt transform authority. The worker cannot run
    * `experimental.chat.system.transform` itself (plugins are loaded on the hub),
    * so it calls the hub, which mutates and returns `output`. Absent means the
@@ -702,12 +729,13 @@ export interface HubProxyAuthorities {
   ) => Promise<MessagesTransformOutput>
   /**
    * Optional hub-proxied plugin trigger. The worker never invokes a hook the hub
-   * owns (`tool.execute.before/after`, `shell.env`, `tool.definition`, the two
-   * experimental transforms); it forwards `(name, input, output)` here, where the
-   * real plugin instance runs under the worker's session context. Absent means
+   * owns (`tool.execute.before/after`, `shell.env`, `tool.definition`, the
+   * transforms, `chat.message`); it forwards `(name, input, output)` here, where
+   * the real plugin instance runs under the worker's session context. Absent means
    * the output passes through unchanged (no configured plugin). The authority
-   * rejects a hook whose route is not `hub-proxy`, so a worker cannot smuggle an
-   * unsupported trigger across the port.
+   * rejects a hook whose route is `unsupported`, so a worker cannot smuggle an
+   * unsupported trigger across the port; a worker-hosted hook may be forwarded
+   * too, which is how `chat.params`/`chat.headers` resolve per request.
    */
   readonly pluginTrigger?: (name: string, input: unknown, output: unknown) => Promise<unknown>
   /**
@@ -735,6 +763,31 @@ export interface HubProxyAuthorities {
    * resolves as a no-op rather than failing a cancel path.
    */
   readonly pluginToolAbort?: (input: { readonly sessionID: string; readonly callID: string }) => void | Promise<void>
+  /**
+   * Optional worker-job mirror authority. A session worker owns its process-local
+   * `BackgroundJob` registry, so a foreground job is invisible to the hub's
+   * promotion endpoint unless the worker registers it here. The hub mirrors the
+   * running job in its own registry, which makes `list`/`promote` work; promotion
+   * resolves the worker's `awaitPromotion` long-poll so the worker applies it to
+   * the local registry (and fires the task notification).
+   */
+  readonly backgroundJob?: WorkerBackgroundJobAuthority
+}
+
+/** One worker-reported terminal job state, settled into the hub mirror. */
+export interface WorkerBackgroundJobSettle {
+  readonly id: string
+  readonly status: Exclude<BackgroundJobStatus, "running">
+  readonly output?: string
+  readonly error?: string
+}
+
+/** The worker-job mirror surface exposed over the hub-proxy control port. */
+export interface WorkerBackgroundJobAuthority {
+  register(info: BackgroundJobInfo): Promise<void>
+  settle(input: WorkerBackgroundJobSettle): Promise<void>
+  /** Resolves `true` on promotion, `false` once the job settles or disappears. */
+  awaitPromotion(id: string): Promise<boolean>
 }
 
 /**
@@ -743,6 +796,13 @@ export interface HubProxyAuthorities {
  * the runner provides that instance's context (captured at dispatch).
  */
 export type HubProxyRunner = <A, E>(effect: Effect.Effect<A, E>) => Promise<A>
+
+/**
+ * The prompt authority's string-keyed service. Resolving it by key lets the hub
+ * run the authoritative children-first cancel without importing `prompt.ts`
+ * (hub → prompt → run-state → hub would cycle).
+ */
+const SessionPromptService = Context.Service<SessionPrompt.Interface>("@opencode/SessionPrompt")
 
 /** The descriptive rejection an absent plugin-tool authority returns (fail loud). */
 function missingPluginToolAuthority(what: string): Error {
@@ -786,9 +846,7 @@ export function buildHubProxyHandlers(authorities: HubProxyAuthorities, run: Hub
     // Always served: a worker forwards every hub-proxied hook through this one
     // method. Absent an authority (no configured plugin) the output is unchanged.
     pluginTrigger: (name, input, output) =>
-      authorities.pluginTrigger === undefined
-        ? output
-        : authorities.pluginTrigger(name as string, input, output),
+      authorities.pluginTrigger === undefined ? output : authorities.pluginTrigger(name as string, input, output),
     // Always served, but with no identity fallback: an execute has no result to
     // hand back, so an absent authority is a descriptive rejection — never an
     // "unknown hub-proxy method" (that would mask a missing wiring, not a typo).
@@ -808,10 +866,35 @@ export function buildHubProxyHandlers(authorities: HubProxyAuthorities, run: Hub
     // A cancel path must never turn an abort into a tool failure.
     "pluginTool.abort": (input) =>
       authorities.pluginToolAbort?.(input as { readonly sessionID: string; readonly callID: string }),
+    // Worker-owned jobs are mirrored into the hub registry when the worker
+    // reports them. Absent an authority (a plain test hub) registration and
+    // settlement are no-ops, but promotion never fabricates a `true`.
+    "backgroundJob.register": (info) =>
+      authorities.backgroundJob?.register(info as BackgroundJobInfo) ?? Promise.resolve(),
+    "backgroundJob.settle": (input) =>
+      authorities.backgroundJob?.settle(input as WorkerBackgroundJobSettle) ?? Promise.resolve(),
+    "backgroundJob.awaitPromotion": (id) =>
+      authorities.backgroundJob?.awaitPromotion(id as string) ?? Promise.resolve(false),
     "session.spawn": (request) =>
       authorities.sessionSpawn === undefined
         ? Promise.reject(new Error('the hub has no "sessionSpawn" authority wired; cannot spawn a session'))
         : authorities.sessionSpawn(request as SessionSpawnRequest),
+    "session.create": (request) =>
+      authorities.sessionCreate === undefined
+        ? Promise.reject(new Error('the hub has no "sessionCreate" authority wired; cannot create a child session'))
+        : authorities.sessionCreate(request as SessionCreateRequest),
+    "session.get": (request) =>
+      authorities.sessionGet === undefined
+        ? Promise.reject(new Error('the hub has no "sessionGet" authority wired; cannot read a child session'))
+        : authorities.sessionGet(request as SessionGetRequest),
+    "session.children": (request) =>
+      authorities.sessionChildren === undefined
+        ? Promise.reject(new Error('the hub has no "sessionChildren" authority wired; cannot list child sessions'))
+        : authorities.sessionChildren(request as SessionChildrenRequest),
+    "session.cancel": (request) =>
+      authorities.sessionCancel === undefined
+        ? Promise.reject(new Error('the hub has no "sessionCancel" authority wired; cannot cancel a child session'))
+        : authorities.sessionCancel(request as SessionCancelRequest),
   }
 }
 
@@ -867,16 +950,19 @@ export function messagesTransformAuthority(options: {
  * Build the hub-resident authority for the worker's hub-proxied plugin hook
  * bridge. The worker ships only `(name, input, output)`; the hub owns the plugin
  * functions and runs the real trigger under the worker's session context. A name
- * whose route is not `hub-proxy` is rejected with
+ * whose route is `unsupported` is rejected with
  * {@link UnsupportedPluginHookError}: the bridge is not a generic plugin RPC and
- * a worker may never invoke an unsupported hook through it.
+ * a worker may never invoke an unsupported hook through it. Worker-hosted hooks
+ * may also be forwarded, which is how per-request `chat.params`/`chat.headers`
+ * avoid freezing at the init model.
  */
 export function pluginTriggerAuthority(options: {
   readonly plugin: () => Option.Option<Plugin.Interface>
   readonly run: HubProxyRunner
 }): NonNullable<HubProxyAuthorities["pluginTrigger"]> {
   return (name, input, output) => {
-    if (!isHubProxyHook(name)) {
+    const route = workerHookRoute(name)
+    if (route === undefined || route === "unsupported") {
       return Promise.reject(new UnsupportedPluginHookError({ plugin: "worker", hook: name }))
     }
     const plugin = options.plugin()
@@ -1117,7 +1203,12 @@ const executeHubTool = (
     const sessionInfo = yield* sessions.get(input.sessionID as SessionID).pipe(Effect.orDie)
     const bridge = yield* EffectBridge.make()
     const abort = new AbortController()
-    const ask = (request: { permission: string; patterns: string[]; always: string[]; metadata: Record<string, unknown> }) =>
+    const ask = (request: {
+      permission: string
+      patterns: string[]
+      always: string[]
+      metadata: Record<string, unknown>
+    }) =>
       bridge.promise(
         permission
           .ask({
@@ -1463,7 +1554,9 @@ function createCancelReporter(options: CancelReporterOptions): CancelReporter {
       const publisher = options.eventPublisherFor?.(sessionID) ?? options.events
       publisher?.publishDefinition(SessionV1.Event.Cancelled, {
         sessionID: outcome.sessionID,
-        mode: outcome.mode,
+        // The durable event schema predates the typed boot outcome; a boot
+        // cancel is a terminate of the partial isolate from its perspective.
+        mode: outcome.mode === "boot" ? "terminated" : outcome.mode,
         durationMs: outcome.durationMs,
         acknowledged: outcome.acknowledged,
       })
@@ -1508,6 +1601,20 @@ export async function releaseRetiredWorkerLease(
 }
 
 /** Compose the dispatcher + executor pool + cooperative cancel into one hub. */
+/**
+ * Upper bound on a dispatch depth carried from `metadata.depth`. Nesting beyond
+ * this is already refused by the subagent limit; the clamp only keeps a
+ * malformed/forged value from growing the cap's per-depth budget map without
+ * bound.
+ */
+const MAX_DISPATCH_DEPTH = 64
+
+/** Parse a dispatch depth at the boundary: finite, non-negative, bounded. */
+export function boundedDispatchDepth(depth: number | undefined): number {
+  if (depth === undefined || !Number.isFinite(depth)) return 0
+  return Math.min(Math.max(0, Math.trunc(depth)), MAX_DISPATCH_DEPTH)
+}
+
 export function createSessionHub(options: SessionHubOptions): SessionHub {
   const log = options.log ?? noopWorkerLogger
   const cache = options.cache ?? new StateCache<unknown>()
@@ -1764,6 +1871,11 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     crashState: (sessionID) => lifecycle.crashState(sessionID),
     recordCrash: (payload) => lifecycle.observeCrash(payload),
     resumeDecision: (payload) => {
+      // A compiled build mismatch is permanent for this entry: respawning the
+      // same bundle would crash-loop. Refuse auto-resume instead of retrying.
+      if (payload.reason.includes("session worker build mismatch")) {
+        return { resume: false, sessionID: payload.sessionID, phase: payload.phase, reason: "phase" }
+      }
       const decide = (indeterminate: readonly IndeterminateCall[]) =>
         decideAutoResume({
           sessionID: payload.sessionID,
@@ -1833,10 +1945,14 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       log,
     }),
   })
-  // Depth is carried explicitly on the run (`metadata.depth` -> Session.spawn);
-  // the dispatcher has no scheduling split, so no registry lookup is needed.
+  // Depth is carried explicitly on the run (`metadata.depth` -> Session.spawn).
+  // The production hub resolves it per session; a plain hub without the seam is a
+  // foreground root (0). Clamp so malformed metadata cannot grow the cap's depth
+  // map without bound or claim an absurd level.
   const dispatch: SessionDispatch = createSessionDispatch({ dispatcher, pool })
   const onDispatch = options.onDispatch
+  const resolveDepth = (sessionID: SessionID): number =>
+    options.depthOf === undefined ? 0 : boundedDispatchDepth(options.depthOf(sessionID))
 
   return {
     dispatcher,
@@ -1857,7 +1973,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       // still-live lease.
       await awaitRetiredLeaseRelease(sessionID)
       try {
-        const result = await dispatch.ensureRunning(sessionID, undefined, origin)
+        const result = await dispatch.ensureRunning(sessionID, resolveDepth(sessionID), origin)
         lifecycle.resetAttempts(sessionID)
         return result
       } catch (error) {
@@ -1870,7 +1986,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       admitBarrier(sessionID)
       await awaitRetiredLeaseRelease(sessionID)
       try {
-        const result = await dispatch.startShell(sessionID, shell)
+        const result = await dispatch.startShell(sessionID, shell, resolveDepth(sessionID))
         lifecycle.resetAttempts(sessionID)
         return result
       } catch (error) {
@@ -1878,7 +1994,23 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
         throw error
       }
     },
-    assertNotBusy: (sessionID) => dispatch.assertNotBusy(sessionID),
+    assertNotBusy: async (sessionID) => {
+      const workerID = dispatcher.registry.entry(sessionID)?.workerID
+      const worker = workerID === undefined ? undefined : pool.byID(workerID)
+      // A proven-dead isolate is idle even while its run is still registered:
+      // the registry reservation cannot outlive the worker it describes.
+      if (worker !== undefined && !worker.alive) return false
+      // An admitted run is busy even before its worker materializes: a run queued
+      // in `cap.acquire` has no isolate to probe, so the registry reservation is
+      // the only truth. Reporting idle there would let a second prompt mutate a
+      // session whose run is still waiting for a slot.
+      if (dispatcher.registry.get(sessionID) !== undefined) return true
+      // Only a proven-dead isolate is idle. A live worker that cannot answer the
+      // probe (timeout, broken control channel) must fail closed: the caller
+      // must not treat an unproven channel as permission to mutate the session.
+      if (worker === undefined) return false
+      return worker.assertNotBusy(sessionID)
+    },
     cancel: async (sessionID) => {
       lifecycle.cancel(sessionID)
       barrier.cancel(sessionID)
@@ -1917,6 +2049,8 @@ export interface BunExecutorTransportOptions {
   readonly entry: string | URL
   readonly env?: Record<string, string | undefined>
   readonly workerData?: unknown
+  /** The SQLite file this isolate uses, for the live-worker/schema gate. */
+  readonly databasePath?: string
   /**
    * OS thread name (`WorkerOptions.name`) applied at spawn, so the isolate is
    * born with the right Linux `comm` before it self-names. Absent leaves Bun's
@@ -1966,12 +2100,68 @@ const DEFAULT_SPAWN_GATE_TIMEOUT_MS = 30_000
 /** Cap on buffered frames, so a transport nobody waits on cannot grow unbounded. */
 export const DEFAULT_TRANSPORT_BUFFER_CAPACITY = 1024
 
+/**
+ * How long an isolate may take to acknowledge the orderly-shutdown frame before
+ * the hub terminates it anyway. Long enough for a `SQLite.close()` + lease
+ * release; short enough that a wedged worker cannot stall retirement.
+ */
+const SHUTDOWN_ACK_TIMEOUT_MS = 1_000
+
+/**
+ * Ask the isolate to close its native WAL handle and release its bus lease
+ * before the hub calls `Worker.terminate()`. Terminating without this leaves the
+ * bun:sqlite handle (and its WAL lock) alive until process exit. Bounded: a
+ * wedged or half-booted worker is still terminated after the timeout.
+ */
+async function requestWorkerShutdown(worker: Worker): Promise<void> {
+  // A fake/partial worker without event plumbing can never deliver the ack.
+  // Post the close frame (recording fakes assert on it) and return without the
+  // bounded wait, so every test retire does not stall for the full budget.
+  if (typeof worker.addEventListener !== "function") {
+    try {
+      worker.postMessage({ type: "shutdown", id: 0 })
+    } catch {
+      // The isolate is already gone; there is nothing left to close.
+    }
+    return
+  }
+  await new Promise<void>((resolve) => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout>
+    const finish = (): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      worker.removeEventListener?.("message", onMessage)
+      resolve()
+    }
+    const onMessage = (event: MessageEvent): void => {
+      const frame = event.data as { readonly type?: unknown } | undefined
+      if (frame?.type === "shutdown-ack") finish()
+    }
+    timer = setTimeout(finish, SHUTDOWN_ACK_TIMEOUT_MS)
+    timer.unref?.()
+    worker.addEventListener?.("message", onMessage)
+    try {
+      worker.postMessage({ type: "shutdown", id: 0 })
+    } catch {
+      finish()
+    }
+  })
+}
+
 /** A validated boot/port frame; `invalid` fails the spawn loud. */
 type BootFrame =
   | { readonly kind: "ready" }
   | { readonly kind: "worker-ports"; readonly ports: WorkerTransferredPorts }
   | { readonly kind: "hub-proxy"; readonly port: MessagePort }
-  | { readonly kind: "invalid"; readonly reason: string }
+  /**
+   * `error` preserves a typed failure (e.g. `BuildMismatch`) for the caller.
+   * `booted` marks a `ready` frame that the worker actually emitted: the isolate
+   * completed its DB/WAL boot, so its teardown must be orderly even though the
+   * hub rejected it. A malformed frame before `ready` is not booted.
+   */
+  | { readonly kind: "invalid"; readonly reason: string; readonly error?: Error; readonly booted?: boolean }
 
 const asMessagePort = (value: unknown): MessagePort | undefined =>
   typeof MessagePort !== "undefined" && value instanceof MessagePort ? value : undefined
@@ -1995,14 +2185,16 @@ function parseBootFrame(data: unknown): BootFrame | undefined {
     readonly egressControl?: unknown
   }
   if (frame.type === "ready") {
+    // Any `ready` frame proves the isolate opened its DB/WAL: even a rejected
+    // one must close through the orderly shutdown path, never terminate-only.
     if (typeof frame.threadId !== "number") {
-      return { kind: "invalid", reason: "boot-ready frame without a numeric threadId" }
+      return { kind: "invalid", reason: "boot-ready frame without a numeric threadId", booted: true }
     }
     try {
       verifyReadyBuild(frame)
     } catch (error) {
-      if (error instanceof BuildMismatch) return { kind: "invalid", reason: error.message }
-      return { kind: "invalid", reason: "boot-ready frame failed build-hash verification" }
+      if (error instanceof BuildMismatch) return { kind: "invalid", reason: error.message, error, booted: true }
+      return { kind: "invalid", reason: "boot-ready frame failed build-hash verification", booted: true }
     }
     return { kind: "ready" }
   }
@@ -2040,6 +2232,31 @@ interface PendingWaiter {
 }
 
 /**
+ * Process-wide live executor isolates, keyed by the database file their env
+ * points at. The schema gate must observe actual spawns, not just the
+ * single-flight permit: a worker releases the permit when it becomes boot-ready
+ * but stays alive (and writes) for the rest of its generation. `spawnGate.held`
+ * therefore cannot answer "is any worker live?". Every hub in one process shares
+ * this registry; a terminated or failed isolate removes itself.
+ *
+ * The schema gate is per database file, so a worker only blocks a migration of
+ * the database it actually uses: unrelated hubs in the same process (tests, a
+ * second project) must not refuse each other.
+ */
+const liveExecutorWorkers = new Map<object, string | undefined>()
+
+/** How many session-worker isolates live on `databasePath` (all files when omitted). */
+export function liveSessionWorkerCount(databasePath?: string): number {
+  if (databasePath === undefined) return liveExecutorWorkers.size
+  const target = path.resolve(databasePath)
+  let count = 0
+  for (const workerPath of liveExecutorWorkers.values()) {
+    if (workerPath !== undefined && path.resolve(workerPath) === target) count += 1
+  }
+  return count
+}
+
+/**
  * A `MessagePort`-free `ExecutorTransport` over a real Bun worker: buffers every
  * outbound frame so a `waitFor` may match one that already arrived, and fails
  * loud on timeout or isolate error.
@@ -2057,7 +2274,14 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
   let booting: Promise<void> | undefined
   let bootTimer: ReturnType<typeof setTimeout> | undefined
   let bootLifecycle: BootLifecycle<Worker> | undefined
+  // A boot that failed on its own (protocol error, deadline, isolate death) never
+  // completed the handshake, so its teardown is terminate-only: a wedged isolate
+  // cannot ack the orderly-shutdown frame. An explicit boot cancel stays orderly.
+  let bootFailed = false
   // A cancel that arrives while the boot is still waiting for the global permit.
+  // The cancel resolves immediately; the flag tells the pending acquisition to
+  // release its eventual permit without constructing the isolate.
+  let waitingCancelled = false
   let waitingCancel:
     | { readonly promise: Promise<BootCancelResult>; readonly resolve: (result: BootCancelResult) => void }
     | undefined
@@ -2069,7 +2293,6 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
   // terminal error is remembered and replayed to a late waiter instead of
   // leaving it to time out.
   let terminal: Error | undefined
-
   const failWaiters = (error: Error): void => {
     terminal = error
     for (const waiter of waiters) {
@@ -2079,25 +2302,39 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     }
   }
 
-  const constructWorker = (): Worker =>
-    new Worker(options.entry, {
+  const constructWorker = (): Worker => {
+    const created = new Worker(options.entry, {
       env: mergeEnv(options.env),
+      // `smol` keeps each isolate's heap small; a per-session worker does not
+      // need a full-size JS heap, and the cap only bounds concurrently running
+      // workers, not the idle isolates a long session list can retain.
+      smol: true,
       ...defined({ workerData: options.workerData, name: options.name }),
     })
+    liveExecutorWorkers.set(created, options.databasePath ?? options.env?.OPENCODE_DB)
+    return created
+  }
 
   const clearBootTimer = (): void => {
     if (bootTimer !== undefined) clearTimeout(bootTimer)
     bootTimer = undefined
   }
 
-  /** Cancel a boot that is still waiting for the global permit (no permit held yet). */
+  /**
+   * Cancel a boot that is still waiting for the global permit. The caller gets
+   * the typed cancel outcome NOW: the permit may be held by another worker for
+   * its whole boot, and a cancel must not wait for it. The pending acquisition
+   * later observes `waitingCancelled`, releases its permit, and never constructs.
+   */
   const cancelWhileWaiting = (): Promise<BootCancelResult> => {
+    waitingCancelled = true
     if (waitingCancel === undefined) {
       let resolve!: (result: BootCancelResult) => void
       const promise = new Promise<BootCancelResult>((settle) => {
         resolve = settle
       })
       waitingCancel = { promise, resolve }
+      resolve(BOOT_CANCELLED)
     }
     return waitingCancel.promise
   }
@@ -2127,6 +2364,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
    * a started worker is terminated directly.
    */
   const teardownBooted = (created: Worker): void => {
+    liveExecutorWorkers.delete(created)
     if (bootLifecycle !== undefined && (bootLifecycle.state === "booting" || bootLifecycle.state === "ready")) {
       void bootLifecycle.cancel().catch(() => undefined)
       return
@@ -2135,9 +2373,17 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
   }
 
   const connect = (created: Worker): void => {
-    /** Fail one spawn loud on a malformed boot/port frame, then tear the isolate down. */
-    const failProtocol = (reason: string): void => {
-      const error = new Error(`session worker protocol error: ${reason}`)
+    /**
+     * Fail one spawn loud on a malformed boot/port frame, then tear the isolate
+     * down. A typed cause (a `BuildMismatch` from a stale bundle) is preserved so
+     * the dispatcher can refuse to retry it instead of crash-looping.
+     * `booted` distinguishes a rejected `ready` (the isolate opened its DB/WAL,
+     * so it needs the orderly close) from a frame before ready (never usable;
+     * terminate-only).
+     */
+    const failProtocol = (reason: string, cause?: Error, booted = false): void => {
+      const error = cause ?? new Error(`session worker protocol error: ${reason}`)
+      bootFailed = !booted
       alive = false
       created.onmessage = null
       created.onerror = null
@@ -2157,7 +2403,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       // serializes the expensive cold boot; the boot timer stays armed until then.
       const bootFrame = parseBootFrame(event.data)
       if (bootFrame?.kind === "invalid") {
-        failProtocol(bootFrame.reason)
+        failProtocol(bootFrame.reason, bootFrame.error, bootFrame.booted === true)
         return
       }
       if (bootFrame?.kind === "worker-ports") {
@@ -2191,6 +2437,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     }
 
     created.onerror = (event: ErrorEvent) => {
+      bootFailed = true
       alive = false
       // Detach so a terminating worker cannot re-enter this handler, then fail
       // every waiter and tear the isolate down.
@@ -2219,6 +2466,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     // noticed when the run reply times out, losing the crash phase truth.
     created.addEventListener?.("close", (event: Event) => {
       if (!alive) return
+      bootFailed = true
       alive = false
       created.onmessage = null
       created.onerror = null
@@ -2245,6 +2493,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
         bootTimer = setTimeout(() => {
           bootTimer = undefined
           const error = new Error(`session worker boot timeout after ${bootTimeoutMs}ms`)
+          bootFailed = true
           alive = false
           queued.length = 0
           failWaiters(error)
@@ -2260,7 +2509,22 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       },
       terminate: async (partial) => {
         worker = undefined
-        if (partial !== undefined) await partial.terminate()
+        if (partial === undefined) return
+        liveExecutorWorkers.delete(partial)
+        // A failed boot has no acknowledged generation to drain, and the isolate
+        // that missed its deadline or sent a malformed frame cannot answer the
+        // shutdown frame; waiting the full ack budget would stall the released
+        // permit for a worker that never became usable. Terminate it directly.
+        if (bootFailed) {
+          await partial.terminate()
+          return
+        }
+        // A cancelled boot is still an orderly close: let the isolate release its
+        // native WAL handle/lease through the shutdown frame before the thread is
+        // destroyed. Terminate-only would strand the lock; `requestWorkerShutdown`
+        // is the shared close primitive (owned by the cap/close section).
+        await requestWorkerShutdown(partial)
+        await partial.terminate()
       },
       onRun: () => {
         // The validated ready handshake is the one boot-ready permit release.
@@ -2298,24 +2562,21 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     if (booting !== undefined || worker !== undefined || gate === undefined || !alive) return
     booting = (async () => {
       const acquired = await gate.acquire()
-      if (!alive) {
-        acquired.release("failed", new Error("session worker terminated before boot"))
+      // The cancel already resolved to its caller; release the permit the
+      // acquisition granted and never construct the isolate. A terminate that
+      // landed while waiting takes the same path without a cancel outcome.
+      if (!alive || waitingCancelled) {
+        const cancelled = waitingCancelled
+        acquired.release("failed", cancelled ? undefined : new Error("session worker terminated before boot"))
+        alive = false
+        queued.length = 0
+        failWaiters(new Error(cancelled ? "session worker boot cancelled" : "session worker terminated before boot"))
+        if (cancelled) options.onBootTelemetry?.({ type: "boot-cancelled", phase: "boot" })
         if (waitingCancel !== undefined) {
           const waiting = waitingCancel
           waitingCancel = undefined
           waiting.resolve(BOOT_CANCELLED)
         }
-        return
-      }
-      if (waitingCancel !== undefined) {
-        const waiting = waitingCancel
-        waitingCancel = undefined
-        acquired.release("failed")
-        alive = false
-        queued.length = 0
-        failWaiters(new Error("session worker boot cancelled"))
-        options.onBootTelemetry?.({ type: "boot-cancelled", phase: "boot" })
-        waiting.resolve(BOOT_CANCELLED)
         return
       }
       startBoot(acquired)
@@ -2394,6 +2655,8 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       if (!alive) return code
       alive = false
       queued.length = 0
+      // Fail every in-flight run before the bounded shutdown wait, so callers
+      // observe the rejection immediately while the isolate closes its handle.
       failWaiters(new Error("session worker terminated"))
       // A booting/ready interval still owns the permit: cancelling it terminates
       // the partial isolate and releases the permit exactly once. A boot still
@@ -2409,6 +2672,13 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       const current = worker
       worker = undefined
       if (current === undefined) return code
+      liveExecutorWorkers.delete(current)
+      // Close the isolate's SQLite handle/lease while its realm still runs, then
+      // destroy the thread. `terminate()` alone would strand the WAL lock, so
+      // this applies to an in-flight run too: a forced cancel mid-tool must not
+      // keep the write lock until process exit. The wait is bounded, so a wedged
+      // worker is still terminated.
+      await requestWorkerShutdown(current)
       const result = await current.terminate()
       return typeof result === "number" ? result : code
     },
@@ -2419,8 +2689,10 @@ export interface BunExecutorWorkerPoolOptions {
   readonly entry: string | URL
   readonly env?: Record<string, string | undefined>
   readonly workerData?: unknown
+  /** The SQLite file this isolate uses, for the live-worker/schema gate. */
+  readonly databasePath?: string
   readonly timeoutMs?: number
-  /** Run-reply liveness budget; `0`/absent disables the watchdog. */
+  /** Run-reply liveness budget; absent uses the default-on budget, `0` disables it. */
   readonly runIdleTimeoutMs?: number
   readonly workKind?: string
   /**
@@ -2457,10 +2729,16 @@ export interface BunExecutorWorkerPoolOptions {
 export function spawnBunExecutorWorker(id: number, options: BunExecutorWorkerPoolOptions): ExecutorWorker {
   const onWorkerPorts = options.onWorkerPorts
   const onHubProxyPort = options.onHubProxyPort
+  // The options doc promises a default-on budget even for a direct spawn. The
+  // pool factories resolve once and pass a concrete value, so this is a no-op
+  // for them (and never double-warns).
+  const runIdleTimeoutMs = resolveRunIdleTimeoutMs(options)
+  logRunIdleTimeoutWarning(options.log ?? noopWorkerLogger, options)
   const transport = createBunExecutorTransport({
     entry: options.entry,
     ...defined({
       env: options.env,
+      databasePath: options.databasePath,
       workerData: options.workerData,
       // Born named for its bound session (or the legacy slot id when unknown)
       // so the isolate is observable from creation, not only once it self-names.
@@ -2484,7 +2762,7 @@ export function spawnBunExecutorWorker(id: number, options: BunExecutorWorkerPoo
     ...defined({
       workKind: options.workKind,
       timeoutMs: options.timeoutMs,
-      runIdleTimeoutMs: options.runIdleTimeoutMs,
+      runIdleTimeoutMs,
       sessionID: options.sessionID,
       reason: options.reason,
       egressBarrier: options.egressBarrier,
@@ -2498,8 +2776,13 @@ export function spawnBunExecutorWorker(id: number, options: BunExecutorWorkerPoo
 
 /** Production `ExecutorWorkerPool`: spawns frame-protocol workers on demand. */
 export function createBunExecutorWorkerPool(options: BunExecutorWorkerPoolOptions): ExecutorWorkerPool {
+  // Resolve the default-on watchdog HERE: this factory is the documented entry
+  // point, so an absent option must still arm the budget (an explicit `0`
+  // disables it) rather than silently reaching the executor as `undefined`.
+  const runIdleTimeoutMs = resolveRunIdleTimeoutMs(options)
+  if (options.log !== undefined) logRunIdleTimeoutWarning(options.log, options)
   return createExecutorWorkerPool({
-    spawn: (id) => spawnBunExecutorWorker(id, options),
+    spawn: (id) => spawnBunExecutorWorker(id, { ...options, runIdleTimeoutMs }),
     ...(options.log === undefined ? {} : { log: options.log }),
   })
 }
@@ -2507,6 +2790,109 @@ export function createBunExecutorWorkerPool(options: BunExecutorWorkerPoolOption
 // ---------------------------------------------------------------------------
 // Lazy pool (step 12): no isolate is spawned until a worker is first used.
 // ---------------------------------------------------------------------------
+
+/** Minimum reserved child-headroom slots per nesting depth (D23). */
+const WORKER_CAP_MIN_HEADROOM = 2
+
+/**
+ * A FIFO concurrency cap for running workers. At most `max` foreground runs
+ * (depth 0) execute at once; the rest wait in arrival order. A parent that
+ * awaits a foreground `task` child keeps its own slot, and the depth-1 child
+ * runs in bounded headroom instead of deadlocking on the same budget. Each
+ * nesting depth gets its own headroom, so a depth-N child can always start once
+ * its ancestors are blocked.
+ *
+ * This is scheduling state only — it never rejects work and never owns
+ * admission (the dispatcher does).
+ */
+export interface WorkerCap {
+  /** Acquire one slot for a run at `depth` (0/absent = foreground). */
+  acquire(depth?: number): Promise<() => void>
+  readonly running: number
+  readonly queued: number
+}
+
+export function createWorkerCap(max: number): WorkerCap {
+  if (!Number.isInteger(max) || max < 1) {
+    throw new Error(`worker cap must be a positive integer, received ${String(max)}`)
+  }
+  // Additive, transient headroom per nesting depth: bounded so child fan-out
+  // cannot oversubscribe the machine, but never part of the foreground `max`.
+  const headroom = Math.max(WORKER_CAP_MIN_HEADROOM, Math.ceil(max / 2))
+  let foreground = 0
+  const foregroundWaiters: Array<() => void> = []
+  interface Headroom {
+    running: number
+    readonly waiters: Array<() => void>
+  }
+  const depths = new Map<number, Headroom>()
+  const headroomAt = (depth: number): Headroom => {
+    const existing = depths.get(depth)
+    if (existing !== undefined) return existing
+    const created: Headroom = { running: 0, waiters: [] }
+    depths.set(depth, created)
+    return created
+  }
+
+  /** A release frees exactly one slot, and only its own budget (idempotent). */
+  const releaseOf = (budget: "foreground" | Headroom): (() => void) => {
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      if (budget === "foreground") {
+        foreground -= 1
+        foregroundWaiters.shift()?.()
+        return
+      }
+      budget.running -= 1
+      budget.waiters.shift()?.()
+    }
+  }
+
+  const acquire = (depth = 0): Promise<() => void> => {
+    // A malformed depth is a foreground run, matching the executor frame parse.
+    const level = Number.isInteger(depth) && depth > 0 ? depth : 0
+    return new Promise<() => void>((resolve) => {
+      if (level === 0) {
+        if (foreground < max) {
+          foreground += 1
+          resolve(releaseOf("foreground"))
+          return
+        }
+        foregroundWaiters.push(() => {
+          foreground += 1
+          resolve(releaseOf("foreground"))
+        })
+        return
+      }
+      const budget = headroomAt(level)
+      if (budget.running < headroom) {
+        budget.running += 1
+        resolve(releaseOf(budget))
+        return
+      }
+      budget.waiters.push(() => {
+        budget.running += 1
+        resolve(releaseOf(budget))
+      })
+    })
+  }
+
+  return {
+    get running() {
+      let total = foreground
+      for (const budget of depths.values()) total += budget.running
+      return total
+    },
+    get queued() {
+      let total = foregroundWaiters.length
+      for (const budget of depths.values()) total += budget.waiters.length
+      return total
+    },
+    acquire,
+  }
+}
 
 /**
  * The mutable materialization state shared by every worker whose isolate is
@@ -2535,6 +2921,7 @@ function createMaterializingExecutorWorker(
   id: number,
   materialize: (sessionID: SessionID, state: MaterializingWorkerState) => Promise<ExecutorWorker>,
   log: WorkerLogger = noopWorkerLogger,
+  cap?: WorkerCap,
 ): ExecutorWorker {
   const state: MaterializingWorkerState = { inner: undefined, terminated: false, materializing: undefined }
   const worker: ExecutorWorker = {
@@ -2542,7 +2929,18 @@ function createMaterializingExecutorWorker(
     get alive() {
       return !state.terminated && (state.inner === undefined || state.inner.alive)
     },
-    execute: async (run) => (await materialize(run.sessionID, state)).execute(run),
+    execute: async (run) => {
+      // Cap the number of concurrently *running* foreground workers; extra
+      // sessions queue here in FIFO order instead of oversubscribing the CPU.
+      // A depth >= 1 child takes headroom at its own depth, so a parent that
+      // awaits a foreground `task` child never deadlocks on the parent's slot.
+      const release = await cap?.acquire(run.depth)
+      try {
+        return await (await materialize(run.sessionID, state)).execute(run)
+      } finally {
+        release?.()
+      }
+    },
     cancel: (sessionID) => (state.inner === undefined ? Promise.resolve() : state.inner.cancel(sessionID)),
     cancelBoot: () => state.inner?.cancelBoot?.() ?? Promise.resolve(undefined),
     assertNotBusy: (sessionID) =>
@@ -2571,6 +2969,7 @@ export function createLazyExecutorWorker(
   id: number,
   create: LazyExecutorWorkerFactory,
   log: WorkerLogger = noopWorkerLogger,
+  cap?: WorkerCap,
 ): ExecutorWorker {
   return createMaterializingExecutorWorker(
     id,
@@ -2591,6 +2990,7 @@ export function createLazyExecutorWorker(
       return state.materializing
     },
     log,
+    cap,
   )
 }
 
@@ -2602,12 +3002,15 @@ export interface LazyExecutorWorkerPoolOptions {
   readonly create: (id: number) => ExecutorWorker | Promise<ExecutorWorker>
   /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
   readonly log?: WorkerLogger
+  /** Concurrent-running cap; defaults to the CPU-core count. */
+  readonly maxRunning?: number
 }
 
 /** A pool whose workers spawn on first use (per session). */
 export function createLazyExecutorWorkerPool(options: LazyExecutorWorkerPoolOptions): ExecutorWorkerPool {
+  const cap = createWorkerCap(options.maxRunning ?? os.availableParallelism())
   return createExecutorWorkerPool({
-    spawn: (id) => createLazyExecutorWorker(id, () => options.create(id), options.log),
+    spawn: (id) => createLazyExecutorWorker(id, () => options.create(id), options.log, cap),
   })
 }
 
@@ -2668,6 +3071,71 @@ export function resolveSessionWorkerEntry(
 export const SESSION_WORKER_ENTRY: string | URL = resolveSessionWorkerEntry()
 
 /**
+ * Default run-reply watchdog budget. The watchdog pings the worker between run
+ * frames, so a healthy long turn survives however long it takes; only a wedged
+ * event loop (no `pong` for this window) times out. A value of `0` disables it.
+ */
+export const DEFAULT_RUN_IDLE_TIMEOUT_MS = 60_000
+
+/**
+ * Resolve the run-reply watchdog budget, defaulting it ON. An explicit option
+ * wins (including `0` to disable). Otherwise an environment override is honored:
+ * `0` disables it explicitly, a positive integer sets the window, and any
+ * malformed value (negative, fractional, non-numeric) falls back to
+ * {@link DEFAULT_RUN_IDLE_TIMEOUT_MS} with a WARN from
+ * {@link runIdleTimeoutWarning}. An absent/empty variable uses the default.
+ */
+export function resolveRunIdleTimeoutMs(options: {
+  readonly runIdleTimeoutMs?: number
+  readonly env?: Record<string, string | undefined>
+}): number {
+  if (options.runIdleTimeoutMs !== undefined) return options.runIdleTimeoutMs
+  const parsed = parseRunIdleTimeoutEnv((options.env ?? process.env)[SESSION_WORKER_IDLE_TIMEOUT_ENV])
+  return parsed.kind === "value" ? parsed.ms : parsed.kind === "disabled" ? 0 : DEFAULT_RUN_IDLE_TIMEOUT_MS
+}
+
+/**
+ * Why the watchdog budget fell back to the default, or `undefined` when the knob
+ * is absent, empty, `0`, or a valid value. Callers emit this at WARN at startup.
+ */
+export function runIdleTimeoutWarning(options: {
+  readonly runIdleTimeoutMs?: number
+  readonly env?: Record<string, string | undefined>
+}): string | undefined {
+  if (options.runIdleTimeoutMs !== undefined) return undefined
+  const parsed = parseRunIdleTimeoutEnv((options.env ?? process.env)[SESSION_WORKER_IDLE_TIMEOUT_ENV])
+  if (parsed.kind !== "invalid") return undefined
+  return `invalid ${SESSION_WORKER_IDLE_TIMEOUT_ENV}: ${parsed.raw} (expected a positive integer or 0); using default ${DEFAULT_RUN_IDLE_TIMEOUT_MS} ms`
+}
+
+type ParsedRunIdleTimeout =
+  | { readonly kind: "absent" }
+  | { readonly kind: "disabled" }
+  | { readonly kind: "value"; readonly ms: number }
+  | { readonly kind: "invalid"; readonly raw: string }
+
+function parseRunIdleTimeoutEnv(raw: string | undefined): ParsedRunIdleTimeout {
+  if (raw === undefined || raw.trim() === "") return { kind: "absent" }
+  if (raw.trim() === "0") return { kind: "disabled" }
+  const parsed = Number(raw)
+  if (!Number.isInteger(parsed) || parsed <= 0) return { kind: "invalid", raw }
+  return { kind: "value", ms: parsed }
+}
+
+/** Emit the malformed-watchdog warning once per resolved pool/hub. */
+function logRunIdleTimeoutWarning(
+  log: WorkerLogger,
+  options: {
+    readonly runIdleTimeoutMs?: number
+    readonly env?: Record<string, string | undefined>
+  },
+): void {
+  const warning = runIdleTimeoutWarning(options)
+  if (warning === undefined) return
+  log(workerLogMessage("run idle timeout invalid"), { level: "WARN", reason: warning })
+}
+
+/**
  * A worker `workerData` payload, or a (possibly async) resolver for one. The
  * resolver receives the session being dispatched, so the production hub resolves
  * the session's own model rather than reusing the first session's.
@@ -2681,8 +3149,10 @@ export interface ProductionWorkerPoolOptions {
   /** Worker entry; defaults to {@link SESSION_WORKER_ENTRY} (overridable for tests). */
   readonly entry?: string | URL
   readonly env?: Record<string, string | undefined>
+  /** The SQLite file this pool's isolates use, for the live-worker/schema gate. */
+  readonly databasePath?: string
   readonly timeoutMs?: number
-  /** Run-reply liveness budget; `0`/absent disables the watchdog. */
+  /** Run-reply liveness budget; absent uses the default-on budget, `0` disables it. */
   readonly runIdleTimeoutMs?: number
   readonly workKind?: string
   /** Per-session durable-egress barrier (plan 2.6 / R4#16). */
@@ -2707,6 +3177,8 @@ export interface ProductionWorkerPoolOptions {
   readonly onBootTelemetry?: (event: BootTelemetry) => void
   /** Boot-stage phase reporting for the session this isolate is bound to. */
   readonly onPhase?: (sessionID: SessionID, phase: "boot" | "materialize") => void
+  /** Concurrent-running cap; defaults to the CPU-core count. */
+  readonly maxRunning?: number
 }
 
 /** Build one isolate for `sessionID` under a fixed worker id. */
@@ -2725,6 +3197,7 @@ export function createSessionBoundExecutorWorker(
   spawnFor: SessionBoundSpawner,
   log: WorkerLogger = noopWorkerLogger,
   onRetire?: (sessionID: SessionID) => void,
+  cap?: WorkerCap,
 ): ExecutorWorker {
   let boundSession: SessionID | undefined
   return createMaterializingExecutorWorker(
@@ -2768,6 +3241,7 @@ export function createSessionBoundExecutorWorker(
       return state.materializing
     },
     log,
+    cap,
   )
 }
 
@@ -2779,6 +3253,9 @@ export function createSessionBoundExecutorWorker(
  */
 export function createProductionWorkerPool(options: ProductionWorkerPoolOptions): ExecutorWorkerPool {
   const log = options.log ?? noopWorkerLogger
+  // Default the liveness watchdog ON unless the caller or env explicitly opts out.
+  const runIdleTimeoutMs = resolveRunIdleTimeoutMs(options)
+  logRunIdleTimeoutWarning(log, options)
   const resolveSource: (sessionID?: SessionID) => SessionWorkerInit | Promise<SessionWorkerInit> =
     typeof options.init === "function" ? options.init : () => options.init as SessionWorkerInit
   // One init per session: a session's model/variants are stable for its lifetime.
@@ -2800,8 +3277,9 @@ export function createProductionWorkerPool(options: ProductionWorkerPoolOptions)
       workerData: { ...init, workerID: id, role: "session", sessionID },
       ...defined({
         env: options.env,
+        databasePath: options.databasePath,
         timeoutMs: options.timeoutMs,
-        runIdleTimeoutMs: options.runIdleTimeoutMs,
+        runIdleTimeoutMs,
         workKind: options.workKind,
         egressBarrier: options.egressBarrier,
         log,
@@ -2819,8 +3297,9 @@ export function createProductionWorkerPool(options: ProductionWorkerPoolOptions)
       }),
     })
   }
+  const cap = createWorkerCap(options.maxRunning ?? os.availableParallelism())
   return createExecutorWorkerPool({
-    spawn: (id) => createSessionBoundExecutorWorker(id, spawnFor, log, options.onSessionRebound),
+    spawn: (id) => createSessionBoundExecutorWorker(id, spawnFor, log, options.onSessionRebound, cap),
     onSessionReleased: (sessionID) => {
       initBySession.delete(sessionID)
       options.onSessionReleased?.(sessionID)
@@ -2839,6 +3318,12 @@ export interface WorkerPoolSinks {
 export type ProductionPoolFactory = (
   resolveInit: (sessionID?: SessionID) => Promise<SessionWorkerInit>,
   sinks: WorkerPoolSinks,
+  /**
+   * The dispatch cap resolved from `maxRunningWorkers` (or the CPU default). A
+   * factory that builds a lazy pool should use it so the test/production cap is
+   * the one actually applied.
+   */
+  runtime: { readonly maxRunning: number },
 ) => ExecutorWorkerPool
 
 /** Mark a generation as serving the worker egress ports. */
@@ -2898,6 +3383,11 @@ interface DispatchedSession {
    * into the synchronous cascade index on worker boot.
    */
   readonly parentID?: SessionID
+  /**
+   * The persisted subagent depth (`metadata.depth`). Mirrored into the dispatch
+   * depth index so a re-dispatched child keeps its cap headroom level.
+   */
+  readonly depth?: number
 }
 
 /**
@@ -2958,6 +3448,10 @@ async function loadDispatchedSession(
     ...(info?.directory === undefined ? {} : { directory: info.directory }),
     ...(info?.projectID === undefined ? {} : { projectID: String(info.projectID) }),
     ...(info?.parentID === undefined ? {} : { parentID: info.parentID }),
+    // `metadata.depth` is the persisted nesting level `Session.spawn` stamped.
+    // Recording it on boot keeps the cap headroom correct after a restart or a
+    // worker retire/re-dispatch.
+    ...(info === undefined ? {} : { depth: spawnDepth(info.metadata) }),
   }
 }
 
@@ -3156,7 +3650,7 @@ export interface ProductionSessionHubOptions {
   readonly timeoutMs?: number
   /**
    * Run-reply liveness budget for the spawned workers. Defaults to
-   * `OPENCODE_SESSION_WORKER_IDLE_TIMEOUT_MS` (`0` = disabled).
+   * `OPENCODE_SESSION_WORKER_IDLE_TIMEOUT_MS`, then `DEFAULT_RUN_IDLE_TIMEOUT_MS`.
    */
   readonly runIdleTimeoutMs?: number
   readonly workKind?: string
@@ -3184,6 +3678,12 @@ export interface ProductionSessionHubOptions {
   /** Off-loop hub SQL fallback; see `SessionHubOptions.db`. */
   readonly db?: DbExecutor
   /**
+   * Live-worker count the schema gate must observe. Defaults to the scheduler's
+   * derived state (a held spawn permit means a worker is live); tests may inject
+   * a probe to exercise the refusal path.
+   */
+  readonly liveWorkers?: () => number
+  /**
    * SQLite file the hub owns schema-ensure for. When present the hub applies the
    * shipped migrations (with zero live workers) before it can spawn anything.
    */
@@ -3194,6 +3694,8 @@ export interface ProductionSessionHubOptions {
   readonly onWorkerCrashed?: (payload: WorkerCrashed) => void | Promise<void>
   /** Invoked synchronously at the start of each dispatch (see `SessionHubOptions`). */
   readonly onDispatch?: (sessionID: SessionID) => void
+  /** Resolve a session's subagent depth for the dispatch path (see `SessionHubOptions`). */
+  readonly depthOf?: (sessionID: SessionID) => number | undefined
   /** Live-only event publisher (worker republish + `session.cancelled`). */
   readonly events?: LiveEventPublisher
   /** Per-session live publisher, so a cancel carries the cancelled session's location. */
@@ -3207,6 +3709,12 @@ export interface ProductionSessionHubOptions {
   readonly onSessionRebound?: (sessionID: SessionID) => void
   /** Test seam: build the pool from the lazy init resolver. Defaults to the production pool. */
   readonly poolFactory?: ProductionPoolFactory
+  /**
+   * Maximum number of session workers *running* at once. Extra sessions queue
+   * in FIFO order (scheduling only, never rejection). Defaults to the CPU-core
+   * count so a burst cannot oversubscribe the machine.
+   */
+  readonly maxRunningWorkers?: number
   /**
    * The one global spawn permit for this hub. Defaults to a fresh gate whose
    * acquisition timeout is {@link spawnTimeoutMs}. Tests may inject a gate to
@@ -3276,20 +3784,27 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   const log = options.log ?? noopWorkerLogger
   // One permit serializes every cold isolate spawn for this hub (and every
   // crash respawn, because the pool retains the same handle).
-  // Schema-ensure runs before the pool exists and therefore before any spawn:
-  // there are zero live workers, and `BEGIN IMMEDIATE` serializes concurrent
-  // hubs. The real production layer always passes the resolved database path.
-  if (options.databasePath !== undefined) {
-    ensureProductionSchema({ filename: options.databasePath, liveWorkers: 0 })
-  }
   const spawnGate =
     options.spawnGate ?? createSpawnGate({ timeoutMs: options.spawnTimeoutMs ?? DEFAULT_SPAWN_GATE_TIMEOUT_MS })
+  // Schema-ensure runs before the pool exists and therefore before any spawn.
+  // Its live count is the process-wide registry of constructed isolates, plus a
+  // spawn that has acquired the one permit but not constructed its isolate yet.
+  // A booted (permit-released) worker is exactly the case `spawnGate.held` alone
+  // missed. `BEGIN IMMEDIATE` serializes concurrent hubs.
+  if (options.databasePath !== undefined) {
+    ensureProductionSchema({
+      filename: options.databasePath,
+      liveWorkers:
+        options.liveWorkers?.() ?? liveSessionWorkerCount(options.databasePath) + (spawnGate.held === true ? 1 : 0),
+    })
+  }
   // No worker is spawned until a session dispatches; `workerCount` is diagnostic
   // (log line + worker snapshot), never a pool prewarm.
   const workerCount = options.count ?? 0
   // Resolve the run-reply liveness budget once, at the hub boundary: an explicit
-  // option wins, else the env override, else disabled (0).
-  const runIdleTimeoutMs = options.runIdleTimeoutMs ?? resolveSessionWorkerIdleTimeoutMs({ env: options.env })
+  // option wins, else the env override, else the default-on watchdog budget.
+  const runIdleTimeoutMs = resolveRunIdleTimeoutMs(options)
+  logRunIdleTimeoutWarning(log, options)
   // Resolve the entry the pool will actually spawn (an explicit entry wins, then
   // the env override, then the build-time define, then the source-relative URL).
   const describedEntry: DescribedSessionWorkerEntry =
@@ -3330,15 +3845,20 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
     (options.db === undefined
       ? undefined
       : (payload: WorkerCrashed) => recordAsync(options.db!, payload).then(() => undefined))
+  // One resolved cap for both pool paths: the production pool owns it internally,
+  // a test/custom factory receives it so `maxRunningWorkers` is never silently
+  // ignored when the factory builds the pool.
+  const maxRunning = options.maxRunningWorkers ?? os.availableParallelism()
   const pool =
     options.poolFactory !== undefined
-      ? options.poolFactory(resolveInit, sinks)
+      ? options.poolFactory(resolveInit, sinks, { maxRunning })
       : createProductionWorkerPool({
           init: resolveInit,
           log,
           onPhase: (sessionID, phase) => lifecycle.phase(sessionID, phase),
           ...defined({
             entry: describedEntry.entry,
+            databasePath: options.databasePath,
             timeoutMs: options.timeoutMs,
             runIdleTimeoutMs,
             workKind: options.workKind,
@@ -3351,6 +3871,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
             spawnGate,
             bootTimeoutMs: options.bootTimeoutMs,
             onBootTelemetry: options.onBootTelemetry,
+            maxRunning,
           }),
           ...sinks,
         })
@@ -3381,6 +3902,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
       cache: options.cache,
       onWorkerCrashed: crashSink,
       onDispatch: options.onDispatch,
+      depthOf: options.depthOf,
       events: options.events,
       eventPublisherFor: options.eventPublisherFor,
       onCancelRequested: options.onCancelRequested,
@@ -3408,7 +3930,7 @@ export interface ProductionSessionHubNodeOptions {
   readonly count?: number
   readonly entry?: string | URL
   readonly timeoutMs?: number
-  /** Run-reply liveness budget; defaults to `OPENCODE_SESSION_WORKER_IDLE_TIMEOUT_MS`. */
+  /** Run-reply liveness budget; defaults to `OPENCODE_SESSION_WORKER_IDLE_TIMEOUT_MS`/`DEFAULT_RUN_IDLE_TIMEOUT_MS`. */
   readonly runIdleTimeoutMs?: number
   readonly workKind?: string
   readonly env?: Record<string, string | undefined>
@@ -3471,6 +3993,12 @@ interface PerSessionResolverDeps {
   readonly epochSequence: EpochSequence
   readonly initOptions: BuildSessionWorkerInitOptions | undefined
   readonly plugins: (() => Promise<readonly WorkerPluginSource[]>) | undefined
+  /**
+   * Whether every worker gets a hub-hook control port. When true the worker
+   * runs `chat.params` / `chat.headers` per request through the bridge, so the
+   * init resolver must not invoke them a second time to build a boot diff.
+   */
+  readonly requestHooksViaHub: boolean
   readonly log: WorkerLogger
   /** The hub-resolved `subagent_depth` its `session.spawn` authority enforces. */
   readonly subagentDepth: number
@@ -3496,6 +4024,13 @@ interface PerSessionResolvers {
   readonly hubProxyStreamingFor: (workerID: number) => Readonly<Record<string, HubProxyStreamHandler>>
   /** Abort every in-flight plugin tool of a session (the hub cancel cascade). */
   readonly abortPluginTools: (sessionID: SessionID) => void
+  /**
+   * Cancel every pending hub-side permission/question request of one session.
+   * A blocked worker ask is then failed through its proxy reply and its pending
+   * entry removed, instead of being abandoned when the worker is cancelled or
+   * retired.
+   */
+  readonly cancelPendingRequests: (sessionID: SessionID) => void
   readonly instanceOfSession: (sessionID: SessionID | undefined) => InstanceContext | undefined
   readonly resolveInit: (sessionID?: SessionID) => Promise<SessionWorkerInit>
   readonly recordDispatch: (sessionID: SessionID) => void
@@ -3507,6 +4042,8 @@ interface PerSessionResolvers {
    * on the crash path and must never block on SQLite.
    */
   readonly childrenOf: (sessionID: SessionID) => ReadonlyArray<SessionID>
+  /** The session's subagent depth recorded from `metadata.depth` at spawn/boot. */
+  readonly depthOf: (sessionID: SessionID) => number | undefined
 }
 
 /**
@@ -3576,6 +4113,17 @@ export function createSessionChildrenIndex(): SessionChildrenIndex {
 }
 
 /**
+ * Caller metadata is data, never classification. Strip a `depth` a worker may
+ * have forged so the only depth on the spawned/created child is the one the hub
+ * derives from the persisted parent.
+ */
+function withoutSpawnDepth(metadata: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (metadata === undefined) return undefined
+  const { depth: _depth, ...rest } = metadata
+  return rest
+}
+
+/**
  * The hub's authoritative child spawn. The hub supplies its own resolved depth
  * limit, so `Session.spawn` rejects an over-depth child before creating one even
  * when the worker forwarded no limit.
@@ -3590,10 +4138,636 @@ export const spawnChildOnHub = (
     ...(request.childID === undefined ? {} : { childID: request.childID }),
     type: request.type,
     ...(request.title === undefined ? {} : { title: request.title }),
-    ...(request.metadata === undefined ? {} : { metadata: request.metadata }),
+    ...(request.metadata === undefined ? {} : { metadata: withoutSpawnDepth(request.metadata) }),
     depthLimit: subagentDepth,
     prompt: request.prompt,
   })
+
+/**
+ * Resolve the worker's authoritative bound session. Only the hub registration
+ * (the worker → session binding) can establish authority: an unregistered worker
+ * cannot claim a session by naming it on the request. A request that names a
+ * different session than the registration is a hard rejection too.
+ */
+function boundSessionScope(
+  expected: SessionID | undefined,
+  requested: SessionID | undefined,
+  targetID: string,
+): Effect.Effect<SessionID, SessionScopeError> {
+  if (expected === undefined) {
+    return Effect.fail(
+      new SessionScopeError({
+        message: "the hub has no bound session for this worker; refusing the request",
+        sessionID: "",
+        targetID,
+      }),
+    )
+  }
+  if (requested !== undefined && requested !== expected) {
+    return Effect.fail(
+      new SessionScopeError({
+        message: `worker bound to ${expected} may not act as ${requested}`,
+        sessionID: expected,
+        targetID,
+      }),
+    )
+  }
+  return Effect.succeed(expected)
+}
+
+/**
+ * Whether `target` is a DIRECT child of `bound`. A bound worker owns exactly one
+ * session, so it may only name its own direct children when it asks the hub to
+ * read or cancel a child. Self, grandchild, ancestor, sibling and foreign ids all
+ * fail this check.
+ */
+function isDirectChildOf(sessions: Session.Interface, bound: SessionID, target: SessionID): Effect.Effect<boolean> {
+  if (target === bound) return Effect.succeed(false)
+  return Effect.gen(function* () {
+    const info: Option.Option<Session.Info> = yield* Effect.option(sessions.get(target))
+    return Option.isSome(info) && info.value.parentID === bound
+  })
+}
+
+/** Create a child on the hub, only under the worker's own bound session. */
+export function createSessionOnHub(
+  sessions: Session.Interface,
+  expected: SessionID | undefined,
+  request: SessionCreateRequest,
+): Effect.Effect<Session.Info, SessionScopeError> {
+  return Effect.gen(function* () {
+    const bound = yield* boundSessionScope(expected, request.sessionID, String(request.parentID ?? ""))
+    if (request.parentID !== bound) {
+      return yield* Effect.fail(
+        new SessionScopeError({
+          message: `worker bound to ${bound} may not create a child under ${String(request.parentID)}`,
+          sessionID: bound,
+          targetID: String(request.parentID ?? ""),
+        }),
+      )
+    }
+    const parent = yield* Effect.option(sessions.get(bound))
+    if (Option.isNone(parent)) {
+      return yield* Effect.fail(
+        new SessionScopeError({
+          message: `cannot create a child under unknown session ${bound}`,
+          sessionID: bound,
+          targetID: String(bound),
+        }),
+      )
+    }
+    // The child's depth belongs to the persisted parent, exactly as on spawn.
+    // Caller metadata is never read for classification, so a worker cannot
+    // create a depth-0 row (and claim foreground headroom) under a deep parent.
+    const childDepth = nextDepth(parent.value.metadata)
+    const { sessionID: _sessionID, ...input } = request
+    return yield* sessions
+      .create({ ...input, metadata: { ...withoutSpawnDepth(request.metadata), depth: childDepth } })
+      .pipe(Effect.orDie)
+  })
+}
+
+/** Read one session, only when it is a direct child of the bound session. */
+export function getSessionOnHub(
+  sessions: Session.Interface,
+  expected: SessionID | undefined,
+  request: SessionGetRequest,
+): Effect.Effect<Session.Info | null, SessionScopeError> {
+  return Effect.gen(function* () {
+    const bound = yield* boundSessionScope(expected, request.sessionID, String(request.targetID))
+    if (!(yield* isDirectChildOf(sessions, bound, request.targetID))) {
+      return yield* Effect.fail(
+        new SessionScopeError({
+          message: `worker bound to ${bound} may not read session ${request.targetID}: not a direct child`,
+          sessionID: bound,
+          targetID: String(request.targetID),
+        }),
+      )
+    }
+    const info = yield* Effect.option(sessions.get(request.targetID))
+    return Option.isNone(info) ? null : info.value
+  })
+}
+
+/** List the bound session's own children; a child's children are out of scope. */
+export function childrenOnHub(
+  sessions: Session.Interface,
+  expected: SessionID | undefined,
+  request: SessionChildrenRequest,
+): Effect.Effect<readonly Session.Info[], SessionScopeError> {
+  return Effect.gen(function* () {
+    const bound = yield* boundSessionScope(expected, request.sessionID, String(request.parentID))
+    if (request.parentID !== bound) {
+      return yield* Effect.fail(
+        new SessionScopeError({
+          message: `worker bound to ${bound} may not list children of ${request.parentID}`,
+          sessionID: bound,
+          targetID: String(request.parentID),
+        }),
+      )
+    }
+    return yield* sessions.children(request.parentID).pipe(Effect.orDie)
+  })
+}
+
+/**
+ * Cancel the bound session (its own run, cascading to its descendants on the
+ * hub) or one of its direct children. A grandchild, ancestor, sibling or foreign
+ * id is rejected: the child worker owns its own subtree.
+ */
+export function cancelSessionOnHub(
+  sessions: Session.Interface,
+  expected: SessionID | undefined,
+  request: SessionCancelRequest,
+  cancel: (sessionID: SessionID) => Effect.Effect<CancelOutcome | undefined>,
+): Effect.Effect<CancelOutcome | undefined, SessionScopeError> {
+  return Effect.gen(function* () {
+    const bound = yield* boundSessionScope(expected, request.sessionID, String(request.targetID))
+    if (request.targetID !== bound && !(yield* isDirectChildOf(sessions, bound, request.targetID))) {
+      return yield* Effect.fail(
+        new SessionScopeError({
+          message: `worker bound to ${bound} may not cancel session ${request.targetID}: not a direct child`,
+          sessionID: bound,
+          targetID: String(request.targetID),
+        }),
+      )
+    }
+    return yield* cancel(request.targetID)
+  })
+}
+
+/**
+ * The dependencies a session-scope hub authority runs under. The runner carries
+ * the dispatching worker's captured context, so `Session`/`SessionPrompt` are
+ * resolved there rather than from the hub's ambient graph.
+ */
+export interface SessionScopeAuthorityDeps {
+  readonly run: HubProxyRunner
+  /** The hub-resolved `subagent_depth` cap enforced before a child is created. */
+  readonly subagentDepth: number
+  /** Record a verified child's authoritative depth before it can dispatch. */
+  readonly recordDepth: (sessionID: SessionID, depth: number) => void
+  /** Synchronous parent → children edge, recorded only for a verified child. */
+  readonly registerChild: (parentID: SessionID, childID: SessionID) => void
+}
+
+function missingSessionService(): Error {
+  return new Error("the hub has no Session service in the parent context")
+}
+
+function missingPromptService(): Error {
+  return new Error("the hub has no SessionPrompt service in the parent context")
+}
+
+/** Run a session-scope check under the worker's captured context. */
+function withSessionScope<A>(
+  run: HubProxyRunner,
+  effect: (sessions: Session.Interface) => Effect.Effect<A, SessionScopeError>,
+): Promise<A> {
+  return run(
+    Effect.gen(function* () {
+      const sessions = yield* Effect.serviceOption(Session.Service)
+      if (Option.isNone(sessions)) return yield* Effect.die(missingSessionService())
+      return yield* effect(sessions.value)
+    }),
+  )
+}
+
+/** Create a child on the hub, only under the worker's own bound session. */
+export function createSessionFor(
+  boundSessionID: SessionID | undefined,
+  run: HubProxyRunner,
+): NonNullable<HubProxyAuthorities["sessionCreate"]> {
+  return (request) => withSessionScope(run, (sessions) => createSessionOnHub(sessions, boundSessionID, request))
+}
+
+/** Read one session, only within the worker's own subtree. */
+export function getSessionFor(
+  boundSessionID: SessionID | undefined,
+  run: HubProxyRunner,
+): NonNullable<HubProxyAuthorities["sessionGet"]> {
+  return (request) => withSessionScope(run, (sessions) => getSessionOnHub(sessions, boundSessionID, request))
+}
+
+/** List a session's children, only within the worker's own subtree. */
+export function sessionChildrenFor(
+  boundSessionID: SessionID | undefined,
+  run: HubProxyRunner,
+): NonNullable<HubProxyAuthorities["sessionChildren"]> {
+  return (request) => withSessionScope(run, (sessions) => childrenOnHub(sessions, boundSessionID, request))
+}
+
+/** Cancel a session and its descendants, only within the worker's subtree. */
+export function cancelSessionFor(
+  boundSessionID: SessionID | undefined,
+  run: HubProxyRunner,
+): NonNullable<HubProxyAuthorities["sessionCancel"]> {
+  return (request) =>
+    run(
+      Effect.gen(function* () {
+        const sessions = yield* Effect.serviceOption(Session.Service)
+        if (Option.isNone(sessions)) return yield* Effect.die(missingSessionService())
+        const prompt = yield* Effect.serviceOption(SessionPromptService)
+        if (Option.isNone(prompt)) return yield* Effect.die(missingPromptService())
+        return yield* cancelSessionOnHub(sessions.value, boundSessionID, request, (sessionID) =>
+          prompt.value.cancel(sessionID),
+        )
+      }),
+    )
+}
+
+/**
+ * The hub's authoritative child spawn. A worker must be bound, may only spawn
+ * under that bound session, and a supplied `childID` must already be a direct
+ * child of it. Depth comes from the persisted parent (`nextDepth`), never from
+ * the request metadata a worker controls.
+ */
+export function sessionSpawnFor(
+  boundSessionID: SessionID | undefined,
+  deps: SessionScopeAuthorityDeps,
+): NonNullable<HubProxyAuthorities["sessionSpawn"]> {
+  return (request) =>
+    deps.run(
+      Effect.gen(function* () {
+        const sessions = yield* Effect.serviceOption(Session.Service)
+        if (Option.isNone(sessions)) return yield* Effect.die(missingSessionService())
+        if (boundSessionID === undefined) {
+          return yield* Effect.fail(
+            new SessionScopeError({
+              message: "the hub has no bound session for this worker; refusing to spawn",
+              sessionID: "",
+              targetID: String(request.parentID),
+            }),
+          )
+        }
+        if (request.parentID !== boundSessionID) {
+          return yield* Effect.fail(
+            new SessionScopeError({
+              message: `worker bound to ${boundSessionID} may not spawn under ${request.parentID}`,
+              sessionID: boundSessionID,
+              targetID: String(request.parentID),
+            }),
+          )
+        }
+        const parent = yield* Effect.option(sessions.value.get(request.parentID))
+        if (Option.isNone(parent)) {
+          return yield* Effect.fail(
+            new SessionScopeError({
+              message: `cannot spawn under unknown session ${request.parentID}`,
+              sessionID: boundSessionID,
+              targetID: String(request.parentID),
+            }),
+          )
+        }
+        // The child's depth is a property of the persisted parent, not of the
+        // worker-supplied metadata (which a caller could forge).
+        const childDepth = nextDepth(parent.value.metadata)
+        if (request.childID !== undefined) {
+          if (request.childID === request.parentID) {
+            return yield* Effect.fail(
+              new SessionScopeError({
+                message: `worker bound to ${boundSessionID} may not resume its own session as a child`,
+                sessionID: boundSessionID,
+                targetID: String(request.childID),
+              }),
+            )
+          }
+          const child = yield* Effect.option(sessions.value.get(request.childID))
+          if (Option.isNone(child) || child.value.parentID !== request.parentID) {
+            return yield* Effect.fail(
+              new SessionScopeError({
+                message: `worker bound to ${boundSessionID} may not resume ${request.childID}: it is not a direct child of ${request.parentID}`,
+                sessionID: boundSessionID,
+                targetID: String(request.childID),
+              }),
+            )
+          }
+          deps.recordDepth(request.childID, childDepth)
+        }
+        const spawned = yield* spawnChildOnHub(sessions.value, deps.subagentDepth, request)
+        deps.recordDepth(spawned.childID, childDepth)
+        // Record the edge synchronously, before the child's own worker can
+        // start. A parent crash between here and the child dispatch then still
+        // cascades (the child is either queued or admitted, both cancellable).
+        deps.registerChild(boundSessionID, spawned.childID)
+        return spawned
+      }),
+    )
+}
+
+/**
+ * Bind every `sessionStatus` operation to the worker's own session. A foreign
+ * read never reaches the hub service (it resolves idle), a foreign write is
+ * ignored, and the list exposes only the bound entry.
+ */
+function bindSessionStatus(
+  inner: SessionStatus.Interface,
+  boundSessionID: SessionID | undefined,
+): SessionStatus.Interface {
+  const owns = (sessionID: SessionID): boolean => boundSessionID !== undefined && sessionID === boundSessionID
+  return {
+    get: (sessionID) => (owns(sessionID) ? inner.get(sessionID) : Effect.succeed({ type: "idle" as const })),
+    list: () =>
+      boundSessionID === undefined
+        ? Effect.succeed(new Map<SessionID, SessionStatus.Info>())
+        : inner
+            .list()
+            .pipe(
+              Effect.map((statuses) => new Map([...statuses].filter(([sessionID]) => sessionID === boundSessionID))),
+            ),
+    set: (sessionID, status) => (owns(sessionID) ? inner.set(sessionID, status) : Effect.void),
+  }
+}
+
+/** A foreign session target on a per-session cancel/plugin authority. */
+function foreignSessionError(
+  what: string,
+  boundSessionID: SessionID | undefined,
+  targetID: string,
+): SessionScopeError | undefined {
+  if (boundSessionID !== undefined && targetID === boundSessionID) return undefined
+  return new SessionScopeError({
+    message: `worker bound to ${boundSessionID ?? "no session"} may not ${what} for ${targetID}`,
+    sessionID: boundSessionID ?? "",
+    targetID,
+  })
+}
+
+/**
+ * Bind a per-session cancel to the worker's own session. The hub release path
+ * cancels only the session whose authority map it builds; a worker asking for
+ * another session must fail, not silently cancel (or leave) that session's
+ * pending requests.
+ */
+function bindCancelSession<ID extends string>(
+  cancel: (sessionID: ID) => Effect.Effect<void>,
+  boundSessionID: SessionID | undefined,
+  what: string,
+): (sessionID: ID) => Effect.Effect<void> {
+  return (sessionID) => {
+    const foreign = foreignSessionError(what, boundSessionID, String(sessionID))
+    return foreign === undefined ? cancel(sessionID) : Effect.die(foreign)
+  }
+}
+
+/** Bind a plugin-tool execute to the worker's own session before it reaches the hub plugin. */
+function bindPluginTool(
+  execute: NonNullable<HubProxyAuthorities["pluginTool"]>,
+  boundSessionID: SessionID | undefined,
+): NonNullable<HubProxyAuthorities["pluginTool"]> {
+  return (input, emit) => {
+    const foreign = foreignSessionError("execute a plugin tool", boundSessionID, input.sessionID)
+    return foreign === undefined ? execute(input, emit) : Promise.reject(foreign)
+  }
+}
+
+/** Bind a plugin-tool abort to the worker's own session before it reaches the abort registry. */
+function bindPluginToolAbort(
+  abort: NonNullable<HubProxyAuthorities["pluginToolAbort"]>,
+  boundSessionID: SessionID | undefined,
+): NonNullable<HubProxyAuthorities["pluginToolAbort"]> {
+  return (input) => {
+    const foreign = foreignSessionError("abort a plugin tool", boundSessionID, input.sessionID)
+    return foreign === undefined ? abort(input) : Promise.reject(foreign)
+  }
+}
+
+/** Bind permission asks/replies/lists to the worker's own session's requests. */
+function bindPermission(inner: Permission.Interface, boundSessionID: SessionID | undefined): Permission.Interface {
+  return {
+    ask: (input) =>
+      boundSessionID === undefined || input.sessionID !== boundSessionID
+        ? Effect.fail(new PermissionV1.DeniedError({ ruleset: [] }))
+        : inner.ask(input),
+    reply: (input) =>
+      Effect.gen(function* () {
+        if (boundSessionID === undefined) {
+          return yield* Effect.fail(new PermissionV1.NotFoundError({ requestID: input.requestID }))
+        }
+        const pending = yield* inner.list()
+        const target = pending.find((item) => item.id === input.requestID)
+        if (target === undefined || target.sessionID !== boundSessionID) {
+          return yield* Effect.fail(new PermissionV1.NotFoundError({ requestID: input.requestID }))
+        }
+        return yield* inner.reply(input)
+      }),
+    list: () =>
+      boundSessionID === undefined
+        ? Effect.succeed<ReadonlyArray<PermissionV1.Request>>([])
+        : inner.list().pipe(Effect.map((pending) => pending.filter((item) => item.sessionID === boundSessionID))),
+    ...(inner.cancelSession === undefined
+      ? {}
+      : { cancelSession: bindCancelSession(inner.cancelSession, boundSessionID, "cancel permission requests") }),
+  }
+}
+
+/** Bind question asks/replies/rejects/lists to the worker's own session's requests. */
+function bindQuestion(inner: Question.Interface, boundSessionID: SessionID | undefined): Question.Interface {
+  return {
+    ask: (input) =>
+      boundSessionID === undefined || input.sessionID !== boundSessionID
+        ? Effect.fail(new Question.RejectedError())
+        : inner.ask(input),
+    reply: (input) =>
+      Effect.gen(function* () {
+        if (boundSessionID === undefined) {
+          return yield* Effect.fail(new Question.NotFoundError({ requestID: input.requestID }))
+        }
+        const pending = yield* inner.list()
+        const target = pending.find((item) => item.id === input.requestID)
+        if (target === undefined || target.sessionID !== boundSessionID) {
+          return yield* Effect.fail(new Question.NotFoundError({ requestID: input.requestID }))
+        }
+        return yield* inner.reply(input)
+      }),
+    reject: (requestID) =>
+      Effect.gen(function* () {
+        if (boundSessionID === undefined) {
+          return yield* Effect.fail(new Question.NotFoundError({ requestID }))
+        }
+        const pending = yield* inner.list()
+        const target = pending.find((item) => item.id === requestID)
+        if (target === undefined || target.sessionID !== boundSessionID) {
+          return yield* Effect.fail(new Question.NotFoundError({ requestID }))
+        }
+        return yield* inner.reject(requestID)
+      }),
+    list: () =>
+      boundSessionID === undefined
+        ? Effect.succeed<ReadonlyArray<Question.Request>>([])
+        : inner.list().pipe(Effect.map((pending) => pending.filter((item) => item.sessionID === boundSessionID))),
+    ...(inner.cancelSession === undefined
+      ? {}
+      : { cancelSession: bindCancelSession(inner.cancelSession, boundSessionID, "cancel question requests") }),
+  }
+}
+
+/** The inputs the worker-facing authority map is built from. */
+export interface HubProxyAuthorityDeps extends SessionScopeAuthorityDeps {
+  readonly boundSessionID: SessionID | undefined
+  readonly sessionStatus: SessionStatus.Interface
+  readonly permission: Permission.Interface
+  readonly question: Question.Interface
+  readonly systemTransform?: NonNullable<HubProxyAuthorities["systemTransform"]>
+  readonly messagesTransform?: NonNullable<HubProxyAuthorities["messagesTransform"]>
+  readonly pluginTrigger?: NonNullable<HubProxyAuthorities["pluginTrigger"]>
+  readonly pluginTool?: NonNullable<HubProxyAuthorities["pluginTool"]>
+  readonly pluginToolList?: NonNullable<HubProxyAuthorities["pluginToolList"]>
+  readonly pluginToolAbort?: NonNullable<HubProxyAuthorities["pluginToolAbort"]>
+  readonly backgroundJob?: NonNullable<HubProxyAuthorities["backgroundJob"]>
+}
+
+/**
+ * The production authority map for one worker. Every worker-controlled id is
+ * bound to the session the worker is registered to: status writes, permission
+ * and question replies/lists, and every session-scope RPC.
+ */
+export function hubProxyAuthoritiesFor(deps: HubProxyAuthorityDeps): HubProxyAuthorities {
+  return {
+    sessionStatus: bindSessionStatus(deps.sessionStatus, deps.boundSessionID),
+    permission: bindPermission(deps.permission, deps.boundSessionID),
+    question: bindQuestion(deps.question, deps.boundSessionID),
+    ...(deps.systemTransform === undefined ? {} : { systemTransform: deps.systemTransform }),
+    ...(deps.messagesTransform === undefined ? {} : { messagesTransform: deps.messagesTransform }),
+    ...(deps.pluginTrigger === undefined ? {} : { pluginTrigger: deps.pluginTrigger }),
+    ...(deps.pluginTool === undefined
+      ? {}
+      : { pluginTool: bindPluginTool(deps.pluginTool, deps.boundSessionID) }),
+    ...(deps.pluginToolList === undefined ? {} : { pluginToolList: deps.pluginToolList }),
+    ...(deps.pluginToolAbort === undefined
+      ? {}
+      : { pluginToolAbort: bindPluginToolAbort(deps.pluginToolAbort, deps.boundSessionID) }),
+    ...(deps.backgroundJob === undefined ? {} : { backgroundJob: deps.backgroundJob }),
+    sessionSpawn: sessionSpawnFor(deps.boundSessionID, deps),
+    sessionCreate: createSessionFor(deps.boundSessionID, deps.run),
+    sessionGet: getSessionFor(deps.boundSessionID, deps.run),
+    sessionChildren: sessionChildrenFor(deps.boundSessionID, deps.run),
+    sessionCancel: cancelSessionFor(deps.boundSessionID, deps.run),
+  }
+}
+
+interface MirroredWorkerJob {
+  /** The session that owns the worker; used to prune on release. */
+  readonly sessionID: string
+  readonly registry: BackgroundJob.Interface
+  /** The session-context runner, so registry methods resolve their instance. */
+  readonly run: HubProxyRunner
+  readonly done: Deferred.Deferred<{ readonly output?: string; readonly error?: string }>
+  readonly promotionWaiters: Set<(promoted: boolean) => void>
+  promoted: boolean
+  settled: boolean
+}
+
+/** Resolve every pending promotion long-poll with one outcome and clear them. */
+function resolvePromotionWaiters(job: MirroredWorkerJob, promoted: boolean): void {
+  for (const waiter of job.promotionWaiters) waiter(promoted)
+  job.promotionWaiters.clear()
+}
+
+/**
+ * The hub-half of worker-job promotion. Each worker reports its running jobs
+ * here; the mirror lives in the hub's own `BackgroundJob` registry so the
+ * existing `list`/`promote` endpoint sees foreground jobs too. Promotion
+ * resolves the worker's long-poll, which is the only way to run the worker-local
+ * `onPromote` (and therefore the task notification) across the isolate.
+ *
+ * The mirror is keyed by job id and pruned when the worker reports settlement or
+ * its session is released, so a dead worker cannot leave a permanently-running
+ * ghost entry.
+ */
+export interface WorkerJobMirror {
+  authorityFor(run: HubProxyRunner): WorkerBackgroundJobAuthority
+  releaseSession(sessionID: string): void
+}
+
+export function createWorkerJobMirror(): WorkerJobMirror {
+  const jobs = new Map<string, MirroredWorkerJob>()
+
+  const settleMirror = async (job: MirroredWorkerJob, input: WorkerBackgroundJobSettle): Promise<void> => {
+    job.settled = true
+    jobs.delete(input.id)
+    resolvePromotionWaiters(job, false)
+    if (input.status === "cancelled") {
+      await job.run(job.registry.cancel(input.id)).catch(() => undefined)
+      return
+    }
+    const payload = input.status === "error" ? { error: input.error ?? "job failed" } : { output: input.output ?? "" }
+    await job.run(Deferred.succeed(job.done, payload)).catch(() => undefined)
+  }
+
+  return {
+    authorityFor: (run) => ({
+      register: async (info) => {
+        if (info.status !== "running") return
+        const existing = jobs.get(info.id)
+        if (existing !== undefined) {
+          // A resumed foreground job is promoted worker-side; propagate that
+          // state so the hub mirror stops reporting it as foreground. Promoting
+          // an already-background mirror is an observation, not a new promotion.
+          if (info.metadata?.background === true && !existing.promoted) {
+            await run(existing.registry.promote(info.id))
+          }
+          return
+        }
+        const registry = await run(Effect.serviceOption(BackgroundJob.Service))
+        if (Option.isNone(registry)) return
+        const job: MirroredWorkerJob = {
+          sessionID: info.parentID ?? info.id,
+          registry: registry.value,
+          run,
+          done: Effect.runSync(Deferred.make<{ readonly output?: string; readonly error?: string }>()),
+          promotionWaiters: new Set(),
+          promoted: false,
+          settled: false,
+        }
+        jobs.set(info.id, job)
+        try {
+          await run(
+            registry.value.start({
+              id: info.id,
+              type: info.type,
+              ...(info.title === undefined ? {} : { title: info.title }),
+              ...(info.metadata === undefined ? {} : { metadata: info.metadata }),
+              ...(info.parentID === undefined ? {} : { parentID: info.parentID }),
+              onPromote: Effect.sync(() => {
+                job.promoted = true
+                resolvePromotionWaiters(job, true)
+              }),
+              run: Deferred.await(job.done).pipe(
+                Effect.flatMap((payload) =>
+                  payload.error === undefined
+                    ? Effect.succeed(payload.output ?? "")
+                    : Effect.fail(new Error(payload.error)),
+                ),
+              ),
+            }),
+          )
+        } catch (error) {
+          jobs.delete(info.id)
+          resolvePromotionWaiters(job, false)
+          throw error
+        }
+      },
+      settle: async (input) => {
+        const job = jobs.get(input.id)
+        if (job === undefined) return
+        await settleMirror(job, input)
+      },
+      awaitPromotion: (id) => {
+        const job = jobs.get(id)
+        if (job === undefined || job.settled) return Promise.resolve(false)
+        if (job.promoted) return Promise.resolve(true)
+        return new Promise((resolve) => job.promotionWaiters.add(resolve))
+      },
+    }),
+    releaseSession: (sessionID) => {
+      for (const [id, job] of jobs) {
+        if (job.sessionID !== sessionID) continue
+        void settleMirror(job, { id, status: "cancelled" })
+      }
+    },
+  }
+}
 
 function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionResolvers {
   const { services, bridge, authorities, log, subagentDepth } = deps
@@ -3601,12 +4775,28 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
   // cascade reads. Registered at the two hub-observable boundaries below and
   // pruned when a session's worker is released.
   const children = createSessionChildrenIndex()
+  // The synchronous session → subagent-depth mirror the dispatch path reads
+  // BEFORE a worker materializes. `Session.spawn` stamps `metadata.depth` on the
+  // child and forwards it over the spawn proxy, so the hub records it here before
+  // the child prompt dispatches; a foreground root is 0. Kept after a worker is
+  // released so a re-dispatched child keeps its headroom level.
+  const sessionDepths = new Map<SessionID, number>()
+  const depthOf = (sessionID: SessionID): number | undefined => sessionDepths.get(sessionID)
+  const recordDepth = (sessionID: SessionID, depth: number): void => {
+    // Roots need no entry (absence resolves to 0); only nested children keep
+    // headroom state, so the map stays bounded by the spawned subagent tree.
+    if (depth > 0) sessionDepths.set(sessionID, depth)
+    else sessionDepths.delete(sessionID)
+  }
   // Per-session state, written on EVERY dispatch (never latched with `??=`).
   // A session's own ambient `InstanceRef` and full runtime context are stored
   // under its id, so a second project's worker is never built — and its
   // hub-proxy calls never run — under the first project's directory/instance.
   const instanceBySession = new Map<SessionID, InstanceContext>()
   const contextBySession = new Map<SessionID, Context.Context<never>>()
+  // Worker-owned jobs are mirrored into the hub registry so the promotion
+  // endpoint sees foreground jobs; release prunes a dead worker's ghosts.
+  const jobMirrors = createWorkerJobMirror()
   // Release one session's per-session state; the finalizer clears the rest.
   // Called on every rebind and at teardown, so the maps stay bounded by the set
   // of live sessions. A session's own entry is dropped once its worker rebinds
@@ -3618,11 +4808,13 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
     instanceBySession.delete(sessionID)
     contextBySession.delete(sessionID)
     children.release(sessionID)
+    jobMirrors.releaseSession(sessionID)
   }
   const clearSessions = (): void => {
     instanceBySession.clear()
     contextBySession.clear()
     children.clear()
+    sessionDepths.clear()
   }
   // The session currently being dispatched. Updated on every dispatch; used only
   // as the fallback when a pool resolves an init without a session id.
@@ -3706,53 +4898,44 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
   // worker is bound to exactly one session, so its control port reaches the
   // right `SessionStatus`/`Permission`/`Question`/`systemTransform`/
   // `messagesTransform`/`pluginTool` instance.
-  const hubProxyAuthoritiesFor = (context: Context.Context<never> | undefined): HubProxyAuthorities => ({
-    sessionStatus: authorities.sessionStatus,
-    permission: authorities.permission,
-    question: authorities.question,
-    systemTransform: systemTransformFor(context),
-    messagesTransform: messagesTransformFor(context),
-    pluginTrigger: pluginTriggerFor(context),
-    // The worker forwards plugin-tool executes here; the definition (and its
-    // plugin instance) stays on the hub. `registerAbort` keys each in-flight call
-    // so the hub cancel path / `pluginTool.abort` can unwind it.
-    pluginTool: pluginToolFor(context),
-    // The lazy descriptor refresh: descriptors shipped at init go stale when a
-    // plugin reloads, so the worker re-fetches them here.
-    pluginToolList: () => resolveContextHubToolDescriptors(context),
-    // Best-effort per-call abort the worker may request directly.
-    pluginToolAbort: (input) => pluginToolAborts.abort(input.sessionID, input.callID),
-    sessionSpawn: sessionSpawnFor(context),
-  })
-  // `session.spawn` runs in the parent worker's captured context: `Session.spawn`
-  // stamps `metadata.depth`, persists the prompt, and the context's run-state
-  // dispatches the child to its own per-session worker.
-  const sessionSpawnFor =
-    (context: Context.Context<never> | undefined): NonNullable<HubProxyAuthorities["sessionSpawn"]> =>
-    (request) =>
-      runHubProxyFor(context)(
-        Effect.gen(function* () {
-          const sessions = yield* Effect.serviceOption(Session.Service)
-          if (Option.isNone(sessions)) {
-            return yield* Effect.die(new Error("the hub has no Session service in the parent context"))
-          }
-          const spawned = yield* spawnChildOnHub(sessions.value, subagentDepth, request)
-          // Record the edge synchronously, before the child's own worker can
-          // start. A parent crash between here and the child dispatch then still
-          // cascades (the child is either queued or admitted, both cancellable).
-          children.register(request.parentID, spawned.childID)
-          return spawned
-        }),
-      )
+  const authoritiesFor = (
+    context: Context.Context<never> | undefined,
+    boundSessionID: SessionID | undefined,
+  ): HubProxyAuthorities =>
+    hubProxyAuthoritiesFor({
+      run: runHubProxyFor(context),
+      boundSessionID,
+      subagentDepth,
+      recordDepth,
+      registerChild: children.register,
+      sessionStatus: authorities.sessionStatus,
+      permission: authorities.permission,
+      question: authorities.question,
+      systemTransform: systemTransformFor(context),
+      messagesTransform: messagesTransformFor(context),
+      pluginTrigger: pluginTriggerFor(context),
+      // The worker forwards plugin-tool executes here; the definition (and its
+      // plugin instance) stays on the hub. `registerAbort` keys each in-flight call
+      // so the hub cancel path / `pluginTool.abort` can unwind it.
+      pluginTool: pluginToolFor(context),
+      // The lazy descriptor refresh: descriptors shipped at init go stale when a
+      // plugin reloads, so the worker re-fetches them here.
+      pluginToolList: () => resolveContextHubToolDescriptors(context),
+      // Best-effort per-call abort the worker may request directly.
+      pluginToolAbort: (input) => pluginToolAborts.abort(input.sessionID, input.callID),
+      // Worker jobs have no hub process to live in: the mirror makes them visible
+      // to the promotion endpoint, and the long-poll below reaches the worker.
+      backgroundJob: jobMirrors.authorityFor(runHubProxyFor(context)),
+    })
   const hubProxyFor = (workerID: number): HubProxyHandlers => {
     const context = contextOfWorker(workerID)
-    return buildHubProxyHandlers(hubProxyAuthoritiesFor(context), runHubProxyFor(context))
+    return buildHubProxyHandlers(authoritiesFor(context, deps.sessionOfWorker(workerID)), runHubProxyFor(context))
   }
   // The streaming half of the map: `pluginTool.execute` pushes mid-execute
   // metadata to the awaiting worker. Served alongside the plain map.
   const hubProxyStreamingFor = (workerID: number): Readonly<Record<string, HubProxyStreamHandler>> => {
     const context = contextOfWorker(workerID)
-    return buildHubProxyStreamHandlers(hubProxyAuthoritiesFor(context))
+    return buildHubProxyStreamHandlers(authoritiesFor(context, deps.sessionOfWorker(workerID)))
   }
   // Per-session: the pool passes the session it is building a worker for, so
   // this session's instance/model (and plugin effect) is the one shipped, never
@@ -3774,6 +4957,9 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
     if (session !== undefined && dispatched?.parentID !== undefined) {
       children.register(dispatched.parentID, session)
     }
+    // Mirror the persisted depth so a re-dispatched child keeps its cap level
+    // even when the in-memory spawn record is gone (restart/custom pool).
+    if (session !== undefined && dispatched?.depth !== undefined) recordDepth(session, dispatched.depth)
     const instance = resolveSessionInstance(session, dispatched, instanceOfSession, log)
     const model = dispatched?.model
     const request = dispatched?.request
@@ -3797,6 +4983,9 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
                 sources: pluginSources,
                 sessionID: session,
                 ...(request ?? {}),
+                // A bridged worker runs these hooks once per request; resolving
+                // them here too would double-invoke and freeze the boot model.
+                deferRequestHooks: deps.requestHooksViaHub,
               }),
       pluginTools,
     }
@@ -3831,12 +5020,34 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
     hubProxyFor,
     hubProxyStreamingFor,
     abortPluginTools: (sessionID) => pluginToolAborts.abortSession(sessionID),
+    cancelPendingRequests: (sessionID) => {
+      // Capture the session's own context before any asynchronous run so a
+      // concurrent release cannot drop it out from under the authority effects.
+      const context = contextOfSession(sessionID)
+      const run = runHubProxyFor(context)
+      const cancels: Array<Promise<void>> = []
+      if (authorities.permission.cancelSession !== undefined) {
+        cancels.push(run(authorities.permission.cancelSession(sessionID)))
+      }
+      if (authorities.question.cancelSession !== undefined) {
+        cancels.push(run(authorities.question.cancelSession(sessionID)))
+      }
+      if (cancels.length === 0) return
+      void Promise.all(cancels).catch((error: unknown) => {
+        log(workerLogMessage("pending request cancel failed"), {
+          level: "WARN",
+          sessionID,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      })
+    },
     instanceOfSession,
     resolveInit,
     recordDispatch,
     releaseSession,
     clearSessions,
     childrenOf: children.childrenOf,
+    depthOf,
   }
 }
 
@@ -3920,6 +5131,16 @@ export function productionSessionHubLayer(
       // The per-session resolvers (the session → instance/context registry, the
       // live publishers, and the per-worker hub-proxy handlers and init) live in
       // one factory; the layer body only wires them to the hub.
+      //
+      // The hub ALWAYS resolves a port source below: the default production
+      // backends serve the resolvers' own `hubProxyFor`, so a worker receives the
+      // request-hook bridge even though `options.ports` is undefined here. Only a
+      // caller-supplied object that exposes no hub-proxy handler can omit it.
+      const requestHooksViaHub =
+        options.ports === undefined ||
+        typeof options.ports === "function" ||
+        options.ports.hubProxy !== undefined ||
+        options.ports.hubProxyFor !== undefined
       const resolvers = createPerSessionResolvers({
         services: { config, auth, modelsDev, provider, flags },
         bridge,
@@ -3928,6 +5149,9 @@ export function productionSessionHubLayer(
         epochSequence,
         initOptions: options.initOptions,
         plugins: options.plugins,
+        // A bridged worker runs `chat.params` / `chat.headers` once per request;
+        // resolving them during init as well would double every invocation.
+        requestHooksViaHub,
         log,
         subagentDepth,
         sessionOfWorker: (workerID) => hubRef?.sessionOfWorker(workerID),
@@ -3972,13 +5196,25 @@ export function productionSessionHubLayer(
           options.onSessionRebound?.(sessionID)
         },
         onSessionReleased: (sessionID) => {
+          // A retired generation can never answer a hub-side permission/question
+          // request; fail and remove it before dropping the session's context.
+          resolvers.cancelPendingRequests(sessionID)
           // Per-session workers never rebind: release state when the worker is
           // reaped/cancelled so the per-session maps stay bounded.
           resolvers.releaseSession(sessionID)
           options.onSessionReleased?.(sessionID)
         },
         onDispatch: resolvers.recordDispatch,
-        onCancelRequested: (sessionID) => resolvers.abortPluginTools(sessionID),
+        // The production dispatch path must carry the child's `metadata.depth`;
+        // without it `cap.acquire` always sees 0 and nested children deadlock
+        // behind their parent's foreground slot.
+        depthOf: resolvers.depthOf,
+        onCancelRequested: (sessionID) => {
+          // Abort hub-executed tools and fail blocked permission/question asks at
+          // the moment of the cancel, not only after the grace window.
+          resolvers.abortPluginTools(sessionID)
+          resolvers.cancelPendingRequests(sessionID)
+        },
       })
       hubRef = hub
       yield* Effect.addFinalizer(() =>

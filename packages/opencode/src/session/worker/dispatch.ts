@@ -117,7 +117,7 @@ export class ParentCrashedError extends SessionCancelledError {
 }
 
 /** Every terminal mode a cancelled run can report. There is no admission queue. */
-export const CANCELLED_MODES = ["cooperative", "terminated", "completed"] as const
+export const CANCELLED_MODES = ["cooperative", "terminated", "completed", "boot"] as const
 
 /** The terminal mode reported when a session is cancelled. */
 export type CancelledMode = (typeof CANCELLED_MODES)[number]
@@ -410,6 +410,23 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     return controller
   }
 
+  /**
+   * A worker kept idle for reuse can die between turns (the isolate exits on its
+   * own or its process is reaped externally). Reusing its handle would run the
+   * next turn on a dead isolate, so a dead idle worker is retired and its handle
+   * closed before the registry materializes a fresh one.
+   */
+  const replaceDeadIdleWorker = (sessionID: SessionID): void => {
+    const entry = workers.entry(sessionID)
+    if (entry === undefined || entry.state !== "idle" || entry.worker.alive) return
+    log(workerLogMessage("dead idle worker replaced"), {
+      level: "WARN",
+      sessionID,
+      workerID: entry.id,
+    })
+    retireWorker(sessionID)
+  }
+
   const start = (pending: Pending): void => {
     if (terminated) {
       pending.gate.claim("cancel")
@@ -418,6 +435,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     }
     clearIdle(pending.sessionID)
     options.onRunStart?.(pending.sessionID)
+    replaceDeadIdleWorker(pending.sessionID)
     const worker = workers.getOrCreate(pending.sessionID, (id) => pool.spawn(id))
     pending.startedAt = Date.now()
     pending.workerID = worker.id
@@ -809,10 +827,25 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     rejectWaiters(sessionID, cancelled(sessionID))
     if (owned === undefined) return
     if (workers.has(sessionID)) workers.markCancelling(sessionID)
+    const worker = workers.worker(sessionID)
+    // A run still in its first boot has no fiber to terminate: the boot lifecycle
+    // aborts the partial isolate, releases the permit, and reports the typed boot
+    // outcome. Only a run that already started takes the terminate-only path.
+    const boot = await worker?.cancelBoot?.()
+    if (boot !== undefined) {
+      settleCancelled(sessionID, owned, {
+        mode: "boot",
+        winner: "cancel",
+        worker,
+        retires: true,
+        reaps: false,
+      })
+      return
+    }
     settleCancelled(sessionID, owned, {
       mode: "terminated",
       winner: "cancel",
-      worker: workers.worker(sessionID),
+      worker,
       retires: true,
       reaps: true,
     })
@@ -864,6 +897,28 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
 
     if (workers.has(sessionID)) workers.markCancelling(sessionID)
     const worker = workers.worker(sessionID)
+    // The first boot owns the spawn permit and has no run fiber yet: abort the
+    // boot interval and report `boot` instead of sending a cancel frame to a
+    // worker that cannot answer it. The boot path releases the permit exactly
+    // once; a terminate-only settlement would hide that typed outcome.
+    if (worker !== undefined) {
+      const started = Date.now()
+      const boot = await worker.cancelBoot?.()
+      if (boot !== undefined) {
+        settleCancelled(sessionID, owned, {
+          mode: "boot",
+          winner: "cancel",
+          worker,
+          retires: true,
+          reaps: false,
+        })
+        // A boot cancel settles a partial isolate that never started a run, so
+        // no worker published the terminal idle. `acknowledged: false` forces the
+        // caller's fallback idle; otherwise an auto-resume boot cancel would
+        // leave the session busy forever.
+        return { sessionID, mode: "boot", winner: "cancel", acknowledged: false, durationMs: Date.now() - started }
+      }
+    }
     const port = worker === undefined ? undefined : config.portFor?.(worker)
 
     if (worker === undefined || port === undefined) {
@@ -900,7 +955,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
         mode: resolved.mode,
         winner: resolved.winner,
         worker,
-        retires: resolved.mode === "terminated",
+        retires: resolved.mode === "terminated" || resolved.mode === "boot",
         reaps: false,
       })
     }

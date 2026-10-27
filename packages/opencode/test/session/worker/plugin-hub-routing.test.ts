@@ -81,8 +81,15 @@ export default async () => ({
   "tool.definition": (_input, output) => {
     output.description = output.description + " [plugin]"
   },
-  "chat.params": (_input, output) => {
-    output.temperature = 0.25
+  "chat.params": (input, output) => {
+    output.temperature = input?.model?.id === "other-model" ? 0.75 : 0.25
+  },
+  "chat.headers": (input, output) => {
+    output.headers["x-plugin-model"] = String(input?.model?.id ?? "none")
+  },
+  "chat.message": (_input, output) => {
+    output.message.agent = "plugin-agent"
+    output.parts.push({ type: "text", text: "from-plugin" })
   },
 })
 `
@@ -198,15 +205,73 @@ describe("tool.execute.before/after are real in a worker", () => {
     }
   })
 
+  test("mutations land on the caller's objects, not just the returned clone", async () => {
+    const real = await loadRealPlugin()
+    try {
+      const { layer } = await productionWorker(real.hooks)
+
+      // `tool.execute.before`: the call sites keep the args object they passed
+      // and ignore the trigger return, so the injected field must be observable
+      // on that original reference.
+      const beforeOutput = { args: { command: "ls" } as Record<string, unknown> }
+      await trigger(layer, "tool.execute.before", { tool: "bash" }, beforeOutput)
+      expect(beforeOutput.args).toEqual({ command: "ls", injected: true })
+
+      // `tool.execute.after`: same contract for the result object.
+      const afterOutput = { title: "t", output: "done", metadata: {} }
+      await trigger(layer, "tool.execute.after", { tool: "bash" }, afterOutput)
+      expect(afterOutput.output).toBe("done!")
+
+      // `tool.definition`: the registry reads `output` after the trigger.
+      const definition = { description: "base", parameters: {}, jsonSchema: {} }
+      await trigger(layer, "tool.definition", { toolID: "bash" }, definition)
+      expect(definition.description).toBe("base [plugin]")
+
+      // `chat.message`: both the message and the parts array are reconciled in
+      // place, preserving the identities the prompt path keeps using.
+      const message = { agent: "build" }
+      const parts: unknown[] = []
+      const chatOutput = { message, parts }
+      await trigger(layer, "chat.message", { sessionID: "ses" }, chatOutput)
+      expect(message.agent).toBe("plugin-agent")
+      expect(parts).toEqual([{ type: "text", text: "from-plugin" }])
+    } finally {
+      await real.dispose()
+    }
+  })
+
+  test("chat.params and chat.headers resolve against the request's current model", async () => {
+    const real = await loadRealPlugin()
+    try {
+      const { layer } = await productionWorker(real.hooks)
+      const baseline = () => ({ temperature: 0.1, topP: 1, topK: 1, maxOutputTokens: 100, options: {} })
+
+      const first = await trigger(layer, "chat.params", { model: { id: "mock-model" } }, baseline())
+      const second = await trigger(layer, "chat.params", { model: { id: "other-model" } }, baseline())
+      if (!Exit.isSuccess(first) || !Exit.isSuccess(second)) throw new Error("chat.params failed")
+      // The init-resolved diff was 0.25; the second request must not be frozen to it.
+      expect((first.value as { temperature?: number }).temperature).toBe(0.25)
+      expect((second.value as { temperature?: number }).temperature).toBe(0.75)
+
+      const headersA = await trigger(layer, "chat.headers", { model: { id: "mock-model" } }, { headers: {} })
+      const headersB = await trigger(layer, "chat.headers", { model: { id: "other-model" } }, { headers: {} })
+      if (!Exit.isSuccess(headersA) || !Exit.isSuccess(headersB)) throw new Error("chat.headers failed")
+      expect((headersA.value as { headers: Record<string, string> }).headers["x-plugin-model"]).toBe("mock-model")
+      expect((headersB.value as { headers: Record<string, string> }).headers["x-plugin-model"]).toBe("other-model")
+    } finally {
+      await real.dispose()
+    }
+  })
+
   test("the hub-side bridge rejects a hook that is not hub-proxy", async () => {
     const real = await loadRealPlugin()
     try {
       const { wired } = await productionWorker(real.hooks)
-      const error = await wired.bridge("chat.message", {}, { parts: [] }).catch((failure: unknown) => failure)
+      const error = await wired.bridge("command.execute.before", {}, { parts: [] }).catch((failure: unknown) => failure)
       // The wire reconstructs the remote tagged error (the `_tag` metadata is
       // carried so callers can branch on the domain failure, not a bare string).
       expect((error as { tag?: string }).tag).toBe("UnsupportedPluginHookError")
-      expect(String((error as Error).message)).toContain("chat.message")
+      expect(String((error as Error).message)).toContain("command.execute.before")
     } finally {
       await real.dispose()
     }
@@ -232,6 +297,10 @@ describe("unsupported hooks are never invoked in a worker", () => {
       )
       if (Exit.isFailure(listed)) throw new Error(Cause.pretty(listed.cause))
       expect(Exit.isSuccess(listed)).toBe(true)
+      if (!Exit.isSuccess(listed)) throw new Error("registry.tools failed")
+      // The registry ignores the trigger return and reads `output`; the plugin's
+      // description mutation must still be visible there.
+      expect(listed.value.some((tool) => tool.description.includes("[plugin]"))).toBe(true)
 
       // The shell tool's env call site forwards to the hub instead of dispatching
       // an unsupported trigger locally.
@@ -255,7 +324,16 @@ describe("admission through the production init factory", () => {
       Layer.mock(Provider.Service, {
         defaultModel: () =>
           Effect.succeed({ providerID: ProviderV2.ID.make("mock"), modelID: ModelV2.ID.make("mock-model") }),
-        getProvider: () => Effect.succeed({ id: "mock", name: "Mock", source: "config", env: [], key: "k", options: {}, models: {} } as never),
+        getProvider: () =>
+          Effect.succeed({
+            id: "mock",
+            name: "Mock",
+            source: "config",
+            env: [],
+            key: "k",
+            options: {},
+            models: {},
+          } as never),
         getModel: () =>
           Effect.succeed({
             id: "mock-model",
@@ -312,7 +390,7 @@ describe("admission through the production init factory", () => {
   test("an unsupported hook added after startup fails the factory admission", async () => {
     const real = await loadRealPlugin()
     try {
-      const result = await build({ ...real.hooks, "chat.message": (() => {}) as never })
+      const result = await build({ ...real.hooks, "command.execute.before": (() => {}) as never })
       expect(result._tag).toBe("Failure")
       if (result._tag !== "Failure") throw new Error("expected admission failure")
       expect(result.failure).toBeInstanceOf(UnsupportedPluginHookError)

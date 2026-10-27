@@ -46,6 +46,12 @@ type DbExecutorRequest =
       readonly id: number
       readonly statements: ReadonlyArray<DbStatement>
     }
+  /**
+   * Ask the isolate to close its native handle before the thread is terminated.
+   * `Worker.terminate()` destroys the JS realm without running finalizers, so a
+   * live `bun:sqlite` connection would keep its WAL locks until process exit.
+   */
+  | { readonly type: "close"; readonly id: number }
 
 interface DbExecutorFailure {
   readonly name: string
@@ -62,6 +68,7 @@ type DbExecutorResponse =
   | { readonly type: "ready"; readonly threadId: number }
   | { readonly type: "result"; readonly id: number; readonly value: unknown }
   | { readonly type: "failure"; readonly id: number; readonly error: DbExecutorFailure }
+  | { readonly type: "closed"; readonly id: number }
 
 export class DbExecutorCrashedError extends Error {
   readonly tag = "DB_EXECUTOR_CRASHED"
@@ -238,6 +245,8 @@ function execute(db: Database, request: DbExecutorRequest): unknown {
       return db.query(request.sql).all(...nativeBindings(request.params))
     case "transaction":
       return runTransaction(db, request.statements)
+    case "close":
+      return undefined
   }
 }
 
@@ -250,6 +259,17 @@ function startWorkerThread(data: DbExecutorWorkerData): void {
     let poisoned = false
     transport.postMessage({ type: "ready", threadId } satisfies DbExecutorResponse)
     transport.on("message", (message: DbExecutorRequest) => {
+      // A close is honoured even by a poisoned handle: releasing the native
+      // handle is the whole point, and it must never be answered with a retry.
+      if (message.type === "close") {
+        try {
+          db.close()
+        } catch {
+          // The handle may already be unusable; the lock is released either way.
+        }
+        transport.postMessage({ type: "closed", id: message.id } satisfies DbExecutorResponse)
+        return
+      }
       if (poisoned) {
         transport.postMessage({
           type: "failure",
@@ -330,6 +350,40 @@ const terminateWorker = async (worker: Worker | undefined): Promise<void> => {
   }
 }
 
+/** How long a closing executor may take to acknowledge its native-handle close. */
+const CLOSE_ACK_TIMEOUT_MS = 1_000
+
+/**
+ * Ask the isolate to close its `bun:sqlite` handle and wait (bounded) for the
+ * acknowledgement before terminating the thread. Without this the native handle
+ * outlives the JS realm and its WAL lock survives until the process exits.
+ */
+const closeWorkerDatabase = async (worker: Worker | undefined, id: number): Promise<void> => {
+  if (worker === undefined) return
+  await new Promise<void>((resolve) => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout>
+    const onMessage = (event: MessageEvent<DbExecutorResponse>): void => {
+      if (event.data?.type === "closed" && event.data.id === id) finish()
+    }
+    const finish = (): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      worker.removeEventListener?.("message", onMessage)
+      resolve()
+    }
+    timer = setTimeout(finish, CLOSE_ACK_TIMEOUT_MS)
+    timer.unref?.()
+    worker.addEventListener?.("message", onMessage)
+    try {
+      worker.postMessage({ type: "close", id } satisfies DbExecutorRequest)
+    } catch {
+      finish()
+    }
+  })
+}
+
 export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
   const entry = options.entry ?? resolveDbExecutorEntry({ env: options.env })
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
@@ -386,6 +440,9 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
           resolve()
           return
         }
+        // A close acknowledgement has no request to settle; `close()` waits for
+        // it through its own listener.
+        if (message.type === "closed") return
         const request = pending.get(message.id)
         if (request === undefined) return
         pending.delete(message.id)
@@ -470,6 +527,9 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
       worker = undefined
       ready = undefined
       failPending(new DbExecutorClosedError())
+      // The isolate must close its own native handle while its realm still
+      // exists; `terminate()` alone would strand the WAL lock.
+      await closeWorkerDatabase(current, nextId++)
       await terminateWorker(current)
     },
   }

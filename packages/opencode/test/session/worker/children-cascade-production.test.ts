@@ -153,9 +153,9 @@ const spawnRequest = (parentID: string, childID: string): SessionSpawnRequest =>
   },
 })
 
-const sessionIdle = (sessionID: string) => ({
+const sessionIdle = (sessionID: string, parentID?: string) => ({
   id: sessionID,
-  parentID: undefined,
+  parentID,
   metadata: {},
 })
 
@@ -204,7 +204,10 @@ describe("R2-M4 production crash cascade", () => {
           const sessions = Layer.succeed(
             Session.Service,
             Session.Service.of({
-              get: (id: never) => Effect.succeed(sessionIdle(String(id)) as never),
+              // The spawn authority requires a supplied childID to be a direct
+              // child; model the persisted edge the production DB always has.
+              get: (id: never) =>
+                Effect.succeed(sessionIdle(String(id), String(id) === childID ? String(parentID) : undefined) as never),
               findMessage: () => Effect.succeed(Option.none()),
               spawn: (input: { readonly childID?: string }) =>
                 Effect.succeed({

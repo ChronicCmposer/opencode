@@ -77,6 +77,7 @@ describe("worker messages.transform dispatch", () => {
       names: ["fake"],
       chatParams: async (_input, output) => output,
       chatHeaders: async (_input, output) => output,
+      chatMessage: async (_input, output) => output,
       toolBefore: async (_input, output) => output,
       toolAfter: async (_input, output) => output,
       shellEnv: async (_input, output) => output,

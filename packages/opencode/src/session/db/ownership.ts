@@ -13,7 +13,7 @@ export { SCHEMA_TABLES, WORKER_WRITABLE_TABLES }
  * The durable log is written by the Bus, not by session-scoped DML, so it is not
  * part of the generated `session_id` allowlist. The Bus owns its access rule.
  */
-export const DURABLE_LOG_TABLES: readonly string[] = Object.freeze(["event", "event_sequence"])
+export const DURABLE_LOG_TABLES: readonly string[] = Object.freeze(["event", "event_sequence", "event_blob"])
 
 const workerTables = new Set(WORKER_WRITABLE_TABLES)
 const durableTables = new Set(DURABLE_LOG_TABLES)

@@ -7,9 +7,12 @@
 // `BEGIN IMMEDIATE` transaction. A worker probes read-only and refuses a mismatch
 // with `SchemaMismatch`: it never runs DDL and never marks schema state.
 
+import { Effect } from "effect"
+import path from "node:path"
+import { Database } from "@opencode-ai/core/database/database"
 import { openConnection, type Connection, type ConnectionOptions } from "@opencode-ai/core/database/connection"
 import { inImmediateTransaction } from "@opencode-ai/core/database/transaction"
-import { migrationStatements } from "@/session/writer/migration.statements.gen"
+import { ledgerStatements, migrationStatements } from "@/session/writer/migration.statements.gen"
 import {
   SCHEMA_BODY_HASH,
   SCHEMA_MIGRATION_IDS,
@@ -166,30 +169,107 @@ export interface EnsureSchemaOptions {
 }
 
 /**
+ * Databases this process has already ensured. Core's migration path and the
+ * opencode ledger are process-wide one-time work; repeating them on every hub
+ * construction re-opens the file and replays the journal. Keyed by the resolved
+ * filename so a relative/absolute alias of the same file shares one entry.
+ *
+ * Deliberately not persisted: a new process must re-probe and apply anything a
+ * previous process did not finish.
+ */
+const ensuredDatabases = new Map<string, SchemaIdentity>()
+
+/** Test seam: forget process-level ensure results (each test owns fresh files). */
+export function resetSchemaEnsureCache(): void {
+  ensuredDatabases.clear()
+}
+
+/** Open an existing database read/write without creating one; absent/failed probes are not an error. */
+function openExistingConnection(filename: string): Connection | undefined {
+  try {
+    return openConnection({ filename, create: false })
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Hub boot schema-ensure. A fresh app-migrated database is upgraded with the
  * shipped statements (the opencode-owned ledger and the identity marker) and
  * marked. An already-current database is left untouched. The zero-live-worker
  * guard and `BEGIN IMMEDIATE` make the check and the write one atomic step, so
- * two concurrent hubs cannot interleave read/verify/mark.
+ * two concurrent hubs cannot interleave read/verify/mark. Once a file is
+ * ensured in this process, later hubs reuse that result instead of re-running
+ * core's migration journal and the ledger.
  */
 export function ensureProductionSchema(options: EnsureSchemaOptions): SchemaIdentity {
+  // A private in-memory database cannot share core's migration connection, so it
+  // uses the self-contained statement list on the one handle opened below. A real
+  // file is upgraded incrementally through the normal `DatabaseMigration.apply`
+  // path; replaying the final schema there would stamp every migration id with
+  // `INSERT OR IGNORE` and skip real data migrations.
+  const inMemory = options.filename === ":memory:"
+  const expected = currentSchemaIdentity()
+  const cacheKey = inMemory ? undefined : path.resolve(options.filename)
+  if (cacheKey !== undefined) {
+    const ensured = ensuredDatabases.get(cacheKey)
+    if (ensured !== undefined) return ensured
+    // An already-current file needs no core migration at all. Probing first also
+    // keeps a second hub in this process from re-opening and replaying the
+    // journal; only a genuinely legacy/missing file takes the migration path.
+    const existing = openExistingConnection(options.filename)
+    if (existing !== undefined) {
+      try {
+        if (sameSchemaIdentity(expected, schemaIdentity(existing))) {
+          assertWorkerTableParity(existing)
+          ensuredDatabases.set(cacheKey, expected)
+          return expected
+        }
+      } finally {
+        existing.close()
+      }
+    }
+  }
+  // The zero-live-worker guard protects DDL/migration only. A cached or already
+  // current database is probe-and-return above, so a second hub sharing an
+  // ensured file does not fail just because workers are now live.
   if (options.liveWorkers !== 0) throw new LiveWorkersError(options.liveWorkers)
+  if (!inMemory) applyCoreMigrations(options.filename)
   const connection = openConnection({ filename: options.filename })
   try {
-    const expected = currentSchemaIdentity()
     if (sameSchemaIdentity(expected, schemaIdentity(connection))) {
       assertWorkerTableParity(connection)
+      if (cacheKey !== undefined) ensuredDatabases.set(cacheKey, expected)
       return expected
     }
     inImmediateTransaction(connection, (tx) => {
-      for (const statement of migrationStatements) tx.exec(statement)
+      // On a file, only the opencode-owned ledger and marker are ours; core
+      // already applied its schema. An in-memory DB is self-contained.
+      for (const statement of inMemory ? migrationStatements : ledgerStatements) tx.exec(statement)
       markSchemaIdentity(tx)
       assertWorkerTableParity(tx)
     })
-    return currentSchemaIdentity()
+    const identity = currentSchemaIdentity()
+    if (cacheKey !== undefined) ensuredDatabases.set(cacheKey, identity)
+    return identity
   } finally {
     connection.close()
   }
+}
+
+/**
+ * Run the normal app migration path on `filename`. `Database.layerFromPath`
+ * opens its own connection, applies core's incremental journal (or the current
+ * schema on a fresh file), and closes the layer scope before returning.
+ */
+function applyCoreMigrations(filename: string): void {
+  Effect.runSync(
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* Database.Service
+      }),
+    ).pipe(Effect.provide(Database.layerFromPath(filename)), Effect.orDie),
+  )
 }
 
 export interface GatedConnection {

@@ -354,6 +354,14 @@ export interface ResolveWorkerPluginsOptions {
    * worker stays approximate until the worker rebinds to another session.
    */
   readonly message?: unknown
+  /**
+   * Skip resolving `chat.params` / `chat.headers` into a boot-time diff. Set
+   * when the worker has a hub-hook bridge: those hooks then run once per
+   * request against the request's current model instead of being invoked here
+   * as well (which would double every invocation and freeze the boot model's
+   * result as a stale fallback).
+   */
+  readonly deferRequestHooks?: boolean
 }
 
 /** The hook input the hub synthesises from the worker's serialized model. */
@@ -451,7 +459,10 @@ export const resolveWorkerPlugins = Effect.fn("WorkerPlugins.resolve")(function*
   const plugins: WorkerPlugin[] = []
   for (const source of options.sources) {
     const resolved: { "chat.params"?: ResolvedChatParams; "chat.headers"?: ResolvedChatHeaders } = {}
-    const paramsHook = source.hooks["chat.params"]
+    // With a hub bridge these two hooks run per request, so invoking them here
+    // would count twice and pin the boot model's effect as a fallback. Admission
+    // and proxied-route recording below still run for the source.
+    const paramsHook = options.deferRequestHooks === true ? undefined : source.hooks["chat.params"]
     if (paramsHook !== undefined) {
       const output = pluginParamsBaseline(options.model)
       // Snapshot BEFORE the hook mutates its output, so the diff compares the
@@ -463,7 +474,7 @@ export const resolveWorkerPlugins = Effect.fn("WorkerPlugins.resolve")(function*
       })
       resolved["chat.params"] = diffResolvedParams(before, after)
     }
-    const headersHook = source.hooks["chat.headers"]
+    const headersHook = options.deferRequestHooks === true ? undefined : source.hooks["chat.headers"]
     if (headersHook !== undefined) {
       const output: ChatHeadersOutput = { headers: {} }
       const after = yield* runPluginHook(source.name, "chat.headers", async () => {
@@ -558,8 +569,7 @@ export const buildSessionWorkerInit = Effect.fn("SessionWorkerInit.build")(funct
   const model = yield* resolveWorkerModel(options.model)
   // The hub resolves plugin hooks against the model the worker will run, then
   // ships the resolved effect as data (a hook function cannot cross the isolate).
-  const plugins =
-    typeof options.plugins === "function" ? yield* options.plugins(model) : options.plugins
+  const plugins = typeof options.plugins === "function" ? yield* options.plugins(model) : options.plugins
   return {
     snapshot,
     env,

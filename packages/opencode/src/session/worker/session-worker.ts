@@ -24,6 +24,7 @@
 // `comm` limit (see `@/util/thread-name`).
 
 import { randomUUID } from "node:crypto"
+import path from "node:path"
 import { threadId, workerData } from "node:worker_threads"
 import { Cause, Context, Effect, Exit, Fiber, Layer, Option, Scope } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -33,7 +34,7 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { BackgroundJob } from "@/background/job"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRunState } from "@/session/run-state"
-import type { SessionID } from "@/session/schema"
+import { SessionID } from "@/session/schema"
 import { Snapshot } from "@/snapshot"
 import { InstanceRef } from "@/effect/instance-ref"
 import { EffectBridge } from "@/effect/bridge"
@@ -46,7 +47,7 @@ import * as Database from "@opencode-ai/core/database/database"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
 import { openWriterConnection } from "@/session/writer/connection"
 import { createWorkerEgressClient, type WorkerEgressClient } from "./egress-client"
-import { openWorkerDatabase, type WorkerConnection, type WorkerDatabase } from "./db"
+import { openWorkerDatabase, type WorkerBus, type WorkerConnection, type WorkerDatabase } from "./db"
 import { createProxyReporting, installReporting } from "@/session/ledger/lifecycle"
 import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
 import { workerLoggingLayer } from "./worker-logging"
@@ -188,6 +189,9 @@ export interface SessionWorkerInit {
 interface WorkerScope {
   postMessage(message: unknown, transfer?: readonly Transferable[]): void
   onmessage: ((event: { data: unknown }) => void) | null
+  /** Present on a real Bun worker global; absent on minimal test doubles. */
+  addEventListener?: (type: "message", listener: (event: { data: unknown }) => void) => void
+  removeEventListener?: (type: "message", listener: (event: { data: unknown }) => void) => void
 }
 
 /**
@@ -293,7 +297,15 @@ export interface WorkerWriterClient extends WriterClientHandle {
 
 type WriterQueryConnection = Pick<WorkerConnection, "all" | "values" | "run" | "exec">
 
-function writerQuery(connection: WriterQueryConnection, method: string, sql: string, params?: readonly unknown[]): unknown {
+const WRITER_TX_WRITE_REJECTED =
+  "writer txQuery is read-only; use the typed repository or durable Bus for writes"
+
+function writerQuery(
+  connection: WriterQueryConnection,
+  method: string,
+  sql: string,
+  params?: readonly unknown[],
+): unknown {
   switch (method) {
     case "all":
       return connection.all(sql, params)
@@ -319,17 +331,64 @@ export function createWorkerDatabaseWriter(
   options: {
     workerID?: number
     filename?: string
+    /**
+     * Transaction-capable scoped handle. Production passes
+     * `WorkerDatabase.connection` (repository-backed, never a raw main handle);
+     * standalone tests may pass a trusted unbound connection. Ad-hoc raw SQL is
+     * read-only: the typed repository/Bus owns every write.
+     */
     connection?: WorkerConnection
+    /** Read-only query connection for raw writer SQL; defaults to `connection`. */
+    queryConnection?: WorkerConnection
+    /**
+     * Narrow Bus/EventV2 capability owned by the worker DB. Production passes
+     * this instead of a raw connection; the returned handle has no `connection`
+     * or transaction surface.
+     */
+    bus?: WorkerBus
     /** The session this generation owns; claimed (or reclaimed) at generation start. */
     sessionID?: string
+    /** D16 content-addressed blob directory; defaults to a sibling of the DB. */
+    blobDir?: string
   } = {},
 ): WorkerWriterClient {
-  const connection = options.connection ?? openWriterConnection(options.filename ?? Database.path())
+  // D16 blobs live next to the database this writer actually opens: an explicit
+  // `filename` or custom connection wins over the process-global database path,
+  // so a custom-file worker never publishes (or unlinks) the global DB's blobs.
+  const databaseFilename = options.filename ?? options.connection?.filename ?? Database.path()
+  const ownedConnection =
+    options.connection ?? (options.bus === undefined ? openWriterConnection(databaseFilename) : undefined)
+  // Transaction control (BEGIN/COMMIT/ROLLBACK) must use the scoped transaction
+  // handle; ad-hoc statements may use the stricter read-only handle. Conflating
+  // the two made `begin()` on a bound worker fail as "query connection is
+  // read-only". Raw writes are rejected below on either handle: durable writes
+  // belong to the typed repository/Bus, never to the writer seam.
+  const writeConnection = options.connection ?? ownedConnection ?? openWriterConnection(databaseFilename)
+  const readConnection = options.queryConnection ?? writeConnection
   const ownerID = `worker-${options.workerID ?? threadId}-${process.pid}-${randomUUID()}`
   // The event service commits durable events in this isolate; stamp it with the
   // same generation lease so a stale generation's durable write is fenced.
   EventV2.setWorkerLeaseOwner(ownerID)
-  const bus = Bus.create({ connection, ownerID, leaseTimeoutMs: 30_000 })
+  // A session worker's Bus is scoped to its one session aggregate: publishing,
+  // claiming, reading, or releasing another session's log is refused.
+  const blobDir = options.blobDir ?? path.join(path.dirname(databaseFilename), "event-blobs")
+  const bus =
+    options.bus !== undefined
+      ? options.bus.create({
+          ownerID,
+          leaseTimeoutMs: 30_000,
+          ...(options.sessionID === undefined ? {} : { aggregateID: options.sessionID }),
+          // Let the WorkerBus default to the actual database file unless the
+          // caller named a directory explicitly.
+          ...(options.blobDir === undefined ? {} : { blobDir: options.blobDir }),
+        })
+      : Bus.create({
+          connection: ownedConnection!,
+          ownerID,
+          leaseTimeoutMs: 30_000,
+          ...(options.sessionID === undefined ? {} : { aggregateID: options.sessionID }),
+          blobDir,
+        })
   const transactions = new Set<string>()
   let nextTransaction = 1
 
@@ -359,41 +418,45 @@ export function createWorkerDatabaseWriter(
   }
 
   return {
-    query: async (method, sql, params) => writerQuery(connection, method, sql, params),
+    query: async (method, sql, params) => writerQuery(readConnection, method, sql, params),
     publish: async (event) => {
       const definition =
         Durable.get(event.type) ?? [...Durable.values()].find((candidate) => candidate.type === event.type)
       if (definition === undefined) throw new Error(`unknown durable event type "${event.type}"`)
-      const published = bus.publish([
-        { definition, data: event.data as never, id: event.id as never },
-      ])
+      // Non-blocking busy backoff: the async Bus path yields between retries so
+      // cancellation and streaming progress keep running while SQLite is busy.
+      const published = await bus.publishAsync([{ definition, data: event.data as never, id: event.id as never }])
       const last = published[published.length - 1]
       return { seq: last?.durable?.seq ?? null, committed: true }
     },
     begin: async () => {
       const handle = `tx-${nextTransaction++}`
-      connection.exec("BEGIN IMMEDIATE")
+      writeConnection.exec("BEGIN IMMEDIATE")
       transactions.add(handle)
       return handle
     },
     txQuery: async (handle, method, sql, params) => {
       requireTransaction(handle)
-      return writerQuery(connection, method, sql, params)
+      // `run` is the raw write method; durable writes belong to the typed
+      // repository/Bus. The trusted Drizzle graph's writer path issues its
+      // statements through `all`, so only the write method is refused here.
+      if (method === "run") throw new Error(WRITER_TX_WRITE_REJECTED)
+      return writerQuery(readConnection, method, sql, params)
     },
     commit: async (handle) => {
       requireTransaction(handle)
-      connection.exec("COMMIT")
+      writeConnection.exec("COMMIT")
       transactions.delete(handle)
     },
     rollback: async (handle) => {
       requireTransaction(handle)
-      connection.exec("ROLLBACK")
+      writeConnection.exec("ROLLBACK")
       transactions.delete(handle)
     },
     dispose: () => {
       if (options.sessionID !== undefined) bus.release(options.sessionID)
       EventV2.setWorkerLeaseOwner(undefined)
-      connection.close()
+      ownedConnection?.close()
     },
   }
 }
@@ -464,7 +527,14 @@ export function buildWorkerClients(
   return {
     writer: createWorkerDatabaseWriter({
       ...(workerID === undefined ? {} : { workerID }),
-      ...(options.database === undefined ? {} : { connection: options.database.connection }),
+      ...(options.database === undefined
+        ? {}
+        : {
+            bus: options.database.bus,
+            connection: options.database.connection,
+            queryConnection: options.database.strictConnection,
+            filename: options.database.filename,
+          }),
       ...(options.sessionID === undefined ? {} : { sessionID: options.sessionID }),
     }),
     egress: createWorkerEgressClient(egress, {
@@ -695,9 +765,7 @@ export function createSessionWork(options: SessionWorkOptions): SessionWork {
       if (builtContext !== undefined) return Effect.succeed(builtContext)
       const layer = options.layer as Layer.Layer<unknown, unknown>
       const build =
-        options.scope === undefined
-          ? Layer.buildWithScope(layer, runScope)
-          : Layer.buildWithScope(layer, options.scope)
+        options.scope === undefined ? Layer.buildWithScope(layer, runScope) : Layer.buildWithScope(layer, options.scope)
       return Effect.map(build.pipe(Effect.orDie), (context) => {
         if (options.scope !== undefined) builtContext = context
         return context
@@ -776,9 +844,7 @@ export function createSessionWork(options: SessionWorkOptions): SessionWork {
  * worker pinned.
  */
 export function hasRunningBackgroundJob(jobs: readonly BackgroundJob.Info[], sessionID: string): boolean {
-  return jobs.some(
-    (job) => job.status === "running" && (job.parentID === undefined || job.parentID === sessionID),
-  )
+  return jobs.some((job) => job.status === "running" && (job.parentID === undefined || job.parentID === sessionID))
 }
 
 /**
@@ -787,11 +853,100 @@ export function hasRunningBackgroundJob(jobs: readonly BackgroundJob.Info[], ses
  * job keeps the isolate alive across an idle-reap window without making a new
  * prompt fail `assertNotBusy`.
  */
-export function createBackgroundWorkProbe(
-  jobs: BackgroundJob.Interface,
-): (sessionID: SessionID) => Promise<boolean> {
+export function createBackgroundWorkProbe(jobs: BackgroundJob.Interface): (sessionID: SessionID) => Promise<boolean> {
   return (sessionID) =>
     Effect.runPromise(jobs.list().pipe(Effect.map((running) => hasRunningBackgroundJob(running, sessionID))))
+}
+
+/**
+ * Worker-side mirror of the process-local job registry over the hub control
+ * port. Foreground jobs run in the worker isolate, so the hub's promotion
+ * endpoint cannot see them; each running job is registered in a hub-side mirror
+ * (visible to `list`/`promote`) and the worker long-polls for promotion.
+ *
+ * Promotion must apply to the LOCAL registry: that is where `onPromote` (the
+ * task notification and metadata rewrite) lives. The hub resolves the long-poll
+ * when `promote` runs, and this wrapper then calls the local `promote`. Settlement
+ * is reported back so the hub mirror is removed instead of leaking a ghost
+ * running job.
+ */
+export function createHubSyncedBackgroundJobs(
+  local: BackgroundJob.Interface,
+  client: HubProxyClient,
+): BackgroundJob.Interface {
+  const mirrored = new Set<string>()
+
+  const reportSettlement = async (id: string): Promise<void> => {
+    const waited = await Effect.runPromise(local.wait({ id }))
+    const info = waited.info
+    if (info === undefined || info.status === "running") return
+    await client.call("backgroundJob.settle", [
+      {
+        id,
+        status: info.status,
+        ...(info.output === undefined ? {} : { output: info.output }),
+        ...(info.error === undefined ? {} : { error: info.error }),
+      },
+    ])
+  }
+
+  const mirror = async (info: BackgroundJob.Info): Promise<void> => {
+    if (info.status !== "running") return
+    const first = !mirrored.has(info.id)
+    if (first) mirrored.add(info.id)
+    try {
+      // A re-register carries updated metadata (a resumed foreground job is
+      // promoted worker-side), so the hub mirror reports the current state.
+      await client.call("backgroundJob.register", [info])
+    } catch {
+      if (first) mirrored.delete(info.id)
+      return
+    }
+    if (!first) return
+    // Both watchers settle independently: promotion applies locally, while
+    // settlement removes the hub mirror. Neither may throw into the job start.
+    void reportSettlement(info.id).catch(() => undefined)
+    void client
+      .call("backgroundJob.awaitPromotion", [info.id])
+      .then((promoted) => (promoted === true ? Effect.runPromise(local.promote(info.id)) : undefined))
+      .catch(() => undefined)
+      .finally(() => mirrored.delete(info.id))
+  }
+
+  const sync = (info: BackgroundJob.Info): void => {
+    void mirror(info).catch(() => undefined)
+  }
+
+  return {
+    list: () => local.list(),
+    get: (id) => local.get(id),
+    start: (input) => local.start(input).pipe(Effect.tap((info) => Effect.sync(() => sync(info)))),
+    extend: (input) =>
+      local.extend(input).pipe(
+        Effect.flatMap((extended) => {
+          if (!extended) return Effect.succeed(false)
+          return local.get(input.id).pipe(
+            Effect.tap((info) =>
+              Effect.sync(() => {
+                if (info !== undefined) sync(info)
+              }),
+            ),
+            Effect.as(true),
+          )
+        }),
+      ),
+    wait: (input) => local.wait(input),
+    waitForPromotion: (id) => local.waitForPromotion(id),
+    promote: (id) =>
+      local.promote(id).pipe(
+        Effect.tap((info) =>
+          Effect.sync(() => {
+            if (info !== undefined) sync(info)
+          }),
+        ),
+      ),
+    cancel: (id) => local.cancel(id),
+  }
 }
 
 /** An explicit work-kind registry; an unknown kind is a typed error. */
@@ -1040,6 +1195,17 @@ export interface BootstrapSessionWorkerOptions {
    * test prove `dispose()` rejects its in-flight calls (M8).
    */
   readonly observeHubProxy?: (client: HubProxyClient) => void
+  /**
+   * Test seam: observe the worker's own writer handle. Lets a shutdown test pin
+   * a real write transaction on the same connection the orderly close owns.
+   */
+  readonly observeWriter?: (writer: WorkerWriterClient) => void
+  /**
+   * Test seam: observe the process-local job registry the worker graph receives.
+   * A full-port boot wraps it with the hub mirror, so a test can drive the same
+   * registry the task tool uses end to end.
+   */
+  readonly observeBackgroundJobs?: (jobs: BackgroundJob.Interface) => void
 }
 
 /**
@@ -1092,11 +1258,69 @@ export function bootstrapSessionWorker(
   // the hub could not name one). `bind` is the only lifecycle entry point.
   if (init.sessionID !== undefined) namer.bind(init.sessionID)
   else if (init.workerID !== undefined) namer.bind(String(init.workerID))
-  let clients: WorkerClients
+  let clients: WorkerClients | undefined
   let database: WorkerDatabase | undefined
   let hubProxyClient: HubProxyClient | undefined
   let hubProxies: HubProxyClients | undefined
   let pidReporter: PidReporterInterface | undefined
+  // Orderly teardown, shared by the hub's `shutdown` frame and `dispose()`.
+  // It is defined and installed BEFORE the DB opens: a shutdown that arrives
+  // while the worker is still booting must not be lost, otherwise the isolate's
+  // native WAL handle outlives `Worker.terminate()` and keeps the write lock
+  // until the process exits. It must run while the realm still exists so the
+  // handle closes and the Bus releases its lease.
+  let resourcesClosed = false
+  let shutdownRequested = false
+  /** Run one best-effort disposal: a broken handle must never skip the rest. */
+  const disposeSafely = (dispose: (() => void) | undefined): void => {
+    try {
+      dispose?.()
+    } catch {
+      // The resource may already be unusable under a forced terminate; the
+      // remaining resources (and the native handle close) still run.
+    }
+  }
+  const closeResources = (): void => {
+    if (resourcesClosed) return
+    resourcesClosed = true
+    try {
+      // Dispose the outbound clients first: pending hub-proxy calls reject instead
+      // of hanging past termination, and the egress listeners are removed before
+      // the graph/connection teardown (M8). Each disposal is independently guarded
+      // so a throw cannot skip the others or the native WAL close below.
+      disposeSafely(() => hubProxyClient?.dispose())
+      disposeSafely(() => clients?.egress.dispose())
+      // The writer owns the generation lease and the same connection as the DB;
+      // its dispose releases the lease and closes the handle (idempotently).
+      disposeSafely(() => clients?.writer.dispose())
+    } finally {
+      // Always attempt the native handle close: it owns the WAL write lock, and a
+      // half-open transaction is rolled back by SQLite's close.
+      const db = database
+      if (db !== undefined) disposeSafely(() => Effect.runSync(db.close))
+    }
+  }
+  // A raw worker message (not an executor frame), handled here rather than in
+  // `execute.ts`; the executor's unknown-frame path is harmless.
+  const onShutdownFrame = (event: { data: unknown }): void => {
+    const frame = event.data as { readonly type?: unknown; readonly id?: unknown } | undefined
+    if (frame?.type !== "shutdown") return
+    shutdownRequested = true
+    try {
+      closeResources()
+    } finally {
+      // The hub's bounded ack wait may already have elapsed and terminated the
+      // thread; attempt the ack unconditionally so a closed WAL is observed as
+      // orderly rather than as a timeout whenever the realm still runs.
+      scope.postMessage({ type: "shutdown-ack", id: typeof frame.id === "number" ? frame.id : 0 })
+    }
+  }
+  scope.addEventListener?.("message", onShutdownFrame)
+  // A shutdown delivered synchronously during registration wins the whole boot:
+  // never open a DB (or install an executor) for an isolate already being torn
+  // down.
+  if (shutdownRequested) return { dispose() {} }
+
   // The real `SessionPrompt` loop needs the worker's own WAL connection and an
   // ambient `InstanceRef`; only the full hub-port wiring provides them. The
   // degraded (no-port) boot runs the reduced pipeline.
@@ -1104,7 +1328,12 @@ export function bootstrapSessionWorker(
   if (usePrompt) {
     // One connection per worker generation: the schema gate is read-only and a
     // mismatch refuses boot before any run starts (D5/D7).
-    database = Effect.runSync(openWorkerDatabase({ filename: Database.path() }))
+    database = Effect.runSync(
+      openWorkerDatabase({
+        filename: Database.path(),
+        ...(init.sessionID === undefined ? {} : { sessionID: init.sessionID }),
+      }),
+    )
     const egressChannel = new MessageChannel()
     // A dedicated control plane, so durable wakeups and resync never queue
     // behind the delta stream; without it the egress mesh is dead in production.
@@ -1129,6 +1358,9 @@ export function bootstrapSessionWorker(
         ...(init.sessionID === undefined ? {} : { sessionID: init.sessionID }),
       },
     )
+    // A test may pin a write transaction on the worker's own connection before
+    // delivering the shutdown frame, proving the orderly close releases the WAL.
+    options.observeWriter?.(clients.writer)
     // The hub serves the `SessionStatus` / `Permission` / `Question`
     // authorities over one control port; a single multiplexing client backs all
     // three proxies (each call is correlated by the client's own request id).
@@ -1207,11 +1439,14 @@ export function bootstrapSessionWorker(
   // every turn boundary; a single `Layer.succeed` value keeps a background job
   // alive after the turn that started it, which the idle-reap probe observes.
   const backgroundJobScope = Effect.runSync(Scope.make())
-  const backgroundJobContext = Effect.runSync(
-    Layer.buildWithScope(localBackgroundJobLayer(), backgroundJobScope),
-  )
+  const backgroundJobContext = Effect.runSync(Layer.buildWithScope(localBackgroundJobLayer(), backgroundJobScope))
   const backgroundJobs = Context.get(backgroundJobContext, BackgroundJob.Service)
-  const backgroundJobLayer = Layer.succeed(BackgroundJob.Service, backgroundJobs)
+  // A full-port worker mirrors its jobs over the control port so the hub's
+  // promotion endpoint can see foreground jobs; a degraded boot stays local.
+  const syncedBackgroundJobs =
+    hubProxyClient === undefined ? backgroundJobs : createHubSyncedBackgroundJobs(backgroundJobs, hubProxyClient)
+  options.observeBackgroundJobs?.(syncedBackgroundJobs)
+  const backgroundJobLayer = Layer.succeed(BackgroundJob.Service, syncedBackgroundJobs)
 
   const runtime = buildSessionWorkerLayer({
     // The full runnable graph needs the writer-backed Database and the serialized
@@ -1244,6 +1479,9 @@ export function bootstrapSessionWorker(
     ...(plugins === undefined ? {} : { plugins }),
     ...(pluginTools === undefined ? {} : { pluginTools }),
     ...(hubProxies === undefined ? {} : { hubProxies }),
+    // The worker's one session: every hub-proxied child operation is authorized
+    // against it, so this isolate can never read or write another session's rows.
+    ...(init.sessionID === undefined ? {} : { boundSessionID: SessionID.make(init.sessionID) }),
     ...(pidReporter === undefined ? {} : { pidReporter }),
     // The worker's Effect logs reach the main `opencode.log` sink. Merged as a
     // non-graph seam, so the node table and its assertion are untouched.
@@ -1311,16 +1549,10 @@ export function bootstrapSessionWorker(
       // The registry scope outlives every run, so close it explicitly with the
       // worker bootstrap; a still-running job is interrupted with the isolate.
       void Effect.runPromise(Scope.close(backgroundJobScope, Exit.void)).catch(() => undefined)
-      // Dispose the worker's outbound clients first: pending hub-proxy calls
-      // reject instead of hanging past termination, and the egress listeners
-      // are removed before the graph/connection teardown (M8).
-      hubProxyClient?.dispose()
-      clients.egress.dispose()
+      // Close durable resources before the graph scope; close is idempotent.
+      closeResources()
       // Close the worker-lifetime graph scope (DB/egress/bridge finalizers).
       void Effect.runPromise(Scope.close(workerScope, Exit.void)).catch(() => undefined)
-      // The worker's one WAL connection is owned by bootstrap, not the graph
-      // scope finalizer alone; close is idempotent.
-      if (database !== undefined) Effect.runSync(database.close)
     },
   }
 }

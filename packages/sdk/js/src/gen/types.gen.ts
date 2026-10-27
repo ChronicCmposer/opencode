@@ -2400,7 +2400,7 @@ export type SessionAbortResponses = {
    */
   200: {
     sessionID?: string
-    mode?: "cooperative" | "terminated" | "completed"
+    mode?: "cooperative" | "terminated" | "completed" | "boot"
     winner?: "cancel" | "completion"
     acknowledged?: boolean
     durationMs?: number

@@ -79,19 +79,19 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const available = (ref: ToolRoute.ToolRef) => ToolRoute.runsOn(ToolRoute.routeTool(ref), toolHost)
 
   // The ledger row is the durable truth a crash is recovered from. Resolve it
-  // once per tool set: an explicit handle wins, otherwise the worker's own WAL
-  // connection backs it. The hub has neither, so it records nothing.
+  // once per tool set: an explicit handle wins, otherwise the worker's typed
+  // repository backs it. The hub has no worker DB, so it records nothing.
   const ledger = yield* Effect.gen(function* () {
     if (input.ledger !== undefined) return input.ledger
     const workerDb = yield* Effect.serviceOption(WorkerDb)
     if (Option.isNone(workerDb)) return undefined
     // The reduced graph binds `WorkerDb` to a fail-loud boundary when no worker
-    // database is supplied (degraded boot, in-process tests). That boundary is
-    // not a ledger connection; absent a real worker DB the tool path keeps its
+    // database is supplied (degraded boot, in-process tests). That boundary has
+    // no typed write surface; absent a real worker DB the tool path keeps its
     // previous no-ledger behavior instead of failing every call.
-    const connection = workerDb.value.connection
-    if (typeof connection?.all !== "function" || typeof connection?.run !== "function") return undefined
-    return createToolCallLedger(connection)
+    const repository = workerDb.value.repository
+    if (typeof repository?.insert !== "function" || typeof repository?.select !== "function") return undefined
+    return createToolCallLedger(repository)
   })
 
   /**

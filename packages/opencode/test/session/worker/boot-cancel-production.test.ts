@@ -5,11 +5,17 @@
 // permit accounting is idempotent and leaves the pool ready for the next spawn.
 
 import { describe, expect, test } from "bun:test"
+import { Database } from "bun:sqlite"
 import { existsSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createSpawnGate } from "@/session/worker/spawn-gate"
-import { createBunExecutorWorkerPool, createBunExecutorTransport } from "@/session/worker/hub"
+import {
+  createBunExecutorWorkerPool,
+  createBunExecutorTransport,
+  createSessionHub,
+  createWorkerCancellation,
+} from "@/session/worker/hub"
 import type { ExecutorWorker } from "@/session/worker/execute"
 import { BOOT_CANCELLED, type BootTelemetry } from "@/session/worker/cancel"
 import { flush, settleOf, sid } from "../../lib/async"
@@ -73,6 +79,100 @@ describe("production boot cancellation", () => {
       await waitFor(() => gate.held === false, "the next spawn's ready handshake")
       expect((await nextRun).ok).toBe(true)
       await next.terminateAll()
+    } finally {
+      await pool.terminateAll()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("a boot cancel closes through the shutdown frame before terminate", async () => {
+    const calls: string[] = []
+    const original = (globalThis as { Worker?: unknown }).Worker
+    class ClosingWorker {
+      onmessage: ((event: MessageEvent) => void) | null = null
+      onerror: ((event: ErrorEvent) => void) | null = null
+      private readonly listeners = new Set<(event: { data: unknown }) => void>()
+
+      postMessage(message: unknown): void {
+        const type = (message as { type?: unknown } | undefined)?.type
+        calls.push(`post:${String(type)}`)
+        if (type !== "shutdown") return
+        for (const listener of this.listeners) listener({ data: { type: "shutdown-ack", id: 0 } })
+      }
+
+      addEventListener(type: string, listener: (event: { data: unknown }) => void): void {
+        if (type === "message") this.listeners.add(listener)
+      }
+
+      removeEventListener(type: string, listener: (event: { data: unknown }) => void): void {
+        if (type === "message") this.listeners.delete(listener)
+      }
+
+      async terminate(): Promise<number> {
+        calls.push("terminate")
+        return 0
+      }
+    }
+    ;(globalThis as { Worker?: unknown }).Worker = ClosingWorker
+    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    try {
+      const transport = createBunExecutorTransport({ entry: "fake://boot-close", spawnGate: gate })
+      transport.post({ type: "run", id: 1, sessionID: sid("ses_boot_close"), kind: "session" })
+      await waitFor(() => gate.held === true, "the spawn permit")
+
+      expect(await transport.cancelBoot?.()).toEqual(BOOT_CANCELLED)
+      // The typed boot outcome is an orderly close: the isolate sees `shutdown`
+      // (so it can release its WAL handle/lease) before the thread is destroyed.
+      expect(calls).toEqual(["post:run", "post:shutdown", "terminate"])
+      // The single permit is released exactly once and the close is idempotent.
+      expect(gate.held).toBe(false)
+      expect(await transport.cancelBoot?.()).toEqual(BOOT_CANCELLED)
+      expect(calls.filter((call) => call === "post:shutdown")).toHaveLength(1)
+      expect(calls.filter((call) => call === "terminate")).toHaveLength(1)
+      expect(gate.held).toBe(false)
+    } finally {
+      ;(globalThis as { Worker?: unknown }).Worker = original
+    }
+  })
+
+  test("a boot cancel after the WAL open releases the write lock (no SQLITE_BUSY)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "boot-cancel-wal-"))
+    const dbPath = join(dir, "boot.sqlite")
+    const dbReadyPath = join(dir, "db-ready")
+    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const pool = createBunExecutorWorkerPool({
+      entry: GATED_FIXTURE,
+      // The fixture opens the WAL handle and holds `BEGIN IMMEDIATE` before the
+      // ready handshake, exactly like a production worker's pre-ready DB open.
+      workerData: { bootDelayMs: 60_000, dbPath, dbReadyPath },
+      spawnGate: gate,
+      timeoutMs: 10_000,
+    })
+    try {
+      const worker = pool.spawn(1) as ExecutorWorker
+      const run = settleOf(worker.execute(runFrame("ses_boot_wal")))
+      await waitFor(() => gate.held === true, "the spawn permit")
+      await waitFor(() => existsSync(dbReadyPath), "the worker's WAL write lock")
+
+      // The worker holds the only write lock, so a second immediate writer must
+      // fail before the cancel.
+      const locked = new Database(dbPath)
+      expect(() => locked.exec("BEGIN IMMEDIATE")).toThrow()
+      locked.close()
+
+      expect(await cancelBootOf(worker)).toEqual(BOOT_CANCELLED)
+      expect((await run).ok).toBe(false)
+      expect(gate.held).toBe(false)
+
+      // The orderly close released the handle/transaction, so the next writer
+      // can take the lock immediately.
+      const next = new Database(dbPath)
+      try {
+        next.exec("BEGIN IMMEDIATE")
+        next.exec("COMMIT")
+      } finally {
+        next.close()
+      }
     } finally {
       await pool.terminateAll()
       rmSync(dir, { recursive: true, force: true })
@@ -146,6 +246,42 @@ describe("production boot cancellation", () => {
       ])
     } finally {
       ;(globalThis as { Worker?: unknown }).Worker = original
+    }
+  })
+})
+
+describe("dispatch boot cancellation", () => {
+  test("cancel during the first boot reports a typed boot outcome and releases the permit", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "boot-cancel-dispatch-"))
+    const marker = join(dir, "executed")
+    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const sessionID = sid("ses_boot_dispatch")
+    const pool = createBunExecutorWorkerPool({
+      entry: GATED_FIXTURE,
+      workerData: { bootDelayMs: 60_000, markerPath: marker },
+      spawnGate: gate,
+    })
+    const hub = createSessionHub({ pool, cancellation: (p) => createWorkerCancellation(p, { graceMs: 5_000 }) })
+    try {
+      const run = settleOf(hub.ensureRunning(sessionID))
+      // The permit is held once the isolate has been constructed, before the
+      // worker can announce ready: this is the first-boot window.
+      await waitFor(() => gate.held === true, "the spawn permit")
+
+      const report = await hub.cancelWithReport(sessionID)
+      expect(report.outcome?.mode).toBe("boot")
+      expect(report.outcome?.winner).toBe("cancel")
+      // A boot cancel never started a run, so no worker published the terminal
+      // idle. `acknowledged: false` makes run-state write the fallback idle.
+      expect(report.outcome?.acknowledged).toBe(false)
+      // The typed boot path releases the one permit; it is not a terminate-only
+      // settlement that would leave the gate wedged.
+      expect(gate.held).toBe(false)
+      expect((await run).ok).toBe(false)
+      expect(existsSync(marker)).toBe(false)
+    } finally {
+      await hub.terminateAll()
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 })

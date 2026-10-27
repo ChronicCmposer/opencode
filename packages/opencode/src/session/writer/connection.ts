@@ -13,7 +13,12 @@ import {
   type WriteOutcome,
 } from "@opencode-ai/core/database/connection"
 import { isBusyError } from "@opencode-ai/core/database/transaction"
-import { resolveWalConfig, walPragmas, type WalConfig } from "@opencode-ai/core/database/pragmas"
+import {
+  resolveWalConfig,
+  resolveWorkerCacheSizeKib,
+  walPragmas,
+  type WalConfig,
+} from "@opencode-ai/core/database/pragmas"
 
 /**
  * A synchronous driver must not stall a Session worker on a lock, so the worker
@@ -39,9 +44,18 @@ export function createBunSqliteConnection(options: BunSqliteConnectionOptions): 
   return openConnection({ filename: options.filename, pragmas: options.pragmas ?? [] })
 }
 
-/** Worker-side pragmas: the shared WAL tuning plus the short busy timeout. */
+/**
+ * Worker-side pragmas: the shared WAL tuning, the short busy timeout, and the
+ * per-worker page-cache budget. The cache value must be explicit here because
+ * `walPragmas` otherwise defaults to the hub's 64 MiB, which the fallback
+ * connection would inherit.
+ */
 export function writerPragmas(config: WalConfig): ReadonlyArray<string> {
-  return walPragmas({ journalSizeLimitBytes: config.journalSizeLimitBytes, busyTimeoutMs: WRITER_BUSY_TIMEOUT_MS })
+  return walPragmas({
+    journalSizeLimitBytes: config.journalSizeLimitBytes,
+    busyTimeoutMs: WRITER_BUSY_TIMEOUT_MS,
+    cacheSizeKib: resolveWorkerCacheSizeKib(),
+  })
 }
 
 /**

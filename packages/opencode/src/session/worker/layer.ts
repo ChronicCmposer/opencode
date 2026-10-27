@@ -78,7 +78,11 @@ import { SystemPrompt } from "@/session/system"
 import { Command } from "@/command"
 import { Image } from "@/image/image"
 import { Snapshot } from "@/snapshot"
-import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { SessionProjector, sessionRow } from "@opencode-ai/core/session/projector"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionEvent } from "@opencode-ai/core/session/event"
+import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { MCP } from "@/mcp"
 import { LSP } from "@/lsp/lsp"
@@ -131,6 +135,7 @@ import {
 import type { Hooks } from "@opencode-ai/plugin"
 import type {
   ChatHeadersOutput,
+  ChatMessageOutput,
   ChatParamsOutput,
   MessagesTransformInput,
   MessagesTransformOutput,
@@ -143,8 +148,16 @@ import type {
   WorkerPluginHost,
 } from "./plugin-host"
 import { WorkerDb, databaseLayer, type WorkerDatabase } from "./db"
+import { changedHubOwnedSessionColumns, HUB_OWNED_METADATA, SESSION_IMMUTABLE_COLUMNS } from "./repository/policy"
 import { PidReporter, type PidReporterInterface } from "./pid-registry"
-import { SessionSpawnProxyService, type SessionSpawnRequest, type SessionSpawnResult } from "./subagent"
+import {
+  SessionScopeError,
+  SessionSpawnProxyService,
+  type SessionSpawnProxy,
+  type SessionSpawnRequest,
+  type SessionSpawnResult,
+} from "./subagent"
+import type { CancelOutcome } from "./cancel"
 
 export { PidReporter } from "./pid-registry"
 export type { PidReport, PidReportEntry, PidReporterInterface } from "./pid-registry"
@@ -526,6 +539,12 @@ function restoreHubProxyError(error: unknown): Error {
       })
     case "QuestionRejectedError":
       return new Question.RejectedError()
+    case "SessionScopeError":
+      return new SessionScopeError({
+        message: error.message,
+        sessionID: String((error.data as { sessionID?: unknown } | undefined)?.sessionID ?? ""),
+        targetID: String((error.data as { targetID?: unknown } | undefined)?.targetID ?? ""),
+      })
     default:
       return error
   }
@@ -608,9 +627,31 @@ export interface HubProxyClients {
  * reads it optionally, so a worker forwards the spawn to the hub instead of
  * running the child on its own isolate.
  */
-export function sessionSpawnProxyLayer(client: HubProxyClient): Layer.Layer<SessionSpawnProxyService> {
+export function sessionSpawnProxyLayer(
+  client: HubProxyClient,
+  boundSessionID?: SessionID,
+): Layer.Layer<SessionSpawnProxyService> {
+  const scope: Pick<SessionSpawnProxy, "create" | "get" | "children" | "cancel"> =
+    boundSessionID === undefined
+      ? {}
+      : {
+          create: (input) =>
+            hubProxyCall<Session.Info>(client, "session.create", [{ ...input, sessionID: boundSessionID }]),
+          get: (targetID) =>
+            hubProxyCall<Session.Info | null>(client, "session.get", [{ sessionID: boundSessionID, targetID }]),
+          children: (parentID) =>
+            hubProxyCall<readonly Session.Info[]>(client, "session.children", [
+              { sessionID: boundSessionID, parentID },
+            ]),
+          cancel: (targetID) =>
+            hubProxyCall<CancelOutcome | undefined>(client, "session.cancel", [
+              { sessionID: boundSessionID, targetID },
+            ]),
+        }
   return Layer.succeed(SessionSpawnProxyService, {
+    ...(boundSessionID === undefined ? {} : { boundID: boundSessionID }),
     spawn: (request: SessionSpawnRequest) => hubProxyCall<SessionSpawnResult>(client, "session.spawn", [request]),
+    ...scope,
   })
 }
 
@@ -1270,6 +1311,172 @@ export function sharedBoundaryReplacements(
   ]
 }
 
+const sameProjectionValue = (left: unknown, right: unknown): boolean =>
+  JSON.stringify(left ?? null) === JSON.stringify(right ?? null)
+
+function rejectProjection(
+  event: SessionProjector.ProjectedEvent,
+  sessionID: string,
+  reason: string,
+): Effect.Effect<never> {
+  return Effect.die(new SessionProjector.ProjectionViolation({ type: event.type, sessionID, reason }))
+}
+
+/**
+ * The projection authority of a bound worker. The durable aggregate fence only
+ * checks `data.sessionID`; this policy also pins every nested identity to it,
+ * rejects worker-authored session-root lifecycle, and refuses immutable session
+ * columns plus hub-owned `metadata.depth`. It runs before any projector write,
+ * inside the same durable-commit transaction.
+ */
+function workerProjectionPolicy(): SessionProjector.ProjectionPolicy {
+  return {
+    authorize: (event, db) =>
+      Effect.gen(function* () {
+        if (event.type === SessionV1.Event.Created.type || event.type === SessionV1.Event.Deleted.type) {
+          return yield* rejectProjection(event, event.data.sessionID, "the session root is hub authority")
+        }
+
+        // Relocation is a control-plane operation: it rewrites the immutable
+        // directory/workspace identity and must not originate in a worker.
+        if (event.type === SessionEvent.Moved.type) {
+          return yield* rejectProjection(event, event.data.sessionID, "session location is hub authority")
+        }
+
+        if (event.type === SessionV1.Event.Updated.type) {
+          const info = event.data.info
+          if (info.id !== event.data.sessionID) {
+            return yield* rejectProjection(
+              event,
+              event.data.sessionID,
+              "info.id does not match the durable aggregate",
+            )
+          }
+          const current = yield* db
+            .select()
+            .from(SessionTable)
+            .where(eq(SessionTable.id, event.data.sessionID))
+            .get()
+            .pipe(Effect.orDie)
+          // A missing row makes the projector update a no-op; it can never mint
+          // the root, because Created is rejected above.
+          if (current === undefined) return
+          // Mirror the projector's write semantics: an absent optional field is
+          // omitted from the UPDATE (preserved), while `workspaceID` is written
+          // as null when absent.
+          const next: Record<string, unknown> = {
+            id: info.id,
+            project_id: info.projectID,
+            workspace_id: info.workspaceID ?? null,
+            slug: info.slug,
+            directory: info.directory,
+          }
+          if (info.parentID !== undefined) next.parent_id = info.parentID
+          if (info.permission !== undefined) next.permission = info.permission
+          const before: Record<string, unknown> = {
+            id: current.id,
+            project_id: current.project_id,
+            workspace_id: current.workspace_id ?? null,
+            parent_id: current.parent_id ?? null,
+            slug: current.slug,
+            directory: current.directory,
+            permission: current.permission ?? null,
+          }
+          for (const column of SESSION_IMMUTABLE_COLUMNS) {
+            if (!(column in next)) continue
+            if (!sameProjectionValue(next[column], before[column])) {
+              return yield* rejectProjection(
+                event,
+                event.data.sessionID,
+                `immutable session column ${column} changed`,
+              )
+            }
+          }
+          if (info.metadata !== undefined) {
+            for (const key of HUB_OWNED_METADATA.session ?? []) {
+              if (!sameProjectionValue(info.metadata[key], current.metadata?.[key])) {
+                return yield* rejectProjection(event, event.data.sessionID, `hub-owned metadata ${key} changed`)
+              }
+            }
+          }
+          // The projector writes the whole `sessionRow(info)` image (undefined
+          // fields are omitted by `SET`). Compare that exact image with the row
+          // the policy already loaded and allow only worker-owned columns to
+          // change; a repeated hub value is a no-op, a changed one is authority.
+          const currentRow = current as Record<string, unknown>
+          const changed = changedHubOwnedSessionColumns(sessionRow(info) as Record<string, unknown>, (column, value) =>
+            sameProjectionValue(value, currentRow[column]),
+          )
+          if (changed.length > 0) {
+            return yield* rejectProjection(
+              event,
+              event.data.sessionID,
+              `hub-owned session column ${changed[0]} changed`,
+            )
+          }
+          return
+        }
+
+        if (event.type === SessionV1.Event.MessageUpdated.type) {
+          const info = event.data.info
+          if (info.sessionID !== event.data.sessionID) {
+            return yield* rejectProjection(
+              event,
+              event.data.sessionID,
+              "info.sessionID does not match the durable aggregate",
+            )
+          }
+          const existing = yield* db
+            .select({ sessionID: MessageTable.session_id })
+            .from(MessageTable)
+            .where(eq(MessageTable.id, info.id))
+            .get()
+            .pipe(Effect.orDie)
+          if (existing !== undefined && existing.sessionID !== event.data.sessionID) {
+            return yield* rejectProjection(event, event.data.sessionID, "message id belongs to another session")
+          }
+          return
+        }
+
+        if (event.type === SessionV1.Event.PartUpdated.type) {
+          const part = event.data.part
+          if (part.sessionID !== event.data.sessionID) {
+            return yield* rejectProjection(
+              event,
+              event.data.sessionID,
+              "part.sessionID does not match the durable aggregate",
+            )
+          }
+          const message = yield* db
+            .select({ sessionID: MessageTable.session_id })
+            .from(MessageTable)
+            .where(eq(MessageTable.id, part.messageID))
+            .get()
+            .pipe(Effect.orDie)
+          if (message === undefined || message.sessionID !== event.data.sessionID) {
+            return yield* rejectProjection(
+              event,
+              event.data.sessionID,
+              "part.messageID does not belong to the durable aggregate",
+            )
+          }
+          const existing = yield* db
+            .select({ sessionID: PartTable.session_id, messageID: PartTable.message_id })
+            .from(PartTable)
+            .where(eq(PartTable.id, part.id))
+            .get()
+            .pipe(Effect.orDie)
+          if (
+            existing !== undefined &&
+            (existing.sessionID !== event.data.sessionID || existing.messageID !== part.messageID)
+          ) {
+            return yield* rejectProjection(event, event.data.sessionID, "part id is bound to another message")
+          }
+        }
+      }),
+  }
+}
+
 /**
  * Boundary replacements every session layer needs. `Database` is replaced by
  * the per-worker WAL connection when one is supplied (otherwise the legacy
@@ -1651,6 +1858,7 @@ type PluginTrigger = Plugin.Interface["trigger"]
 const WORKER_DISPATCHED_HOOKS: ReadonlySet<string> = new Set([
   "chat.params",
   "chat.headers",
+  "chat.message",
   "tool.execute.before",
   "tool.execute.after",
   "shell.env",
@@ -1688,6 +1896,8 @@ function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknow
       return host.chatParams(input, output as ChatParamsOutput)
     case "chat.headers":
       return host.chatHeaders(input, output as ChatHeadersOutput)
+    case "chat.message":
+      return host.chatMessage(input, output as ChatMessageOutput)
     case "tool.execute.before":
       return host.toolBefore(input, output as ToolBeforeOutput)
     case "tool.execute.after":
@@ -2139,6 +2349,12 @@ export interface SessionLayerOptions {
    */
   readonly hubProxies?: HubProxyClients
   /**
+   * The one session this isolate is bound to. The hub-proxy session scope uses
+   * it to authorize child create/read/children/cancel so a worker can never
+   * reach another session's rows. Absent on degraded graphs that run inline.
+   */
+  readonly boundSessionID?: SessionID
+  /**
    * Functional `BackgroundJob` replacement; the default is the process-local
    * registry (per-session workers own their background jobs).
    */
@@ -2227,12 +2443,19 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
   const layer =
     options.hubProxies === undefined
       ? withPid
-      : Layer.merge(withPid, sessionSpawnProxyLayer(sessionSpawnClient(options.hubProxies)))
+      : Layer.merge(withPid, sessionSpawnProxyLayer(sessionSpawnClient(options.hubProxies), options.boundSessionID))
   // `logging` is not a graph node either: it contributes only context references
   // (the file sink + minimum level), so merging it leaves the graph and its
   // node-table assertion untouched. Absent keeps the layer unchanged.
   const withLogging = options.logging === undefined ? layer : Layer.merge(layer, options.logging)
-  return { root: base, replacements, layer: withLogging }
+  // The strict projection authority is a non-graph seam too. Only a BOUND worker
+  // (one with a durable session aggregate) may publish session events; an
+  // unbound/degraded graph keeps the hub's projection behavior unchanged.
+  const withProjectionPolicy =
+    options.boundSessionID === undefined && options.clients.database?.sessionID === undefined
+      ? withLogging
+      : withLogging.pipe(Layer.provide(Layer.succeed(SessionProjector.Policy, workerProjectionPolicy())))
+  return { root: base, replacements, layer: withProjectionPolicy }
 }
 
 export * as SessionWorkerLayer from "./layer"

@@ -6,11 +6,12 @@
 // sessions, and a crash respawn goes through the same gate.
 
 import { describe, expect, test } from "bun:test"
+import { BOOT_CANCELLED } from "@/session/worker/cancel"
 import { createSpawnGate, SpawnGateTimeoutError } from "@/session/worker/spawn-gate"
 import { createBunExecutorTransport, spawnBunExecutorWorker } from "@/session/worker/hub"
 import type { SessionExecutorInbound } from "@/session/worker/execute"
 import { resolveBuildHash } from "@/session/worker/build-hash"
-import { flush, settleOf, sid } from "../../lib/async"
+import { flush, pollUntil, settleOf, sid, withDeadline } from "../../lib/async"
 
 /** A valid boot-ready frame for a fake isolate (must carry the hub build hash). */
 const ready = (threadId: number) => ({ type: "ready", threadId, buildHash: resolveBuildHash({ env: {} }).hash })
@@ -109,6 +110,39 @@ describe("spawn-gate wiring", () => {
     })
   })
 
+  test("a boot cancel while waiting for the global permit resolves at once and never constructs", async () => {
+    await withFakeWorker(async () => {
+      const gate = createSpawnGate({ timeoutMs: 1_000 })
+      const holder = createBunExecutorTransport({ entry: "fake://holder", spawnGate: gate })
+      holder.post(runFrame(1, "ses_holder"))
+      await flush()
+      expect(FakeWorker.instances).toHaveLength(1)
+
+      const waiting = createBunExecutorTransport({ entry: "fake://waiting", spawnGate: gate })
+      waiting.post(runFrame(2, "ses_waiting"))
+      await flush()
+      // The waiter has not been granted the permit, so no isolate exists.
+      expect(FakeWorker.instances).toHaveLength(1)
+
+      // The cancel must resolve NOW, not when the holder eventually releases the
+      // permit (which may be its whole boot).
+      const cancelled = await withDeadline(
+        waiting.cancelBoot?.() ?? Promise.resolve(undefined),
+        200,
+        "cancelBoot waited for the global spawn permit",
+      )
+      expect(cancelled).toEqual(BOOT_CANCELLED)
+
+      // Releasing the holder's permit must not construct the cancelled waiter.
+      FakeWorker.instances[0]!.emit(ready(1))
+      await flush()
+      expect(FakeWorker.instances.map((instance) => instance.url)).toEqual(["fake://holder"])
+      expect(waiting.alive).toBe(false)
+
+      await holder.terminate()
+    })
+  })
+
   test("a malformed ports frame fails the spawn loud and releases the gate", async () => {
     await withFakeWorker(async () => {
       const gate = createSpawnGate({ timeoutMs: 1_000 })
@@ -124,6 +158,10 @@ describe("spawn-gate wiring", () => {
       expect(settled).toMatchObject({ ok: false })
       expect(settled.ok ? undefined : settled.error).toBeInstanceOf(Error)
       expect(transport.alive).toBe(false)
+      await flush()
+      // Never ready: the isolate cannot have opened its DB/WAL, so the teardown
+      // is terminate-only (no orderly shutdown frame).
+      expect(worker.posted.some((frame) => (frame as { type?: string }).type === "shutdown")).toBe(false)
 
       // The failed spawn released the permit for the next session.
       const next = createBunExecutorTransport({ entry: "fake://after", spawnGate: gate })
@@ -151,12 +189,19 @@ describe("spawn-gate wiring", () => {
       const readyRun = settleOf(badReady.waitFor(() => true))
       badReady.post(runFrame(2, "ses_ready"))
       await flush()
-      // A `ready` without the numeric thread id is not a boot handshake.
-      FakeWorker.instances[1]!.emit({ type: "ready" })
+      // A `ready` without the numeric thread id is not a valid handshake, but
+      // the isolate DID boot (it opened its DB/WAL), so its teardown is orderly.
+      const malformedReadyWorker = FakeWorker.instances[1]!
+      malformedReadyWorker.emit({ type: "ready" })
 
       const readySettled = await readyRun
       expect(readySettled).toMatchObject({ ok: false })
       expect(badReady.alive).toBe(false)
+      await pollUntil(
+        () => malformedReadyWorker.posted.some((frame) => (frame as { type?: string }).type === "shutdown"),
+        { message: "a rejected ready frame must close through the orderly shutdown frame" },
+      )
+      expect(malformedReadyWorker.terminated).toBe(true)
       await badProxy.terminate()
       await badReady.terminate()
     })
@@ -169,12 +214,21 @@ describe("spawn-gate wiring", () => {
       const run = settleOf(transport.waitFor(() => true))
       transport.post(runFrame(1, "ses_hash"))
       await flush()
-      FakeWorker.instances[0]!.emit({ type: "ready", threadId: 1, buildHash: "not-the-hub-hash" })
+      const worker = FakeWorker.instances[0]!
+      worker.emit({ type: "ready", threadId: 1, buildHash: "not-the-hub-hash" })
 
       const settled = await run
       expect(settled.ok).toBe(false)
       if (!settled.ok) expect(String(settled.error)).toContain("build mismatch")
       expect(transport.alive).toBe(false)
+      // The bundle booted (its native WAL handle exists) but the hub rejected the
+      // build: close it through the shutdown frame before terminate, never
+      // terminate-only, or the WAL lock outlives the thread.
+      await pollUntil(
+        () => worker.posted.some((frame) => (frame as { type?: string }).type === "shutdown"),
+        { message: "a build-mismatched ready frame must close through the orderly shutdown frame" },
+      )
+      expect(worker.terminated).toBe(true)
       await transport.terminate()
     })
   })

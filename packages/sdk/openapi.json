@@ -6327,6 +6327,11 @@
                   "variant": {
                     "type": "string"
                   },
+                  "origin": {
+                    "type": "string",
+                    "enum": ["user", "auto"],
+                    "description": "Who asked for the dispatch: an explicit user prompt or background/auto work"
+                  },
                   "parts": {
                     "type": "array",
                     "items": {
@@ -6695,48 +6700,204 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "sessionID": {
-                      "type": "string",
-                      "pattern": "^ses"
-                    },
-                    "mode": {
-                      "type": "string",
-                      "enum": ["cooperative", "terminated", "completed"]
-                    },
-                    "winner": {
-                      "type": "string",
-                      "enum": ["cancel", "completion"]
-                    },
-                    "acknowledged": {
-                      "type": "boolean"
-                    },
-                    "durationMs": {
-                      "anyOf": [
-                        {
-                          "type": "number"
-                        },
-                        {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "sessionID": {
                           "type": "string",
-                          "enum": ["NaN"]
+                          "pattern": "^ses"
                         },
-                        {
-                          "type": "string",
-                          "enum": ["Infinity"]
+                        "acknowledged": {
+                          "type": "boolean"
                         },
-                        {
-                          "type": "string",
-                          "enum": ["-Infinity"]
+                        "durationMs": {
+                          "anyOf": [
+                            {
+                              "type": "number"
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["NaN"]
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["Infinity"]
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["-Infinity"]
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["Infinity", "-Infinity", "NaN"]
+                            }
+                          ]
                         },
-                        {
+                        "mode": {
                           "type": "string",
-                          "enum": ["Infinity", "-Infinity", "NaN"]
+                          "enum": ["cooperative"]
+                        },
+                        "winner": {
+                          "type": "string",
+                          "enum": ["cancel"]
+                        },
+                        "message": {
+                          "type": "object",
+                          "properties": {
+                            "info": {
+                              "$ref": "#/components/schemas/Message"
+                            },
+                            "parts": {
+                              "type": "array",
+                              "items": {
+                                "$ref": "#/components/schemas/Part"
+                              }
+                            }
+                          },
+                          "required": ["info", "parts"],
+                          "additionalProperties": false
                         }
-                      ]
+                      },
+                      "required": ["sessionID", "acknowledged", "durationMs", "mode", "winner"],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "sessionID": {
+                          "type": "string",
+                          "pattern": "^ses"
+                        },
+                        "acknowledged": {
+                          "type": "boolean"
+                        },
+                        "durationMs": {
+                          "anyOf": [
+                            {
+                              "type": "number"
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["NaN"]
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["Infinity"]
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["-Infinity"]
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["Infinity", "-Infinity", "NaN"]
+                            }
+                          ]
+                        },
+                        "mode": {
+                          "type": "string",
+                          "enum": ["terminated"]
+                        },
+                        "winner": {
+                          "type": "string",
+                          "enum": ["cancel"]
+                        }
+                      },
+                      "required": ["sessionID", "acknowledged", "durationMs", "mode", "winner"],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "sessionID": {
+                          "type": "string",
+                          "pattern": "^ses"
+                        },
+                        "acknowledged": {
+                          "type": "boolean"
+                        },
+                        "durationMs": {
+                          "anyOf": [
+                            {
+                              "type": "number"
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["NaN"]
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["Infinity"]
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["-Infinity"]
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["Infinity", "-Infinity", "NaN"]
+                            }
+                          ]
+                        },
+                        "mode": {
+                          "type": "string",
+                          "enum": ["completed"]
+                        },
+                        "winner": {
+                          "type": "string",
+                          "enum": ["completion"]
+                        }
+                      },
+                      "required": ["sessionID", "acknowledged", "durationMs", "mode", "winner"],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "sessionID": {
+                          "type": "string",
+                          "pattern": "^ses"
+                        },
+                        "acknowledged": {
+                          "type": "boolean"
+                        },
+                        "durationMs": {
+                          "anyOf": [
+                            {
+                              "type": "number"
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["NaN"]
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["Infinity"]
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["-Infinity"]
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["Infinity", "-Infinity", "NaN"]
+                            }
+                          ]
+                        },
+                        "mode": {
+                          "type": "string",
+                          "enum": ["boot"]
+                        },
+                        "winner": {
+                          "type": "string",
+                          "enum": ["cancel"]
+                        }
+                      },
+                      "required": ["sessionID", "acknowledged", "durationMs", "mode", "winner"],
+                      "additionalProperties": false
                     }
-                  },
-                  "additionalProperties": false,
+                  ],
                   "description": "Aborted session"
                 }
               }
@@ -7249,6 +7410,11 @@
                   },
                   "variant": {
                     "type": "string"
+                  },
+                  "origin": {
+                    "type": "string",
+                    "enum": ["user", "auto"],
+                    "description": "Who asked for the dispatch: an explicit user prompt or background/auto work"
                   },
                   "parts": {
                     "type": "array",
@@ -16232,6 +16398,71 @@
         "required": ["name", "data"],
         "additionalProperties": false
       },
+      "IncompleteStreamError": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["IncompleteStreamError"]
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": ["message"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["name", "data"],
+        "additionalProperties": false
+      },
+      "MaxStepsExceededError": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["MaxStepsExceededError"]
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "steps": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["NaN"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["-Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity", "-Infinity", "NaN"]
+                  }
+                ]
+              }
+            },
+            "required": ["message", "steps"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["name", "data"],
+        "additionalProperties": false
+      },
       "APIError": {
         "type": "object",
         "properties": {
@@ -16327,6 +16558,12 @@
               },
               {
                 "$ref": "#/components/schemas/ContentFilterError"
+              },
+              {
+                "$ref": "#/components/schemas/IncompleteStreamError"
+              },
+              {
+                "$ref": "#/components/schemas/MaxStepsExceededError"
               },
               {
                 "$ref": "#/components/schemas/APIError"
@@ -19174,6 +19411,12 @@
                           },
                           {
                             "$ref": "#/components/schemas/ContentFilterError"
+                          },
+                          {
+                            "$ref": "#/components/schemas/IncompleteStreamError"
+                          },
+                          {
+                            "$ref": "#/components/schemas/MaxStepsExceededError"
                           },
                           {
                             "$ref": "#/components/schemas/APIError"
@@ -23981,6 +24224,46 @@
             "additionalProperties": false
           }
         ]
+      },
+      "MaxStepsExceededError1": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["MaxStepsExceededError"]
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "steps": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["NaN"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["-Infinity"]
+                  }
+                ]
+              }
+            },
+            "required": ["message", "steps"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["name", "data"],
+        "additionalProperties": false
       },
       "session.status": {
         "type": "object",
@@ -31799,6 +32082,12 @@
                     "$ref": "#/components/schemas/ContentFilterError"
                   },
                   {
+                    "$ref": "#/components/schemas/IncompleteStreamError"
+                  },
+                  {
+                    "$ref": "#/components/schemas/MaxStepsExceededError1"
+                  },
+                  {
                     "$ref": "#/components/schemas/APIError"
                   }
                 ]
@@ -35736,6 +36025,12 @@
                   },
                   {
                     "$ref": "#/components/schemas/ContentFilterError"
+                  },
+                  {
+                    "$ref": "#/components/schemas/IncompleteStreamError"
+                  },
+                  {
+                    "$ref": "#/components/schemas/MaxStepsExceededError1"
                   },
                   {
                     "$ref": "#/components/schemas/APIError"

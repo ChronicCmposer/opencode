@@ -9,6 +9,7 @@ import { Decimal } from "decimal.js"
 import type { ProviderMetadata, Usage } from "@opencode-ai/llm"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionV2 } from "@opencode-ai/core/session"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
@@ -581,6 +582,18 @@ const layer: Layer.Layer<
     })
 
     const get = Effect.fn("Session.get")(function* (id: SessionID) {
+      // A bound worker never reads another session's row directly. When the
+      // hub-proxy session scope is present, the hub resolves the id (and checks
+      // it belongs to this worker's subtree) and returns the Info across the
+      // port. The hub graph has no proxy, so it keeps the local read.
+      const proxy = yield* Effect.serviceOption(SessionSpawnProxyService)
+      // The worker's own row stays a local read; only another session's row
+      // (a child) crosses the hub.
+      if (Option.isSome(proxy) && proxy.value.get !== undefined && proxy.value.boundID !== id) {
+        const info = yield* proxy.value.get(id).pipe(Effect.orDie)
+        if (info === null) return yield* Effect.fail(new NotFoundError({ message: `Session not found: ${id}` }))
+        return info
+      }
       const row = yield* db.select().from(SessionTable).where(eq(SessionTable.id, id)).get().pipe(Effect.orDie)
       if (!row) return yield* Effect.fail(new NotFoundError({ message: `Session not found: ${id}` }))
       return fromRow(row)
@@ -637,6 +650,13 @@ const layer: Layer.Layer<
     })
 
     const children = Effect.fn("Session.children")(function* (parentID: SessionID) {
+      // A bound worker's child scan is another session's row set; the hub
+      // resolves it against this worker's subtree. Never fall back to a local
+      // scan once the proxy is present (that is the boundary this closes).
+      const proxy = yield* Effect.serviceOption(SessionSpawnProxyService)
+      if (Option.isSome(proxy) && proxy.value.children !== undefined) {
+        return [...(yield* proxy.value.children(parentID).pipe(Effect.orDie))]
+      }
       const rows = yield* db
         .select()
         .from(SessionTable)
@@ -663,7 +683,11 @@ const layer: Layer.Layer<
         }
 
         yield* events.publish(SessionV1.Event.Deleted, { sessionID, info: session })
-        yield* events.remove(sessionID)
+        // The whole durable log (events, blob rows, sequence) and any D16 files
+        // this aggregate alone referenced are removed by one Bus
+        // `BEGIN IMMEDIATE`. `EventV2.deleteAggregate` keeps the worker-session
+        // fence and is the same path `EventV2.remove` uses.
+        yield* EventV2.deleteAggregate(database.db, sessionID)
       } catch (error) {
         yield* Effect.logError("failed to remove session", { sessionID, error })
       }
@@ -716,6 +740,16 @@ const layer: Layer.Layer<
       permission?: PermissionV1.Ruleset
       workspaceID?: WorkspaceV2.ID
     }) {
+      // A child session is created on the hub: the worker cannot write the
+      // session root for a different aggregate. The hub checks `parentID`
+      // against this worker's bound session before creating the row.
+      const proxy = yield* Effect.serviceOption(SessionSpawnProxyService)
+      if (Option.isSome(proxy) && proxy.value.create !== undefined) {
+        const { permission, ...rest } = input ?? {}
+        return yield* proxy.value
+          .create({ ...rest, ...(permission === undefined ? {} : { permission: [...permission] }) })
+          .pipe(Effect.orDie)
+      }
       const ctx = yield* InstanceState.context
       const workspace = yield* InstanceState.workspaceID
       return yield* createNext({
@@ -738,6 +772,34 @@ const layer: Layer.Layer<
     })
 
     const spawn = Effect.fn("Session.spawn")(function* (input: SpawnInput) {
+      // The origin rides the prompt so it also crosses the hub-proxy spawn
+      // request (the worker's `Session.spawn` forwards only the prompt); an
+      // absent origin is an explicit user action.
+      const origin = input.origin ?? input.prompt.origin
+      const request = {
+        parentID: input.parentID,
+        ...(input.childID === undefined ? {} : { childID: input.childID }),
+        type: input.type,
+        ...(input.title === undefined ? {} : { title: input.title }),
+        ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
+        prompt: {
+          ...input.prompt,
+          // The hub rewrites this to the real child id after creating it; a
+          // worker with no child id yet sends the parent as a placeholder.
+          sessionID: input.childID ?? input.parentID,
+          ...(origin === undefined ? {} : { origin }),
+        },
+      }
+
+      // A worker hands the WHOLE spawn to the hub: reading the parent, stamping
+      // the child's depth and prompting the child are all hub writes. Doing any
+      // of them locally would write another session's rows from the worker.
+      const proxy = yield* Effect.serviceOption(SessionSpawnProxyService)
+      if (Option.isSome(proxy)) {
+        const spawned = yield* proxy.value.spawn(request).pipe(Effect.orDie)
+        return { childID: spawned.childID, result: spawned.result }
+      }
+
       const parent = yield* get(input.parentID).pipe(Effect.orDie)
       const childDepth = SessionDepth.nextDepth(parent.metadata)
       if (input.depthLimit !== undefined && SessionDepth.exceedsSubagentDepth(childDepth, input.depthLimit)) {
@@ -754,33 +816,7 @@ const layer: Layer.Layer<
               metadata,
             })
           : yield* stampDepth(input.childID, metadata)
-      // The origin rides the prompt so it also crosses the hub-proxy spawn
-      // request (the worker's `Session.spawn` forwards only the prompt); an
-      // absent origin is an explicit user action.
-      const origin = input.origin ?? input.prompt.origin
-      const prompt = {
-        ...input.prompt,
-        sessionID: child.id,
-        ...(origin === undefined ? {} : { origin }),
-      }
-
-      // A worker prefers the hub-proxy spawn: the child's own per-session worker
-      // must run the prompt, never the parent's isolate. The main process has no
-      // proxy and prompts directly (flag-off and hub authority paths).
-      const proxy = yield* Effect.serviceOption(SessionSpawnProxyService)
-      if (Option.isSome(proxy)) {
-        const spawned = yield* proxy.value
-          .spawn({
-            parentID: input.parentID,
-            childID: child.id,
-            type: input.type,
-            title: input.title,
-            metadata,
-            prompt,
-          })
-          .pipe(Effect.orDie)
-        return { childID: spawned.childID, result: spawned.result }
-      }
+      const prompt = { ...request.prompt, sessionID: child.id }
 
       const promptService = yield* Effect.serviceOption(SessionPromptService)
       if (Option.isNone(promptService)) {
