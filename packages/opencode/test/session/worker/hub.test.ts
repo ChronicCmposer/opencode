@@ -166,7 +166,10 @@ describe("12.2 per-session admission", () => {
 
 describe("12.3 the hub loop is I/O-only", () => {
   test("a hub timer keeps firing while K sessions run in workers", async () => {
-    const pool = createBunExecutorWorkerPool({ entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
+    // Use the long-running work kind so a saturated scheduler still gives the
+    // main-thread timer a real window; the 200ms "slow" kind could finish before
+    // the timer got a turn under host load.
+    const pool = createBunExecutorWorkerPool({ entry: EXECUTOR_FIXTURE, workKind: "verySlow", timeoutMs: 15_000 })
     const hub = createSessionHub({ pool })
     try {
       let ticks = 0

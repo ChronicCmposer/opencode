@@ -26,6 +26,11 @@ import { TestLLMServer } from "../lib/llm-server"
 import { testEffect } from "../lib/effect"
 import { sid } from "../lib/async"
 import { pollUntil } from "../lib/poll"
+import {
+  REAL_WORKER_IDLE_TIMEOUT_MS,
+  REAL_WORKER_TEST_TIMEOUT_MS,
+  REAL_WORKER_TRANSPORT_TIMEOUT_MS,
+} from "../lib/worker-timeouts"
 import { Effect } from "effect"
 
 const it = testEffect(TestLLMServer.layer)
@@ -101,7 +106,7 @@ describe("retired lease release is scoped to the retired generation", () => {
       connection.close()
     }
 
-    const db = createDbExecutor({ filename, timeoutMs: 10_000 })
+    const db = createDbExecutor({ filename, timeoutMs: REAL_WORKER_TRANSPORT_TIMEOUT_MS })
     try {
       const released = await releaseRetiredWorkerLease(db, sid(sessionID), "worker-1-999-dead")
       expect(released).toBe(false)
@@ -126,7 +131,7 @@ function dispatchPrompt(hub: SessionHub, sessionID: string, text: string): Promi
   })
 }
 
-async function crashPayload(run: Promise<void>, timeoutMs = 10_000) {
+async function crashPayload(run: Promise<void>, timeoutMs = REAL_WORKER_TRANSPORT_TIMEOUT_MS) {
   const outcome = await Promise.race([
     run.then(
       () => ({ kind: "completed" as const }),
@@ -154,7 +159,7 @@ function startHub(input: {
   readonly env?: Record<string, string | undefined>
   readonly cancellation?: { readonly graceMs?: number }
 }): RealHubFixture {
-  const db = createDbExecutor({ filename: input.filename, timeoutMs: 10_000 })
+  const db = createDbExecutor({ filename: input.filename, timeoutMs: REAL_WORKER_TRANSPORT_TIMEOUT_MS })
   const hub = createProductionSessionHub({
     db,
     init: () =>
@@ -167,8 +172,8 @@ function startHub(input: {
     entry: SESSION_WORKER,
     databasePath: input.filename,
     env: { OPENCODE_DB: input.filename, ...(input.env ?? {}) },
-    timeoutMs: 10_000,
-    runIdleTimeoutMs: 3_000,
+    timeoutMs: REAL_WORKER_TRANSPORT_TIMEOUT_MS,
+    runIdleTimeoutMs: REAL_WORKER_IDLE_TIMEOUT_MS,
     ...(input.cancellation === undefined ? {} : { cancellation: input.cancellation }),
     ports: {
       hubProxy: {
@@ -225,6 +230,7 @@ describe("P0: a crashed generation's lease is reclaimed immediately", () => {
           yield* Effect.promise(() =>
             pollUntil(() => readLease(filename, sessionID)?.worker_expires_at === 0, {
               message: "retirement never released the dead lease",
+              timeoutMs: REAL_WORKER_TRANSPORT_TIMEOUT_MS,
             }),
           )
           const deadLease = readLease(filename, sessionID)
@@ -242,7 +248,7 @@ describe("P0: a crashed generation's lease is reclaimed immediately", () => {
           yield* Effect.promise(() => fixture.dispose())
         }
       }),
-    30_000,
+    REAL_WORKER_TEST_TIMEOUT_MS,
   )
 })
 
@@ -285,6 +291,6 @@ describe("P0: retirement release is ordered before the successor boots", () => {
           yield* Effect.promise(() => fixture.dispose())
         }
       }),
-    30_000,
+    REAL_WORKER_TEST_TIMEOUT_MS,
   )
 })

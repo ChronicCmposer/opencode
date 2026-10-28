@@ -23,6 +23,11 @@ import { workerSnapshot } from "../lib/snapshot"
 import { TestLLMServer } from "../lib/llm-server"
 import { testEffect } from "../lib/effect"
 import { sid } from "../lib/async"
+import {
+  REAL_WORKER_IDLE_TIMEOUT_MS,
+  REAL_WORKER_TEST_TIMEOUT_MS,
+  REAL_WORKER_TRANSPORT_TIMEOUT_MS,
+} from "../lib/worker-timeouts"
 
 const it = testEffect(TestLLMServer.layer)
 
@@ -119,7 +124,7 @@ function startHub(input: {
   readonly entry?: string | URL
   readonly workerData?: Record<string, unknown>
 }): HubFixture {
-  const db = createDbExecutor({ filename: input.filename, timeoutMs: 10_000 })
+  const db = createDbExecutor({ filename: input.filename, timeoutMs: REAL_WORKER_TRANSPORT_TIMEOUT_MS })
   const hub = createProductionSessionHub({
     db,
     init: () =>
@@ -133,8 +138,8 @@ function startHub(input: {
     entry: input.entry ?? SESSION_WORKER,
     databasePath: input.filename,
     env: { OPENCODE_DB: input.filename, ...(input.env ?? {}) },
-    timeoutMs: 10_000,
-    runIdleTimeoutMs: 10_000,
+    timeoutMs: REAL_WORKER_TRANSPORT_TIMEOUT_MS,
+    runIdleTimeoutMs: REAL_WORKER_IDLE_TIMEOUT_MS,
     ports: {
       hubProxy: {
         "sessionStatus.get": () => ({ type: "idle" }),
@@ -170,7 +175,7 @@ function dispatchPrompt(fixture: HubFixture, text: string): Promise<void> {
   })
 }
 
-async function crashPayload(run: Promise<void>, timeoutMs = 20_000): Promise<WorkerCrashed> {
+async function crashPayload(run: Promise<void>, timeoutMs = REAL_WORKER_TRANSPORT_TIMEOUT_MS): Promise<WorkerCrashed> {
   const outcome = await Promise.race([
     run.then(
       () => ({ kind: "completed" as const }),
@@ -202,7 +207,7 @@ function effectCount(counter: string): number {
  * hang. The assertion is on the side effect itself, never on request counts
  * (title generation also hits the LLM server).
  */
-function waitForEffects(counter: string, count: number, timeoutMs = 3_000) {
+function waitForEffects(counter: string, count: number, timeoutMs = REAL_WORKER_TRANSPORT_TIMEOUT_MS) {
   return Effect.gen(function* () {
     const deadline = Date.now() + timeoutMs
     while (effectCount(counter) < count && Date.now() < deadline) yield* Effect.sleep(25)
@@ -258,7 +263,7 @@ describe("duplicate side effect at the result window (P0)", () => {
           yield* Effect.promise(() => fixture.dispose())
         }
       }),
-    60_000,
+    REAL_WORKER_TEST_TIMEOUT_MS,
   )
 })
 
@@ -296,7 +301,7 @@ describe("resume reads the durable tool_call ledger (P0)", () => {
           yield* Effect.promise(() => fixture.dispose())
         }
       }),
-    60_000,
+    REAL_WORKER_TEST_TIMEOUT_MS,
   )
 
   it.live(
@@ -329,7 +334,7 @@ describe("resume reads the durable tool_call ledger (P0)", () => {
           yield* Effect.promise(() => fixture.dispose())
         }
       }),
-    60_000,
+    REAL_WORKER_TEST_TIMEOUT_MS,
   )
 
   it.live(
@@ -358,7 +363,7 @@ describe("resume reads the durable tool_call ledger (P0)", () => {
           yield* Effect.promise(() => fixture.dispose())
         }
       }),
-    60_000,
+    REAL_WORKER_TEST_TIMEOUT_MS,
   )
 })
 
@@ -425,6 +430,6 @@ describe("phase-correct resume (P0)", () => {
           yield* Effect.promise(() => fixture.dispose())
         }
       }),
-    60_000,
+    REAL_WORKER_TEST_TIMEOUT_MS,
   )
 })

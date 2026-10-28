@@ -15,7 +15,7 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test"
 import { Context, Effect, Exit, Layer, Option, Scope } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
@@ -49,6 +49,10 @@ import { serveHubProxy } from "@/session/worker/hub-proxy-wire"
 import type { CancelOutcome } from "@/session/worker/cancel"
 import { recordingHubAuthorities } from "../lib/hub-proxy"
 import { withDeadline } from "../lib/async"
+import { REAL_WORKER_TEST_TIMEOUT_MS } from "../lib/worker-timeouts"
+
+// Bun resets the per-file default to 5s; this file boots a real worker isolate.
+setDefaultTimeout(REAL_WORKER_TEST_TIMEOUT_MS)
 
 const WORKER = new URL("../fixture/session-hub-worker.ts", import.meta.url)
 const ROOT = SessionID.make("ses_session_hub_root")

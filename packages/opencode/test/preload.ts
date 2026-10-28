@@ -4,7 +4,18 @@ import os from "os"
 import path from "path"
 import fs from "fs/promises"
 import { setTimeout as sleep } from "node:timers/promises"
-import { afterAll } from "bun:test"
+import { afterAll, setDefaultTimeout } from "bun:test"
+import { DEFAULT_TEST_TIMEOUT_MS } from "./lib/worker-timeouts"
+
+// Bun does not parse `[test] timeout` from bunfig.toml (oven-sh/bun#7789), and
+// raw `bun test` still defaults to 5s, while the package's own `test` script
+// passes 30s. Real session-worker isolates boot in separate Bun workers, so a
+// busy host can push a legitimate test past 5s. Bun resets the default for each
+// file after the first, so suite helpers (`test/lib/effect.ts`) and real-worker
+// integration files also call `setDefaultTimeout` at module scope; this covers
+// the first file and documents the shared budget. A test that passes an
+// explicit timeout keeps it.
+setDefaultTimeout(DEFAULT_TEST_TIMEOUT_MS)
 
 // Host config isolation: the ambient shell/harness exports OPENCODE_* config
 // inputs (global config content, a config dir, project-config disabling, the

@@ -19,6 +19,9 @@ const DURATIONS: Record<string, number> = {
   instant: 0,
   noop: 10,
   slow: 200,
+  // Long enough that a main-thread timer has an unambiguous window to fire even
+  // on a heavily oversubscribed host (event-loop liveness test).
+  verySlow: 2_000,
 }
 
 let executions = 0

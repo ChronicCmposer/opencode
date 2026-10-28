@@ -52,8 +52,16 @@ import { createWorkerPluginHost, type WorkerPluginHooks } from "@/session/worker
 import { hubProxyPluginTrigger } from "@/session/worker/session-worker"
 import { instantRunner, recordingHubAuthorities, serveHubProxyFor } from "../lib/hub-proxy"
 import { workerSnapshot } from "../lib/snapshot"
-import { testEffect } from "../lib/effect"
+import { testEffect, setFileTimeout } from "../lib/effect"
+import { REAL_WORKER_TEST_TIMEOUT_MS } from "../lib/worker-timeouts"
 import { disposeAllInstances } from "../fixture/fixture"
+
+// The runner resets each test file to its 5s default, so a preload-only
+// `setDefaultTimeout` does not reach this file. Promotion boots real worker and
+// hub layers and needs the shared real-worker budget. Declare it through the
+// suite helper so the `testEffect(...)` declarations below reapply it instead of
+// restoring the generic default for tests registered afterwards.
+setFileTimeout(REAL_WORKER_TEST_TIMEOUT_MS)
 
 const workerModel = (): WorkerModel => ({
   providerID: "mock",

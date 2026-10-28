@@ -8,7 +8,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test"
 import { layer as sqliteLayer } from "@opencode-ai/core/database/sqlite.bun"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { Effect, Exit, Schema } from "effect"
@@ -50,6 +50,10 @@ import {
 import { createBunExecutorTransport, createProductionSessionHub, liveSessionWorkerCount } from "@/session/worker/hub"
 import { migrationStatements } from "@/session/writer/migration.statements.gen"
 import { sessionWorkerInit } from "../lib/session-worker-init"
+import { REAL_WORKER_TEST_TIMEOUT_MS } from "../lib/worker-timeouts"
+
+// Bun resets the per-file default to 5s; this file boots real worker isolates.
+setDefaultTimeout(REAL_WORKER_TEST_TIMEOUT_MS)
 
 const directories: string[] = []
 const cleanups: Array<() => void | Promise<void>> = []

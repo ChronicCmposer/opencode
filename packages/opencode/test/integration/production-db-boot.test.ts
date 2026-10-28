@@ -23,6 +23,7 @@ import { workerSnapshot } from "../lib/snapshot"
 import { TestLLMServer } from "../lib/llm-server"
 import { testEffect } from "../lib/effect"
 import { sid } from "../lib/async"
+import { REAL_WORKER_TEST_TIMEOUT_MS, REAL_WORKER_TRANSPORT_TIMEOUT_MS } from "../lib/worker-timeouts"
 
 const it = testEffect(TestLLMServer.layer)
 
@@ -117,7 +118,7 @@ describe("production DB boot (C1 / D7)", () => {
                 "sessionStatus.set": () => undefined,
               },
             },
-            timeoutMs: 20_000,
+            timeoutMs: REAL_WORKER_TRANSPORT_TIMEOUT_MS,
           })
           try {
             await hub.dispatcher.dispatch({
@@ -149,6 +150,6 @@ describe("production DB boot (C1 / D7)", () => {
         expect(outcome).toBeUndefined()
         expect(observed.messages[0]?.count).toBeGreaterThan(0)
       }),
-    30_000,
+    REAL_WORKER_TEST_TIMEOUT_MS,
   )
 })

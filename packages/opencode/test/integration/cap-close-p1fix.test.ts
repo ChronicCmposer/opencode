@@ -11,7 +11,7 @@
 // spawns a real Bun worker that holds a real `BEGIN IMMEDIATE` on a real WAL
 // file, then terminates it through the production transport.
 
-import { describe, expect, test } from "bun:test"
+import { describe, expect, setDefaultTimeout, test } from "bun:test"
 import { Database } from "bun:sqlite"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -36,6 +36,10 @@ import {
 } from "@/session/worker/hub"
 import { sessionWorkerInit } from "../lib/session-worker-init"
 import { flush, pollUntil, settleOf, sid, withDeadline } from "../lib/async"
+import { REAL_WORKER_TEST_TIMEOUT_MS } from "../lib/worker-timeouts"
+
+// Bun resets the per-file default to 5s; this file boots real executor workers.
+setDefaultTimeout(REAL_WORKER_TEST_TIMEOUT_MS)
 
 /** A one-shot signal: `promise` resolves on the first `resolve()` call. */
 function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {

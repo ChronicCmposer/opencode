@@ -4,7 +4,7 @@
 // `workerData` is present), so the pure aggregation / registry / work builders
 // are exercised in-process here.
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test"
 import { Database } from "bun:sqlite"
 import fs from "node:fs"
 import os from "node:os"
@@ -100,6 +100,14 @@ import { withParts } from "../../lib/session-parts"
 import { startMockProvider } from "../../lib/mock-provider"
 import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
 import { assertStructuredCloneable } from "../../lib/session-worker-init"
+import {
+  DEFAULT_TEST_TIMEOUT_MS,
+  REAL_WORKER_SLOW_TEST_TIMEOUT_MS,
+} from "../../lib/worker-timeouts"
+
+// Bun resets the per-file default to 5s; this file boots real worker isolates
+// and publishes 17MB blobs, which can exceed 5s on a busy host.
+setDefaultTimeout(DEFAULT_TEST_TIMEOUT_MS)
 
 const sid = (value: string) => SessionID.make(value)
 
@@ -849,7 +857,7 @@ describe("worker→hub PID reporting (P5 prerequisite)", () => {
         fs.rmSync(directory, { recursive: true, force: true })
       }
     },
-    30_000,
+    REAL_WORKER_SLOW_TEST_TIMEOUT_MS,
   )
 })
 

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, setDefaultTimeout, test } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -13,6 +13,11 @@ import {
   DbExecutorTimeoutError,
   type DbExecutor,
 } from "@/session/worker/db-executor"
+import { DEFAULT_TEST_TIMEOUT_MS } from "../../lib/worker-timeouts"
+
+// Bun resets the per-file default to 5s. The deadline test's executor budget
+// alone is 5s, so the runner must not clip the surrounding test.
+setDefaultTimeout(DEFAULT_TEST_TIMEOUT_MS)
 
 const BURN_SQL =
   "WITH RECURSIVE cnt(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM cnt WHERE x < 2000000) SELECT sum(x) AS total FROM cnt"
@@ -172,11 +177,25 @@ describe("db executor hardening", () => {
   })
 
   test("a request deadline is indeterminate and retires the thread", async () => {
-    const executor = createDbExecutor({ filename: ":memory:", timeoutMs: 50 })
+    // Deterministic block: a second connection holds the write lock while the
+    // executor's INSERT waits on it with a long driver busy timeout, so only the
+    // executor deadline can settle the request. No CPU burn is involved, and the
+    // generous budget covers a loaded host's scheduling delay for the
+    // post-retirement read (a 50ms budget made that follow-up query flaky).
+    const { filename, directory } = tempDatabase()
+    const holder = new BunDatabase(filename)
+    holder.exec("PRAGMA journal_mode = WAL")
+    holder.exec("CREATE TABLE item (id INTEGER PRIMARY KEY)")
+    holder.exec("BEGIN IMMEDIATE")
+    const executor = createDbExecutor({
+      filename,
+      timeoutMs: 5_000,
+      env: { OPENCODE_DB_BUSY_TIMEOUT_MS: "60000" },
+    })
     try {
-      await executor.query("SELECT 1 AS n")
+      expect(await executor.query("SELECT 1 AS n")).toEqual([{ n: 1 }])
       const firstThread = executor.threadId
-      const outcome = await executor.query(BURN_SQL).then(
+      const outcome = await executor.run("INSERT INTO item (id) VALUES (1)").then(
         () => "resolved",
         (error: unknown) =>
           error instanceof DbExecutorTimeoutError
@@ -184,12 +203,20 @@ describe("db executor hardening", () => {
             : { kind: "other" as const, error },
       )
       expect(outcome).toEqual({ kind: "timeout", indeterminate: true })
-      // The timed-out thread is gone; the next request opens a fresh one.
+      // The timed-out thread is gone; the next request opens a fresh one. A read
+      // succeeds under WAL even while the holder still owns the write lock.
       expect(await executor.query("SELECT 2 AS n")).toEqual([{ n: 2 }])
       expect(executor.threadId).toBeGreaterThan(0)
       expect(executor.threadId).not.toBe(firstThread)
     } finally {
       await executor.close()
+      try {
+        holder.exec("ROLLBACK")
+      } catch {
+        // The holder may already be released.
+      }
+      holder.close()
+      fs.rmSync(directory, { recursive: true, force: true })
     }
   })
 

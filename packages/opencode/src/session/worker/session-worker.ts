@@ -1263,6 +1263,12 @@ export function bootstrapSessionWorker(
   let hubProxyClient: HubProxyClient | undefined
   let hubProxies: HubProxyClients | undefined
   let pidReporter: PidReporterInterface | undefined
+  // Partial-bootstrap state the shared teardown also owns. Declared before the
+  // mid-bootstrap `try` so a throw can close whatever was already built instead
+  // of relying on isolate teardown.
+  let backgroundJobScope: Scope.Scope | undefined
+  let workerScope: Scope.Scope | undefined
+  let installed: ReturnType<typeof installSessionExecutor> | undefined
   // Orderly teardown, shared by the hub's `shutdown` frame and `dispose()`.
   // It is defined and installed BEFORE the DB opens: a shutdown that arrives
   // while the worker is still booting must not be lost, otherwise the isolate's
@@ -1300,6 +1306,29 @@ export function bootstrapSessionWorker(
       if (db !== undefined) disposeSafely(() => Effect.runSync(db.close))
     }
   }
+  /**
+   * The one teardown for both the returned handle and a failed mid-bootstrap.
+   * Every step is idempotent or best-effort, so it is safe on a partially built
+   * worker and safe after `closeResources` already ran. On the failure path this
+   * closes the SQLite handle/WAL locally instead of relying on isolate teardown.
+   */
+  const disposeBootstrap = (): void => {
+    installReporting(undefined)
+    namer.onDispose()
+    // Close the executor's owned scope so its runner-table fibers/finalizers
+    // settle with the worker instead of leaking past bootstrap disposal.
+    const executor = installed
+    if (executor !== undefined) void executor.dispose().catch(() => undefined)
+    // The registry scope outlives every run, so close it explicitly with the
+    // worker bootstrap; a still-running job is interrupted with the isolate.
+    const jobs = backgroundJobScope
+    if (jobs !== undefined) void Effect.runPromise(Scope.close(jobs, Exit.void)).catch(() => undefined)
+    // Close durable resources before the graph scope; close is idempotent.
+    closeResources()
+    // Close the worker-lifetime graph scope (DB/egress/bridge finalizers).
+    const graph = workerScope
+    if (graph !== undefined) void Effect.runPromise(Scope.close(graph, Exit.void)).catch(() => undefined)
+  }
   // A raw worker message (not an executor frame), handled here rather than in
   // `execute.ts`; the executor's unknown-frame path is harmless.
   const onShutdownFrame = (event: { data: unknown }): void => {
@@ -1321,239 +1350,235 @@ export function bootstrapSessionWorker(
   // down.
   if (shutdownRequested) return { dispose() {} }
 
-  // The real `SessionPrompt` loop needs the worker's own WAL connection and an
-  // ambient `InstanceRef`; only the full hub-port wiring provides them. The
-  // degraded (no-port) boot runs the reduced pipeline.
-  const usePrompt = servesWorkerPorts(init.capabilities)
-  if (usePrompt) {
-    // One connection per worker generation: the schema gate is read-only and a
-    // mismatch refuses boot before any run starts (D5/D7).
-    database = Effect.runSync(
-      openWorkerDatabase({
-        filename: Database.path(),
-        ...(init.sessionID === undefined ? {} : { sessionID: init.sessionID }),
+  try {
+    // The real `SessionPrompt` loop needs the worker's own WAL connection and an
+    // ambient `InstanceRef`; only the full hub-port wiring provides them. The
+    // degraded (no-port) boot runs the reduced pipeline.
+    const usePrompt = servesWorkerPorts(init.capabilities)
+    if (usePrompt) {
+      // One connection per worker generation: the schema gate is read-only and a
+      // mismatch refuses boot before any run starts (D5/D7).
+      database = Effect.runSync(
+        openWorkerDatabase({
+          filename: Database.path(),
+          ...(init.sessionID === undefined ? {} : { sessionID: init.sessionID }),
+        }),
+      )
+      const egressChannel = new MessageChannel()
+      // A dedicated control plane, so durable wakeups and resync never queue
+      // behind the delta stream; without it the egress mesh is dead in production.
+      const egressControlChannel = new MessageChannel()
+      scope.postMessage(
+        {
+          type: "ports",
+          egress: egressChannel.port2,
+          egressControl: egressControlChannel.port2,
+        },
+        [egressChannel.port2, egressControlChannel.port2].map(transferable),
+      )
+      clients = buildWorkerClients(
+        {
+          egress: egressChannel.port1,
+          egressControl: egressControlChannel.port1,
+        },
+        {
+          workerID: reportedWorkerID(init, threadId),
+          log,
+          database,
+          ...(init.sessionID === undefined ? {} : { sessionID: init.sessionID }),
+        },
+      )
+      // A test may pin a write transaction on the worker's own connection before
+      // delivering the shutdown frame, proving the orderly close releases the WAL.
+      options.observeWriter?.(clients.writer)
+      // The hub serves the `SessionStatus` / `Permission` / `Question`
+      // authorities over one control port; a single multiplexing client backs all
+      // three proxies (each call is correlated by the client's own request id).
+      const hubProxyChannel = new MessageChannel()
+      scope.postMessage({ type: "hub-proxy", port: hubProxyChannel.port2 }, [transferable(hubProxyChannel.port2)])
+      const client = createHubProxyClient(hubProxyChannel.port1)
+      hubProxyClient = client
+      options.observeHubProxy?.(client)
+      hubProxies = { sessionStatus: client, permission: client, question: client }
+      // The real prompt runs in this isolate; report the durable lifecycle facts
+      // (commit, tool start/finish, phase) to the hub tracker over the same
+      // control port before the effects they guard.
+      installReporting(createProxyReporting((method, args) => client.call(method as never, args)))
+      // The shell tool's detached children are reaped by the hub, so the same
+      // control port carries their `pid-report` frames (the hub distinguishes the
+      // two frame shapes). Only the full-port boot owns children.
+      pidReporter = createPidReporter(hubProxyChannel.port1, reportedWorkerID(init, threadId), log)
+    } else {
+      clients = directClients()
+    }
+
+    const config = modelConfig(init.model)
+    // The worker runs the model-facing plugin hooks in its own isolate; build the
+    // host from the shipped hooks so their `chat.params`/`chat.headers` mutations
+    // reach the reduced LLM exactly as flag-off. Both the system and messages
+    // transforms are hub proxies (the hub owns plugin loading and returns the
+    // mutated arrays): with no hub client (degraded boot) each is omitted and its
+    // array passes through unchanged.
+    const systemTransform = hubProxySystemTransform(hubProxies?.sessionStatus)
+    const messagesTransform = hubProxyMessagesTransform(hubProxies?.sessionStatus)
+    const hubHook = hubProxyPluginTrigger(hubProxies?.sessionStatus)
+    // The executor, abort and list seams all ride the SAME multiplexed control
+    // client (`hubProxies.sessionStatus`): the hub distinguishes the methods, so no
+    // second port is opened. The abort/list seams are surfaced on the bootstrap
+    // handle for the registry/cancel owners to consume.
+    const pluginToolExecutor = hubProxyPluginTool(hubProxies?.sessionStatus)
+    const pluginToolAbort = hubProxyPluginToolAbort(hubProxies?.sessionStatus)
+    const pluginToolList = hubProxyPluginToolList(hubProxies?.sessionStatus)
+    const plugins =
+      init.plugins === undefined
+        ? undefined
+        : createWorkerPluginHost(init.plugins, {
+            ...(systemTransform === undefined ? {} : { systemTransform }),
+            ...(messagesTransform === undefined ? {} : { messagesTransform }),
+            ...(hubHook === undefined ? {} : { hubHook }),
+          })
+    // Hub-executed plugin tools need BOTH the clone-safe descriptors the hub
+    // shipped and the hub-port executor. A descriptor without an executor (or the
+    // reverse) cannot execute, so the option is omitted entirely: degraded boot
+    // lists no plugin tools rather than a stub that would fail on call.
+    // A live handle, not a frozen literal: `refresh` swaps the descriptor set in
+    // place after a hub-side plugin reload, and the worker's `Plugin.Service.list()`
+    // reads the current set on every call (design Q4).
+    const pluginTools =
+      pluginToolExecutor === undefined || init.pluginTools === undefined || init.pluginTools.length === 0
+        ? undefined
+        : refreshablePluginTools(init.pluginTools, pluginToolExecutor, {
+            // The abort and list seams ride the same control client as the
+            // executor; attaching them here makes each rebuilt remote definition
+            // carry a working abort bridge and lazy-refresh action.
+            ...(pluginToolAbort === undefined ? {} : { abort: pluginToolAbort }),
+            ...(pluginToolList === undefined ? {} : { list: pluginToolList }),
+          })
+    // Pass the real hub-proxy clients so the reduced LLM sub-graph routes
+    // `Permission` over the hub control port (never a silent mock); absent
+    // (degraded boot) the sub-graph uses a fail-loud boundary. The same live
+    // `pluginTools` handle reaches the reduced sub-graph's `Plugin` replacement, so
+    // a future tool-consuming reduced node sees the refreshed set too.
+    const modelClient = llmModelClientLayer(config).pipe(
+      Layer.provide(reducedLlmLayer(init.snapshot, config, hubProxies, plugins, pluginTools)),
+    )
+
+    // One process-local `BackgroundJob` registry per worker, built on a scope that
+    // lives for the isolate. `createSessionWork` provides the graph layer per run,
+    // so a `Layer.effect` registry would be rebuilt (and its jobs interrupted) at
+    // every turn boundary; a single `Layer.succeed` value keeps a background job
+    // alive after the turn that started it, which the idle-reap probe observes.
+    backgroundJobScope = Effect.runSync(Scope.make())
+    const backgroundJobContext = Effect.runSync(Layer.buildWithScope(localBackgroundJobLayer(), backgroundJobScope))
+    const backgroundJobs = Context.get(backgroundJobContext, BackgroundJob.Service)
+    // A full-port worker mirrors its jobs over the control port so the hub's
+    // promotion endpoint can see foreground jobs; a degraded boot stays local.
+    const syncedBackgroundJobs =
+      hubProxyClient === undefined ? backgroundJobs : createHubSyncedBackgroundJobs(backgroundJobs, hubProxyClient)
+    options.observeBackgroundJobs?.(syncedBackgroundJobs)
+    const backgroundJobLayer = Layer.succeed(BackgroundJob.Service, syncedBackgroundJobs)
+
+    const runtime = buildSessionWorkerLayer({
+      // The full runnable graph needs the writer-backed Database and the serialized
+      // model catalog the hub ships; the degraded boot runs the reduced pipeline.
+      // The runnable graph also carries the worker EventV2 bridge, which rides the
+      // transferred `egress` port and is disposed with the layer scope, so it is
+      // built exactly when the events/egress port is available (`usePrompt`).
+      ...(usePrompt ? {} : { nodes: PIPELINE_SESSION_NODES }),
+      snapshot: init.snapshot,
+      env: init.env,
+      // PENDING hub-a: `node-table.ts`/`layer.ts` still declare an unused
+      // `BackgroundJobClientNode`; supply its inert handle here until that removal
+      // lands (the session worker owns its jobs through the process-local service).
+      clients: {
+        ...clients,
+        ...(database === undefined ? {} : { database }),
+        backgroundJob: { wait: async () => ({ timedOut: true }), cancel: async () => {} },
+      },
+      modelClient,
+      backgroundJob: backgroundJobLayer,
+      // The worker serves exactly one serialized model, so the reduced provider is
+      // the graph's provider (the real loop's `LLM` and `SessionPrompt` use it), and
+      // snapshot tracking is a fail-soft no-op (the isolate cannot run `git`). With
+      // a control-port reporter, `AppProcess` is replaced by the reporting wrapper
+      // so a mid-flight `rg` child's PGID reaches the hub mirror before terminate.
+      replacements: workerGraphReplacements(config, pidReporter),
+      // The worker-hosted plugin host reaches the graph's `LLM`/`Plugin` node too,
+      // not just the `ModelClient` sealed below, so plugin-set sampling/headers
+      // apply identically in both. Absent keeps the graph's no-op pass-through.
+      ...(plugins === undefined ? {} : { plugins }),
+      ...(pluginTools === undefined ? {} : { pluginTools }),
+      ...(hubProxies === undefined ? {} : { hubProxies }),
+      // The worker's one session: every hub-proxied child operation is authorized
+      // against it, so this isolate can never read or write another session's rows.
+      ...(init.sessionID === undefined ? {} : { boundSessionID: SessionID.make(init.sessionID) }),
+      ...(pidReporter === undefined ? {} : { pidReporter }),
+      // The worker's Effect logs reach the main `opencode.log` sink. Merged as a
+      // non-graph seam, so the node table and its assertion are untouched.
+      logging,
+    })
+
+    // Build the graph exactly once on a worker-lifetime scope. Every turn provides
+    // the cached context (the per-worker DB included) and only its own run scope;
+    // the old per-run `Effect.provide(layer)` disposed the DB after the first turn
+    // (C3). The scope is closed by `dispose()`.
+    workerScope = Effect.runSync(Scope.make())
+
+    // The worker-local run control is registered once the first `run` resolves the
+    // worker's `SessionRunState`; the executor proxy reads it live.
+    let control: SessionRunControl | undefined
+    const work = productionWorkRegistry(
+      createSessionWork({
+        layer: runtime.layer,
+        scope: workerScope,
+        writer: clients.writer,
+        threadId,
+        prompt: usePrompt,
+        instance: workerInstanceContext(init.snapshot),
+        registerControl: (registered) => {
+          control = registered
+        },
       }),
     )
-    const egressChannel = new MessageChannel()
-    // A dedicated control plane, so durable wakeups and resync never queue
-    // behind the delta stream; without it the egress mesh is dead in production.
-    const egressControlChannel = new MessageChannel()
-    scope.postMessage(
-      {
-        type: "ports",
-        egress: egressChannel.port2,
-        egressControl: egressControlChannel.port2,
-      },
-      [egressChannel.port2, egressControlChannel.port2].map(transferable),
-    )
-    clients = buildWorkerClients(
-      {
-        egress: egressChannel.port1,
-        egressControl: egressControlChannel.port1,
-      },
-      {
-        workerID: reportedWorkerID(init, threadId),
-        log,
-        database,
-        ...(init.sessionID === undefined ? {} : { sessionID: init.sessionID }),
-      },
-    )
-    // A test may pin a write transaction on the worker's own connection before
-    // delivering the shutdown frame, proving the orderly close releases the WAL.
-    options.observeWriter?.(clients.writer)
-    // The hub serves the `SessionStatus` / `Permission` / `Question`
-    // authorities over one control port; a single multiplexing client backs all
-    // three proxies (each call is correlated by the client's own request id).
-    const hubProxyChannel = new MessageChannel()
-    scope.postMessage({ type: "hub-proxy", port: hubProxyChannel.port2 }, [transferable(hubProxyChannel.port2)])
-    const client = createHubProxyClient(hubProxyChannel.port1)
-    hubProxyClient = client
-    options.observeHubProxy?.(client)
-    hubProxies = { sessionStatus: client, permission: client, question: client }
-    // The real prompt runs in this isolate; report the durable lifecycle facts
-    // (commit, tool start/finish, phase) to the hub tracker over the same
-    // control port before the effects they guard.
-    installReporting(createProxyReporting((method, args) => client.call(method as never, args)))
-    // The shell tool's detached children are reaped by the hub, so the same
-    // control port carries their `pid-report` frames (the hub distinguishes the
-    // two frame shapes). Only the full-port boot owns children.
-    pidReporter = createPidReporter(hubProxyChannel.port1, reportedWorkerID(init, threadId), log)
-  } else {
-    clients = directClients()
-  }
-
-  const config = modelConfig(init.model)
-  // The worker runs the model-facing plugin hooks in its own isolate; build the
-  // host from the shipped hooks so their `chat.params`/`chat.headers` mutations
-  // reach the reduced LLM exactly as flag-off. Both the system and messages
-  // transforms are hub proxies (the hub owns plugin loading and returns the
-  // mutated arrays): with no hub client (degraded boot) each is omitted and its
-  // array passes through unchanged.
-  const systemTransform = hubProxySystemTransform(hubProxies?.sessionStatus)
-  const messagesTransform = hubProxyMessagesTransform(hubProxies?.sessionStatus)
-  const hubHook = hubProxyPluginTrigger(hubProxies?.sessionStatus)
-  // The executor, abort and list seams all ride the SAME multiplexed control
-  // client (`hubProxies.sessionStatus`): the hub distinguishes the methods, so no
-  // second port is opened. The abort/list seams are surfaced on the bootstrap
-  // handle for the registry/cancel owners to consume.
-  const pluginToolExecutor = hubProxyPluginTool(hubProxies?.sessionStatus)
-  const pluginToolAbort = hubProxyPluginToolAbort(hubProxies?.sessionStatus)
-  const pluginToolList = hubProxyPluginToolList(hubProxies?.sessionStatus)
-  const plugins =
-    init.plugins === undefined
-      ? undefined
-      : createWorkerPluginHost(init.plugins, {
-          ...(systemTransform === undefined ? {} : { systemTransform }),
-          ...(messagesTransform === undefined ? {} : { messagesTransform }),
-          ...(hubHook === undefined ? {} : { hubHook }),
-        })
-  // Hub-executed plugin tools need BOTH the clone-safe descriptors the hub
-  // shipped and the hub-port executor. A descriptor without an executor (or the
-  // reverse) cannot execute, so the option is omitted entirely: degraded boot
-  // lists no plugin tools rather than a stub that would fail on call.
-  // A live handle, not a frozen literal: `refresh` swaps the descriptor set in
-  // place after a hub-side plugin reload, and the worker's `Plugin.Service.list()`
-  // reads the current set on every call (design Q4).
-  const pluginTools =
-    pluginToolExecutor === undefined || init.pluginTools === undefined || init.pluginTools.length === 0
-      ? undefined
-      : refreshablePluginTools(init.pluginTools, pluginToolExecutor, {
-          // The abort and list seams ride the same control client as the
-          // executor; attaching them here makes each rebuilt remote definition
-          // carry a working abort bridge and lazy-refresh action.
-          ...(pluginToolAbort === undefined ? {} : { abort: pluginToolAbort }),
-          ...(pluginToolList === undefined ? {} : { list: pluginToolList }),
-        })
-  // Pass the real hub-proxy clients so the reduced LLM sub-graph routes
-  // `Permission` over the hub control port (never a silent mock); absent
-  // (degraded boot) the sub-graph uses a fail-loud boundary. The same live
-  // `pluginTools` handle reaches the reduced sub-graph's `Plugin` replacement, so
-  // a future tool-consuming reduced node sees the refreshed set too.
-  const modelClient = llmModelClientLayer(config).pipe(
-    Layer.provide(reducedLlmLayer(init.snapshot, config, hubProxies, plugins, pluginTools)),
-  )
-
-  // One process-local `BackgroundJob` registry per worker, built on a scope that
-  // lives for the isolate. `createSessionWork` provides the graph layer per run,
-  // so a `Layer.effect` registry would be rebuilt (and its jobs interrupted) at
-  // every turn boundary; a single `Layer.succeed` value keeps a background job
-  // alive after the turn that started it, which the idle-reap probe observes.
-  const backgroundJobScope = Effect.runSync(Scope.make())
-  const backgroundJobContext = Effect.runSync(Layer.buildWithScope(localBackgroundJobLayer(), backgroundJobScope))
-  const backgroundJobs = Context.get(backgroundJobContext, BackgroundJob.Service)
-  // A full-port worker mirrors its jobs over the control port so the hub's
-  // promotion endpoint can see foreground jobs; a degraded boot stays local.
-  const syncedBackgroundJobs =
-    hubProxyClient === undefined ? backgroundJobs : createHubSyncedBackgroundJobs(backgroundJobs, hubProxyClient)
-  options.observeBackgroundJobs?.(syncedBackgroundJobs)
-  const backgroundJobLayer = Layer.succeed(BackgroundJob.Service, syncedBackgroundJobs)
-
-  const runtime = buildSessionWorkerLayer({
-    // The full runnable graph needs the writer-backed Database and the serialized
-    // model catalog the hub ships; the degraded boot runs the reduced pipeline.
-    // The runnable graph also carries the worker EventV2 bridge, which rides the
-    // transferred `egress` port and is disposed with the layer scope, so it is
-    // built exactly when the events/egress port is available (`usePrompt`).
-    ...(usePrompt ? {} : { nodes: PIPELINE_SESSION_NODES }),
-    snapshot: init.snapshot,
-    env: init.env,
-    // PENDING hub-a: `node-table.ts`/`layer.ts` still declare an unused
-    // `BackgroundJobClientNode`; supply its inert handle here until that removal
-    // lands (the session worker owns its jobs through the process-local service).
-    clients: {
-      ...clients,
-      ...(database === undefined ? {} : { database }),
-      backgroundJob: { wait: async () => ({ timedOut: true }), cancel: async () => {} },
-    },
-    modelClient,
-    backgroundJob: backgroundJobLayer,
-    // The worker serves exactly one serialized model, so the reduced provider is
-    // the graph's provider (the real loop's `LLM` and `SessionPrompt` use it), and
-    // snapshot tracking is a fail-soft no-op (the isolate cannot run `git`). With
-    // a control-port reporter, `AppProcess` is replaced by the reporting wrapper
-    // so a mid-flight `rg` child's PGID reaches the hub mirror before terminate.
-    replacements: workerGraphReplacements(config, pidReporter),
-    // The worker-hosted plugin host reaches the graph's `LLM`/`Plugin` node too,
-    // not just the `ModelClient` sealed below, so plugin-set sampling/headers
-    // apply identically in both. Absent keeps the graph's no-op pass-through.
-    ...(plugins === undefined ? {} : { plugins }),
-    ...(pluginTools === undefined ? {} : { pluginTools }),
-    ...(hubProxies === undefined ? {} : { hubProxies }),
-    // The worker's one session: every hub-proxied child operation is authorized
-    // against it, so this isolate can never read or write another session's rows.
-    ...(init.sessionID === undefined ? {} : { boundSessionID: SessionID.make(init.sessionID) }),
-    ...(pidReporter === undefined ? {} : { pidReporter }),
-    // The worker's Effect logs reach the main `opencode.log` sink. Merged as a
-    // non-graph seam, so the node table and its assertion are untouched.
-    logging,
-  })
-
-  // Build the graph exactly once on a worker-lifetime scope. Every turn provides
-  // the cached context (the per-worker DB included) and only its own run scope;
-  // the old per-run `Effect.provide(layer)` disposed the DB after the first turn
-  // (C3). The scope is closed by `dispose()`.
-  const workerScope = Effect.runSync(Scope.make())
-
-  // The worker-local run control is registered once the first `run` resolves the
-  // worker's `SessionRunState`; the executor proxy reads it live.
-  let control: SessionRunControl | undefined
-  const work = productionWorkRegistry(
-    createSessionWork({
-      layer: runtime.layer,
-      scope: workerScope,
-      writer: clients.writer,
+    const slot = init.workerID
+    const installExecutor = options.installExecutor ?? installSessionExecutor
+    installed = installExecutor(scope, {
+      work,
       threadId,
-      prompt: usePrompt,
-      instance: workerInstanceContext(init.snapshot),
-      registerControl: (registered) => {
-        control = registered
+      // The control is registered when the first `run` resolves the worker's
+      // `SessionRunState`; the proxy reads it live so a cancel after registration
+      // reaches the real loop (table B). Before that there is nothing to cancel.
+      control: {
+        cancel: (sessionID) => control?.cancel(sessionID) ?? Promise.resolve(),
+        busy: (sessionID) => control?.busy(sessionID) ?? Promise.resolve(false),
       },
-    }),
-  )
-  const slot = init.workerID
-  const installExecutor = options.installExecutor ?? installSessionExecutor
-  const installed = installExecutor(scope, {
-    work,
-    threadId,
-    // The control is registered when the first `run` resolves the worker's
-    // `SessionRunState`; the proxy reads it live so a cancel after registration
-    // reaches the real loop (table B). Before that there is nothing to cancel.
-    control: {
-      cancel: (sessionID) => control?.cancel(sessionID) ?? Promise.resolve(),
-      busy: (sessionID) => control?.busy(sessionID) ?? Promise.resolve(false),
-    },
-    // A running process-local background job keeps the isolate alive across an
-    // idle-reap window (M5). Kept separate from `busy`: a background job must
-    // never block the next prompt.
-    activeWork: createBackgroundWorkProbe(backgroundJobs),
-    // Dynamic OS thread name (Linux-only, fail-soft): `ocs<slot>` at rest and
-    // `ocs<slot>:<last6>` while a run is live. `onIdle` fires on every terminal
-    // (settle, cooperative cancel, interrupt), so the name always resets. Both
-    // callbacks are fail-soft in `execute.ts`, so naming never unwinds a run.
-    // Skipped when the hub shipped no slot id.
-    ...(slot === undefined
-      ? {}
-      : {
-          onRunStart: (sessionID) => namer.bind(sessionID, true),
-          onIdle: () => Effect.sync(() => namer.onIdle()),
-        }),
-  })
+      // A running process-local background job keeps the isolate alive across an
+      // idle-reap window (M5). Kept separate from `busy`: a background job must
+      // never block the next prompt.
+      activeWork: createBackgroundWorkProbe(backgroundJobs),
+      // Dynamic OS thread name (Linux-only, fail-soft): `ocs<slot>` at rest and
+      // `ocs<slot>:<last6>` while a run is live. `onIdle` fires on every terminal
+      // (settle, cooperative cancel, interrupt), so the name always resets. Both
+      // callbacks are fail-soft in `execute.ts`, so naming never unwinds a run.
+      // Skipped when the hub shipped no slot id.
+      ...(slot === undefined
+        ? {}
+        : {
+            onRunStart: (sessionID) => namer.bind(sessionID, true),
+            onIdle: () => Effect.sync(() => namer.onIdle()),
+          }),
+    })
 
-  return {
-    dispose() {
-      installReporting(undefined)
-      namer.onDispose()
-      // Close the executor's owned scope so its runner-table fibers/finalizers
-      // settle with the worker instead of leaking past bootstrap disposal.
-      void installed.dispose().catch(() => undefined)
-      // The registry scope outlives every run, so close it explicitly with the
-      // worker bootstrap; a still-running job is interrupted with the isolate.
-      void Effect.runPromise(Scope.close(backgroundJobScope, Exit.void)).catch(() => undefined)
-      // Close durable resources before the graph scope; close is idempotent.
-      closeResources()
-      // Close the worker-lifetime graph scope (DB/egress/bridge finalizers).
-      void Effect.runPromise(Scope.close(workerScope, Exit.void)).catch(() => undefined)
-    },
+    return {
+      dispose() {
+        disposeBootstrap()
+      },
+    }
+  } catch (error) {
+    // A failed mid-bootstrap closes locally (SQLite handle/WAL included)
+    // before the error surfaces, so the isolate is never the only closer.
+    disposeBootstrap()
+    throw error
   }
 }
 

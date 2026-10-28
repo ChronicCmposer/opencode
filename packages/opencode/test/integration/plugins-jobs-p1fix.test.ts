@@ -11,7 +11,7 @@
 // invoke `chat.params`/`chat.headers` eagerly, while a per-request trigger runs
 // the real plugin once.
 
-import { describe, expect, test } from "bun:test"
+import { describe, expect, setDefaultTimeout, test } from "bun:test"
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Scope } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -59,8 +59,14 @@ import { productionServiceReplacements } from "../lib/production-deps"
 import { pollWithTimeout } from "../lib/effect"
 import { sid } from "../lib/async"
 import { workerSnapshot } from "../lib/snapshot"
+import { REAL_WORKER_TEST_TIMEOUT_MS } from "../lib/worker-timeouts"
 import { disposeAllInstances, withTmpdirInstance } from "../fixture/fixture"
 import { seed, spawnResult, stubOps, toolContext } from "../session/worker/characterization/task-harness"
+
+// The runner resets each test file to its 5s default, so a preload-only
+// `setDefaultTimeout` does not reach this file. Worker job promotion boots real
+// isolates and needs the shared real-worker budget.
+setDefaultTimeout(REAL_WORKER_TEST_TIMEOUT_MS)
 
 const model: WorkerModel = {
   providerID: "mock",

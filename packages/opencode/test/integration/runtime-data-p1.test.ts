@@ -6,7 +6,7 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test"
 import { Database as BunDatabase } from "bun:sqlite"
 import { Effect, Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
@@ -32,6 +32,10 @@ import {
 } from "@/session/worker/db"
 import type { ExecutorWorker } from "@/session/worker/execute"
 import { sessionWorkerInit } from "../lib/session-worker-init"
+import { REAL_WORKER_TEST_TIMEOUT_MS } from "../lib/worker-timeouts"
+
+// Bun resets the per-file default to 5s; this file boots production hubs.
+setDefaultTimeout(REAL_WORKER_TEST_TIMEOUT_MS)
 
 const directories: string[] = []
 const cleanups: Array<() => void | Promise<void>> = []

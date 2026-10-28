@@ -1,4 +1,5 @@
-import { test, type TestOptions } from "bun:test"
+import { afterAll, setDefaultTimeout, test, type TestOptions } from "bun:test"
+import { DEFAULT_TEST_TIMEOUT_MS } from "./worker-timeouts"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Cause, Duration, Effect, Exit, Layer } from "effect"
 import * as Scope from "effect/Scope"
@@ -63,7 +64,32 @@ const sharedRun: Runner = (value, layer) =>
     return yield* exit
   }).pipe(Effect.runPromise)
 
+// Bun resets the per-file timeout to its 5s default, so a preload-only
+// `setDefaultTimeout` cannot cover the whole suite. Every suite built here
+// calls `testEffect(...)`/`it` at module scope during its own file's
+// evaluation, which is the earliest per-file hook available. Tests that pass
+// an explicit timeout keep it.
+//
+// A file may need a larger budget than the generic default (real worker boot,
+// multi-worker promotion). Bun captures a test's timeout when that test is
+// registered, and each `testEffect(...)` call re-installs the default, so a
+// budget set before the suite declarations would otherwise be clobbered for
+// every test registered afterwards. `setFileTimeout` records the budget so
+// `make()` reapplies it until the file's tests finish.
+let fileTimeout: number | undefined
+
+/** Declare this file's default test budget; every later `testEffect(...)` preserves it. */
+export const setFileTimeout = (timeout: number) => {
+  fileTimeout = timeout
+  setDefaultTimeout(timeout)
+  afterAll(() => {
+    fileTimeout = undefined
+  })
+}
+
 const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, run: Runner = isolatedRun) => {
+  setDefaultTimeout(fileTimeout ?? DEFAULT_TEST_TIMEOUT_MS)
+
   const effect = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
     test(name, () => run(value, testLayer), opts)
 
