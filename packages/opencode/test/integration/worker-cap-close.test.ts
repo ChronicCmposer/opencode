@@ -365,6 +365,97 @@ describe("worker cap: slot release matrix", () => {
   })
 })
 
+describe("worker cap: FIFO and headroom state machine", () => {
+  test("waiters are admitted in arrival order within one budget", async () => {
+    const cap = createWorkerCap(1)
+    const order: string[] = []
+    const first = await cap.acquire(0)
+    const second = cap.acquire(0).then((release) => {
+      order.push("second")
+      return release
+    })
+    const third = cap.acquire(0).then((release) => {
+      order.push("third")
+      return release
+    })
+    await flush()
+    expect(cap.queued).toBe(2)
+    expect(cap.running).toBe(1)
+
+    first()
+    const secondRelease = await second
+    expect(order).toEqual(["second"])
+    expect(cap.queued).toBe(1)
+    expect(cap.running).toBe(1)
+
+    secondRelease()
+    const thirdRelease = await third
+    expect(order).toEqual(["second", "third"])
+    expect(cap.queued).toBe(0)
+    expect(cap.running).toBe(1)
+
+    thirdRelease()
+    expect(cap.running).toBe(0)
+  })
+
+  test("headroom is per nesting depth and never consumes foreground slots", async () => {
+    // max 1 => two headroom slots at each depth.
+    const cap = createWorkerCap(1)
+    const foreground = await cap.acquire(0)
+    const depthOneA = await cap.acquire(1)
+    const depthOneB = await cap.acquire(1)
+    const depthTwo = await cap.acquire(2)
+    expect(cap.running).toBe(4)
+    expect(cap.queued).toBe(0)
+
+    const depthOneC = cap.acquire(1)
+    await flush()
+    expect(cap.queued).toBe(1)
+
+    depthOneA()
+    const depthOneCRelease = await depthOneC
+    expect(cap.running).toBe(4)
+    expect(cap.queued).toBe(0)
+
+    depthOneB()
+    depthOneCRelease()
+    depthTwo()
+    foreground()
+    expect(cap.running).toBe(0)
+    expect(cap.queued).toBe(0)
+  })
+
+  test("a double release admits at most one waiter", async () => {
+    const cap = createWorkerCap(1)
+    const first = await cap.acquire(0)
+    let secondAdmitted = false
+    let thirdAdmitted = false
+    const second = cap.acquire(0).then((release) => {
+      secondAdmitted = true
+      return release
+    })
+    const third = cap.acquire(0).then((release) => {
+      thirdAdmitted = true
+      return release
+    })
+    await flush()
+
+    first()
+    first()
+    await flush()
+    expect(secondAdmitted).toBe(true)
+    expect(thirdAdmitted).toBe(false)
+    expect(cap.running).toBe(1)
+    expect(cap.queued).toBe(1)
+
+    const secondRelease = await second
+    secondRelease()
+    const thirdRelease = await third
+    expect(thirdAdmitted).toBe(true)
+    thirdRelease()
+  })
+})
+
 /** A real Bun worker that holds a real WAL write lock until it is shut down. */
 const WAL_HOLDER_SOURCE = `
 import { parentPort, workerData } from "node:worker_threads"

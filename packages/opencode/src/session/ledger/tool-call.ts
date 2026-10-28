@@ -512,7 +512,9 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/To
 /** Adapt the synchronous handle without owning, reordering, or retrying anything. */
 export function fromHandle(ledger: ToolCallLedgerHandle): Interface {
   const startStandalone = Effect.fn("ToolCallLedger.startStandalone")(function* (input: StartInput) {
-    return yield* mapLegacyErrors("startStandalone", ledger.startStandalone(input))
+    // `suspend` defers handle construction into the Effect so a synchronous throw
+    // from an `exclusive` acquirer is mapped like any other legacy failure.
+    return yield* mapLegacyErrors("startStandalone", Effect.suspend(() => ledger.startStandalone(input)))
   })
   const start = Effect.fn("ToolCallLedger.start")(function* (input: StartInput) {
     return yield* mapLegacyErrors(
@@ -527,7 +529,9 @@ export function fromHandle(ledger: ToolCallLedgerHandle): Interface {
     )
   })
   const finishStandalone = Effect.fn("ToolCallLedger.finishStandalone")(function* (input: FinishInput) {
-    return yield* mapLegacyErrors("finishStandalone", ledger.finishStandalone(input))
+    // `suspend` defers handle construction into the Effect so a synchronous throw
+    // from an `exclusive` acquirer is mapped like any other legacy failure.
+    return yield* mapLegacyErrors("finishStandalone", Effect.suspend(() => ledger.finishStandalone(input)))
   })
   const finishWithResult = Effect.fn("ToolCallLedger.finishWithResult")(function* <T>(
     input: FinishInput,

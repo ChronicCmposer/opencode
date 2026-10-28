@@ -2,7 +2,7 @@
 import os from "node:os"
 import path from "node:path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Context, Effect, Layer, Scope, SynchronizedRef } from "effect"
+import { Context, Deferred, Effect, Layer, Scope, SynchronizedRef } from "effect"
 import type { SessionID } from "@/session/schema"
 import { defined } from "@/util/object"
 import {
@@ -882,6 +882,114 @@ export interface WorkerCap {
   readonly queued: number
 }
 
+interface WorkerCapHeadroom {
+  readonly running: number
+  readonly waiters: ReadonlyArray<number>
+}
+
+/**
+ * The whole cap is one immutable value. `active` is the set of tickets that
+ * currently own a slot; releasing a ticket that is absent is a no-op, which is
+ * what makes the synchronous release idempotent.
+ */
+interface WorkerCapState {
+  readonly foreground: number
+  readonly foregroundWaiters: ReadonlyArray<number>
+  readonly depths: ReadonlyMap<number, WorkerCapHeadroom>
+  readonly active: ReadonlySet<number>
+  readonly nextTicket: number
+}
+
+interface CapAdmission {
+  readonly state: WorkerCapState
+  readonly ticket: number
+  readonly admitted: boolean
+}
+
+interface CapRelease {
+  readonly state: WorkerCapState
+  readonly granted?: { readonly ticket: number; readonly level: number }
+}
+
+const initialWorkerCapState = (): WorkerCapState => ({
+  foreground: 0,
+  foregroundWaiters: [],
+  depths: new Map(),
+  active: new Set(),
+  nextTicket: 1,
+})
+
+const headroomOf = (state: WorkerCapState, depth: number): WorkerCapHeadroom =>
+  state.depths.get(depth) ?? { running: 0, waiters: [] }
+
+const withHeadroom = (state: WorkerCapState, depth: number, headroom: WorkerCapHeadroom): WorkerCapState => {
+  const depths = new Map(state.depths)
+  depths.set(depth, headroom)
+  return { ...state, depths }
+}
+
+/** Admit a fresh ticket when its budget has room, otherwise append it to FIFO. */
+const requestSlot = (state: WorkerCapState, level: number, max: number, headroom: number): CapAdmission => {
+  const ticket = state.nextTicket
+  const next = { ...state, nextTicket: ticket + 1 }
+  if (level === 0) {
+    if (state.foreground < max) {
+      return {
+        state: { ...next, foreground: state.foreground + 1, active: new Set(state.active).add(ticket) },
+        ticket,
+        admitted: true,
+      }
+    }
+    return { state: { ...next, foregroundWaiters: [...state.foregroundWaiters, ticket] }, ticket, admitted: false }
+  }
+  const budget = headroomOf(state, level)
+  if (budget.running < headroom) {
+    return {
+      state: {
+        ...withHeadroom(next, level, { running: budget.running + 1, waiters: budget.waiters }),
+        active: new Set(state.active).add(ticket),
+      },
+      ticket,
+      admitted: true,
+    }
+  }
+  return {
+    state: withHeadroom(next, level, { running: budget.running, waiters: [...budget.waiters, ticket] }),
+    ticket,
+    admitted: false,
+  }
+}
+
+/**
+ * Free one ticket's slot and promote the oldest waiter in the same budget.
+ * Promotion keeps `running` unchanged because the waiter takes the freed slot.
+ */
+const releaseSlot = (state: WorkerCapState, level: number, ticket: number): CapRelease => {
+  if (!state.active.has(ticket)) return { state }
+  const active = new Set(state.active)
+  active.delete(ticket)
+  if (level === 0) {
+    const [nextTicket, ...rest] = state.foregroundWaiters
+    if (nextTicket === undefined) return { state: { ...state, foreground: state.foreground - 1, active } }
+    return {
+      state: { ...state, foregroundWaiters: rest, active: new Set(active).add(nextTicket) },
+      granted: { ticket: nextTicket, level: 0 },
+    }
+  }
+  const budget = headroomOf(state, level)
+  const [nextTicket, ...rest] = budget.waiters
+  if (nextTicket === undefined) {
+    return { state: { ...withHeadroom(state, level, { running: budget.running - 1, waiters: [] }), active } }
+  }
+  return {
+    state: {
+      ...withHeadroom(state, level, { running: budget.running, waiters: rest }),
+      active: new Set(active).add(nextTicket),
+    },
+    granted: { ticket: nextTicket, level },
+  }
+}
+
 export function createWorkerCap(max: number): WorkerCap {
   if (!Number.isInteger(max) || max < 1) {
     throw new Error(`worker cap must be a positive integer, received ${String(max)}`)
@@ -889,75 +997,40 @@ export function createWorkerCap(max: number): WorkerCap {
   // Additive, transient headroom per nesting depth: bounded so child fan-out
   // cannot oversubscribe the machine, but never part of the foreground `max`.
   const headroom = Math.max(WORKER_CAP_MIN_HEADROOM, Math.ceil(max / 2))
-  let foreground = 0
-  const foregroundWaiters: Array<() => void> = []
-  interface Headroom {
-    running: number
-    readonly waiters: Array<() => void>
-  }
-  const depths = new Map<number, Headroom>()
-  const headroomAt = (depth: number): Headroom => {
-    const existing = depths.get(depth)
-    if (existing !== undefined) return existing
-    const created: Headroom = { running: 0, waiters: [] }
-    depths.set(depth, created)
-    return created
-  }
+  let state = initialWorkerCapState()
+  const waiters = new Map<number, (release: () => void) => void>()
 
-  /** A release frees exactly one slot, and only its own budget (idempotent). */
-  const releaseOf = (budget: "foreground" | Headroom): (() => void) => {
-    let released = false
-    return () => {
-      if (released) return
-      released = true
-      if (budget === "foreground") {
-        foreground -= 1
-        foregroundWaiters.shift()?.()
-        return
-      }
-      budget.running -= 1
-      budget.waiters.shift()?.()
-    }
+  const releaseFor = (ticket: number, level: number): (() => void) => () => {
+    const released = releaseSlot(state, level, ticket)
+    state = released.state
+    const granted = released.granted
+    if (granted === undefined) return
+    const resolve = waiters.get(granted.ticket)
+    if (resolve === undefined) return
+    waiters.delete(granted.ticket)
+    resolve(releaseFor(granted.ticket, granted.level))
   }
 
   const acquire = (depth = 0): Promise<() => void> => {
     // A malformed depth is a foreground run, matching the executor frame parse.
     const level = Number.isInteger(depth) && depth > 0 ? depth : 0
+    const admission = requestSlot(state, level, max, headroom)
+    state = admission.state
+    if (admission.admitted) return Promise.resolve(releaseFor(admission.ticket, level))
     return new Promise<() => void>((resolve) => {
-      if (level === 0) {
-        if (foreground < max) {
-          foreground += 1
-          resolve(releaseOf("foreground"))
-          return
-        }
-        foregroundWaiters.push(() => {
-          foreground += 1
-          resolve(releaseOf("foreground"))
-        })
-        return
-      }
-      const budget = headroomAt(level)
-      if (budget.running < headroom) {
-        budget.running += 1
-        resolve(releaseOf(budget))
-        return
-      }
-      budget.waiters.push(() => {
-        budget.running += 1
-        resolve(releaseOf(budget))
-      })
+      waiters.set(admission.ticket, resolve)
     })
   }
 
   return {
     get running() {
-      let total = foreground
-      for (const budget of depths.values()) total += budget.running
+      let total = state.foreground
+      for (const budget of state.depths.values()) total += budget.running
       return total
     },
     get queued() {
-      let total = foregroundWaiters.length
-      for (const budget of depths.values()) total += budget.waiters.length
+      let total = state.foregroundWaiters.length
+      for (const budget of state.depths.values()) total += budget.waiters.length
       return total
     },
     acquire,
@@ -1025,29 +1098,48 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
     sessionID: SessionID | undefined
     terminated: boolean
   }
-  const tracked = new Map<number, Tracked>()
-  // Insertion order is the LRU: a run removes the entry, its settlement re-adds it.
-  const idle = new Map<number, Tracked>()
-  const active = new Set<number>()
-  let evictions = 0
-  let enforcing = false
-  let recheck = false
+  interface IdleCapState {
+    readonly tracked: ReadonlyMap<number, Tracked>
+    readonly idle: ReadonlyMap<number, Tracked>
+    readonly active: ReadonlySet<number>
+    readonly evictions: number
+    /** The in-flight enforce, or `undefined` when none is running. */
+    readonly enforcing: Deferred.Deferred<void> | undefined
+    /** An enforce request arrived while the flight was busy. */
+    readonly recheck: boolean
+  }
+  const state = SynchronizedRef.makeUnsafe<IdleCapState>({
+    tracked: new Map(),
+    idle: new Map(),
+    active: new Set(),
+    evictions: 0,
+    enforcing: undefined,
+    recheck: false,
+  })
 
-  const evict = async (entry: Tracked): Promise<void> => {
-    entry.terminated = true
-    tracked.delete(entry.worker.id)
-    idle.delete(entry.worker.id)
-    active.delete(entry.worker.id)
-    evictions += 1
+  /** Apply one synchronous transition; callers never await while holding it. */
+  const mutate = <A>(change: (current: IdleCapState) => readonly [A, IdleCapState]): A =>
+    Effect.runSync(SynchronizedRef.modify(state, change))
+
+  const evict = Effect.fnUntraced(function* (entry: Tracked) {
+    yield* SynchronizedRef.modify(state, (current) => {
+      entry.terminated = true
+      const tracked = new Map(current.tracked)
+      tracked.delete(entry.worker.id)
+      const idle = new Map(current.idle)
+      idle.delete(entry.worker.id)
+      const active = new Set(current.active)
+      active.delete(entry.worker.id)
+      return [undefined, { ...current, tracked, idle, active, evictions: current.evictions + 1 }] as const
+    })
     const sessionID = entry.sessionID
     if (sessionID !== undefined) {
-      try {
-        // Await the retirement so a successor is never admitted while the old
-        // generation's ports/lease are still live.
-        await options.onEvict({ worker: entry.worker, sessionID })
-      } catch {
-        // Retirement cleanup is best-effort: the isolate must still be terminated.
-      }
+      // Await the retirement so a successor is never admitted while the old
+      // generation's ports/lease are still live. Cleanup is best-effort: the
+      // isolate must still be terminated when the hook throws or rejects.
+      yield* Effect.tryPromise(() => Promise.resolve(options.onEvict({ worker: entry.worker, sessionID }))).pipe(
+        Effect.catchCause(() => Effect.void),
+      )
     }
     options.log?.(workerLogMessage("idle worker evicted"), {
       level: "INFO",
@@ -1057,47 +1149,76 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
     })
     // Await the same in-flight close a later retire will join: eviction is not
     // complete until the isolate has exited and its lease release has landed.
-    await entry.worker.terminate().catch(() => undefined)
-  }
+    yield* Effect.tryPromise(() => entry.worker.terminate()).pipe(Effect.catchCause(() => Effect.void))
+  })
 
-  const enforce = async (): Promise<void> => {
-    if (enforcing) {
-      recheck = true
+  /**
+   * One enforce flight at a time. A request that arrives mid-flight sets
+   * `recheck` and joins the same flight, so concurrent settlements can never
+   * run two eviction passes against one idle snapshot.
+   */
+  const enforce = Effect.fn("WorkerPools.enforce")(function* () {
+    const [flight, owner] = yield* SynchronizedRef.modify(state, (current) => {
+      if (current.enforcing !== undefined) {
+        return [[current.enforcing, false as boolean] as const, { ...current, recheck: true }] as const
+      }
+      const flight = Deferred.makeUnsafe<void>()
+      return [[flight, true as boolean] as const, { ...current, enforcing: flight, recheck: false }] as const
+    })
+    if (!owner) {
+      yield* Deferred.await(flight)
       return
     }
-    enforcing = true
     try {
-      do {
-        recheck = false
-        while (idle.size > capacity) {
-          const oldest = idle.entries().next()
-          if (oldest.done) break
-          const [workerID, entry] = oldest.value
-          idle.delete(workerID)
-          if (entry.terminated || active.has(workerID)) continue
+      let again = true
+      while (again) {
+        yield* SynchronizedRef.modify(state, (current) => [undefined, { ...current, recheck: false }] as const)
+        while (true) {
+          const next = yield* SynchronizedRef.modify(state, (current) => {
+            if (current.idle.size <= capacity) return [undefined, current] as const
+            const oldest = current.idle.entries().next()
+            if (oldest.done) return [undefined, current] as const
+            const [workerID, entry] = oldest.value
+            const idle = new Map(current.idle)
+            idle.delete(workerID)
+            return [[workerID, entry] as const, { ...current, idle }] as const
+          })
+          if (next === undefined) break
+          const [workerID, entry] = next
+          if (entry.terminated || mutate((current) => [current.active.has(workerID), current])) continue
           // Background work must outlive an idle turn; keep one worker alive even
           // above the cap rather than killing a running job. Its next settlement
           // (or the dispatcher's idle reap) revisits the cap.
-          if (entry.sessionID !== undefined && entry.worker.hasActiveWork !== undefined) {
-            let background = false
-            try {
-              background = await entry.worker.hasActiveWork(entry.sessionID)
-            } catch {
-              background = false
-            }
+          const sessionID = entry.sessionID
+          if (sessionID !== undefined && entry.worker.hasActiveWork !== undefined) {
+            const hasActiveWork = entry.worker.hasActiveWork
+            const background = yield* Effect.tryPromise(() => hasActiveWork(sessionID)).pipe(
+              Effect.catchCause(() => Effect.succeed(false)),
+            )
             if (background) {
-              if (!entry.terminated && !active.has(workerID)) idle.set(workerID, entry)
+              yield* SynchronizedRef.modify(state, (current) => {
+                if (entry.terminated || current.active.has(workerID)) return [undefined, current] as const
+                const idle = new Map(current.idle)
+                idle.set(workerID, entry)
+                return [undefined, { ...current, idle }] as const
+              })
               break
             }
             // A new run may have started while the probe was in flight.
-            if (entry.terminated || active.has(workerID)) continue
+            if (entry.terminated || mutate((current) => [current.active.has(workerID), current])) continue
           }
-          await evict(entry)
+          yield* evict(entry)
         }
-      } while (recheck)
+        again = yield* SynchronizedRef.modify(state, (current) => [current.recheck, current] as const)
+      }
     } finally {
-      enforcing = false
+      yield* SynchronizedRef.modify(state, (current) => [undefined, { ...current, enforcing: undefined }] as const)
+      yield* Deferred.succeed(flight, undefined)
     }
+  })
+
+  const requestEnforce = (): void => {
+    void Effect.runPromise(enforce()).catch(() => undefined)
   }
 
   const track = (worker: ExecutorWorker): ExecutorWorker => {
@@ -1110,31 +1231,46 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
         return !entry.terminated && worker.alive
       },
       execute: async (run) => {
-        if (entry.terminated) throw new Error(`executor worker ${worker.id} was evicted while idle`)
-        active.add(worker.id)
-        idle.delete(worker.id)
+        const started = mutate((current) => {
+          if (entry.terminated) return [false, current] as const
+          const active = new Set(current.active)
+          active.add(worker.id)
+          const idle = new Map(current.idle)
+          idle.delete(worker.id)
+          return [true, { ...current, active, idle }] as const
+        })
+        if (!started) throw new Error(`executor worker ${worker.id} was evicted while idle`)
         try {
           return await worker.execute(run)
         } finally {
-          active.delete(worker.id)
-          if (!entry.terminated) {
+          mutate((current) => {
+            const active = new Set(current.active)
+            active.delete(worker.id)
+            if (entry.terminated) return [undefined, { ...current, active }] as const
             entry.sessionID = run.sessionID
+            const idle = new Map(current.idle)
             idle.delete(worker.id)
             idle.set(worker.id, entry)
-            void enforce()
-          }
+            return [undefined, { ...current, active, idle }] as const
+          })
+          requestEnforce()
         }
       },
       cancel: (sessionID) => worker.cancel(sessionID),
       assertNotBusy: (sessionID) => worker.assertNotBusy(sessionID),
       resultFor: (sessionID) => worker.resultFor(sessionID),
       terminate: async () => {
-        if (!entry.terminated) {
+        mutate((current) => {
+          if (entry.terminated) return [undefined, current] as const
           entry.terminated = true
+          const tracked = new Map(current.tracked)
           tracked.delete(worker.id)
+          const idle = new Map(current.idle)
           idle.delete(worker.id)
+          const active = new Set(current.active)
           active.delete(worker.id)
-        }
+          return [undefined, { ...current, tracked, idle, active }] as const
+        })
         await worker.terminate()
       },
       ...(worker.hasActiveWork === undefined
@@ -1146,28 +1282,36 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
         ? {}
         : { awaitEgress: (sessionID: SessionID) => worker.awaitEgress!(sessionID) }),
     }
-    tracked.set(worker.id, entry)
+    mutate((current) => {
+      const tracked = new Map(current.tracked)
+      tracked.set(worker.id, entry)
+      return [undefined, { ...current, tracked }] as const
+    })
     return wrapped
   }
 
   return {
     capacity,
     get idle() {
-      return idle.size
+      return SynchronizedRef.getUnsafe(state).idle.size
     },
     get evictions() {
-      return evictions
+      return SynchronizedRef.getUnsafe(state).evictions
     },
     track,
     forget: (workerID) => {
-      tracked.delete(workerID)
-      idle.delete(workerID)
-      active.delete(workerID)
+      mutate((current) => {
+        const tracked = new Map(current.tracked)
+        tracked.delete(workerID)
+        const idle = new Map(current.idle)
+        idle.delete(workerID)
+        const active = new Set(current.active)
+        active.delete(workerID)
+        return [undefined, { ...current, tracked, idle, active }] as const
+      })
     },
     clear: () => {
-      tracked.clear()
-      idle.clear()
-      active.clear()
+      mutate((current) => [undefined, { ...current, tracked: new Map(), idle: new Map(), active: new Set() }] as const)
     },
   }
 }
@@ -1619,15 +1763,21 @@ export function createSessionBoundExecutorWorker(
   )
 }
 
+/** One init build shared by every concurrent caller for the same key. */
+interface InitFlight {
+  readonly deferred: Deferred.Deferred<SessionWorkerInit, unknown>
+  readonly promise: Promise<SessionWorkerInit>
+}
+
 /**
  * The production pool's init bookkeeping. The Wave-6 `makeProduction` service
  * keeps this state in a `SynchronizedRef`; the direct factory keeps the same
  * operations over plain maps, so both paths resolve in exactly the same order.
  */
 interface ProductionInitState {
-  inFlight(key: string): Promise<SessionWorkerInit> | undefined
-  startInFlight(key: string, value: Promise<SessionWorkerInit>): void
-  finishInFlight(key: string): void
+  inFlight(key: string): InitFlight | undefined
+  startInFlight(key: string, flight: InitFlight): void
+  finishInFlight(key: string, flight: InitFlight): void
   clearInFlight(sessionID: SessionID): void
   cached(sessionID: SessionID): WorkerGeneration | undefined
   cache(sessionID: SessionID, generation: WorkerGeneration): void
@@ -1635,15 +1785,17 @@ interface ProductionInitState {
 }
 
 function mapProductionInitState(): ProductionInitState {
-  const inFlight = new Map<string, Promise<SessionWorkerInit>>()
+  const inFlight = new Map<string, InitFlight>()
   const cache = new Map<SessionID, WorkerGeneration>()
   return {
     inFlight: (key) => inFlight.get(key),
-    startInFlight: (key, value) => {
-      inFlight.set(key, value)
+    startInFlight: (key, flight) => {
+      inFlight.set(key, flight)
     },
-    finishInFlight: (key) => {
-      inFlight.delete(key)
+    finishInFlight: (key, flight) => {
+      // Only the flight that still owns the key may remove it: a cleared
+      // session may already have started a newer build under the same key.
+      if (inFlight.get(key) === flight) inFlight.delete(key)
     },
     clearInFlight: (sessionID) => {
       for (const key of inFlight.keys()) if (key.startsWith(`${sessionID}:`)) inFlight.delete(key)
@@ -1688,14 +1840,25 @@ function createProductionWorkerPoolWithState(
   const resolveInit = (sessionID: SessionID, model?: WorkerModelSelection): Promise<SessionWorkerInit> => {
     const key = `${sessionID}:${model === undefined ? "" : modelKey(model)}`
     const existing = state.inFlight(key)
-    if (existing !== undefined) return existing
-    const resolved = Promise.resolve().then(() => resolveSource(sessionID, model))
-    state.startInFlight(key, resolved)
-    resolved.then(
-      () => state.finishInFlight(key),
-      () => state.finishInFlight(key),
-    )
-    return resolved
+    if (existing !== undefined) return existing.promise
+    const deferred = Deferred.makeUnsafe<SessionWorkerInit, unknown>()
+    const flight: InitFlight = { deferred, promise: Effect.runPromise(Deferred.await(deferred)) }
+    state.startInFlight(key, flight)
+    Promise.resolve()
+      .then(() => resolveSource(sessionID, model))
+      .then(
+        (init) => {
+          Deferred.doneUnsafe(deferred, Effect.succeed(init))
+          state.finishInFlight(key, flight)
+        },
+        (error) => {
+          // Remove the failed flight so the next turn retries instead of
+          // observing a poisoned cache entry.
+          Deferred.doneUnsafe(deferred, Effect.fail(error))
+          state.finishInFlight(key, flight)
+        },
+      )
+    return flight.promise
   }
   // `(sessionID, generation)` is the init cache: a repeated turn on the same
   // generation never rebuilds the graph/plugin/model bootstrap.
@@ -1900,8 +2063,8 @@ export function fromPool(pool: ExecutorWorkerPool, options: FromPoolOptions = {}
 }
 
 type ProductionInitMaps = {
-  readonly inFlight: Map<string, Promise<SessionWorkerInit>>
-  readonly cache: Map<SessionID, WorkerGeneration>
+  readonly inFlight: ReadonlyMap<string, InitFlight>
+  readonly cache: ReadonlyMap<SessionID, WorkerGeneration>
 }
 
 /**
@@ -1918,9 +2081,11 @@ function synchronizedProductionInitState(
   const current = (): ProductionInitMaps => SynchronizedRef.getUnsafe(ref)
   return {
     inFlight: (key) => current().inFlight.get(key),
-    startInFlight: (key, value) => update((maps) => ({ ...maps, inFlight: new Map(maps.inFlight).set(key, value) })),
-    finishInFlight: (key) =>
+    startInFlight: (key, flight) =>
+      update((maps) => ({ ...maps, inFlight: new Map(maps.inFlight).set(key, flight) })),
+    finishInFlight: (key, flight) =>
       update((maps) => {
+        if (maps.inFlight.get(key) !== flight) return maps
         const inFlight = new Map(maps.inFlight)
         inFlight.delete(key)
         return { ...maps, inFlight }

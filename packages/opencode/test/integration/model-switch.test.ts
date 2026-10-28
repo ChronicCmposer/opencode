@@ -13,7 +13,7 @@ import { describe, expect, test } from "bun:test"
 import { createProductionWorkerPool } from "@/session/worker/hub"
 import { createSessionBoundExecutorWorker } from "@/session/worker/hub"
 import type { ExecutorWorker } from "@/session/worker/execute"
-import { sid } from "../lib/async"
+import { pollUntil, sid } from "../lib/async"
 import { sessionWorkerInit } from "../lib/session-worker-init"
 
 const EXECUTOR_FIXTURE = new URL("../fixture/session-execute-worker.ts", import.meta.url)
@@ -84,6 +84,90 @@ describe("model switch mid-session", () => {
       modelID = "model-a"
       await worker.execute({ sessionID, depth: 0 })
       expect(executionOf(pool.resultFor(sessionID)?.value)).toBe(1)
+    } finally {
+      await pool.terminateAll()
+    }
+  }, 30_000)
+})
+
+describe("production init single-flight", () => {
+  test("concurrent first turns share one init build", async () => {
+    const sessionID = sid("ses_init_single_flight")
+    let builds = 0
+    let releaseBuild!: () => void
+    const buildGate = new Promise<void>((resolve) => {
+      releaseBuild = resolve
+    })
+    const pool = createProductionWorkerPool({
+      init: async () => {
+        builds += 1
+        await buildGate
+        return sessionWorkerInit()
+      },
+      entry: EXECUTOR_FIXTURE,
+      workKind: "instant",
+      timeoutMs: 15_000,
+    })
+    try {
+      const first = pool.spawn()
+      const second = pool.spawn()
+      const runs = [
+        first.execute({ sessionID, depth: 0 }),
+        second.execute({ sessionID, depth: 0 }),
+      ]
+      await pollUntil(() => builds === 1, { message: "the init build never started" })
+      releaseBuild()
+      await Promise.all(runs)
+      expect(builds).toBe(1)
+    } finally {
+      await pool.terminateAll()
+    }
+  }, 30_000)
+
+  test("a failed init is shared by concurrent callers and retried by the next turn", async () => {
+    const sessionID = sid("ses_init_retry")
+    let builds = 0
+    let shouldFail = true
+    let releaseBuild!: () => void
+    const buildGate = new Promise<void>((resolve) => {
+      releaseBuild = resolve
+    })
+    const pool = createProductionWorkerPool({
+      init: async () => {
+        builds += 1
+        await buildGate
+        if (shouldFail) {
+          shouldFail = false
+          throw new Error("init build failed")
+        }
+        return sessionWorkerInit()
+      },
+      entry: EXECUTOR_FIXTURE,
+      workKind: "instant",
+      timeoutMs: 15_000,
+    })
+    try {
+      const first = pool.spawn()
+      const second = pool.spawn()
+      const failed = Promise.allSettled([
+        first.execute({ sessionID, depth: 0 }),
+        second.execute({ sessionID, depth: 0 }),
+      ])
+      await pollUntil(() => builds === 1, { message: "the init build never started" })
+      releaseBuild()
+
+      // Both concurrent callers see the same typed failure from one build.
+      const outcomes = await failed
+      expect(outcomes.map((outcome) => outcome.status)).toEqual(["rejected", "rejected"])
+      for (const outcome of outcomes) {
+        expect(outcome.status === "rejected" ? String(outcome.reason) : "").toContain("init build failed")
+      }
+      expect(builds).toBe(1)
+
+      // The failure is not cached: the next turn rebuilds and succeeds.
+      await first.execute({ sessionID, depth: 0 })
+      expect(builds).toBe(2)
+      expect(pool.resultFor(sessionID)?.value).toBeDefined()
     } finally {
       await pool.terminateAll()
     }

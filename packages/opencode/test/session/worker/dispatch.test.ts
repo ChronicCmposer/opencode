@@ -1640,3 +1640,201 @@ function captureTerminations(worker: FakeSessionWorker): () => number {
   }
   return () => count
 }
+
+describe("atomic ownership transitions", () => {
+  test("a dispatch during completion settlement parks instead of joining or running concurrently", async () => {
+    const pool = createFakeWorkerPool(1)
+    const barrier = Deferred.makeUnsafe<void>()
+    const sessionID = sid("ses_settling")
+    const dispatcher = createDispatcher({
+      pool,
+      writeBarrier: () => Effect.runPromise(Deferred.await(barrier)),
+    })
+
+    const first = capture(dispatcher.dispatch({ sessionID }))
+    await pollUntil(() => pool.spawned.length === 1, { message: "the first run never started" })
+    pool.spawned[0].finish(sessionID)
+    await flush()
+
+    // The run is terminal but its write barrier still owns the slot: a caller
+    // must park, never join the settled promise or start a second isolate.
+    expect(dispatcher.busySlotCount).toBe(1)
+    const second = capture(dispatcher.dispatch({ sessionID }))
+    await flush()
+    expect(dispatcher.queuedCount).toBe(1)
+    expect(pool.spawned[0].runs).toHaveLength(1)
+
+    Deferred.doneUnsafe(barrier, Effect.void)
+    expect(await first).toEqual({ ok: true, value: undefined })
+    await pollUntil(() => pool.spawned[0].runs.length === 2, {
+      message: "the parked caller was never promoted after the barrier",
+    })
+    expect(pool.spawned[0].runs.map((run) => run.depth)).toEqual([0, 0])
+    expect(dispatcher.queuedCount).toBe(0)
+
+    pool.spawned[0].finish(sessionID)
+    expect(await second).toEqual({ ok: true, value: undefined })
+    await dispatcher.terminateAll()
+  })
+
+  test("a successor admitted during crash settlement is not overwritten by a parked waiter", async () => {
+    const pool = createFakeWorkerPool(1)
+    const sessionID = sid("ses_crash_race")
+    let successor: Promise<void> | undefined
+    const dispatcher = createDispatcher({
+      pool,
+      resumeDecision: (payload) => ({
+        resume: true,
+        sessionID: payload.sessionID,
+        attempt: 1,
+        phase: payload.phase,
+        fromMessageID: "msg_1",
+      }),
+      onAutoResume: () => {
+        successor = dispatcher.dispatch({ sessionID })
+        return undefined
+      },
+    })
+
+    const crashed = capture(dispatcher.dispatch({ sessionID }))
+    const waiter = capture(dispatcher.dispatch({ sessionID, depth: 1 }))
+    await pollUntil(() => dispatcher.queuedCount === 1, { message: "the waiter was never parked" })
+
+    pool.spawned[0].crash(sessionID)
+    expect((await crashed).ok).toBe(false)
+    await pollUntil(() => dispatcher.workerForSession(sessionID) === 2, {
+      message: "the auto-resume successor never took the session",
+    })
+
+    // The successor owns the slot; the parked waiter must stay parked.
+    expect(dispatcher.busySlotCount).toBe(1)
+    expect(dispatcher.queuedCount).toBe(1)
+    expect(pool.spawned[1]?.runs.map((run) => run.depth)).toEqual([0])
+
+    pool.spawned[1].finish(sessionID)
+    await successor!
+    await pollUntil(() => pool.spawned[1].runs.length === 2, {
+      message: "the parked waiter was never promoted after the successor settled",
+    })
+    expect(pool.spawned[1].runs.map((run) => run.depth)).toEqual([0, 1])
+    expect(dispatcher.queuedCount).toBe(0)
+
+    pool.spawned[1].finish(sessionID)
+    expect(await waiter).toEqual({ ok: true, value: undefined })
+    await dispatcher.terminateAll()
+  })
+
+  test("terminateAll latches shutdown and rejects the admitted run and every parked waiter", async () => {
+    const pool = createFakeWorkerPool(1)
+    const dispatcher = createDispatcher({ pool })
+    const sessionID = sid("ses_shutdown")
+
+    const root = capture(dispatcher.dispatch({ sessionID }))
+    const waiter = capture(dispatcher.dispatch({ sessionID, depth: 1 }))
+    await pollUntil(() => dispatcher.queuedCount === 1, { message: "the waiter was never parked" })
+
+    await dispatcher.terminateAll()
+
+    expect(await root).toMatchObject({ ok: false, error: expect.any(SessionCancelledError) })
+    expect(await waiter).toMatchObject({ ok: false, error: expect.any(SessionCancelledError) })
+    expect(dispatcher.busySlotCount).toBe(0)
+    expect(dispatcher.queuedCount).toBe(0)
+    expect(dispatcher.registry.size).toBe(0)
+
+    const spawnedBefore = pool.spawned.length
+    await expect(dispatcher.dispatch({ sessionID })).rejects.toBeInstanceOf(SessionCancelledError)
+    expect(pool.spawned).toHaveLength(spawnedBefore)
+    await dispatcher.terminateAll()
+  })
+
+  test("cancel owns the run: a later completion cannot resolve the caller", async () => {
+    let finishRun: (() => void) | undefined
+    let terminations = 0
+    const pool: WorkerPool = {
+      spawn: () => ({
+        id: 1,
+        alive: true,
+        execute: () =>
+          new Promise<void>((resolve) => {
+            finishRun = resolve
+          }),
+        terminate: async () => {
+          terminations += 1
+        },
+      }),
+      terminateAll: async () => {},
+    }
+    const dispatcher = createDispatcher({ pool })
+    const sessionID = sid("ses_cancel_owns")
+    let settlements = 0
+    const run = dispatcher.dispatch({ sessionID })
+    void run.then(
+      () => {
+        settlements += 1
+      },
+      () => {
+        settlements += 1
+      },
+    )
+    await pollUntil(() => finishRun !== undefined, { message: "the run never started" })
+
+    await dispatcher.cancel(sessionID)
+    expect(await capture(run)).toMatchObject({ ok: false, error: expect.any(SessionCancelledError) })
+    expect(dispatcher.busySlotCount).toBe(0)
+
+    // The cancelled run's execution resolves late; ownership is already gone, so
+    // the caller and its gate cannot be settled a second time.
+    finishRun!()
+    await flush()
+    expect(settlements).toBe(1)
+    expect(terminations).toBe(1)
+    await dispatcher.terminateAll()
+  })
+
+  test("an admission guard may re-enter dispatch for another session", async () => {
+    const pool = createFakeWorkerPool(1)
+    const outer = sid("ses_guard_outer")
+    const inner = sid("ses_guard_inner")
+    let innerDispatch: Promise<void> | undefined
+    let innerThrown: unknown
+    let reentered = false
+    const dispatcher = createDispatcher({
+      pool,
+      assertAdmissible: (sessionID) => {
+        if (reentered || sessionID !== outer) return
+        reentered = true
+        // User code must not run while the transition permit is held: a nested
+        // dispatch would otherwise find the non-reentrant lock taken.
+        try {
+          innerDispatch = dispatcher.dispatch({ sessionID: inner })
+        } catch (error) {
+          innerThrown = error
+        }
+      },
+    })
+
+    const outerRun = capture(dispatcher.dispatch({ sessionID: outer }))
+    await pollUntil(() => reentered, { message: "the admission guard never ran" })
+
+    expect(innerThrown).toBeUndefined()
+    expect(innerDispatch).toBeDefined()
+
+    await pollUntil(() => dispatcher.busySlotCount === 2, {
+      message: "the outer and inner sessions were never both admitted",
+    })
+    expect(dispatcher.queuedCount).toBe(0)
+
+    const outerWorker = pool.spawned.find((worker) => worker.runs[0]?.sessionID === outer)
+    const innerWorker = pool.spawned.find((worker) => worker.runs[0]?.sessionID === inner)
+    expect(outerWorker).toBeDefined()
+    expect(innerWorker).toBeDefined()
+
+    outerWorker!.finish(outer)
+    innerWorker!.finish(inner)
+    expect(await outerRun).toEqual({ ok: true, value: undefined })
+    expect(await capture(innerDispatch!)).toEqual({ ok: true, value: undefined })
+    expect(dispatcher.busySlotCount).toBe(0)
+    expect(dispatcher.queuedCount).toBe(0)
+    await dispatcher.terminateAll()
+  })
+})

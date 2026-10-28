@@ -11,7 +11,7 @@
 // so scheduling stays deterministic in tests. The production adapter lives in
 // `hub.ts` (`createProductionWorkerPool`).
 
-import { Cause, Deferred, Effect, Exit, Ref, Schema } from "effect"
+import { Cause, Deferred, Effect, Exit, Ref, Schema, SynchronizedRef } from "effect"
 import type { SessionID } from "@/session/schema"
 import { isWorkerCrashPhase, workerCrashed, type WorkerCrashPhase, type WorkerCrashed } from "@/session/ledger/crash"
 import type { AutoResumeDecision } from "@/session/ledger/resume"
@@ -316,6 +316,76 @@ interface SettlementBridge<A> {
   readonly settle: () => void
 }
 
+/**
+ * The session ownership table. `runs` is the admitted run per session (the old
+ * `byKey`), `waiters` is the unbounded parked-run list per session (the old
+ * `waitersByKey`), and `terminated` is the shutdown latch. Every transition is
+ * serialized through one `SynchronizedRef`, so a check and the state write it
+ * guards can never be split by another ownership transition.
+ */
+interface OwnershipState {
+  readonly runs: ReadonlyMap<SessionID, Pending>
+  readonly waiters: ReadonlyMap<SessionID, ReadonlyArray<Pending>>
+  readonly terminated: boolean
+}
+
+/** A new state with `pending` as the session's admitted run. */
+const withRun = (state: OwnershipState, sessionID: SessionID, pending: Pending): OwnershipState => {
+  const runs = new Map(state.runs)
+  runs.set(sessionID, pending)
+  return { ...state, runs }
+}
+
+/** A new state with no admitted run for the session (an absent run is a no-op). */
+const withoutRun = (state: OwnershipState, sessionID: SessionID): OwnershipState => {
+  if (!state.runs.has(sessionID)) return state
+  const runs = new Map(state.runs)
+  runs.delete(sessionID)
+  return { ...state, runs }
+}
+
+/** A new state with exactly `waiters` parked for the session (empty removes it). */
+const withWaiters = (state: OwnershipState, sessionID: SessionID, waiters: ReadonlyArray<Pending>): OwnershipState => {
+  const next = new Map(state.waiters)
+  if (waiters.length === 0) next.delete(sessionID)
+  else next.set(sessionID, waiters)
+  return { ...state, waiters: next }
+}
+
+/** A new state with the session's parked waiters removed. */
+const withoutWaiters = (state: OwnershipState, sessionID: SessionID): OwnershipState => {
+  if (!state.waiters.has(sessionID)) return state
+  const next = new Map(state.waiters)
+  next.delete(sessionID)
+  return { ...state, waiters: next }
+}
+
+/** How an admitted run may begin after its build/shutdown preflight. */
+type StartAdmission =
+  | { readonly kind: "terminated" }
+  | { readonly kind: "blocked"; readonly error: unknown }
+  | { readonly kind: "open" }
+
+/** What `nextWaiter` must do after atomically inspecting the session slot. */
+type NextWaiterDecision =
+  | { readonly kind: "owned" }
+  | { readonly kind: "idle" }
+  | { readonly kind: "blocked"; readonly error: unknown; readonly waiters: ReadonlyArray<Pending> }
+  | { readonly kind: "promote"; readonly next: Pending; readonly remaining: number }
+
+/** How `dispatch` admits, joins, or parks a request. */
+type DispatchDecision =
+  | { readonly kind: "reject" }
+  | { readonly kind: "join"; readonly promise: Promise<void> }
+  | { readonly kind: "park"; readonly pending: Pending }
+  | { readonly kind: "admit"; readonly pending: Pending }
+
+/** How a failed run's ownership and gate state resolve. */
+type FailOwnershipDecision =
+  | { readonly kind: "superseded" }
+  | { readonly kind: "gate-cancel" }
+  | { readonly kind: "owned" }
+
 const phaseOf = (pending: Pending): PendingPhase => Ref.getUnsafe(pending.phase)
 
 const updatePhase = (pending: Pending, update: (phase: PendingPhase) => PendingPhase): void => {
@@ -400,8 +470,12 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   // The session→worker map. Workers outlive runs (reuse across turns) until
   // idle-reap or terminal cancel disposes them.
   const workers = createSessionWorkerRegistry<SessionWorker>()
-  const byKey = new Map<SessionID, Pending>()
-  const waitersByKey = new Map<SessionID, Pending[]>()
+  // Run ownership, parked waiters, and the shutdown latch are one atomic state.
+  const ownership = SynchronizedRef.makeUnsafe<OwnershipState>({
+    runs: new Map(),
+    waiters: new Map(),
+    terminated: false,
+  })
   const idleTimers = new Map<SessionID, () => void>()
   const controllers = new Map<number, CancelController>()
   /**
@@ -409,7 +483,23 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
    * start until the old isolate is gone and its lease release has landed.
    */
   const terminating = new Map<SessionID, Promise<void>>()
-  let terminated = false
+
+  /** The current ownership state, read without acquiring the transition lock. */
+  const stateOf = (): OwnershipState => SynchronizedRef.getUnsafe(ownership)
+
+  /**
+   * Apply one pure check-then-act transition atomically. The transition body must
+   * be synchronous and must never transition ownership again, so the effect can
+   * be run to completion inside the SynchronizedRef permit.
+   */
+  const ownershipTransition = Effect.fnUntraced(function* <A>(
+    update: (state: OwnershipState) => readonly [A, OwnershipState],
+  ) {
+    return yield* SynchronizedRef.modifyEffect(ownership, (state) => Effect.sync(() => update(state)))
+  })
+
+  const atomically = <A>(update: (state: OwnershipState) => readonly [A, OwnershipState]): A =>
+    Effect.runSync(ownershipTransition(update))
 
   const cancelled = (sessionID: SessionID): SessionCancelledError =>
     new SessionCancelledError({ message: `session ${sessionID} was cancelled`, sessionID })
@@ -421,7 +511,9 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     idleTimers.delete(sessionID)
   }
 
-  const hasWaiters = (sessionID: SessionID): boolean => (waitersByKey.get(sessionID)?.length ?? 0) > 0
+  const hasWaiters = (sessionID: SessionID): boolean => (stateOf().waiters.get(sessionID)?.length ?? 0) > 0
+
+  const hasRun = (sessionID: SessionID): boolean => stateOf().runs.has(sessionID)
 
   /**
    * The typed refusal when the session's build is no longer admissible (or
@@ -441,7 +533,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
    * Whether a worker still owns work that must outlive an idle turn. The probe
    * is optional on the seam; a worker that cannot answer (or fails) is treated
    * as having none, so a dead isolate is never pinned forever. Background work
-   * is deliberately NOT part of `byKey`/waiters: it must not make a new prompt
+   * is deliberately NOT part of `runs`/waiters: it must not make a new prompt
    * fail `assertNotBusy`.
    */
   const hasActiveWork = async (worker: SessionWorker, sessionID: SessionID): Promise<boolean> => {
@@ -467,13 +559,13 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
    */
   const reapIfIdle = async (sessionID: SessionID): Promise<void> => {
     idleTimers.delete(sessionID)
-    if (terminated || byKey.has(sessionID) || hasWaiters(sessionID)) return
+    if (stateOf().terminated || hasRun(sessionID) || hasWaiters(sessionID)) return
     const worker = workers.worker(sessionID)
     if (worker === undefined) return
     const active = await hasActiveWork(worker, sessionID)
     // Re-check after the await: a new run or parked waiter must win, and a
     // retired/replaced worker must not be touched by this stale timer.
-    if (terminated || byKey.has(sessionID) || hasWaiters(sessionID)) return
+    if (stateOf().terminated || hasRun(sessionID) || hasWaiters(sessionID)) return
     if (workers.worker(sessionID) !== worker) return
     if (active) {
       // A running background job still owns this isolate; arm a fresh window
@@ -492,7 +584,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
 
   const scheduleReap = (sessionID: SessionID): void => {
     clearIdle(sessionID)
-    if (terminated || workers.worker(sessionID) === undefined) return
+    if (stateOf().terminated || workers.worker(sessionID) === undefined) return
     idleTimers.set(
       sessionID,
       schedule(reapMs, () => {
@@ -629,8 +721,8 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     void (async () => {
       await awaitTerminating(pending.sessionID, exit)
       if (terminating.get(pending.sessionID) === exit) terminating.delete(pending.sessionID)
-      if (byKey.get(pending.sessionID) !== pending) return
-      if (terminated) {
+      if (stateOf().runs.get(pending.sessionID) !== pending) return
+      if (stateOf().terminated) {
         pending.gate.claim("cancel")
         rejectRun(pending, cancelled(pending.sessionID))
         return
@@ -652,17 +744,25 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const awaitRelease = (sessionID: SessionID): Promise<void> => terminating.get(sessionID) ?? Promise.resolve()
 
   const start = (pending: Pending): void => {
-    if (terminated) {
+    // The build guard is user code: run it before taking the ownership permit,
+    // so a guard that re-enters dispatch/terminateAll cannot find the lock held.
+    // Shutdown still wins because the transition below re-checks the latch.
+    const blocked = stateOf().terminated ? undefined : inadmissible(pending.sessionID)
+    const admission = atomically<StartAdmission>((state) => {
+      if (state.terminated) return [{ kind: "terminated" }, state]
+      // A build that became inadmissible while this run waited (a crash blocked
+      // the bundle) must reject here too, before any isolate is materialized.
+      if (blocked === undefined) return [{ kind: "open" }, state]
+      const owns = state.runs.get(pending.sessionID) === pending
+      return [{ kind: "blocked", error: blocked }, owns ? withoutRun(state, pending.sessionID) : state]
+    })
+    if (admission.kind === "terminated") {
       pending.gate.claim("cancel")
       rejectRun(pending, cancelled(pending.sessionID))
       return
     }
-    // A build that became inadmissible while this run waited (a crash blocked
-    // the bundle) must reject here too, before any isolate is materialized.
-    const blocked = inadmissible(pending.sessionID)
-    if (blocked !== undefined) {
-      if (ownsSession(pending)) byKey.delete(pending.sessionID)
-      if (pending.gate.claim("cancel")) rejectRun(pending, blocked)
+    if (admission.kind === "blocked") {
+      if (pending.gate.claim("cancel")) rejectRun(pending, admission.error)
       nextWaiter(pending.sessionID)
       return
     }
@@ -690,7 +790,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       sessionID: pending.sessionID,
       workerID: worker.id,
       depth: pending.depth,
-      queueDepth: waitersByKey.get(pending.sessionID)?.length ?? 0,
+      queueDepth: stateOf().waiters.get(pending.sessionID)?.length ?? 0,
     })
     const run: SessionRun = {
       sessionID: pending.sessionID,
@@ -732,10 +832,21 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
 
   /**
    * Whether a run still owns its session. A cancelled or superseded run may
-   * settle its worker protocol arbitrarily late; only the run `byKey` points at
+   * settle its worker protocol arbitrarily late; only the run `runs` points at
    * may mutate the session maps, reservations, waiters, or worker.
    */
-  const ownsSession = (pending: Pending): boolean => byKey.get(pending.sessionID) === pending
+  const ownsSession = (pending: Pending): boolean => stateOf().runs.get(pending.sessionID) === pending
+
+  /**
+   * Atomically drop `pending` from run ownership. Returns false when a different
+   * run (or no run) owns the session, so a stale settlement can never delete a
+   * successor's entry.
+   */
+  const removeOwnedRun = (pending: Pending): boolean =>
+    atomically((state) => {
+      if (state.runs.get(pending.sessionID) !== pending) return [false, state] as const
+      return [true, withoutRun(state, pending.sessionID)] as const
+    })
 
   /**
    * Settle a superseded run's own promise without touching shared session state.
@@ -747,19 +858,19 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   }
 
   const finalizeCompletion = (pending: Pending): void => {
-    // A cancel owns this run's terminal decision: keep the run visible in `byKey`
+    // A cancel owns this run's terminal decision: keep the run visible in `runs`
     // so a prompt arriving mid-grace parks instead of starting on the worker the
     // cancel is about to retire. `cancelWithGrace` releases the exact run.
     if (phaseOf(pending).cancelPending) return
     // A newer run owns the session (cancel + immediate re-dispatch): settling this
-    // stale run must not release the successor's reservation, delete its `byKey`
+    // stale run must not release the successor's reservation, delete its run
     // entry, retire its worker, or promote its waiters.
-    if (!ownsSession(pending)) {
+    const released = removeOwnedRun(pending)
+    if (!released) {
       settleSuperseded(pending)
       return
     }
     workers.release(pending.sessionID)
-    byKey.delete(pending.sessionID)
     const { startedAt, workerID } = phaseOf(pending)
     log(workerLogMessage("session completed"), {
       level: "INFO",
@@ -808,12 +919,15 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       if (seen.has(childSessionID)) continue
       const failure = new ParentCrashedError(parentSessionID, childSessionID)
       rejectWaiters(childSessionID, failure)
-      const owned = byKey.get(childSessionID)
+      const owned = atomically((state) => {
+        const run = state.runs.get(childSessionID)
+        if (run === undefined) return [undefined, state] as const
+        return [run, withoutRun(state, childSessionID)] as const
+      })
       const worker = workers.worker(childSessionID)
       if (owned !== undefined) {
         owned.gate.claim("cancel")
         rejectRun(owned, failure)
-        byKey.delete(childSessionID)
         workers.release(childSessionID)
       }
       if (worker !== undefined) {
@@ -835,7 +949,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
    * the crash outcome: a durable ledger read must finish before the run rejects,
    * otherwise a caller could re-dispatch and race the decision.
    *
-   * While that read is pending the run keeps `byKey`/worker ownership, so a
+   * While that read is pending the run keeps run/worker ownership, so a
    * dispatch parks instead of starting a concurrent run. If a cancel (or a
    * partial settlement) took the session over in the meantime, this stale crash
    * must only settle its own promise: never release or promote over the new run.
@@ -846,12 +960,11 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     payload: WorkerCrashed,
     decision: AutoResumeDecision | undefined,
   ): void => {
-    if (!ownsSession(pending)) {
+    if (!removeOwnedRun(pending)) {
       rejectRun(pending, failure)
       return
     }
     workers.release(pending.sessionID)
-    byKey.delete(pending.sessionID)
     if (decision?.resume === true) {
       // The caller's run was resumed, so its promise must reflect the resumed
       // run, not the crash that triggered it. When the owner re-dispatches (the
@@ -902,14 +1015,21 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       return
     }
     // A late rejection from a cancelled/superseded run must not settle the
-    // successor that now owns this session.
-    if (!ownsSession(pending)) {
+    // successor that now owns this session. The ownership read, gate check, and
+    // run removal are one atomic transition.
+    const outcome = atomically<FailOwnershipDecision>((state) => {
+      if (state.runs.get(pending.sessionID) !== pending) return [{ kind: "superseded" }, state]
+      if (pending.gate.winner === "cancel") {
+        return [{ kind: "gate-cancel" }, withoutRun(state, pending.sessionID)]
+      }
+      return [{ kind: "owned" }, state]
+    })
+    if (outcome.kind === "superseded") {
       settleSuperseded(pending)
       return
     }
-    if (pending.gate.winner === "cancel") {
+    if (outcome.kind === "gate-cancel") {
       workers.release(pending.sessionID)
-      byKey.delete(pending.sessionID)
       retireDeadCancelledWorker(pending.sessionID)
       rejectRun(pending, cancelled(pending.sessionID))
       nextWaiter(pending.sessionID)
@@ -921,7 +1041,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     if (timedOut) {
       // A wedged isolate is retired, never requeued; cascade to its subagents.
       workers.release(pending.sessionID)
-      byKey.delete(pending.sessionID)
+      removeOwnedRun(pending)
       rejectRun(pending, error)
       void cancelWithGrace(pending.sessionID).catch(() => undefined)
       retireWorker(pending.sessionID)
@@ -1000,7 +1120,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
         cause: error,
       })
       workers.release(pending.sessionID)
-      byKey.delete(pending.sessionID)
+      removeOwnedRun(pending)
       rejectRun(pending, error)
     }
     nextWaiter(pending.sessionID)
@@ -1008,40 +1128,62 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
 
   /** Start the next parked run for a session, or arm the idle-reap timer. */
   const nextWaiter = (sessionID: SessionID): void => {
-    // A settlement can admit a successor as a side effect (auto-resume dispatches
-    // synchronously). Never overwrite that live owner with a parked waiter.
-    if (byKey.has(sessionID)) return
-    const waiters = waitersByKey.get(sessionID)
-    if (waiters === undefined || waiters.length === 0) {
-      scheduleReap(sessionID)
-      return
-    }
-    // A waiter promoted after a crash must not respawn a bundle that is no
-    // longer admissible. The typed refusal is the caller's outcome, not a run.
-    const blocked = inadmissible(sessionID)
-    if (blocked !== undefined) {
-      waitersByKey.delete(sessionID)
-      for (const waiter of waiters) {
-        if (waiter.gate.claim("cancel")) rejectRun(waiter, blocked)
+    // The admission guard is user code and must run outside the ownership
+    // permit. Snapshot first so an owned session or an empty queue short-
+    // circuits without invoking it.
+    const snapshot = stateOf()
+    const willAdmit = !snapshot.runs.has(sessionID) && (snapshot.waiters.get(sessionID)?.length ?? 0) > 0
+    const blocked = willAdmit ? inadmissible(sessionID) : undefined
+    // The live-owner guard, the admission check, the waiter list drain, and the
+    // promotion are one atomic transition. A settlement can admit a successor as
+    // a side effect (auto-resume dispatches synchronously), so a parked waiter
+    // must never overwrite that live owner.
+    const decision = atomically<NextWaiterDecision>((state) => {
+      if (state.runs.has(sessionID)) return [{ kind: "owned" }, state]
+      const waiters = state.waiters.get(sessionID)
+      if (waiters === undefined || waiters.length === 0) return [{ kind: "idle" }, state]
+      // A waiter promoted after a crash must not respawn a bundle that is no
+      // longer admissible. The typed refusal is the caller's outcome, not a run.
+      if (blocked !== undefined) {
+        return [{ kind: "blocked", error: blocked, waiters }, withoutWaiters(state, sessionID)]
       }
-      scheduleReap(sessionID)
-      return
-    }
-    const next = waiters.shift()!
-    log(workerLogMessage("waiter promoted"), {
-      level: "INFO",
-      sessionID,
-      waiterQueueDepth: waiters.length,
+      const next = waiters[0]
+      const remaining = waiters.slice(1)
+      return [
+        { kind: "promote", next, remaining: remaining.length },
+        withWaiters(withRun(state, sessionID, next), sessionID, remaining),
+      ]
     })
-    if (waiters.length === 0) waitersByKey.delete(sessionID)
-    byKey.set(sessionID, next)
-    start(next)
+    switch (decision.kind) {
+      case "owned":
+        return
+      case "idle":
+        scheduleReap(sessionID)
+        return
+      case "blocked":
+        for (const waiter of decision.waiters) {
+          if (waiter.gate.claim("cancel")) rejectRun(waiter, decision.error)
+        }
+        scheduleReap(sessionID)
+        return
+      case "promote":
+        log(workerLogMessage("waiter promoted"), {
+          level: "INFO",
+          sessionID,
+          waiterQueueDepth: decision.remaining,
+        })
+        start(decision.next)
+        return
+    }
   }
 
   const rejectWaiters = (sessionID: SessionID, error: unknown): void => {
-    const waiters = waitersByKey.get(sessionID)
+    const waiters = atomically((state) => {
+      const current = state.waiters.get(sessionID)
+      if (current === undefined) return [undefined, state] as const
+      return [current, withoutWaiters(state, sessionID)] as const
+    })
     if (waiters === undefined) return
-    waitersByKey.delete(sessionID)
     for (const waiter of waiters) {
       waiter.gate.claim("cancel")
       rejectRun(waiter, error)
@@ -1061,20 +1203,23 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
 
   /**
    * The single settlement path for a cancelled run. `owned` is the exact run the
-   * request captured; shared state is only touched while it still owns `byKey`.
-   * Parked waiters are drained by the caller exactly once before any await, so a
-   * waiter that arrives during the grace window survives and is promoted here.
+   * request captured; shared state is only touched while it still owns the run
+   * slot. Parked waiters are drained by the caller exactly once before any await,
+   * so a waiter that arrives during the grace window survives and is promoted
+   * here.
    */
-  const settleCancelled = (
-    sessionID: SessionID,
-    owned: Pending | undefined,
-    settlement: CancelSettlement,
-  ): void => {
+  const settleCancelled = (sessionID: SessionID, owned: Pending | undefined, settlement: CancelSettlement): void => {
     const { mode, winner, worker, retires, reaps } = settlement
-    const owns = owned !== undefined && ownsSession(owned)
+    // The ownership check and the run-slot removal are one transition: a cancel
+    // can never delete a successor's entry or release its worker.
+    const owns =
+      owned !== undefined &&
+      atomically((state) => {
+        if (state.runs.get(sessionID) !== owned) return [false, state] as const
+        return [true, withoutRun(state, sessionID)] as const
+      })
 
     if (owns) {
-      byKey.delete(sessionID)
       if (workers.has(sessionID)) {
         workers.markCancelling(sessionID)
         workers.release(sessionID)
@@ -1098,7 +1243,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       cancellation?.onCancelled?.({ sessionID, mode, workerID: worker?.id, resumeFromDb: true })
     }
 
-    if (!byKey.has(sessionID)) nextWaiter(sessionID)
+    if (!hasRun(sessionID)) nextWaiter(sessionID)
   }
 
   /** Whether an in-flight run is the exact same run as a new request. */
@@ -1120,8 +1265,9 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
 
   const dispatch = (request: DispatchRequest): Promise<void> => {
     // Shutdown owns the terminal state: a prompt racing `terminateAll`/`dispose`
-    // must never construct an isolate after the pool and backends are gone.
-    if (terminated) return Promise.reject(cancelled(request.sessionID))
+    // must never construct an isolate after the pool and backends are gone. The
+    // atomic transition re-checks the latch, so the fast path cannot race it.
+    if (stateOf().terminated) return Promise.reject(cancelled(request.sessionID))
     const depth = request.depth ?? 0
     if (!Number.isInteger(depth) || depth < 0) {
       return Promise.reject(new Error(`invalid dispatch depth: ${depth} (expected a non-negative integer)`))
@@ -1132,26 +1278,34 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const shell = request.shell
     const model = request.model ?? request.prompt?.model
 
-    const admitted = byKey.get(sessionID)
-    if (admitted !== undefined) {
-      if (isSameRun(admitted, depth, mode, prompt, shell, model)) return admitted.promise
-      // Different run identity: park behind the in-flight run. Unbounded.
-      clearIdle(sessionID)
+    // Join vs park vs admit is decided together with the ownership write.
+    const decision = atomically<DispatchDecision>((state) => {
+      if (state.terminated) return [{ kind: "reject" }, state]
+      const admitted = state.runs.get(sessionID)
+      if (admitted !== undefined) {
+        if (isSameRun(admitted, depth, mode, prompt, shell, model)) {
+          return [{ kind: "join", promise: admitted.promise }, state]
+        }
+        // Different run identity: park behind the in-flight run. Unbounded.
+        const pending = createPending(sessionID, depth, mode, prompt, shell, model)
+        const waiters = state.waiters.get(sessionID) ?? []
+        return [{ kind: "park", pending }, withWaiters(state, sessionID, [...waiters, pending])]
+      }
       const pending = createPending(sessionID, depth, mode, prompt, shell, model)
-      const waiters = waitersByKey.get(sessionID)
-      if (waiters === undefined) waitersByKey.set(sessionID, [pending])
-      else waiters.push(pending)
-      return pending.promise
+      return [{ kind: "admit", pending }, withRun(state, sessionID, pending)]
+    })
+    if (decision.kind === "reject") return Promise.reject(cancelled(sessionID))
+    if (decision.kind === "join") return decision.promise
+    if (decision.kind === "park") {
+      clearIdle(sessionID)
+      return decision.pending.promise
     }
-
-    const pending = createPending(sessionID, depth, mode, prompt, shell, model)
-    byKey.set(sessionID, pending)
-    start(pending)
-    return pending.promise
+    start(decision.pending)
+    return decision.pending.promise
   }
 
   const cancel = async (sessionID: SessionID): Promise<void> => {
-    const owned = byKey.get(sessionID)
+    const owned = stateOf().runs.get(sessionID)
     // Parked waiters belong to this session's terminal decision: drain them once,
     // before the admitted run's worker settles.
     rejectWaiters(sessionID, cancelled(sessionID))
@@ -1190,10 +1344,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
    * Cascade one node: children first, then this session. `seen` is the single
    * cycle guard, so a self-parent or a diamond edge visits each session once.
    */
-  const cancelOne = async (
-    sessionID: SessionID,
-    cascade: CascadeAccumulator,
-  ): Promise<CancelOutcome | undefined> => {
+  const cancelOne = async (sessionID: SessionID, cascade: CascadeAccumulator): Promise<CancelOutcome | undefined> => {
     if (cascade.seen.has(sessionID)) return undefined
     cascade.seen.add(sessionID)
 
@@ -1207,7 +1358,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     // be admitted while children unwind or the grace window is open. The
     // `Pending` identity is the generation; only this run may be cancelled,
     // released, or have its worker retired.
-    const owned = byKey.get(sessionID)
+    const owned = stateOf().runs.get(sessionID)
 
     for (const child of config.childrenOf?.(sessionID) ?? []) {
       if (cascade.seen.has(child)) continue
@@ -1215,15 +1366,26 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       cascade.descendants.push({ sessionID: child, mode: childOutcome?.mode })
     }
 
-    // The run we meant to cancel already settled and something else owns the
-    // session now: never cancel the newcomer.
-    if (byKey.get(sessionID) !== owned) return undefined
     if (owned === undefined) return undefined
 
-    // Drain waiters that exist at request time exactly once. A prompt that parks
-    // during the grace window is NOT drained here; `settleCancelled` promotes it
-    // onto a fresh worker after this cancel no longer owns the session.
-    rejectWaiters(sessionID, cancelled(sessionID))
+    // The run we meant to cancel already settled and something else owns the
+    // session now: never cancel the newcomer. The owner check and the waiter
+    // drain are one atomic transition, so a waiter cannot be left behind.
+    const drained = atomically((state) => {
+      if (state.runs.get(sessionID) !== owned) return [undefined, state] as const
+      const waiters = state.waiters.get(sessionID)
+      if (waiters === undefined) return [[] as ReadonlyArray<Pending>, state] as const
+      return [waiters, withoutWaiters(state, sessionID)] as const
+    })
+    if (drained === undefined) return undefined
+
+    // Drain waiters that existed at request time exactly once. A prompt that
+    // parks during the grace window is NOT drained here; `settleCancelled`
+    // promotes it onto a fresh worker after this cancel no longer owns it.
+    for (const waiter of drained) {
+      waiter.gate.claim("cancel")
+      rejectRun(waiter, cancelled(sessionID))
+    }
 
     if (workers.has(sessionID)) workers.markCancelling(sessionID)
     const worker = workers.worker(sessionID)
@@ -1306,16 +1468,27 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   }
 
   const terminateAll = async (): Promise<void> => {
-    if (terminated) return
-    terminated = true
+    // The shutdown latch, the run table, and the waiter table flip together:
+    // a dispatch can either observe the pre-shutdown state or the latch, never a
+    // cleared table that still admits work.
+    const shutdown = atomically((state) => {
+      if (state.terminated) return [undefined, state] as const
+      const runs = [...state.runs.values()]
+      const waiters = [...state.waiters.values()].flat()
+      return [
+        { runs, waiters },
+        {
+          runs: new Map<SessionID, Pending>(),
+          waiters: new Map<SessionID, ReadonlyArray<Pending>>(),
+          terminated: true,
+        },
+      ] as const
+    })
+    if (shutdown === undefined) return
     for (const cancel of idleTimers.values()) cancel()
     idleTimers.clear()
-    for (const pending of byKey.values()) rejectRun(pending, cancelled(pending.sessionID))
-    for (const waiters of waitersByKey.values()) {
-      for (const pending of waiters) rejectRun(pending, cancelled(pending.sessionID))
-    }
-    byKey.clear()
-    waitersByKey.clear()
+    for (const pending of shutdown.runs) rejectRun(pending, cancelled(pending.sessionID))
+    for (const pending of shutdown.waiters) rejectRun(pending, cancelled(pending.sessionID))
     for (const controller of controllers.values()) controller.dispose()
     controllers.clear()
     const workersToTerminate = workers.entries().map((entry) => entry.worker)
@@ -1327,11 +1500,11 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
 
   return {
     get busySlotCount() {
-      return byKey.size
+      return stateOf().runs.size
     },
     get queuedCount() {
       let count = 0
-      for (const waiters of waitersByKey.values()) count += waiters.length
+      for (const waiters of stateOf().waiters.values()) count += waiters.length
       return count
     },
     registry: workers,
