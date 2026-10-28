@@ -322,135 +322,136 @@ const unresolvedBackends: BackendResolution = { resolved: false }
  * map live in `SynchronizedRef`s, so a concurrent first attach resolves the
  * backends exactly once and disposer swaps are serialized.
  */
-export function make(options: WorkerPortsOptions = {}): Effect.Effect<WorkerPorts, never, Scope.Scope> {
-  return Effect.gen(function* () {
-    const log = options.log ?? noopWorkerLogger
-    const workerPortDisposers = yield* SynchronizedRef.make(new Map<number, () => void>())
-    const hubProxyDisposers = yield* SynchronizedRef.make(new Map<number, () => void>())
-    const backendResolution = yield* SynchronizedRef.make(unresolvedBackends)
+export const make = Effect.fn("WorkerPorts.make")(function* (
+  options: WorkerPortsOptions = {},
+): Effect.fn.Return<WorkerPorts, never, Scope.Scope> {
+  const log = options.log ?? noopWorkerLogger
+  const workerPortDisposers = yield* SynchronizedRef.make(new Map<number, () => void>())
+  const hubProxyDisposers = yield* SynchronizedRef.make(new Map<number, () => void>())
+  const backendResolution = yield* SynchronizedRef.make<BackendResolution>(unresolvedBackends)
 
-    const resolveBackends = Effect.gen(function* () {
-      const current = yield* SynchronizedRef.get(backendResolution)
-      if (current.resolved) return current.value
-      return yield* SynchronizedRef.modifyEffect(backendResolution, (state) =>
-        state.resolved
-          ? Effect.succeed([state.value, state] as const)
-          : Effect.sync(() => {
-              const value = typeof options.backends === "function" ? options.backends() : options.backends
-              return [value, { resolved: true, value } as const] as const
-            }),
-      )
-    })
+  const resolveBackends = Effect.gen(function* () {
+    const current = yield* SynchronizedRef.get(backendResolution)
+    if (current.resolved) return current.value
+    return yield* SynchronizedRef.modifyEffect(backendResolution, (state) =>
+      state.resolved
+        ? Effect.succeed([state.value, state] as const)
+        : Effect.sync(() => {
+            const value = typeof options.backends === "function" ? options.backends() : options.backends
+            return [value, { resolved: true, value } as const] as const
+          }),
+    )
+  })
 
-    const detach = (ref: SynchronizedRef.SynchronizedRef<Map<number, () => void>>, workerID: number) =>
-      SynchronizedRef.modifyEffect(ref, (current) =>
-        Effect.sync(() => {
-          current.get(workerID)?.()
+  const detach = (ref: SynchronizedRef.SynchronizedRef<Map<number, () => void>>, workerID: number) =>
+    SynchronizedRef.modifyEffect(ref, (current) =>
+      Effect.sync(() => {
+        current.get(workerID)?.()
+        const next = new Map(current)
+        next.delete(workerID)
+        return [undefined, next] as const
+      }),
+    )
+
+  /**
+   * The disposer returned to a caller also forgets its own map entry, but only
+   * while that entry is still current: a later re-attach owns the slot and must
+   * not be removed by the superseded disposer.
+   */
+  const attachedDisposer = (
+    ref: SynchronizedRef.SynchronizedRef<Map<number, () => void>>,
+    workerID: number,
+    disposer: () => void,
+  ): (() => void) => {
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      disposer()
+      Effect.runSync(
+        SynchronizedRef.update(ref, (current) => {
+          if (current.get(workerID) !== disposer) return current
           const next = new Map(current)
           next.delete(workerID)
-          return [undefined, next] as const
+          return next
         }),
       )
-
-    /**
-     * The disposer returned to a caller also forgets its own map entry, but only
-     * while that entry is still current: a later re-attach owns the slot and must
-     * not be removed by the superseded disposer.
-     */
-    const attachedDisposer = (
-      ref: SynchronizedRef.SynchronizedRef<Map<number, () => void>>,
-      workerID: number,
-      disposer: () => void,
-    ): (() => void) => {
-      let released = false
-      return () => {
-        if (released) return
-        released = true
-        disposer()
-        Effect.runSync(
-          SynchronizedRef.update(ref, (current) => {
-            if (current.get(workerID) !== disposer) return current
-            const next = new Map(current)
-            next.delete(workerID)
-            return next
-          }),
-        )
-      }
     }
+  }
 
-    const attachWorkerPorts = (workerID: number, ports: WorkerTransferredPorts) =>
-      Effect.gen(function* () {
-        logWorkerPorts(log, workerID, ports)
-        const next = buildWorkerPortServer(workerID, ports, yield* resolveBackends)
-        if (next === undefined) {
-          yield* detach(workerPortDisposers, workerID)
-          return () => {}
-        }
-        yield* SynchronizedRef.modifyEffect(workerPortDisposers, (current) =>
-          Effect.sync(() => {
-            current.get(workerID)?.()
-            return [undefined, new Map(current).set(workerID, next)] as const
-          }),
-        )
-        return attachedDisposer(workerPortDisposers, workerID, next)
-      })
-
-    const attachHubProxyPort = (workerID: number, port: MessagePort) =>
-      Effect.gen(function* () {
-        logHubProxyPort(log, workerID)
-        const next = buildHubProxyServer(workerID, port, options, yield* resolveBackends)
-        if (next === undefined) {
-          yield* detach(hubProxyDisposers, workerID)
-          return () => {}
-        }
-        yield* SynchronizedRef.modifyEffect(hubProxyDisposers, (current) =>
-          Effect.sync(() => {
-            current.get(workerID)?.()
-            return [undefined, new Map(current).set(workerID, next)] as const
-          }),
-        )
-        return attachedDisposer(hubProxyDisposers, workerID, next)
-      })
-
-    const disposeWorker = (workerID: number) =>
-      Effect.gen(function* () {
-        yield* detach(workerPortDisposers, workerID)
-        yield* detach(hubProxyDisposers, workerID)
-      })
-
-    const disposeAll = () =>
-      Effect.gen(function* () {
-        yield* SynchronizedRef.modifyEffect(workerPortDisposers, (current) =>
-          Effect.sync(() => {
-            for (const dispose of current.values()) dispose()
-            return [undefined, new Map()] as const
-          }),
-        )
-        yield* SynchronizedRef.modifyEffect(hubProxyDisposers, (current) =>
-          Effect.sync(() => {
-            for (const dispose of current.values()) dispose()
-            return [undefined, new Map()] as const
-          }),
-        )
-      })
-
-    const attached = () =>
-      Effect.gen(function* () {
-        const [ports, proxies] = yield* Effect.all([
-          SynchronizedRef.get(workerPortDisposers),
-          SynchronizedRef.get(hubProxyDisposers),
-        ])
-        return {
-          workerPorts: [...ports.keys()].sort((left, right) => left - right),
-          hubProxy: [...proxies.keys()].sort((left, right) => left - right),
-        }
-      })
-
-    const ports: WorkerPorts = { attachWorkerPorts, attachHubProxyPort, disposeWorker, disposeAll, attached }
-    yield* Effect.addFinalizer(() => ports.disposeAll())
-    return ports
+  const attachWorkerPorts = Effect.fn("WorkerPorts.attachWorkerPorts")(function* (
+    workerID: number,
+    ports: WorkerTransferredPorts,
+  ): Effect.fn.Return<() => void> {
+    logWorkerPorts(log, workerID, ports)
+    const next = buildWorkerPortServer(workerID, ports, yield* resolveBackends)
+    if (next === undefined) {
+      yield* detach(workerPortDisposers, workerID)
+      return () => {}
+    }
+    yield* SynchronizedRef.modifyEffect(workerPortDisposers, (current) =>
+      Effect.sync(() => {
+        current.get(workerID)?.()
+        return [undefined, new Map(current).set(workerID, next)] as const
+      }),
+    )
+    return attachedDisposer(workerPortDisposers, workerID, next)
   })
-}
+
+  const attachHubProxyPort = Effect.fn("WorkerPorts.attachHubProxyPort")(function* (
+    workerID: number,
+    port: MessagePort,
+  ): Effect.fn.Return<() => void> {
+    logHubProxyPort(log, workerID)
+    const next = buildHubProxyServer(workerID, port, options, yield* resolveBackends)
+    if (next === undefined) {
+      yield* detach(hubProxyDisposers, workerID)
+      return () => {}
+    }
+    yield* SynchronizedRef.modifyEffect(hubProxyDisposers, (current) =>
+      Effect.sync(() => {
+        current.get(workerID)?.()
+        return [undefined, new Map(current).set(workerID, next)] as const
+      }),
+    )
+    return attachedDisposer(hubProxyDisposers, workerID, next)
+  })
+
+  const disposeWorker = Effect.fn("WorkerPorts.disposeWorker")(function* (workerID: number) {
+    yield* detach(workerPortDisposers, workerID)
+    yield* detach(hubProxyDisposers, workerID)
+  })
+
+  const disposeAll = Effect.fn("WorkerPorts.disposeAll")(function* () {
+    yield* SynchronizedRef.modifyEffect(workerPortDisposers, (current) =>
+      Effect.sync(() => {
+        for (const dispose of current.values()) dispose()
+        return [undefined, new Map()] as const
+      }),
+    )
+    yield* SynchronizedRef.modifyEffect(hubProxyDisposers, (current) =>
+      Effect.sync(() => {
+        for (const dispose of current.values()) dispose()
+        return [undefined, new Map()] as const
+      }),
+    )
+  })
+
+  const attached = Effect.fn("WorkerPorts.attached")(function* () {
+    const [ports, proxies] = yield* Effect.all([
+      SynchronizedRef.get(workerPortDisposers),
+      SynchronizedRef.get(hubProxyDisposers),
+    ])
+    return {
+      workerPorts: [...ports.keys()].sort((left, right) => left - right),
+      hubProxy: [...proxies.keys()].sort((left, right) => left - right),
+    }
+  })
+
+  const ports: WorkerPorts = { attachWorkerPorts, attachHubProxyPort, disposeWorker, disposeAll, attached }
+  yield* Effect.addFinalizer(() => ports.disposeAll())
+  return ports
+})
 
 export function layer(options: WorkerPortsOptions = {}): Layer.Layer<Service> {
   return Layer.effect(Service, make(options))

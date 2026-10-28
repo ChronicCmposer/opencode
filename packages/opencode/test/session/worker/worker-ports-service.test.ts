@@ -4,7 +4,7 @@
 // `createWorkerPortRegistry`, without exercising the hub wiring.
 
 import { describe, expect, test } from "bun:test"
-import { Effect } from "effect"
+import { Effect, Tracer } from "effect"
 import { createHubProxyClient } from "@/session/worker/hub-proxy-wire"
 import type { PidReport } from "@/session/worker/pid-registry"
 import { Service, createWorkerPortRegistry, layer, make, node, type WorkerPorts } from "@/session/worker/worker-ports"
@@ -199,6 +199,53 @@ describe("worker-ports service", () => {
     expect(entry.name).toBe("@opencode/WorkerPorts")
     expect(entry.service).toBe(Service)
     expect(entry.dependencies).toEqual([])
+  })
+
+  it.live("names every service method with its WorkerPorts span", () => {
+    const names: string[] = []
+    const tracer = Tracer.make({
+      span(options) {
+        names.push(options.name)
+        return new Tracer.NativeSpan(options)
+      },
+    })
+
+    return Effect.gen(function* () {
+      let disposals = 0
+      const ports = yield* make({ backends: { egress: () => () => void disposals++, hubProxy: {} } })
+      const egress = messageChannel()
+      const control = messageChannel()
+
+      const disposePorts = yield* ports.attachWorkerPorts(1, { egress: egress.port1 })
+      const disposeProxy = yield* ports.attachHubProxyPort(2, control.port1)
+      expect(yield* ports.attached()).toEqual({ workerPorts: [1], hubProxy: [2] })
+
+      disposePorts()
+      yield* ports.disposeWorker(2)
+      yield* ports.disposeAll()
+      disposeProxy()
+      expect(disposals).toBe(1)
+      expect(yield* ports.attached()).toEqual({ workerPorts: [], hubProxy: [] })
+
+      egress.port1.close()
+      egress.port2.close()
+      control.port1.close()
+      control.port2.close()
+    }).pipe(
+      Effect.provideService(Tracer.Tracer, tracer),
+      Effect.map(() =>
+        expect(names).toEqual(
+          expect.arrayContaining([
+            "WorkerPorts.make",
+            "WorkerPorts.attachWorkerPorts",
+            "WorkerPorts.attachHubProxyPort",
+            "WorkerPorts.attached",
+            "WorkerPorts.disposeWorker",
+            "WorkerPorts.disposeAll",
+          ]),
+        ),
+      ),
+    )
   })
 
   it.live("matches the synchronous registry adapter", () =>

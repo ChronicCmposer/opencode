@@ -8,7 +8,7 @@
 import { describe, expect, test } from "bun:test"
 import { existsSync, readdirSync, readFileSync } from "node:fs"
 import path from "node:path"
-import { Effect } from "effect"
+import { Deferred, Effect } from "effect"
 import type { SessionID } from "@/session/schema"
 import type { ShellInput } from "@/session/prompt"
 import {
@@ -303,6 +303,156 @@ describe("key→worker map lifecycle", () => {
     await dispatcher.terminateAll()
     expect(dispatcher.registry.size).toBe(0)
     await expect(running).rejects.toBeInstanceOf(SessionCancelledError)
+  })
+})
+
+describe("Pending settlement is single-owner", () => {
+  test("completion that wins the cancel race settles the caller exactly once", async () => {
+    const pool = createFakeWorkerPool(1)
+    const barrier = Deferred.makeUnsafe<void>()
+    const barrierCalls: SessionID[] = []
+    const events: string[] = []
+    const dispatcher = createDispatcher({
+      pool,
+      writeBarrier: (sessionID) => {
+        barrierCalls.push(sessionID)
+        return Effect.runPromise(Deferred.await(barrier))
+      },
+      cancellation: {
+        portFor: (worker) => (worker as FakeSessionWorker).cancelPort,
+        graceMs: 500,
+        schedule: createTestScheduler().schedule,
+        onCancelled: (event) => events.push(event.mode),
+      },
+    })
+
+    const sessionID = sid("ses_once")
+    let settlements = 0
+    const run = dispatcher.dispatch({ sessionID })
+    void run.then(
+      () => {
+        settlements += 1
+      },
+      () => {
+        settlements += 1
+      },
+    )
+    await pollUntil(() => pool.spawned.length === 1, { message: "the run never started" })
+
+    // Completion lands before the cancel request; the controller must observe it,
+    // start the completion barrier, and the caller must settle exactly once.
+    pool.spawned[0].finish(sessionID)
+    expect(await dispatcher.cancelWithGrace(sessionID)).toMatchObject({
+      mode: "completed",
+      winner: "completion",
+    })
+    expect(settlements).toBe(1)
+    expect(events).toEqual(["completed"])
+    expect(barrierCalls).toEqual([sessionID])
+
+    Deferred.doneUnsafe(barrier, Effect.void)
+    await run
+    await flush()
+    expect(settlements).toBe(1)
+    await dispatcher.terminateAll()
+  })
+
+  test("a superseded run's late completion cannot invoke the successor's write barrier", async () => {
+    let finishCancelled!: () => void
+    let finishSuccessor!: () => void
+    let nextID = 1
+    const spawned: number[] = []
+    const terminated: number[] = []
+    const pool: WorkerPool = {
+      spawn: () => {
+        const id = nextID++
+        spawned.push(id)
+        return {
+          id,
+          alive: true,
+          execute: () =>
+            new Promise<void>((resolve) => {
+              if (id === 1) finishCancelled = resolve
+              else finishSuccessor = resolve
+            }),
+          terminate: async () => {
+            terminated.push(id)
+          },
+        }
+      },
+      terminateAll: async () => {},
+    }
+    const barrierCalls: SessionID[] = []
+    const dispatcher = createDispatcher({
+      pool,
+      writeBarrier: (sessionID) => {
+        barrierCalls.push(sessionID)
+        return undefined
+      },
+    })
+
+    const sessionID = sid("ses_superseded")
+    const cancelledRun = capture(dispatcher.dispatch({ sessionID }))
+    await pollUntil(() => spawned.length === 1, { message: "the first run never started" })
+    await dispatcher.cancel(sessionID)
+    expect((await cancelledRun).ok).toBe(false)
+
+    // The successor now owns the same session on a fresh worker.
+    const successor = capture(dispatcher.dispatch({ sessionID, depth: 1 }))
+    await pollUntil(() => dispatcher.workerForSession(sessionID) === 2, {
+      message: "the successor never took the session",
+    })
+
+    // The cancelled run's execution promise resolves arbitrarily late.
+    finishCancelled()
+    await flush()
+
+    expect(barrierCalls).toEqual([])
+    expect(dispatcher.workerForSession(sessionID)).toBe(2)
+    expect(dispatcher.registry.has(sessionID)).toBe(true)
+    expect(dispatcher.busySlotCount).toBe(1)
+    expect(terminated).toEqual([1])
+
+    finishSuccessor()
+    expect(await successor).toEqual({ ok: true, value: undefined })
+    await dispatcher.terminateAll()
+  })
+
+  test("a parked waiter is promoted exactly once after the admitted run settles", async () => {
+    const pool = createFakeWorkerPool(1)
+    const dispatcher = createDispatcher({ pool })
+    const sessionID = sid("ses_promote")
+    let rootSettlements = 0
+    const root = dispatcher.dispatch({ sessionID })
+    void root.then(
+      () => {
+        rootSettlements += 1
+      },
+      () => {
+        rootSettlements += 1
+      },
+    )
+    const waiter = capture(dispatcher.dispatch({ sessionID, depth: 1 }))
+    await pollUntil(() => dispatcher.queuedCount === 1, { message: "the waiter was never parked" })
+
+    pool.spawned[0].finish(sessionID)
+    await root
+    await pollUntil(() => pool.spawned[0].runs.length === 2, {
+      message: "the waiter was never promoted",
+    })
+
+    expect(pool.spawned[0].runs.map((run) => run.depth)).toEqual([0, 1])
+    expect(dispatcher.queuedCount).toBe(0)
+    expect(dispatcher.busySlotCount).toBe(1)
+    expect(rootSettlements).toBe(1)
+
+    pool.spawned[0].finish(sessionID)
+    expect(await waiter).toEqual({ ok: true, value: undefined })
+    await pollUntil(() => !dispatcher.registry.has(sessionID), {
+      message: "the promoted run never released the session",
+    })
+    expect(dispatcher.queuedCount).toBe(0)
+    await dispatcher.terminateAll()
   })
 })
 

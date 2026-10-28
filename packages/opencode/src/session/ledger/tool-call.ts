@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs"
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Layer, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import type { Connection, WriteOutcome } from "@opencode-ai/core/database/connection"
 import type { RepositoryValues, WorkerRepository } from "@/session/worker/repository/types"
@@ -158,9 +158,80 @@ export class StaleWorkerGenerationError extends ToolCallLedgerError {
   }
 }
 
+/**
+ * The service-level failure for a ledger operation. Every tagged class wraps the
+ * exact legacy throw in `cause` (so callers can still recover with `instanceof`)
+ * and carries the legacy error's stable `tag` (`TOOL_CALL_LEDGER`). Only
+ * `fromHandle` maps to these; the synchronous adapter keeps throwing the legacy
+ * classes unchanged.
+ */
+const serviceErrorFields = {
+  operation: Schema.String,
+  message: Schema.String,
+  legacyTag: Schema.String,
+  cause: Schema.Defect(),
+} as const
+
+/** A generic ledger failure surfaced through the Effect service boundary. */
+export class ToolCallLedgerServiceError extends Schema.TaggedErrorClass<ToolCallLedgerServiceError>()(
+  "ToolCallLedger.ServiceError",
+  serviceErrorFields,
+) {}
+
+/** A duplicate start surfaced through the Effect service boundary. */
+export class ToolCallAlreadyStartedServiceError extends Schema.TaggedErrorClass<ToolCallAlreadyStartedServiceError>()(
+  "ToolCallLedger.AlreadyStarted",
+  serviceErrorFields,
+) {}
+
+/** A finish without a started row surfaced through the Effect service boundary. */
+export class ToolCallNotStartedServiceError extends Schema.TaggedErrorClass<ToolCallNotStartedServiceError>()(
+  "ToolCallLedger.NotStarted",
+  serviceErrorFields,
+) {}
+
+/** A superseded-generation write surfaced through the Effect service boundary. */
+export class ToolCallStaleGenerationServiceError extends Schema.TaggedErrorClass<ToolCallStaleGenerationServiceError>()(
+  "ToolCallLedger.StaleGeneration",
+  serviceErrorFields,
+) {}
+
+/** Every typed way a ledger service operation can fail. */
+export type ServiceError =
+  | ToolCallLedgerServiceError
+  | ToolCallAlreadyStartedServiceError
+  | ToolCallNotStartedServiceError
+  | ToolCallStaleGenerationServiceError
+
 /** The lease-generation identity of the ledger's writer. */
 export interface ToolCallFence {
   readonly ownerID: string
+}
+
+/**
+ * Map a legacy throw to its tagged service error. Anything that is not a legacy
+ * ledger error is not ours to reinterpret, so it stays a defect.
+ */
+function serviceError(operation: string, error: unknown): ServiceError | undefined {
+  if (!(error instanceof ToolCallLedgerError)) return undefined
+  const fields = { operation, message: error.message, legacyTag: error.tag, cause: error }
+  if (error instanceof ToolCallAlreadyStartedError) return new ToolCallAlreadyStartedServiceError(fields)
+  if (error instanceof ToolCallNotStartedError) return new ToolCallNotStartedServiceError(fields)
+  if (error instanceof StaleWorkerGenerationError) return new ToolCallStaleGenerationServiceError(fields)
+  return new ToolCallLedgerServiceError(fields)
+}
+
+/** Lift a handle operation, turning a legacy throw into a typed service error. */
+function mapLegacyErrors<A, E, R>(
+  operation: string,
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E | ServiceError, R> {
+  return effect.pipe(
+    Effect.catchDefect((defect) => {
+      const failure = serviceError(operation, defect)
+      return failure === undefined ? Effect.die(defect) : Effect.fail(failure)
+    }),
+  )
 }
 
 function requireText(value: string, field: string): string {
@@ -426,14 +497,14 @@ export function createToolCallLedger(
 /** The Effect-facing ledger surface. `ledger` is the synchronous adapter. */
 export interface Interface {
   readonly ledger: ToolCallLedgerHandle
-  readonly startStandalone: (input: StartInput) => Effect.Effect<ToolCallRow>
-  readonly start: (input: StartInput) => Effect.Effect<ToolCallRow>
-  readonly finish: (input: FinishInput) => Effect.Effect<ToolCallRow>
-  readonly finishStandalone: (input: FinishInput) => Effect.Effect<ToolCallRow>
-  readonly finishWithResult: <T>(input: FinishInput, result: () => T) => Effect.Effect<T>
-  readonly indeterminate: (sessionID: string) => Effect.Effect<readonly ToolCallRow[]>
-  readonly list: (sessionID: string) => Effect.Effect<readonly ToolCallRow[]>
-  readonly hasSideEffectingStarted: (sessionID: string) => Effect.Effect<boolean>
+  readonly startStandalone: (input: StartInput) => Effect.Effect<ToolCallRow, ServiceError>
+  readonly start: (input: StartInput) => Effect.Effect<ToolCallRow, ServiceError>
+  readonly finish: (input: FinishInput) => Effect.Effect<ToolCallRow, ServiceError>
+  readonly finishStandalone: (input: FinishInput) => Effect.Effect<ToolCallRow, ServiceError>
+  readonly finishWithResult: <T>(input: FinishInput, result: () => T) => Effect.Effect<T, ServiceError>
+  readonly indeterminate: (sessionID: string) => Effect.Effect<readonly ToolCallRow[], ServiceError>
+  readonly list: (sessionID: string) => Effect.Effect<readonly ToolCallRow[], ServiceError>
+  readonly hasSideEffectingStarted: (sessionID: string) => Effect.Effect<boolean, ServiceError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ToolCallLedger") {}
@@ -441,25 +512,49 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/To
 /** Adapt the synchronous handle without owning, reordering, or retrying anything. */
 export function fromHandle(ledger: ToolCallLedgerHandle): Interface {
   const startStandalone = Effect.fn("ToolCallLedger.startStandalone")(function* (input: StartInput) {
-    return yield* ledger.startStandalone(input)
+    return yield* mapLegacyErrors("startStandalone", ledger.startStandalone(input))
   })
   const start = Effect.fn("ToolCallLedger.start")(function* (input: StartInput) {
-    return ledger.start(input)
+    return yield* mapLegacyErrors(
+      "start",
+      Effect.sync(() => ledger.start(input)),
+    )
   })
   const finish = Effect.fn("ToolCallLedger.finish")(function* (input: FinishInput) {
-    return ledger.finish(input)
+    return yield* mapLegacyErrors(
+      "finish",
+      Effect.sync(() => ledger.finish(input)),
+    )
   })
   const finishStandalone = Effect.fn("ToolCallLedger.finishStandalone")(function* (input: FinishInput) {
-    return yield* ledger.finishStandalone(input)
+    return yield* mapLegacyErrors("finishStandalone", ledger.finishStandalone(input))
+  })
+  const finishWithResult = Effect.fn("ToolCallLedger.finishWithResult")(function* <T>(
+    input: FinishInput,
+    result: () => T,
+  ) {
+    return yield* mapLegacyErrors(
+      "finishWithResult",
+      Effect.sync(() => ledger.finishWithResult(input, result)),
+    )
   })
   const indeterminate = Effect.fn("ToolCallLedger.indeterminate")(function* (sessionID: string) {
-    return ledger.indeterminate(sessionID)
+    return yield* mapLegacyErrors(
+      "indeterminate",
+      Effect.sync(() => ledger.indeterminate(sessionID)),
+    )
   })
   const list = Effect.fn("ToolCallLedger.list")(function* (sessionID: string) {
-    return ledger.list(sessionID)
+    return yield* mapLegacyErrors(
+      "list",
+      Effect.sync(() => ledger.list(sessionID)),
+    )
   })
   const hasSideEffectingStarted = Effect.fn("ToolCallLedger.hasSideEffectingStarted")(function* (sessionID: string) {
-    return ledger.hasSideEffectingStarted(sessionID)
+    return yield* mapLegacyErrors(
+      "hasSideEffectingStarted",
+      Effect.sync(() => ledger.hasSideEffectingStarted(sessionID)),
+    )
   })
   return {
     ledger,
@@ -467,7 +562,7 @@ export function fromHandle(ledger: ToolCallLedgerHandle): Interface {
     start,
     finish,
     finishStandalone,
-    finishWithResult: (input, result) => Effect.sync(() => ledger.finishWithResult(input, result)),
+    finishWithResult,
     indeterminate,
     list,
     hasSideEffectingStarted,

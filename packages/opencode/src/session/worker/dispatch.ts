@@ -11,7 +11,7 @@
 // so scheduling stays deterministic in tests. The production adapter lives in
 // `hub.ts` (`createProductionWorkerPool`).
 
-import { Schema } from "effect"
+import { Cause, Deferred, Effect, Exit, Ref, Schema } from "effect"
 import type { SessionID } from "@/session/schema"
 import { isWorkerCrashPhase, workerCrashed, type WorkerCrashPhase, type WorkerCrashed } from "@/session/ledger/crash"
 import type { AutoResumeDecision } from "@/session/ledger/resume"
@@ -273,6 +273,16 @@ export interface Dispatcher extends AsyncDisposable {
   dispose(): Promise<void>
 }
 
+/** The mutable settlement phase of one run. Every field is written synchronously. */
+interface PendingPhase {
+  /** True once the run reached a terminal observation (completion/failure). */
+  settled: boolean
+  completed: boolean
+  startedAt: number | undefined
+  workerID: number | undefined
+  cancelPending: boolean
+}
+
 interface Pending {
   readonly sessionID: SessionID
   readonly depth: number
@@ -280,18 +290,65 @@ interface Pending {
   readonly prompt: PromptInput | undefined
   readonly shell: ShellInput | undefined
   readonly model: { readonly providerID: string; readonly modelID: string } | undefined
+  /** The caller's settlement cell; completed exactly once. */
+  readonly done: Deferred.Deferred<void, unknown>
+  /** Synchronous Promise adapter for `done`, settled by the same call. */
+  readonly doneBridge: SettlementBridge<void>
+  /** The cancellation controller's "the run completed" probe. */
+  readonly completion: Deferred.Deferred<void>
+  /** Synchronous Promise adapter for `completion`, settled by the same call. */
+  readonly completionBridge: SettlementBridge<void>
+  /** The caller's promise, bridged from `done` at admission. */
   readonly promise: Promise<void>
-  readonly resolve: () => void
-  readonly reject: (error: unknown) => void
-  readonly settled: Promise<void>
-  readonly markSettled: () => void
-  /** True once the run has reached a terminal observation (completion/failure). */
-  settledFlag: boolean
-  completed: boolean
+  /** The completion probe, bridged from `completion` at admission. */
+  readonly completionPromise: Promise<void>
+  readonly phase: Ref.Ref<PendingPhase>
   readonly gate: OutcomeGate
-  startedAt: number | undefined
-  workerID: number | undefined
-  cancelPending: boolean
+}
+
+/**
+ * A Promise viewer over a `Deferred`. `settle` runs only after the Deferred is
+ * completed, and resolves/rejects the Promise in the same synchronous tick, so
+ * the dispatcher's long-standing microtask ordering is preserved.
+ */
+interface SettlementBridge<A> {
+  readonly promise: Promise<A>
+  readonly settle: () => void
+}
+
+const phaseOf = (pending: Pending): PendingPhase => Ref.getUnsafe(pending.phase)
+
+const updatePhase = (pending: Pending, update: (phase: PendingPhase) => PendingPhase): void => {
+  Effect.runSync(Ref.update(pending.phase, update))
+}
+
+/** Bridge a `Deferred` to the synchronous Promise façade at the adapter boundary. */
+const bridgeDeferred = <A, E>(deferred: Deferred.Deferred<A, E>): SettlementBridge<A> => {
+  let deliver!: () => void
+  const promise = new Promise<A>((resolve, reject) => {
+    deliver = () => {
+      const exit = Effect.runSyncExit(Deferred.await(deferred))
+      if (Exit.isSuccess(exit)) resolve(exit.value)
+      else reject(Cause.squash(exit.cause))
+    }
+  })
+  return { promise, settle: deliver }
+}
+
+/** Complete the caller's run exactly once; a later settlement is ignored. */
+const resolveRun = (pending: Pending): void => {
+  if (Deferred.doneUnsafe(pending.done, Effect.void)) pending.doneBridge.settle()
+}
+
+/** Fail the caller's run exactly once; a later settlement is ignored. */
+const rejectRun = (pending: Pending, error: unknown): void => {
+  if (Deferred.doneUnsafe(pending.done, Effect.fail(error))) pending.doneBridge.settle()
+}
+
+/** Record the terminal observation once and wake the cancellation controller. */
+const markSettled = (pending: Pending): void => {
+  updatePhase(pending, (phase) => (phase.settled ? phase : { ...phase, settled: true }))
+  if (Deferred.doneUnsafe(pending.completion, Effect.void)) pending.completionBridge.settle()
 }
 
 function createPending(
@@ -302,39 +359,32 @@ function createPending(
   shell: ShellInput | undefined,
   model: { readonly providerID: string; readonly modelID: string } | undefined,
 ): Pending {
-  let resolve!: () => void
-  let reject!: (error: unknown) => void
-  const promise = new Promise<void>((res, rej) => {
-    resolve = res
-    reject = rej
-  })
-  let markSettled!: () => void
-  const settled = new Promise<void>((res) => {
-    markSettled = res
-  })
-  const pending: Pending = {
+  const done = Deferred.makeUnsafe<void, unknown>()
+  const doneBridge = bridgeDeferred(done)
+  const completion = Deferred.makeUnsafe<void>()
+  const completionBridge = bridgeDeferred(completion)
+  return {
     sessionID,
     depth,
     mode,
     prompt,
     shell,
     model,
-    promise,
-    resolve,
-    reject,
-    settled,
-    markSettled: () => {
-      pending.settledFlag = true
-      markSettled()
-    },
-    settledFlag: false,
-    completed: false,
+    done,
+    doneBridge,
+    completion,
+    completionBridge,
+    promise: doneBridge.promise,
+    completionPromise: completionBridge.promise,
+    phase: Ref.makeUnsafe<PendingPhase>({
+      settled: false,
+      completed: false,
+      startedAt: undefined,
+      workerID: undefined,
+      cancelPending: false,
+    }),
     gate: createOutcomeGate(),
-    startedAt: undefined,
-    workerID: undefined,
-    cancelPending: false,
   }
-  return pending
 }
 
 export function createDispatcher(options: DispatcherOptions): Dispatcher {
@@ -582,7 +632,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       if (byKey.get(pending.sessionID) !== pending) return
       if (terminated) {
         pending.gate.claim("cancel")
-        pending.reject(cancelled(pending.sessionID))
+        rejectRun(pending, cancelled(pending.sessionID))
         return
       }
       start(pending)
@@ -604,7 +654,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const start = (pending: Pending): void => {
     if (terminated) {
       pending.gate.claim("cancel")
-      pending.reject(cancelled(pending.sessionID))
+      rejectRun(pending, cancelled(pending.sessionID))
       return
     }
     // A build that became inadmissible while this run waited (a crash blocked
@@ -612,7 +662,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const blocked = inadmissible(pending.sessionID)
     if (blocked !== undefined) {
       if (ownsSession(pending)) byKey.delete(pending.sessionID)
-      if (pending.gate.claim("cancel")) pending.reject(blocked)
+      if (pending.gate.claim("cancel")) rejectRun(pending, blocked)
       nextWaiter(pending.sessionID)
       return
     }
@@ -633,8 +683,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     }
     options.onRunStart?.(pending.sessionID)
     const worker = workers.getOrCreate(pending.sessionID, (id) => pool.spawn(id))
-    pending.startedAt = Date.now()
-    pending.workerID = worker.id
+    updatePhase(pending, (phase) => ({ ...phase, startedAt: Date.now(), workerID: worker.id }))
     workers.markRunning(pending.sessionID)
     log(workerLogMessage("session admitted"), {
       level: "INFO",
@@ -665,9 +714,12 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
 
   /** Release a completed run once the per-session write barrier (if any) resolves. */
   const complete = (pending: Pending): void => {
-    pending.completed = true
-    pending.markSettled()
-    const barrier = pending.cancelPending ? undefined : writeBarrier?.(pending.sessionID)
+    updatePhase(pending, (phase) => ({ ...phase, completed: true }))
+    markSettled(pending)
+    // A run whose cancellation owns the terminal decision, or whose session a
+    // successor now owns, must not touch the successor's write barrier.
+    const { cancelPending } = phaseOf(pending)
+    const barrier = cancelPending || !ownsSession(pending) ? undefined : writeBarrier?.(pending.sessionID)
     if (barrier === undefined) {
       finalizeCompletion(pending)
       return
@@ -691,14 +743,14 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
    * claimed it the promise is settled, otherwise it is settled as cancelled.
    */
   const settleSuperseded = (pending: Pending): void => {
-    if (pending.gate.claim("cancel")) pending.reject(cancelled(pending.sessionID))
+    if (pending.gate.claim("cancel")) rejectRun(pending, cancelled(pending.sessionID))
   }
 
   const finalizeCompletion = (pending: Pending): void => {
     // A cancel owns this run's terminal decision: keep the run visible in `byKey`
     // so a prompt arriving mid-grace parks instead of starting on the worker the
     // cancel is about to retire. `cancelWithGrace` releases the exact run.
-    if (pending.cancelPending) return
+    if (phaseOf(pending).cancelPending) return
     // A newer run owns the session (cancel + immediate re-dispatch): settling this
     // stale run must not release the successor's reservation, delete its `byKey`
     // entry, retire its worker, or promote its waiters.
@@ -708,14 +760,15 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     }
     workers.release(pending.sessionID)
     byKey.delete(pending.sessionID)
+    const { startedAt, workerID } = phaseOf(pending)
     log(workerLogMessage("session completed"), {
       level: "INFO",
       sessionID: pending.sessionID,
-      workerID: pending.workerID,
-      durationMs: pending.startedAt === undefined ? 0 : Date.now() - pending.startedAt,
+      workerID,
+      durationMs: startedAt === undefined ? 0 : Date.now() - startedAt,
     })
-    if (pending.gate.claim("completion")) pending.resolve()
-    else pending.reject(cancelled(pending.sessionID))
+    if (pending.gate.claim("completion")) resolveRun(pending)
+    else rejectRun(pending, cancelled(pending.sessionID))
     nextWaiter(pending.sessionID)
   }
 
@@ -726,7 +779,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const phase = isWorkerCrashPhase(reported?.phase) ? reported.phase : (state?.phase ?? "stream")
     const payload = workerCrashed({
       sessionID: pending.sessionID,
-      workerID: reported?.workerID ?? workers.worker(pending.sessionID)?.id ?? pending.workerID ?? -1,
+      workerID: reported?.workerID ?? workers.worker(pending.sessionID)?.id ?? phaseOf(pending).workerID ?? -1,
       phase,
       lastCommittedMessageID: reported?.lastCommittedMessageID ?? state?.lastCommittedMessageID ?? null,
       inFlightCallIDs: reported?.inFlightCallIDs ?? state?.inFlightCallIDs ?? [],
@@ -759,7 +812,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       const worker = workers.worker(childSessionID)
       if (owned !== undefined) {
         owned.gate.claim("cancel")
-        owned.reject(failure)
+        rejectRun(owned, failure)
         byKey.delete(childSessionID)
         workers.release(childSessionID)
       }
@@ -794,7 +847,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     decision: AutoResumeDecision | undefined,
   ): void => {
     if (!ownsSession(pending)) {
-      pending.reject(failure)
+      rejectRun(pending, failure)
       return
     }
     workers.release(pending.sessionID)
@@ -809,11 +862,11 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       if (resumed instanceof Promise) {
         resumed.then(
           () => {
-            if (pending.gate.claim("completion")) pending.resolve()
-            else pending.reject(cancelled(pending.sessionID))
+            if (pending.gate.claim("completion")) resolveRun(pending)
+            else rejectRun(pending, cancelled(pending.sessionID))
           },
           (error: unknown) => {
-            pending.reject(error)
+            rejectRun(pending, error)
             nextWaiter(pending.sessionID)
           },
         )
@@ -822,7 +875,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       // A resume owner that returns no run promise cannot deliver its outcome:
       // the caller still observes the typed crash (never a silent success).
     }
-    pending.reject(failure)
+    rejectRun(pending, failure)
     nextWaiter(pending.sessionID)
   }
 
@@ -840,11 +893,11 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   }
 
   const fail = (pending: Pending, error: unknown): void => {
-    pending.markSettled()
+    markSettled(pending)
     // A dead isolate must never survive a cancel that owns this run: the cancel
     // settles the terminal decision, but retirement and the child cascade still
     // belong to this crash.
-    if (pending.cancelPending) {
+    if (phaseOf(pending).cancelPending) {
       retireDeadCancelledWorker(pending.sessionID)
       return
     }
@@ -858,7 +911,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       workers.release(pending.sessionID)
       byKey.delete(pending.sessionID)
       retireDeadCancelledWorker(pending.sessionID)
-      pending.reject(cancelled(pending.sessionID))
+      rejectRun(pending, cancelled(pending.sessionID))
       nextWaiter(pending.sessionID)
       return
     }
@@ -869,7 +922,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       // A wedged isolate is retired, never requeued; cascade to its subagents.
       workers.release(pending.sessionID)
       byKey.delete(pending.sessionID)
-      pending.reject(error)
+      rejectRun(pending, error)
       void cancelWithGrace(pending.sessionID).catch(() => undefined)
       retireWorker(pending.sessionID)
     } else if (crashed) {
@@ -942,13 +995,13 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       log(workerLogMessage("worker run failed"), {
         level: "ERROR",
         sessionID: pending.sessionID,
-        workerID: pending.workerID,
+        workerID: phaseOf(pending).workerID,
         error: describeFailure(error),
         cause: error,
       })
       workers.release(pending.sessionID)
       byKey.delete(pending.sessionID)
-      pending.reject(error)
+      rejectRun(pending, error)
     }
     nextWaiter(pending.sessionID)
   }
@@ -969,7 +1022,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     if (blocked !== undefined) {
       waitersByKey.delete(sessionID)
       for (const waiter of waiters) {
-        if (waiter.gate.claim("cancel")) waiter.reject(blocked)
+        if (waiter.gate.claim("cancel")) rejectRun(waiter, blocked)
       }
       scheduleReap(sessionID)
       return
@@ -991,7 +1044,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     waitersByKey.delete(sessionID)
     for (const waiter of waiters) {
       waiter.gate.claim("cancel")
-      waiter.reject(error)
+      rejectRun(waiter, error)
     }
   }
 
@@ -1034,10 +1087,10 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     }
 
     if (owned !== undefined) {
-      if (winner === "completion" && owned.gate.claim("completion")) owned.resolve()
+      if (winner === "completion" && owned.gate.claim("completion")) resolveRun(owned)
       else {
         owned.gate.claim("cancel")
-        owned.reject(cancelled(sessionID))
+        rejectRun(owned, cancelled(sessionID))
       }
     }
 
@@ -1057,7 +1110,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     shell: ShellInput | undefined,
     model: { readonly providerID: string; readonly modelID: string } | undefined,
   ): boolean =>
-    !admitted.settledFlag &&
+    !phaseOf(admitted).settled &&
     admitted.depth === depth &&
     admitted.mode === mode &&
     admitted.prompt === prompt &&
@@ -1209,7 +1262,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       return { sessionID, mode: "terminated", winner: "cancel", acknowledged: false, durationMs: 0 }
     }
 
-    owned.cancelPending = true
+    updatePhase(owned, (phase) => ({ ...phase, cancelPending: true }))
     let resolved: CancelOutcome = {
       sessionID,
       mode: "terminated",
@@ -1218,14 +1271,16 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       durationMs: 0,
     }
     try {
-      const outcome = await controllerFor(config, worker, port).cancel(sessionID, { complete: owned.settled })
+      const outcome = await controllerFor(config, worker, port).cancel(sessionID, {
+        complete: owned.completionPromise,
+      })
       resolved =
-        outcome.mode === "cooperative" && !outcome.acknowledged && owned.completed
+        outcome.mode === "cooperative" && !outcome.acknowledged && phaseOf(owned).completed
           ? { ...outcome, mode: "completed", winner: "completion" }
           : outcome
       return resolved
     } finally {
-      owned.cancelPending = false
+      updatePhase(owned, (phase) => ({ ...phase, cancelPending: false }))
       // The controller terminates/reaps on the forced path; a cooperative or
       // completed outcome keeps the worker. Only the captured run is released.
       settleCancelled(sessionID, owned, {
@@ -1255,9 +1310,9 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     terminated = true
     for (const cancel of idleTimers.values()) cancel()
     idleTimers.clear()
-    for (const pending of byKey.values()) pending.reject(cancelled(pending.sessionID))
+    for (const pending of byKey.values()) rejectRun(pending, cancelled(pending.sessionID))
     for (const waiters of waitersByKey.values()) {
-      for (const pending of waiters) pending.reject(cancelled(pending.sessionID))
+      for (const pending of waiters) rejectRun(pending, cancelled(pending.sessionID))
     }
     byKey.clear()
     waitersByKey.clear()
