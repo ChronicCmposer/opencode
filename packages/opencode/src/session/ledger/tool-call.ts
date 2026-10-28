@@ -37,6 +37,45 @@ export const LEDGER_SQL = (() => {
   }
 })()
 
+/**
+ * The generation-fence column is additive. `CREATE TABLE IF NOT EXISTS` cannot
+ * add it to a `tool_call` table that a P0 build already created, so the hub must
+ * issue this ALTER before it marks that database current. Without it the worker
+ * boot registry gate sees a column drift and every fenced write fails.
+ */
+const FENCE_COLUMN = "worker_owner_id"
+const ADD_FENCE_COLUMN = `ALTER TABLE tool_call ADD COLUMN ${FENCE_COLUMN} TEXT`
+
+/** The read-only column probe; the `Connection` and its async twin both satisfy it. */
+export interface LedgerSchemaQuery {
+  all(sql: string): ReadonlyArray<Record<string, unknown>>
+}
+
+/** The hub executor's read surface (the off-loop schema-ensure path). */
+export interface LedgerSchemaExecutor {
+  query(sql: string): Promise<ReadonlyArray<Record<string, unknown>>>
+}
+
+/** No table yet (a fresh create) and an already-current table both need no DDL. */
+function fenceUpgrade(columns: readonly string[]): readonly string[] {
+  if (columns.length === 0) return []
+  return columns.includes(FENCE_COLUMN) ? [] : [ADD_FENCE_COLUMN]
+}
+
+/** The upgrade statements for the live `tool_call` table; empty when current. */
+export function toolCallUpgradeStatements(connection: LedgerSchemaQuery): readonly string[] {
+  return fenceUpgrade(connection.all("PRAGMA table_info(tool_call)").map((column) => String(column.name)))
+}
+
+export async function toolCallUpgradeStatementsAsync(executor: LedgerSchemaExecutor): Promise<readonly string[]> {
+  return fenceUpgrade((await executor.query("PRAGMA table_info(tool_call)")).map((column) => String(column.name)))
+}
+
+/** Apply the additive upgrade in place (used by tests and the sync hub gate). */
+export function upgradeToolCallSchema(connection: LedgerSchemaQuery & { exec(sql: string): void }): void {
+  for (const statement of toolCallUpgradeStatements(connection)) connection.exec(statement)
+}
+
 export interface ToolCallRow {
   readonly callID: string
   readonly sessionID: string
@@ -46,6 +85,8 @@ export interface ToolCallRow {
   readonly outcome: string | null
   readonly timeStarted: number
   readonly timeFinished: number | null
+  /** The lease-generation owner that recorded the row; null for unbound/tests. */
+  readonly workerOwnerID: string | null
 }
 
 export interface StartInput {
@@ -74,6 +115,12 @@ export type LedgerExclusive = <A>(operation: () => A) => Effect.Effect<A>
 
 export interface ToolCallLedgerOptions {
   readonly exclusive?: LedgerExclusive
+  /**
+   * Bind every write to one worker generation. When set, a start/finish whose
+   * generation is not the session's current event-sequence lease owner is
+   * rejected inside the same transaction as the write.
+   */
+  readonly fence?: ToolCallFence
 }
 
 export class ToolCallLedgerError extends Error {
@@ -98,6 +145,25 @@ export class ToolCallNotStartedError extends ToolCallLedgerError {
   }
 }
 
+/**
+ * A write from a superseded worker generation. The session's event-sequence
+ * lease already belongs to another owner, so this isolate may no longer record
+ * or settle tool calls for it.
+ */
+export class StaleWorkerGenerationError extends ToolCallLedgerError {
+  constructor(sessionID: string, expected: string, actual: string | undefined) {
+    super(
+      `worker generation ${expected} is stale for session ${sessionID}: current lease owner is ${actual ?? "none"}`,
+    )
+    this.name = "StaleWorkerGenerationError"
+  }
+}
+
+/** The lease-generation identity of the ledger's writer. */
+export interface ToolCallFence {
+  readonly ownerID: string
+}
+
 function requireText(value: string, field: string): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new ToolCallLedgerError(`${field} must be a non-empty string`)
@@ -116,10 +182,11 @@ function rowFromRecord(record: Record<string, unknown>): ToolCallRow {
     tool: String(record.tool),
     sideEffecting: Number(record.side_effecting) === 1,
     state,
-    outcome: record.outcome === null || record.outcome === undefined ? null : String(record.outcome),
+    outcome: typeof record.outcome === "string" ? record.outcome : null,
     timeStarted: Number(record.time_started),
     timeFinished:
       record.time_finished === null || record.time_finished === undefined ? null : Number(record.time_finished),
+    workerOwnerID: typeof record.worker_owner_id === "string" ? record.worker_owner_id : null,
   }
 }
 
@@ -142,35 +209,69 @@ function stored(repository: WorkerRepository, callID: string, sessionID: string)
   return row as Record<string, unknown>
 }
 
-function startWith(repository: WorkerRepository, input: StartInput): ToolCallRow {
+/** The event-sequence lease owner, the authoritative worker generation. */
+function currentLeaseOwner(repository: WorkerRepository, sessionID: string): string | undefined {
+  const row = repository.select("event_sequence", { aggregate_id: sessionID })[0]
+  const owner = row?.worker_owner_id
+  return typeof owner === "string" && owner.length > 0 ? owner : undefined
+}
+
+function assertCurrentGeneration(
+  repository: WorkerRepository,
+  sessionID: string,
+  fence: ToolCallFence | undefined,
+): void {
+  if (fence === undefined) return
+  const owner = currentLeaseOwner(repository, sessionID)
+  if (owner !== undefined && owner !== fence.ownerID) {
+    throw new StaleWorkerGenerationError(sessionID, fence.ownerID, owner)
+  }
+}
+
+function startWith(repository: WorkerRepository, input: StartInput, fence?: ToolCallFence): ToolCallRow {
   const callID = requireText(input.callID, "callID")
   const sessionID = requireText(input.sessionID, "sessionID")
   const tool = requireText(input.tool, "tool")
-  const where: RepositoryValues<"tool_call"> = { call_id: callID, session_id: sessionID }
-  if (repository.select("tool_call", where).length > 0) throw new ToolCallAlreadyStartedError(callID, sessionID)
-  repository.insert("tool_call", {
-    call_id: callID,
-    session_id: sessionID,
-    tool,
-    side_effecting: input.sideEffecting === false ? 0 : 1,
-    state: "started",
-    outcome: null,
-    time_started: input.timeStarted ?? Date.now(),
+  // The generation check, duplicate check and insert share one transaction so a
+  // successor's claim cannot interleave between the fence read and the write.
+  return repository.atomic(() => {
+    assertCurrentGeneration(repository, sessionID, fence)
+    const where: RepositoryValues<"tool_call"> = { call_id: callID, session_id: sessionID }
+    if (repository.select("tool_call", where).length > 0) throw new ToolCallAlreadyStartedError(callID, sessionID)
+    repository.insert("tool_call", {
+      call_id: callID,
+      session_id: sessionID,
+      tool,
+      side_effecting: input.sideEffecting === false ? 0 : 1,
+      state: "started",
+      outcome: null,
+      time_started: input.timeStarted ?? Date.now(),
+      ...(fence === undefined ? {} : { worker_owner_id: fence.ownerID }),
+    })
+    return rowFromRecord(stored(repository, callID, sessionID))
   })
-  return rowFromRecord(stored(repository, callID, sessionID))
 }
 
-function finishWith(repository: WorkerRepository, input: FinishInput): ToolCallRow {
+function finishWith(repository: WorkerRepository, input: FinishInput, fence?: ToolCallFence): ToolCallRow {
   const callID = requireText(input.callID, "callID")
   const sessionID = requireText(input.sessionID, "sessionID")
   const outcome = requireText(input.outcome, "outcome")
-  const changed: WriteOutcome = repository.update(
-    "tool_call",
-    { state: "finished", outcome, time_finished: input.timeFinished ?? Date.now() },
-    { call_id: callID, session_id: sessionID, state: "started" },
-  )
-  if (changed.changes !== 1) throw new ToolCallNotStartedError(callID, sessionID)
-  return rowFromRecord(stored(repository, callID, sessionID))
+  return repository.atomic(() => {
+    assertCurrentGeneration(repository, sessionID, fence)
+    const where: RepositoryValues<"tool_call"> = {
+      call_id: callID,
+      session_id: sessionID,
+      state: "started",
+      ...(fence === undefined ? {} : { worker_owner_id: fence.ownerID }),
+    }
+    const changed: WriteOutcome = repository.update(
+      "tool_call",
+      { state: "finished", outcome, time_finished: input.timeFinished ?? Date.now() },
+      where,
+    )
+    if (changed.changes !== 1) throw new ToolCallNotStartedError(callID, sessionID)
+    return rowFromRecord(stored(repository, callID, sessionID))
+  })
 }
 
 /**
@@ -178,16 +279,21 @@ function finishWith(repository: WorkerRepository, input: FinishInput): ToolCallR
  * production tool path uses {@link startStandaloneWith} so a parallel tool
  * cannot record its start inside another tool's result transaction.
  */
-export function start(source: ToolCallLedgerSource, input: StartInput): ToolCallRow {
-  return startWith(repositoryFor(source), input)
+export function start(
+  source: ToolCallLedgerSource,
+  input: StartInput,
+  fence?: ToolCallFence,
+): ToolCallRow {
+  return startWith(repositoryFor(source), input, fence)
 }
 
 function startStandaloneWith(
   repository: WorkerRepository,
   exclusive: LedgerExclusive | undefined,
   input: StartInput,
+  fence?: ToolCallFence,
 ): Effect.Effect<ToolCallRow> {
-  const write = () => startWith(repository, input)
+  const write = () => startWith(repository, input, fence)
   return exclusive === undefined ? Effect.sync(write) : exclusive(write)
 }
 
@@ -196,16 +302,21 @@ function startStandaloneWith(
  * connection already owns; use {@link finishWithResult} when the result needs a
  * transaction the ledger owns.
  */
-export function finish(source: ToolCallLedgerSource, input: FinishInput): ToolCallRow {
-  return finishWith(repositoryFor(source), input)
+export function finish(
+  source: ToolCallLedgerSource,
+  input: FinishInput,
+  fence?: ToolCallFence,
+): ToolCallRow {
+  return finishWith(repositoryFor(source), input, fence)
 }
 
 function finishStandaloneWith(
   repository: WorkerRepository,
   exclusive: LedgerExclusive | undefined,
   input: FinishInput,
+  fence?: ToolCallFence,
 ): Effect.Effect<ToolCallRow> {
-  const write = () => finishWith(repository, input)
+  const write = () => finishWith(repository, input, fence)
   return exclusive === undefined ? Effect.sync(write) : exclusive(write)
 }
 
@@ -219,15 +330,25 @@ function finishStandaloneWith(
  * transaction, and a nested savepoint composes with that owner. With no outer
  * transaction the scope commits the pair itself.
  */
-function finishWithResultWith<T>(repository: WorkerRepository, input: FinishInput, result: () => T): T {
+function finishWithResultWith<T>(
+  repository: WorkerRepository,
+  input: FinishInput,
+  result: () => T,
+  fence?: ToolCallFence,
+): T {
   return repository.atomic(() => {
-    finishWith(repository, input)
+    finishWith(repository, input, fence)
     return result()
   })
 }
 
-export function finishWithResult<T>(source: ToolCallLedgerSource, input: FinishInput, result: () => T): T {
-  return finishWithResultWith(repositoryFor(source), input, result)
+export function finishWithResult<T>(
+  source: ToolCallLedgerSource,
+  input: FinishInput,
+  result: () => T,
+  fence?: ToolCallFence,
+): T {
+  return finishWithResultWith(repositoryFor(source), input, result, fence)
 }
 
 /** Calls still in `started`: indeterminate work that is never auto-retried. */
@@ -289,12 +410,13 @@ export function createToolCallLedger(
   options: ToolCallLedgerOptions = {},
 ): ToolCallLedgerHandle {
   const repository = repositoryFor(source)
+  const fence = options.fence
   return {
-    startStandalone: (input) => startStandaloneWith(repository, options.exclusive, input),
-    start: (input) => startWith(repository, input),
-    finish: (input) => finishWith(repository, input),
-    finishStandalone: (input) => finishStandaloneWith(repository, options.exclusive, input),
-    finishWithResult: (input, result) => finishWithResultWith(repository, input, result),
+    startStandalone: (input) => startStandaloneWith(repository, options.exclusive, input, fence),
+    start: (input) => startWith(repository, input, fence),
+    finish: (input) => finishWith(repository, input, fence),
+    finishStandalone: (input) => finishStandaloneWith(repository, options.exclusive, input, fence),
+    finishWithResult: (input, result) => finishWithResultWith(repository, input, result, fence),
     indeterminate: (sessionID) => indeterminateWith(repository, sessionID),
     list: (sessionID) => listWith(repository, sessionID),
     hasSideEffectingStarted: (sessionID) => hasSideEffectingStartedWith(repository, sessionID),

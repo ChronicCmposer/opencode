@@ -4,7 +4,8 @@
 //
 // Admission has two boundaries, pinned separately: startup tolerates a
 // configured `unsupported` hook (it is only a defect when dispatched) but still
-// rejects a hook with no route at all; invocation always fails typed.
+// rejects a hook with no route at all; invocation fails typed only when a loaded
+// plugin declared the hook (an undeclared hook is a true no-op).
 
 import { describe, expect, test } from "bun:test"
 import { readdirSync, readFileSync } from "node:fs"

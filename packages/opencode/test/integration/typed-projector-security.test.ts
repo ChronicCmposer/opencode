@@ -531,6 +531,42 @@ describe("bound worker projector authority", () => {
     }
   })
 
+  test("a delta patch ignores stale unemitted hub columns", async () => {
+    const testHarness = await harness()
+    try {
+      // The hub owns billing and has advanced it after the worker read its
+      // `Session.Info` snapshot. A worker title update must not be rejected (or
+      // resurrect the stale cost) just because the carried image is old.
+      admin(
+        testHarness.filename,
+        "UPDATE session SET cost = 7, tokens_input = 3, tokens_output = 4, tokens_reasoning = 1, tokens_cache_read = 2, tokens_cache_write = 5, share_url = ?, revert = ?, version = '2', time_created = 11 WHERE id = ?",
+        ["https://share.test/root", JSON.stringify({ messageID: ROOT_MESSAGE }), ROOT],
+      )
+      const before = sessionSnapshot(testHarness.filename)
+
+      const result = await outcome(testHarness, (events) =>
+        events.publish(
+          SessionV1.Event.Updated,
+          {
+            sessionID: ROOT,
+            // A stale full image: cost/tokens/revert/share/version/time.created
+            // all predate the hub advance above.
+            info: info({ title: "renamed from a stale snapshot", time: { created: 1, updated: 2 } }),
+          },
+          { metadata: { sessionPatch: ["title", "time_updated"] } },
+        ),
+      )
+
+      expect(result.ok, `delta patch rejected: ${String(result.error)}`).toBe(true)
+      expect(sessionSnapshot(testHarness.filename)).toEqual(before)
+      expect(admin(testHarness.filename, "SELECT title FROM session WHERE id = ?", [ROOT])).toEqual([
+        { title: "renamed from a stale snapshot" },
+      ])
+    } finally {
+      await testHarness.close()
+    }
+  })
+
   test("session.updated cannot widen permission in a bound worker", async () => {
     const testHarness = await harness()
     try {

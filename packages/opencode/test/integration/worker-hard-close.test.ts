@@ -11,7 +11,8 @@ import os from "node:os"
 import path from "node:path"
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test"
 import { Database } from "bun:sqlite"
-import { DbExecutorTimeoutError, createDbExecutor } from "@/session/worker/db-executor"
+import { pathToFileURL } from "node:url"
+import { DbExecutorClosedError, DbExecutorTimeoutError, createDbExecutor } from "@/session/worker/db-executor"
 import { REAL_WORKER_TEST_TIMEOUT_MS } from "../lib/worker-timeouts"
 import { pollUntil } from "../lib/async"
 
@@ -27,6 +28,46 @@ function workspace(): { filename: string } {
 
 afterEach(() => {
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
+})
+
+const NEVER_READY_WORKER_SOURCE = `
+import { parentPort } from "node:worker_threads"
+
+// Deliberately never sends "ready": the caller stays in the boot handshake
+// until close() settles it.
+parentPort!.on("message", (message: { type: string; id: number }) => {
+  if (message.type === "close") parentPort!.postMessage({ type: "closed", id: message.id })
+})
+`
+
+describe("db executor boot close", () => {
+  test("close rejects a request still waiting on the boot handshake", async () => {
+    const { filename } = workspace()
+    const worker = path.join(path.dirname(filename), "never-ready-worker.ts")
+    await Bun.write(worker, NEVER_READY_WORKER_SOURCE)
+
+    const executor = createDbExecutor({
+      filename: ":memory:",
+      entry: pathToFileURL(worker),
+      timeoutMs: 2_000,
+    })
+    const pending = executor.query("SELECT 1")
+    // Attach a handler before close: the rejection is expected, and Bun should
+    // not report it as unhandled while the test waits for close() itself.
+    void pending.catch(() => undefined)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    await executor.close()
+
+    const outcome = await Promise.race([
+      pending.then(
+        () => "resolved" as const,
+        (error: unknown) => error,
+      ),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 1_000)),
+    ])
+    // A close during boot must settle the waiter instead of dropping it.
+    expect(outcome).toBeInstanceOf(DbExecutorClosedError)
+  })
 })
 
 describe("db executor deadline hard-close", () => {

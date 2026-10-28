@@ -36,7 +36,7 @@ const ENTRIES: readonly WorkerEntry[] = [
     source: "./src/session/worker/session-worker.ts",
     shim: "session-worker.js",
     define: "OPENCODE_SESSION_WORKER_PATH",
-    consumer: "src/session/worker/hub.ts",
+    consumer: "src/session/worker/worker-pools.ts",
   },
   {
     name: "tree-sitter",
@@ -81,5 +81,13 @@ describe("script/build.ts bundles every worker entry", () => {
       if (!(await read(entry.consumer)).includes(entry.define)) missing.push(entry.name)
     }
     expect(missing).toEqual([])
+  })
+
+  test("the packaged identity and worker hash defines are injected and consumed", async () => {
+    expect(buildSource).toContain("OPENCODE_PACKAGED:")
+    expect(buildSource).toContain("OPENCODE_BUILD_HASH:")
+    const buildHash = await read("src/session/worker/build-hash.ts")
+    expect(buildHash).toContain("OPENCODE_PACKAGED")
+    expect(buildHash).toContain("OPENCODE_BUILD_HASH")
   })
 })

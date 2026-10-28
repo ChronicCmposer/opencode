@@ -53,7 +53,7 @@ import { hashIdentity, readPersistedBodyHash } from "@/session/db/identity"
 import { deriveSessionScopedTables } from "@/session/db/derive"
 import { createWriteCapability } from "./repository/capability"
 import { assertTableRegistry } from "./repository/registry"
-import { makeRepository } from "./repository/write"
+import { leadingKeyword, makeRepository } from "./repository/write"
 import type { WorkerRepository } from "./repository/types"
 import { DURABLE_LOG_TABLES, SESSION_IMMUTABLE_COLUMNS, WORKER_READABLE_HUB_TABLES } from "./repository/policy"
 import { WORKER_DB_KEY } from "./node-table"
@@ -738,9 +738,54 @@ function assertHubOnlyAccess(table: string, action: number): void {
 
 const RAW_WRITE_REJECTED = "raw writes are repository-only; use WorkerRepository"
 
+/** Bound on memoized SQL classifications; worker SQL is a small repeated set. */
+export const WORKER_STATEMENT_CACHE_LIMIT = 256
+
+export interface WorkerStatementClassification {
+  /** SQL with comments removed, used for pragma/route decisions. */
+  readonly stripped: string
+  /**
+   * Effective statement keyword (`select`, `insert`, …). A `WITH` statement
+   * reports the keyword of its top-level statement after the CTE bodies, so a
+   * CTE write routes to `main` instead of the scoped read view.
+   */
+  readonly keyword: string
+  /** Whether a top-level `;` is followed by another statement. */
+  readonly multipleStatements: boolean
+}
+
+const statementClassifications = new Map<string, WorkerStatementClassification>()
+
+/**
+ * Classify a worker statement once per distinct SQL text. This runs on every
+ * `all`/`run`/`exec` call, so repeated statements must not re-scan and re-strip
+ * the same string. The bounded LRU keeps dynamic SQL from growing the map
+ * without limit.
+ */
+export function classifyWorkerStatement(sql: string): WorkerStatementClassification {
+  const cached = statementClassifications.get(sql)
+  if (cached !== undefined) {
+    statementClassifications.delete(sql)
+    statementClassifications.set(sql, cached)
+    return cached
+  }
+  const stripped = stripComments(sql)
+  const classification: WorkerStatementClassification = {
+    stripped,
+    keyword: leadingKeyword(stripped),
+    multipleStatements: hasMultipleStatements(sql),
+  }
+  if (statementClassifications.size >= WORKER_STATEMENT_CACHE_LIMIT) {
+    const oldest = statementClassifications.keys().next().value
+    if (oldest !== undefined) statementClassifications.delete(oldest)
+  }
+  statementClassifications.set(sql, classification)
+  return classification
+}
+
 /** One statement only. Multi-statement SQL is never a valid worker statement. */
 function assertSingleStatement(sql: string): void {
-  if (hasMultipleStatements(sql)) {
+  if (classifyWorkerStatement(sql).multipleStatements) {
     throw new WorkerStatementRejectedError({ reason: "multiple statements are hub-only" })
   }
 }
@@ -830,8 +875,7 @@ function guardBoundConnection(connection: NodeConnection): WorkerConnection {
     run: (_sql, _params = []) => rejectWrite(),
     exec: (sql) => {
       assertSingleStatement(sql)
-      const stripped = stripComments(sql)
-      const keyword = leadingKeyword(stripped)
+      const { stripped, keyword } = classifyWorkerStatement(sql)
       if (TRANSACTION_KEYWORDS.has(keyword)) {
         connection.exec(sql)
         return
@@ -928,7 +972,7 @@ function trustedRunner(
     params: QueryParams,
     mode: "all" | "values" | "run",
   ): WriteOutcome | ReadonlyArray<Record<string, unknown>> | ReadonlyArray<ReadonlyArray<unknown>> => {
-    if (!WRITE_KEYWORDS.has(leadingKeyword(stripComments(sql)))) {
+    if (!WRITE_KEYWORDS.has(classifyWorkerStatement(sql).keyword)) {
       if (mode === "run") {
         connection.all(sql, params)
         return { changes: 0, lastInsertRowid: 0 }
@@ -964,8 +1008,7 @@ function trustedRunner(
     values: <Row>(sql: string, params: QueryParams = []) => execute(sql, params, "values") as ReadonlyArray<Row>,
     run: (sql: string, params: QueryParams = []) => execute(sql, params, "run") as WriteOutcome,
     exec: (sql) => {
-      const stripped = stripComments(sql)
-      const keyword = leadingKeyword(stripped)
+      const { stripped, keyword } = classifyWorkerStatement(sql)
       if (TRANSACTION_KEYWORDS.has(keyword)) {
         connection.exec(sql)
         return
@@ -1086,10 +1129,6 @@ function tableColumns(connection: Connection, table: string): readonly string[] 
   return connection
     .all<{ readonly name: string }>(`PRAGMA main.table_info(${quoteIdentifier(table)})`)
     .map((row) => row.name)
-}
-
-function leadingKeyword(sql: string): string {
-  return /^[\s(]*([A-Za-z_]+)/.exec(sql)?.[1]?.toLowerCase() ?? ""
 }
 
 /** Read-only pragmas whose optional parenthesized argument is a schema name. */

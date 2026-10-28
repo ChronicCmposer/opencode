@@ -31,6 +31,11 @@ const DEV_ENTRY = "opencode.session-worker.dev"
 declare global {
   /** Compile-time worker build hash, injected by `script/build.ts`. */
   const OPENCODE_BUILD_HASH: string | undefined
+  /**
+   * Compile-time packaged identity, injected by `script/build.ts`. A source run
+   * leaves it undefined; runtime mode never depends on `NODE_ENV`.
+   */
+  const OPENCODE_PACKAGED: boolean | undefined
 }
 
 /** Severity-compatible logger seam; mirrors the worker logger without importing it. */
@@ -100,49 +105,9 @@ export function computeBundleHash(
   return hash.digest("hex")
 }
 
-/** Options for bundling + hashing the worker entry graph with the real bundler. */
-export interface HashWorkerBundleOptions {
-  readonly entrypoint: string
-  readonly cwd?: string
-  readonly tsconfig?: string
-  readonly external?: readonly string[]
-  readonly plugins?: readonly unknown[]
-  readonly define?: Record<string, string>
-  readonly schemaVersion?: number
-}
-
-/**
- * Bundle the worker entry the same way the production build does and hash the
- * emitted graph. Hashing the bundler output (not the entry source) means a
- * transitive import change moves the hash, while files outside the graph do not.
- */
-export async function hashWorkerBundle(options: HashWorkerBundleOptions): Promise<string> {
-  const config: Parameters<typeof Bun.build>[0] & { write?: boolean } = {
-    entrypoints: [options.entrypoint],
-    ...(options.cwd === undefined ? {} : { root: options.cwd }),
-    ...(options.tsconfig === undefined ? {} : { tsconfig: options.tsconfig }),
-    ...(options.external === undefined ? {} : { external: [...options.external] }),
-    ...(options.plugins === undefined ? {} : { plugins: options.plugins as never[] }),
-    ...(options.define === undefined ? {} : { define: options.define }),
-    target: "bun",
-    conditions: ["bun", "node"],
-    format: "esm",
-    splitting: true,
-    minify: true,
-    write: false,
-  }
-  const result = await Bun.build(config)
-  if (!result.success) {
-    throw new Error(`worker bundle failed: ${result.logs.map((log) => log.message).join("; ")}`)
-  }
-  const artifacts = await Promise.all(
-    result.outputs.map(async (output) => ({
-      path: output.path,
-      bytes: new Uint8Array(await output.arrayBuffer()),
-    })),
-  )
-  return computeBundleHash(artifacts, options.schemaVersion)
-}
+// NOTE: the runtime module deliberately has no bundler dependency. The build
+// script owns `Bun.build`, hashes the emitted worker graph, and injects only the
+// resulting digest as `OPENCODE_BUILD_HASH`.
 
 export type BuildHashSource = "build" | "override" | "dev"
 
@@ -159,29 +124,34 @@ export interface ResolveBuildHashOptions {
   readonly schemaVersion?: number
   readonly log?: BuildHashLogger
   /**
-   * Explicit dev/test mode. Defaults to true only for an unpackaged source run
-   * (no build-time hash) or when `OPENCODE_DEV` is set; a packaged build or
-   * `NODE_ENV=production` is production unless a caller says otherwise.
+   * Explicit dev/test mode. Defaults to true for an unpackaged source run or
+   * when `OPENCODE_DEV` is set. Packaging is a compile-time identity, not
+   * `NODE_ENV`: a source run with `NODE_ENV=production` still has no packaged
+   * worker to verify.
    */
   readonly dev?: boolean
+  /** Packaged identity override (defaults to the compile-time define). */
+  readonly packaged?: boolean
 }
 
 const definedBuildHash = (): string | undefined =>
   typeof OPENCODE_BUILD_HASH !== "undefined" && OPENCODE_BUILD_HASH !== "" ? OPENCODE_BUILD_HASH : undefined
 
+const isPackagedBuild = (): boolean => typeof OPENCODE_PACKAGED !== "undefined" && OPENCODE_PACKAGED === true
+
+/** Normalize an explicit hash: an empty string is the same as "not defined". */
+function definedHashOrUndefined(value: string | undefined): string | undefined {
+  return value !== undefined && value !== "" ? value : undefined
+}
+
 /** Resolve the build identity, logging an active development override at error. */
 export function resolveBuildHash(options: ResolveBuildHashOptions = {}): ResolvedBuildHash {
   const env = options.env ?? process.env
   const schemaVersion = options.schemaVersion ?? PROTOCOL_SCHEMA_VERSION
-  const defined = options.definedHash ?? definedBuildHash()
+  const defined = definedHashOrUndefined(options.definedHash) ?? definedBuildHash()
+  const packaged = options.packaged ?? (isPackagedBuild() || defined !== undefined)
   const override = env[BUILD_HASH_OVERRIDE_ENV]
-  const dev =
-    options.dev ??
-    (env[DEV_ENV] === "1" || env[DEV_ENV] === "true"
-      ? true
-      : env.NODE_ENV === "production"
-        ? false
-        : defined === undefined || defined === "")
+  const dev = options.dev ?? (env[DEV_ENV] === "1" || env[DEV_ENV] === "true" || !packaged)
 
   if (override !== undefined && override !== "" && dev) {
     options.log?.(

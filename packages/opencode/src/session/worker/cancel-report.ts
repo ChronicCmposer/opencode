@@ -45,12 +45,20 @@ interface CancelReporterOptions {
    */
   readonly onCancelRequested?: (sessionID: SessionID) => void
   readonly log: WorkerLogger
+  /**
+   * Bound on recorded modes retained between cancels. Entries are also dropped
+   * as soon as their session (or descendant) is reported, so this is only the
+   * safety net for a session that is cancelled but never reported.
+   */
+  readonly maxSessions?: number
 }
 
 interface CancelReporter {
   /** Record a dispatcher-reported terminal mode so the report can reconstruct it. */
   readonly recordCancelled: (sessionID: string, mode: CancelledMode) => void
   readonly cancelWithReport: (sessionID: SessionID) => Promise<CancelReport>
+  /** Retained mode count (test/diagnostic seam for the bound). */
+  readonly size: number
 }
 
 /**
@@ -61,7 +69,22 @@ interface CancelReporter {
  * grace-terminated one does not).
  */
 export function createCancelReporter(options: CancelReporterOptions): CancelReporter {
+  const maxSessions = options.maxSessions ?? 1024
+  if (!Number.isInteger(maxSessions) || maxSessions < 1) {
+    throw new Error(`invalid cancel-report session bound: ${maxSessions}`)
+  }
   const cancelledModes = new Map<string, CancelledMode>()
+
+  /** LRU insertion: newest last, evict the oldest beyond the bound. */
+  const remember = (sessionID: string, mode: CancelledMode): void => {
+    cancelledModes.delete(sessionID)
+    cancelledModes.set(sessionID, mode)
+    while (cancelledModes.size > maxSessions) {
+      const oldest = cancelledModes.keys().next().value
+      if (oldest === undefined) break
+      cancelledModes.delete(oldest)
+    }
+  }
 
   /**
    * Every descendant of `sessionID` (children-first, depth-first), as the
@@ -124,6 +147,10 @@ export function createCancelReporter(options: CancelReporterOptions): CancelRepo
       sessionID: child,
       needsFallbackIdle: !workerPublishedIdle(cancelledModes.get(child)),
     }))
+    // The report consumed the modes. Dropping them here bounds the map by live
+    // cancels instead of by the process lifetime.
+    cancelledModes.delete(sessionID)
+    for (const descendant of descendants) cancelledModes.delete(descendant)
     options.log(workerLogMessage("cancel cascade"), {
       level: "INFO",
       sessionID,
@@ -134,9 +161,10 @@ export function createCancelReporter(options: CancelReporterOptions): CancelRepo
   }
 
   return {
-    recordCancelled: (sessionID, mode) => {
-      cancelledModes.set(sessionID, mode)
-    },
+    recordCancelled: remember,
     cancelWithReport,
+    get size() {
+      return cancelledModes.size
+    },
   }
 }

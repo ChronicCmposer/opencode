@@ -24,18 +24,20 @@ import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
+import { withBusyRetry } from "@opencode-ai/core/database/busy"
 import { LLMError, UnknownProviderReason, Usage, type LLMEvent } from "@opencode-ai/llm"
 import { Faults } from "@/testing/faults"
 
 const DOOM_LOOP_THRESHOLD = 3
 
 /**
- * Upper bound on the abort settlement drain. A normal result commit resolves
- * the call's `done` deferred as soon as its transaction and lifecycle report
- * finish, so this bound only stops cleanup from wedging on a tool that never
- * settles; it is not the abort window.
+ * One settlement deadline per run, shared by every call being drained. A result
+ * that commits before it settles `ok`; a call that has not settled by then is
+ * left `started` (indeterminate) rather than being guessed as `error`, because
+ * its side effect may still have succeeded. The deadline only stops cleanup from
+ * wedging on a tool that never reports at all.
  */
-const ABORT_RESULT_DRAIN_MS = 2_000
+const RUN_SETTLEMENT_DEADLINE_MS = 5_000
 export type Result = "compact" | "stop" | "continue"
 
 /**
@@ -62,7 +64,7 @@ export class ToolCallDuringSummaryError extends Schema.TaggedErrorClass<ToolCall
  * committed, never while the writer is held. `settle` is the standalone path
  * for abort/cleanup, where no transaction exists.
  */
-export type ToolSettlementPhase = "commit" | "afterCommit" | "settle"
+export type ToolSettlementPhase = "commit" | "afterCommit" | "settle" | "abandon"
 
 export type ToolSettlement = (outcome: "ok" | "error", phase: ToolSettlementPhase) => Effect.Effect<void>
 
@@ -95,6 +97,8 @@ type Input = {
   assistantMessage: SessionV1.Assistant
   sessionID: SessionID
   model: Provider.Model
+  /** Test seam for the per-run settlement deadline; production uses 5s. */
+  settlementDeadlineMs?: number
 }
 
 export interface Interface {
@@ -186,7 +190,7 @@ const layer = Layer.effect(
         if (settle === undefined) return
         // `commit` must stay registered until its transaction succeeds, so a
         // rollback can still be settled as an error by cleanup.
-        if (phase !== "commit") settlements.delete(toolCallID)
+        if (phase !== "commit" && phase !== "abandon") settlements.delete(toolCallID)
         // Ledger bookkeeping must never turn a committed result into a run
         // failure; the durable row is the only thing callers can rely on.
         yield* settle(outcome, phase).pipe(
@@ -254,7 +258,19 @@ const layer = Layer.effect(
           toolCallID,
           Effect.gen(function* () {
             const match = yield* readToolCall(toolCallID)
-            if (!match || match.part.state.status !== "running") {
+            if (!match) {
+              yield* settleRegistered(toolCallID, "ok", "settle")
+              return
+            }
+            const state = match.part.state
+            // Cleanup may have written an interrupted placeholder after its
+            // per-run deadline. A result that lands later still owns the call:
+            // revive the placeholder into a completed result instead of losing
+            // the success to the abort.
+            const resumable =
+              state.status === "running" ||
+              (state.status === "error" && state.metadata?.interrupted === true)
+            if (!resumable) {
               // The abort path may have written the result early; a later AI SDK
               // result event still has to drain the pending settlement.
               yield* settleRegistered(toolCallID, "ok", "settle")
@@ -264,11 +280,11 @@ const layer = Layer.effect(
               ...match.part,
               state: {
                 status: "completed",
-                input: match.part.state.input,
+                input: state.input,
                 output: output.output,
                 metadata: output.metadata,
                 title: output.title,
-                time: { start: match.part.state.time.start, end: Date.now() },
+                time: { start: state.time.start, end: Date.now() },
                 attachments: output.attachments,
               },
             }
@@ -286,7 +302,9 @@ const layer = Layer.effect(
                   }),
                 { behavior: "immediate" },
               )
-              .pipe(Effect.orDie)
+              // Busy retry owns the whole result/failure transaction; replaying a
+              // single statement inside it would keep the stale snapshot.
+              .pipe(withBusyRetry, Effect.orDie)
             yield* settleRegistered(toolCallID, "ok", "afterCommit")
             yield* settleToolCall(toolCallID)
           }),
@@ -322,7 +340,9 @@ const layer = Layer.effect(
                   }),
                 { behavior: "immediate" },
               )
-              .pipe(Effect.orDie)
+              // Busy retry owns the whole result/failure transaction; replaying a
+              // single statement inside it would keep the stale snapshot.
+              .pipe(withBusyRetry, Effect.orDie)
             yield* settleRegistered(toolCallID, "error", "afterCommit")
             if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
               ctx.blocked = ctx.shouldBreak
@@ -729,44 +749,66 @@ const layer = Layer.effect(
         }
         ctx.reasoningMap = {}
 
+        const deadline = Date.now() + (input.settlementDeadlineMs ?? RUN_SETTLEMENT_DEADLINE_MS)
         yield* Effect.forEach(
           Object.values(ctx.toolcalls),
-          (call) => Deferred.await(call.done).pipe(Effect.timeout(ABORT_RESULT_DRAIN_MS), Effect.ignore),
+          (call) =>
+            Deferred.await(call.done).pipe(
+              Effect.timeout(Math.max(0, deadline - Date.now())),
+              Effect.ignore,
+            ),
           { concurrency: "unbounded" },
         )
 
         for (const toolCallID of Object.keys(ctx.toolcalls)) {
           const match = yield* readToolCall(toolCallID)
           if (!match) {
-            // The part is gone but a settlement may still be parked: never leak
-            // a `started` row or an in-flight lifecycle entry.
-            yield* settleRegistered(toolCallID, "error", "settle")
+            // The part is gone but a settlement may still be parked. Leave the
+            // durable row `started` (indeterminate): the effect may have run.
+            yield* settleRegistered(toolCallID, "error", "abandon")
             continue
           }
           const part = match.part
-          // A part already returned keeps its successful settlement; anything
-          // still running is being aborted and settles error. Draining here is
-          // what prevents an interrupted result from leaking a `started` row.
-          const returned = part.state.status === "completed"
-          yield* settleRegistered(toolCallID, returned ? "ok" : "error", "settle")
-          if (returned) continue
+          const state = part.state
+          if (state.status === "completed") {
+            // A part already returned keeps its successful settlement.
+            yield* settleRegistered(toolCallID, "ok", "settle")
+            continue
+          }
+          if (state.status === "pending") {
+            // The effect never began, so no side effect can have happened.
+            yield* settleRegistered(toolCallID, "error", "settle")
+          } else if (state.status === "error" && state.metadata?.interrupted !== true) {
+            // A genuine tool failure already owns the settlement.
+            yield* settleRegistered(toolCallID, "error", "settle")
+            continue
+          } else {
+            // The result is still owed when the deadline is reached. Abandon the
+            // settlement (do not write an error) so a later success can still
+            // settle `ok`; the ledger row stays indeterminate until then.
+            yield* settleRegistered(toolCallID, "error", "abandon")
+            if (state.status === "error") continue
+          }
           const end = Date.now()
-          const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
+          const metadata = "metadata" in state && isRecord(state.metadata) ? state.metadata : {}
           yield* session.updatePart({
             ...part,
             state: {
-              ...part.state,
+              ...state,
               status: "error",
               error: "Tool execution aborted",
               metadata: { ...metadata, interrupted: true },
-              time: { start: "time" in part.state ? part.state.time.start : end, end },
+              time: { start: "time" in state ? state.time.start : end, end },
             },
           })
         }
-        // Defensive: a registration whose part vanished before the loop snapshot
-        // must still be drained rather than leak its ledger row.
-        for (const toolCallID of [...settlements.keys()]) {
-          yield* settleRegistered(toolCallID, "error", "settle")
+        // Defensive: a registration whose part vanished from the run snapshot
+        // must still be abandoned rather than leak a false `error`. Calls the
+        // loop above already abandoned stay registered for a late success.
+        const drained = new Set(Object.keys(ctx.toolcalls))
+        for (const toolCallID of settlements.keys()) {
+          if (drained.has(toolCallID)) continue
+          yield* settleRegistered(toolCallID, "error", "abandon")
         }
         ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()

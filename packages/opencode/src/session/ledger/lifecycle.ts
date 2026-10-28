@@ -270,24 +270,76 @@ export function reporting(): LifecycleReporting | undefined {
   return installed
 }
 
+/** Every lifecycle RPC is bounded; a wedged control port must not hang a run. */
+export const LIFECYCLE_RPC_TIMEOUT_MS = 5_000
+
+export class LifecycleRpcTimeoutError extends Error {
+  readonly tag = "LIFECYCLE_RPC_TIMEOUT"
+  constructor(
+    readonly method: string,
+    readonly timeoutMs: number,
+  ) {
+    super(`lifecycle RPC ${method} was not acknowledged within ${timeoutMs}ms`)
+    this.name = "LifecycleRpcTimeoutError"
+  }
+}
+
+export interface ProxyReportingOptions {
+  /** Per-RPC bound. Defaults to {@link LIFECYCLE_RPC_TIMEOUT_MS}. */
+  readonly timeoutMs?: number
+}
+
+function withDeadline<T>(
+  method: string,
+  timeoutMs: number,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      reject(new LifecycleRpcTimeoutError(method, timeoutMs))
+    }, timeoutMs)
+    timer.unref?.()
+    const finish = (settle: () => void) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      settle()
+    }
+    operation().then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    )
+  })
+}
+
 /**
- * Build the hub-proxy backed reporting seam. A failed report is swallowed: the
- * durable ledger/message row remains the authoritative truth, and a torn-down
- * port during cancel must not turn a tool into a failure.
+ * Build the hub-proxy backed reporting seam. `toolStarted` is the one
+ * authority-bearing report: it must reject when the hub has not observed the
+ * call, so the tool path can fail closed before its side effect. The other
+ * reports are best effort: the durable ledger/message row remains the
+ * authoritative truth, and a torn-down port during cancel must not turn a tool
+ * into a failure.
  */
 export function createProxyReporting(
   call: (method: string, args: readonly unknown[]) => Promise<unknown>,
+  options: ProxyReportingOptions = {},
 ): LifecycleReporting {
+  const timeoutMs = options.timeoutMs ?? LIFECYCLE_RPC_TIMEOUT_MS
   const send = (method: string, args: readonly unknown[]): Promise<void> =>
-    call(method, args).then(
+    withDeadline(method, timeoutMs, () => call(method, args)).then(() => undefined)
+  const bestEffort = (method: string, args: readonly unknown[]): Promise<void> =>
+    send(method, args).then(
       () => undefined,
       () => undefined,
     )
   return {
-    commit: (sessionID, messageID) => send("lifecycle.commit", [sessionID, messageID]),
+    commit: (sessionID, messageID) => bestEffort("lifecycle.commit", [sessionID, messageID]),
     toolStarted: (sessionID, callID, sideEffecting = true) =>
       send("lifecycle.toolStarted", [sessionID, callID, sideEffecting]),
-    toolFinished: (sessionID, callID) => send("lifecycle.toolFinished", [sessionID, callID]),
-    phase: (sessionID, phase) => send("lifecycle.phase", [sessionID, phase]),
+    toolFinished: (sessionID, callID) => bestEffort("lifecycle.toolFinished", [sessionID, callID]),
+    phase: (sessionID, phase) => bestEffort("lifecycle.phase", [sessionID, phase]),
   }
 }

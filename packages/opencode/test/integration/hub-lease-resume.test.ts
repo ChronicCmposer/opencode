@@ -23,6 +23,7 @@ import {
 import type { DbExecutor } from "@/session/worker/db-executor"
 import type { SessionID } from "@/session/schema"
 import { sid } from "../lib/async"
+import { BuildMismatch, resolveBuildHash } from "@/session/worker/build-hash"
 import { pollUntil } from "../lib/poll"
 
 const SESSION = "ses_resume_deadline"
@@ -175,6 +176,261 @@ describe("a resume decision that resolves after cancel cannot dispatch", () => {
       expect(hub.lifecycle.cancelled(SESSION)).toBe(true)
       // The late decision must not re-dispatch the cancelled run.
       expect(pool.executed.map(String)).toEqual(["ses_resume_deadline"])
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+})
+
+describe("retirement awaits the scoped lease release", () => {
+  test("a successor cannot boot before the retired generation's release lands", async () => {
+    const release = deferred<ReadonlyArray<Record<string, unknown>>>()
+    const pool = poolWith(() => new Promise<void>(() => {}))
+    const hub = createSessionHub({
+      pool,
+      db: fakeDb((sql) => (sql.includes("event_sequence") ? release.promise : Promise.resolve([]))),
+      onWorkerCrashed: () => {},
+    })
+    const sessionID = sid("ses_release_before_successor")
+    try {
+      // Drive the dispatcher directly: this asserts the RETIREMENT CALLBACK is
+      // awaited, not just the hub's separate pre-admission lease wait.
+      const first = hub.dispatcher.dispatch({ sessionID }).catch(() => undefined)
+      await pollUntil(() => pool.executed.length === 1, { message: "the first run never reached the worker" })
+      await hub.dispatcher.cancel(sessionID)
+
+      const successor = hub.dispatcher.dispatch({ sessionID }).catch(() => undefined)
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      expect(pool.executed).toHaveLength(1)
+
+      release.resolve([])
+      await pollUntil(() => pool.executed.length === 2, {
+        message: "the successor never booted after the lease release",
+      })
+      void first
+      void successor
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+
+  test("releaseGeneration zeroes the retired lease even when port disposal throws", async () => {
+    const zeroed: Array<ReadonlyArray<unknown> | Record<string, unknown>> = []
+    const sessionID = sid("ses_release_finally_ports")
+    const pool = poolWith(async () => {})
+    let disposed = false
+    const hub = createSessionHub({
+      pool,
+      db: {
+        threadId: 0,
+        query: async (sql) => (sql.includes("event_sequence") ? [{ worker_owner_id: "worker-7-1-uuid" }] : []),
+        run: async (sql, params) => {
+          if (sql.includes("worker_expires_at = 0") && params !== undefined) zeroed.push(params)
+          return { changes: 1, lastInsertRowid: 0 }
+        },
+        transaction: async () => [],
+        close: async () => {},
+      },
+      ports: {
+        egress: () => () => {
+          // Throw once (the retirement disposition); teardown retries benignly.
+          if (disposed) return
+          disposed = true
+          throw new Error("port dispose failed")
+        },
+      },
+      onWorkerCrashed: () => {},
+    })
+    try {
+      hub.attachWorkerPorts(7, { egress: {} as MessagePort })
+      await expect(hub.releaseGeneration(sessionID, 7)).rejects.toThrow("port dispose failed")
+      expect(zeroed).toEqual([[sessionID, "worker-7-1-uuid"]])
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+
+  test("releaseGeneration zeroes the retired lease even when onSessionReleased throws", async () => {
+    const zeroed: Array<ReadonlyArray<unknown> | Record<string, unknown>> = []
+    const sessionID = sid("ses_release_finally_hook")
+    const pool = poolWith(async () => {})
+    const hub = createSessionHub({
+      pool,
+      db: {
+        threadId: 0,
+        query: async (sql) => (sql.includes("event_sequence") ? [{ worker_owner_id: "worker-9-1-uuid" }] : []),
+        run: async (sql, params) => {
+          if (sql.includes("worker_expires_at = 0") && params !== undefined) zeroed.push(params)
+          return { changes: 1, lastInsertRowid: 0 }
+        },
+        transaction: async () => [],
+        close: async () => {},
+      },
+      onSessionReleased: () => {
+        throw new Error("release hook failed")
+      },
+      onWorkerCrashed: () => {},
+    })
+    try {
+      await expect(hub.releaseGeneration(sessionID, 9)).rejects.toThrow("release hook failed")
+      expect(zeroed).toEqual([[sessionID, "worker-9-1-uuid"]])
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+})
+
+describe("a typed build mismatch is returned as-is and blocks respawn", () => {
+  test("the caller sees BuildMismatch and a retry does not respawn the stale bundle", async () => {
+    const sessionID = "ses_build_mismatch"
+    const mismatch = new BuildMismatch({ expected: resolveBuildHash().hash, actual: "stale-bundle" })
+    let executed = 0
+    const worker: ExecutorWorker = {
+      id: 7,
+      get alive() {
+        return false
+      },
+      async execute() {
+        executed += 1
+        throw mismatch
+      },
+      async cancel() {},
+      async assertNotBusy() {
+        return false
+      },
+      resultFor: () => undefined,
+      async terminate() {},
+    }
+    const pool: ExecutorWorkerPool = {
+      workers: [worker],
+      spawn: () => worker,
+      terminateAll: async () => {},
+      byID: (id) => (id === worker.id ? worker : undefined),
+      resultFor: () => undefined,
+    }
+    const hub = createSessionHub({ pool, onWorkerCrashed: () => {} })
+    try {
+      await expect(hub.ensureRunning(sid(sessionID))).rejects.toBeInstanceOf(BuildMismatch)
+      expect(executed).toBe(1)
+      // The bundle did not change, so a retry fails fast with the same typed
+      // error instead of crash-looping a fresh isolate.
+      await expect(hub.ensureRunning(sid(sessionID))).rejects.toBeInstanceOf(BuildMismatch)
+      expect(executed).toBe(1)
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+})
+
+describe("a build mismatch rejects a parked waiter instead of respawning", () => {
+  test("a concurrent waiter is rejected with the typed cause and never executes", async () => {
+    const sessionID = "ses_build_mismatch_waiter"
+    const mismatch = new BuildMismatch({ expected: resolveBuildHash().hash, actual: "stale-bundle" })
+    let alive = true
+    let executed = 0
+    const gate = deferred<void>()
+    const worker: ExecutorWorker = {
+      id: 9,
+      get alive() {
+        return alive
+      },
+      async execute() {
+        executed += 1
+        if (executed === 1) await gate.promise
+        alive = false
+        throw mismatch
+      },
+      async cancel() {},
+      async assertNotBusy() {
+        return false
+      },
+      resultFor: () => undefined,
+      async terminate() {},
+    }
+    const pool: ExecutorWorkerPool = {
+      workers: [worker],
+      spawn: () => worker,
+      terminateAll: async () => {},
+      byID: (id) => (id === worker.id ? worker : undefined),
+      resultFor: () => undefined,
+    }
+    const hub = createSessionHub({ pool, onWorkerCrashed: () => {} })
+    try {
+      const first = hub.dispatcher.dispatch({ sessionID: sid(sessionID), depth: 0 }).catch((error) => error)
+      // A different run identity parks behind the first.
+      const second = hub.dispatcher.dispatch({ sessionID: sid(sessionID), depth: 1 }).catch((error) => error)
+      await pollUntil(() => executed === 1, { message: "the first run never executed" })
+      expect(hub.dispatcher.queuedCount).toBe(1)
+
+      gate.resolve()
+      const [firstOutcome, secondOutcome] = await Promise.all([first, second])
+      expect(firstOutcome).toBeInstanceOf(BuildMismatch)
+      expect(secondOutcome).toBeInstanceOf(BuildMismatch)
+      // The stale bundle is never respawned for the parked waiter.
+      expect(executed).toBe(1)
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+})
+
+describe("a failing auto-resume settles the original caller with that failure", () => {
+  test("the caller observes the resumed run's typed failure, not a generic no-result", async () => {
+    const error = new Error("resume dispatch failed")
+    const crash = new WorkerCrashedError({
+      message: "worker 7 crashed",
+      workerID: 7,
+      sessionID: SESSION,
+      phase: "stream",
+      lastCommittedMessageID: "msg_committed",
+      inFlightCallIDs: [],
+      reason: "isolate exited",
+    })
+    const pool = poolWith(() => Promise.reject(crash))
+    const hub = createSessionHub({
+      pool,
+      resumeRun: () => Promise.reject(error),
+      onWorkerCrashed: () => {},
+    })
+    try {
+      const outcome = await hub.ensureRunning(sid(SESSION)).then(
+        () => ({ rejected: false as const }),
+        (failure: unknown) => ({ rejected: true as const, failure }),
+      )
+      expect(outcome.rejected).toBe(true)
+      if (outcome.rejected) expect(outcome.failure).toBe(error)
+      // Exactly one attempt: the owner's resume failed instead of silently
+      // resolving the crashed caller as a successful (empty) run.
+      expect(pool.executed.map(String)).toEqual(["ses_resume_deadline"])
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+})
+
+describe("same-session generation retirement", () => {
+  test("releaseGeneration releases lost in-flight calls and the pending-request hook", async () => {
+    const sessionID = sid("ses_generation_release")
+    const released: SessionID[] = []
+    const pool = poolWith(async () => {})
+    const hub = createSessionHub({
+      pool,
+      onSessionReleased: (id) => released.push(id),
+      onWorkerCrashed: () => {},
+    })
+    try {
+      hub.lifecycle.toolStarted(sessionID, "call_1", true)
+      expect(hub.lifecycle.indeterminate(sessionID)).toHaveLength(1)
+
+      await hub.releaseGeneration(sessionID, 7)
+      // The production hook is where `cancelPendingRequests` is wired.
+      expect(released).toEqual([sessionID])
+
+      // The next run releases the dead generation's calls instead of letting
+      // them hold the barrier forever. Drive the dispatcher directly: the result
+      // seam is irrelevant to the on-run-start release.
+      await hub.dispatcher.dispatch({ sessionID })
+      expect(hub.lifecycle.indeterminate(sessionID)).toHaveLength(0)
     } finally {
       await hub.terminateAll()
     }

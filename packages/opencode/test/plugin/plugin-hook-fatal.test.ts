@@ -91,7 +91,9 @@ async function triggerWorkerHook(name: string): Promise<Exit.Exit<unknown, unkno
       backgroundJob: { wait: async () => null, cancel: async () => {} },
     },
     modelClient: Layer.succeed(ModelClient, { complete: () => Effect.succeed({ text: "stub" }) }),
-    plugins: createWorkerPluginHost([{ name: "empty", hooks: {} }]),
+    // The hook is declared by a loaded plugin, so the worker must fail typed
+    // rather than silently pass the trigger through.
+    plugins: createWorkerPluginHost([{ name: "empty", hooks: {}, declared: [name] }]),
   })
   return Effect.runPromise(
     Effect.gen(function* () {

@@ -1,13 +1,34 @@
-// Executor transport and lazy/session-bound worker-pool factories.
+// Executor transport, worker cap, and session-bound pool factories.
 import os from "node:os"
 import path from "node:path"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Context, Effect, Layer, Scope, SynchronizedRef } from "effect"
 import type { SessionID } from "@/session/schema"
 import { defined } from "@/util/object"
-import { createExecutorCancelPort, createExecutorWorker, createExecutorWorkerPool, SessionWorkerReplyTimeoutError, type ExecutorTransport, type ExecutorWorker, type ExecutorWorkerPool, type SessionExecutorInbound, type SessionExecutorOutbound, type WorkerSpawnReason } from "./execute"
-import { BOOT_CANCELLED, createBootLifecycle, type BootCancelResult, type BootLifecycle, type BootTelemetry } from "./cancel"
+import {
+  createExecutorCancelPort,
+  createExecutorWorker,
+  createExecutorWorkerPool,
+  SessionWorkerReplyTimeoutError,
+  type ExecutorSessionWorker,
+  type ExecutorTransport,
+  type ExecutorWorker,
+  type ExecutorWorkerPool,
+  type SessionExecutionResult,
+  type SessionExecutorInbound,
+  type SessionExecutorOutbound,
+  type WorkerSpawnReason,
+} from "./execute"
+import {
+  BOOT_CANCELLED,
+  createBootLifecycle,
+  type BootCancelResult,
+  type BootLifecycle,
+  type BootTelemetry,
+} from "./cancel"
 import { type SpawnGateHandle, type SpawnPermit } from "./spawn-gate"
 import { SESSION_WORKER_IDLE_TIMEOUT_ENV } from "./pool"
-import { mergeEnv } from "./init"
+import { mergeEnv, type WorkerModelSelection } from "./init"
 import { BuildMismatch, verifyReadyBuild } from "./build-hash"
 import type { SessionWorkerInit } from "./session-worker"
 import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
@@ -75,18 +96,39 @@ export const DEFAULT_TRANSPORT_BUFFER_CAPACITY = 1024
 
 /**
  * How long an isolate may take to acknowledge the orderly-shutdown frame before
- * the hub terminates it anyway. Long enough for a `SQLite.close()` + lease
- * release; short enough that a wedged worker cannot stall retirement.
+ * the hub terminates it anyway. The worker's SQLite connections use a 250 ms
+ * busy timeout (`WORKER_BUSY_TIMEOUT_MS`), so a synchronous statement reaches a
+ * safepoint well inside this budget. The 1 s bound is deliberately ~4x that
+ * timeout: tightening it to 250 ms would raw-terminate a healthy worker that is
+ * merely finishing one blocked statement. The budget only covers a genuinely
+ * wedged event loop; the raw-terminate fallback is logged and counted.
  */
 const SHUTDOWN_ACK_TIMEOUT_MS = 1_000
+
+/** Raw terminates (an isolate that never acknowledged the shutdown frame). */
+let rawTerminateCount = 0
+
+/** Observe how many isolates had to be terminated without an orderly ack. */
+export function workerShutdownStats(): { readonly rawTerminates: number } {
+  return { rawTerminates: rawTerminateCount }
+}
+
+/** Workers already asked to close, so a second retire never re-posts `shutdown`. */
+const shutdownRequested = new WeakSet<object>()
+
+interface WorkerShutdownOptions {
+  readonly log?: WorkerLogger
+  readonly workerID?: number
+}
 
 /**
  * Ask the isolate to close its native WAL handle and release its bus lease
  * before the hub calls `Worker.terminate()`. Terminating without this leaves the
  * bun:sqlite handle (and its WAL lock) alive until process exit. Bounded: a
- * wedged or half-booted worker is still terminated after the timeout.
+ * wedged or half-booted worker is still terminated after the timeout, and the
+ * raw terminate is logged/counted so the fallback is observable.
  */
-async function requestWorkerShutdown(worker: Worker): Promise<void> {
+async function requestWorkerShutdown(worker: Worker, options: WorkerShutdownOptions = {}): Promise<void> {
   // A fake/partial worker without event plumbing can never deliver the ack.
   // Post the close frame (recording fakes assert on it) and return without the
   // bounded wait, so every test retire does not stall for the full budget.
@@ -98,6 +140,9 @@ async function requestWorkerShutdown(worker: Worker): Promise<void> {
     }
     return
   }
+  if (shutdownRequested.has(worker)) return
+  shutdownRequested.add(worker)
+  let acknowledged = false
   await new Promise<void>((resolve) => {
     let settled = false
     let timer: ReturnType<typeof setTimeout>
@@ -110,7 +155,9 @@ async function requestWorkerShutdown(worker: Worker): Promise<void> {
     }
     const onMessage = (event: MessageEvent): void => {
       const frame = event.data as { readonly type?: unknown } | undefined
-      if (frame?.type === "shutdown-ack") finish()
+      if (frame?.type !== "shutdown-ack") return
+      acknowledged = true
+      finish()
     }
     timer = setTimeout(finish, SHUTDOWN_ACK_TIMEOUT_MS)
     timer.unref?.()
@@ -120,6 +167,14 @@ async function requestWorkerShutdown(worker: Worker): Promise<void> {
     } catch {
       finish()
     }
+  })
+  if (acknowledged) return
+  rawTerminateCount += 1
+  options.log?.(workerLogMessage("worker shutdown ack timed out"), {
+    level: "WARN",
+    ...(options.workerID === undefined ? {} : { workerID: options.workerID }),
+    timeoutMs: SHUTDOWN_ACK_TIMEOUT_MS,
+    reason: "the isolate reached no safepoint within the shutdown budget; terminating it raw",
   })
 }
 
@@ -243,8 +298,14 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
   const messages: SessionExecutorOutbound[] = []
   const waiters = new Set<PendingWaiter>()
   let alive = true
+  // Set by `close`/`terminate`; a later `terminate` still destroys the thread
+  // even though `alive` is already false (so a concurrent run sees it dead).
+  let closing = false
   let worker: Worker | undefined
   let booting: Promise<void> | undefined
+  // Aborts the pending spawn-permit acquisition when the boot is cancelled or
+  // terminated, so a cancelled spawn never waits out the gate deadline.
+  let bootAcquisition: AbortController | undefined
   let bootTimer: ReturnType<typeof setTimeout> | undefined
   let bootLifecycle: BootLifecycle<Worker> | undefined
   // A boot that failed on its own (protocol error, deadline, isolate death) never
@@ -301,6 +362,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
    */
   const cancelWhileWaiting = (): Promise<BootCancelResult> => {
     waitingCancelled = true
+    bootAcquisition?.abort()
     if (waitingCancel === undefined) {
       let resolve!: (result: BootCancelResult) => void
       const promise = new Promise<BootCancelResult>((settle) => {
@@ -496,7 +558,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
         // native WAL handle/lease through the shutdown frame before the thread is
         // destroyed. Terminate-only would strand the lock; `requestWorkerShutdown`
         // is the shared close primitive (owned by the cap/close section).
-        await requestWorkerShutdown(partial)
+        await requestWorkerShutdown(partial, { log, workerID: options.workerID })
         await partial.terminate()
       },
       onRun: () => {
@@ -533,11 +595,14 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
    */
   const boot = (): void => {
     if (booting !== undefined || worker !== undefined || gate === undefined || !alive) return
+    const acquisition = new AbortController()
+    bootAcquisition = acquisition
     booting = (async () => {
-      const acquired = await gate.acquire()
+      const acquired = await gate.acquire(acquisition.signal)
       // The cancel already resolved to its caller; release the permit the
       // acquisition granted and never construct the isolate. A terminate that
       // landed while waiting takes the same path without a cancel outcome.
+      bootAcquisition = undefined
       if (!alive || waitingCancelled) {
         const cancelled = waitingCancelled
         acquired.release("failed", cancelled ? undefined : new Error("session worker terminated before boot"))
@@ -554,6 +619,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       }
       startBoot(acquired)
     })().catch((error) => {
+      bootAcquisition = undefined
       const failure = error instanceof Error ? error : new Error(String(error))
       // A cancelled waiter must settle even when the permit acquisition failed.
       if (waitingCancel !== undefined) {
@@ -624,8 +690,29 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       return alive
     },
     cancelBoot,
+    /**
+     * Close the isolate's durable resources while its realm still runs. Exposed
+     * to the executor so every retire (including a materializing/rebind path)
+     * goes through the orderly shutdown frame before `terminate()`.
+     */
+    async close(): Promise<void> {
+      if (closing) return
+      closing = true
+      // The run is terminal the moment retirement starts: mark the isolate dead
+      // and fail in-flight waits now, so a slow turn cannot complete during the
+      // bounded shutdown-ack wait and the dispatcher classifies a dead worker.
+      alive = false
+      queued.length = 0
+      failWaiters(new Error("session worker terminated"))
+      const current = worker
+      if (current === undefined) return
+      await requestWorkerShutdown(current, { log, workerID: options.workerID })
+    },
     async terminate(code = 0): Promise<number> {
-      if (!alive) return code
+      // A `close()` already marked the isolate dead; the thread still exists and
+      // must be destroyed, so only a repeated terminate (no close) short-circuits.
+      if (!alive && !closing) return code
+      closing = true
       alive = false
       queued.length = 0
       // Fail every in-flight run before the bounded shutdown wait, so callers
@@ -639,6 +726,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
         return code
       }
       if (bootLifecycle === undefined && booting !== undefined) {
+        bootAcquisition?.abort()
         void cancelWhileWaiting()
         return code
       }
@@ -651,7 +739,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       // this applies to an in-flight run too: a forced cancel mid-tool must not
       // keep the write lock until process exit. The wait is bounded, so a wedged
       // worker is still terminated.
-      await requestWorkerShutdown(current)
+      await requestWorkerShutdown(current, { log, workerID: options.workerID })
       const result = await current.terminate()
       return typeof result === "number" ? result : code
     },
@@ -692,6 +780,8 @@ export interface BunExecutorWorkerPoolOptions {
   readonly spawnGate?: SpawnGateHandle
   /** Boot-ready deadline; see {@link BunExecutorTransportOptions.bootTimeoutMs}. */
   readonly bootTimeoutMs?: number
+  /** Idle isolates retained by the pool; defaults to {@link resolveIdleWorkerCapacity}. */
+  readonly maxIdleWorkers?: number
 }
 
 /**
@@ -748,20 +838,27 @@ export function spawnBunExecutorWorker(id: number, options: BunExecutorWorkerPoo
 }
 
 /** Production `ExecutorWorkerPool`: spawns frame-protocol workers on demand. */
-export function createBunExecutorWorkerPool(options: BunExecutorWorkerPoolOptions): ExecutorWorkerPool {
+export function createBunExecutorWorkerPool(options: BunExecutorWorkerPoolOptions): IdleBoundedExecutorWorkerPool {
   // Resolve the default-on watchdog HERE: this factory is the documented entry
   // point, so an absent option must still arm the budget (an explicit `0`
   // disables it) rather than silently reaching the executor as `undefined`.
   const runIdleTimeoutMs = resolveRunIdleTimeoutMs(options)
   if (options.log !== undefined) logRunIdleTimeoutWarning(options.log, options)
-  return createExecutorWorkerPool({
-    spawn: (id) => spawnBunExecutorWorker(id, { ...options, runIdleTimeoutMs }),
+  let pool: ExecutorWorkerPool | undefined
+  const idleCap = createIdleIsolateCap({
+    capacity: options.maxIdleWorkers ?? resolveIdleWorkerCapacity(),
+    ...(options.log === undefined ? {} : { log: options.log }),
+    onEvict: (entry) => pool?.releaseSession?.(entry.sessionID, entry.worker.id),
+  })
+  pool = createExecutorWorkerPool({
+    spawn: (id) => idleCap.track(spawnBunExecutorWorker(id, { ...options, runIdleTimeoutMs })),
     ...(options.log === undefined ? {} : { log: options.log }),
   })
+  return withIdleIsolateCap(pool, idleCap)
 }
 
 // ---------------------------------------------------------------------------
-// Lazy pool: no isolate is spawned until a worker is first used.
+// Worker cap, idle retention, and materialization.
 // ---------------------------------------------------------------------------
 
 /** Minimum reserved child-headroom slots per nesting depth (D23). */
@@ -868,10 +965,258 @@ export function createWorkerCap(max: number): WorkerCap {
 }
 
 /**
+ * Default idle-isolate retention: two per available core. Reuse across turns is
+ * valuable, but a process that has dispatched thousands of sessions must not
+ * retain one idle isolate for every session ever seen. Two per core matches the
+ * oversubscription factor already used for in-flight work while keeping the
+ * retained footprint legible.
+ */
+export function resolveIdleWorkerCapacity(cores: number = os.availableParallelism()): number {
+  const available = Number.isInteger(cores) && cores > 0 ? cores : 1
+  return Math.max(1, available * 2)
+}
+
+/** An idle isolate selected for eviction (never one with an in-flight run). */
+export interface IdleWorkerEntry {
+  readonly worker: ExecutorWorker
+  readonly sessionID: SessionID
+}
+
+export interface IdleIsolateCapOptions {
+  /** Idle isolates retained; defaults to {@link resolveIdleWorkerCapacity}. */
+  readonly capacity?: number
+  /**
+   * Called before the idle isolate is terminated. The production pool routes it
+   * through the dispatcher's full retirement (hub ports, pending asks, lease) and
+   * awaits it, so eviction is not complete until the old generation is really
+   * gone.
+   */
+  readonly onEvict: (entry: IdleWorkerEntry) => unknown
+  readonly log?: WorkerLogger
+}
+
+/**
+ * Cap the number of idle isolates by LRU, never touching a worker with an
+ * in-flight run (active) or one still materializing/generating (also inside
+ * `execute`). The tracker sits ABOVE a pool worker: `execute` marks it active,
+ * its settlement marks it idle, and the oldest idle worker above the cap is
+ * retired. Eviction goes through the same orderly `terminate` a reap would use.
+ */
+export interface IdleIsolateCap {
+  readonly capacity: number
+  /** Idle isolates currently retained. */
+  readonly idle: number
+  readonly evictions: number
+  /** Wrap a pool worker so its runs update the active/idle LRU. */
+  track(worker: ExecutorWorker): ExecutorWorker
+  /** Stop tracking a worker a dispatcher/pool has already retired. */
+  forget(workerID: number): void
+  /** Stop tracking every worker without terminating (pool teardown does that). */
+  clear(): void
+}
+
+export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolateCap {
+  const capacity = options.capacity ?? resolveIdleWorkerCapacity()
+  if (!Number.isInteger(capacity) || capacity < 1) {
+    throw new Error(`idle worker cap must be a positive integer, received ${String(capacity)}`)
+  }
+  interface Tracked {
+    readonly worker: ExecutorWorker
+    sessionID: SessionID | undefined
+    terminated: boolean
+  }
+  const tracked = new Map<number, Tracked>()
+  // Insertion order is the LRU: a run removes the entry, its settlement re-adds it.
+  const idle = new Map<number, Tracked>()
+  const active = new Set<number>()
+  let evictions = 0
+  let enforcing = false
+  let recheck = false
+
+  const evict = async (entry: Tracked): Promise<void> => {
+    entry.terminated = true
+    tracked.delete(entry.worker.id)
+    idle.delete(entry.worker.id)
+    active.delete(entry.worker.id)
+    evictions += 1
+    const sessionID = entry.sessionID
+    if (sessionID !== undefined) {
+      try {
+        // Await the retirement so a successor is never admitted while the old
+        // generation's ports/lease are still live.
+        await options.onEvict({ worker: entry.worker, sessionID })
+      } catch {
+        // Retirement cleanup is best-effort: the isolate must still be terminated.
+      }
+    }
+    options.log?.(workerLogMessage("idle worker evicted"), {
+      level: "INFO",
+      workerID: entry.worker.id,
+      sessionID,
+      capacity,
+    })
+    // Await the same in-flight close a later retire will join: eviction is not
+    // complete until the isolate has exited and its lease release has landed.
+    await entry.worker.terminate().catch(() => undefined)
+  }
+
+  const enforce = async (): Promise<void> => {
+    if (enforcing) {
+      recheck = true
+      return
+    }
+    enforcing = true
+    try {
+      do {
+        recheck = false
+        while (idle.size > capacity) {
+          const oldest = idle.entries().next()
+          if (oldest.done) break
+          const [workerID, entry] = oldest.value
+          idle.delete(workerID)
+          if (entry.terminated || active.has(workerID)) continue
+          // Background work must outlive an idle turn; keep one worker alive even
+          // above the cap rather than killing a running job. Its next settlement
+          // (or the dispatcher's idle reap) revisits the cap.
+          if (entry.sessionID !== undefined && entry.worker.hasActiveWork !== undefined) {
+            let background = false
+            try {
+              background = await entry.worker.hasActiveWork(entry.sessionID)
+            } catch {
+              background = false
+            }
+            if (background) {
+              if (!entry.terminated && !active.has(workerID)) idle.set(workerID, entry)
+              break
+            }
+            // A new run may have started while the probe was in flight.
+            if (entry.terminated || active.has(workerID)) continue
+          }
+          await evict(entry)
+        }
+      } while (recheck)
+    } finally {
+      enforcing = false
+    }
+  }
+
+  const track = (worker: ExecutorWorker): ExecutorWorker => {
+    const entry: Tracked = { worker, sessionID: undefined, terminated: false }
+    const wrapped: ExecutorWorker = {
+      get id() {
+        return worker.id
+      },
+      get alive() {
+        return !entry.terminated && worker.alive
+      },
+      execute: async (run) => {
+        if (entry.terminated) throw new Error(`executor worker ${worker.id} was evicted while idle`)
+        active.add(worker.id)
+        idle.delete(worker.id)
+        try {
+          return await worker.execute(run)
+        } finally {
+          active.delete(worker.id)
+          if (!entry.terminated) {
+            entry.sessionID = run.sessionID
+            idle.delete(worker.id)
+            idle.set(worker.id, entry)
+            void enforce()
+          }
+        }
+      },
+      cancel: (sessionID) => worker.cancel(sessionID),
+      assertNotBusy: (sessionID) => worker.assertNotBusy(sessionID),
+      resultFor: (sessionID) => worker.resultFor(sessionID),
+      terminate: async () => {
+        if (!entry.terminated) {
+          entry.terminated = true
+          tracked.delete(worker.id)
+          idle.delete(worker.id)
+          active.delete(worker.id)
+        }
+        await worker.terminate()
+      },
+      ...(worker.hasActiveWork === undefined
+        ? {}
+        : { hasActiveWork: (sessionID: SessionID) => worker.hasActiveWork!(sessionID) }),
+      ...(worker.cancelBoot === undefined ? {} : { cancelBoot: () => worker.cancelBoot!() }),
+      ...(worker.cancelPort === undefined ? {} : { cancelPort: worker.cancelPort }),
+      ...(worker.awaitEgress === undefined
+        ? {}
+        : { awaitEgress: (sessionID: SessionID) => worker.awaitEgress!(sessionID) }),
+    }
+    tracked.set(worker.id, entry)
+    return wrapped
+  }
+
+  return {
+    capacity,
+    get idle() {
+      return idle.size
+    },
+    get evictions() {
+      return evictions
+    },
+    track,
+    forget: (workerID) => {
+      tracked.delete(workerID)
+      idle.delete(workerID)
+      active.delete(workerID)
+    },
+    clear: () => {
+      tracked.clear()
+      idle.clear()
+      active.clear()
+    },
+  }
+}
+
+/** A pool bounded at {@link resolveIdleWorkerCapacity} idle isolates by default. */
+export interface IdleBoundedExecutorWorkerPool extends ExecutorWorkerPool {
+  readonly idleWorkers: number
+  /** Alias for {@link idleWorkers}, for callers that read the count directly. */
+  readonly idleCount: number
+  readonly idleCapacity: number
+  readonly idleEvictions: number
+}
+
+/** Publish the idle-cap counters without changing the pool's worker surface. */
+function withIdleIsolateCap(pool: ExecutorWorkerPool, cap: IdleIsolateCap): IdleBoundedExecutorWorkerPool {
+  return {
+    get workers() {
+      return pool.workers
+    },
+    spawn: (id?: number) => pool.spawn(id),
+    releaseSession: (sessionID, workerID) => {
+      if (workerID !== undefined) cap.forget(workerID)
+      pool.releaseSession?.(sessionID, workerID)
+    },
+    terminateAll: async () => {
+      cap.clear()
+      await pool.terminateAll()
+    },
+    byID: (id) => pool.byID(id),
+    resultFor: (sessionID) => pool.resultFor(sessionID),
+    get idleWorkers() {
+      return cap.idle
+    },
+    get idleCount() {
+      return cap.idle
+    },
+    get idleCapacity() {
+      return cap.capacity
+    },
+    get idleEvictions() {
+      return cap.evictions
+    },
+  }
+}
+
+/**
  * The mutable materialization state shared by every worker whose isolate is
- * created on first use. The `materialize` policy owns the *why* (a lazy factory
- * ignores the session; a session-bound factory rebinds); this helper owns the
- * worker surface and the terminate race.
+ * created on first use. The `materialize` policy owns the *why* (a session-bound
+ * factory rebinds); this helper owns the worker surface and the terminate race.
  */
 interface MaterializingWorkerState {
   /** The live isolate, or `undefined` before the first materialization. */
@@ -892,11 +1237,15 @@ interface MaterializingWorkerState {
  */
 function createMaterializingExecutorWorker(
   id: number,
-  materialize: (sessionID: SessionID, state: MaterializingWorkerState) => Promise<ExecutorWorker>,
+  materialize: (run: import("./execute").ExecutorRun, state: MaterializingWorkerState) => Promise<ExecutorWorker>,
   log: WorkerLogger = noopWorkerLogger,
   cap?: WorkerCap,
 ): ExecutorWorker {
   const state: MaterializingWorkerState = { inner: undefined, terminated: false, materializing: undefined }
+  // One close for the whole generation. A repeated terminate (idle eviction,
+  // then the dispatcher's dead-idle replacement) joins this promise instead of
+  // returning before the isolate exits and its lease release lands.
+  let termination: Promise<void> | undefined
   const worker: ExecutorWorker = {
     id,
     get alive() {
@@ -909,7 +1258,7 @@ function createMaterializingExecutorWorker(
       // awaits a foreground `task` child never deadlocks on the parent's slot.
       const release = await cap?.acquire(run.depth)
       try {
-        return await (await materialize(run.sessionID, state)).execute(run)
+        return await (await materialize(run, state)).execute(run)
       } finally {
         release?.()
       }
@@ -919,72 +1268,34 @@ function createMaterializingExecutorWorker(
     assertNotBusy: (sessionID) =>
       state.inner === undefined ? Promise.resolve(false) : state.inner.assertNotBusy(sessionID),
     resultFor: (sessionID) => state.inner?.resultFor(sessionID),
+    // The materialized isolate owns the real probes. Forward them so the idle
+    // cap can see background work; before materialization (or on a minimal
+    // inner) the safe defaults are "no work" and "nothing to await".
+    hasActiveWork: (sessionID) => state.inner?.hasActiveWork?.(sessionID) ?? Promise.resolve(false),
+    awaitEgress: (sessionID) => state.inner?.awaitEgress?.(sessionID) ?? Promise.resolve(),
     cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID), log }),
-    terminate: async () => {
+    terminate: () => {
+      if (termination !== undefined) return termination
       state.terminated = true
+      const materializing = state.materializing
       state.materializing = undefined
       const current = state.inner
       state.inner = undefined
-      if (current !== undefined) await current.terminate()
+      termination = (async () => {
+        if (current !== undefined) {
+          await current.terminate()
+          return
+        }
+        // A retire raced the first materialization: the worker it is about to
+        // publish must still be closed (orderly) instead of leaked.
+        if (materializing !== undefined) {
+          await materializing.then((worker) => worker.terminate()).catch(() => undefined)
+        }
+      })()
+      return termination
     },
   }
   return worker
-}
-
-/**
- * Wrap a worker factory so the underlying isolate is created on first use. The
- * dispatcher reads `alive`/builds slots at construction, so a lazy worker reports
- * itself alive (and free) before it exists; the isolate appears on the first
- * `execute`. The factory may be async (the production init is resolved on first
- * dispatch).
- */
-export function createLazyExecutorWorker(
-  id: number,
-  create: LazyExecutorWorkerFactory,
-  log: WorkerLogger = noopWorkerLogger,
-  cap?: WorkerCap,
-): ExecutorWorker {
-  return createMaterializingExecutorWorker(
-    id,
-    async (_sessionID, state) => {
-      if (state.terminated) throw new Error(`executor worker ${id} is terminated`)
-      if (state.inner !== undefined) return state.inner
-      state.materializing ??= Promise.resolve()
-        .then(create)
-        .then((worker) => {
-          // A terminate raced the materialisation: never publish a live worker.
-          if (state.terminated) {
-            void worker.terminate()
-            throw new Error(`executor worker ${id} is terminated`)
-          }
-          state.inner = worker
-          return worker
-        })
-      return state.materializing
-    },
-    log,
-    cap,
-  )
-}
-
-/** Build one worker on first use; may be async (the production init is resolved on dispatch). */
-export type LazyExecutorWorkerFactory = () => ExecutorWorker | Promise<ExecutorWorker>
-
-export interface LazyExecutorWorkerPoolOptions {
-  /** Build one worker on first use. */
-  readonly create: (id: number) => ExecutorWorker | Promise<ExecutorWorker>
-  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
-  readonly log?: WorkerLogger
-  /** Concurrent-running cap; defaults to the CPU-core count. */
-  readonly maxRunning?: number
-}
-
-/** A pool whose workers spawn on first use (per session). */
-export function createLazyExecutorWorkerPool(options: LazyExecutorWorkerPoolOptions): ExecutorWorkerPool {
-  const cap = createWorkerCap(options.maxRunning ?? os.availableParallelism())
-  return createExecutorWorkerPool({
-    spawn: (id) => createLazyExecutorWorker(id, () => options.create(id), options.log, cap),
-  })
 }
 
 // ---------------------------------------------------------------------------
@@ -1115,7 +1426,7 @@ export function logRunIdleTimeoutWarning(
  */
 export type SessionWorkerInitSource =
   | SessionWorkerInit
-  | ((sessionID?: SessionID) => SessionWorkerInit | Promise<SessionWorkerInit>)
+  | ((sessionID?: SessionID, model?: WorkerModelSelection) => SessionWorkerInit | Promise<SessionWorkerInit>)
 
 export interface ProductionWorkerPoolOptions {
   readonly init: SessionWorkerInitSource
@@ -1138,8 +1449,24 @@ export interface ProductionWorkerPoolOptions {
    * per-session instance/context so those maps cannot grow without bound.
    */
   readonly onSessionRebound?: (sessionID: SessionID) => void
+  /**
+   * Full retirement for a same-session generation change (a mid-session model
+   * switch). The pool replaces the isolate in place, so the dispatcher's
+   * `retireWorker` never sees it; this hook runs the hub's authoritative
+   * retirement (lost in-flight calls, ports, pending permission/question
+   * requests, and the retired generation's lease release) before the successor
+   * boots.
+   */
+  readonly onGenerationRetired?: (sessionID: SessionID, workerID?: number) => void | Promise<void>
   /** Pool-side cleanup when a session's worker is retired (init cache eviction). */
   readonly onSessionReleased?: (sessionID: SessionID) => void
+  /**
+   * Cheap generation probe: the model identity a session will run, read without
+   * building the full init. When absent, the init is resolved to learn the model
+   * (one expensive read per dispatch); production supplies this so an unchanged
+   * generation reuses the cached init.
+   */
+  readonly generationOf?: (sessionID: SessionID, model?: WorkerModelSelection) => string | Promise<string>
   /** One global spawn permit shared by every isolate this pool spawns/re-spawns. */
   readonly spawnGate?: SpawnGateHandle
   /** Boot-ready deadline; see {@link BunExecutorTransportOptions.bootTimeoutMs}. */
@@ -1152,6 +1479,15 @@ export interface ProductionWorkerPoolOptions {
   readonly onPhase?: (sessionID: SessionID, phase: "boot" | "materialize") => void
   /** Concurrent-running cap; defaults to the CPU-core count. */
   readonly maxRunning?: number
+  /** Idle isolates retained by the pool; defaults to {@link resolveIdleWorkerCapacity}. */
+  readonly maxIdleWorkers?: number
+  /**
+   * Run the full retirement for an idle isolate the cap evicts. The production
+   * hub wires this to the dispatcher: dropping only the pool's local session
+   * state would leave the worker's hub ports, pending asks, and durable lease
+   * live behind an exit. Awaited before the eviction terminates the isolate.
+   */
+  readonly onIdleEvicted?: (sessionID: SessionID, workerID: number) => void | Promise<void>
   /**
    * Awaited before each isolate spawn (the hub's off-loop schema gate). It must
    * run before `bun:sqlite` opens the worker's connection, including when a
@@ -1160,8 +1496,27 @@ export interface ProductionWorkerPoolOptions {
   readonly beforeSpawn?: () => Promise<void>
 }
 
-/** Build one isolate for `sessionID` under a fixed worker id. */
-export type SessionBoundSpawner = (id: number, sessionID: SessionID) => Promise<ExecutorWorker>
+/** One resolved worker generation: its identity key and the init that boots it. */
+export interface WorkerGeneration {
+  readonly generation: string
+  /**
+   * The init resolved for this generation. Present when the generation probe
+   * resolved it; a probe that only derives a cheap key may omit it, in which
+   * case the spawner resolves the init itself.
+   */
+  readonly init?: SessionWorkerInit
+}
+
+/**
+ * Build one isolate for `sessionID` under a fixed worker id. The generation's
+ * resolved init rides along so the spawn uses exactly the init the generation
+ * probe keyed on (never a second read that could have moved).
+ */
+export type SessionBoundSpawner = (
+  id: number,
+  sessionID: SessionID,
+  init?: SessionWorkerInit,
+) => Promise<ExecutorWorker>
 
 /**
  * A worker whose isolate is bound to ONE dispatched session. A worker isolate
@@ -1175,52 +1530,80 @@ export function createSessionBoundExecutorWorker(
   id: number,
   spawnFor: SessionBoundSpawner,
   log: WorkerLogger = noopWorkerLogger,
-  onRetire?: (sessionID: SessionID) => void,
+  /**
+   * Runs when this isolate rebinds to a different session. The old session's
+   * hub-side state is no longer reachable from this worker.
+   */
+  onSessionRebound?: (sessionID: SessionID) => unknown,
   cap?: WorkerCap,
   /**
-   * The generation key for a dispatch. A changed key (the session's persisted
-   * model changed) retires the isolate even though the session id is the same,
+   * The generation for a dispatch: a changed key (a different requested or
+   * persisted model) retires the isolate even though the session id is the same,
    * so a legitimate mid-session model switch rebuilds the worker instead of
    * surfacing `WorkerModelMismatchError` on the next turn.
    */
-  generationOf?: (sessionID: SessionID) => Promise<string>,
+  generationOf?: (sessionID: SessionID, model?: import("./execute").WorkerRunModel) => Promise<WorkerGeneration>,
+  /**
+   * Full retirement for a same-session generation change. Awaited after the old
+   * isolate exits and before the successor spawns, so the successor never boots
+   * against the retired generation's live lease or hub-side state.
+   */
+  onGenerationRetired?: (sessionID: SessionID, workerID?: number) => void | Promise<void>,
 ): ExecutorWorker {
   let boundSession: SessionID | undefined
   let boundGeneration: string | undefined
   return createMaterializingExecutorWorker(
     id,
-    async (sessionID, state) => {
+    async (run, state) => {
+      const sessionID = run.sessionID
       if (state.terminated) throw new Error(`executor worker ${id} is terminated`)
-      const generation = generationOf === undefined ? sessionID : await generationOf(sessionID)
+      const resolved = generationOf === undefined ? { generation: sessionID } : await generationOf(sessionID, run.model)
+      const generation = resolved.generation
       if (state.inner !== undefined && boundSession === sessionID && boundGeneration === generation) {
         return state.inner
       }
       const previousSession = boundSession
+      const previousGeneration = boundGeneration
       const previous = state.inner
       state.inner = undefined
       boundSession = sessionID
       boundGeneration = generation
-      // A worker rebinding from one session to another is the observable signal
-      // that the isolate is being retired and rebuilt for a different model.
-      if (previousSession !== undefined && previousSession !== sessionID) {
-        // The old session's isolate is being retired; let the hub release its
-        // per-session state before the new session's init is resolved.
-        onRetire?.(previousSession)
-        log(workerLogMessage("worker rebound"), {
+      // Retire the previous isolate for ANY generation change, including the
+      // same session moving to a new model. A rebind releases the old session's
+      // state; a same-session generation change runs the hub's full retirement
+      // path (the dispatcher never sees an in-place replacement).
+      if (previousSession !== undefined && previous !== undefined) {
+        const rebound = previousSession !== sessionID
+        log(workerLogMessage(rebound ? "worker rebound" : "worker generation changed"), {
           level: "INFO",
           workerID: id,
-          fromSession: previousSession,
-          toSession: sessionID,
-          // The rebound-to session is always defined here (the branch guards
-          // `previousSession !== undefined`), so the log seam hoists it into the
-          // message prefix. `fromSession`/`toSession` stay for backward compat.
+          ...(rebound
+            ? { fromSession: previousSession, toSession: sessionID }
+            : { fromGeneration: previousGeneration, toGeneration: generation }),
           sessionID,
         })
       }
+      const retiredSession = previousSession
+      const retiredIsRebind = retiredSession !== undefined && retiredSession !== sessionID
       state.materializing = Promise.resolve()
         // Retire the old isolate first so two models never share one worker.
         .then(() => previous?.terminate().catch(() => undefined))
-        .then(() => spawnFor(id, sessionID))
+        .then(async () => {
+          if (retiredSession === undefined || previous === undefined) return
+          try {
+            if (retiredIsRebind) await onSessionRebound?.(retiredSession)
+            else await onGenerationRetired?.(retiredSession, id)
+          } catch (error) {
+            // Cleanup must never fail the new run; the successor still boots.
+            log(workerLogMessage("worker retirement callback failed"), {
+              level: "WARN",
+              workerID: id,
+              sessionID: retiredSession,
+              error: error instanceof Error ? error.message : String(error),
+            })
+          }
+        })
+        .then(() => spawnFor(id, sessionID, resolved.init))
         .then((worker) => {
           if (state.terminated) {
             void worker.terminate()
@@ -1237,45 +1620,125 @@ export function createSessionBoundExecutorWorker(
 }
 
 /**
+ * The production pool's init bookkeeping. The Wave-6 `makeProduction` service
+ * keeps this state in a `SynchronizedRef`; the direct factory keeps the same
+ * operations over plain maps, so both paths resolve in exactly the same order.
+ */
+interface ProductionInitState {
+  inFlight(key: string): Promise<SessionWorkerInit> | undefined
+  startInFlight(key: string, value: Promise<SessionWorkerInit>): void
+  finishInFlight(key: string): void
+  clearInFlight(sessionID: SessionID): void
+  cached(sessionID: SessionID): WorkerGeneration | undefined
+  cache(sessionID: SessionID, generation: WorkerGeneration): void
+  forget(sessionID: SessionID): void
+}
+
+function mapProductionInitState(): ProductionInitState {
+  const inFlight = new Map<string, Promise<SessionWorkerInit>>()
+  const cache = new Map<SessionID, WorkerGeneration>()
+  return {
+    inFlight: (key) => inFlight.get(key),
+    startInFlight: (key, value) => {
+      inFlight.set(key, value)
+    },
+    finishInFlight: (key) => {
+      inFlight.delete(key)
+    },
+    clearInFlight: (sessionID) => {
+      for (const key of inFlight.keys()) if (key.startsWith(`${sessionID}:`)) inFlight.delete(key)
+    },
+    cached: (sessionID) => cache.get(sessionID),
+    cache: (sessionID, generation) => {
+      cache.set(sessionID, generation)
+    },
+    forget: (sessionID) => {
+      cache.delete(sessionID)
+    },
+  }
+}
+
+/**
  * Production `ExecutorWorkerPool` over the session-worker entry. Lazy: building
  * the pool spawns no isolates. Each worker resolves its init for the session it
  * is asked to run (and rebinds when that session changes), so multiple sessions
  * with distinct models share a generation without a `WorkerModelMismatchError`.
  */
-export function createProductionWorkerPool(options: ProductionWorkerPoolOptions): ExecutorWorkerPool {
+export function createProductionWorkerPool(options: ProductionWorkerPoolOptions): IdleBoundedExecutorWorkerPool {
+  return createProductionWorkerPoolWithState(options, mapProductionInitState())
+}
+
+function createProductionWorkerPoolWithState(
+  options: ProductionWorkerPoolOptions,
+  state: ProductionInitState,
+): IdleBoundedExecutorWorkerPool {
   const log = options.log ?? noopWorkerLogger
   // Default the liveness watchdog ON unless the caller or env explicitly opts out.
   const runIdleTimeoutMs = resolveRunIdleTimeoutMs(options)
   logRunIdleTimeoutWarning(log, options)
-  const resolveSource: (sessionID?: SessionID) => SessionWorkerInit | Promise<SessionWorkerInit> =
+  const resolveSource: (
+    sessionID?: SessionID,
+    model?: WorkerModelSelection,
+  ) => SessionWorkerInit | Promise<SessionWorkerInit> =
     typeof options.init === "function" ? options.init : () => options.init as SessionWorkerInit
-  // Re-resolve the init on every dispatch (in-flight deduped): the persisted
-  // model may change mid-session, and a stale boot model would raise
-  // `WorkerModelMismatchError` on the next turn.
-  const initInFlight = new Map<string, Promise<SessionWorkerInit>>()
-  const resolveInit = (sessionID: SessionID): Promise<SessionWorkerInit> => {
-    const existing = initInFlight.get(sessionID)
+  const modelKey = (model: WorkerModelSelection): string => `${model.providerID}/${model.modelID}`
+  // In-flight dedup is keyed by the exact generation request, so two concurrent
+  // first turns for one model share one build while a model switch never joins
+  // the old build.
+  const resolveInit = (sessionID: SessionID, model?: WorkerModelSelection): Promise<SessionWorkerInit> => {
+    const key = `${sessionID}:${model === undefined ? "" : modelKey(model)}`
+    const existing = state.inFlight(key)
     if (existing !== undefined) return existing
-    const resolved = Promise.resolve().then(() => resolveSource(sessionID))
-    initInFlight.set(sessionID, resolved)
+    const resolved = Promise.resolve().then(() => resolveSource(sessionID, model))
+    state.startInFlight(key, resolved)
     resolved.then(
-      () => initInFlight.delete(sessionID),
-      () => initInFlight.delete(sessionID),
+      () => state.finishInFlight(key),
+      () => state.finishInFlight(key),
     )
     return resolved
   }
-  // The init resolved by the generation probe, consumed by the spawn in the same
-  // materialization so the persisted model is read once per dispatch.
-  const pendingInit = new Map<string, SessionWorkerInit>()
-  const generationOf = async (sessionID: SessionID): Promise<string> => {
+  // `(sessionID, generation)` is the init cache: a repeated turn on the same
+  // generation never rebuilds the graph/plugin/model bootstrap.
+  const generationOf = async (
+    sessionID: SessionID,
+    requested?: import("./execute").WorkerRunModel,
+  ): Promise<WorkerGeneration> => {
+    const cached = state.cached(sessionID)
+    const requestedKey = requested === undefined ? undefined : modelKey(requested)
+    // The requested model is the authoritative generation key: it is the model
+    // this run will actually use, even before the session row catches up.
+    if (requestedKey !== undefined) {
+      if (cached?.generation === requestedKey && cached.init !== undefined) return cached
+      const init = await resolveInit(sessionID, requested)
+      const entry: WorkerGeneration = { generation: requestedKey, init }
+      state.cache(sessionID, entry)
+      return entry
+    }
+    // No requested model: use the cheap probe when supplied (production). It
+    // returns the persisted/current model identity without rebuilding the init.
+    if (options.generationOf !== undefined) {
+      const generation = await options.generationOf(sessionID)
+      if (cached?.generation === generation && cached.init !== undefined) return cached
+      // The probe proved this is a NEW generation, so the previous init is
+      // stale by definition. Always rebuild it (production resolves the last
+      // user message's model, never the lagging `session.model` row).
+      const init = await resolveInit(sessionID)
+      const entry: WorkerGeneration = { generation, init }
+      state.cache(sessionID, entry)
+      return entry
+    }
+    // Last resort for a caller that supplies neither: resolve the init and key
+    // on its resolved model (correct, but one build per dispatch).
     const init = await resolveInit(sessionID)
-    pendingInit.set(sessionID, init)
-    return `${init.model.providerID}/${init.model.modelID}`
+    const generation = modelKey(init.model)
+    if (cached?.generation === generation) return cached
+    const entry: WorkerGeneration = { generation, init }
+    state.cache(sessionID, entry)
+    return entry
   }
-  const spawnFor: SessionBoundSpawner = async (id, sessionID) => {
+  const spawnFor: SessionBoundSpawner = async (id, sessionID, resolvedInit) => {
     await options.beforeSpawn?.()
-    const init = pendingInit.get(sessionID) ?? (await resolveInit(sessionID))
-    pendingInit.delete(sessionID)
+    const init = resolvedInit ?? (await resolveInit(sessionID))
     return spawnBunExecutorWorker(id, {
       entry: options.entry ?? SESSION_WORKER_ENTRY,
       // Ship the pool id so the worker's `pid-report` frames are keyed to this
@@ -1305,15 +1768,40 @@ export function createProductionWorkerPool(options: ProductionWorkerPoolOptions)
     })
   }
   const cap = createWorkerCap(options.maxRunning ?? os.availableParallelism())
-  return createExecutorWorkerPool({
-    spawn: (id) => createSessionBoundExecutorWorker(id, spawnFor, log, options.onSessionRebound, cap, generationOf),
+  let pool: ExecutorWorkerPool | undefined
+  const idleCap = createIdleIsolateCap({
+    capacity: options.maxIdleWorkers ?? resolveIdleWorkerCapacity(),
+    log,
+    // An eviction is a generation retirement, not a pool-local cache drop. When
+    // the hub supplies the hook it owns the whole retirement (including the
+    // dispatcher's registry entry and the retired lease); otherwise keep the
+    // local release for a standalone pool.
+    onEvict: (entry) =>
+      options.onIdleEvicted === undefined
+        ? pool?.releaseSession?.(entry.sessionID, entry.worker.id)
+        : options.onIdleEvicted(entry.sessionID, entry.worker.id),
+  })
+  pool = createExecutorWorkerPool({
+    spawn: (id) =>
+      idleCap.track(
+        createSessionBoundExecutorWorker(
+          id,
+          spawnFor,
+          log,
+          options.onSessionRebound,
+          cap,
+          generationOf,
+          options.onGenerationRetired,
+        ),
+      ),
     onSessionReleased: (sessionID) => {
-      initInFlight.delete(sessionID)
-      pendingInit.delete(sessionID)
+      state.clearInFlight(sessionID)
+      state.forget(sessionID)
       options.onSessionReleased?.(sessionID)
     },
     log,
   })
+  return withIdleIsolateCap(pool, idleCap)
 }
 
 /** The port-transfer sinks a production pool routes worker messages to. */
@@ -1338,3 +1826,147 @@ export type ProductionPoolFactory = (
 export function withSessionWorkerPorts(init: SessionWorkerInit): SessionWorkerInit {
   return { ...init, capabilities: { ...init.capabilities, sessionWorkerPorts: true } }
 }
+
+// ---------------------------------------------------------------------------
+// WorkerPools service (Wave-6 additive adapter over the Promise pool).
+// ---------------------------------------------------------------------------
+
+/** The counters {@link Interface.stats} publishes without changing the pool. */
+export interface WorkerPoolsStats {
+  readonly workers: number
+  readonly idleWorkers: number
+  readonly idleCapacity: number
+  readonly idleEvictions: number
+}
+
+/** Optional counters for a pool that is not an {@link IdleBoundedExecutorWorkerPool}. */
+export interface FromPoolOptions {
+  readonly idle?: () => Pick<WorkerPoolsStats, "idleWorkers" | "idleCapacity" | "idleEvictions">
+}
+
+/**
+ * The Effect-facing pool surface. `executorPool` stays the structural Promise
+ * pool the dispatcher and hub already consume; every other member lifts one of
+ * its operations into the service idiom without changing the adapter.
+ */
+export interface Interface {
+  readonly executorPool: ExecutorWorkerPool
+  readonly spawn: (id?: number) => Effect.Effect<ExecutorSessionWorker>
+  readonly releaseSession: (sessionID: SessionID, workerID?: number) => Effect.Effect<void>
+  readonly byID: (id: number) => Effect.Effect<ExecutorWorker | undefined>
+  readonly resultFor: (sessionID: SessionID) => Effect.Effect<SessionExecutionResult | undefined>
+  readonly workers: Effect.Effect<ReadonlyArray<ExecutorSessionWorker>>
+  readonly terminateAll: () => Effect.Effect<void>
+  readonly stats: Effect.Effect<WorkerPoolsStats>
+}
+
+export class Service extends Context.Service<Service, Interface>()("@opencode/WorkerPools") {}
+
+function idleStats(pool: ExecutorWorkerPool): Pick<WorkerPoolsStats, "idleWorkers" | "idleCapacity" | "idleEvictions"> {
+  const bounded = pool as Partial<IdleBoundedExecutorWorkerPool>
+  return {
+    idleWorkers: bounded.idleWorkers ?? 0,
+    idleCapacity: bounded.idleCapacity ?? 0,
+    idleEvictions: bounded.idleEvictions ?? 0,
+  }
+}
+
+/** Adapt an existing structural pool (the production pool or a test fake). */
+export function fromPool(pool: ExecutorWorkerPool, options: FromPoolOptions = {}): Interface {
+  // One termination per adapter: a second concurrent call joins the first
+  // instead of posting a second shutdown wave.
+  let terminating: Promise<void> | undefined
+  const stats = (): WorkerPoolsStats => ({
+    workers: pool.workers.length,
+    ...(options.idle?.() ?? idleStats(pool)),
+  })
+  return {
+    executorPool: pool,
+    spawn: (id) => Effect.sync(() => pool.spawn(id)),
+    releaseSession: (sessionID, workerID) =>
+      Effect.sync(() => {
+        pool.releaseSession?.(sessionID, workerID)
+      }),
+    byID: (id) => Effect.sync(() => pool.byID(id)),
+    resultFor: (sessionID) => Effect.sync(() => pool.resultFor(sessionID)),
+    workers: Effect.sync(() => pool.workers),
+    terminateAll: () =>
+      Effect.suspend(() => {
+        const joined = (terminating ??= Promise.resolve(pool.terminateAll()))
+        return Effect.promise(() => joined)
+      }),
+    stats: Effect.sync(stats),
+  }
+}
+
+type ProductionInitMaps = {
+  readonly inFlight: Map<string, Promise<SessionWorkerInit>>
+  readonly cache: Map<SessionID, WorkerGeneration>
+}
+
+/**
+ * Effect-owned production init state. Reads and pure modifications stay
+ * synchronous, so the adapter observes exactly the ordering the plain-map
+ * factory has while the service owns the state through a `SynchronizedRef`.
+ */
+function synchronizedProductionInitState(
+  ref: SynchronizedRef.SynchronizedRef<ProductionInitMaps>,
+): ProductionInitState {
+  const update = (change: (maps: ProductionInitMaps) => ProductionInitMaps): void => {
+    Effect.runSync(SynchronizedRef.modify(ref, (maps) => [undefined, change(maps)] as const))
+  }
+  const current = (): ProductionInitMaps => SynchronizedRef.getUnsafe(ref)
+  return {
+    inFlight: (key) => current().inFlight.get(key),
+    startInFlight: (key, value) => update((maps) => ({ ...maps, inFlight: new Map(maps.inFlight).set(key, value) })),
+    finishInFlight: (key) =>
+      update((maps) => {
+        const inFlight = new Map(maps.inFlight)
+        inFlight.delete(key)
+        return { ...maps, inFlight }
+      }),
+    clearInFlight: (sessionID) =>
+      update((maps) => {
+        const inFlight = new Map(maps.inFlight)
+        for (const key of inFlight.keys()) if (key.startsWith(`${sessionID}:`)) inFlight.delete(key)
+        return { ...maps, inFlight }
+      }),
+    cached: (sessionID) => current().cache.get(sessionID),
+    cache: (sessionID, generation) =>
+      update((maps) => ({ ...maps, cache: new Map(maps.cache).set(sessionID, generation) })),
+    forget: (sessionID) =>
+      update((maps) => {
+        const cache = new Map(maps.cache)
+        cache.delete(sessionID)
+        return { ...maps, cache }
+      }),
+  }
+}
+
+/**
+ * Build the production {@link Interface}. Lazy like the factory it composes: no
+ * isolate exists until `spawn`/`execute`; the returned scope terminates the pool.
+ */
+export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Effect<Interface, never, Scope.Scope> {
+  return Effect.gen(function* () {
+    const state = yield* SynchronizedRef.make<ProductionInitMaps>({
+      inFlight: new Map(),
+      cache: new Map(),
+    })
+    const pools = fromPool(createProductionWorkerPoolWithState(options, synchronizedProductionInitState(state)))
+    yield* Effect.addFinalizer(() => pools.terminateAll())
+    return pools
+  })
+}
+
+/** Install a production `WorkerPools` implementation into the context. */
+export function layer(options: ProductionWorkerPoolOptions): Layer.Layer<Service> {
+  return Layer.effect(Service, makeProduction(options))
+}
+
+/** The unbound graph node for {@link Service}; wave 6 does not wire a consumer. */
+export function node(options: ProductionWorkerPoolOptions): LayerNode.Node<Service, never, undefined> {
+  return LayerNode.make({ service: Service, layer: layer(options), deps: [] })
+}
+
+export * as WorkerPools from "./worker-pools"

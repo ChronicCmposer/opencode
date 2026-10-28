@@ -12,6 +12,7 @@
 // progress is observable across the port rather than only implied by the events.
 
 import { ackFrame, type EventsFrame, type EventV2Event } from "@/session/worker/frame"
+import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "@/session/worker/log"
 
 import { createCoalescer, type Coalescer, type CoalescerScheduler } from "./coalesce"
 import { durableMetaOf, encodeFrame, encodeFrameChunks, type DurableMeta } from "./frame"
@@ -21,6 +22,8 @@ export interface EgressSenderOptions {
   readonly windowMs?: number
   readonly maxBatch?: number
   readonly scheduler?: CoalescerScheduler
+  /** Structured logger; an oversized advisory frame is dropped with a warning. */
+  readonly log?: WorkerLogger
 }
 
 export interface EgressSender {
@@ -37,6 +40,7 @@ export interface EgressSender {
 }
 
 export function createEgressSender(options: EgressSenderOptions): EgressSender {
+  const log = options.log ?? noopWorkerLogger
   const coalescer: Coalescer = createCoalescer({
     windowMs: options.windowMs,
     maxBatch: options.maxBatch,
@@ -46,8 +50,21 @@ export function createEgressSender(options: EgressSenderOptions): EgressSender {
       // into chunks that each fit the 4 MiB transport cap. A batch that merely
       // totals too much is split, never dropped; a DURABLE frame whose body alone
       // exceeds the cap crosses as its blob-position reference (core already
-      // offloaded the body), and a non-durable one stays a typed error.
-      const chunks = encodeFrameChunks(frames)
+      // offloaded the body), and an advisory non-durable one is dropped with a
+      // warning so it cannot take the rest of the batch and its ack with it.
+      const chunks = encodeFrameChunks(frames, {
+        onDrop: (frame, error) => {
+          log(
+            workerLogMessage("dropped oversized non-durable egress frame"),
+            {
+              kind: frame.kind,
+              byteLength: error.byteLength,
+              limit: error.limit,
+            },
+            "warn",
+          )
+        },
+      })
       for (const chunk of chunks) {
         for (const text of chunk) options.port.postMessage(text)
       }

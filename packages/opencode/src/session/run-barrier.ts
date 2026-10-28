@@ -14,9 +14,12 @@
 // Phases settle only when their real observation is reported. A begun run opens
 // an unreported report set; `RunBarrierRun` accepts one report per phase from the
 // code that actually observed it. A zero-tool run settles `tools` explicitly
-// through `noTools`; it is never inferred from the run having started. A missing
-// report is a typed `RunBarrierTimeout` (or a `RunBarrierReportError` refusal for
-// an invalid/stale report), and cancellation wins over every drain.
+// through `noTools`; it is never inferred from the run having started. A run that
+// commits nothing (a shell turn, an early loop exit, a compaction stop) settles
+// both commit-side phases through `noCommit`; that is an explicit `none`, not a
+// fabricated commit. A missing report is a typed `RunBarrierTimeout` (or a
+// `RunBarrierReportError` refusal for an invalid/stale report), and cancellation
+// wins over every drain.
 //
 // The barrier is per Session and bounded at 5 s. Expiry raises the typed
 // `RunBarrierTimeout` and leaves the Session in `timed-out`, so the next run is
@@ -46,6 +49,8 @@ export type RunBarrierObservation =
   | { readonly kind: "tool"; readonly callID: string }
   | { readonly kind: "tool-none" }
   | { readonly kind: "promotion"; readonly outcome: RunBarrierPromotionOutcome }
+  /** The explicit zero-commit settlement: nothing was committed, nothing projected. */
+  | { readonly kind: "none" }
 
 export interface RunBarrierPhaseReport {
   readonly sessionID: string
@@ -66,6 +71,13 @@ export interface RunBarrierRun {
   tool(callID: string): boolean
   /** Settle a run that observed no tool calls; never inferred from run start. */
   noTools(): boolean
+  /**
+   * Settle a run that committed nothing (a shell turn, a loop that exited
+   * before its first model step, a compaction stop). The commit-side phases are
+   * reported as `none`; this never fabricates a commit. A run that already
+   * reported a real commit is refused.
+   */
+  noCommit(): boolean
   promotion(outcome: RunBarrierPromotionOutcome): boolean
   reported(phase: RunBarrierPhase): boolean
   /** Phases whose report has not arrived yet, in canonical order. */
@@ -211,8 +223,8 @@ interface RunRecord {
 }
 
 const OBSERVATION_KINDS: Record<RunBarrierPhase, readonly RunBarrierObservation["kind"][]> = {
-  commits: ["commit"],
-  projectors: ["projector"],
+  commits: ["commit", "none"],
+  projectors: ["projector", "none"],
   tools: ["tool", "tool-none"],
   promotion: ["promotion"],
 }
@@ -258,6 +270,8 @@ function validateReport(sessionID: string, report: RunBarrierPhaseReport): RunBa
       requireText(observation.callID, "callID", sessionID)
       break
     case "tool-none":
+      break
+    case "none":
       break
     case "promotion":
       if (
@@ -316,8 +330,9 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
         throw error
       }
       const observed = record.kinds.get(report.phase)
-      // `tools` has two possible observations; a run cannot claim both an
-      // explicit zero-tool settle and a real tool settlement.
+      // Some phases have more than one possible observation (`tools` and the
+      // commit-side phases accept an explicit zero/none settle). A run cannot
+      // claim a real observation and its explicit absence for the same phase.
       if (observed !== undefined && observed !== report.observation.kind) {
         return invalidate(
           new RunBarrierReportError(
@@ -341,6 +356,9 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
         report({ sessionID: record.sessionID, phase: "projectors", observation: { kind: "projector", projector } }),
       tool: (callID) => report({ sessionID: record.sessionID, phase: "tools", observation: { kind: "tool", callID } }),
       noTools: () => report({ sessionID: record.sessionID, phase: "tools", observation: { kind: "tool-none" } }),
+      noCommit: () =>
+        report({ sessionID: record.sessionID, phase: "commits", observation: { kind: "none" } }) &&
+        report({ sessionID: record.sessionID, phase: "projectors", observation: { kind: "none" } }),
       promotion: (outcome) =>
         report({ sessionID: record.sessionID, phase: "promotion", observation: { kind: "promotion", outcome } }),
       reported: (phase) => record.reported.has(phase),

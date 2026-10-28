@@ -49,8 +49,65 @@ function sameSqlValue(left: unknown, right: unknown): boolean {
   return String(left) === String(right)
 }
 
-function sameJsonValue(left: unknown, right: unknown): boolean {
-  return JSON.stringify(left) === JSON.stringify(right)
+/** A plain object (not a Date/Map/class instance) is the only JSON object shape. */
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+/** JSON omits undefined/function/symbol object members. */
+function jsonMember(value: unknown): unknown {
+  return value === undefined || typeof value === "function" || typeof value === "symbol" ? undefined : value
+}
+
+/** JSON turns undefined/function/symbol array items into null. */
+function jsonElement(value: unknown): unknown {
+  const member = jsonMember(value)
+  return member === undefined ? null : member
+}
+
+/** JSON serializes non-finite numbers as null and collapses -0 to 0. */
+function jsonNumber(value: number): number | null {
+  return Number.isFinite(value) ? (value === 0 ? 0 : value) : null
+}
+
+/**
+ * Compare one written JSON field with JSON semantics, without serializing it.
+ * Metadata values are usually scalars (`depth`), so the scalar path avoids a
+ * full `JSON.stringify` per row. Object key order is irrelevant; array order is
+ * not. `undefined` object members are omitted, array holes/undefined become
+ * `null`, non-finite numbers serialize as `null`, and `-0` equals `0`. Only
+ * plain objects/arrays compare structurally: a Date/Map is never equal to an
+ * empty object merely because both expose no enumerable keys.
+ */
+export function sameJsonValue(left: unknown, right: unknown): boolean {
+  const normalizedLeft = typeof left === "number" ? jsonNumber(left) : left
+  const normalizedRight = typeof right === "number" ? jsonNumber(right) : right
+  if (normalizedLeft === normalizedRight) return true
+  if (normalizedLeft === null || normalizedRight === null) return false
+  if (typeof normalizedLeft !== typeof normalizedRight) return false
+  if (typeof normalizedLeft !== "object") return false
+  if (Array.isArray(normalizedLeft) || Array.isArray(normalizedRight)) {
+    if (!Array.isArray(normalizedLeft) || !Array.isArray(normalizedRight)) return false
+    if (normalizedLeft.length !== normalizedRight.length) return false
+    for (let index = 0; index < normalizedLeft.length; index += 1) {
+      if (!sameJsonValue(jsonElement(normalizedLeft[index]), jsonElement(normalizedRight[index]))) return false
+    }
+    return true
+  }
+  if (!isJsonObject(normalizedLeft) || !isJsonObject(normalizedRight)) return false
+  const leftKeys = Object.keys(normalizedLeft).filter((key) => jsonMember(normalizedLeft[key]) !== undefined)
+  const rightKeys = Object.keys(normalizedRight).filter((key) => jsonMember(normalizedRight[key]) !== undefined)
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every(
+      (key) =>
+        Object.hasOwn(normalizedRight, key) &&
+        jsonMember(normalizedRight[key]) !== undefined &&
+        sameJsonValue(normalizedLeft[key], normalizedRight[key]),
+    )
+  )
 }
 
 function parseJsonObject(value: unknown): Record<string, unknown> | undefined {
@@ -99,14 +156,194 @@ const TRANSACTION_KEYWORDS: ReadonlySet<string> = new Set([
   "savepoint",
 ])
 
-function leadingKeyword(sql: string): string | undefined {
-  const stripped = sql.replace(/^\s*(?:(?:--[^\n]*(?:\n|$))|(?:\/\*[\s\S]*?\*\/)\s*)*/u, "")
-  return /^([A-Za-z]+)/.exec(stripped)?.[1]?.toLowerCase()
+/** Skip a quoted string/identifier whose opening quote is at `index`. */
+function skipQuoted(sql: string, index: number, quote: string): number {
+  let next = index + 1
+  while (next < sql.length) {
+    if (sql[next] === quote) {
+      if (sql[next + 1] === quote) {
+        next += 2
+        continue
+      }
+      return next + 1
+    }
+    next += 1
+  }
+  return next
+}
+
+function skipBracket(sql: string, index: number): number {
+  const end = sql.indexOf("]", index + 1)
+  return end === -1 ? sql.length : end + 1
+}
+
+function skipLineComment(sql: string, index: number): number {
+  const end = sql.indexOf("\n", index + 2)
+  return end === -1 ? sql.length : end + 1
+}
+
+function skipBlockComment(sql: string, index: number): number {
+  const end = sql.indexOf("*/", index + 2)
+  return end === -1 ? sql.length : end + 2
+}
+
+/** Skip whitespace, comments, and the opening parentheses used as a statement prefix. */
+function skipLeadingTrivia(sql: string): number {
+  let index = 0
+  while (index < sql.length) {
+    const char = sql[index]!
+    if (/\s/u.test(char)) {
+      index += 1
+      continue
+    }
+    if (char === "-" && sql[index + 1] === "-") {
+      index = skipLineComment(sql, index)
+      continue
+    }
+    if (char === "/" && sql[index + 1] === "*") {
+      index = skipBlockComment(sql, index)
+      continue
+    }
+    if (char === "(") {
+      index += 1
+      continue
+    }
+    break
+  }
+  return index
+}
+
+interface CteCursor {
+  index: number
+}
+
+function skipCteTrivia(sql: string, cursor: CteCursor): void {
+  while (cursor.index < sql.length) {
+    const char = sql[cursor.index]!
+    if (/\s/u.test(char)) {
+      cursor.index += 1
+      continue
+    }
+    if (char === "-" && sql[cursor.index + 1] === "-") {
+      cursor.index = skipLineComment(sql, cursor.index)
+      continue
+    }
+    if (char === "/" && sql[cursor.index + 1] === "*") {
+      cursor.index = skipBlockComment(sql, cursor.index)
+      continue
+    }
+    break
+  }
+}
+
+function readCteWord(sql: string, cursor: CteCursor): string | undefined {
+  skipCteTrivia(sql, cursor)
+  const match = /^[A-Za-z_][A-Za-z0-9_]*/.exec(sql.slice(cursor.index))
+  if (match === null) return undefined
+  cursor.index += match[0].length
+  return match[0].toLowerCase()
+}
+
+function readCteName(sql: string, cursor: CteCursor): boolean {
+  skipCteTrivia(sql, cursor)
+  const char = sql[cursor.index]
+  if (char === '"' || char === "`") {
+    cursor.index = skipQuoted(sql, cursor.index, char)
+    return true
+  }
+  if (char === "[") {
+    cursor.index = skipBracket(sql, cursor.index)
+    return true
+  }
+  return readCteWord(sql, cursor) !== undefined
+}
+
+/** Skip one balanced parenthesis group, including strings/comments/quoted names. */
+function skipCteParens(sql: string, cursor: CteCursor): boolean {
+  skipCteTrivia(sql, cursor)
+  if (sql[cursor.index] !== "(") return false
+  let depth = 0
+  while (cursor.index < sql.length) {
+    const char = sql[cursor.index]!
+    if (char === "'" || char === '"' || char === "`") {
+      cursor.index = skipQuoted(sql, cursor.index, char)
+      continue
+    }
+    if (char === "[") {
+      cursor.index = skipBracket(sql, cursor.index)
+      continue
+    }
+    if (char === "-" && sql[cursor.index + 1] === "-") {
+      cursor.index = skipLineComment(sql, cursor.index)
+      continue
+    }
+    if (char === "/" && sql[cursor.index + 1] === "*") {
+      cursor.index = skipBlockComment(sql, cursor.index)
+      continue
+    }
+    if (char === "(") {
+      depth += 1
+    } else if (char === ")") {
+      depth -= 1
+      cursor.index += 1
+      if (depth === 0) return true
+      continue
+    }
+    cursor.index += 1
+  }
+  return false
+}
+
+/**
+ * Keyword of the statement after a `WITH` CTE list. SQLite CTE bodies are
+ * parenthesized and the main statement follows the final body, so a small
+ * grammar walk is both conservative and exact. Anything unparseable returns
+ * undefined and the caller keeps `with` (a read).
+ */
+function cteStatementKeyword(sql: string): string | undefined {
+  const cursor: CteCursor = { index: 0 }
+  if (readCteWord(sql, cursor) !== "with") return undefined
+  const afterWith = cursor.index
+  if (readCteWord(sql, cursor) !== "recursive") cursor.index = afterWith
+  while (true) {
+    if (!readCteName(sql, cursor)) return undefined
+    skipCteTrivia(sql, cursor)
+    if (sql[cursor.index] === "(" && !skipCteParens(sql, cursor)) return undefined
+    if (readCteWord(sql, cursor) !== "as") return undefined
+    const afterAs = cursor.index
+    const hint = readCteWord(sql, cursor)
+    if (hint === "not") {
+      if (readCteWord(sql, cursor) !== "materialized") return undefined
+    } else if (hint !== "materialized") {
+      cursor.index = afterAs
+    }
+    if (!skipCteParens(sql, cursor)) return undefined
+    skipCteTrivia(sql, cursor)
+    if (sql[cursor.index] !== ",") break
+    cursor.index += 1
+  }
+  return readCteWord(sql, cursor)
+}
+
+/**
+ * Classify a SQL statement by its leading keyword, ignoring leading whitespace,
+ * comments, and opening parentheses. Lowercase; empty when there is no word.
+ *
+ * A `WITH` statement is classified by its top-level statement after the CTE
+ * bodies: `WITH … INSERT/UPDATE/DELETE/REPLACE` is a write, while `WITH … SELECT`
+ * stays a read. This is the one lexical classifier the worker uses, so the
+ * statement router (`db.ts`) and the transaction fence cannot disagree about
+ * what a statement does.
+ */
+export function leadingKeyword(sql: string): string {
+  const start = skipLeadingTrivia(sql)
+  const keyword = /^[A-Za-z_][A-Za-z0-9_]*/.exec(sql.slice(start))?.[0]?.toLowerCase() ?? ""
+  return keyword === "with" ? (cteStatementKeyword(sql) ?? keyword) : keyword
 }
 
 function assertNoTransactionControl(sql: string): void {
   const keyword = leadingKeyword(sql)
-  if (keyword !== undefined && TRANSACTION_KEYWORDS.has(keyword)) {
+  if (TRANSACTION_KEYWORDS.has(keyword)) {
     throw new TransactionScopeError({ keyword })
   }
 }
@@ -617,54 +854,65 @@ function atomic<T>(capability: WriteCapability, work: () => T): T {
   }
 }
 
+/**
+ * Single-statement writes are already atomic in SQLite, and validation only
+ * reads, so the per-write SAVEPOINT/RELEASE round trip is pure overhead. The
+ * caller's enclosing transaction (if any) still provides rollback for the
+ * operation; only the redundant nested savepoint is skipped. Batches and
+ * caller-supplied `atomic` callbacks keep the savepoint.
+ *
+ * Explicit tradeoff: validation (scope/immutable/ownership reads) and the write
+ * are NOT snapshot-atomic against a concurrent hub writer. The SQLite statement
+ * itself is atomic, and an upsert's ownership predicate is re-checked inside the
+ * write, so a vanished/foreign row cannot be repointed; a caller that needs a
+ * read-write snapshot must wrap the call in `atomic`/its own transaction.
+ */
 function insertOne(
   capability: WriteCapability,
   entry: TableRegistryEntry,
   input: Row,
   conflict: RepositoryConflict | undefined,
 ): WriteOutcome {
-  return atomic(capability, () => {
-    const values = insertValues(capability, entry, input, "insert")
-    // The session root is hub authority. A worker projects data onto an
-    // existing row (update/upsert), but it may never mint the root itself: a
-    // forged row could reset metadata.depth/parent_id and buy spawn headroom.
-    if (entry.table === "session" && conflict === undefined) {
+  const values = insertValues(capability, entry, input, "insert")
+  // The session root is hub authority. A worker projects data onto an
+  // existing row (update/upsert), but it may never mint the root itself: a
+  // forged row could reset metadata.depth/parent_id and buy spawn headroom.
+  if (entry.table === "session" && conflict === undefined) {
+    throw new UnsupportedWriteError({
+      operation: "insert",
+      table: entry.table,
+      reason: "the session root is created by the hub",
+    })
+  }
+  assertForeignKeyOwnership(capability, entry, values)
+  assertUniqueOwnership(capability, entry, values)
+  if (conflict !== undefined) {
+    assertConflictKey(entry, conflict, values)
+    const existing = conflictRow(capability, entry, conflict, values)
+    if (entry.table === "session" && existing === undefined) {
       throw new UnsupportedWriteError({
-        operation: "insert",
+        operation: "upsert",
         table: entry.table,
         reason: "the session root is created by the hub",
       })
     }
-    assertForeignKeyOwnership(capability, entry, values)
-    assertUniqueOwnership(capability, entry, values)
-    if (conflict !== undefined) {
-      assertConflictKey(entry, conflict, values)
-      const existing = conflictRow(capability, entry, conflict, values)
-      if (entry.table === "session" && existing === undefined) {
-        throw new UnsupportedWriteError({
-          operation: "upsert",
-          table: entry.table,
-          reason: "the session root is created by the hub",
-        })
-      }
-      if (existing !== undefined) {
-        const update = conflictValues(entry, values, conflict)
-        rejectImmutableConflict(capability, entry, update.values)
-        assertAssignmentScope(capability, entry, update.values, "move a row out of scope")
-        assertImmutable(capability, entry, update.values, [existing])
-        assertSessionUpdateColumns(capability, entry, update.values, [existing])
-        assertForeignKeyOwnership(capability, entry, update.values)
-        assertUniqueOwnership(capability, entry, { ...existing, ...update.values })
-      }
-      if (entry.table === "session") {
-        const statement = sessionUpsertStatement(capability, entry, values, conflict)
-        if (statement === undefined) return { changes: 0, lastInsertRowid: 0 }
-        return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
-      }
+    if (existing !== undefined) {
+      const update = conflictValues(entry, values, conflict)
+      rejectImmutableConflict(capability, entry, update.values)
+      assertAssignmentScope(capability, entry, update.values, "move a row out of scope")
+      assertImmutable(capability, entry, update.values, [existing])
+      assertSessionUpdateColumns(capability, entry, update.values, [existing])
+      assertForeignKeyOwnership(capability, entry, update.values)
+      assertUniqueOwnership(capability, entry, { ...existing, ...update.values })
     }
-    const statement = insertStatement(capability, entry, values, conflict)
-    return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
-  })
+    if (entry.table === "session") {
+      const statement = sessionUpsertStatement(capability, entry, values, conflict)
+      if (statement === undefined) return { changes: 0, lastInsertRowid: 0 }
+      return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
+    }
+  }
+  const statement = insertStatement(capability, entry, values, conflict)
+  return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
 }
 
 function normalizeInsert<T extends WritableTable>(
@@ -749,17 +997,15 @@ export function makeRepository(capability: WriteCapability): WorkerRepository {
       const entry = writeEntry(table, "update")
       const assignments: Row = { ...(values as Row) }
       columnsOf(entry, assignments)
-      return atomic(capability, () => {
-        const predicate = scopedWhere(capability, entry, where as Row)
-        const current = currentRows(capability, entry, predicate)
-        assertImmutable(capability, entry, assignments, current)
-        assertSessionUpdateColumns(capability, entry, assignments, current)
-        assertAssignmentScope(capability, entry, assignments, "move a row out of scope")
-        assertForeignKeyOwnership(capability, entry, assignments)
-        assertUniqueOwnership(capability, entry, assignments)
-        const statement = updateStatement(entry, assignments, predicate)
-        return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
-      })
+      const predicate = scopedWhere(capability, entry, where as Row)
+      const current = currentRows(capability, entry, predicate)
+      assertImmutable(capability, entry, assignments, current)
+      assertSessionUpdateColumns(capability, entry, assignments, current)
+      assertAssignmentScope(capability, entry, assignments, "move a row out of scope")
+      assertForeignKeyOwnership(capability, entry, assignments)
+      assertUniqueOwnership(capability, entry, assignments)
+      const statement = updateStatement(entry, assignments, predicate)
+      return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
     },
     delete(table: any, where: any) {
       const entry = writeEntry(table, "delete")
@@ -773,11 +1019,9 @@ export function makeRepository(capability: WriteCapability): WorkerRepository {
           reason: "the session root may only be removed by the hub",
         })
       }
-      return atomic(capability, () => {
-        const predicate = scopedWhere(capability, entry, where as Row)
-        const statement = deleteStatement(entry, predicate)
-        return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
-      })
+      const predicate = scopedWhere(capability, entry, where as Row)
+      const statement = deleteStatement(entry, predicate)
+      return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
     },
     atomic(operation: any) {
       return atomic(capability, operation)

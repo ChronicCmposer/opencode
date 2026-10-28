@@ -17,6 +17,7 @@ import { migrations } from "@opencode-ai/core/database/migration.gen"
 import { DEFAULT_WORKER_CACHE_SIZE_KIB } from "@opencode-ai/core/database/pragmas"
 import { EventBlobTable } from "@opencode-ai/core/event/sql"
 import { markSchemaIdentity } from "@/session/db/schema"
+import { ENVELOPE_HEADROOM_BYTES, MAX_INLINE_EVENT_BYTES } from "@/session/egress/frame"
 import { openWorkerDatabase } from "@/session/worker/db"
 import { MAX_WORKER_FRAME_BYTES } from "@/session/worker/frame"
 import { migrationStatements } from "@/session/writer/migration.statements.gen"
@@ -441,10 +442,33 @@ describe("blob-integrity: hot path", () => {
 })
 
 describe("blob-integrity: frame-aligned inline bound", () => {
-  test("the D16 inline bound never exceeds the worker frame cap", () => {
-    // A payload above one worker frame must be stored by reference *before* it
-    // reaches egress, or the frame/batch carrying it is rejected as oversized.
+  test("the default inline bound leaves envelope headroom below the frame cap", () => {
+    // The schema bound may reach the cap, but the DEFAULT inline bound must
+    // reserve the envelope: an inline row at the cap cannot fit its frame, and
+    // would cross as a position reference with no event_blob row to resolve.
     expect(Bus.DEFAULT_BLOB_LIMIT_BYTES).toBeLessThanOrEqual(MAX_WORKER_FRAME_BYTES)
+    expect(Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES).toBe(MAX_INLINE_EVENT_BYTES)
+    expect(MAX_INLINE_EVENT_BYTES).toBe(MAX_WORKER_FRAME_BYTES - ENVELOPE_HEADROOM_BYTES)
+  })
+
+  test("a payload just under 4 MiB is blob-referenced under the default bound", () => {
+    const database = open()
+    const bus = Bus.create({
+      connection: database.connection,
+      ownerID: "gen-inline-headroom",
+      definitions: [Note],
+      blobDir: database.blobDir,
+    })
+    const text = `headroom:${"x".repeat(4 * 1024 * 1024 - 1_024)}`
+    expect(Buffer.byteLength(JSON.stringify(note("s1", text)))).toBeGreaterThan(Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES)
+    expect(Buffer.byteLength(JSON.stringify(note("s1", text)))).toBeLessThanOrEqual(Bus.DEFAULT_BLOB_LIMIT_BYTES)
+
+    bus.publish([{ definition: Note, data: note("s1", text) }])
+
+    const [stored] = database.connection.all("SELECT data FROM event") as ReadonlyArray<{ data: string }>
+    expect(stored?.data).toContain("__eventBlob")
+    expect(database.connection.all("SELECT COUNT(*) AS count FROM event_blob")).toEqual([{ count: 1 }])
+    expect(bus.read({ aggregateID: "s1" }).map(textOf)).toEqual([text])
   })
 
   test("a 4-16 MiB event is blob-referenced instead of stored inline", () => {

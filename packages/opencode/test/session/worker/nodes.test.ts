@@ -27,11 +27,11 @@ import { Provider } from "@/provider/provider"
 import { collectNodeNames } from "@/session/worker/node-table"
 import {
   SessionHubService,
-  createLazyExecutorWorkerPool,
   productionSessionHubNode,
   type ProductionSessionHubNodeOptions,
   type ProductionPoolFactory,
 } from "@/session/worker/hub"
+import { createLazyExecutorWorkerPool } from "../../lib/lazy-worker-pool"
 import {
   createExecutorWorker,
   type ExecutorTransport,

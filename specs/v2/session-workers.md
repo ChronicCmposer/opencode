@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-Status: accepted for a v1-only implementation. This document is normative for the v1 per-session worker divergence. Shared Session semantics remain governed by `specs/v2/session.md`; the v2 pin below is a read-only semantic reference.
+Status: accepted for a v1-only implementation. This document is normative for the v1 per-session worker divergence. Shared Session semantics remain governed by `specs/v2/session.md`; the reference commit below is read-only.
 
 | Ref | SHA | Role |
 | --- | --- | --- |
@@ -10,17 +10,18 @@ Status: accepted for a v1-only implementation. This document is normative for th
 | `rebaseline/green` | `a1f9457fa0c95a62c68a9c5daba482730f6f5f2d` | Current work base; 30/30 typecheck tasks pass. |
 | `wip/parallel-refactor-checkpoint` | `b6ec8f1c6b35ac7d250c7f7c85a46bc37ba1702a` | Archived prior WIP; reapply source only. |
 | `rebaseline/session-workers` | `58926fd8c2aad21c72b16588888c083768dd315d` | Earlier rebaseline; reference only. |
-| v2 pin | `4617210822bdbb31e5749751afbfb4584ccedac8` | Read-only v2 semantics. |
+| reference commit | `be242b5cd7` (10-char prefix; full SHA unverified in this clone) | Read-only upstream v1 reference; pending rebase target, not a merged branch. `git cat-file -t be242b5cd7` fails here. |
+| fetched upstream ref | `upstream/v2` = `4617210822bdbb31e5749751afbfb4584ccedac8` | The upstream ref this clone actually fetched; not the reference commit and not a merge target. |
 
-The v2 pin has no per-session workers and uses one global serialized database. V1 diverges for two primary reasons: multicore CPU parallelism for Session execution, and crash containment per Session. Plugin isolation is secondary. Behavioral parity with the flag off, and with v2 semantics, is a constraint rather than a purpose.
+The reference commit's 10-character prefix `be242b5cd7` is the target of the pending rebase, not a merged branch. Its full 40-character SHA cannot be expanded or verified in this clone (`git cat-file -t be242b5cd7` fails), so the pin is not authoritative here; the fetched upstream ref this clone does have is `upstream/v2` = `4617210822bdbb31e5749751afbfb4584ccedac8`. Neither is a merge target. V1 diverges from the reference for two primary reasons: multicore CPU parallelism for Session execution, and crash containment per Session. Plugin isolation is secondary. Behavioral parity with the flag off, and with the reference semantics, is a constraint rather than a purpose.
 
 The divergence has a kill criterion. Keep per-session workers only if the benchmark in D2 is met; otherwise switch to the in-process v2 model and delete the worker stack. D2 is the governing measurement, not a general preference for workers.
 
 ## Decisions
 
-### D1 — v2 is a read-only reference
+### D1 — The reference commit is read-only
 
-The v2 pin `4617210822bdbb31e5749751afbfb4584ccedac8` is a read-only reference for semantics. Do not merge, cherry-pick, or copy v2 worker code from it, and do not treat it as a merge target. Shared behavior is implemented in v1 terms and compared through the parity suite.
+The reference commit's 10-character prefix `be242b5cd7` is the target of the pending rebase, not a merged branch. Its full 40-character SHA is unverified in this clone (`git cat-file -t be242b5cd7` fails), so do not treat the pin as authoritative; the fetched upstream ref this clone has is `upstream/v2` = `4617210822bdbb31e5749751afbfb4584ccedac8`. The reference is read-only for semantics. Do not merge, cherry-pick, or copy worker code from it, and do not treat either ref as a merge target. Shared behavior is implemented in v1 terms and compared through the parity suite.
 
 ### D2 — Keep per-session workers only as a v1-only divergence
 
@@ -93,7 +94,7 @@ No message is appended. A graph that is ready but not started takes the same pat
 
 ### D12 — Sequences and ownership
 
-There is no global or sender ordinal. Each aggregate has a contiguous sequence allocated inside `BEGIN IMMEDIATE` by an atomic upsert-returning block reservation, with `unique(aggregate_id, seq)`. `event_sequence.owner_id` is the v1 sync owner and is never rewritten by a worker. Worker ownership is a separate generation lease in `event_sequence.worker_owner_id`, renewed on every write and by the background heartbeat (`worker_heartbeat_at`, `worker_expires_at`); an idle generation must not self-fence while it is alive. Reclaim is owner-scoped and atomic, and happens only after verifying that no commit is in flight for the old owner. A stale generation's next write is fenced by the owner mismatch. Projectors are database-only and run in the committing process inside the same transaction.
+There is no global or sender ordinal. `event_sequence` is keyed by `aggregate_id`; each aggregate's cursor is `seq`, and `event` has `unique(aggregate_id, seq)`. A new append reserves a contiguous block inside `BEGIN IMMEDIATE` with a single upsert-returning statement (`INSERT … ON CONFLICT(aggregate_id) DO UPDATE … RETURNING seq`, the block form used by both the Bus and EventV2), so a failed commit never leaves a gap. `event_sequence.owner_id` is the v1 sync owner and is never rewritten by a worker. Worker ownership is a separate generation lease in `event_sequence.worker_owner_id`, renewed on every write and by the background heartbeat (`worker_heartbeat_at`, `worker_expires_at`); an idle generation must not self-fence while it is alive. Reclaim is owner-scoped and atomic in one `BEGIN IMMEDIATE`, conditional on the observed owner and sequence, refuses a live lease unless its owner process is provably dead, and happens only after verifying that no commit advanced the sequence. A stale generation's next write is fenced by the owner mismatch. Projectors are database-only and run in the committing process inside the same transaction.
 
 ### D13 — Bus API
 
@@ -101,7 +102,7 @@ Export `publish(events)` with in-transaction projectors, `project`, and `claim`/
 
 ### D14 — Database and durable log are the only truth
 
-The database and durable log are the only authoritative state. Hub caches are keyed by `(aggregate_id, seq)`, invalidated by events, and fenced by state version. No authoritative prompt state lives in memory. Permission and question state is hub-owned and is never written by a worker.
+The database and durable log are the only authoritative state. No authoritative prompt state lives in memory. Permission and question state is hub-owned and is never written by a worker. `StateCache` is an advisory, version-fenced cache keyed by `(aggregate_id, seq)`; the hub constructs it, invalidates an aggregate when a durable event arrives, and clears it on shutdown. Production never reads or writes payload entries through it (`get`/`set`); only tests do.
 
 ### D15 — Worker transport
 
@@ -109,7 +110,7 @@ Send JSON strings over `postMessage`. Decode exactly once with Effect Schema at 
 
 ### D16 — Large durable payloads
 
-`event_blob` is keyed by `(aggregate_id, seq)` with `type`, `hash`, and `size`, written in the same transaction as the event row. Payloads at or below 4 MiB stay inline in `event.data`; a larger payload is written first to a content-addressed file under the blob directory and the row stores `hash`/`size` with `file_path` set. `data` remains only for rows written by the older inline-blob schema. `event_blob.hash` is indexed because GC probes references across every aggregate. Workers fetch blobs through the Bus and never receive a raw connection. GC deletes the row in the committing transaction and unlinks a file only when no row for that hash remains, so a concurrent publisher's file is never removed.
+`event_blob` is keyed by `(aggregate_id, seq)` with `type`, `hash`, `size`, and `file_path`, written in the same transaction as the event row. The inline threshold is `DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES` = `DEFAULT_BLOB_LIMIT_BYTES` (4 MiB) minus the core Bus's `ENVELOPE_HEADROOM_BYTES` (64 KiB). The egress frame owns a separate, independent `ENVELOPE_HEADROOM_BYTES` constant in `frame.ts`; tests pin the two together by asserting `DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES === MAX_INLINE_EVENT_BYTES`, not by sharing one constant. Payloads at or below that threshold stay inline in `event.data`; a larger payload is written first to a content-addressed file under the blob directory, the `event_blob` row stores `hash`/`size` with `file_path` set, and `event.data` stores the `{ __eventBlob, size }` reference. `event_blob.data` remains only for rows written by the older inline-blob schema. `event_blob.hash` is indexed because GC probes references across every aggregate. The worker publishes oversized bodies through its own Bus; the egress frame carries a small `{ __eventBlobPosition, frameBytes }` reference for a body that does not fit its envelope. The hub resolves that reference with its off-loop SQL executor: it reads the `event_blob` row by position, validates hash and path through the core Bus, and reads the file, falling back to the committed inline `event.data` row when no blob row exists. Workers do not fetch blobs through the Bus for delivery. GC deletes the row in the committing transaction and unlinks a file only when no row for that hash remains, so a concurrent publisher's file is never removed.
 
 ### D17 — Deltas and resync
 
@@ -137,7 +138,7 @@ Port the v2 `SubagentJob.start`, `background`, and `notify` semantics plus `Sess
 
 ### D23 — Effect and module boundaries
 
-Convert each module to Effect as it is touched; do not perform a standalone rewrite. `packages/session-transport` has zero `@/` imports and uses Effect plus Schema only. Split the hub into transport, plugin-tool routing, production wiring, and core, with an import-boundary test. Move code upstream behind `Foo.Service` and update `AGENTS.md`; do not mix conventions. Exit criterion: no new Promise service internals in changed modules.
+Convert each module to Effect as it is touched; do not perform a standalone rewrite. There is no `packages/session-transport` package; do not target a package that does not exist. Split the hub into transport, plugin-tool routing, production wiring, and core, with an import-boundary test. Move code upstream behind `Foo.Service` and update `AGENTS.md`; do not mix conventions. Exit criterion: no new Promise service internals in changed modules.
 
 ### D24 — Comment purge
 
@@ -209,7 +210,7 @@ Landed on the green baseline: layer/graph, dispatch/runtime, and test-infra. Arc
 5. **Crash and idempotency.** `WorkerCrashed` covers all phases including commit-after-durable; the tool ledger marks orphans indeterminate and never auto-replays; auto-resume is capped at 10; boot cancel releases one permit and appends no message.
 6. **Transport.** JSON strings cross `postMessage`; Schema decodes once; 4 MiB and `BuildMismatch` tests pass; deltas resync without dropping durables; the 5-second run barrier times out without starting the next run.
 7. **Tools and plugins.** One tool routing point; broker and port/client/layer nodes are gone; MCP/LSP run on the hub; the 14-entry hook route table fails startup on configured unsupported hooks; permission/question state stays hub-owned.
-8. **Effect and structure.** `packages/session-transport` has zero `@/` imports; hub boundaries have an import-boundary test; changed modules expose `Foo.Service` and follow Effect naming; no new Promise service internals.
+8. **Effect and structure.** Hub boundaries have an import-boundary test; changed modules expose `Foo.Service` and follow Effect naming; no new Promise service internals.
 9. **Rollout.** Two flag states only; kill switch drains existing Sessions and blocks new ones; status exposes mode, disabled reason, and build hash; flag removal waits one release after full parity green; kill switch remains two releases.
 10. **Comments.** Purge only after re-baseline, in package-scoped comment-only commits, with this spec as the rationale; no `.parallel-implement` or plan references remain in source; 1% remains a guideline.
 

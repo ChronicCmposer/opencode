@@ -549,6 +549,7 @@ describe("typed transaction scope and connected repository", () => {
           outcome: null,
           time_started: 1,
           time_finished: null,
+          worker_owner_id: null,
         },
       ])
       expect(

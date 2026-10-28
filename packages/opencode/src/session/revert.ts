@@ -5,7 +5,6 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Snapshot } from "../snapshot"
 import { Storage } from "@/storage/storage"
 import { Session } from "./session"
-import { MessageV2 } from "./message-v2"
 import { SessionID, MessageID, PartID } from "./schema"
 import { SessionRunState } from "./run-state"
 import { SessionSummary } from "./summary"
@@ -124,6 +123,13 @@ const layer = Layer.effect(
       return yield* sessions.get(input.sessionID).pipe(Effect.orDie)
     })
 
+    /**
+     * Apply a staged revert. The clear is committed **first**: if the process
+     * dies or the hub clear fails after that, the session no longer points at
+     * rows that may already be gone. A crash after the clear leaves the suffix
+     * in place (a retry finds no revert and is a safe no-op) instead of leaving
+     * a dangling revert pointer at deleted rows.
+     */
     const cleanup = Effect.fn("SessionRevert.cleanup")(function* (session: Session.Info) {
       if (!session.revert) return
       const sessionID = session.id
@@ -132,6 +138,7 @@ const layer = Layer.effect(
       const index = msgs.findIndex((msg) => msg.info.id === messageID)
       const target = index < 0 ? undefined : msgs[index]
       const remove = index < 0 ? [] : msgs.slice(index + (session.revert.partID ? 1 : 0))
+      yield* clearRevert(sessionID)
       for (const msg of remove) {
         yield* sessions.removeMessage({ sessionID, messageID: msg.info.id })
       }
@@ -146,7 +153,6 @@ const layer = Layer.effect(
           }
         }
       }
-      yield* clearRevert(sessionID)
     })
 
     return Service.of({ revert, unrevert, cleanup })

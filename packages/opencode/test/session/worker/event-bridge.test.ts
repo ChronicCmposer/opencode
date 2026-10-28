@@ -136,6 +136,42 @@ describe("createWorkerEventBridge", () => {
     }),
   )
 
+  it.effect("forwards a near-limit durable event verbatim, never a position reference", () =>
+    Effect.gen(function* () {
+      const durable: EventV2Event[] = []
+      let emitToListener: EventV2.Subscriber | undefined
+      const fake: EventSubscriber = {
+        listen: (listener) =>
+          Effect.sync(() => {
+            emitToListener = listener
+            return Effect.void
+          }),
+      }
+      const bridge = yield* createWorkerEventBridge(fake, {
+        emit: () => {
+          throw new Error("a durable event must never downgrade to emit")
+        },
+        emitDurable: (event) => durable.push(event),
+      })
+
+      // Just under the 4 MiB frame boundary: the bridge must hand the full body
+      // to the durable sink. Replacing it with `__eventBlobPosition` (or dropping
+      // it) is the egress/hub boundary's decision, never the bridge's.
+      const text = "x".repeat(4 * 1024 * 1024 - 512)
+      yield* emitToListener!({
+        id: EventV2.ID.create(),
+        type: "test.worker.session",
+        data: { sessionID: "ses_1", text },
+        durable: { aggregateID: "ses_1", seq: 9, version: 1 },
+      })
+
+      expect(durable).toHaveLength(1)
+      expect(durable[0]?.properties).toEqual({ sessionID: "ses_1", text })
+      expect(durable[0]?.properties).not.toHaveProperty("__eventBlobPosition")
+      yield* bridge.dispose
+    }),
+  )
+
   it.effect("never downgrades a durable event to a non-durable emit", () =>
     Effect.gen(function* () {
       const plain: EventV2Event[] = []

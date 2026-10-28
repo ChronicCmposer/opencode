@@ -19,9 +19,8 @@ import {
   buildProductionPortBackends,
   createBunExecutorTransport,
   createBunExecutorWorkerPool,
+  createEgressDeliveryBarrier,
   createHubEventSink,
-  createLazyExecutorWorker,
-  createLazyExecutorWorkerPool,
   createProductionSessionHub,
   createProductionWorkerPool,
   createSessionBoundExecutorWorker,
@@ -40,6 +39,7 @@ import {
   runIdleTimeoutWarning,
   serveEventsPort,
   spawnBunExecutorWorker,
+  sweepDeadLeasesAtStartup,
   SESSION_CANCELLED_TYPE,
   SessionHubService,
   type ProductionPoolFactory,
@@ -47,8 +47,17 @@ import {
   type WorkerPortBackends,
   type WorkerTransferredPorts,
 } from "@/session/worker/hub"
-import { ackFrame, endFrame, eventFrame, MAX_WORKER_FRAME_BYTES, resyncFrame } from "@/session/worker/frame"
+import { createLazyExecutorWorker, createLazyExecutorWorkerPool } from "../../lib/lazy-worker-pool"
+import {
+  ackFrame,
+  blobPositionReferenceFrame,
+  endFrame,
+  eventFrame,
+  MAX_WORKER_FRAME_BYTES,
+  resyncFrame,
+} from "@/session/worker/frame"
 import { resolveSessionWorkerIdleTimeoutMs, SESSION_WORKER_IDLE_TIMEOUT_ENV } from "@/session/worker/pool"
+import { createIdleIsolateCap } from "@/session/worker/worker-pools"
 import { encodeFrame } from "@/session/egress/frame"
 import { createMeshWorkerClient, type DurableCommit } from "@/session/egress/mesh"
 import { createLiveEventPublisher, EventV2Bridge, type LiveEvent, type LiveEventPublisher } from "@/event-v2-bridge"
@@ -99,7 +108,11 @@ import { SessionStatus } from "@/session/status"
 import { InstanceRef } from "@/effect/instance-ref"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Provider } from "@/provider/provider"
+import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
+import { randomUUID } from "node:crypto"
+import { openConnection } from "@opencode-ai/core/database/connection"
 import { tmpdir } from "../../fixture/fixture"
 
 const it = testEffect(TestLLMServer.layer)
@@ -810,6 +823,86 @@ describe("production egress mesh", () => {
   })
 })
 
+describe("egress ack correlation", () => {
+  test("an ack for a resynced frame does not credit a later run", async () => {
+    const sessionID = "ses_egress_drift" as SessionID
+    const barrier = createEgressDeliveryBarrier({ timeoutMs: 1_000 })
+
+    // Run 1: one durable observed, but the sender's batch ack includes a
+    // second frame that resynced instead of reaching the live sink.
+    barrier.observeDurable(sessionID)
+    barrier.observeAck(sessionID, 2)
+    await barrier.wait(sessionID)
+
+    // Run 2: the stale extra ack must not be carried forward as credit.
+    barrier.observeDurable(sessionID)
+    let resolved = false
+    const wait = barrier.wait(sessionID).then(() => {
+      resolved = true
+    })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(resolved).toBe(false)
+
+    barrier.observeAck(sessionID, 1)
+    await wait
+    expect(resolved).toBe(true)
+  })
+
+  test("waits for observed durables when the same batch also carried a resynced reference", async () => {
+    const sessionID = "ses_egress_reference" as SessionID
+    const { publisher } = recordingPublisher()
+    const barrier = createEgressDeliveryBarrier({ timeoutMs: 1_000 })
+    const backends = buildProductionPortBackends({
+      events: publisher,
+      egressDelivery: barrier,
+      sessionOfWorker: () => sessionID,
+    })
+    const channel = new MessageChannel()
+    const dispose = backends.egress!(1, channel.port1)
+    try {
+      // A durable body that cannot resolve by position is surfaced as a resync:
+      // the sender still counts it in its batch ack.
+      const reference = blobPositionReferenceFrame(
+        eventFrame({
+          event: { id: "evt_ref", type: "session.updated", properties: { sessionID } },
+          aggregateID: sessionID,
+          seq: 1,
+        }),
+        MAX_WORKER_FRAME_BYTES + 1,
+      )
+      if (reference === undefined) throw new Error("oversized durable did not produce a reference")
+      channel.port2.postMessage(encodeFrame(reference))
+      channel.port2.postMessage(
+        encodeFrame(
+          eventFrame({
+            event: { id: "evt_ok", type: "session.updated", properties: { sessionID } },
+            aggregateID: sessionID,
+            seq: 2,
+          }),
+        ),
+      )
+      await new Promise((resolve) => setTimeout(resolve, 20))
+
+      let resolved = false
+      const wait = barrier.wait(sessionID).then(() => {
+        resolved = true
+      })
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(resolved).toBe(false)
+
+      // The ack covers both hand-offs; the resynced one is settled without
+      // crediting a future batch.
+      channel.port2.postMessage(encodeFrame(ackFrame({ count: 2 })))
+      await wait
+      expect(resolved).toBe(true)
+    } finally {
+      dispose()
+      channel.port1.close()
+      channel.port2.close()
+    }
+  })
+})
+
 describe("14 makeSessionHubNode", () => {
   test("provides SessionHubService and terminates the pool on scope close", async () => {
     const created: ImmediateWorker[] = []
@@ -1348,14 +1441,21 @@ describe("Q22 hub event sink", () => {
   })
 
   test("a durable worker event republishes live-only (no durable re-commit)", async () => {
-    // A `db` that throws on any access: a durable commit on the hub would explode.
+    // EventV2 probes the schema once at layer construction through the Effect
+    // client (`db.$client.unsafe`). Emulate that production surface with empty
+    // probe results; every real database access still explodes, so a durable
+    // commit on the hub fails loudly.
+    const probeOnlyClient = { unsafe: () => Effect.succeed([] as Record<string, unknown>[]) }
     const commitGuard = Layer.succeed(Database.Service, {
       db: new Proxy(
         {},
         {
-          get: () => () => {
-            throw new Error("durable commit attempted on the hub")
-          },
+          get: (_, property) =>
+            property === "$client"
+              ? probeOnlyClient
+              : () => {
+                  throw new Error("durable commit attempted on the hub")
+                },
         },
       ) as never,
     })
@@ -2744,5 +2844,193 @@ describe("the worker job mirror authority is session-bound", () => {
 
     const bound = hubProxyAuthoritiesFor({ ...deps, boundSessionID: sid("ses_job_bound") })
     expect(bound.backgroundJob).toBe(backgroundJob)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Idle isolate cap: reuse across turns is useful, but a long-lived process must
+// not retain one idle isolate per session ever dispatched. The cap is an LRU of
+// idle isolates (~2x available cores by default); active/generating workers are
+// never candidates, and the existing per-session idle reap still applies.
+// ---------------------------------------------------------------------------
+
+describe("idle isolate cap", () => {
+  function scriptedIdleWorker(
+    id: number,
+    terminated: number[],
+    execute?: (run: ExecutorRun) => Promise<void>,
+  ): ExecutorWorker {
+    let alive = true
+    return {
+      id,
+      get alive() {
+        return alive
+      },
+      execute: async (run) => {
+        await execute?.(run)
+      },
+      cancel: async () => {},
+      assertNotBusy: async () => false,
+      resultFor: () => undefined,
+      terminate: async () => {
+        if (!alive) return
+        alive = false
+        terminated.push(id)
+      },
+    }
+  }
+
+  test("retains only the LRU cap of idle isolates and evicts the oldest", async () => {
+    const terminated: number[] = []
+    const pool = createLazyExecutorWorkerPool({
+      create: (id) => scriptedIdleWorker(id, terminated),
+      maxRunning: 16,
+      maxIdleWorkers: 2,
+    })
+    try {
+      const workers = Array.from({ length: 5 }, () => pool.spawn())
+      for (const [index, worker] of workers.entries()) {
+        await worker.execute({ sessionID: sid(`ses_idle_cap_${index}`), depth: 0 })
+      }
+
+      expect(pool.idleCapacity).toBe(2)
+      expect(pool.idleWorkers).toBe(2)
+      expect(terminated).toEqual([1, 2, 3])
+    } finally {
+      await pool.terminateAll()
+    }
+  })
+
+  test("never evicts an active or generating worker to make room", async () => {
+    const terminated: number[] = []
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const pool = createLazyExecutorWorkerPool({
+      create: (id) =>
+        scriptedIdleWorker(id, terminated, id === 1 ? async () => await gate : undefined),
+      maxRunning: 16,
+      maxIdleWorkers: 1,
+    })
+    try {
+      const busy = pool.spawn()
+      const second = pool.spawn()
+      const third = pool.spawn()
+      const running = busy.execute({ sessionID: sid("ses_idle_active"), depth: 0 })
+      await second.execute({ sessionID: sid("ses_idle_second"), depth: 0 })
+      await third.execute({ sessionID: sid("ses_idle_third"), depth: 0 })
+
+      // The oldest IDLE worker is evicted; the still-running one is untouched.
+      expect(terminated).toEqual([2])
+      expect(pool.idleWorkers).toBe(1)
+      expect(terminated).not.toContain(1)
+
+      release()
+      await running
+      // Once it becomes idle the LRU applies again, still keeping one isolate.
+      expect(terminated).toEqual([2, 3])
+      expect(pool.idleWorkers).toBe(1)
+      expect(terminated).not.toContain(1)
+    } finally {
+      release()
+      await pool.terminateAll()
+    }
+  })
+
+  test("keeps an idle worker with active background work above the cap", async () => {
+    const terminated: number[] = []
+    const evicted: number[] = []
+    const background = scriptedIdleWorker(1, terminated)
+    background.hasActiveWork = async () => true
+    const foreground = scriptedIdleWorker(2, terminated)
+    const spawnFor = async (id: number) => (id === 1 ? background : foreground)
+    const cap = createIdleIsolateCap({
+      capacity: 1,
+      onEvict: (entry) => evicted.push(entry.worker.id),
+    })
+    const first = cap.track(createSessionBoundExecutorWorker(1, spawnFor))
+    const second = cap.track(createSessionBoundExecutorWorker(2, spawnFor))
+
+    await first.execute({ sessionID: sid("ses_idle_background_first"), depth: 0 })
+    await second.execute({ sessionID: sid("ses_idle_background_second"), depth: 0 })
+
+    // The oldest idle worker still owns a background job. The cap must probe it
+    // and keep it (temporarily above capacity) instead of killing that work.
+    await pollUntil(() => cap.idle === 2, {
+      message: "the worker with active background work was evicted",
+      timeoutMs: 250,
+    })
+    expect(terminated).toEqual([])
+    expect(evicted).toEqual([])
+  })
+})
+
+describe("startup dead-lease sweep", () => {
+  const DEAD_PID = 2_000_000_000
+  const owner = (id: number, pid: number) => `worker-${id}-${pid}-${randomUUID()}`
+
+  function scratch(): { filename: string; directory: string } {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-hub-lease-sweep-"))
+    return { filename: path.join(directory, "opencode.db"), directory }
+  }
+
+  test("marks only provably dead generations reclaimable", () => {
+    const { filename, directory } = scratch()
+    const connection = openConnection({ filename })
+    try {
+      connection.exec(`
+        CREATE TABLE event_sequence (
+          aggregate_id text PRIMARY KEY,
+          seq integer NOT NULL,
+          owner_id text,
+          worker_owner_id text,
+          worker_heartbeat_at integer,
+          worker_expires_at integer
+        )
+      `)
+      const deadOwner = owner(1, DEAD_PID)
+      const liveOwner = owner(2, process.pid)
+      const expiry = Date.now() + 30_000
+      connection.run(
+        "INSERT INTO event_sequence (aggregate_id, seq, worker_owner_id, worker_expires_at) VALUES (?, ?, ?, ?)",
+        ["s-dead", 1, deadOwner, expiry],
+      )
+      connection.run(
+        "INSERT INTO event_sequence (aggregate_id, seq, worker_owner_id, worker_expires_at) VALUES (?, ?, ?, ?)",
+        ["s-live", 2, liveOwner, expiry],
+      )
+
+      const logs: Array<{ message: string; fields: Record<string, unknown> }> = []
+      const released = sweepDeadLeasesAtStartup(filename, (message, fields) => {
+        logs.push({ message, fields })
+      })
+
+      expect(released).toBe(1)
+      const rows = connection.all<{ aggregate_id: string; worker_expires_at: number }>(
+        "SELECT aggregate_id, worker_expires_at FROM event_sequence ORDER BY aggregate_id",
+      )
+      expect(rows).toEqual([
+        { aggregate_id: "s-dead", worker_expires_at: 0 },
+        { aggregate_id: "s-live", worker_expires_at: expiry },
+      ])
+      expect(logs).toHaveLength(1)
+      expect(logs[0]?.message).toContain("startup lease sweep")
+      expect(logs[0]?.fields.released).toBe(1)
+    } finally {
+      connection.close()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test("a missing database is logged and never thrown", () => {
+    const { filename, directory } = scratch()
+    try {
+      const logs: string[] = []
+      expect(sweepDeadLeasesAtStartup(filename, (message) => logs.push(message))).toBe(0)
+      expect(logs).toEqual([expect.stringContaining("startup lease sweep failed")])
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
   })
 })

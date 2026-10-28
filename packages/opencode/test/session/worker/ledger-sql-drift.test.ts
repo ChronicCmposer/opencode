@@ -9,6 +9,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { describe, expect, test } from "bun:test"
 import { LEDGER_SQL_FALLBACK } from "@/session/ledger/sql/fallback.gen"
+import { classifyWorkerStatement } from "@/session/worker/db"
 
 const sqlPath = path.join(import.meta.dir, "../../../src/session/ledger/sql/001-tool-call.sql")
 const sourcePath = path.join(import.meta.dir, "../../../src/session/ledger/tool-call.ts")
@@ -22,5 +23,25 @@ describe("ledger SQL fallback", () => {
     const source = fs.readFileSync(sourcePath, "utf8")
     expect(source).toContain('from "./sql/fallback.gen"')
     expect(source).not.toContain("CREATE TABLE IF NOT EXISTS tool_call")
+  })
+})
+
+describe("worker statement keyword classifier", () => {
+  const workerSource = path.join(import.meta.dir, "../../../src/session/worker")
+
+  test("one leading-keyword implementation is shared by the router and the fence", () => {
+    const db = fs.readFileSync(path.join(workerSource, "db.ts"), "utf8")
+    const write = fs.readFileSync(path.join(workerSource, "repository/write.ts"), "utf8")
+    expect(write).toContain("export function leadingKeyword")
+    expect(db).toContain('import { leadingKeyword, makeRepository } from "./repository/write"')
+    expect(db).not.toMatch(/function leadingKeyword\s*\(/)
+  })
+
+  test("comments and parenthesized prefixes classify to the same keyword", () => {
+    expect(classifyWorkerStatement("/* c */ -- x\n  INSERT INTO t VALUES (1)").keyword).toBe("insert")
+    expect(classifyWorkerStatement("(select 1)").keyword).toBe("select")
+    // A comment after the opening parenthesis must not defeat the classifier.
+    expect(classifyWorkerStatement("( /* c */ BEGIN )").keyword).toBe("begin")
+    expect(classifyWorkerStatement("( /* c */ select 1)").keyword).toBe("select")
   })
 })

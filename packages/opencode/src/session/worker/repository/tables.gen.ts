@@ -316,7 +316,17 @@ export const TABLE_SCHEMA = [
   },
   {
     table: "tool_call",
-    columns: ["call_id", "session_id", "tool", "side_effecting", "state", "outcome", "time_started", "time_finished"],
+    columns: [
+      "call_id",
+      "session_id",
+      "tool",
+      "side_effecting",
+      "state",
+      "outcome",
+      "time_started",
+      "time_finished",
+      "worker_owner_id",
+    ],
     scope: "session_id",
     primaryKey: ["call_id", "session_id"],
     uniqueKeys: [["call_id", "session_id"]],

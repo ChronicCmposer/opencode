@@ -133,19 +133,20 @@ import {
   type PluginToolExecutor,
 } from "./plugin-tool-wire"
 import type { Hooks } from "@opencode-ai/plugin"
-import type {
-  ChatHeadersOutput,
-  ChatMessageOutput,
-  ChatParamsOutput,
-  MessagesTransformInput,
-  MessagesTransformOutput,
-  ShellEnvOutput,
-  SystemTransformInput,
-  SystemTransformOutput,
-  ToolAfterOutput,
-  ToolBeforeOutput,
-  ToolDefinitionOutput,
-  WorkerPluginHost,
+import {
+  workerPluginHostDeclaresHook,
+  type ChatHeadersOutput,
+  type ChatMessageOutput,
+  type ChatParamsOutput,
+  type MessagesTransformInput,
+  type MessagesTransformOutput,
+  type ShellEnvOutput,
+  type SystemTransformInput,
+  type SystemTransformOutput,
+  type ToolAfterOutput,
+  type ToolBeforeOutput,
+  type ToolDefinitionOutput,
+  type WorkerPluginHost,
 } from "./plugin-host"
 import { WorkerDb, databaseLayer, type WorkerDatabase } from "./db"
 import { changedHubOwnedSessionColumns, HUB_OWNED_METADATA, SESSION_IMMUTABLE_COLUMNS } from "./repository/policy"
@@ -389,15 +390,19 @@ type WakeupEvents = Pick<EventV2.Interface, "publishLive" | "wakeDurable"> &
  * stream. `takeUntil` is what makes the read terminate: the snapshot cursor is a
  * commit that already exists in SQLite, so the scan stops at it instead of
  * waiting on the live tail.
+ *
+ * `after` is the last commit this isolate already observed. Reading only
+ * `(after, seq]` is what keeps a real gap from re-scanning the whole aggregate
+ * log; an empty range is answered without touching the stream at all.
  */
 function durableSnapshotOf(events: WakeupEvents): SnapshotReader | undefined {
   const durable = events.durable
   if (durable === undefined) return undefined
-  return async (aggregateID, seq) => {
+  return async (aggregateID, seq, after = -1) => {
     // -1 is the only "before the first event" cursor; 0 is a real event.
-    if (seq < 0) return []
+    if (seq < 0 || after >= seq) return []
     const payloads = await Effect.runPromise(
-      durable({ aggregateID, after: -1 }).pipe(
+      durable({ aggregateID, after }).pipe(
         Stream.takeUntil((payload) => (payload.durable?.seq ?? -1) >= seq),
         Stream.runCollect,
       ),
@@ -1345,6 +1350,55 @@ export function sharedBoundaryReplacements(
 const sameProjectionValue = (left: unknown, right: unknown): boolean =>
   JSON.stringify(left ?? null) === JSON.stringify(right ?? null)
 
+/** Payload metadata key carrying `Session.patch`'s changed-column delta. */
+const SESSION_PATCH_METADATA_KEY = "sessionPatch"
+
+type MutableSessionInfo = { -readonly [K in keyof SessionV1.SessionInfo]: SessionV1.SessionInfo[K] }
+
+/**
+ * The columns a `session.updated` publisher declared it actually changed.
+ * `undefined` means an older/undeltaed publisher, which keeps the conservative
+ * full-image comparison.
+ */
+function emittedSessionColumns(event: SessionProjector.ProjectedEvent): ReadonlySet<string> | undefined {
+  const value = event.metadata?.[SESSION_PATCH_METADATA_KEY]
+  if (!Array.isArray(value)) return undefined
+  return new Set(value.filter((column): column is string => typeof column === "string"))
+}
+
+/**
+ * Keep the projector's full-image write safe for a delta patch: every
+ * hub-owned column the patch did not emit is restored from the authoritative
+ * row, so a stale worker snapshot can never resurrect billing/share/revert or
+ * identity state that the hub advanced concurrently.
+ */
+function restoreUnemittedSessionColumns(
+  info: MutableSessionInfo,
+  authoritative: SessionV1.SessionInfo,
+  emitted: ReadonlySet<string>,
+): void {
+  const keep = (column: string) => !emitted.has(column)
+  if (keep("id")) info.id = authoritative.id
+  if (keep("project_id")) info.projectID = authoritative.projectID
+  if (keep("workspace_id")) info.workspaceID = authoritative.workspaceID
+  if (keep("parent_id")) info.parentID = authoritative.parentID
+  if (keep("slug")) info.slug = authoritative.slug
+  if (keep("directory")) info.directory = authoritative.directory
+  if (keep("path")) info.path = authoritative.path
+  if (keep("version")) info.version = authoritative.version
+  if (keep("permission")) info.permission = authoritative.permission
+  if (keep("metadata")) info.metadata = authoritative.metadata
+  if (keep("cost")) info.cost = authoritative.cost
+  if (
+    ["tokens_input", "tokens_output", "tokens_reasoning", "tokens_cache_read", "tokens_cache_write"].every(keep)
+  ) {
+    info.tokens = authoritative.tokens
+  }
+  if (keep("share_url")) info.share = authoritative.share
+  if (keep("revert")) info.revert = authoritative.revert
+  if (keep("time_created")) info.time = { ...info.time, created: authoritative.time.created }
+}
+
 function rejectProjection(
   event: SessionProjector.ProjectedEvent,
   sessionID: string,
@@ -1353,17 +1407,66 @@ function rejectProjection(
   return Effect.die(new SessionProjector.ProjectionViolation({ type: event.type, sessionID, reason }))
 }
 
+function parseSessionJsonColumn(value: unknown): unknown {
+  if (typeof value !== "string") return value
+  try {
+    return JSON.parse(value)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The authoritative session row read synchronously on the worker's connection.
+ * `authorize` is called before `SessionProjector` builds its write effect, so
+ * the delta normalization below must read the row at call time to be seen by
+ * that effect. The worker connection is inside the durable-commit transaction,
+ * so this read observes every committed hub write.
+ */
+function readSessionProjectionRow(
+  database: WorkerDatabase,
+  sessionID: string,
+): (typeof SessionTable.$inferSelect) | undefined {
+  const raw = database.connection.all<Record<string, unknown>>("SELECT * FROM session WHERE id = ?", [sessionID])[0]
+  if (raw === undefined) return undefined
+  return {
+    ...raw,
+    summary_diffs: parseSessionJsonColumn(raw.summary_diffs),
+    metadata: parseSessionJsonColumn(raw.metadata),
+    revert: parseSessionJsonColumn(raw.revert),
+    permission: parseSessionJsonColumn(raw.permission),
+    model: parseSessionJsonColumn(raw.model),
+  } as unknown as typeof SessionTable.$inferSelect
+}
+
 /**
  * The projection authority of a bound worker. The durable aggregate fence only
  * checks `data.sessionID`; this policy also pins every nested identity to it,
  * rejects worker-authored session-root lifecycle, and refuses immutable session
  * columns plus hub-owned `metadata.depth`. It runs before any projector write,
  * inside the same durable-commit transaction.
+ *
+ * A delta patch (`metadata.sessionPatch`) is normalized synchronously at call
+ * time: every hub-owned column it did not emit is replaced with the
+ * authoritative row before `SessionProjector` builds its full-image write.
  */
-function workerProjectionPolicy(): SessionProjector.ProjectionPolicy {
+function workerProjectionPolicy(database?: WorkerDatabase): SessionProjector.ProjectionPolicy {
   return {
-    authorize: (event, db) =>
-      Effect.gen(function* () {
+    authorize: (event, db) => {
+      if (event.type === SessionV1.Event.Updated.type && database !== undefined) {
+        const emitted = emittedSessionColumns(event)
+        if (emitted !== undefined) {
+          const row = readSessionProjectionRow(database, event.data.sessionID)
+          if (row !== undefined) {
+            restoreUnemittedSessionColumns(
+              event.data.info as MutableSessionInfo,
+              Session.fromRow(row),
+              emitted,
+            )
+          }
+        }
+      }
+      return Effect.gen(function* () {
         if (event.type === SessionV1.Event.Created.type || event.type === SessionV1.Event.Deleted.type) {
           return yield* rejectProjection(event, event.data.sessionID, "the session root is hub authority")
         }
@@ -1403,6 +1506,11 @@ function workerProjectionPolicy(): SessionProjector.ProjectionPolicy {
           // A missing row makes the projector update a no-op; it can never mint
           // the root, because Created is rejected above.
           if (current === undefined) return
+          // A delta publisher names exactly the columns it changed. Judge (and
+          // write) only those, so a stale full image cannot be rejected for, or
+          // overwrite, hub-owned columns it merely echoed.
+          const emitted = emittedSessionColumns(event)
+          const isEmitted = (column: string) => emitted === undefined || emitted.has(column)
           // Mirror the projector's write semantics: an absent optional field is
           // omitted from the UPDATE (preserved), while `workspaceID` is written
           // as null when absent.
@@ -1425,6 +1533,7 @@ function workerProjectionPolicy(): SessionProjector.ProjectionPolicy {
             permission: current.permission ?? null,
           }
           for (const column of SESSION_IMMUTABLE_COLUMNS) {
+            if (!isEmitted(column)) continue
             if (!(column in next)) continue
             if (!sameProjectionValue(next[column], before[column])) {
               return yield* rejectProjection(
@@ -1434,7 +1543,7 @@ function workerProjectionPolicy(): SessionProjector.ProjectionPolicy {
               )
             }
           }
-          if (info.metadata !== undefined) {
+          if (isEmitted("metadata") && info.metadata !== undefined) {
             for (const key of HUB_OWNED_METADATA.session ?? []) {
               if (!sameProjectionValue(info.metadata[key], current.metadata?.[key])) {
                 return yield* rejectProjection(event, event.data.sessionID, `hub-owned metadata ${key} changed`)
@@ -1442,11 +1551,17 @@ function workerProjectionPolicy(): SessionProjector.ProjectionPolicy {
             }
           }
           // The projector writes the whole `sessionRow(info)` image (undefined
-          // fields are omitted by `SET`). Compare that exact image with the row
-          // the policy already loaded and allow only worker-owned columns to
-          // change; a repeated hub value is a no-op, a changed one is authority.
+          // fields are omitted by `SET`). Compare the columns this event emitted
+          // with the row the policy already loaded and allow only worker-owned
+          // columns to change; a repeated hub value is a no-op, a changed one is
+          // authority.
           const currentRow = current as Record<string, unknown>
-          const changed = changedHubOwnedSessionColumns(sessionRow(info) as Record<string, unknown>, (column, value) =>
+          const image = sessionRow(info) as Record<string, unknown>
+          const emittedImage =
+            emitted === undefined
+              ? image
+              : Object.fromEntries([...emitted].map((column) => [column, image[column]]))
+          const changed = changedHubOwnedSessionColumns(emittedImage, (column, value) =>
             sameProjectionValue(value, currentRow[column]),
           )
           if (changed.length > 0) {
@@ -1515,7 +1630,8 @@ function workerProjectionPolicy(): SessionProjector.ProjectionPolicy {
             return yield* rejectProjection(event, event.data.sessionID, "part id is bound to another message")
           }
         }
-      }),
+      })
+    },
   }
 }
 
@@ -1910,29 +2026,30 @@ const WORKER_DISPATCHED_HOOKS: ReadonlySet<string> = new Set([
 ])
 
 /**
- * A worker trigger must be classified and dispatched. An unsupported or
- * unclassified hook is a typed failure, never a silent pass-through (D19).
- */
-function assertWorkerHookDispatch(name: string): void {
-  const route = workerHookRoute(name)
-  if (route === undefined) throw new UnclassifiedPluginHookError({ plugin: "worker", hook: name })
-  if (route === "unsupported" || !WORKER_DISPATCHED_HOOKS.has(name)) {
-    throw new UnsupportedPluginHookError({ plugin: "worker", hook: name })
-  }
-}
-
-/**
  * No plugin host means no configured hook exists, so the trigger is a true
- * no-op. An unsupported hook is only a failure when a host actually has to
- * dispatch it (a configured hook is rejected at startup instead).
+ * no-op. An unsupported hook is only a failure when a loaded plugin declared it.
  */
 const noopPluginTrigger = ((_name: string, _input: unknown, output: unknown) => Effect.succeed(output)) as PluginTrigger
 
 /**
  * Dispatch one `Plugin.trigger` to the matching worker-hosted hook.
+ *
+ * A routed-but-unsupported hook is a true no-op when no loaded plugin declared
+ * it: the worker invokes `experimental.text.complete` on every text-end, so a
+ * host existing (because `init.plugins` is an array) must not fail an
+ * unimplemented hook. A hook a plugin *did* declare stays a typed failure at
+ * invocation (D19) rather than being silently skipped.
  */
 function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknown, output: unknown): Promise<unknown> {
-  assertWorkerHookDispatch(name)
+  const route = workerHookRoute(name)
+  if (route === undefined) throw new UnclassifiedPluginHookError({ plugin: "worker", hook: name })
+  if (route === "unsupported") {
+    if (!workerPluginHostDeclaresHook(host, name)) return Promise.resolve(output)
+    throw new UnsupportedPluginHookError({ plugin: "worker", hook: name })
+  }
+  if (!WORKER_DISPATCHED_HOOKS.has(name)) {
+    throw new UnsupportedPluginHookError({ plugin: "worker", hook: name })
+  }
   switch (name) {
     case "chat.params":
       return host.chatParams(input, output as ChatParamsOutput)
@@ -2503,7 +2620,7 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
   const withProjectionPolicy =
     options.boundSessionID === undefined && options.clients.database?.sessionID === undefined
       ? withLogging
-      : withLogging.pipe(Layer.provide(Layer.succeed(SessionProjector.Policy, workerProjectionPolicy())))
+      : withLogging.pipe(Layer.provide(Layer.succeed(SessionProjector.Policy, workerProjectionPolicy(options.clients.database))))
   return { root: base, replacements, layer: withProjectionPolicy }
 }
 

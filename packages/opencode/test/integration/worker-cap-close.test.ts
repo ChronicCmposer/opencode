@@ -6,8 +6,8 @@
 //    isolate's native WAL handle before the thread dies, so the hub can take a
 //    `BEGIN IMMEDIATE` write lock without `SQLITE_BUSY`.
 //
-// The cap tests drive the production `createLazyExecutorWorkerPool` seam with
-// scripted workers (the same seam the hub tests use); the forced-close test
+// The cap tests drive the test-only lazy pool seam with scripted workers (the
+// same helper the hub tests use); the forced-close test
 // spawns a real Bun worker that holds a real `BEGIN IMMEDIATE` on a real WAL
 // file, then terminates it through the production transport.
 
@@ -30,10 +30,11 @@ import {
 } from "@/session/worker/execute"
 import {
   createBunExecutorTransport,
-  createLazyExecutorWorkerPool,
   createProductionSessionHub,
   createWorkerCap,
+  workerShutdownStats,
 } from "@/session/worker/hub"
+import { createLazyExecutorWorkerPool } from "../lib/lazy-worker-pool"
 import { sessionWorkerInit } from "../lib/session-worker-init"
 import { flush, pollUntil, settleOf, sid, withDeadline } from "../lib/async"
 import { REAL_WORKER_TEST_TIMEOUT_MS } from "../lib/worker-timeouts"
@@ -438,5 +439,65 @@ describe("forced close: terminate with an in-flight run releases the WAL lock", 
       await worker.terminate().catch(() => undefined)
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe("forced close observability and ordering", () => {
+  test("a shutdown ack timeout is counted and logged before the raw terminate", async () => {
+    const original = (globalThis as { Worker?: unknown }).Worker
+    class SilentWorker {
+      onmessage: ((event: MessageEvent) => void) | null = null
+      onerror: ((event: ErrorEvent) => void) | null = null
+      terminated = false
+      postMessage(): void {}
+      addEventListener(): void {}
+      removeEventListener(): void {}
+      async terminate(): Promise<number> {
+        this.terminated = true
+        return 0
+      }
+    }
+    let created: SilentWorker | undefined
+    ;(globalThis as { Worker?: unknown }).Worker = class extends SilentWorker {
+      constructor() {
+        super()
+        created = this
+      }
+    }
+    const lines: Array<{ message: string; fields: Record<string, unknown> }> = []
+    try {
+      const before = workerShutdownStats().rawTerminates
+      const transport = createBunExecutorTransport({
+        entry: "fake://silent-close",
+        log: (message, fields) => lines.push({ message, fields }),
+      })
+      await transport.terminate()
+      expect(workerShutdownStats().rawTerminates).toBe(before + 1)
+      expect(lines.some((line) => line.message.endsWith("worker shutdown ack timed out"))).toBe(true)
+      expect(created?.terminated).toBe(true)
+    } finally {
+      ;(globalThis as { Worker?: unknown }).Worker = original
+    }
+  })
+
+  test("executor terminate asks the transport to close before terminating", async () => {
+    const order: string[] = []
+    const transport = {
+      post: () => {},
+      waitFor: () => Promise.reject(new Error("not used")),
+      get alive() {
+        return true
+      },
+      close: async () => {
+        order.push("close")
+      },
+      terminate: async () => {
+        order.push("terminate")
+        return 0
+      },
+    }
+    const worker = createExecutorWorker({ id: 1, transport })
+    await worker.terminate()
+    expect(order).toEqual(["close", "terminate"])
   })
 })

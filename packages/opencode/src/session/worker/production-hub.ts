@@ -5,6 +5,7 @@ import path from "node:path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Database } from "@opencode-ai/core/database/database"
+import { openConnection } from "@opencode-ai/core/database/connection"
 import { Auth } from "@/auth"
 import { Config } from "@/config/config"
 import { Provider } from "@/provider/provider"
@@ -44,11 +45,13 @@ import { recordAsync } from "@/session/ledger/crash"
 import { ensureProductionSchemaAsync } from "@/session/db/schema"
 
 import {
+  createDurableHealReader,
   createEgressDeliveryBarrier,
   createEventBlobResolver,
   createHubEventSink,
   createSessionHub,
   serveEventsPort,
+  type DurableHealReader,
   type EgressDeliveryBarrier,
   type EventBlobResolver,
   type HubCacheInvalidation,
@@ -198,9 +201,23 @@ async function loadDispatchedSession(
   // The user message carries the per-request agent; the session's persisted agent
   // is the fallback when the message is absent.
   const agent = (message?.role === "user" ? message.agent : undefined) ?? info?.agent
-  const model = info?.model
+  // The dispatching user message carries the model this turn was requested with.
+  // It is newer than `session.model` (which is updated asynchronously), so a
+  // first turn after a model switch must key the generation on it.
+  const userModel = message?.role === "user" ? message.model : undefined
+  const model =
+    userModel !== undefined
+      ? {
+          providerID: userModel.providerID,
+          modelID: String(
+            "modelID" in userModel ? userModel.modelID : (userModel as { readonly id?: string }).id,
+          ),
+        }
+      : info?.model === undefined
+        ? undefined
+        : { providerID: info.model.providerID, modelID: info.model.id }
   return {
-    ...(model === undefined ? {} : { model: { providerID: model.providerID, modelID: model.id } }),
+    ...(model === undefined ? {} : { model }),
     ...(agent === undefined && message === undefined
       ? {}
       : { request: { ...(agent === undefined ? {} : { agent }), ...(message === undefined ? {} : { message }) } }),
@@ -326,6 +343,12 @@ export interface ProductionPortBackendsOptions {
    * resync instead of ever reaching the live publisher.
    */
   readonly resolveBlob?: EventBlobResolver
+  /**
+   * Read a missed durable range from the committed log so a worker gap is
+   * healed on the live (SSE) surface, not just counted. The production layer
+   * supplies a reader over the hub's off-loop SQL executor.
+   */
+  readonly readDurable?: DurableHealReader
 }
 
 /** The production port authorities plus the disposer that tears their isolates down. */
@@ -382,11 +405,13 @@ export function buildProductionPortBackends(options: ProductionPortBackendsOptio
           publisher,
           ...(options.cache === undefined ? {} : { cache: options.cache }),
           ...(options.resolveBlob === undefined ? {} : { resolveBlob: options.resolveBlob }),
+          ...(options.readDurable === undefined ? {} : { readDurable: options.readDurable }),
         })
         // Wrap the sink so the egress barrier sees the SAME ordered stream the
         // receiver decodes: durable frames first, then their ack.
         const observedSink: HubEventSink = {
           ...(sink.resolveBlob === undefined ? {} : { resolveBlob: sink.resolveBlob }),
+          ...(sink.heal === undefined ? {} : { heal: sink.heal }),
           event(event, meta) {
             sink.event(event, meta)
             if (meta?.durable !== true) return
@@ -440,6 +465,11 @@ export interface ProductionSessionHubOptions {
   readonly resumeDecisionTimeoutMs?: number
   /** Hub-side cleanup when a session's worker is retired (per-session maps). */
   readonly onSessionReleased?: (sessionID: SessionID) => void
+  /**
+   * Cheap generation probe (the dispatching session's requested model), so an
+   * unchanged generation reuses the cached worker init instead of rebuilding it.
+   */
+  readonly generationOf?: (sessionID: SessionID) => string | Promise<string>
   /**
    * Per-session durable-write barrier forwarded to the
    * dispatcher: a completed run's slot is held until it resolves.
@@ -531,6 +561,35 @@ function ignoreReapFailure(reap: () => void): void {
 }
 
 /**
+ * Best-effort startup sweep of leases left by earlier hub-process generations.
+ * A `worker-<id>-<pid>-<uuid>` owner whose PID is gone is marked reclaimable so
+ * the next admission does not wait for its TTL; a live generation is untouched.
+ *
+ * Runs once, after the schema gate has migrated the file, over a short-lived
+ * connection. A failure is logged and swallowed: the successor reclaim path
+ * still fences correctly, so this is defense-in-depth, never a boot blocker.
+ */
+export function sweepDeadLeasesAtStartup(filename: string, log: WorkerLogger = noopWorkerLogger): number {
+  let connection: ReturnType<typeof openConnection> | undefined
+  try {
+    connection = openConnection({ filename, create: false, busyTimeoutMs: 250 })
+    const released = Bus.create({ connection, ownerID: "hub-startup-lease-sweep" }).releaseDeadLeases()
+    if (released > 0) {
+      log(workerLogMessage("startup lease sweep"), { level: "INFO", released })
+    }
+    return released
+  } catch (error) {
+    log(workerLogMessage("startup lease sweep failed"), {
+      level: "WARN",
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return 0
+  } finally {
+    connection?.close()
+  }
+}
+
+/**
  * Resolve the ambient instance a session's worker boots under: this session's
  * captured instance, else its persisted directory, else the resolving fiber's
  * ambient instance, else the documented global fallback (warned, because it is a
@@ -579,14 +638,21 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   // missed. `BEGIN IMMEDIATE` serializes concurrent hubs.
   let bootGate: Promise<void> | undefined
   const awaitBootGate = (): Promise<void> => {
-    if (options.databasePath === undefined) return Promise.resolve()
+    const databasePath = options.databasePath
+    if (databasePath === undefined) return Promise.resolve()
     bootGate ??= ensureProductionSchemaAsync({
-      filename: options.databasePath,
+      filename: databasePath,
       liveWorkers:
-        options.liveWorkers?.() ?? liveSessionWorkerCount(options.databasePath) + (spawnGate.held === true ? 1 : 0),
+        options.liveWorkers?.() ?? liveSessionWorkerCount(databasePath) + (spawnGate.held === true ? 1 : 0),
       ...(options.db === undefined ? {} : { executor: options.db }),
     }).then(
-      () => undefined,
+      () => {
+        // The schema gate has migrated/verified the file, so the lease table is
+        // safe to sweep. Schedule after this promise resolves and never await:
+        // a slow or failing sweep must not delay the first worker admission.
+        setTimeout(() => sweepDeadLeasesAtStartup(databasePath, log), 0)
+        return undefined
+      },
       (error: unknown) => {
         // Reset so a later dispatch can retry after the cause is fixed; the
         // current dispatch still observes the typed failure.
@@ -653,6 +719,10 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
           init: resolveInit,
           log,
           onPhase: (sessionID, phase) => lifecycle.phase(sessionID, phase),
+          // An idle-cap eviction is a full generation retirement: drop the
+          // dispatcher entry, terminate, and run the hub release (ports, asks,
+          // lease). Wired lazily because the hub is created after the pool.
+          onIdleEvicted: (sessionID) => hub?.dispatcher.retire(sessionID) ?? Promise.resolve(),
           ...defined({
             entry: describedEntry.entry,
             databasePath: options.databasePath,
@@ -669,8 +739,13 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
             bootTimeoutMs: options.bootTimeoutMs,
             onBootTelemetry: options.onBootTelemetry,
             maxRunning,
+            ...(options.generationOf === undefined ? {} : { generationOf: options.generationOf }),
             beforeSpawn: awaitBootGate,
           }),
+          // A same-session model switch replaces the isolate in place, so the
+          // dispatcher never retires it. Route it through the hub's full
+          // generation retirement (lost calls, ports, pending asks, lease).
+          onGenerationRetired: (sessionID, workerID) => hub?.releaseGeneration(sessionID, workerID),
           ...sinks,
         })
   // The hub-side mirror of every worker child's process group: a
@@ -781,6 +856,11 @@ export interface ProductionSessionHubNodeOptions {
   readonly onSessionRebound?: (sessionID: SessionID) => void
   /** Hub-side cleanup when a session's worker is retired (per-session maps). */
   readonly onSessionReleased?: (sessionID: SessionID) => void
+  /**
+   * Cheap generation probe (the dispatching session's requested model), so an
+   * unchanged generation reuses the cached worker init instead of rebuilding it.
+   */
+  readonly generationOf?: (sessionID: SessionID) => string | Promise<string>
   /** The background-promotion decision the hub observed (see `SessionHubOptions`). */
   readonly promotionOutcome?: (sessionID: SessionID) => RunBarrierPromotionOutcome
 }
@@ -845,6 +925,7 @@ interface PerSessionResolvers {
   readonly cancelPendingRequests: (sessionID: SessionID) => void
   readonly instanceOfSession: (sessionID: SessionID | undefined) => InstanceContext | undefined
   readonly resolveInit: (sessionID?: SessionID) => Promise<SessionWorkerInit>
+  readonly generationOfSession: (sessionID: SessionID) => Promise<string>
   readonly recordDispatch: (sessionID: SessionID) => void
   readonly releaseSession: (sessionID: SessionID) => void
   readonly clearSessions: () => void
@@ -1179,6 +1260,17 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
       ),
     )
   }
+  /**
+   * Cheap generation probe: read the dispatching session's requested model
+   * without building the full worker init. `createProductionWorkerPool` caches
+   * the init per `(session, generation)`, so an unchanged model never rebuilds
+   * the graph/plugin bootstrap on every turn.
+   */
+  const generationOfSession = async (sessionID: SessionID): Promise<string> => {
+    const dispatched = await loadDispatchedSession(contextOfSession(sessionID), sessionID)
+    const model = dispatched?.model
+    return model === undefined ? "unknown" : `${model.providerID}/${model.modelID}`
+  }
   const recordDispatch = (sessionID: SessionID): void => {
     // Overwrite on every dispatch (never `??=`): each session keeps its own
     // ambient instance/context, so a later project never inherits the first.
@@ -1218,6 +1310,7 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
     },
     instanceOfSession,
     resolveInit,
+    generationOfSession,
     recordDispatch,
     releaseSession,
     clearSessions,
@@ -1317,6 +1410,10 @@ export function productionSessionHubLayer(
         (blobDir === undefined
           ? undefined
           : createEventBlobResolver({ query: (sql, params) => db.query(sql, params), blobDir }))
+      // A worker gap is healed by reading the missed committed range off-loop.
+      const readDurable =
+        options.backends?.readDurable ??
+        createDurableHealReader({ query: (sql, params) => db.query(sql, params) })
       // The hub is assigned after the pool is built; the resolver's per-worker
       // lookups run lazily on the first port attach (post-assignment), so the
       // deferred reference is safe.
@@ -1362,6 +1459,7 @@ export function productionSessionHubLayer(
           buildProductionPortBackends({
             ...options.backends,
             ...(resolveBlob === undefined ? {} : { resolveBlob }),
+            readDurable,
             hubProxy: options.backends?.hubProxy,
             hubProxyFor: options.backends?.hubProxyFor ?? resolvers.hubProxyFor,
             hubProxyStreamingFor: options.backends?.hubProxyStreamingFor ?? resolvers.hubProxyStreamingFor,
@@ -1376,6 +1474,7 @@ export function productionSessionHubLayer(
         count,
         databasePath,
         init: resolvers.resolveInit,
+        generationOf: resolvers.generationOfSession,
         ports,
         db,
         cache,

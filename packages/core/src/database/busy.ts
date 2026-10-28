@@ -4,7 +4,7 @@
 // reserves the `Connection` and issues `begin`/`commit`/`rollback` (and every
 // statement) through that connection's methods. Wrapping those methods is
 // therefore what lets both transactions and statements recover from a lock held
-// by the worker writer. Retries are additive to the fixed `busy_timeout`: a busy
+// by a worker connection. Retries are additive to the fixed `busy_timeout`: a busy
 // failure is retried with bounded exponential backoff, and once the budget is
 // spent the effect still fails loud with `BusyRetriesExhaustedError`.
 
@@ -52,8 +52,8 @@ export interface NativeSqliteError {
  * locked" message fallback is only trustworthy for these: an arbitrary error
  * whose message happens to contain that text must not trigger a retry.
  *
- * This is the single guard; the writer isolate should reuse it rather than
- * re-implementing its own driver-shape check.
+ * This is the single guard: the Effect adapter and the synchronous transaction
+ * helpers both narrow through it instead of re-implementing a driver-shape check.
  */
 export function isNativeSqliteError(error: unknown): error is NativeSqliteError {
   if (typeof error !== "object" || error === null) return false
@@ -78,7 +78,7 @@ function isBusyNumericCode(code: number): boolean {
 function hasBusyCode(error: NativeSqliteError): boolean {
   const code = error.code
   if (typeof code === "string" && isBusyCode(code)) return true
-  // The writer-side classifier reads `sqliteCode`; mirror that for parity.
+  // Bun/`node:sqlite` may expose the family as `sqliteCode` instead of `code`.
   const sqliteCode = error.sqliteCode
   if (typeof sqliteCode === "string" && isBusyCode(sqliteCode)) return true
   if (typeof error.errno === "number" && isBusyNumericCode(error.errno)) return true
@@ -100,9 +100,9 @@ function hasBusyMessage(error: NativeSqliteError): boolean {
  * True when `error` is a lock/busy failure a retry can recover from. Recognizes
  * the `LockTimeoutError` reason produced by `classifySqliteError`, the native
  * `SQLITE_BUSY`/`SQLITE_LOCKED` code families (including extended forms), and a
- * native-driver error whose message says the database is locked. Mirrors the
- * writer isolate's `isSqliteBusy` without importing across packages (core stays
- * self-contained).
+ * native-driver error whose message says the database is locked. This is the
+ * one busy classifier: the Effect adapter and the synchronous transaction
+ * helpers both delegate here, so driver shapes cannot drift between them.
  */
 export function isBusySqlError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false

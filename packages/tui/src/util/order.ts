@@ -11,6 +11,16 @@ export function compareCodepoint(left: string, right: string): number {
   return leftPoints.length - rightPoints.length
 }
 
+/**
+ * Identity order for persisted ids. SQLite `ORDER BY id` uses binary collation,
+ * so ids must follow byte/code-point order; digit runs are never numeric here.
+ * Numeric comparison would invert hex ids (`…a19f` before `…a1a0`) and collapse
+ * distinct ids such as `x2` and `x02`, breaking id-keyed binary searches.
+ */
+export function compareIds(left: string, right: string): number {
+  return compareCodepoint(left, right)
+}
+
 const DIGIT = /[0-9]/
 
 /** Code-point order with digit runs compared numerically (`part2` before `part10`). */

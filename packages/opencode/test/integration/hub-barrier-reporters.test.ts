@@ -125,28 +125,26 @@ describe("run-barrier phase reporters", () => {
     }
   })
 
-  test("a run that never reports a commit cannot drain and times out typed", async () => {
+  test("a run that commits nothing drains explicitly and admits the next prompt", async () => {
     const lifecycle = createLifecycleTracker()
     const clock = fakeScheduler()
     const barrier = createRunBarrier({ scheduler: clock.scheduler })
-    const pool = createFakeExecutorPool(1, { mode: "blocking" })
+    // `auto` settles the run without any lifecycle report: a no-commit run.
+    const pool = createFakeExecutorPool(1)
     const hub = createSessionHub({ pool, lifecycle, barrier })
-    const sessionID = sid("ses_barrier_missing_commit")
+    const sessionID = sid("ses_barrier_no_commit")
 
-    const run = hub.ensureRunning(sessionID)
-    await flush()
     try {
-      await (pool.spawned[0] ?? pool.workers[0])!.cancel(sessionID)
+      const run = hub.ensureRunning(sessionID)
       await flush()
-      // `tools` (zero) and `promotion` were reported, but the missing
-      // `commits`/`projectors` reports keep the barrier closed.
-      expect(hub.barrier.state(sessionID)).toBe("draining")
-
-      clock.advance(RUN_BARRIER_TIMEOUT_MS)
+      // The run exited without a commit: `commits`/`projectors` settle as an
+      // explicit `none` instead of waiting for the 5 s bound.
+      expect(hub.barrier.state(sessionID)).toBe("drained")
       await run
-      await flush()
-      expect(hub.barrier.state(sessionID)).toBe("timed-out")
-      await expect(hub.ensureRunning(sessionID)).rejects.toBeInstanceOf(RunBarrierTimeout)
+
+      await hub.ensureRunning(sessionID)
+      expect(hub.barrier.state(sessionID)).toBe("drained")
+      expect(hub.barrier.state(sessionID)).not.toBe("timed-out")
     } finally {
       await hub.terminateAll()
     }

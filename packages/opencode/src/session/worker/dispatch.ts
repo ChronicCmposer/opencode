@@ -18,7 +18,7 @@ import type { AutoResumeDecision } from "@/session/ledger/resume"
 import type { PromptInput, ShellInput } from "@/session/prompt"
 import { defined } from "@/util/object"
 import { createSessionWorkerRegistry, type SessionWorkerRegistry } from "./session-registry"
-import { defaultSchedule, messageOf } from "./port"
+import { defaultSchedule, errorTagOf, messageOf } from "./port"
 import { resolveReapMs } from "./pool"
 import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
 import { SessionWorkerReplyTimeoutError } from "./execute"
@@ -36,6 +36,9 @@ import {
 
 /** Default deadline for an asynchronous crash resume decision. */
 const DEFAULT_RESUME_DECISION_TIMEOUT_MS = 5_000
+
+/** Default deadline for a retiring generation's confirmed exit. */
+const DEFAULT_TERMINATE_TIMEOUT_MS = 5_000
 
 /** One session run: the key the worker executes, its subagent depth and its frame mode. */
 export type SessionRun = ExecutorRun
@@ -173,6 +176,12 @@ export interface DispatchRequest {
   readonly mode?: SessionRunMode
   readonly prompt?: PromptInput
   readonly shell?: ShellInput
+  /**
+   * The model this run was requested with (the prompt's model). A session worker
+   * is bound to one model, so a different request selects a new generation even
+   * when the persisted session row still names the previous model.
+   */
+  readonly model?: { readonly providerID: string; readonly modelID: string }
 }
 
 export interface DispatcherOptions {
@@ -188,6 +197,12 @@ export interface DispatcherOptions {
    * prior run's durable egress write.
    */
   readonly writeBarrier?: (sessionID: SessionID) => Promise<void> | undefined
+  /**
+   * Refuse a run whose bundle can no longer be admitted (e.g. a compiled
+   * `BuildMismatch`). Checked before every waiter promotion, not only at hub
+   * entry: a run that parks behind a crash must not respawn the stale bundle.
+   */
+  readonly assertAdmissible?: (sessionID: SessionID) => void
   /** Hub-side cleanup when a session's worker is retired (reap/cancel/crash). */
   readonly onSessionReleased?: (sessionID: SessionID, workerID?: number) => unknown
   /** Invoked synchronously when a run actually starts (not when it parks). */
@@ -215,8 +230,21 @@ export interface DispatcherOptions {
    * no resume and the parked successor starts. Defaults to 5s; `0` disables it.
    */
   readonly resumeDecisionTimeoutMs?: number
-  /** Observe an allowed auto-resume; re-dispatch stays with the hub owner. */
-  readonly onAutoResume?: (decision: Extract<AutoResumeDecision, { resume: true }>, payload: WorkerCrashed) => void
+  /**
+   * How long a successor waits for a retiring generation's confirmed exit (and
+   * its lease release) before proceeding. A terminate that never settles must not
+   * park the session forever. Defaults to 5s.
+   */
+  readonly terminateTimeoutMs?: number
+  /**
+   * Observe an allowed auto-resume; re-dispatch stays with the hub owner. The
+   * returned promise is the resumed run: the original crashed caller waits for
+   * it instead of observing `WorkerCrashedError` while its replacement runs.
+   */
+  readonly onAutoResume?: (
+    decision: Extract<AutoResumeDecision, { resume: true }>,
+    payload: WorkerCrashed,
+  ) => unknown
 }
 
 export interface Dispatcher extends AsyncDisposable {
@@ -228,6 +256,19 @@ export interface Dispatcher extends AsyncDisposable {
   dispatch(request: DispatchRequest): Promise<void>
   cancel(sessionID: SessionID): Promise<void>
   cancelWithGrace(sessionID: SessionID): Promise<CascadeReport | undefined>
+  /**
+   * Retire the session's generation: drop its registry entry, terminate the
+   * isolate, and run the release callback/lease release. Used by the pool's idle
+   * cap, which evicts a worker the dispatcher would otherwise keep idle.
+   */
+  retire(sessionID: SessionID): Promise<void>
+  /**
+   * Release barrier: resolves once this session's in-flight retirement has
+   * confirmed the isolate exit and finished its `onSessionReleased` callback
+   * (including the retired lease release). Resolves immediately when nothing is
+   * retiring. Awaiting only the run settlement does not observe the release.
+   */
+  awaitRelease(sessionID: SessionID): Promise<void>
   terminateAll(): Promise<void>
   dispose(): Promise<void>
 }
@@ -238,11 +279,14 @@ interface Pending {
   readonly mode: SessionRunMode
   readonly prompt: PromptInput | undefined
   readonly shell: ShellInput | undefined
+  readonly model: { readonly providerID: string; readonly modelID: string } | undefined
   readonly promise: Promise<void>
   readonly resolve: () => void
   readonly reject: (error: unknown) => void
   readonly settled: Promise<void>
   readonly markSettled: () => void
+  /** True once the run has reached a terminal observation (completion/failure). */
+  settledFlag: boolean
   completed: boolean
   readonly gate: OutcomeGate
   startedAt: number | undefined
@@ -256,6 +300,7 @@ function createPending(
   mode: SessionRunMode,
   prompt: PromptInput | undefined,
   shell: ShellInput | undefined,
+  model: { readonly providerID: string; readonly modelID: string } | undefined,
 ): Pending {
   let resolve!: () => void
   let reject!: (error: unknown) => void
@@ -267,23 +312,29 @@ function createPending(
   const settled = new Promise<void>((res) => {
     markSettled = res
   })
-  return {
+  const pending: Pending = {
     sessionID,
     depth,
     mode,
     prompt,
     shell,
+    model,
     promise,
     resolve,
     reject,
     settled,
-    markSettled,
+    markSettled: () => {
+      pending.settledFlag = true
+      markSettled()
+    },
+    settledFlag: false,
     completed: false,
     gate: createOutcomeGate(),
     startedAt: undefined,
     workerID: undefined,
     cancelPending: false,
   }
+  return pending
 }
 
 export function createDispatcher(options: DispatcherOptions): Dispatcher {
@@ -294,6 +345,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const schedule = options.schedule ?? defaultSchedule
   const reapMs = options.reapMs ?? resolveReapMs()
   const resumeDecisionTimeoutMs = options.resumeDecisionTimeoutMs ?? DEFAULT_RESUME_DECISION_TIMEOUT_MS
+  const terminateTimeoutMs = options.terminateTimeoutMs ?? DEFAULT_TERMINATE_TIMEOUT_MS
 
   // The session→worker map. Workers outlive runs (reuse across turns) until
   // idle-reap or terminal cancel disposes them.
@@ -320,6 +372,20 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   }
 
   const hasWaiters = (sessionID: SessionID): boolean => (waitersByKey.get(sessionID)?.length ?? 0) > 0
+
+  /**
+   * The typed refusal when the session's build is no longer admissible (or
+   * `undefined` when it is). A defect in the guard itself must not admit work.
+   */
+  const inadmissible = (sessionID: SessionID): unknown | undefined => {
+    if (options.assertAdmissible === undefined) return undefined
+    try {
+      options.assertAdmissible(sessionID)
+      return undefined
+    } catch (error) {
+      return error
+    }
+  }
 
   /**
    * Whether a worker still owns work that must outlive an idle turn. The probe
@@ -415,8 +481,19 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       .terminate()
       .catch(() => undefined)
       .then(async () => {
-        pool.releaseSession?.(sessionID, worker.id)
-        await options.onSessionReleased?.(sessionID, worker.id)
+        try {
+          pool.releaseSession?.(sessionID, worker.id)
+          await options.onSessionReleased?.(sessionID, worker.id)
+        } catch (error) {
+          // A callback that throws must not leave `exit` rejected (nobody may be
+          // awaiting it) nor park the successor: log and treat it as settled.
+          log(workerLogMessage("session release callback failed"), {
+            level: "WARN",
+            sessionID,
+            workerID: worker.id,
+            reason: messageOf(error),
+          })
+        }
       })
       .finally(() => {
         if (terminating.get(sessionID) === exit) terminating.delete(sessionID)
@@ -457,24 +534,104 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     retireWorker(sessionID)
   }
 
+  /**
+   * Wait for a retiring generation's exit, but never forever: a rejected or
+   * wedged terminate settles at the deadline so the successor can start instead
+   * of parking the session. A rejection is logged and treated as settled.
+   */
+  const awaitTerminating = async (sessionID: SessionID, exit: Promise<void>): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        log(workerLogMessage("retirement exit timed out"), {
+          level: "WARN",
+          sessionID,
+          timeoutMs: terminateTimeoutMs,
+          reason: "the retiring generation never confirmed its exit; starting the successor",
+        })
+        resolve()
+      }, terminateTimeoutMs)
+      timer.unref?.()
+    })
+    try {
+      await Promise.race([
+        exit.catch((error: unknown) => {
+          log(workerLogMessage("retirement exit failed"), {
+            level: "WARN",
+            sessionID,
+            reason: messageOf(error),
+          })
+        }),
+        deadline,
+      ])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }
+
+  /**
+   * Park a run until the previous generation's confirmed exit (or the bounded
+   * deadline). The same helper is used both for an already-retiring generation
+   * and for the retirement a dead-idle replacement just started, so a successor
+   * can never materialize against a live old isolate.
+   */
+  const deferUntilRetired = (pending: Pending, exit: Promise<void>): void => {
+    void (async () => {
+      await awaitTerminating(pending.sessionID, exit)
+      if (terminating.get(pending.sessionID) === exit) terminating.delete(pending.sessionID)
+      if (byKey.get(pending.sessionID) !== pending) return
+      if (terminated) {
+        pending.gate.claim("cancel")
+        pending.reject(cancelled(pending.sessionID))
+        return
+      }
+      start(pending)
+    })()
+  }
+
+  /**
+   * Retire one session's generation on behalf of the pool's idle cap. Idempotent:
+   * a session with no registered worker resolves immediately.
+   */
+  const retire = (sessionID: SessionID): Promise<void> => {
+    retireWorker(sessionID)
+    return terminating.get(sessionID) ?? Promise.resolve()
+  }
+
+  /** The explicit release barrier for a retirement that is already in flight. */
+  const awaitRelease = (sessionID: SessionID): Promise<void> => terminating.get(sessionID) ?? Promise.resolve()
+
   const start = (pending: Pending): void => {
     if (terminated) {
       pending.gate.claim("cancel")
       pending.reject(cancelled(pending.sessionID))
       return
     }
-    const exit = terminating.get(pending.sessionID)
-    if (exit !== undefined) {
-      // The previous generation is still exiting: never materialize a successor
-      // against a live old isolate. `start` re-enters once the exit is confirmed.
-      void exit.then(() => {
-        if (byKey.get(pending.sessionID) === pending) start(pending)
-      })
+    // A build that became inadmissible while this run waited (a crash blocked
+    // the bundle) must reject here too, before any isolate is materialized.
+    const blocked = inadmissible(pending.sessionID)
+    if (blocked !== undefined) {
+      if (ownsSession(pending)) byKey.delete(pending.sessionID)
+      if (pending.gate.claim("cancel")) pending.reject(blocked)
+      nextWaiter(pending.sessionID)
+      return
+    }
+    const exiting = terminating.get(pending.sessionID)
+    if (exiting !== undefined) {
+      deferUntilRetired(pending, exiting)
       return
     }
     clearIdle(pending.sessionID)
-    options.onRunStart?.(pending.sessionID)
     replaceDeadIdleWorker(pending.sessionID)
+    // `replaceDeadIdleWorker` may have just started an orderly retirement. The
+    // check above happened before it ran, so re-check before spawning: the
+    // successor must wait for the old close and lease release.
+    const replaced = terminating.get(pending.sessionID)
+    if (replaced !== undefined) {
+      deferUntilRetired(pending, replaced)
+      return
+    }
+    options.onRunStart?.(pending.sessionID)
     const worker = workers.getOrCreate(pending.sessionID, (id) => pool.spawn(id))
     pending.startedAt = Date.now()
     pending.workerID = worker.id
@@ -492,6 +649,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       ...(pending.mode === "startShell" ? { mode: pending.mode } : {}),
       ...(pending.prompt === undefined ? {} : { prompt: pending.prompt }),
       ...(pending.shell === undefined ? {} : { shell: pending.shell }),
+      ...(pending.model === undefined ? {} : { model: pending.model }),
     }
     let execution: Promise<void>
     try {
@@ -566,7 +724,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const reported = error instanceof WorkerCrashedError ? error : undefined
     const state = options.crashState?.(pending.sessionID)
     const phase = isWorkerCrashPhase(reported?.phase) ? reported.phase : (state?.phase ?? "stream")
-    return workerCrashed({
+    const payload = workerCrashed({
       sessionID: pending.sessionID,
       workerID: reported?.workerID ?? workers.worker(pending.sessionID)?.id ?? pending.workerID ?? -1,
       phase,
@@ -574,6 +732,15 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       inFlightCallIDs: reported?.inFlightCallIDs ?? state?.inFlightCallIDs ?? [],
       reason: reported?.reason ?? describeFailure(error),
     })
+    // Carry the typed underlying failure (e.g. `BuildMismatch`) on the in-memory
+    // payload without changing its observable/persisted shape. The resume
+    // decision reads it to return the typed cause as-is instead of re-classifying
+    // a string reason.
+    const cause = reported?.cause ?? error
+    if (cause instanceof Error) {
+      Object.defineProperty(payload, "cause", { value: cause, enumerable: false, configurable: false })
+    }
+    return payload
   }
 
   /**
@@ -622,7 +789,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
    */
   const settleCrash = (
     pending: Pending,
-    failure: WorkerCrashedError,
+    failure: WorkerCrashedError | Error,
     payload: WorkerCrashed,
     decision: AutoResumeDecision | undefined,
   ): void => {
@@ -632,24 +799,53 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     }
     workers.release(pending.sessionID)
     byKey.delete(pending.sessionID)
+    if (decision?.resume === true) {
+      // The caller's run was resumed, so its promise must reflect the resumed
+      // run, not the crash that triggered it. When the owner re-dispatches (the
+      // production hub returns that promise), settle this caller with its
+      // outcome; without a promise, resolve as resumed so no caller observes
+      // `WorkerCrashedError` for a run that is still healthy.
+      const resumed = options.onAutoResume?.(decision, payload)
+      if (resumed instanceof Promise) {
+        resumed.then(
+          () => {
+            if (pending.gate.claim("completion")) pending.resolve()
+            else pending.reject(cancelled(pending.sessionID))
+          },
+          (error: unknown) => {
+            pending.reject(error)
+            nextWaiter(pending.sessionID)
+          },
+        )
+        return
+      }
+      // A resume owner that returns no run promise cannot deliver its outcome:
+      // the caller still observes the typed crash (never a silent success).
+    }
     pending.reject(failure)
-    if (decision?.resume === true) options.onAutoResume?.(decision, payload)
     nextWaiter(pending.sessionID)
+  }
+
+  /**
+   * Retire a worker that died while a cancel still owned its run. The cancel
+   * controller keeps the graceful settlement (`keepController`), but retirement
+   * and the child cascade belong to this crash; otherwise the next turn reuses a
+   * dead worker. This is the one dead-worker retirement path on the cancel side.
+   */
+  const retireDeadCancelledWorker = (sessionID: SessionID): void => {
+    const dead = workers.worker(sessionID)
+    if (dead === undefined || dead.alive) return
+    crashChildren(sessionID)
+    retireWorker(sessionID, { keepController: true })
   }
 
   const fail = (pending: Pending, error: unknown): void => {
     pending.markSettled()
     // A dead isolate must never survive a cancel that owns this run: the cancel
     // settles the terminal decision, but retirement and the child cascade still
-    // belong to this crash. Otherwise the next turn reuses a dead worker.
+    // belong to this crash.
     if (pending.cancelPending) {
-      const dead = workers.worker(pending.sessionID)
-      if (dead !== undefined && !dead.alive) {
-        crashChildren(pending.sessionID)
-        // The cancel controller still owns the graceful settlement; retiring the
-        // isolate must not dispose it out from under the in-flight request.
-        retireWorker(pending.sessionID, { keepController: true })
-      }
+      retireDeadCancelledWorker(pending.sessionID)
       return
     }
     // A late rejection from a cancelled/superseded run must not settle the
@@ -661,11 +857,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     if (pending.gate.winner === "cancel") {
       workers.release(pending.sessionID)
       byKey.delete(pending.sessionID)
-      const dead = workers.worker(pending.sessionID)
-      if (dead !== undefined && !dead.alive) {
-        crashChildren(pending.sessionID)
-        retireWorker(pending.sessionID, { keepController: true })
-      }
+      retireDeadCancelledWorker(pending.sessionID)
       pending.reject(cancelled(pending.sessionID))
       nextWaiter(pending.sessionID)
       return
@@ -691,19 +883,25 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       })
       options.recordCrash?.(payload)
       options.onCrash?.(payload)
-      const failure = new WorkerCrashedError({
-        message:
-          error instanceof WorkerCrashedError
-            ? error.message
-            : `worker ${payload.workerID} crashed: ${payload.reason}`,
-        workerID: payload.workerID,
-        sessionID: payload.sessionID,
-        phase: payload.phase,
-        lastCommittedMessageID: payload.lastCommittedMessageID,
-        inFlightCallIDs: payload.inFlightCallIDs,
-        reason: payload.reason,
-        cause: error instanceof WorkerCrashedError ? (error.cause ?? error) : error,
-      })
+      const cause = error instanceof WorkerCrashedError ? (error.cause ?? error) : error
+      const failure =
+        errorTagOf(cause) === "BuildMismatch" && cause instanceof Error
+          ? // A stale bundle is a typed, non-retryable failure: return it as-is
+            // (the hub's resume decision also blocks a respawn until it changes).
+            cause
+          : new WorkerCrashedError({
+              message:
+                error instanceof WorkerCrashedError
+                  ? error.message
+                  : `worker ${payload.workerID} crashed: ${payload.reason}`,
+              workerID: payload.workerID,
+              sessionID: payload.sessionID,
+              phase: payload.phase,
+              lastCommittedMessageID: payload.lastCommittedMessageID,
+              inFlightCallIDs: payload.inFlightCallIDs,
+              reason: payload.reason,
+              cause,
+            })
       crashChildren(pending.sessionID)
       retireWorker(pending.sessionID)
       const decision = options.resumeDecision?.(payload)
@@ -762,6 +960,17 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     if (byKey.has(sessionID)) return
     const waiters = waitersByKey.get(sessionID)
     if (waiters === undefined || waiters.length === 0) {
+      scheduleReap(sessionID)
+      return
+    }
+    // A waiter promoted after a crash must not respawn a bundle that is no
+    // longer admissible. The typed refusal is the caller's outcome, not a run.
+    const blocked = inadmissible(sessionID)
+    if (blocked !== undefined) {
+      waitersByKey.delete(sessionID)
+      for (const waiter of waiters) {
+        if (waiter.gate.claim("cancel")) waiter.reject(blocked)
+      }
       scheduleReap(sessionID)
       return
     }
@@ -846,11 +1055,15 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     mode: SessionRunMode,
     prompt: PromptInput | undefined,
     shell: ShellInput | undefined,
+    model: { readonly providerID: string; readonly modelID: string } | undefined,
   ): boolean =>
+    !admitted.settledFlag &&
     admitted.depth === depth &&
     admitted.mode === mode &&
     admitted.prompt === prompt &&
-    admitted.shell === shell
+    admitted.shell === shell &&
+    admitted.model?.providerID === model?.providerID &&
+    admitted.model?.modelID === model?.modelID
 
   const dispatch = (request: DispatchRequest): Promise<void> => {
     // Shutdown owns the terminal state: a prompt racing `terminateAll`/`dispose`
@@ -864,20 +1077,21 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const sessionID = request.sessionID
     const prompt = request.prompt
     const shell = request.shell
+    const model = request.model ?? request.prompt?.model
 
     const admitted = byKey.get(sessionID)
     if (admitted !== undefined) {
-      if (isSameRun(admitted, depth, mode, prompt, shell)) return admitted.promise
+      if (isSameRun(admitted, depth, mode, prompt, shell, model)) return admitted.promise
       // Different run identity: park behind the in-flight run. Unbounded.
       clearIdle(sessionID)
-      const pending = createPending(sessionID, depth, mode, prompt, shell)
+      const pending = createPending(sessionID, depth, mode, prompt, shell, model)
       const waiters = waitersByKey.get(sessionID)
       if (waiters === undefined) waitersByKey.set(sessionID, [pending])
       else waiters.push(pending)
       return pending.promise
     }
 
-    const pending = createPending(sessionID, depth, mode, prompt, shell)
+    const pending = createPending(sessionID, depth, mode, prompt, shell, model)
     byKey.set(sessionID, pending)
     start(pending)
     return pending.promise
@@ -1070,6 +1284,8 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     dispatch,
     cancel,
     cancelWithGrace,
+    retire,
+    awaitRelease,
     terminateAll,
     dispose: terminateAll,
     [Symbol.asyncDispose]: terminateAll,

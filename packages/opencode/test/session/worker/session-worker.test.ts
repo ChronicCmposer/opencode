@@ -9,7 +9,7 @@ import { Database } from "bun:sqlite"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { DateTime, Effect, Latch, Layer, Option, Schema, Sink, Stream } from "effect"
+import { DateTime, Effect, Exit, Latch, Layer, Option, Schema, Sink, Stream } from "effect"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Flag } from "@opencode-ai/core/flag/flag"
@@ -51,6 +51,7 @@ import {
   UnknownWorkKindError,
   type SessionRunControl,
   type SessionWork,
+  type SessionWorkFactory,
 } from "@/session/worker/execute"
 import {
   MissingWorkerPortError,
@@ -461,6 +462,36 @@ describe("bootstrapSessionWorker control-port transfer", () => {
     // Each port-backed peer emits its connected line at construction; without
     // a real logger these were dormant in production.
     expect(messages).toContain(workerLogMessage("egress connected"))
+  })
+
+  test("a cancel with no active run does not latch into the next pipeline run", async () => {
+    const { scope } = fakeScope()
+    let control: SessionRunControl | undefined
+    let work: SessionWorkFactory | undefined
+    const handle = bootstrapSessionWorker(init(), scope, {
+      installExecutor: (_scope, options) => {
+        control = options.control
+        work = options.work
+        return {
+          handle: async () => ({ type: "pong", id: 0 }),
+          dispose: async () => {},
+        }
+      },
+    })
+    try {
+      const sessionID = sid("ses_pipeline_idle_cancel")
+      // Pipeline-only graphs never register `SessionRunState`, so the control is
+      // permanently absent. An idle cancel must not outlive the (non-existent)
+      // run it was meant for.
+      expect(control).toBeDefined()
+      expect(work).toBeDefined()
+      await control!.cancel(sessionID)
+
+      const exit = await Effect.runPromise(Effect.exit(work!(DEFAULT_WORK_KIND)(sessionID)))
+      expect(Exit.hasInterrupts(exit)).toBe(false)
+    } finally {
+      await handle.dispose()
+    }
   })
 })
 

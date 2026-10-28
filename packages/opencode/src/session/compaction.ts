@@ -175,6 +175,12 @@ export interface Interface {
     sessionID: SessionID
     auto: boolean
     overflow?: boolean
+    /**
+     * Report the durable summary message id when compaction stops the run. The
+     * assistant row is already persisted when this runs, so the caller reports
+     * an accurate commit instead of fabricating one.
+     */
+    onStop?: (messageID: MessageID) => Promise<void>
   }) => Effect.Effect<"continue" | "stop">
   readonly create: (input: {
     sessionID: SessionID
@@ -323,7 +329,9 @@ const layer = Layer.effect(
       sessionID: SessionID
       auto: boolean
       overflow?: boolean
+      onStop?: (messageID: MessageID) => Promise<void>
     }) {
+      const reportStop = input.onStop
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
       if (!parent || parent.info.role !== "user") {
         throw new Error(`Compaction parent must be a user message: ${input.parentID}`)
@@ -461,6 +469,7 @@ const layer = Layer.effect(
         }).toObject()
         processor.message.finish = "error"
         yield* session.updateMessage(processor.message)
+        if (reportStop !== undefined) yield* Effect.promise(() => reportStop(processor.message.id))
         return "stop"
       }
 
@@ -555,7 +564,10 @@ const layer = Layer.effect(
         }
       }
 
-      if (processor.message.error) return "stop"
+      if (processor.message.error) {
+        if (reportStop !== undefined) yield* Effect.promise(() => reportStop(processor.message.id))
+        return "stop"
+      }
       if (result === "continue") {
         yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
       }

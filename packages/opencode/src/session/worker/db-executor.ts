@@ -8,8 +8,8 @@
 
 import { Database, type SQLQueryBindings } from "bun:sqlite"
 import { isMainThread, parentPort, threadId, workerData } from "node:worker_threads"
-import { resolveWalConfig, walPragmas } from "@opencode-ai/core/database/pragmas"
-import { retryBusySync } from "@opencode-ai/core/database/transaction"
+import { executorPragmas, resolveWalConfig } from "@opencode-ai/core/database/pragmas"
+import { EXECUTOR_BUSY_RETRY_CONFIG, isBusyError, retryBusySync } from "@opencode-ai/core/database/transaction"
 import { resolveWorkerEntry } from "./port"
 
 export type DbParams = ReadonlyArray<unknown> | Record<string, unknown>
@@ -237,7 +237,9 @@ function runTransaction(db: Database, statements: ReadonlyArray<DbStatement>): R
     db.exec("BEGIN IMMEDIATE")
     try {
       const results = statements.map((statement) => runStatement(db, statement))
-      db.exec("COMMIT")
+      // A busy COMMIT did not commit; the transaction is still open, so retry
+      // the COMMIT in place instead of replaying the whole body.
+      retryBusySync(() => db.exec("COMMIT"), EXECUTOR_BUSY_RETRY_CONFIG)
       return results
     } catch (error) {
       try {
@@ -249,7 +251,7 @@ function runTransaction(db: Database, statements: ReadonlyArray<DbStatement>): R
       }
       throw error
     }
-  })
+  }, EXECUTOR_BUSY_RETRY_CONFIG)
 }
 
 function execute(db: Database, request: DbExecutorRequest): unknown {
@@ -431,15 +433,23 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
   const resolvedWal = resolveWalConfig(options.env)
   const checkpointIntervalMs = options.checkpointIntervalMs ?? resolvedWal.checkpointIntervalMs
   // Applied inside the worker before the ready frame; the default is the shared
-  // WAL tuning (journal mode, synchronous, cache, foreign keys, size cap) plus a
-  // driver-level busy timeout, so a concurrently held write lock waits instead
-  // of surfacing SQLITE_BUSY immediately.
-  const pragmas = options.pragmas ?? walPragmas(resolvedWal)
+  // WAL tuning plus the executor-specific busy budget (1s) and page cache
+  // (16 MiB), so a concurrently held write lock waits briefly instead of
+  // surfacing SQLITE_BUSY immediately, and the executor does not duplicate the
+  // hub's 64 MiB cache.
+  const pragmas = options.pragmas ?? executorPragmas(options.env)
   let worker: Worker | undefined
   let ready: Promise<void> | undefined
+  // Settles the in-flight boot handshake when a close/crash retires the worker
+  // before its `ready` frame. Without it a caller awaiting `ensureReady` hangs.
+  let bootReject: ((error: unknown) => void) | undefined
   let closed = false
   let nextId = 1
   let executorThreadId = 0
+  // Serializes teardown with the next spawn. A timeout retires the old thread
+  // asynchronously; the replacement must await that retirement or two SQLite
+  // handles (and their WAL locks) would overlap during the handover.
+  let retirement: Promise<void> = Promise.resolve()
   const pending = new Map<number, PendingRequest>()
 
   const failPending = (error: unknown): void => {
@@ -450,77 +460,94 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
     pending.clear()
   }
 
-  const retire = (error: Error, orderly = false): void => {
+  const settleBoot = (error: unknown): void => {
+    const reject = bootReject
+    bootReject = undefined
+    reject?.(error)
+  }
+
+  const retire = (error: Error, orderly = false): Promise<void> => {
     const current = worker
     worker = undefined
     ready = undefined
+    settleBoot(error)
     failPending(error)
-    if (current === undefined) return
+    if (current === undefined) return retirement
     // A timeout may have left the thread mid-transaction: ask it to close the
     // native handle (bounded) before terminating, so the WAL lock is released
     // even when the request itself will never answer.
-    if (orderly) {
-      void closeWorkerDatabase(current, nextId++).then(() => terminateWorker(current))
-      return
-    }
-    void terminateWorker(current)
+    const closing = orderly
+      ? closeWorkerDatabase(current, nextId++).then(() => terminateWorker(current))
+      : terminateWorker(current)
+    retirement = retirement.then(() => closing)
+    return retirement
   }
 
   const ensureReady = (): Promise<void> => {
     if (closed) return Promise.reject(new DbExecutorClosedError())
     if (ready !== undefined) return ready
-    ready = new Promise<void>((resolve, reject) => {
-      const workerOptions = {
-        ...(options.name === undefined ? {} : { name: options.name }),
-        workerData: {
-          kind: "db-executor",
-          filename: options.filename,
-          pragmas,
-          checkpointIntervalMs,
-          ...(options.create === undefined ? {} : { create: options.create }),
-        } satisfies DbExecutorWorkerData,
-      } as unknown as WorkerOptions
-      const spawned = new Worker(entry, workerOptions)
-      worker = spawned
-      spawned.onmessage = (event: MessageEvent<DbExecutorResponse>) => {
-        // A retired worker's late frames must never settle a request for, or
-        // resolve, a replacement thread.
-        if (worker !== spawned) return
-        const message = event.data
-        if (message.type === "ready") {
-          executorThreadId = message.threadId
-          resolve()
-          return
+    ready = (async () => {
+      // A previous thread may still be closing. Spawning now would overlap two
+      // handles against the same file; wait for the orderly retirement instead.
+      await retirement
+      if (closed) throw new DbExecutorClosedError()
+      await new Promise<void>((resolve, reject) => {
+        bootReject = reject
+        const workerOptions = {
+          ...(options.name === undefined ? {} : { name: options.name }),
+          workerData: {
+            kind: "db-executor",
+            filename: options.filename,
+            pragmas,
+            checkpointIntervalMs,
+            ...(options.create === undefined ? {} : { create: options.create }),
+          } satisfies DbExecutorWorkerData,
+        } as unknown as WorkerOptions
+        const spawned = new Worker(entry, workerOptions)
+        worker = spawned
+        spawned.onmessage = (event: MessageEvent<DbExecutorResponse>) => {
+          // A retired worker's late frames must never settle a request for, or
+          // resolve, a replacement thread.
+          if (worker !== spawned) return
+          const message = event.data
+          if (message.type === "ready") {
+            executorThreadId = message.threadId
+            bootReject = undefined
+            resolve()
+            return
+          }
+          // A close acknowledgement has no request to settle; `close()` waits
+          // for it through its own listener.
+          if (message.type === "closed") return
+          const request = pending.get(message.id)
+          if (request === undefined) return
+          pending.delete(message.id)
+          if (request.timer !== undefined) clearTimeout(request.timer)
+          if (message.type === "result") request.resolve(message.value)
+          else request.reject(remoteErrorOf(message.error))
         }
-        // A close acknowledgement has no request to settle; `close()` waits for
-        // it through its own listener.
-        if (message.type === "closed") return
-        const request = pending.get(message.id)
-        if (request === undefined) return
-        pending.delete(message.id)
-        if (request.timer !== undefined) clearTimeout(request.timer)
-        if (message.type === "result") request.resolve(message.value)
-        else request.reject(remoteErrorOf(message.error))
-      }
-      spawned.onerror = (event) => {
-        if (worker !== spawned) return
-        const error = new DbExecutorCrashedError(
-          `db executor worker failed: ${event.message || "unknown worker error"}`,
-        )
-        retire(error)
-        reject(error)
-      }
-      spawned.addEventListener("close", () => {
-        if (closed || worker !== spawned) return
-        const error = new DbExecutorCrashedError("db executor worker exited")
-        retire(error)
-        reject(error)
+        spawned.onerror = (event) => {
+          if (worker !== spawned) return
+          const error = new DbExecutorCrashedError(
+            `db executor worker failed: ${event.message || "unknown worker error"}`,
+          )
+          bootReject = undefined
+          void retire(error)
+          reject(error)
+        }
+        spawned.addEventListener("close", () => {
+          if (closed || worker !== spawned) return
+          const error = new DbExecutorCrashedError("db executor worker exited")
+          bootReject = undefined
+          void retire(error)
+          reject(error)
+        })
       })
-    })
+    })()
     return ready
   }
 
-  const request = async (build: (id: number) => DbExecutorRequest): Promise<unknown> => {
+  const requestOnce = async (build: (id: number) => DbExecutorRequest): Promise<unknown> => {
     await ensureReady()
     if (closed) throw new DbExecutorClosedError()
     const id = nextId++
@@ -553,23 +580,62 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
     })
   }
 
+  const backoff = (attempt: number): number =>
+    Math.min(EXECUTOR_BUSY_RETRY_CONFIG.baseDelayMs * 2 ** (attempt - 1), EXECUTOR_BUSY_RETRY_CONFIG.maxDelayMs)
+
+  const sleep = (ms: number): Promise<void> =>
+    new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms)
+      timer.unref?.()
+    })
+
+  /**
+   * A standalone `run`/`query` is one atomic SQLite statement. A busy failure
+   * means SQLite did not take the lock, so re-issuing the statement is safe;
+   * retry it within the shared executor budget instead of surfacing a transient
+   * lock. Transactions keep their own whole-body retry inside the worker.
+   */
+  const request = async (
+    build: (id: number) => DbExecutorRequest,
+    retryBusy: boolean,
+  ): Promise<unknown> => {
+    let attempts = 0
+    for (;;) {
+      attempts += 1
+      try {
+        return await requestOnce(build)
+      } catch (error) {
+        if (!retryBusy || !isBusyError(error) || attempts > EXECUTOR_BUSY_RETRY_CONFIG.retries) throw error
+        await sleep(backoff(attempts))
+      }
+    }
+  }
+
   return {
     run: (sql, params) =>
-      request((id) => ({
-        type: "run",
-        id,
-        sql,
-        ...(params === undefined ? {} : { params }),
-      })) as Promise<DbRunResult>,
+      request(
+        (id) => ({
+          type: "run",
+          id,
+          sql,
+          ...(params === undefined ? {} : { params }),
+        }),
+        true,
+      ) as Promise<DbRunResult>,
     query: (sql, params) =>
-      request((id) => ({
-        type: "query",
-        id,
-        sql,
-        ...(params === undefined ? {} : { params }),
-      })) as Promise<ReadonlyArray<Record<string, unknown>>>,
+      request(
+        (id) => ({
+          type: "query",
+          id,
+          sql,
+          ...(params === undefined ? {} : { params }),
+        }),
+        true,
+      ) as Promise<ReadonlyArray<Record<string, unknown>>>,
     transaction: (statements) =>
-      request((id) => ({ type: "transaction", id, statements })) as Promise<ReadonlyArray<DbTransactionResult>>,
+      request((id) => ({ type: "transaction", id, statements }), false) as Promise<
+        ReadonlyArray<DbTransactionResult>
+      >,
     get threadId() {
       return executorThreadId
     },
@@ -579,11 +645,14 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
       const current = worker
       worker = undefined
       ready = undefined
+      settleBoot(new DbExecutorClosedError())
       failPending(new DbExecutorClosedError())
       // The isolate must close its own native handle while its realm still
       // exists; `terminate()` alone would strand the WAL lock.
       await closeWorkerDatabase(current, nextId++)
       await terminateWorker(current)
+      // A retirement started before close may still be running.
+      await retirement
     },
   }
 }

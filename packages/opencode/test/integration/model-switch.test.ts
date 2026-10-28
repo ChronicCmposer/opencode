@@ -11,6 +11,8 @@
 
 import { describe, expect, test } from "bun:test"
 import { createProductionWorkerPool } from "@/session/worker/hub"
+import { createSessionBoundExecutorWorker } from "@/session/worker/hub"
+import type { ExecutorWorker } from "@/session/worker/execute"
 import { sid } from "../lib/async"
 import { sessionWorkerInit } from "../lib/session-worker-init"
 
@@ -82,6 +84,145 @@ describe("model switch mid-session", () => {
       modelID = "model-a"
       await worker.execute({ sessionID, depth: 0 })
       expect(executionOf(pool.resultFor(sessionID)?.value)).toBe(1)
+    } finally {
+      await pool.terminateAll()
+    }
+  }, 30_000)
+})
+
+describe("generation changes retire the isolate even within one session", () => {
+  test("a same-session generation change calls the full generation retirement hook", async () => {
+    const sessionID = sid("ses_same_session_generation")
+    const retired: Array<[string, number | undefined]> = []
+    const rebound: string[] = []
+    const spawned: ExecutorWorker[] = []
+    let generation = "model-a"
+    const worker = createSessionBoundExecutorWorker(
+      3,
+      async (id) => {
+        const created: ExecutorWorker = {
+          id,
+          alive: true,
+          execute: async () => {},
+          cancel: async () => {},
+          assertNotBusy: async () => false,
+          resultFor: () => undefined,
+          terminate: async () => {},
+        }
+        spawned.push(created)
+        return created
+      },
+      undefined,
+      (id) => rebound.push(String(id)),
+      undefined,
+      async () => ({ generation }),
+      (id, workerID) => {
+        retired.push([String(id), workerID])
+      },
+    )
+    try {
+      await worker.execute({ sessionID, depth: 0 })
+      expect(spawned).toHaveLength(1)
+      generation = "model-b"
+      await worker.execute({ sessionID, depth: 0 })
+      // The old isolate was retired for the new model through the full
+      // generation path (not the session-rebind path), with its worker id.
+      expect(spawned).toHaveLength(2)
+      expect(retired).toEqual([[String(sessionID), 3]])
+      expect(rebound).toEqual([])
+    } finally {
+      await worker.terminate()
+    }
+  })
+
+  test("a production pool routes a same-session generation change through the generation hook", async () => {
+    const sessionID = sid("ses_production_generation_retire")
+    const retired: Array<[string, number | undefined]> = []
+    let generation = "model-a"
+    const pool = createProductionWorkerPool({
+      init: () =>
+        sessionWorkerInit({ model: { providerID: generation, modelID: generation, apiId: generation } }),
+      generationOf: () => generation,
+      onGenerationRetired: (id, workerID) => {
+        retired.push([String(id), workerID])
+      },
+      entry: EXECUTOR_FIXTURE,
+      workKind: "instant",
+      timeoutMs: 15_000,
+    })
+    try {
+      const worker = pool.spawn()
+      await worker.execute({ sessionID, depth: 0 })
+      generation = "model-b"
+      await worker.execute({ sessionID, depth: 0 })
+      expect(retired).toEqual([[String(sessionID), worker.id]])
+    } finally {
+      await pool.terminateAll()
+    }
+  }, 30_000)
+
+  test("the cheap generation probe re-resolves the init after a model switch", async () => {
+    const sessionID = sid("ses_probe_model_switch")
+    // Simulates the production probe: the persisted last-user-message model is
+    // read without the full init build. No requested model is carried.
+    let persisted = "model-a"
+    const resolved: string[] = []
+    const pool = createProductionWorkerPool({
+      init: () => {
+        resolved.push(persisted)
+        return sessionWorkerInit({ model: { providerID: persisted, modelID: persisted, apiId: persisted } })
+      },
+      generationOf: () => persisted,
+      entry: EXECUTOR_FIXTURE,
+      workKind: "instant",
+      timeoutMs: 15_000,
+    })
+    try {
+      const worker = pool.spawn()
+      await worker.execute({ sessionID, depth: 0 })
+      expect(resolved).toEqual(["model-a"])
+      expect(executionOf(pool.resultFor(sessionID)?.value)).toBe(1)
+
+      persisted = "model-b"
+      await worker.execute({ sessionID, depth: 0 })
+      // The generation changed, so the init must be rebuilt for the NEW model,
+      // never reused from the previous generation's cache entry.
+      expect(resolved).toEqual(["model-a", "model-b"])
+      expect(executionOf(pool.resultFor(sessionID)?.value)).toBe(1)
+    } finally {
+      await pool.terminateAll()
+    }
+  }, 30_000)
+
+  test("the requested model keys the generation and the init is built once", async () => {
+    const sessionID = sid("ses_requested_model")
+    let builds = 0
+    const pool = createProductionWorkerPool({
+      init: (_id, requested) => {
+        builds += 1
+        const selection = requested ?? { providerID: "model-a", modelID: "model-a" }
+        return sessionWorkerInit({
+          model: { providerID: selection.providerID, modelID: selection.modelID, apiId: selection.modelID },
+        })
+      },
+      generationOf: (_id, requested) =>
+        requested === undefined ? "model-a" : `${requested.providerID}/${requested.modelID}`,
+      entry: EXECUTOR_FIXTURE,
+      workKind: "instant",
+      timeoutMs: 15_000,
+    })
+    try {
+      const worker = pool.spawn()
+      // The first turn after a model switch uses the requested model even though
+      // the persisted session row still names the old one.
+      await worker.execute({ sessionID, depth: 0, model: { providerID: "model-b", modelID: "model-b" } })
+      expect(executionOf(pool.resultFor(sessionID)?.value)).toBe(1)
+      expect(builds).toBe(1)
+
+      // A repeated turn on the same generation reuses the cached init.
+      await worker.execute({ sessionID, depth: 0, model: { providerID: "model-b", modelID: "model-b" } })
+      expect(executionOf(pool.resultFor(sessionID)?.value)).toBe(2)
+      expect(builds).toBe(1)
     } finally {
       await pool.terminateAll()
     }

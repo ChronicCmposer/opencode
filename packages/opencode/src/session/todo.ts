@@ -2,6 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionID } from "./schema"
 import { Effect, Layer, Context } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
+import { withBusyRetry } from "@opencode-ai/core/database/busy"
 import { eq } from "drizzle-orm"
 import { asc } from "drizzle-orm"
 import { TodoTable } from "@opencode-ai/core/session/sql"
@@ -27,6 +28,8 @@ const layer = Layer.effect(
     const { db } = yield* Database.Service
 
     const update = Effect.fn("Todo.update")(function* (input: { sessionID: SessionID; todos: ReadonlyArray<Info> }) {
+      // The replace is one transaction: busy retry replays the whole body with a
+      // fresh `BEGIN IMMEDIATE` snapshot, never a single statement in place.
       yield* db
         .transaction((tx) =>
           Effect.gen(function* () {
@@ -46,7 +49,7 @@ const layer = Layer.effect(
               .run()
           }),
         )
-        .pipe(Effect.orDie)
+        .pipe(withBusyRetry, Effect.orDie)
       yield* events.publish(Event.Updated, input)
     })
 

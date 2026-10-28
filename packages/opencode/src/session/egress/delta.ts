@@ -26,7 +26,12 @@ export interface DeltaSnapshot extends AggregatePosition {
   readonly events: readonly EventV2Event[]
 }
 
-export type SnapshotReader = (aggregateID: string, seq: number) => Promise<readonly EventV2Event[]>
+export type SnapshotReader = (
+  aggregateID: string,
+  seq: number,
+  /** Exclusive lower bound; omit to read the aggregate from before its first event. */
+  after?: number,
+) => Promise<readonly EventV2Event[]>
 
 /** Parse a trusted aggregate id at the delivery boundary; an empty id is a caller bug. */
 function requireAggregateID(value: unknown): string {
@@ -103,13 +108,13 @@ export function createDeltaSubscription(options: DeltaSubscriptionOptions): Delt
     healed = healed.then(task).catch(report)
   }
 
-  const heal = (at: number): void => {
+  const heal = (at: number, after: number): void => {
     resyncs += 1
     options.onResync?.({ type: "resync", aggregateID, seq: at })
     healing += 1
     enqueue(async () => {
       try {
-        const events = await options.snapshot(aggregateID, at)
+        const events = await options.snapshot(aggregateID, at, after)
         options.onSnapshot?.({ aggregateID, seq: at, events })
       } catch (error) {
         report(error)
@@ -162,8 +167,10 @@ export function createDeltaSubscription(options: DeltaSubscriptionOptions): Delt
         return
       }
       // The gapped frame is superseded by the snapshot; the cursor was already
-      // advanced so later contiguous deltas keep flowing.
-      heal(lastDurableSeq ?? UNSEEN_SEQUENCE)
+      // advanced so later contiguous deltas keep flowing. The durable cursor was
+      // already observed, so the heal range is empty: never re-read its history.
+      const cursor = lastDurableSeq ?? UNSEEN_SEQUENCE
+      heal(cursor, cursor)
     },
     receiveDurable(durable) {
       assertAggregate(durable.aggregateID)
@@ -181,9 +188,10 @@ export function createDeltaSubscription(options: DeltaSubscriptionOptions): Delt
         return
       }
       // A missing durable is a lost cursor, not a droppable delta. Heal at
-      // `seq - 1` so the snapshot includes the skipped range `previous+1..seq-1`;
-      // the durable at `seq` itself is delivered below exactly once.
-      heal(seq - 1)
+      // `seq - 1` from the last observed commit so the snapshot reads only the
+      // skipped range `previous+1..seq-1`; the durable at `seq` itself is
+      // delivered below exactly once.
+      heal(seq - 1, previous)
       deliverDurable(durable)
     },
     get lastDeltaSeq() {
@@ -217,6 +225,9 @@ export type SnapshotQuery = (method: "all", sql: string, params: readonly unknow
 const SNAPSHOT_SQL =
   "SELECT id, type, data FROM event WHERE aggregate_id = ? AND seq <= ? ORDER BY seq ASC"
 
+const SNAPSHOT_RANGE_SQL =
+  "SELECT id, type, data FROM event WHERE aggregate_id = ? AND seq > ? AND seq <= ? ORDER BY seq ASC"
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
@@ -232,21 +243,30 @@ function decodeData(value: unknown): unknown {
 }
 
 /**
- * Build a snapshot reader over the durable `event` log. It returns every event
- * at or below the requested `(aggregate_id, seq)` cursor, in commit order, as
- * EventV2 events (`properties` is the persisted data reference).
+ * Build a snapshot reader over the durable `event` log. With no `after` cursor it
+ * returns every event at or below the requested `(aggregate_id, seq)` cursor, in
+ * commit order. With an `after` cursor it reads only the bounded missing range
+ * `(after, seq]`, so healing a gap never scans the whole aggregate history.
  */
 export function createEventLogSnapshotReader(query: SnapshotQuery): SnapshotReader {
-  return async (aggregateID, seq) => {
+  return async (aggregateID, seq, after) => {
     const aggregate = requireAggregateID(aggregateID)
     if (typeof seq !== "number" || !Number.isInteger(seq) || seq < -1) {
       throw new Error(`invalid snapshot seq: ${JSON.stringify(seq)} (expected an integer >= -1)`)
     }
+    if (after !== undefined && (!Number.isInteger(after) || after < -1)) {
+      throw new Error(`invalid snapshot after: ${JSON.stringify(after)} (expected an integer >= -1)`)
+    }
     // -1 means "before the first event" and is the only empty snapshot. Cursor 0
     // is a real event position and must be read.
     if (seq < 0) return []
+    // An empty range is already at the cursor: no query, no redundant read.
+    if (after !== undefined && after >= seq) return []
 
-    const rows = await query("all", SNAPSHOT_SQL, [aggregate, seq])
+    const rows =
+      after === undefined
+        ? await query("all", SNAPSHOT_SQL, [aggregate, seq])
+        : await query("all", SNAPSHOT_RANGE_SQL, [aggregate, after, seq])
     if (!Array.isArray(rows)) throw new Error("snapshot query returned a non-array result")
     return rows.map((row, index) => {
       if (!isRecord(row)) throw new Error(`invalid event row ${index}: expected an object`)

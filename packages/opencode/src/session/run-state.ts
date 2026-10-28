@@ -191,7 +191,7 @@ export const layer = Layer.effect(
           try: () => hub.ensureRunning(sessionID, origin),
           catch: asRunError,
         })
-        return yield* settleHubRun(run, onInterrupt)
+        return yield* settleHubRun(interruptibleHubRun(run, hub, sessionID, onInterrupt), onInterrupt)
       }
       const runners = yield* InstanceState.get(state)
       return yield* runners.ensureRunning(sessionID, work, onInterrupt)
@@ -221,7 +221,7 @@ export const layer = Layer.effect(
           // `Session.BusyError`; every other failure is a typed run error.
           catch: (error) => (error instanceof SessionBusyError ? busyError(sessionID) : asRunError(error)),
         })
-        return yield* settleHubRun(run, onInterrupt)
+        return yield* settleHubRun(interruptibleHubRun(run, hub, sessionID, onInterrupt), onInterrupt)
       }
       const runners = yield* InstanceState.get(state)
       return yield* runners
@@ -320,6 +320,27 @@ function completedOutcome(sessionID: SessionID): CancelOutcome {
  */
 function cooperativeOutcome(sessionID: SessionID, durationMs: number): CancelOutcome {
   return { sessionID, mode: "cooperative", winner: "cancel", acknowledged: false, durationMs }
+}
+
+/**
+ * A caller-side interruption (HTTP abort, TUI cancel) must reach the hub: the
+ * promise rejection alone cannot stop the worker's run. On interrupt ask the hub
+ * to cancel the session (children-first report) and then run the caller's own
+ * interrupt finalizer, so the assistant message is persisted exactly as the
+ * flag-off runner does.
+ */
+function interruptibleHubRun<A, E>(
+  run: Effect.Effect<A, E>,
+  hub: SessionHub,
+  sessionID: SessionID,
+  onInterrupt: Effect.Effect<SessionV1.WithParts>,
+): Effect.Effect<A, E> {
+  return Effect.onInterrupt(run, () =>
+    Effect.gen(function* () {
+      yield* Effect.promise(() => hub.cancelWithReport(sessionID).catch(() => undefined))
+      yield* onInterrupt
+    }).pipe(Effect.asVoid),
+  )
 }
 
 /**

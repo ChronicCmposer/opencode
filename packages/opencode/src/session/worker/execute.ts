@@ -462,8 +462,20 @@ export interface ExecutorRun {
    * plain run byte-for-byte unchanged.
    */
   readonly prompt?: PromptInput
+  /**
+   * The model the caller requested for this run. A session worker is bound to
+   * one model, so a changed request selects a new worker generation even when
+   * the persisted session row has not caught up yet.
+   */
+  readonly model?: WorkerRunModel
   /** The shell command for a `"startShell"` run; absent for a plain run. */
   readonly shell?: ShellInput
+}
+
+/** The requested provider/model pair carried on a run frame. */
+export interface WorkerRunModel {
+  readonly providerID: string
+  readonly modelID: string
 }
 
 /** Structural mirror of dispatch's `SessionWorker` (keeps this module decoupled). */
@@ -502,6 +514,12 @@ export interface ExecutorTransport {
     options?: { timeoutMs?: number; signal?: AbortSignal },
   ): Promise<SessionExecutorOutbound>
   readonly alive: boolean
+  /**
+   * Orderly close of the isolate's durable resources (native WAL handle, bus
+   * lease) before the thread is destroyed. Optional so lightweight test
+   * transports remain valid; production always provides it.
+   */
+  close?(): Promise<void>
   terminate(code?: number): Promise<number>
   /**
    * Cancel the pre-ready boot interval. Resolves the typed boot outcome when a
@@ -827,6 +845,9 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     terminate: async () => {
       // Drop the result with the isolate so a retired worker never leaks it.
       lastResult = undefined
+      // Route every retire through the orderly close first: `terminate()` alone
+      // can destroy a realm still holding the WAL write lock/lease.
+      await transport.close?.().catch(() => undefined)
       await transport.terminate()
     },
   }

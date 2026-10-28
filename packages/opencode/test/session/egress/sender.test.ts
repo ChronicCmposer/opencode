@@ -7,8 +7,16 @@
 
 import { describe, expect, test } from "bun:test"
 import { decodeFrame } from "@/session/egress/frame"
+import { createEgressReceiver } from "@/session/egress/receiver"
 import { createEgressSender } from "@/session/egress/sender"
-import { type EventV2Event, ackFrame, endFrame, eventFrame } from "@/session/worker/frame"
+import {
+  type EventsFrame,
+  type EventV2Event,
+  ackFrame,
+  endFrame,
+  eventFrame,
+  MAX_WORKER_FRAME_BYTES,
+} from "@/session/worker/frame"
 import { pollUntil } from "../../lib/poll"
 
 const deltaEvent = (id: string, text?: string): EventV2Event => ({
@@ -153,5 +161,52 @@ describe("egress sender", () => {
     expect(sender.ended).toBe(true)
     sender.end()
     expect(chunks.length).toBe(3)
+  })
+
+  test("drops only an oversized non-durable delta and still posts the rest, ack and end", async () => {
+    const channel = new MessageChannel()
+    const frames: EventsFrame[] = []
+    const acks: number[] = []
+    const warnings: Array<{ readonly message: string; readonly level: string | undefined }> = []
+    const receiver = createEgressReceiver({
+      port: channel.port2,
+      onFrame: (frame) => void frames.push(frame),
+      onAck: (payload) => void acks.push(payload?.count ?? -1),
+    })
+    const sender = createEgressSender({
+      port: channel.port1,
+      maxBatch: 2,
+      log: (message, _fields, level) => void warnings.push({ message, level }),
+    })
+    try {
+      const huge: EventV2Event = {
+        id: "huge",
+        type: "message.part.delta",
+        properties: { id: "huge", text: "x".repeat(MAX_WORKER_FRAME_BYTES) },
+      }
+      // The advisory delta alone exceeds the frame bound. It must not take the
+      // whole batch (or the run boundary) down with it.
+      sender.pushDelta(huge)
+      sender.pushDelta(deltaEvent("kept", "still delivered"))
+      sender.end()
+
+      await pollUntil(() => receiver.ended && acks.length === 1, {
+        message: "the run-end frame was lost with the oversized delta",
+      })
+
+      expect(receiver.lastError).toBeUndefined()
+      expect(
+        frames.filter((frame) => frame.kind === "event").map((frame) =>
+          frame.kind === "event" ? frame.payload.event.id : undefined,
+        ),
+      ).toEqual(["kept"])
+      expect(acks).toEqual([0])
+      expect(warnings).toHaveLength(1)
+      expect(warnings[0]?.level).toBe("warn")
+    } finally {
+      receiver.close()
+      channel.port1.close()
+      channel.port2.close()
+    }
   })
 })

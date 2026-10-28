@@ -266,6 +266,47 @@ describe("delta subscription gap detection and resync", () => {
       /aggregateID/,
     )
   })
+  test("a real gap snapshots only the missing range after the last seen seq", async () => {
+    const calls: Array<readonly [string, number, number | undefined]> = []
+    const subscription = createDeltaSubscription({
+      aggregateID: "s1",
+      snapshot: (aggregateID, seq, after) => {
+        calls.push([aggregateID, seq, after])
+        return Promise.resolve([])
+      },
+      onDelta: () => undefined,
+      onDurable: () => undefined,
+    })
+
+    // Seed at 4, then a durable at 7 is a real gap: only 5 and 6 are missing.
+    subscription.receiveDurable({ aggregateID: "s1", seq: 4, event: event("durable-4") })
+    subscription.receiveDurable({ aggregateID: "s1", seq: 7, event: event("durable-7") })
+    await settleSnapshotChain()
+
+    expect(calls).toEqual([["s1", 6, 4]])
+    expect(subscription.resyncs).toBe(1)
+  })
+
+  test("a delta gap does not re-read the durable log it already observed", async () => {
+    const calls: Array<readonly [string, number, number | undefined]> = []
+    const subscription = createDeltaSubscription({
+      aggregateID: "s1",
+      snapshot: (aggregateID, seq, after) => {
+        calls.push([aggregateID, seq, after])
+        return Promise.resolve([])
+      },
+      onDelta: () => undefined,
+      onDurable: () => undefined,
+    })
+
+    subscription.receiveDurable({ aggregateID: "s1", seq: 3, event: event("durable-3") })
+    subscription.receiveDelta({ aggregateID: "s1", seq: 0, event: event("d0") })
+    subscription.receiveDelta({ aggregateID: "s1", seq: 2, event: event("d2") })
+    await settleSnapshotChain()
+
+    // The durable cursor was already observed at 3, so the heal range is empty.
+    expect(calls).toEqual([["s1", 3, 3]])
+  })
 })
 
 describe("durable snapshot reader", () => {

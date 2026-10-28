@@ -8,7 +8,7 @@
 // ambiguous (non-busy) commit failure.
 
 import type { Connection } from "./connection"
-import { isNativeSqliteError } from "./busy"
+import { isBusySqlError } from "./busy"
 
 /**
  * The transaction helpers only ever call `exec`; taking this structural slice
@@ -26,46 +26,31 @@ export interface BusyRetryConfig {
   readonly maxDelayMs: number
 }
 
-/** Fixed by the writer-removal contract (5 retries, 10ms x10, capped at 1s). */
+/** Default budget (5 retries, 10ms x10, capped at 1s). */
 export const DEFAULT_BUSY_RETRY_CONFIG: BusyRetryConfig = Object.freeze({
   retries: 5,
   baseDelayMs: 10,
   maxDelayMs: 1000,
 })
 
-const BUSY_CODES = ["SQLITE_BUSY", "SQLITE_LOCKED"] as const
-
-function isBusyCode(code: string): boolean {
-  return BUSY_CODES.some((base) => code === base || code.startsWith(`${base}_`))
-}
-
-/** SQLITE_BUSY (5) and SQLITE_LOCKED (6), including extended-code suffixes. */
-function isBusyNumericCode(code: number): boolean {
-  const primary = code & 0xff
-  return primary === 5 || primary === 6
-}
+/**
+ * Executor transactions retry at most three times. Each attempt waits the
+ * executor's 1000ms `busy_timeout`, so the whole train is bounded near four
+ * seconds instead of six 5s waits filling the 30s request deadline.
+ */
+export const EXECUTOR_BUSY_RETRY_CONFIG: BusyRetryConfig = Object.freeze({
+  retries: 3,
+  baseDelayMs: 10,
+  maxDelayMs: 250,
+})
 
 /**
  * True when `error` is a lock/busy failure a whole-transaction retry may
- * recover from. Recognizes native `code`/`sqliteCode` values (including
- * extended forms) and the native message text. An injected fault may carry
- * either form.
+ * recover from. This is the one classifier: the Effect-facing adapter and the
+ * synchronous transaction helpers both use it, so a driver shape can never be
+ * recognised by one path and missed by the other.
  */
-export function isBusyError(error: unknown): boolean {
-  // m17: classify on the native driver shape only. A plain Error whose message
-  // says "database is locked" (a proxy, a wrapper, a user error) is not a
-  // recoverable SQLite lock and must surface unchanged instead of being retried.
-  if (!isNativeSqliteError(error)) return false
-  if (typeof error.sqliteCode === "string" && isBusyCode(error.sqliteCode)) return true
-  if (typeof error.code === "string" && isBusyCode(error.code)) return true
-  if (typeof error.errno === "number" && isBusyNumericCode(error.errno)) return true
-  if (typeof error.errcode === "number" && isBusyNumericCode(error.errcode)) return true
-  const message = error.message
-  return (
-    typeof message === "string" &&
-    (message.includes("SQLITE_BUSY") || message.includes("SQLITE_LOCKED") || message.includes("database is locked"))
-  )
-}
+export const isBusyError: (error: unknown) => boolean = isBusySqlError
 
 /** Typed terminal failure: the fixed retry budget was spent. */
 export class BusyExhaustedError extends Error {
@@ -142,37 +127,59 @@ function backoff(config: BusyRetryConfig, failedAttempt: number): number {
   return Math.min(config.baseDelayMs * 10 ** (failedAttempt - 1), config.maxDelayMs)
 }
 
+/** How one failed attempt waits before the next; omitted means retry at once. */
+type BusyWait = (failedAttempt: number) => void | Promise<void>
+
+const retryImmediately: BusyWait = () => {}
+
+/**
+ * The one retry loop. `work` is retried while it fails with a busy error;
+ * session-control, validation, and other non-busy failures pass through
+ * unchanged, and a spent budget raises the typed `BusyExhaustedError`. `wait`
+ * is synchronous for the blocking paths (the driver's `busy_timeout` already
+ * waited) and returns a Promise for the yielding worker path.
+ */
+function retryBusy<T>(work: () => T, config: BusyRetryConfig, wait: BusyWait): T | Promise<T> {
+  const attempt = (attemptsMade: number): T | Promise<T> => {
+    try {
+      return work()
+    } catch (error) {
+      if (!isBusyError(error)) throw error
+      if (attemptsMade > config.retries) throw new BusyExhaustedError(attemptsMade, error)
+      const waited = wait(attemptsMade)
+      return waited instanceof Promise ? waited.then(() => attempt(attemptsMade + 1)) : attempt(attemptsMade + 1)
+    }
+  }
+  return attempt(1)
+}
+
+/** Synchronous retry: the driver's blocking `busy_timeout` already waited. */
+function retryBusyNow<T>(work: () => T, config: BusyRetryConfig): T {
+  return retryBusy(work, config, retryImmediately) as T
+}
+
+/**
+ * Yielding retry used by the worker path; the body itself stays synchronous.
+ * Async so a non-busy (or zero-retry) failure is always a rejected Promise,
+ * never a synchronous throw: callers may use either `await` or `.catch`.
+ */
+async function retryBusyLater<T>(work: () => T, config: BusyRetryConfig): Promise<T> {
+  return retryBusy(work, config, (failedAttempt) => sleep(backoff(config, failedAttempt)))
+}
+
 /**
  * Retry a synchronous call (for example the Bus `publish`) whenever it fails
  * with a busy error. The whole call is retried; non-busy failures pass through
  * unchanged and exhaustion is typed.
  */
 export function retryBusySync<T>(work: () => T, options: Partial<BusyRetryConfig> = {}): T {
-  const config = resolveConfig(options)
-  for (let attempt = 1; ; attempt += 1) {
-    try {
-      return work()
-    } catch (error) {
-      if (!isBusyError(error)) throw error
-      if (attempt > config.retries) throw new BusyExhaustedError(attempt, error)
-      // The driver's `busy_timeout` already waited; retry immediately rather
-      // than blocking the isolate a second time.
-    }
-  }
+  return retryBusyNow(work, resolveConfig(options))
 }
 
 function commit(connection: TransactionConnection, config: BusyRetryConfig): void {
-  for (let attempt = 1; ; attempt += 1) {
-    try {
-      connection.exec("COMMIT")
-      return
-    } catch (error) {
-      if (!isBusyError(error)) throw error
-      // A busy COMMIT did not commit; the transaction is still open, so the
-      // correct recovery is to re-issue COMMIT, never to re-run the body.
-      if (attempt > config.retries) throw new BusyExhaustedError(attempt, error)
-    }
-  }
+  // A busy COMMIT did not commit; the transaction is still open, so the correct
+  // recovery is to re-issue COMMIT, never to re-run the body.
+  retryBusyNow(() => connection.exec("COMMIT"), config)
 }
 
 function rollback(connection: TransactionConnection, cause: unknown): void {
@@ -181,6 +188,26 @@ function rollback(connection: TransactionConnection, cause: unknown): void {
   } catch (rollbackCause) {
     poison(connection)
     throw new TransactionRollbackError(cause, rollbackCause)
+  }
+}
+
+function transactionBody<T, C extends TransactionConnection>(
+  connection: C,
+  work: (tx: C) => T,
+  config: BusyRetryConfig,
+): () => T {
+  return () => {
+    let begun = false
+    try {
+      connection.exec("BEGIN IMMEDIATE")
+      begun = true
+      const result = work(connection)
+      commit(connection, config)
+      return result
+    } catch (error) {
+      if (begun) rollback(connection, error)
+      throw error
+    }
   }
 }
 
@@ -195,23 +222,9 @@ export function inImmediateTransaction<T, C extends TransactionConnection = Conn
   work: (tx: C) => T,
   options: Partial<BusyRetryConfig> = {},
 ): T {
-  const config = resolveConfig(options)
   assertNotPoisoned(connection)
-
-  for (let attempt = 1; ; attempt += 1) {
-    let begun = false
-    try {
-      connection.exec("BEGIN IMMEDIATE")
-      begun = true
-      const result = work(connection)
-      commit(connection, config)
-      return result
-    } catch (error) {
-      if (begun) rollback(connection, error)
-      if (!isBusyError(error)) throw error
-      if (attempt > config.retries) throw new BusyExhaustedError(attempt, error)
-    }
-  }
+  const config = resolveConfig(options)
+  return retryBusyNow(transactionBody(connection, work, config), config)
 }
 
 /**
@@ -220,20 +233,8 @@ export function inImmediateTransaction<T, C extends TransactionConnection = Conn
  * the event loop. This is the path a worker Bus uses so cancellation and
  * streaming progress keep running while SQLite is busy.
  */
-export async function retryBusyAsync<T>(
-  work: () => T,
-  options: Partial<BusyRetryConfig> = {},
-): Promise<T> {
-  const config = resolveConfig(options)
-  for (let attempt = 1; ; attempt += 1) {
-    try {
-      return work()
-    } catch (error) {
-      if (!isBusyError(error)) throw error
-      if (attempt > config.retries) throw new BusyExhaustedError(attempt, error)
-      await sleep(backoff(config, attempt))
-    }
-  }
+export function retryBusyAsync<T>(work: () => T, options: Partial<BusyRetryConfig> = {}): Promise<T> {
+  return retryBusyLater(work, resolveConfig(options))
 }
 
 /**
@@ -245,24 +246,9 @@ export async function inImmediateTransactionAsync<T, C extends TransactionConnec
   work: (tx: C) => T,
   options: Partial<BusyRetryConfig> = {},
 ): Promise<T> {
-  const config = resolveConfig(options)
   assertNotPoisoned(connection)
-
-  for (let attempt = 1; ; attempt += 1) {
-    let begun = false
-    try {
-      connection.exec("BEGIN IMMEDIATE")
-      begun = true
-      const result = work(connection)
-      commit(connection, config)
-      return result
-    } catch (error) {
-      if (begun) rollback(connection, error)
-      if (!isBusyError(error)) throw error
-      if (attempt > config.retries) throw new BusyExhaustedError(attempt, error)
-      await sleep(backoff(config, attempt))
-    }
-  }
+  const config = resolveConfig(options)
+  return retryBusyLater(transactionBody(connection, work, config), config)
 }
 
 /** Readable alias used by the Bus/db-core contract. */

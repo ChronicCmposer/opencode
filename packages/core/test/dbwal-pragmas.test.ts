@@ -12,14 +12,19 @@ import path from "node:path"
 import {
   DEFAULT_BUSY_TIMEOUT_MS,
   DEFAULT_CHECKPOINT_INTERVAL_MS,
+  DEFAULT_EXECUTOR_BUSY_TIMEOUT_MS,
+  DEFAULT_EXECUTOR_CACHE_SIZE_KIB,
   DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
+  executorPragmas,
+  resolveExecutorCacheSizeKib,
+  resolveExecutorBusyTimeoutMs,
   resolveWalConfig,
   walPragmas,
 } from "@opencode-ai/core/database/pragmas"
 import { tmpdir } from "./fixture/tmpdir"
 
 describe("dbwal: WAL pragma source of truth", () => {
-  test("defaults cap the WAL at 64 MiB and checkpoint every 5 minutes", () => {
+  test("defaults cap the WAL at 64 MiB and keep the main connection responsive", () => {
     expect(resolveWalConfig({})).toEqual({
       journalSizeLimitBytes: DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
       checkpointIntervalMs: DEFAULT_CHECKPOINT_INTERVAL_MS,
@@ -27,7 +32,10 @@ describe("dbwal: WAL pragma source of truth", () => {
     })
     expect(DEFAULT_JOURNAL_SIZE_LIMIT_BYTES).toBe(64 * 1024 * 1024)
     expect(DEFAULT_CHECKPOINT_INTERVAL_MS).toBe(5 * 60 * 1000)
-    expect(DEFAULT_BUSY_TIMEOUT_MS).toBe(5000)
+    // The main connection drives the hub's event loop. A 5s native busy wait
+    // stalls it for the whole timeout, so the resolved default is the short
+    // main-thread budget and the adapter retries asynchronously instead.
+    expect(DEFAULT_BUSY_TIMEOUT_MS).toBe(250)
   })
 
   test("environment overrides are parsed and invalid values fall back", () => {
@@ -91,5 +99,24 @@ describe("dbwal: WAL pragma source of truth", () => {
     } finally {
       db.close()
     }
+  })
+
+  test("the executor keeps a bounded busy budget and its own 16 MiB page cache", () => {
+    expect(DEFAULT_EXECUTOR_BUSY_TIMEOUT_MS).toBe(1_000)
+    expect(DEFAULT_EXECUTOR_CACHE_SIZE_KIB).toBe(16 * 1_024)
+    expect(resolveExecutorBusyTimeoutMs({})).toBe(DEFAULT_EXECUTOR_BUSY_TIMEOUT_MS)
+    expect(resolveExecutorCacheSizeKib({})).toBe(DEFAULT_EXECUTOR_CACHE_SIZE_KIB)
+
+    const pragmas = executorPragmas({})
+    expect(pragmas).toContain("PRAGMA busy_timeout = 1000")
+    expect(pragmas).toContain("PRAGMA cache_size = -16384")
+    // The hub keeps its 64 MiB budget; only the executor is reduced.
+    expect(walPragmas()).toContain("PRAGMA cache_size = -64000")
+  })
+
+  test("executor env overrides still win over the bounded defaults", () => {
+    expect(resolveExecutorBusyTimeoutMs({ OPENCODE_DB_BUSY_TIMEOUT_MS: "1234" })).toBe(1_234)
+    expect(resolveExecutorCacheSizeKib({ OPENCODE_DB_EXECUTOR_CACHE_SIZE_KIB: "4096" })).toBe(4_096)
+    expect(executorPragmas({ OPENCODE_DB_BUSY_TIMEOUT_MS: "1234" })).toContain("PRAGMA busy_timeout = 1234")
   })
 })

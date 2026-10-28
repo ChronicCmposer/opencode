@@ -12,11 +12,55 @@
 
 import { randomUUID } from "node:crypto"
 import { Database, type SQLQueryBindings } from "bun:sqlite"
-import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite"
+import { DatabaseSync, type SQLInputValue, type SQLOutputValue, type StatementSync } from "node:sqlite"
 import { resolveWorkerCacheSizeKib, walPragmas } from "./pragmas"
 
 /** SQLite stays locked for this long before the sync driver reports busy. */
 export const WORKER_BUSY_TIMEOUT_MS = 250
+
+/**
+ * Upper bound on prepared statements kept per `node:sqlite` connection. The
+ * worker's SQL surface repeats a small set of statements, so a bounded cache
+ * removes the per-call `prepare` while still refusing unbounded growth from
+ * dynamic SQL. The cache is per handle; statements never cross connections.
+ */
+export const PREPARED_STATEMENT_CACHE_LIMIT = 256
+
+type StatementMode = "rows" | "values" | "run"
+
+interface PreparedStatementCache {
+  statement(sql: string, mode: StatementMode): StatementSync
+  clear(): void
+}
+
+function preparedStatementCache(native: DatabaseSync): PreparedStatementCache {
+  // Insertion order is the eviction order (LRU, refreshed on every cache hit).
+  const entries = new Map<string, StatementSync>()
+  return {
+    statement(sql, mode) {
+      const key = `${mode}\u0000${sql}`
+      const cached = entries.get(key)
+      if (cached !== undefined) {
+        entries.delete(key)
+        entries.set(key, cached)
+        return cached
+      }
+      const statement = native.prepare(sql)
+      // `setReturnArrays` is a property of the statement shape, so array results
+      // get their own cache key instead of mutating a shared statement.
+      if (mode === "values") statement.setReturnArrays(true)
+      if (entries.size >= PREPARED_STATEMENT_CACHE_LIMIT) {
+        const oldest = entries.keys().next().value
+        if (oldest !== undefined) entries.delete(oldest)
+      }
+      entries.set(key, statement)
+      return statement
+    },
+    clear() {
+      entries.clear()
+    },
+  }
+}
 
 export interface WriteOutcome {
   readonly changes: number
@@ -228,6 +272,7 @@ export function openNodeConnection(options: NodeConnectionOptions): NodeConnecti
 
   const owner = nextOwnerID()
   let closed = false
+  const statements = preparedStatementCache(native)
 
   const assertOpen = () => {
     if (closed) throw new ConnectionClosedError(options.filename)
@@ -236,7 +281,7 @@ export function openNodeConnection(options: NodeConnectionOptions): NodeConnecti
   const pragma = (name: string): unknown => {
     assertOpen()
     if (!IDENTIFIER.test(name)) throw new Error(`invalid pragma name: ${name}`)
-    const row = native.prepare(`PRAGMA ${name}`).get() as Record<string, unknown> | null | undefined
+    const row = statements.statement(`PRAGMA ${name}`, "rows").get() as Record<string, unknown> | null | undefined
     return row === null || row === undefined ? undefined : Object.values(row)[0]
   }
 
@@ -248,18 +293,19 @@ export function openNodeConnection(options: NodeConnectionOptions): NodeConnecti
     },
     all<T = Record<string, unknown>>(sql: string, params: QueryParams = []) {
       assertOpen()
-      const statement = native.prepare(sql)
-      return statement.all(...(spread(params) as unknown as SQLInputValue[])) as unknown as ReadonlyArray<T>
+      return statements.statement(sql, "rows").all(
+        ...(spread(params) as unknown as SQLInputValue[]),
+      ) as unknown as ReadonlyArray<T>
     },
     values<T = ReadonlyArray<unknown>>(sql: string, params: QueryParams = []) {
       assertOpen()
-      const statement = native.prepare(sql)
-      statement.setReturnArrays(true)
-      return statement.all(...(spread(params) as unknown as SQLInputValue[])) as unknown as ReadonlyArray<T>
+      return statements.statement(sql, "values").all(
+        ...(spread(params) as unknown as SQLInputValue[]),
+      ) as unknown as ReadonlyArray<T>
     },
     run(sql: string, params: QueryParams = []) {
       assertOpen()
-      const result = native.prepare(sql).run(...(spread(params) as unknown as SQLInputValue[]))
+      const result = statements.statement(sql, "run").run(...(spread(params) as unknown as SQLInputValue[]))
       return { changes: Number(result.changes), lastInsertRowid: Number(result.lastInsertRowid) }
     },
     exec(sql: string) {
@@ -273,6 +319,7 @@ export function openNodeConnection(options: NodeConnectionOptions): NodeConnecti
     close() {
       if (closed) return
       closed = true
+      statements.clear()
       native.close()
     },
     function(name, fn) {

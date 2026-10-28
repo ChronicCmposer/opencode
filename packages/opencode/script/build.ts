@@ -15,7 +15,7 @@ const generated = await import("./generate.ts")
 
 import { Script } from "@opencode-ai/script"
 import pkg from "../package.json"
-import { hashWorkerBundle } from "../src/session/worker/build-hash.ts"
+import { computeBundleHash, type BundleArtifact } from "../src/session/worker/build-hash.ts"
 
 const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
@@ -24,16 +24,51 @@ const sourcemapsFlag = process.argv.includes("--sourcemaps")
 const plugin = createSolidTransformPlugin()
 const skipEmbedWebUi = process.argv.includes("--skip-embed-web-ui")
 
+interface WorkerBundleOptions {
+  readonly entrypoint: string
+  readonly external: readonly string[]
+}
+
+/**
+ * Bundle the worker entry exactly as the compiled artifact does and return the
+ * emitted graph. This function lives with the build script, not in the runtime
+ * module: only the resulting digest is embedded.
+ */
+const emittedWorkerArtifacts = async (options: WorkerBundleOptions): Promise<readonly BundleArtifact[]> => {
+  const config: Parameters<typeof Bun.build>[0] & { write?: boolean } = {
+    entrypoints: [options.entrypoint],
+    root: dir,
+    tsconfig: "./tsconfig.json",
+    external: [...options.external],
+    plugins: [plugin],
+    target: "bun",
+    conditions: ["bun", "node"],
+    format: "esm",
+    splitting: true,
+    minify: true,
+    write: false,
+  }
+  const result = await Bun.build(config)
+  if (!result.success) {
+    throw new Error(`worker bundle failed: ${result.logs.map((log) => log.message).join("; ")}`)
+  }
+  return Promise.all(
+    result.outputs.map(async (output) => ({
+      path: output.path,
+      bytes: new Uint8Array(await output.arrayBuffer()),
+    })),
+  )
+}
+
 // The session-worker build identity: hash the EMITTED worker module graph (the
 // entry plus every transitive chunk), not the entry source text. Files outside
 // the graph (plugins, runtime config) are intentionally excluded.
-const sessionWorkerBuildHash = await hashWorkerBundle({
-  entrypoint: "./src/session/worker/session-worker.ts",
-  cwd: dir,
-  tsconfig: "./tsconfig.json",
-  external: ["node-gyp"],
-  plugins: [plugin],
-})
+const sessionWorkerBuildHash = computeBundleHash(
+  await emittedWorkerArtifacts({
+    entrypoint: "./src/session/worker/session-worker.ts",
+    external: ["node-gyp"],
+  }),
+)
 // A packaged binary must always embed a real hash; an empty/failed hash would
 // make the worker ready handshake unverifiable.
 if (!/^[0-9a-f]{64}$/.test(sessionWorkerBuildHash)) {
@@ -240,6 +275,7 @@ for (const item of targets) {
       OPENCODE_WORKER_PATH: workerPath,
       OPENCODE_SESSION_WORKER_PATH: bunfsRoot + sessionWorkerPath,
       OPENCODE_BUILD_HASH: JSON.stringify(sessionWorkerBuildHash),
+      OPENCODE_PACKAGED: "true",
       OPENCODE_CHANNEL: `'${Script.channel}'`,
       // Compile the fault-injection seam out of production binaries. `define`
       // values are raw code, so `"false"` inlines the boolean literal `false`

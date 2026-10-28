@@ -37,12 +37,12 @@ import { SessionSpawnProxyService, type SessionSpawnRequest, type SessionSpawnRe
 import {
   buildHubProxyHandlers,
   createWorkerJobMirror,
-  createLazyExecutorWorkerPool,
   productionSessionHubNode,
   SessionHubService,
   type ProductionPoolFactory,
   type WorkerBackgroundJobAuthority,
 } from "@/session/worker/hub"
+import { createLazyExecutorWorkerPool } from "../lib/lazy-worker-pool"
 import { createHubProxyClient, serveHubProxy } from "@/session/worker/hub-proxy-wire"
 import { resolveWorkerPlugins, type WorkerModel } from "@/session/worker/init"
 import {

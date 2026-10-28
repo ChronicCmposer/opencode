@@ -135,6 +135,7 @@ function buildEgressClient(port: MessagePort, options: WorkerEgressClientOptions
     ...(options.windowMs === undefined ? {} : { windowMs: options.windowMs }),
     ...(options.maxBatch === undefined ? {} : { maxBatch: options.maxBatch }),
     ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
+    log,
   })
   const mesh = options.controlPort === undefined ? undefined : createMeshWorkerClient(options.controlPort)
   const subscriptions = new Map<string, WorkerDurableSubscription>()

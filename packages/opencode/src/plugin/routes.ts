@@ -124,8 +124,9 @@ export function assertPluginHookAdmission(plugin: string, hooks: object): void {
 /**
  * Startup admission: a configured hook that the worker *can* dispatch but has no
  * route for (the `unsupported` route) must not fail startup. It is only a defect
- * when the worker actually invokes it, and `assertWorkerHookDispatch` fails typed
- * at that point (`layer.ts`). A hook with no route entry at all can never be
+ * when the worker actually invokes it *and a loaded plugin declared it*;
+ * `runWorkerPluginHook` fails typed at that point (`layer.ts`), while an
+ * undeclared hook is a true no-op. A hook with no route entry at all can never be
  * served by any invocation path, so it stays a startup configuration defect.
  */
 export function pluginHookStartupError(

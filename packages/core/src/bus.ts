@@ -63,18 +63,39 @@ export interface Options {
    * Absent means an oversized payload is refused rather than silently truncated.
    */
   readonly blobDir?: string
-  /** Inline durable payload bound; above it the payload is stored by reference. */
+  /**
+   * Inline durable payload bound; above it the payload is stored by reference.
+   * Defaults to {@link DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES} (one worker frame
+   * minus envelope headroom), never the raw frame cap.
+   */
   readonly blobLimitBytes?: number
 }
 
 /**
- * D16 inline bound: 4 MiB. This is deliberately the same bound as the worker
- * egress frame cap (`MAX_WORKER_FRAME_BYTES`); a payload larger than one frame
- * must be stored by reference before the event is fanned out, or the egress
- * batch that carries it is rejected as oversized. The two constants are pinned
- * together by a regression test in `blob-integrity-p1fix.test.ts`.
+ * D16 schema bound: 4 MiB, the same bound as the worker egress frame cap
+ * (`MAX_WORKER_FRAME_BYTES`). This stays the public schema/event bound; the
+ * default Bus inline threshold below is smaller so a stored-inline body still
+ * fits its envelope.
  */
 export const DEFAULT_BLOB_LIMIT_BYTES = 4 * 1024 * 1024
+
+/**
+ * Space reserved inside one worker frame for the envelope: the port/kind/id
+ * fields, the committed `(aggregateID, seq)` metadata, and JSON punctuation.
+ * 64 KiB is far above the measured envelope overhead, so an inline body at the
+ * threshold can always be framed.
+ */
+export const ENVELOPE_HEADROOM_BYTES = 64 * 1024
+
+/**
+ * Default Bus inline bound: one frame minus {@link ENVELOPE_HEADROOM_BYTES}.
+ * A payload at or below this is stored inline AND always fits its frame. A
+ * payload between this bound and {@link DEFAULT_BLOB_LIMIT_BYTES} would be
+ * inline in the row but too large once framed, so the egress sender would have
+ * to substitute a position reference that no `event_blob` row can resolve.
+ * Offloading at this bound keeps the stored row and the frame aligned.
+ */
+export const DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES = DEFAULT_BLOB_LIMIT_BYTES - ENVELOPE_HEADROOM_BYTES
 
 export interface PublishEvent<D extends Event.Definition = Event.Definition> {
   readonly definition: D
@@ -101,6 +122,11 @@ export interface ReclaimInput {
   readonly nextOwnerID: string
   /** Clock for a live-lease decision; defaults to `Date.now()`. */
   readonly now?: number
+  /**
+   * Override the dead-generation probe. Defaults to {@link isDeadWorkerOwner},
+   * which reclaims an unexpired lease only when its encoded PID is gone.
+   */
+  readonly isDeadOwner?: (ownerID: string) => boolean
 }
 
 export interface Transaction {
@@ -167,6 +193,22 @@ export interface ReclaimLeaseInput {
   readonly expectedSeq: number
   readonly nextOwnerID: string
   readonly now?: number
+  readonly isDeadOwner?: (ownerID: string) => boolean
+}
+
+/**
+ * Startup sweep: mark every lease whose owner process is gone reclaimable.
+ * Production calls it once from the hub's post-migration boot path, best-effort;
+ * the successor's owner+seq reclaim fence does not depend on the sweep.
+ */
+export interface ReleaseDeadLeasesInput {
+  /** Restrict the sweep to one aggregate; absent scans every aggregate. */
+  readonly aggregateID?: string
+  /**
+   * Proves an owner generation is dead. Defaults to
+   * {@link isDeadWorkerOwner}; a live/unknown owner is never released.
+   */
+  readonly isDeadOwner?: (ownerID: string) => boolean
 }
 
 /** An `event_blob` row as the typed boundary exposes it. */
@@ -203,6 +245,11 @@ export interface DurableRepository {
   readonly renewLease: (input: LeaseOwnerInput & { readonly leaseTimeoutMs: number }) => number
   readonly releaseLease: (input: LeaseOwnerInput) => number
   readonly reclaimLease: (input: ReclaimLeaseInput & { readonly leaseTimeoutMs: number }) => number
+  /**
+   * Mark every lease owned by a provably dead generation reclaimable
+   * (`worker_expires_at = 0`). Never touches a live generation's lease.
+   */
+  readonly releaseDeadLeases: (input: ReleaseDeadLeasesInput) => number
   /** v1 sync claim: set `owner_id` unconditionally. */
   readonly claimSyncOwner: (input: LeaseOwnerInput) => number
   /** Set `owner_id` only when the row has no sync owner. */
@@ -244,6 +291,12 @@ export interface Interface {
   readonly read: (input: { readonly aggregateID: string; readonly after?: number }) => readonly Event.Payload[]
   readonly claim: (aggregateID: string, nextOwnerID?: string) => Lease
   readonly reclaim: (input: ReclaimInput) => Lease
+  /**
+   * Mark dead-generation leases reclaimable; preserves live-generation fencing.
+   * The production hub sweeps once after schema ensure, so a restart need not
+   * wait for a dead generation's lease TTL.
+   */
+  readonly releaseDeadLeases: (input?: ReleaseDeadLeasesInput) => number
   /** Renew this generation's lease; a stale owner cannot extend it. */
   readonly heartbeat: (aggregateID: string) => void
   /** Mark this generation's lease dead so a successor can reclaim it. */
@@ -319,20 +372,67 @@ function blobFileMatches(file: string, hash: string, size: number): boolean {
   }
 }
 
+/** Flush one path's inode to stable storage (file data or directory entries). */
+function fsyncPath(target: string, flags: "r" | "r+"): void {
+  const fd = fs.openSync(target, flags)
+  try {
+    fs.fsyncSync(fd)
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+/**
+ * Flush a blob file's data through a WRITABLE descriptor. Some platforms reject
+ * `fsync` on a read-only handle, and the temp file was just written by this
+ * process, so `r+` is both valid and the descriptor whose data must be durable.
+ */
+function fsyncFile(file: string): void {
+  fsyncPath(file, "r+")
+}
+
+/**
+ * Flush a directory entry after a rename. Some filesystems/platforms refuse to
+ * fsync a directory handle; that is a capability gap, not a failed write, so
+ * only the known "unsupported" codes are tolerated. Every other error (EIO,
+ * ENOSPC, ...) still fails the write loud.
+ */
+function fsyncDirectory(directory: string): void {
+  try {
+    fsyncPath(directory, "r")
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "EINVAL" || code === "ENOTSUP" || code === "EISDIR" || code === "EPERM") return
+    throw error
+  }
+}
+
 /**
  * Store `payload` under its content hash with a temp-file + rename, so a reader
- * never observes a partially written blob. An existing file is trusted only
- * after its size and hash are revalidated; a torn file is atomically replaced.
+ * never observes a partially written blob. The temp file is fsynced BEFORE the
+ * rename makes it visible, and the directory is fsynced afterwards, so a crash
+ * cannot leave a committed `event_blob` row pointing at a zero-length or missing
+ * file. An existing file is trusted only after its size and hash are revalidated;
+ * a torn file is atomically replaced. The dedupe fast path still re-syncs the
+ * existing file and its directory entry: a prior process may have created the
+ * file without a durability barrier, and the caller is about to commit a row
+ * that points at it.
  */
 export function writeBlobFile(directory: string, hash: string, payload: string): void {
   const file = blobFile(directory, hash)
   const size = Buffer.byteLength(payload)
-  if (blobFileMatches(file, hash, size)) return
+  if (blobFileMatches(file, hash, size)) {
+    fsyncFile(file)
+    fsyncDirectory(directory)
+    return
+  }
   fs.mkdirSync(directory, { recursive: true })
   const temporary = path.join(directory, `.${hash}.${randomUUID()}.tmp`)
   try {
     fs.writeFileSync(temporary, payload, { flag: "wx" })
+    fsyncFile(temporary)
     fs.renameSync(temporary, file)
+    fsyncDirectory(directory)
   } catch (error) {
     try {
       fs.unlinkSync(temporary)
@@ -430,6 +530,26 @@ const parseSequence = (row: Record<string, unknown>): SequenceRow => {
     workerOwnerID: typeof row.worker_owner_id === "string" ? row.worker_owner_id : undefined,
     workerHeartbeatAt: typeof row.worker_heartbeat_at === "number" ? row.worker_heartbeat_at : undefined,
     workerExpiresAt: typeof row.worker_expires_at === "number" ? row.worker_expires_at : undefined,
+  }
+}
+
+/**
+ * `worker-<hubId>-<pid>-<uuid>` is the worker generation identity from
+ * `session-worker.ts`; the PID is the hub process that spawned the isolate. A
+ * lease is "provably dead" only when that PID no longer exists. An unparseable
+ * owner (legacy/test identity) is treated as live so a stale generation can never
+ * self-certify ownership.
+ */
+export function isDeadWorkerOwner(ownerID: string): boolean {
+  const parts = ownerID.split("-")
+  if (parts[0] !== "worker" || parts.length < 7) return false
+  const pid = Number(parts[2])
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return false
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH"
   }
 }
 
@@ -542,7 +662,7 @@ const requireUniqueIds = (events: ReadonlyArray<PreparedEvent>): void => {
   }
 }
 
-const requireWritableOwner = (
+export const assertWritableOwner = (
   current: SequenceRow | undefined,
   ownerID: string,
   aggregateID: string,
@@ -563,7 +683,7 @@ const requireWritableOwner = (
     })
   }
   // A same-owner lease is renewable even after its TTL elapsed: the generation
-  // is still the writer, so the write below re-stamps `worker_expires_at`. A
+  // is still the lease owner, so the write below re-stamps `worker_expires_at`. A
   // genuinely superseded owner never reaches here — the owner mismatch above
   // fences it — so an expired lease can only be renewed by its own generation.
 }
@@ -618,7 +738,7 @@ const stageBlobPayloads = (batch: PreparedBatch, blob: BlobStore): void => {
  * file cannot disappear again once this check runs. A missing/wrong-sized file
  * is rewritten from the (already validated) payload.
  */
-const ensureStagedBlob = (blob: BlobStore, encoded: string): void => {
+export const ensureStagedBlob = (blob: BlobStore, encoded: string): void => {
   if (blob.dir === undefined) return
   const hash = digest(encoded)
   const file = blobFile(blob.dir, hash)
@@ -629,6 +749,76 @@ const ensureStagedBlob = (blob: BlobStore, encoded: string): void => {
     // Missing after a concurrent GC: rewrite below.
   }
   writeBlobFile(blob.dir, hash, encoded)
+}
+
+/** One durable row about to be persisted at an already-reserved sequence. */
+export interface PreparedStoredEvent {
+  readonly aggregateID: string
+  readonly seq: number
+  readonly id: Event.ID
+  readonly type: string
+  readonly encoded: Record<string, unknown>
+}
+
+/**
+ * The one blob/event row writer shared by the Bus batch path and EventV2's
+ * Effect-owned transaction. An oversized body is re-staged under the caller's
+ * write lock (closing the stage/GC race) and stored by reference; an inline body
+ * is inserted verbatim. The caller owns sequence reservation and lease renewal.
+ */
+export function writePreparedEvent(
+  repository: DurableRepository,
+  blob: BlobStore,
+  event: PreparedStoredEvent,
+): Record<string, unknown> {
+  const encoded = JSON.stringify(event.encoded)
+  const size = Buffer.byteLength(encoded)
+  if (size <= blob.limitBytes) {
+    repository.appendEvent({
+      id: event.id,
+      aggregateID: event.aggregateID,
+      seq: event.seq,
+      type: event.type,
+      data: event.encoded,
+    })
+    return event.encoded
+  }
+  ensureStagedBlob(blob, encoded)
+  const hash = digest(encoded)
+  repository.appendBlob({
+    aggregateID: event.aggregateID,
+    seq: event.seq,
+    type: event.type,
+    hash,
+    size,
+    filePath: hash,
+  })
+  const data = { __eventBlob: hash, size } satisfies BlobReference
+  repository.appendEvent({
+    id: event.id,
+    aggregateID: event.aggregateID,
+    seq: event.seq,
+    type: event.type,
+    data,
+  })
+  return data
+}
+
+/**
+ * Renew a worker generation's lease with the one conditional update both publish
+ * paths use. `changes !== 1` means this generation no longer owns the aggregate.
+ */
+export function renewWorkerLease(
+  repository: DurableRepository,
+  input: { readonly aggregateID: string; readonly ownerID: string; readonly leaseTimeoutMs: number },
+): void {
+  if (!repository.workerLease) return
+  const renewed = repository.renewLease(input)
+  if (renewed !== 1) {
+    throw new StaleOwnerError({
+      message: `Aggregate ${input.aggregateID} worker lease is not held by ${input.ownerID}`,
+    })
+  }
 }
 
 const writePrepared = (
@@ -643,7 +833,7 @@ const writePrepared = (
 ): readonly Event.Payload[] => {
   const { aggregateID, events: prepared } = batch
   const current = repository.sequence(aggregateID)
-  requireWritableOwner(current, ownerID, aggregateID, workerLease)
+  assertWritableOwner(current, ownerID, aggregateID, workerLease)
 
   const block = prepared.length
   const lastSeq = repository.appendSequence({
@@ -679,29 +869,17 @@ const writePrepared = (
   for (const [index, event] of prepared.entries()) {
     const seq = firstSeq + index
     const type = Event.versionedType(event.type, event.version)
-    const encoded = JSON.stringify(event.encoded)
-    const size = Buffer.byteLength(encoded)
-    let data: Record<string, unknown> = event.encoded
-    // Inline payloads are not duplicated into event_blob: the blob row exists
-    // only when the bytes were actually offloaded to a file.
-    if (size > blob.limitBytes) {
-      // Close the stage/commit race with a concurrent GC: a file unlinked while
-      // this publisher waited for the write lock is re-created under the lock.
-      ensureStagedBlob(blob, encoded)
-      const hash = digest(encoded)
-      repository.appendBlob({ aggregateID, seq, type, hash, size, filePath: hash })
-      data = { __eventBlob: hash, size } satisfies BlobReference
-    }
-    repository.appendEvent({ id: event.id, aggregateID, seq, type, data })
+    writePreparedEvent(repository, blob, {
+      aggregateID,
+      seq,
+      id: event.id,
+      type,
+      encoded: event.encoded,
+    })
   }
 
   if (workerLease) {
-    const renewed = repository.renewLease({ aggregateID, ownerID, leaseTimeoutMs })
-    if (renewed !== 1) {
-      throw new StaleOwnerError({
-        message: `Aggregate ${aggregateID} worker lease is not held by ${ownerID}`,
-      })
-    }
+    renewWorkerLease(repository, { aggregateID, ownerID, leaseTimeoutMs })
   }
 
   touched?.add(aggregateID)
@@ -922,9 +1100,13 @@ export function createDurableRepository(connection: Connection): DurableReposito
       })
     }
     if (current.workerExpiresAt !== undefined && current.workerExpiresAt > now) {
-      throw new LeaseConflictError({
-        message: `Worker lease for aggregate ${input.aggregateID} is still live until ${current.workerExpiresAt}; refusing reclaim from a live generation`,
-      })
+      const ownerIsDead =
+        current.workerOwnerID !== undefined && (input.isDeadOwner ?? isDeadWorkerOwner)(current.workerOwnerID)
+      if (!ownerIsDead) {
+        throw new LeaseConflictError({
+          message: `Worker lease for aggregate ${input.aggregateID} is still live until ${current.workerExpiresAt}; refusing reclaim from a live generation`,
+        })
+      }
     }
     const expiresAt = input.leaseTimeoutMs > 0 ? now + input.leaseTimeoutMs : null
     const changes = connection.run(
@@ -933,16 +1115,41 @@ export function createDurableRepository(connection: Connection): DurableReposito
       [input.nextOwnerID, now, expiresAt, input.aggregateID, input.expectedOwnerID, input.expectedSeq],
     ).changes
     if (changes !== 1) {
-      throw new LeaseConflictError({ message: `Reclaim of ${input.aggregateID} did not match the observed worker lease` })
+      throw new LeaseConflictError({
+        message: `Reclaim of ${input.aggregateID} did not match the observed worker lease`,
+      })
+    }
+    return changes
+  }
+
+  const releaseDeadLeases = (input: ReleaseDeadLeasesInput): number => {
+    if (!workerLease) return 0
+    const isDeadOwner = input.isDeadOwner ?? isDeadWorkerOwner
+    const scope = input.aggregateID
+    const rows =
+      scope === undefined
+        ? connection.all("SELECT aggregate_id, worker_owner_id FROM event_sequence WHERE worker_owner_id IS NOT NULL")
+        : connection.all(
+            "SELECT aggregate_id, worker_owner_id FROM event_sequence WHERE aggregate_id = ? AND worker_owner_id IS NOT NULL",
+            [scope],
+          )
+    let changes = 0
+    for (const row of rows) {
+      const aggregateID = typeof row.aggregate_id === "string" ? row.aggregate_id : undefined
+      const ownerID = typeof row.worker_owner_id === "string" ? row.worker_owner_id : undefined
+      if (aggregateID === undefined || ownerID === undefined) continue
+      if (!isDeadOwner(ownerID)) continue
+      changes += connection.run(
+        "UPDATE event_sequence SET worker_expires_at = 0 WHERE aggregate_id = ? AND worker_owner_id = ?",
+        [aggregateID, ownerID],
+      ).changes
     }
     return changes
   }
 
   const claimSyncOwner = (input: LeaseOwnerInput): number =>
-    connection.run("UPDATE event_sequence SET owner_id = ? WHERE aggregate_id = ?", [
-      input.ownerID,
-      input.aggregateID,
-    ]).changes
+    connection.run("UPDATE event_sequence SET owner_id = ? WHERE aggregate_id = ?", [input.ownerID, input.aggregateID])
+      .changes
 
   const fillSyncOwner = (input: LeaseOwnerInput): number =>
     connection.run("UPDATE event_sequence SET owner_id = ? WHERE aggregate_id = ? AND owner_id IS NULL", [
@@ -950,15 +1157,12 @@ export function createDurableRepository(connection: Connection): DurableReposito
       input.aggregateID,
     ]).changes
 
-  const readEvents = (input: {
-    readonly aggregateID: string
-    readonly after?: number
-  }): readonly SerializedEvent[] =>
+  const readEvents = (input: { readonly aggregateID: string; readonly after?: number }): readonly SerializedEvent[] =>
     connection
-      .all(
-        "SELECT id, aggregate_id, seq, type, data FROM event WHERE aggregate_id = ? AND seq > ? ORDER BY seq ASC",
-        [input.aggregateID, input.after ?? -1],
-      )
+      .all("SELECT id, aggregate_id, seq, type, data FROM event WHERE aggregate_id = ? AND seq > ? ORDER BY seq ASC", [
+        input.aggregateID,
+        input.after ?? -1,
+      ])
       .map(parseStoredEvent)
 
   const readBlobs = (input: {
@@ -1020,6 +1224,7 @@ export function createDurableRepository(connection: Connection): DurableReposito
     renewLease,
     releaseLease,
     reclaimLease,
+    releaseDeadLeases,
     claimSyncOwner,
     fillSyncOwner,
     readEvents,
@@ -1038,7 +1243,8 @@ export function create(options: Options): Interface {
   if (ownerID.length === 0) {
     throw new Error("Bus.create requires a non-empty ownerID")
   }
-  const repository = options.repository ?? (options.connection ? createDurableRepository(options.connection) : undefined)
+  const repository =
+    options.repository ?? (options.connection ? createDurableRepository(options.connection) : undefined)
   if (repository === undefined) {
     throw new Error("Bus.create requires a connection or a DurableRepository")
   }
@@ -1056,7 +1262,7 @@ export function create(options: Options): Interface {
   const blobDir = options.blobDir ?? derivedBlobDir
   const blob: BlobStore = {
     ...(blobDir === undefined ? {} : { dir: blobDir }),
-    limitBytes: options.blobLimitBytes ?? DEFAULT_BLOB_LIMIT_BYTES,
+    limitBytes: options.blobLimitBytes ?? DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES,
     supportsTable: hasBlobTable,
   }
   const assertAggregate = (aggregateID: string): void => {
@@ -1250,6 +1456,7 @@ export function create(options: Options): Interface {
         nextOwnerID: input.nextOwnerID,
         leaseTimeoutMs,
         ...(input.now === undefined ? {} : { now: input.now }),
+        ...(input.isDeadOwner === undefined ? {} : { isDeadOwner: input.isDeadOwner }),
       })
       return {
         aggregateID: input.aggregateID,
@@ -1259,6 +1466,18 @@ export function create(options: Options): Interface {
     })
     cache?.invalidate(input.aggregateID)
     return lease
+  }
+
+  const releaseDeadLeases = (input: ReleaseDeadLeasesInput = {}): number => {
+    if (!workerLease) return 0
+    const release = () =>
+      repository.releaseDeadLeases({
+        ...(scopeAggregateID === undefined ? {} : { aggregateID: scopeAggregateID }),
+        ...(input.isDeadOwner === undefined ? {} : { isDeadOwner: input.isDeadOwner }),
+      })
+    const released = repository.transaction(release)
+    if (released > 0 && scopeAggregateID !== undefined) cache?.invalidate(scopeAggregateID)
+    return released
   }
 
   const heartbeat = (aggregateID: string): void => {
@@ -1291,6 +1510,7 @@ export function create(options: Options): Interface {
     read,
     claim,
     reclaim,
+    releaseDeadLeases,
     heartbeat,
     release,
     collectBlobs,
@@ -1509,11 +1729,7 @@ function collectBlobsLocked(
   return { removed, hashes }
 }
 
-function deleteAggregateLocked(
-  repository: DurableRepository,
-  aggregateID: string,
-  blob: BlobStore,
-): DeletedAggregate {
+function deleteAggregateLocked(repository: DurableRepository, aggregateID: string, blob: BlobStore): DeletedAggregate {
   const candidates = repository.readBlobs({ aggregateID })
   const hashes = hashesWithFiles(candidates)
   requireBlobDirectory(hashes, blob)

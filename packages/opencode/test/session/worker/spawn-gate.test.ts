@@ -242,3 +242,75 @@ describe("cap-bounded parallel boots", () => {
     stalled.release()
   })
 })
+
+describe("abortable acquisitions", () => {
+  test("aborting a queued acquisition removes its waiter without consuming a permit", async () => {
+    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
+    const first = await gate.acquire()
+    const controller = new AbortController()
+    const queued = gate.acquire(controller.signal)
+    const state = observe(queued)
+    await tick()
+    expect(gate.waiting).toBe(1)
+
+    controller.abort()
+    await tick()
+    expect(state.settled).toBe(true)
+    expect(state.error).toBeInstanceOf(Error)
+    expect((state.error as Error).message).toContain("aborted")
+    expect(gate.waiting).toBe(0)
+    expect(gate.active).toBe(1)
+
+    // The aborted waiter never took the slot: the next FIFO waiter is admitted
+    // by the single release, and the permit accounting stays exact.
+    const next = gate.acquire()
+    const nextState = observe(next)
+    await tick()
+    expect(nextState.settled).toBe(false)
+    first.release()
+    const permit = await next
+    expect(gate.active).toBe(1)
+    permit.release()
+    expect(gate.active).toBe(0)
+  })
+
+  test("an already-aborted signal rejects without queueing", async () => {
+    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
+    const controller = new AbortController()
+    controller.abort()
+    await expect(gate.acquire(controller.signal)).rejects.toThrow(/aborted/)
+    expect(gate.waiting).toBe(0)
+    expect(gate.active).toBe(0)
+    const permit = await gate.acquire()
+    permit.release()
+  })
+})
+
+describe("abort listener lifecycle", () => {
+  test("a timed-out acquisition removes its abort listener", async () => {
+    const gate = createSpawnGate({ timeoutMs: 20, capacity: 1 })
+    const first = await gate.acquire()
+    let added = 0
+    let removed = 0
+    const signal = {
+      aborted: false,
+      addEventListener: () => {
+        added += 1
+      },
+      removeEventListener: () => {
+        removed += 1
+      },
+    } as unknown as AbortSignal
+
+    const waiting = gate.acquire(signal)
+    const state = observe(waiting)
+    await new Promise<void>((resolve) => setTimeout(resolve, 40))
+    expect(state.settled).toBe(true)
+    expect(state.error).toBeInstanceOf(Error)
+    expect(added).toBe(1)
+    // The deadline path must detach the listener so a long-lived signal does not
+    // retain every timed-out acquisition.
+    expect(removed).toBe(1)
+    first.release()
+  })
+})

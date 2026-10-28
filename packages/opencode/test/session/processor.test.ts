@@ -299,11 +299,18 @@ itInterruptTool.live("session.processor cleanup drains a registered settlement i
         const parent = yield* user(chat.id, "interrupt result")
         const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
         const mdl = testModel
-        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          settlementDeadlineMs: 25,
+        })
 
         const outcomes: Array<"ok" | "error"> = []
+        const phases: string[] = []
         handle.registerToolSettlement?.("call-interrupt", (outcome, phase) =>
           Effect.sync(() => {
+            phases.push(phase)
             // Cleanup owns the abort/result-less path; commit/afterCommit are
             // reserved for a result that actually committed.
             if (phase === "settle") outcomes.push(outcome)
@@ -325,7 +332,11 @@ itInterruptTool.live("session.processor cleanup drains a registered settlement i
         const call = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
 
         expect(Exit.isFailure(exit)).toBe(true)
-        expect(outcomes).toEqual(["error"])
+        // Nothing proved the side effect failed: cleanup abandons the
+        // settlement, leaving the durable row indeterminate rather than
+        // recording a false `error`.
+        expect(phases).toEqual(["abandon"])
+        expect(outcomes).toEqual([])
         expect(call?.state.status).toBe("error")
         if (call?.state.status === "error") {
           expect(call.state.error).toBe("Tool execution aborted")
@@ -419,6 +430,53 @@ itDelayedResult.live(
           const part = yield* findingToolPart(msg.id)
           expect(part?.state.status).toBe("completed")
           expect(outcomes).toEqual(["ok"])
+        }),
+      { config: cfg },
+    ),
+)
+
+itDelayedResult.live(
+  "session.processor marks an expired result indeterminate instead of a false error",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const { processors, session } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "expired result")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = testModel
+          // A short per-run deadline makes this test deterministic: cleanup
+          // reaches it before the (never-arriving) result commits.
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+            settlementDeadlineMs: 10,
+          })
+
+          const terminal: Array<"ok" | "error"> = []
+          const phases: string[] = []
+          handle.registerToolSettlement?.(delayedCallID, (outcome, phase) =>
+            Effect.sync(() => {
+              phases.push(phase)
+              if (phase === "settle" || phase === "afterCommit") terminal.push(outcome)
+            }),
+          )
+
+          const run = yield* handle.process(streamInput(chat.id, parent, mdl)).pipe(Effect.forkChild)
+          yield* pollWithTimeout(runningToolPart(msg.id), "timed out waiting for the running tool part")
+          yield* Fiber.interrupt(run)
+          yield* Fiber.await(run)
+
+          // No terminal decision was invented. The interrupted placeholder is
+          // UI state; the durable row remains `started` (indeterminate).
+          expect(phases).toEqual(["abandon"])
+          expect(terminal).toEqual([])
+          const part = yield* findingToolPart(msg.id)
+          expect(part?.state.status).toBe("error")
+          if (part?.state.status === "error") expect(part.state.metadata?.interrupted).toBe(true)
         }),
       { config: cfg },
     ),

@@ -210,6 +210,22 @@ function effectCount(counter: string): number {
 }
 
 /**
+ * Wait until resume has been attempted `count` times. A resumable crash resolves
+ * the original dispatch with the replacement run, and the armed fault fires
+ * again in that replacement, so the test must observe the decision instead of
+ * awaiting the (looping) dispatch promise.
+ */
+function waitForAttempts(fixture: HubFixture, count: number, timeoutMs = REAL_WORKER_TRANSPORT_TIMEOUT_MS) {
+  return Effect.gen(function* () {
+    const deadline = Date.now() + timeoutMs
+    while (fixture.hub.lifecycle.attempts(fixture.sessionID) < count && Date.now() < deadline) {
+      yield* Effect.sleep(25)
+    }
+    return fixture.hub.lifecycle.attempts(fixture.sessionID)
+  })
+}
+
+/**
  * Wait for a replay to become observable, bounded so a refused resume does not
  * hang. The assertion is on the side effect itself, never on request counts
  * (title generation also hits the LLM server).
@@ -334,9 +350,11 @@ describe("resume reads the durable tool_call ledger", () => {
           fixture.hub.lifecycle.commit(sessionID, "msg_committed")
           // A lost finish report leaves the mirror stale; the durable row wins.
           fixture.hub.lifecycle.toolStarted(sessionID, "call_done")
-          const payload = yield* Effect.promise(() => crashPayload(dispatchPrompt(fixture, "second turn")))
-          expect(payload.phase).toBe("stream")
-          expect(fixture.hub.lifecycle.attempts(sessionID)).toBe(1)
+          // A resumable crash resolves the caller with the replacement run, not
+          // `WorkerCrashedError`; the assertion is the resume decision itself.
+          const run = dispatchPrompt(fixture, "second turn")
+          run.catch(() => undefined)
+          expect(yield* waitForAttempts(fixture, 1)).toBeGreaterThanOrEqual(1)
         } finally {
           yield* Effect.promise(() => fixture.dispose())
         }
@@ -364,8 +382,11 @@ describe("resume reads the durable tool_call ledger", () => {
         })
         try {
           fixture.hub.lifecycle.commit(sessionID, "msg_committed")
-          yield* Effect.promise(() => crashPayload(dispatchPrompt(fixture, "second turn")))
-          expect(fixture.hub.lifecycle.attempts(sessionID)).toBe(1)
+          // The durable commit allows a resume; observe the decision while the
+          // armed fault keeps firing in replacement runs.
+          const run = dispatchPrompt(fixture, "second turn")
+          run.catch(() => undefined)
+          expect(yield* waitForAttempts(fixture, 1)).toBeGreaterThanOrEqual(1)
         } finally {
           yield* Effect.promise(() => fixture.dispose())
         }
@@ -380,9 +401,11 @@ describe("phase-correct resume", () => {
     () =>
       Effect.gen(function* () {
         const llm = yield* TestLLMServer
-        for (const phase of ["boot", "materialize"] as const) {
+
+        // Boot has no run to replay: the caller observes the typed crash.
+        {
           const { filename, directory } = freshWorkspace()
-          const sessionID = `ses_resume_${phase}`
+          const sessionID = "ses_resume_boot"
           yield* migrateLikeProduction(filename)
           seedSession(filename, sessionID)
           yield* llm.reset
@@ -393,14 +416,40 @@ describe("phase-correct resume", () => {
             directory,
             sessionID,
             entry: PHASE_WORKER,
-            workerData: { phase },
+            workerData: { phase: "boot" },
           })
           try {
             fixture.hub.lifecycle.commit(sessionID, "msg_committed")
             const payload = yield* Effect.promise(() => crashPayload(dispatchPrompt(fixture, "phase turn")))
-            expect(payload.phase).toBe(phase)
-            // Boot has no run to replay; materialize is resumable from the commit.
-            expect(fixture.hub.lifecycle.attempts(sessionID)).toBe(phase === "boot" ? 0 : 1)
+            expect(payload.phase).toBe("boot")
+            expect(fixture.hub.lifecycle.attempts(sessionID)).toBe(0)
+          } finally {
+            yield* Effect.promise(() => fixture.dispose())
+          }
+        }
+
+        // Materialize is resumable from the commit: the replacement run settles
+        // the original dispatch promise.
+        {
+          const { filename, directory } = freshWorkspace()
+          const sessionID = "ses_resume_materialize"
+          yield* migrateLikeProduction(filename)
+          seedSession(filename, sessionID)
+          yield* llm.reset
+
+          const fixture = startHub({
+            llm,
+            filename,
+            directory,
+            sessionID,
+            entry: PHASE_WORKER,
+            workerData: { phase: "materialize" },
+          })
+          try {
+            fixture.hub.lifecycle.commit(sessionID, "msg_committed")
+            const run = dispatchPrompt(fixture, "phase turn")
+            run.catch(() => undefined)
+            expect(yield* waitForAttempts(fixture, 1)).toBe(1)
           } finally {
             yield* Effect.promise(() => fixture.dispose())
           }
@@ -429,10 +478,11 @@ describe("phase-correct resume", () => {
           env: { OPENCODE_TEST_FAULTS: "crashWorker@prompt:commit" },
         })
         try {
-          const payload = yield* Effect.promise(() => crashPayload(dispatchPrompt(fixture, "commit turn")))
-          expect(payload.phase).toBe("commit")
-          expect(payload.lastCommittedMessageID).not.toBeNull()
-          expect(fixture.hub.lifecycle.attempts(sessionID)).toBeGreaterThanOrEqual(1)
+          // The commit is durable, so the crash is resumable; the caller sees the
+          // replacement run and the assertion is the recorded attempt.
+          const run = dispatchPrompt(fixture, "commit turn")
+          run.catch(() => undefined)
+          expect(yield* waitForAttempts(fixture, 1)).toBeGreaterThanOrEqual(1)
         } finally {
           yield* Effect.promise(() => fixture.dispose())
         }

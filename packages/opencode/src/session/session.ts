@@ -12,6 +12,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { sessionRow } from "@opencode-ai/core/session/projector"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
 import { locationServiceMapLayer } from "@opencode-ai/core/location-services"
 
@@ -60,6 +61,22 @@ export function isDefaultTitle(title: string) {
 }
 
 type SessionRow = typeof SessionTable.$inferSelect
+
+const sameSessionColumn = (left: unknown, right: unknown): boolean =>
+  JSON.stringify(left ?? null) === JSON.stringify(right ?? null)
+
+/**
+ * The session columns whose projector image actually changes between `before`
+ * and `after`. This is the patch's projection delta: a worker policy may compare
+ * only these columns, so a stale `Session.Info` image (which still carries a
+ * snapshot of hub-owned billing/share/revert state) cannot be mistaken for an
+ * authority violation or resurrect the old value.
+ */
+function changedSessionColumns(before: Info, after: Info): readonly string[] {
+  const beforeRow = sessionRow(before as SessionV1.SessionInfo) as Record<string, unknown>
+  const afterRow = sessionRow(after as SessionV1.SessionInfo) as Record<string, unknown>
+  return Object.keys(afterRow).filter((column) => !sameSessionColumn(afterRow[column], beforeRow[column]))
+}
 
 export function fromRow(row: SessionRow): Info {
   const summary =
@@ -881,7 +898,12 @@ const layer: Layer.Layer<
           revert: info.revert === null ? undefined : (info.revert ?? current.revert),
           permission: info.permission === null ? undefined : (info.permission ?? current.permission),
         } as Info
-        yield* events.publish(SessionV1.Event.Updated, { sessionID, info: next })
+        // The event carries the full image for hub consumers, but the worker
+        // projection policy must only judge the columns this patch actually
+        // changed. Otherwise a stale snapshot (concurrent hub billing/share)
+        // looks like an authority violation, or worse, overwrites it.
+        const changed = changedSessionColumns(current, next)
+        yield* events.publish(SessionV1.Event.Updated, { sessionID, info: next }, { metadata: { sessionPatch: changed } })
       })
 
     const touch = Effect.fn("Session.touch")(function* (sessionID: SessionID) {

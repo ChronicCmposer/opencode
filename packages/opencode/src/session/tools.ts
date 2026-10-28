@@ -24,6 +24,7 @@ import type { LifecycleReporting } from "./ledger/lifecycle"
 import { Faults } from "@/testing/faults"
 import { WorkerDb } from "./worker/db"
 import { Database } from "@opencode-ai/core/database/database"
+import { withBusyRetry } from "@opencode-ai/core/database/busy"
 import { Session } from "./session"
 import { SessionProcessor } from "./processor"
 import { PartID } from "./schema"
@@ -105,9 +106,18 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       ? <A>(operation: () => A) =>
           database.value.db
             .transaction(() => Effect.sync(operation), { behavior: "immediate" })
-            .pipe(Effect.orDie)
+            // A busy ledger write owns no outer transaction, so the whole
+            // exclusive transaction replays instead of a single statement.
+            .pipe(withBusyRetry, Effect.orDie)
       : undefined
-    return createToolCallLedger(repository, exclusive === undefined ? {} : { exclusive })
+    // The event-sequence lease owner is this worker's generation identity. The
+    // ledger binds every write to it so a superseded generation cannot start or
+    // settle a call after its successor claimed the session.
+    const ownerID = workerDb.value.eventBinding.leaseOwner
+    return createToolCallLedger(repository, {
+      ...(exclusive === undefined ? {} : { exclusive }),
+      ...(ownerID === undefined ? {} : { fence: { ownerID } }),
+    })
   })
 
   /**
@@ -145,8 +155,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
    * `settle` is the standalone abort/cleanup path: no transaction exists, so it
    * writes the ledger under the connection semaphore and then reports.
    *
-   * The first outcome wins: a failure that settles before a late success keeps
-   * the row finished `error`; a committed result ignores a later error.
+   * A terminal outcome settles exactly once. Cleanup's `abandon` is not an
+   * outcome: the ledger row stays `started` (indeterminate) so a successful
+   * result that lands after the run's settlement deadline can still settle `ok`
+   * instead of being recorded as a false error.
    */
   const createSettlement = (callID: string, ledgerKey: string): SessionProcessor.ToolSettlement => {
     let settled: "ok" | "error" | undefined
@@ -164,6 +176,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         )
       })
     return (outcome, phase) => {
+      if (phase === "abandon") return Effect.void
       if (phase === "commit") {
         if (settled !== undefined) return Effect.void
         // Left unmarked until `afterCommit`: a rolled-back transaction must
@@ -174,6 +187,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       settled = outcome
       if (phase === "afterCommit") return finishHub(outcome)
       return Effect.gen(function* () {
+        // A late terminal outcome after abandonment is still the truth: the
+        // ledger update succeeds because the row was never finished.
         yield* finishLedger(ledgerKey, outcome, "settle")
         yield* finishHub(outcome)
       })

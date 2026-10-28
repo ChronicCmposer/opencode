@@ -769,6 +769,13 @@ export interface SessionWorkOptions {
    * lying). Pipeline-only graphs have no `SessionRunState`, so nothing registers.
    */
   readonly registerControl?: (control: SessionRunControl) => void
+  /**
+   * Consume a cancel that arrived before the first graph build registered a
+   * control. A pre-run cancel must not be lost: the run interrupts at its start
+   * (before building) or immediately after the build, so a cancelled first turn
+   * never executes its prompt.
+   */
+  readonly consumePreRunCancel?: (sessionID: SessionID) => boolean
 }
 
 /**
@@ -848,7 +855,13 @@ export function createSessionWork(options: SessionWorkOptions): SessionWork {
     })
     const run = Effect.scopedWith((runScope) =>
       Effect.gen(function* () {
+        // A cancel that landed before this run started wins the whole build:
+        // never construct the graph for work that is already cancelled.
+        if (options.consumePreRunCancel?.(sessionID) === true) return yield* Effect.interrupt
         const context = yield* resolveContext(runScope)
+        // A cancel that landed during the build must be honoured before the
+        // prompt runs, even though the control could not receive it yet.
+        if (options.consumePreRunCancel?.(sessionID) === true) return yield* Effect.interrupt
         return yield* body.pipe(
           // A failed run is logged once, through the worker logger (the run's
           // context provides the logging sink), before the cause is re-raised.
@@ -1577,19 +1590,38 @@ export function bootstrapSessionWorker(
     // The worker-local run control is registered once the first `run` resolves the
     // worker's `SessionRunState`; the executor proxy reads it live.
     let control: SessionRunControl | undefined
-    const work = productionWorkRegistry(
-      createSessionWork({
-        layer: runtime.layer,
-        scope: workerScope,
-        writer: clients.writer,
-        threadId,
-        prompt: usePrompt,
-        instance: workerInstanceContext(init.snapshot),
-        registerControl: (registered) => {
-          control = registered
-        },
-      }),
-    )
+    // A cancel can arrive while the first run is still building its graph, before
+    // any control exists. Latch it here and let the run consume it at start (or
+    // after the build). The latch is scoped to a run that is actually in flight:
+    // an idle cancel must never interrupt the NEXT run (pipeline-only graphs
+    // never register a control at all).
+    const preRunCancels = new Set<SessionID>()
+    const activeRuns = new Set<SessionID>()
+    const sessionWork = createSessionWork({
+      layer: runtime.layer,
+      scope: workerScope,
+      writer: clients.writer,
+      threadId,
+      prompt: usePrompt,
+      instance: workerInstanceContext(init.snapshot),
+      registerControl: (registered) => {
+        control = registered
+      },
+      consumePreRunCancel: (sessionID) => preRunCancels.delete(sessionID),
+    })
+    const work = productionWorkRegistry((sessionID, prompt, shell) => {
+      activeRuns.add(sessionID)
+      return sessionWork(sessionID, prompt, shell).pipe(
+        // A run's pre-run latch dies with the run: a cancel delivered after its
+        // last consume point can never outlive it into the next turn.
+        Effect.ensuring(
+          Effect.sync(() => {
+            activeRuns.delete(sessionID)
+            preRunCancels.delete(sessionID)
+          }),
+        ),
+      )
+    })
     const slot = init.workerID
     const installExecutor = options.installExecutor ?? installSessionExecutor
     installed = installExecutor(scope, {
@@ -1599,7 +1631,14 @@ export function bootstrapSessionWorker(
       // `SessionRunState`; the proxy reads it live so a cancel after registration
       // reaches the real loop (table B). Before that there is nothing to cancel.
       control: {
-        cancel: (sessionID) => control?.cancel(sessionID) ?? Promise.resolve(),
+        cancel: (sessionID) => {
+          if (control !== undefined) return control.cancel(sessionID)
+          // No graph/control yet: latch the cancel only for a run that is
+          // building. With no run in flight there is nothing to cancel, so the
+          // latch must not carry into the next run.
+          if (activeRuns.has(sessionID)) preRunCancels.add(sessionID)
+          return Promise.resolve()
+        },
         busy: (sessionID) => control?.busy(sessionID) ?? Promise.resolve(false),
       },
       // A running process-local background job keeps the isolate alive across an

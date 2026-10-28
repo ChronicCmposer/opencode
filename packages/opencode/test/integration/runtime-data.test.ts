@@ -20,7 +20,8 @@ import {
 import { inImmediateTransactionAsync, retryBusyAsync } from "@opencode-ai/core/database/transaction"
 import { createDbExecutor } from "@/session/worker/db-executor"
 import { buildHashStatus, verifyReadyBuild } from "@/session/worker/build-hash"
-import { createLazyExecutorWorkerPool, createProductionSessionHub } from "@/session/worker/hub"
+import { createProductionSessionHub } from "@/session/worker/hub"
+import { createLazyExecutorWorkerPool } from "../lib/lazy-worker-pool"
 import { migrationStatements, ledgerStatements } from "@/session/writer/migration.statements.gen"
 import { currentSchemaIdentity, ensureProductionSchema, markSchemaIdentity, schemaIdentity } from "@/session/db/schema"
 import {

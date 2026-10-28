@@ -160,6 +160,13 @@ export interface WorkerPlugin {
    * the control port instead of dropping them.
    */
   readonly proxied?: readonly string[]
+  /**
+   * Every trigger-shaped hook the source declared, including routed-but-
+   * unsupported ones. The worker needs this to tell an undeclared unsupported
+   * hook (a true no-op) from one the plugin actually implements (a typed
+   * failure). Only clone-safe names cross the isolate.
+   */
+  readonly declared?: readonly string[]
 }
 
 export interface WorkerPluginHost {
@@ -346,6 +353,31 @@ function applyChatMessage(output: ChatMessageOutput, next: ChatMessageOutput): C
   return output
 }
 
+/**
+ * The hooks each host's loaded plugins declared, keyed by host identity. A
+ * `WorkerPluginHost` exposes methods for every route regardless of declaration,
+ * so this side table is the only way to tell "declared but unsupported" from
+ * "not declared at all" without widening the host interface.
+ */
+const declaredHooksByHost = new WeakMap<WorkerPluginHost, ReadonlySet<string>>()
+
+/** Whether any loaded plugin behind `host` declared `hook`. */
+export function workerPluginHostDeclaresHook(host: WorkerPluginHost, hook: string): boolean {
+  return declaredHooksByHost.get(host)?.has(hook) ?? false
+}
+
+function declaredHooksOf(plugins: readonly WorkerPlugin[]): ReadonlySet<string> {
+  const declared = new Set<string>()
+  for (const plugin of plugins) {
+    for (const [name, value] of Object.entries(plugin.hooks)) {
+      if (typeof value === "function") declared.add(name)
+    }
+    for (const name of plugin.proxied ?? []) declared.add(name)
+    for (const name of plugin.declared ?? []) declared.add(name)
+  }
+  return declared
+}
+
 export function createWorkerPluginHost(
   plugins: readonly WorkerPlugin[],
   options?: WorkerPluginHostOptions,
@@ -357,7 +389,7 @@ export function createWorkerPluginHost(
     seen.add(name)
   }
 
-  return {
+  const host: WorkerPluginHost = {
     names,
     // `chat.params` / `chat.headers` must resolve against the model of THIS
     // request: a session can switch models mid-run, so the init-resolved diff is
@@ -450,6 +482,8 @@ export function createWorkerPluginHost(
       })
     },
   }
+  declaredHooksByHost.set(host, declaredHooksOf(plugins))
+  return host
 }
 
 /**

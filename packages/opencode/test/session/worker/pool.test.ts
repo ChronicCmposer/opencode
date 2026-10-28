@@ -16,11 +16,15 @@ import {
   resolveWorkerModel,
 } from "@/session/worker/init"
 import { DEFAULT_REAP_MS, REAP_MS_ENV, reapMsWarning, resolveReapMs } from "@/session/worker/pool"
-import { createProductionWorkerPool } from "@/session/worker/hub"
+import { createProductionWorkerPool, createSessionBoundExecutorWorker, createSessionHub } from "@/session/worker/hub"
+import type { DbExecutor } from "@/session/worker/db-executor"
+import { createDispatcher } from "@/session/worker/dispatch"
+import type { ExecutorWorker } from "@/session/worker/execute"
 import { buildWorkerSnapshot, createEpochSequence, nextEpoch } from "@/session/worker/snapshot"
 import { assertStructuredCloneable, sessionWorkerInit } from "../../lib/session-worker-init"
 import { bootSessionWorker } from "../../lib/session-worker-harness"
-import { sid } from "../../lib/async"
+import { createFakeWorkerPool } from "../../lib/fake-worker-pool"
+import { flush, pollUntil, sid } from "../../lib/async"
 
 /** The dependency-light executor fixture (speaks the executor protocol). */
 const EXECUTOR_FIXTURE = new URL("../../fixture/session-execute-worker.ts", import.meta.url)
@@ -418,11 +422,170 @@ describe("createProductionWorkerPool", () => {
   }, 30_000)
 })
 
+describe("idle eviction retirement", () => {
+  test("an idle-cap eviction runs the dispatcher retirement and releases hub ports + lease", async () => {
+    const served: number[] = []
+    const disposedPorts: number[] = []
+    const zeroed: string[] = []
+    let retiredOwner = ""
+    let hub: ReturnType<typeof createSessionHub> | undefined
+
+    const db: DbExecutor = {
+      threadId: 0,
+      query: async (sql) => (sql.includes("event_sequence") ? [{ worker_owner_id: retiredOwner }] : []),
+      run: async (sql, params) => {
+        if (sql.includes("worker_expires_at = 0") && Array.isArray(params)) zeroed.push(String(params[0]))
+        return { changes: 1, lastInsertRowid: 0 }
+      },
+      transaction: async () => [],
+      close: async () => {},
+    }
+    const pool = createProductionWorkerPool({
+      init: sessionWorkerInit(),
+      entry: EXECUTOR_FIXTURE,
+      workKind: "instant",
+      timeoutMs: 15_000,
+      maxIdleWorkers: 1,
+      // The production hub's hook: idle eviction takes the dispatcher retirement
+      // path (isolate exit, hub ports, pending asks, retired lease), not only the
+      // pool's local `releaseSession`.
+      onIdleEvicted: (sessionID) => hub?.dispatcher.retire(sessionID) ?? Promise.resolve(),
+    })
+    hub = createSessionHub({
+      pool,
+      db,
+      ports: {
+        egress: (workerID) => {
+          served.push(workerID)
+          return () => {
+            disposedPorts.push(workerID)
+          }
+        },
+      },
+      onWorkerCrashed: () => {},
+    })
+    const sessionHub = hub
+    try {
+      const first = sid("ses_idle_evict_first")
+      await sessionHub.dispatcher.dispatch({ sessionID: first, depth: 0 })
+      const firstWorker = sessionHub.dispatcher.registry.worker(first)?.id
+      expect(firstWorker).toBeDefined()
+      retiredOwner = `worker-${firstWorker}-1-uuid`
+      sessionHub.attachWorkerPorts(firstWorker!, { egress: {} as MessagePort })
+      expect(served).toEqual([firstWorker!])
+
+      await sessionHub.dispatcher.dispatch({ sessionID: sid("ses_idle_evict_second"), depth: 0 })
+      await pollUntil(
+        () => zeroed.includes(String(first)) && disposedPorts.includes(firstWorker!),
+        { message: "the evicted generation's hub ports/lease were not released", timeoutMs: 10_000 },
+      )
+
+      expect(zeroed).toEqual([String(first)])
+      expect(disposedPorts).toEqual([firstWorker!])
+      expect(sessionHub.dispatcher.workerForSession(first)).toBeUndefined()
+      expect(pool.idleEvictions).toBe(1)
+    } finally {
+      await sessionHub.terminateAll()
+    }
+  }, 30_000)
+})
+
 describe("dispatch pool constants", () => {
   test("dispatch does not re-export duplicate pool constants", async () => {
     const dispatch = await import("@/session/worker/dispatch")
     expect("DEFAULT_SESSION_WORKER_REAP_MS" in dispatch).toBe(false)
     expect("SESSION_WORKER_REAP_ENV" in dispatch).toBe(false)
     expect("resolveSessionWorkerReapMs" in dispatch).toBe(false)
+  })
+})
+
+describe("one production pool", () => {
+  test("test-only lazy factories are gone while the production factory remains", async () => {
+    const workerPools = await import("@/session/worker/worker-pools")
+    expect(workerPools).not.toHaveProperty("createLazyExecutorWorker")
+    expect(workerPools).not.toHaveProperty("createLazyExecutorWorkerPool")
+    expect(typeof workerPools.createProductionWorkerPool).toBe("function")
+  })
+})
+
+describe("termination ordering", () => {
+  test("a repeated terminate joins the in-flight orderly close", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let calls = 0
+    const inner: ExecutorWorker = {
+      id: 1,
+      get alive() {
+        return true
+      },
+      execute: async () => {},
+      cancel: async () => {},
+      assertNotBusy: async () => false,
+      resultFor: () => undefined,
+      terminate: async () => {
+        calls += 1
+        await gate
+      },
+    }
+    const worker = createSessionBoundExecutorWorker(1, async () => inner)
+    await worker.execute({ sessionID: sid("ses_close_cache"), depth: 0 })
+
+    const first = worker.terminate()
+    const second = worker.terminate()
+    let secondSettled = false
+    void second.then(() => {
+      secondSettled = true
+    })
+    await flush()
+
+    // The second caller must wait for the same close, not observe a fake exit.
+    expect(calls).toBe(1)
+    expect(secondSettled).toBe(false)
+
+    release()
+    await Promise.all([first, second])
+    expect(secondSettled).toBe(true)
+  })
+
+  test("a dead idle replacement finishes closing before its successor starts", async () => {
+    const pool = createFakeWorkerPool(1)
+    const dispatcher = createDispatcher({ pool, terminateTimeoutMs: 5_000 })
+    const sessionID = sid("ses_dead_idle_ordering")
+
+    const first = dispatcher.dispatch({ sessionID })
+    await flush()
+    const idle = pool.spawned[0]!
+    idle.finish(sessionID)
+    await first
+
+    // The parked worker dies between turns. Its orderly close is slow.
+    idle.alive = false
+    let releaseClose!: () => void
+    const close = new Promise<void>((resolve) => {
+      releaseClose = resolve
+    })
+    let closed = false
+    idle.terminate = async () => {
+      await close
+      closed = true
+    }
+
+    const second = dispatcher.dispatch({ sessionID })
+    await flush()
+
+    // The dead generation is still closing: no successor may be materialized.
+    expect(closed).toBe(false)
+    expect(pool.spawned).toHaveLength(1)
+
+    releaseClose()
+    await pollUntil(() => closed && pool.spawned[1]?.runs.length === 1, {
+      message: "the successor never started after the old isolate closed",
+      timeoutMs: 1_000,
+    })
+    pool.spawned[1]!.finish(sessionID)
+    await second
+    await dispatcher.terminateAll()
   })
 })

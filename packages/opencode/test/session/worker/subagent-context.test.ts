@@ -28,11 +28,11 @@ import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { type ExecutorWorker, type SessionExecutionResult } from "@/session/worker/execute"
 import {
-  createLazyExecutorWorkerPool,
   productionSessionHubLayer,
   SessionHubService,
   type ProductionPoolFactory,
 } from "@/session/worker/hub"
+import { createLazyExecutorWorkerPool } from "../../lib/lazy-worker-pool"
 import type { SessionWorkerInit } from "@/session/worker/session-worker"
 import { sid } from "../../lib/async"
 

@@ -32,7 +32,7 @@ import { batch, onMount } from "solid-js"
 import path from "path"
 import { useKV } from "./kv"
 import { usePermission } from "./permission"
-import { compareCodepointNumeric } from "../util/order"
+import { compareIds } from "../util/order"
 
 const emptyConsoleState: ConsoleState = {
   consoleManagedProviders: [],
@@ -44,7 +44,7 @@ const emptyConsoleState: ConsoleState = {
  * total order that keeps `items` sorted, so the returned `index` is also the
  * insertion point when the target is absent.
  */
-function search<T, K>(items: T[], target: K, compare: (item: T, target: K) => number) {
+export function search<T, K>(items: T[], target: K, compare: (item: T, target: K) => number) {
   let left = 0
   let right = items.length - 1
   while (left <= right) {
@@ -55,11 +55,6 @@ function search<T, K>(items: T[], target: K, compare: (item: T, target: K) => nu
     else right = middle - 1
   }
   return { found: false, index: left }
-}
-
-/** Total order for ids, shared by every id-keyed cache (sessions, parts, requests). */
-function compareIds(candidate: string, target: string) {
-  return compareCodepointNumeric(candidate, target)
 }
 
 /** Locate an entity by id; the ascending invariant for every id-keyed cache. */

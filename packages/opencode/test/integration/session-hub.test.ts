@@ -37,13 +37,13 @@ import { migrationStatements } from "@/session/writer/migration.statements.gen"
 import {
   boundedDispatchDepth,
   buildHubProxyHandlers,
-  createLazyExecutorWorkerPool,
   createSessionChildrenIndex,
   hubProxyAuthoritiesFor,
   sessionSpawnFor,
   spawnChildOnHub,
   type HubProxyRunner,
 } from "@/session/worker/hub"
+import { createLazyExecutorWorkerPool } from "../lib/lazy-worker-pool"
 import type { ExecutorWorker, ExecutorWorkerPool } from "@/session/worker/execute"
 import { serveHubProxy } from "@/session/worker/hub-proxy-wire"
 import type { CancelOutcome } from "@/session/worker/cancel"

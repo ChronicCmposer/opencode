@@ -491,6 +491,8 @@ const layer = Layer.effect(
     })
 
     const shellImpl = Effect.fn("SessionPrompt.shellImpl")(function* (input: ShellInput, ready?: Latch.Latch) {
+      // Outside a session worker (flag-off hub) there is no reporting seam.
+      const lifecycle = LifecycleLedger.reporting()
       return yield* Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const markReady = ready ? ready.open.pipe(Effect.asVoid) : Effect.void
@@ -616,6 +618,12 @@ const layer = Layer.effect(
             aborted = true
           }
           yield* finish
+
+          // The assistant row is durable once `finish` completes. Report it
+          // before the run can exit: the barrier then settles from a real commit
+          // instead of `noCommit()`, and resume/auto-resume reads the message
+          // this shell turn actually wrote.
+          if (lifecycle !== undefined) yield* Effect.promise(() => lifecycle.commit(input.sessionID, msg.id))
 
           if (Exit.isFailure(exit) && !aborted && !Cause.hasInterruptsOnly(exit.cause)) {
             return yield* Effect.failCause(exit.cause)
@@ -1134,6 +1142,9 @@ const layer = Layer.effect(
               sessionID,
               auto: task.auto,
               overflow: task.overflow,
+              // Compaction may persist a summary assistant message and then stop
+              // the run; that row is durable, so it is the reported commit.
+              onStop: (messageID) => lifecycle?.commit(sessionID, messageID) ?? Promise.resolve(),
             })
             if (result === "stop") break
             continue

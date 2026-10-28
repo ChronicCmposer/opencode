@@ -51,8 +51,12 @@ export interface SpawnPermit {
 }
 
 export interface SpawnGateHandle {
-  /** Wait for a boot slot, resolving in FIFO order. */
-  acquire(): Promise<SpawnPermit>
+  /**
+   * Wait for a boot slot, resolving in FIFO order. An aborted `signal` removes
+   * this waiter without granting or consuming a permit, so a cancelled boot
+   * never waits out the acquisition deadline or leaves a phantom slot behind.
+   */
+  acquire(signal?: AbortSignal): Promise<SpawnPermit>
   /** Whether at least one boot slot is currently held (permit-count probes/tests). */
   readonly held?: boolean
   /** How many boot slots are currently held. */
@@ -74,10 +78,20 @@ export class SpawnGateTimeoutError extends Error {
   }
 }
 
+/** A boot slot acquisition was aborted before it was granted. */
+export class SpawnGateAbortedError extends Error {
+  constructor() {
+    super("spawn gate: acquisition aborted before a worker spawn permit was granted")
+    this.name = "SpawnGateAbortedError"
+  }
+}
+
 interface Waiter {
   readonly resolve: (permit: SpawnPermit) => void
   readonly reject: (error: Error) => void
   readonly timer: ReturnType<typeof setTimeout>
+  readonly signal: AbortSignal | undefined
+  readonly onAbort: (() => void) | undefined
 }
 
 const DEFAULT_CAPACITY = 4
@@ -106,9 +120,21 @@ export function createSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
       const waiter = waiters.shift()
       if (waiter === undefined) return
       clearTimeout(waiter.timer)
+      if (waiter.signal !== undefined && waiter.onAbort !== undefined) {
+        waiter.signal.removeEventListener("abort", waiter.onAbort)
+      }
       active += 1
       waiter.resolve(permit())
     }
+  }
+
+  /** Remove a waiter that was aborted; its abort listener is already running. */
+  const abortWaiter = (waiter: Waiter, reject: (error: Error) => void): void => {
+    const index = waiters.indexOf(waiter)
+    if (index === -1) return
+    waiters.splice(index, 1)
+    clearTimeout(waiter.timer)
+    reject(new SpawnGateAbortedError())
   }
 
   return {
@@ -124,7 +150,8 @@ export function createSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
     get waiting() {
       return waiters.length
     },
-    acquire() {
+    acquire(signal?: AbortSignal) {
+      if (signal?.aborted === true) return Promise.reject(new SpawnGateAbortedError())
       if (active < capacity) {
         active += 1
         return Promise.resolve(permit())
@@ -134,12 +161,19 @@ export function createSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
           const index = waiters.indexOf(waiter)
           if (index === -1) return
           waiters.splice(index, 1)
+          // The deadline ends the acquisition: detach the abort listener so a
+          // long-lived signal does not retain every timed-out waiter.
+          if (signal !== undefined && onAbort !== undefined) {
+            signal.removeEventListener("abort", onAbort)
+          }
           reject(new SpawnGateTimeoutError(timeoutMs))
         }, timeoutMs)
         // The acquisition deadline is a shutdown guard, not work: never keep the
         // process alive waiting for a slot nobody will release.
         timer.unref?.()
-        const waiter: Waiter = { resolve, reject, timer }
+        const onAbort = signal === undefined ? undefined : () => abortWaiter(waiter, reject)
+        const waiter: Waiter = { resolve, reject, timer, signal, onAbort }
+        if (signal !== undefined && onAbort !== undefined) signal.addEventListener("abort", onAbort, { once: true })
         waiters.push(waiter)
       })
     },

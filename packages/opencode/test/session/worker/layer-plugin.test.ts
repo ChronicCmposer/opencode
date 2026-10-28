@@ -197,8 +197,10 @@ describe("worker plugin host", () => {
     expect((result as { system: string[] }).system).toEqual(["base", "worker"])
   })
 
-  test("an unsupported or unclassified trigger is a typed failure, never a pass-through", async () => {
-    const host = createWorkerPluginHost([{ name: "empty", hooks: {} }])
+  test("a declared unsupported or unclassified trigger is a typed failure, never a pass-through", async () => {
+    // A loaded plugin declares the unsupported hook: invocation fails typed. An
+    // undeclared unsupported hook is a true no-op (see plugin-text-complete).
+    const host = createWorkerPluginHost([{ name: "empty", hooks: {}, declared: ["command.execute.before"] }])
     const built = buildSessionWorkerLayer({
       snapshot: workerSnapshot(),
       env: { values: {} },

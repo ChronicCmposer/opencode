@@ -170,7 +170,11 @@ interface Harness {
  * real write: it clears the persisted `revert` column outside the worker. The
  * worker must reach it instead of writing `revert: null` itself.
  */
-function hubPort(filename: string, cleared: string[]): { clients: HubProxyClients; dispose: () => void } {
+function hubPort(
+  filename: string,
+  cleared: string[],
+  options: { readonly failClear?: boolean } = {},
+): { clients: HubProxyClients; dispose: () => void } {
   const authorities: HubProxyAuthorities = {
     sessionStatus: {
       get: () => Effect.succeed({ type: "idle" }),
@@ -193,6 +197,7 @@ function hubPort(filename: string, cleared: string[]): { clients: HubProxyClient
     ...buildHubProxyHandlers(authorities, instantRunner),
     "session.clearRevert": (request) => {
       const sessionID = String((request as { sessionID: unknown }).sessionID)
+      if (options.failClear) throw new Error("hub clear failed")
       cleared.push(sessionID)
       // The hub's real `Session.clearRevert` write, on the hub side of the
       // boundary: it owns the `revert` column.
@@ -213,7 +218,10 @@ function hubPort(filename: string, cleared: string[]): { clients: HubProxyClient
   }
 }
 
-async function harness(provider: Awaited<ReturnType<typeof startMockProvider>>): Promise<Harness> {
+async function harness(
+  provider: Awaited<ReturnType<typeof startMockProvider>>,
+  options: { readonly failClear?: boolean } = {},
+): Promise<Harness> {
   const directory = workspace()
   const filename = migrated(directory)
   const model = modelConfig(provider)
@@ -223,7 +231,7 @@ async function harness(provider: Awaited<ReturnType<typeof startMockProvider>>):
   databases.push(database)
 
   const cleared: string[] = []
-  const hub = hubPort(filename, cleared)
+  const hub = hubPort(filename, cleared, options)
   disposes.push(hub.dispose)
 
   const snapshot = workerSnapshot({ directory })
@@ -328,6 +336,50 @@ describe("worker-mode revert cleanup", () => {
       expect(assistantText(result)).toBe("recovered")
       expect(adminRows(testHarness.filename, "SELECT revert FROM session WHERE id = ?", [SESSION])).toEqual([
         { revert: null },
+      ])
+    } finally {
+      await testHarness.close()
+    }
+  }, 60_000)
+
+  test("cleanup clears the revert before deleting any row", async () => {
+    await using provider = startMockProvider({ chunks: ["unused"] })
+    const testHarness = await harness(provider, { failClear: true })
+    try {
+      // A message after the revert point that cleanup would delete.
+      admin(testHarness.filename, "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)", [
+        "msg_revert_worker_tail",
+        SESSION,
+        2,
+        2,
+        JSON.stringify({
+          role: "assistant",
+          time: { created: 2 },
+          agent: "build",
+          model: { providerID: "mock", modelID: "mock" },
+          parentID: USER_MESSAGE,
+        }),
+      ])
+
+      const cleanup = Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const revert = yield* SessionRevert.Service
+        yield* revert.cleanup(yield* sessions.get(SESSION))
+      }).pipe(
+        Effect.provide(testHarness.context),
+        Effect.provideService(InstanceRef, testHarness.instance),
+      )
+
+      // The hub clear fails. Because the clear is the first write, no row has
+      // been deleted: a crash here leaves the session recoverable, never a
+      // revert pointer aimed at deleted rows.
+      await expect(Effect.runPromise(cleanup)).rejects.toThrow()
+      const ids = adminRows<{ id: string }>(testHarness.filename, "SELECT id FROM message WHERE session_id = ? ORDER BY id", [
+        SESSION,
+      ]).map((row) => row.id)
+      expect([...ids].sort()).toEqual([USER_MESSAGE, "msg_revert_worker_tail"].sort())
+      expect(adminRows(testHarness.filename, "SELECT revert FROM session WHERE id = ?", [SESSION])).toEqual([
+        { revert: JSON.stringify({ messageID: USER_MESSAGE }) },
       ])
     } finally {
       await testHarness.close()

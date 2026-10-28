@@ -11,9 +11,10 @@
 // numeric header (so no `u32` length can overflow). Encoding rejects a frame or
 // a coalesced batch above 4 MiB with a typed `FrameTooLargeError` before it is
 // posted; decoding applies the same bound to untrusted input. The one exception
-// is a DURABLE event whose body core already offloaded to the shared blob store:
-// it crosses as a small `{ __eventBlobPosition, frameBytes }` reference the hub
-// resolves by position, so a committed event is never lost to the frame cap.
+// is a DURABLE event that does not fit its envelope: it crosses as a small
+// `{ __eventBlobPosition, frameBytes }` reference the hub resolves by position
+// from either the shared blob store OR the committed inline `event.data` row, so
+// a committed event is never lost to the frame cap.
 
 import {
   FrameTooLargeError,
@@ -23,6 +24,7 @@ import {
   WORKER_FRAME_VERSION,
   blobPositionReferenceFrame,
   decodeWorkerFrame,
+  durableAggregateMetaOf,
   encodeWorkerFrameSized,
   isEventBlobReference,
   parseEventsFrame,
@@ -53,6 +55,16 @@ export const MAX_FRAME_BYTES = MAX_WORKER_FRAME_BYTES
 
 /** A coalesced batch may not exceed the same 4 MiB wire bound. */
 export const MAX_BATCH_BYTES = MAX_WORKER_FRAME_BYTES
+
+/**
+ * Envelope space reserved inside one frame: port/kind/id, committed
+ * `(aggregateID, seq)` metadata, and JSON punctuation. The core D16 inline bound
+ * reserves the same headroom, so a body stored inline is guaranteed to fit.
+ */
+export const ENVELOPE_HEADROOM_BYTES = 64 * 1024
+
+/** Largest event body that always fits one frame with its envelope. */
+export const MAX_INLINE_EVENT_BYTES = MAX_FRAME_BYTES - ENVELOPE_HEADROOM_BYTES
 
 /**
  * A committed position in one aggregate's durable log. This is the ONLY durable
@@ -154,19 +166,43 @@ export function encodeFrames(frames: readonly WorkerFrameEnvelope[]): readonly s
  * transport bound, measuring each frame exactly once. A durable event frame that
  * alone exceeds the bound is replaced by its committed blob-position reference
  * (core already offloaded the body before fan-out), so the batch survives and no
- * durable event is dropped by the cap. A non-durable frame that alone exceeds the
- * bound is still a typed `FrameTooLargeError`; a batch that merely totals too
- * much is split.
+ * durable event is dropped by the cap.
+ *
+ * A non-durable frame is advisory stream data. When `onDrop` is supplied, a
+ * non-durable frame that alone exceeds the bound is dropped and reported rather
+ * than failing the whole batch; without it the codec keeps its typed rejection.
+ * A batch that merely totals too much is always split, never dropped.
  */
+export interface EncodeFrameChunksOptions {
+  /** Total wire bound per chunk; defaults to {@link MAX_BATCH_BYTES}. */
+  readonly limit?: number
+  /** Called for an advisory (non-durable) frame that alone exceeds the bound. */
+  readonly onDrop?: (frame: EventsFrame, error: FrameTooLargeError) => void
+}
+
 export function encodeFrameChunks(
   frames: readonly EventsFrame[],
-  limit: number = MAX_BATCH_BYTES,
+  limitOrOptions: number | EncodeFrameChunksOptions = MAX_BATCH_BYTES,
 ): readonly (readonly string[])[] {
+  const options = typeof limitOrOptions === "number" ? { limit: limitOrOptions } : limitOrOptions
+  const limit = options.limit ?? MAX_BATCH_BYTES
+  const onDrop = options.onDrop
   const chunks: string[][] = []
   let current: string[] = []
   let total = 0
   for (const frame of frames) {
-    const sized = encodeFrameOrReference(frame)
+    let sized: { readonly text: string; readonly bytes: number }
+    try {
+      sized = encodeFrameOrReference(frame)
+    } catch (error) {
+      // Only a non-durable advisory frame is droppable: a durable commit has a
+      // position reference or fails loud, so its bytes are never silently lost.
+      if (onDrop !== undefined && error instanceof FrameTooLargeError && durableAggregateMetaOf(frame) === undefined) {
+        onDrop(frame, error)
+        continue
+      }
+      throw error
+    }
     if (sized.bytes > limit) throw new FrameTooLargeError(sized.bytes, limit)
     if (current.length > 0 && total + sized.bytes > limit) {
       chunks.push(current)
@@ -180,6 +216,36 @@ export function encodeFrameChunks(
   return chunks
 }
 
+/** Core's D16 offload marker: the body lives in the content-addressed blob store. */
+interface CoreBlobReference {
+  readonly __eventBlob: string
+  readonly size: number
+}
+
+function isCoreBlobReference(value: unknown): value is CoreBlobReference {
+  if (typeof value !== "object" || value === null) return false
+  const record = value as Record<string, unknown>
+  return typeof record["__eventBlob"] === "string" && typeof record["size"] === "number"
+}
+
+/**
+ * The frame to encode when the event ALREADY carries a resolvable reference,
+ * checked before any serialisation. An `{ __eventBlobPosition }` frame is sent
+ * as-is (never re-wrapped), and EVERY durable core `{ __eventBlob, size }` marker
+ * is turned into the committed position reference the hub can resolve. The
+ * marker's own frame is tiny, so its declared `size` must not gate the rewrite:
+ * a body in the window between the inline bound and the frame cap otherwise
+ * crossed unresolved. A non-durable marker has no position and keeps its legacy
+ * pass-through (`blobPositionReferenceFrame` returns `undefined`).
+ */
+function referenceFrameOf(frame: EventsFrame): EventsFrame | undefined {
+  if (frame.kind !== "event") return undefined
+  const properties = frame.payload.event.properties
+  if (isEventBlobReference(properties)) return frame
+  if (!isCoreBlobReference(properties)) return undefined
+  return blobPositionReferenceFrame(frame, properties.size)
+}
+
 /**
  * Encode one frame within the per-frame bound. A durable event body that does
  * not fit is re-expressed as its blob-position reference and re-encoded; the
@@ -187,12 +253,18 @@ export function encodeFrameChunks(
  * rejection, so a caller bug (or an over-cap non-durable delta) still fails loud.
  */
 function encodeFrameOrReference(frame: EventsFrame): { readonly text: string; readonly bytes: number } {
+  const existingReference = referenceFrameOf(frame)
+  if (existingReference !== undefined) return encodeFrameSized(existingReference)
   try {
     return encodeFrameSized(frame)
   } catch (error) {
     if (!(error instanceof FrameTooLargeError)) throw error
     const reference = blobPositionReferenceFrame(frame, error.byteLength)
     if (reference === undefined) throw error
+    // The substituted frame must be the small, resolvable reference — never the
+    // original body re-encoded (which would overflow again) and never a
+    // half-formed marker the hub cannot resolve by position.
+    if (reference.kind !== "event" || !isEventBlobReference(reference.payload.event.properties)) throw error
     return encodeFrameSized(reference)
   }
 }

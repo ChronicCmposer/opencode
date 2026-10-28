@@ -283,6 +283,10 @@ export const migrationStatements: readonly string[] = Object.freeze([
   outcome TEXT,
   time_started INTEGER NOT NULL,
   time_finished INTEGER,
+  -- The worker lease owner that recorded the row. It is the generation fence:
+  -- a stale generation may not start or finish a call once a successor owns the
+  -- session's event-sequence lease.
+  worker_owner_id TEXT,
   PRIMARY KEY (call_id, session_id),
   CONSTRAINT tool_call_session_id_session_id_fk FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE
 )`,
@@ -355,6 +359,10 @@ export const ledgerStatements: readonly string[] = Object.freeze([
   outcome TEXT,
   time_started INTEGER NOT NULL,
   time_finished INTEGER,
+  -- The worker lease owner that recorded the row. It is the generation fence:
+  -- a stale generation may not start or finish a call once a successor owns the
+  -- session's event-sequence lease.
+  worker_owner_id TEXT,
   PRIMARY KEY (call_id, session_id),
   CONSTRAINT tool_call_session_id_session_id_fk FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE
 )`,

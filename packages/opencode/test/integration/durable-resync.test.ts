@@ -129,10 +129,11 @@ describe("mid-run rename resyncs from the DB snapshot", () => {
       subscription.receiveDurable(rename(2))
       await pollUntil(() => snapshots.length === 1, { message: "gap never produced a DB snapshot" })
 
-      // Heal at `seq - 1` so the skipped commit (seq 1) is part of the snapshot.
+      // Heal at `seq - 1` from the last seen position (0), so only the skipped
+      // commit (seq 1) is read back rather than the whole aggregate log.
       expect(resyncs).toEqual([{ type: "resync", aggregateID: AGGREGATE, seq: 1 }])
       expect(snapshots[0]?.seq).toBe(1)
-      expect(snapshots[0]?.events.map((event) => event.id)).toEqual(["evt_0", "evt_1"])
+      expect(snapshots[0]?.events.map((event) => event.id)).toEqual(["evt_1"])
 
       // The stream is not closed: the next rename still streams, and the
       // already-delivered durable 2 is not snapshotted (no duplicate delivery).
@@ -173,14 +174,14 @@ describe("mid-run rename resyncs from the DB snapshot", () => {
       expect(subscription.lastDurableSeq).toBe(1)
       expect(delivered).toEqual(["evt_1"])
 
-      // A real gap after the seed still heals at `seq - 1`, so the skipped
-      // commit is in the snapshot and the gapped durable is delivered once.
+      // A real gap after the seed heals at `seq - 1` from the last seen seq (1),
+      // so only the missing commit (seq 2) is read back.
       subscription.receiveDurable(rename(3))
       await pollUntil(() => snapshots.length === 1, { message: "seeded gap never snapshotted" })
 
       expect(resyncs).toEqual([{ type: "resync", aggregateID: AGGREGATE, seq: 2 }])
       expect(snapshots[0]?.seq).toBe(2)
-      expect(snapshots[0]?.events.map((event) => event.id)).toEqual(["evt_0", "evt_1", "evt_2"])
+      expect(snapshots[0]?.events.map((event) => event.id)).toEqual(["evt_2"])
       await pollUntil(() => delivered.length === 2, { message: "gapped durable was not delivered" })
       expect(delivered).toEqual(["evt_1", "evt_3"])
       expect(subscription.healing).toBe(0)

@@ -288,6 +288,40 @@ describe("per-Session run barrier — real phase reports", () => {
     expect(await barrier.wait("s1")).toEqual({ sessionID: "s1", status: "drained" })
   })
 
+  test("a no-commit run settles commits and projectors explicitly", async () => {
+    const fake = createFakeScheduler()
+    const barrier = createRunBarrier({ scheduler: fake.scheduler })
+    const run = barrier.beginRun("s1")
+    run.noCommit()
+    run.noTools()
+    run.promotion("no-job")
+
+    expect(run.reported("commits")).toBe(true)
+    expect(run.reported("projectors")).toBe(true)
+    expect(await barrier.wait("s1")).toEqual({ sessionID: "s1", status: "drained" })
+    expect(fake.pending).toBe(0)
+  })
+
+  test("a no-commit report cannot overwrite a real commit report", async () => {
+    const barrier = createRunBarrier()
+    const run = barrier.beginRun("s1")
+    run.commit("msg_1")
+    run.projector("session-row")
+
+    expect(() => run.noCommit()).toThrow(RunBarrierReportError)
+    // The conflicting observation fails loud instead of draining a broken run.
+    await expect(barrier.wait("s1")).rejects.toBeInstanceOf(RunBarrierReportError)
+  })
+
+  test("a none observation cannot settle a phase that requires a real observation", () => {
+    const barrier = createRunBarrier()
+    const run = barrier.beginRun("s1")
+
+    expect(() =>
+      run.report({ sessionID: "s1", phase: "tools", observation: { kind: "none" } }),
+    ).toThrow(RunBarrierReportError)
+  })
+
   test.each([...RUN_BARRIER_PHASES])("refuses a run whose %s reporter never arrived", async (missing) => {
     const fake = createFakeScheduler()
     const barrier = createRunBarrier({ scheduler: fake.scheduler })

@@ -14,9 +14,10 @@ import { Database, type SQLQueryBindings } from "bun:sqlite"
 import { afterEach, describe, expect, test } from "bun:test"
 import { Bus } from "@opencode-ai/core/bus"
 import { Event } from "@opencode-ai/schema/event"
+import { ENVELOPE_HEADROOM_BYTES, MAX_INLINE_EVENT_BYTES, decodeFrame, encodeFrameChunks } from "@/session/egress/frame"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { createEgressSender } from "@/session/egress/sender"
-import { MAX_WORKER_FRAME_BYTES, type EventsFrame, type EventV2Event } from "@/session/worker/frame"
+import { MAX_WORKER_FRAME_BYTES, eventFrame, type EventsFrame, type EventV2Event } from "@/session/worker/frame"
 import { pollUntil } from "../../lib/poll"
 
 const MiB = 1024 * 1024
@@ -75,17 +76,20 @@ function harness() {
 }
 
 describe("frame-aligned durable events", () => {
-  test("the worker frame cap can never be smaller than the blob offload bound", () => {
-    // Pinned exactly once: a payload that core stores inline (<= blob limit) must
-    // always fit one frame, or a valid durable event would be unrepresentable.
-    expect(MAX_WORKER_FRAME_BYTES).toBeGreaterThanOrEqual(Bus.DEFAULT_BLOB_LIMIT_BYTES)
+  test("the default inline bound leaves envelope headroom inside the frame cap", () => {
+    // Pinned exactly once: an inline payload must always fit one frame. The bound
+    // is the cap MINUS the envelope, not the cap itself, or a body just under
+    // 4 MiB would take the reference path with no event_blob row to resolve.
+    expect(MAX_WORKER_FRAME_BYTES).toBeGreaterThan(Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES)
+    expect(Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES).toBe(MAX_INLINE_EVENT_BYTES)
+    expect(MAX_INLINE_EVENT_BYTES).toBe(MAX_WORKER_FRAME_BYTES - ENVELOPE_HEADROOM_BYTES)
   })
 
   test("a 5 MiB durable event crosses as a blob position reference instead of throwing", async () => {
     const { sender, receiver, received, acks } = harness()
     const big = durableEvent("evt_big", "ses_1", "x".repeat(5 * MiB))
 
-    // RED: this currently throws FrameTooLargeError from `encodeFrameChunks`.
+    // The sender must substitute a reference instead of rejecting the batch.
     expect(() => sender.pushDurable(big, { aggregateID: "ses_1", seq: 1 })).not.toThrow()
 
     await pollUntil(() => received.length === 1, { message: "oversized durable event never reached the hub" })
@@ -182,5 +186,34 @@ describe("frame-aligned durable events", () => {
       new Map(),
     )
     expect(resolved).toEqual(JSON.parse(stored))
+  })
+
+  test("an oversized core blob reference crosses as a position reference without a second body serialisation", () => {
+    const position = { aggregateID: "ses_offloaded", seq: 4 }
+    const offloaded = { __eventBlob: Bus.digest("already-offloaded"), size: 5 * MiB }
+    const frame = eventFrame({
+      event: { id: "evt_offloaded", type: "session.next.prompted", properties: offloaded },
+      ...position,
+    })
+
+    // The hub can only resolve a `__eventBlobPosition`, never the raw marker.
+    const [text] = encodeFrameChunks([frame]).flat()
+    const decoded = decodeFrame(text!)
+    if (decoded.kind !== "event") throw new Error(`expected an event frame, got ${decoded.kind}`)
+    expect(decoded.payload.event.properties).toEqual({ __eventBlobPosition: position, frameBytes: 5 * MiB })
+  })
+
+  test("a frame that already carries a position reference is forwarded unchanged", () => {
+    const position = { aggregateID: "ses_offloaded", seq: 5 }
+    const reference = { __eventBlobPosition: position, frameBytes: 5 * MiB }
+    const frame = eventFrame({
+      event: { id: "evt_reference", type: "session.next.prompted", properties: reference },
+      ...position,
+    })
+
+    const [text] = encodeFrameChunks([frame]).flat()
+    const decoded = decodeFrame(text!)
+    if (decoded.kind !== "event") throw new Error(`expected an event frame, got ${decoded.kind}`)
+    expect(decoded.payload.event.properties).toEqual(reference)
   })
 })

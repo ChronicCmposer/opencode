@@ -22,6 +22,7 @@ import { Plugin } from "@/plugin"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { createBunSqliteConnection } from "@/session/writer/connection"
 import { LEDGER_SQL, createToolCallLedger } from "@/session/ledger/tool-call"
+import { createProxyReporting, type LifecycleReporting } from "@/session/ledger/lifecycle"
 import { WorkerDb, markSchemaIdentity, openWorkerDatabase, type WorkerDatabase } from "@/session/worker/db"
 import { migrationStatements } from "@/session/writer/migration.statements.gen"
 import { openConnection } from "@opencode-ai/core/database/connection"
@@ -167,6 +168,7 @@ async function resolveTool(
   toolDefinition: RegisteredTool,
   ledger: ReturnType<typeof createToolCallLedger>,
   proc: LedgerTestProcessor = processor,
+  lifecycle?: Pick<LifecycleReporting, "toolStarted" | "toolFinished">,
 ) {
   const tools = await Effect.runPromise(
     Effect.gen(function* () {
@@ -179,6 +181,7 @@ async function resolveTool(
         messages: [],
         promptOps: {} as never,
         ledger,
+        ...(lifecycle === undefined ? {} : { lifecycle }),
       })
     }).pipe(Effect.provide(layerWith(toolDefinition))),
   )
@@ -207,10 +210,17 @@ describe("tool-call ledger on the production tool path", () => {
         "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [String(sessionID), "project-1", "ledger", "/tmp/project", "ledger", "1", 1, 1],
       )
+      seed.run(
+        "INSERT INTO event_sequence (aggregate_id, seq, worker_owner_id) VALUES (?, -1, ?)",
+        [String(sessionID), "worker-tools-ledger-generation"],
+      )
     } finally {
       seed.close()
     }
     const database = await Effect.runPromise(openWorkerDatabase({ filename }))
+    // The worker boot binds its generation identity on the event scope; the
+    // tool ledger copies it onto every row.
+    database.eventBinding.leaseOwner = "worker-tools-ledger-generation"
     try {
       const tools = await Effect.runPromise(
         Effect.gen(function* () {
@@ -235,20 +245,20 @@ describe("tool-call ledger on the production tool path", () => {
       // The effect returned, but no result part committed yet: the row must
       // still be `started` so a crash here is indeterminate, not replayable.
       expect(
-        database.connection.all("SELECT state, outcome FROM tool_call WHERE call_id = ? AND session_id = ?", [
-          ledgerKey,
-          String(sessionID),
-        ]),
-      ).toEqual([{ state: "started", outcome: null }])
+        database.connection.all(
+          "SELECT state, outcome, worker_owner_id FROM tool_call WHERE call_id = ? AND session_id = ?",
+          [ledgerKey, String(sessionID)],
+        ),
+      ).toEqual([{ state: "started", outcome: null, worker_owner_id: "worker-tools-ledger-generation" }])
 
       await commitResult()
 
       expect(
-        database.connection.all("SELECT state, outcome FROM tool_call WHERE call_id = ? AND session_id = ?", [
-          ledgerKey,
-          String(sessionID),
-        ]),
-      ).toEqual([{ state: "finished", outcome: "ok" }])
+        database.connection.all(
+          "SELECT state, outcome, worker_owner_id FROM tool_call WHERE call_id = ? AND session_id = ?",
+          [ledgerKey, String(sessionID)],
+        ),
+      ).toEqual([{ state: "finished", outcome: "ok", worker_owner_id: "worker-tools-ledger-generation" }])
     } finally {
       await Effect.runPromise(database.close)
       fs.rmSync(directory, { recursive: true, force: true })
@@ -284,6 +294,34 @@ describe("tool-call ledger on the production tool path", () => {
 
     expect(ledger.list(sessionID)).toEqual([
       expect.objectContaining({ callID: ledgerKey, sessionID, tool: "ledger", state: "finished", outcome: "ok" }),
+    ])
+    expect(ledger.indeterminate(sessionID)).toEqual([])
+  })
+
+  test("an unacknowledged lifecycle start fails the tool closed before its effect", async () => {
+    const { ledger } = ledgerForTest()
+    const local = makeProcessor()
+    let ran = false
+    const execute = await resolveTool(
+      tool(() =>
+        Effect.sync(() => {
+          ran = true
+          return { title: "ledger", metadata: {}, output: "done" }
+        }),
+      ),
+      ledger,
+      local.processor,
+      createProxyReporting(
+        (method) => (method === "lifecycle.toolStarted" ? new Promise(() => {}) : Promise.resolve()),
+        { timeoutMs: 10 },
+      ),
+    )
+
+    await expect(run(execute)).rejects.toThrow("not acknowledged")
+    // The side effect must never run when the hub has not recorded the start.
+    expect(ran).toBe(false)
+    expect(ledger.list(sessionID)).toEqual([
+      expect.objectContaining({ callID: ledgerKey, state: "finished", outcome: "error" }),
     ])
     expect(ledger.indeterminate(sessionID)).toEqual([])
   })
@@ -340,27 +378,34 @@ describe("tool-call ledger on the production tool path", () => {
     ])
   })
 
-  test("an abort settlement wins over a late success", async () => {
+  test("an abandoned settlement leaves the row indeterminate, then a late success settles ok", async () => {
     const { ledger } = ledgerForTest()
-    settlements.delete(callID)
+    const local = makeProcessor()
+    local.settlements.delete(callID)
     const execute = await resolveTool(
       tool(() => Effect.succeed({ title: "ledger", metadata: {}, output: "done" })),
       ledger,
+      local.processor,
     )
 
     // The effect returned, so the registration waits for a result commit.
     await run(execute)
-    const settle = settlements.get(callID)
+    const settle = local.settlements.get(callID)
     if (settle === undefined) throw new Error("settlement was not registered")
 
-    // Abort cleanup settles error and removes the registration. A later result
-    // event must not overwrite the durable row or settle the hub twice.
-    await Effect.runPromise(settle("error", "settle"))
-    settlements.delete(callID)
-    await commitResult()
-
+    // Cleanup reaches the per-run deadline: it must not guess `error`, because
+    // the side effect already succeeded and only the result is late.
+    await Effect.runPromise(settle("error", "abandon"))
+    expect(local.settlements.has(callID)).toBe(true)
     expect(ledger.list(sessionID)).toEqual([
-      expect.objectContaining({ callID: ledgerKey, state: "finished", outcome: "error" }),
+      expect.objectContaining({ callID: ledgerKey, state: "started", outcome: null }),
+    ])
+    expect(ledger.indeterminate(sessionID)).toHaveLength(1)
+
+    // The result commit lands late and settles the same call `ok`.
+    await Effect.runPromise(local.processor.completeToolCall(callID))
+    expect(ledger.list(sessionID)).toEqual([
+      expect.objectContaining({ callID: ledgerKey, state: "finished", outcome: "ok" }),
     ])
     expect(ledger.indeterminate(sessionID)).toEqual([])
   })

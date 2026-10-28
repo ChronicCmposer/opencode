@@ -503,11 +503,19 @@ export const resolveWorkerPlugins = Effect.fn("WorkerPlugins.resolve")(function*
     const proxied = Object.entries(source.hooks)
       .filter(([name, value]) => typeof value === "function" && isHubProxyHook(name))
       .map(([name]) => name)
+    // Every declared trigger name crosses the isolate, including routed-but-
+    // unsupported hooks. The worker must distinguish "declared unsupported" (a
+    // typed failure when dispatched) from "not declared" (a true no-op); the
+    // function itself stays hub-side.
+    const declared = Object.entries(source.hooks)
+      .filter(([, value]) => typeof value === "function")
+      .map(([name]) => name)
     plugins.push({
       name: source.name,
       hooks: {},
       resolved,
       ...(proxied.length === 0 ? {} : { proxied }),
+      ...(declared.length === 0 ? {} : { declared }),
     })
   }
   return plugins

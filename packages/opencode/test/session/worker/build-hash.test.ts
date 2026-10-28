@@ -95,12 +95,15 @@ describe("production override gate", () => {
     ).toMatchObject({ buildHash: "build-hash", source: "build", override: false })
   })
 
-  test("NODE_ENV=production ignores the override and requires a compiled hash", () => {
-    expect(() =>
+  test("NODE_ENV=production alone does not make a source run packaged", () => {
+    // Packaging is a compile-time identity. A source checkout with NODE_ENV set
+    // still has no worker build to verify, so it uses the development identity.
+    expect(
       resolveBuildHash({
         env: { NODE_ENV: "production", OPENCODE_BUILD_HASH_OVERRIDE: "local-hash" },
       }),
-    ).toThrow(MissingBuildHashError)
+    ).toMatchObject({ hash: "local-hash", source: "override", override: true })
+    expect(resolveBuildHash({ env: { NODE_ENV: "production" } })).toMatchObject({ source: "dev" })
   })
 
   test("development and test builds honour the override", () => {
@@ -114,18 +117,21 @@ describe("production override gate", () => {
     })
   })
 
-  test("a packaged production run without a compiled hash fails loud", () => {
-    expect(() => resolveBuildHash({ definedHash: undefined, env: { NODE_ENV: "production" } })).toThrow(
-      MissingBuildHashError,
-    )
-    // An override cannot rescue a production build either: it is ignored unless
+  test("a packaged run without a compiled hash fails loud", () => {
+    expect(() => resolveBuildHash({ definedHash: undefined, packaged: true, env: {} })).toThrow(MissingBuildHashError)
+    // An override cannot rescue a packaged build either: it is ignored unless
     // the explicit dev marker is set.
     expect(() =>
       resolveBuildHash({
         definedHash: undefined,
-        env: { NODE_ENV: "production", OPENCODE_BUILD_HASH_OVERRIDE: "local" },
+        packaged: true,
+        env: { OPENCODE_BUILD_HASH_OVERRIDE: "local" },
       }),
     ).toThrow(MissingBuildHashError)
+    // An explicit dev marker is the documented escape hatch.
+    expect(
+      resolveBuildHash({ definedHash: undefined, packaged: true, env: { OPENCODE_DEV: "1" } }),
+    ).toMatchObject({ source: "dev" })
   })
 })
 

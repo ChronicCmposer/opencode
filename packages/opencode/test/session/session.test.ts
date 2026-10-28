@@ -106,6 +106,40 @@ describe("session.created event", () => {
     }),
   )
 
+  it.instance("session.updated carries only the changed-column delta", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const source = yield* EventV2Bridge.Service
+      const received = yield* Deferred.make<EventV2.Payload>()
+
+      const unsubscribe = yield* source.listen((event) => {
+        if (event.type !== SessionNs.Event.Updated.type) return Effect.void
+        if ((event.data as { info: SessionNs.Info }).info.title !== "delta title") return Effect.void
+        Deferred.doneUnsafe(received, Effect.succeed(event))
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const info = yield* session.create({})
+      yield* session.setTitle({ sessionID: info.id, title: "delta title" })
+      const event = yield* awaitDeferred(received, "timed out waiting for the delta session.updated")
+
+      const patch = event.metadata?.sessionPatch
+      expect(Array.isArray(patch)).toBe(true)
+      expect(patch).toContain("title")
+      expect(patch).not.toContain("time_updated")
+      // Hub-owned columns were not part of this patch; emitting them would let a
+      // stale worker image overwrite concurrent hub billing/share/revert state.
+      expect(patch).not.toContain("cost")
+      expect(patch).not.toContain("tokens_input")
+      expect(patch).not.toContain("share_url")
+      expect(patch).not.toContain("revert")
+      expect(patch).not.toContain("version")
+
+      yield* session.remove(info.id)
+    }),
+  )
+
   it.instance("emits legacy global sync payload", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service

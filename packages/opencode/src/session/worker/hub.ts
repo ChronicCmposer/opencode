@@ -47,6 +47,7 @@ import { Session } from "@/session/session"
 import type { SessionPrompt } from "@/session/prompt"
 import type { ShellInput } from "@/session/prompt"
 import { isWorkerCrashPhase, recordAsync } from "@/session/ledger/crash"
+import { BuildMismatch, resolveBuildHash } from "./build-hash"
 
 import { createCancelReporter, type CancelReport } from "./cancel-report"
 import {
@@ -178,7 +179,8 @@ export interface SessionHub {
   /**
    * Serve the worker's transferred egress ports against the hub's
    * authorities. Returns a disposer; idempotent per worker. No-op for a port the
-   * hub has no backend for. The writer port is never served (D5).
+   * hub has no backend for. Worker writes never cross a port: the isolate owns
+   * its own connection.
    */
   attachWorkerPorts(workerID: number, ports: WorkerTransferredPorts): () => void
   /**
@@ -187,6 +189,13 @@ export interface SessionHub {
    * worker; no-op when the hub has no hub-proxy handlers.
    */
   attachHubProxyPort(workerID: number, port: MessagePort): () => void
+  /**
+   * Retire one generation of a session's worker that the pool replaces in place
+   * (a mid-session model switch). Runs the same hub-side retirement as the
+   * dispatcher path so the old generation's in-flight tool calls, ports, pending
+   * permission/question requests and durable lease never outlive it.
+   */
+  releaseGeneration(sessionID: SessionID, workerID?: number): Promise<void>
   /** Dispatch `sessionID` to a worker and resolve with its result (admission-aware). */
   ensureRunning(sessionID: SessionID, origin?: DispatchOrigin): Promise<SessionExecutionResult>
   /**
@@ -218,7 +227,7 @@ export class SessionHubService extends Context.Service<SessionHubService, Sessio
 export type CancellationSource = CancellationConfig | ((pool: ExecutorWorkerPool) => CancellationConfig)
 
 export interface SessionHubOptions {
-  /** The executor pool; lazy pools spawn no isolate until the first dispatch. */
+  /** The executor pool; production workers spawn on the first dispatch, not at boot. */
   readonly pool: ExecutorWorkerPool
   /**
    * Hub-resident authorities for the worker egress ports and the
@@ -242,7 +251,7 @@ export interface SessionHubOptions {
    */
   readonly depthOf?: (sessionID: SessionID) => number | undefined
   readonly cancellation?: CancellationSource
-  /** Hub-side cleanup when a session's worker is retired (reap/cancel/crash). */
+  /** Release hub-side state for one retired generation (crash/reap/cancel/model switch). */
   readonly onSessionReleased?: (sessionID: SessionID) => void
   /**
    * Idle-reap window forwarded to the dispatcher. Absent uses the dispatcher's
@@ -350,11 +359,13 @@ export interface SessionHubOptions {
 export const SESSION_CANCELLED_TYPE = SessionV1.Event.Cancelled.type
 
 /**
- * Recover an oversized durable event body from the shared D16 blob by committed
- * position. `undefined` means no blob row exists at that position, which the
- * events port surfaces as a typed resync — never a dropped event or a raw
- * reference. A corrupt row fails loud (`Bus.InvalidDurableEvent`) and is also
- * surfaced as a resync.
+ * Recover an over-frame durable event body by committed position. The body is
+ * usually in the shared D16 blob, but a body just under the inline bound lives
+ * in `event.data` instead (the envelope, not the body, exceeded the frame):
+ * the resolver falls back to that committed row. `undefined` means neither
+ * source exists at that position, which the events port surfaces as a typed
+ * resync — never a dropped event or a raw reference. A corrupt row fails loud
+ * (`Bus.InvalidDurableEvent`) and is also surfaced as a resync.
  */
 export type EventBlobResolver = (
   position: EventBlobPosition,
@@ -372,10 +383,29 @@ export interface EventBlobResolverOptions {
   readonly blobDir: string
 }
 
+/** The committed inline body at one aggregate position, when no blob row exists. */
+const INLINE_EVENT_QUERY = "SELECT data FROM event WHERE aggregate_id = ? AND seq = ?"
+
 /**
- * Build the production blob resolver: one `event_blob` lookup by position,
- * decoded and hash/path-validated by the core Bus. The SQL comes from
- * `Bus.blobRowQuery`, the same query the synchronous `Bus.loadBlobRows` issues.
+ * Parse a committed inline `event.data` value. A JSON string is decoded; an
+ * already-decoded record is accepted as-is. A leftover blob reference (or any
+ * non-object) is not a body, so the caller keeps the typed-resync path.
+ */
+function inlineEventDataOf(row: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (row === undefined) return undefined
+  const data = row["data"]
+  const decoded = typeof data === "string" ? JSON.parse(data) : data
+  if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) return undefined
+  const record = decoded as Record<string, unknown>
+  return Bus.isBlobReference(record) ? undefined : record
+}
+
+/**
+ * Build the production body resolver: first the `event_blob` row by position,
+ * decoded and hash/path-validated by the core Bus (the SQL comes from
+ * `Bus.blobRowQuery`, the same query `Bus.loadBlobRows` issues). When no blob
+ * row exists, the body was stored inline, so the committed `event.data` row is
+ * the authority. A position with neither source is `undefined`.
  */
 export function createEventBlobResolver(options: EventBlobResolverOptions): EventBlobResolver {
   const blob: Bus.BlobStore = {
@@ -387,11 +417,15 @@ export function createEventBlobResolver(options: EventBlobResolverOptions): Even
     const query = Bus.blobRowQuery(position.aggregateID, [position.seq])
     const rows = await options.query(query.sql, query.params)
     const row = Bus.blobRowsBySeq(rows).get(position.seq)
-    return Bus.resolveBlobRow(
-      { type: event.type, aggregateID: position.aggregateID, seq: position.seq },
-      row,
-      blob,
-    )
+    if (row !== undefined) {
+      return Bus.resolveBlobRow(
+        { type: event.type, aggregateID: position.aggregateID, seq: position.seq },
+        row,
+        blob,
+      )
+    }
+    const inline = await options.query(INLINE_EVENT_QUERY, [position.aggregateID, position.seq])
+    return inlineEventDataOf(inline[0])
   }
 }
 
@@ -408,6 +442,92 @@ export interface HubEventSinkOptions {
    * row or a resolution failure is surfaced as a typed resync.
    */
   readonly resolveBlob?: EventBlobResolver
+  /**
+   * Read the committed events in a missing durable range so a gap is healed on
+   * the live surface instead of only counted. Production supplies a reader over
+   * the hub's off-loop SQL executor; absent means a gap is resync-only.
+   */
+  readonly readDurable?: DurableHealReader
+}
+
+/** One committed durable event read back while healing a gap. */
+export interface DurableHealEntry {
+  readonly seq: number
+  readonly event: EventV2Event
+}
+
+/**
+ * Read committed events in the bounded range `(after, upTo]`, ordered by
+ * sequence. The reader is async by contract so production can run SQLite on the
+ * hub's executor thread and never block the hub event loop.
+ */
+export type DurableHealReader = (
+  aggregateID: string,
+  after: number,
+  upTo: number,
+) => Promise<readonly DurableHealEntry[]>
+
+/** The gap a sink heals; `after` defaults to the last position it published. */
+export interface DurableHealPosition {
+  readonly aggregateID: string
+  readonly seq: number
+  readonly after?: number
+}
+
+export interface DurableHealReaderOptions {
+  /** Async SQL over the same database file the worker wrote. */
+  readonly query: (sql: string, params: ReadonlyArray<unknown>) => Promise<ReadonlyArray<Record<string, unknown>>>
+  /** Maximum rows per page; the sink keeps reading pages until the gap is filled. */
+  readonly pageSize?: number
+}
+
+const DURABLE_HEAL_SQL =
+  "SELECT id, type, seq, data FROM event WHERE aggregate_id = ? AND seq > ? AND seq <= ? ORDER BY seq ASC LIMIT ?"
+
+const DEFAULT_HEAL_PAGE_SIZE = 512
+
+/** Decode a persisted `event.data` value; SQLite stores it as JSON text. */
+function decodeHealRowData(value: unknown): unknown {
+  if (typeof value !== "string") return value
+  try {
+    return JSON.parse(value)
+  } catch (error) {
+    throw new Error(`invalid persisted event data: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+/**
+ * Build the production gap-heal reader over the durable `event` log. Each read
+ * is bounded by `pageSize`; the sink iterates pages so healing is both ordered
+ * and memory-bounded regardless of how large the missed range is.
+ */
+export function createDurableHealReader(options: DurableHealReaderOptions): DurableHealReader {
+  const pageSize = options.pageSize ?? DEFAULT_HEAL_PAGE_SIZE
+  if (!Number.isInteger(pageSize) || pageSize < 1) {
+    throw new Error(`invalid durable heal page size: ${pageSize} (expected a positive integer)`)
+  }
+  return async (aggregateID, after, upTo) => {
+    if (typeof aggregateID !== "string" || aggregateID.length === 0) {
+      throw new Error(`invalid durable heal aggregateID: ${JSON.stringify(aggregateID)}`)
+    }
+    if (!Number.isInteger(after) || after < -1 || !Number.isInteger(upTo)) {
+      throw new Error(`invalid durable heal range: (${JSON.stringify(after)}, ${JSON.stringify(upTo)}]`)
+    }
+    if (upTo <= after) return []
+    const rows = await options.query(DURABLE_HEAL_SQL, [aggregateID, after, upTo, pageSize])
+    return rows.map((row, index) => {
+      if (typeof row["id"] !== "string") throw new Error(`invalid durable heal row ${index}: id must be a string`)
+      if (typeof row["type"] !== "string") throw new Error(`invalid durable heal row ${index}: type must be a string`)
+      if (typeof row["seq"] !== "number" || !Number.isInteger(row["seq"])) {
+        throw new Error(`invalid durable heal row ${index}: seq must be an integer`)
+      }
+      if (!("data" in row)) throw new Error(`invalid durable heal row ${index}: data is missing`)
+      return {
+        seq: row["seq"],
+        event: { id: row["id"], type: row["type"], properties: decodeHealRowData(row["data"]) },
+      }
+    })
+  }
 }
 
 /** The aggregate an event belongs to, when its payload identifies one. */
@@ -433,6 +553,8 @@ export interface HubEventSink {
    * already happened in the worker, so the hub cache must drop the aggregate.
    * `aggregateID`/`seq` are the frame's committed identity; when present they are
    * authoritative for cache invalidation (the payload is not re-parsed to guess).
+   * A durable event with no `seq` is malformed: its commit still fences the
+   * aggregate, so it is never downgraded to a live-only delta.
    */
   event(
     event: EventV2Event,
@@ -444,6 +566,12 @@ export interface HubEventSink {
   ): void
   /** The worker signalled end-of-stream. */
   end(): void
+  /**
+   * Heal a durable gap by reading `(after, seq)` from the committed log and
+   * republishing it live. Awaited by `serveEventsPort` so the gapped frame and
+   * every later delivery stay ordered behind the healed range.
+   */
+  readonly heal?: (position: DurableHealPosition) => void | Promise<void>
   /** A resync: a delta was dropped or a durable sequence gapped; durable events continue. */
   resync(payload?: DurableResyncPayload): void
   /** A delivery acknowledgement. */
@@ -479,11 +607,84 @@ function publishWithDurable(publisher: LiveEventPublisher, event: DurableLiveEve
 export function createHubEventSink(options: HubEventSinkOptions): HubEventSink {
   const { publisher, cache } = options
   const aggregateOf = options.aggregateOf ?? aggregateIDOfEvent
+  const readDurable = options.readDurable
+  const lastDurable = new Map<string, number>()
   let ended = false
   let resyncs = 0
   let acks = 0
+
+  const publishDurable = (event: EventV2Event, aggregateID: string, seq: number): void => {
+    publishWithDurable(publisher, {
+      id: event.id,
+      type: event.type,
+      data: event.properties,
+      durable: {
+        aggregateID,
+        seq,
+        // The position is authoritative; only the schema version comes from the
+        // shipped manifest.
+        version: Durable.get(event.type)?.durable?.version ?? 1,
+      },
+    })
+    cache?.invalidate(aggregateID)
+    lastDurable.set(aggregateID, Math.max(seq, lastDurable.get(aggregateID) ?? -1))
+  }
+
+  /** Recover a healed row's body, falling back to the committed blob/inline row. */
+  const healBodyOf = async (
+    event: EventV2Event,
+    aggregateID: string,
+    seq: number,
+  ): Promise<unknown | undefined> => {
+    const properties = event.properties
+    if (isEventBlobReference(properties)) {
+      return options.resolveBlob?.(properties.__eventBlobPosition, { type: event.type })
+    }
+    if (!Bus.isBlobReference(properties)) return properties
+    return options.resolveBlob?.({ aggregateID, seq }, { type: event.type })
+  }
+
+  /**
+   * Read the bounded missing range page by page and publish each committed event
+   * in order. The graft deliberately stops at `seq - 1`: the gapped frame at
+   * `seq` is delivered by the normal port path exactly once.
+   */
+  const healRange = async (position: DurableHealPosition): Promise<void> => {
+    if (readDurable === undefined) return
+    const upTo = position.seq - 1
+    let cursor = position.after ?? lastDurable.get(position.aggregateID) ?? -1
+    while (cursor < upTo) {
+      let page: readonly DurableHealEntry[]
+      try {
+        page = await readDurable(position.aggregateID, cursor, upTo)
+      } catch {
+        // A failed read is recoverable by the worker's own resync; never throw
+        // into the ordered port chain.
+        return
+      }
+      if (page.length === 0) return
+      const before = cursor
+      for (const entry of page) {
+        if (entry.seq <= cursor || entry.seq > upTo) continue
+        const body = await healBodyOf(entry.event, position.aggregateID, entry.seq)
+        if (body === undefined) return
+        publishDurable({ ...entry.event, properties: body }, position.aggregateID, entry.seq)
+        cursor = entry.seq
+      }
+      // A reader that made no progress cannot fill the gap; stop rather than spin.
+      if (cursor === before) return
+    }
+  }
+
+  const heal = (position: DurableHealPosition): void | Promise<void> => {
+    resyncs += 1
+    if (readDurable === undefined) return
+    return healRange(position)
+  }
+
   return {
     ...(options.resolveBlob === undefined ? {} : { resolveBlob: options.resolveBlob }),
+    heal,
     event(event, meta) {
       // Defense in depth: `serveEventsPort` resolves a position reference before
       // calling here. A reference that still arrives (a direct caller, or a hub
@@ -498,32 +699,29 @@ export function createHubEventSink(options: HubEventSinkOptions): HubEventSink {
       // `sync` envelope can identify the exact durable position; the payload is
       // never re-committed here (the worker's commit is authoritative).
       const aggregateID = meta?.durable === true ? (meta.aggregateID ?? aggregateOf(event)) : undefined
-      if (aggregateID === undefined || meta?.seq === undefined) {
+      if (aggregateID === undefined) {
         publisher.publish({ id: event.id, type: event.type, data: event.properties })
-      } else {
-        publishWithDurable(publisher, {
-          id: event.id,
-          type: event.type,
-          data: event.properties,
-          durable: {
-            aggregateID,
-            seq: meta.seq,
-            // The position is authoritative; only the schema version comes from
-            // the shipped manifest.
-            version: Durable.get(event.type)?.durable?.version ?? 1,
-          },
-        })
+        return
       }
-      if (meta?.durable !== true) return
-      // Prefer the committed frame identity: the payload's `sessionID` can name a
-      // different aggregate than the one the commit actually advanced.
-      if (aggregateID !== undefined) cache?.invalidate(aggregateID)
+      if (meta?.seq === undefined) {
+        // A durable event with no committed position is malformed, but its commit
+        // still happened: fence the aggregate rather than treating it as a delta.
+        cache?.invalidate(aggregateID)
+        publisher.publish({ id: event.id, type: event.type, data: event.properties })
+        return
+      }
+      publishDurable(event, aggregateID, meta.seq)
     },
     end() {
       ended = true
     },
-    resync() {
+    resync(payload) {
       resyncs += 1
+      // A worker-reported resync may carry the exact position it lost. Heal it
+      // the same way as a receiver gap; the counter above already recorded it.
+      if (readDurable !== undefined && payload?.aggregateID !== undefined && payload.seq !== undefined) {
+        void healRange({ aggregateID: payload.aggregateID, seq: payload.seq })
+      }
     },
     ack() {
       acks += 1
@@ -555,10 +753,17 @@ export function createHubEventSink(options: HubEventSinkOptions): HubEventSink {
 export interface EgressDeliveryBarrier {
   /** One durable frame reached the hub's events port for `sessionID`. */
   observeDurable(sessionID: SessionID): void
-  /** The worker acknowledged `count` durable hand-offs for `sessionID`. */
+  /**
+   * The worker acknowledged `count` durable hand-offs for `sessionID`. An ack
+   * closes the CURRENT batch: a count larger than the durables observed since the
+   * previous ack (a resynced reference that never reached the live sink) settles
+   * what was observed and is never carried forward as credit.
+   */
   observeAck(sessionID: SessionID, count?: number): void
-  /** Resolve once every durable frame observed so far is acknowledged. */
+  /** Resolve once every durable frame observed for the current run is acknowledged. */
   wait(sessionID: SessionID): Promise<void>
+  /** Drop the current run's progress; `wait` also resets implicitly when it settles. */
+  reset(sessionID: SessionID): void
 }
 
 export interface EgressDeliveryBarrierOptions {
@@ -570,7 +775,10 @@ export interface EgressDeliveryBarrierOptions {
 export const DEFAULT_EGRESS_BARRIER_TIMEOUT_MS = 5_000
 
 interface EgressProgress {
-  durables: number
+  /** Durables observed since the last ack (the current sender batch). */
+  outstanding: number
+  /** Diagnostics for the current run; reset when the run settles. */
+  observed: number
   acked: number
   waiters: Set<() => void>
   timer: ReturnType<typeof setTimeout> | undefined
@@ -587,25 +795,35 @@ export function createEgressDeliveryBarrier(options: EgressDeliveryBarrierOption
   const progressOf = (sessionID: SessionID): EgressProgress => {
     const existing = progress.get(sessionID)
     if (existing !== undefined) return existing
-    const created: EgressProgress = { durables: 0, acked: 0, waiters: new Set(), timer: undefined }
+    const created: EgressProgress = { outstanding: 0, observed: 0, acked: 0, waiters: new Set(), timer: undefined }
     progress.set(sessionID, created)
     return created
   }
 
-  /** Release every waiter once the acknowledged count covers the observed frames. */
-  const settle = (state: EgressProgress): void => {
-    if (state.acked < state.durables) return
+  /** Clear one run's progress and release its waiters. */
+  const clear = (state: EgressProgress): void => {
     if (state.timer !== undefined) {
       clearTimeout(state.timer)
       state.timer = undefined
     }
+    state.outstanding = 0
+    state.observed = 0
+    state.acked = 0
     for (const waiter of state.waiters) waiter()
     state.waiters.clear()
   }
 
+  /** Release every waiter once the current batch is fully acknowledged. */
+  const settle = (state: EgressProgress): void => {
+    if (state.outstanding > 0) return
+    clear(state)
+  }
+
   return {
     observeDurable(sessionID) {
-      progressOf(sessionID).durables += 1
+      const state = progressOf(sessionID)
+      state.outstanding += 1
+      state.observed += 1
     },
     observeAck(sessionID, count = 1) {
       // An ack is authoritative only for a non-negative integer count. A
@@ -613,11 +831,14 @@ export function createEgressDeliveryBarrier(options: EgressDeliveryBarrierOption
       if (!Number.isInteger(count) || count < 0) return
       const state = progressOf(sessionID)
       state.acked += count
+      // Correlation, not cumulative credit: only durables actually observed in
+      // this batch can be settled, and any extra ack count is discarded.
+      state.outstanding = Math.max(0, state.outstanding - count)
       settle(state)
     },
     wait(sessionID) {
       const state = progressOf(sessionID)
-      if (state.acked >= state.durables) return Promise.resolve()
+      if (state.outstanding === 0) return Promise.resolve()
       return new Promise<void>((resolve) => {
         state.waiters.add(resolve)
         state.timer ??= setTimeout(() => {
@@ -625,14 +846,18 @@ export function createEgressDeliveryBarrier(options: EgressDeliveryBarrierOption
           log(workerLogMessage("durable egress ack missing"), {
             level: "WARN",
             sessionID,
-            durables: state.durables,
+            outstanding: state.outstanding,
+            observed: state.observed,
             acked: state.acked,
             timeoutMs,
           })
-          for (const waiter of state.waiters) waiter()
-          state.waiters.clear()
+          clear(state)
         }, timeoutMs)
       })
+    },
+    reset(sessionID) {
+      const state = progress.get(sessionID)
+      if (state !== undefined) clear(state)
     },
   }
 }
@@ -731,13 +956,19 @@ export function serveEventsPort(
       }
       ordered(() => deliver(event, meta))
     },
-    // A worker that skipped a durable sequence is healed by its OWN database
-    // snapshot, not by closing the port: surface the resync on the sink and ask
-    // the worker (back over the same bidirectional events port) to re-read the
-    // aggregate at the exact observed position.
-    onDurableGap: (got) => {
-      ordered(() => {
-        sink.resync({ aggregateID: got.aggregateID, seq: got.seq })
+    // A worker that skipped a durable sequence is healed from the committed log
+    // (when the sink has a reader) and asked over the same bidirectional events
+    // port to re-read its own aggregate. Healing is awaited on the delivery chain
+    // so the gapped frame and the frames after it cannot overtake it.
+    onDurableGap: (got, last) => {
+      enqueue(async () => {
+        if (closed) return
+        if (sink.heal !== undefined) {
+          await sink.heal({ aggregateID: got.aggregateID, seq: got.seq, after: last.seq })
+        } else {
+          sink.resync({ aggregateID: got.aggregateID, seq: got.seq })
+        }
+        if (closed) return
         try {
           port.postMessage(encodeFrame(resyncWithPositionFrame({ aggregateID: got.aggregateID, seq: got.seq })))
         } catch (error) {
@@ -1040,6 +1271,12 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       // that never finished is NOT settled: the missing report times the barrier
       // out instead of letting the next run overtake it.
       if (run.missing().includes("tools") && lifecycle.indeterminate(sessionID).length === 0) run.noTools()
+      // A run can end without a durable commit: a shell turn, a loop that exits
+      // before its first model step, or a compaction stop. The commit-side
+      // phases are settled as an explicit `none` (never a fabricated commit), so
+      // the next run is admitted instead of waiting out the 5 s bound and then
+      // refusing every prompt until the idle reaper retires the worker.
+      if (run.missing().includes("commits")) run.noCommit()
       run.promotion(promotionOutcome(sessionID))
     }
     try {
@@ -1057,6 +1294,22 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
    * generation grants that release: a live run's calls always hold the barrier.
    */
   const lostGenerations = new Set<SessionID>()
+
+  /**
+   * A compiled build mismatch is permanent for this entry: respawning the same
+   * bundle crash-loops. The typed error is kept until the resolved build hash
+   * changes, so a retry before a rebuild fails fast with the same typed cause.
+   */
+  const blockedBuilds = new Map<SessionID, BuildMismatch>()
+  const assertBuildAdmissible = (sessionID: SessionID): void => {
+    const blocked = blockedBuilds.get(sessionID)
+    if (blocked === undefined) return
+    if (blocked.expected !== resolveBuildHash().hash) {
+      blockedBuilds.delete(sessionID)
+      return
+    }
+    throw blocked
+  }
 
   /**
    * A retired generation can never run `dispose()` (crash, hard terminate), so
@@ -1107,6 +1360,29 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     retiredLeaseReleases.get(sessionID) ?? Promise.resolve()
 
   /**
+   * The one hub-side retirement for a worker generation. Both the dispatcher's
+   * `onSessionReleased` (crash/reap/cancel) and the pool's in-place generation
+   * replacement (a mid-session model switch) funnel through here, so every
+   * retired generation releases the same state exactly once.
+   */
+  const releaseGeneration = async (sessionID: SessionID, workerID?: number): Promise<void> => {
+    // This generation can never settle another phase: the next run must not
+    // inherit its in-flight calls.
+    lostGenerations.add(sessionID)
+    try {
+      // Retirement disposes this worker's hub-side port servers immediately,
+      // rather than leaving them alive until shutdown.
+      if (workerID !== undefined) ports.disposeWorker(workerID)
+      await options.onSessionReleased?.(sessionID)
+    } finally {
+      // The lease release is the retirement's contract, not a best-effort
+      // follow-up: even a throwing port disposer or release hook must not let a
+      // successor boot against the old generation's live lease.
+      await releaseRetiredLease(sessionID, workerID)
+    }
+  }
+
+  /**
    * A timed-out barrier refuses the next run while its worker is still alive
    * (the run may still settle). Once that worker has been retired — a crash or a
    * hard terminate — no fiber can ever settle the phases, so the stale barrier is
@@ -1131,8 +1407,12 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     recordCrash: (payload) => lifecycle.observeCrash(payload),
     resumeDecision: (payload) => {
       // A compiled build mismatch is permanent for this entry: respawning the
-      // same bundle would crash-loop. Refuse auto-resume instead of retrying.
-      if (payload.reason.includes("session worker build mismatch")) {
+      // same bundle would crash-loop. The dispatcher carries the typed cause on
+      // the in-memory payload, so no string matching is involved; keep the
+      // session blocked until the resolved build changes.
+      const cause = (payload as { readonly cause?: unknown }).cause
+      if (cause instanceof BuildMismatch) {
+        blockedBuilds.set(payload.sessionID as SessionID, cause)
         return { resume: false, sessionID: payload.sessionID, phase: payload.phase, reason: "phase" }
       }
       const decide = (indeterminate: readonly IndeterminateCall[]) =>
@@ -1192,15 +1472,30 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       }
       lifecycle.recordAttempt(decision.sessionID)
       if (options.resumeRun !== undefined) {
-        void Promise.resolve(options.resumeRun(decision, payload)).catch(() => undefined)
-        return
+        // The dispatcher settles the original crashed caller from this promise,
+        // so its failure must reach that caller instead of being swallowed into
+        // a generic "no session result recorded".
+        return options.resumeRun(decision, payload)
       }
+      // No explicit resume owner: run the successor detached. The dispatcher
+      // cannot observe this run's outcome without replacing the crashed caller's
+      // typed `WorkerCrashedError` with it, which would hide the crash. Keep the
+      // crash authoritative for this caller; a deliberate replay wires
+      // `resumeRun` above and can forward its outcome instead.
       void dispatch
         .ensureRunning(decision.sessionID as SessionID)
         .then(() => lifecycle.resetAttempts(decision.sessionID))
-        .catch(() => undefined)
+        .catch((error: unknown) => {
+          log(workerLogMessage("auto-resume failed"), {
+            level: "WARN",
+            sessionID: decision.sessionID,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        })
+      return undefined
     },
     writeBarrier: runBarrier,
+    assertAdmissible: assertBuildAdmissible,
     onRunStart: (sessionID) => {
       // A lost generation's calls can never settle. Release them into the OLD
       // phases first (so the fresh `tools` phase below is not pre-resolved and
@@ -1222,18 +1517,8 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
         })
       }
     },
-    onSessionReleased: (sessionID, workerID) => {
-      // This generation can never settle another phase: the next run must not
-      // inherit its in-flight calls.
-      lostGenerations.add(sessionID)
-      // The retired generation's lease is dead even when its isolate never ran
-      // `dispose()` (crash/terminate). Mark it reclaimable before the successor
-      // boots; the next admission awaits this release (see `ensureRunning`).
-      void releaseRetiredLease(sessionID, workerID)
-      // Retirement (reap/cancel/crash) disposes this worker's hub-side port
-      // servers immediately, rather than leaving them alive until shutdown.
-      if (workerID !== undefined) ports.disposeWorker(workerID)
-      options.onSessionReleased?.(sessionID)
+    onSessionReleased: async (sessionID, workerID) => {
+      await releaseGeneration(sessionID, workerID)
     },
     ...defined({
       cancellation,
@@ -1258,6 +1543,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     sessionOfWorker: (workerID) => dispatcher.registry.sessionsOn(workerID)[0],
     attachWorkerPorts: ports.attachWorkerPorts,
     attachHubProxyPort: ports.attachHubProxyPort,
+    releaseGeneration,
     lifecycle,
     barrier,
     ensureRunning: async (sessionID, origin) => {
@@ -1267,12 +1553,14 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       // The off-loop schema gate must complete before any isolate can spawn.
       await awaitBootGate()
       admitBarrier(sessionID)
+      assertBuildAdmissible(sessionID)
       // A retired generation's release must land before its successor boots and
       // claims the aggregate; otherwise the successor can be admitted against a
       // still-live lease.
       await awaitRetiredLeaseRelease(sessionID)
       try {
         const result = await dispatch.ensureRunning(sessionID, resolveDepth(sessionID), origin)
+        blockedBuilds.delete(sessionID)
         lifecycle.resetAttempts(sessionID)
         return result
       } catch (error) {
@@ -1284,9 +1572,11 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       onDispatch?.(sessionID)
       await awaitBootGate()
       admitBarrier(sessionID)
+      assertBuildAdmissible(sessionID)
       await awaitRetiredLeaseRelease(sessionID)
       try {
         const result = await dispatch.startShell(sessionID, shell, resolveDepth(sessionID))
+        blockedBuilds.delete(sessionID)
         lifecycle.resetAttempts(sessionID)
         return result
       } catch (error) {
@@ -1344,7 +1634,76 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
 export * from "./cancel-report"
 export * from "./hub-proxy-authorities"
 export * from "./production-hub"
-export * from "./worker-pools"
-export * from "./worker-ports"
+
+// `worker-pools` and `worker-ports` both model the service idiom, so star-exporting
+// both makes `Service`, `layer`, and `node` ambiguous (TS2308). Re-export every
+// public symbol explicitly and qualify the colliding names by module; the
+// `WorkerPools` / `WorkerPorts` namespaces still expose them unqualified
+// (`WorkerPools.Service`, `WorkerPorts.layer`, ...).
+export {
+  type BunExecutorTransportOptions,
+  type BunExecutorWorkerPoolOptions,
+  DEFAULT_RUN_IDLE_TIMEOUT_MS,
+  DEFAULT_SPAWN_GATE_TIMEOUT_MS,
+  DEFAULT_TRANSPORT_BUFFER_CAPACITY,
+  type DescribedSessionWorkerEntry,
+  type FromPoolOptions,
+  type IdleBoundedExecutorWorkerPool,
+  type IdleIsolateCap,
+  type IdleIsolateCapOptions,
+  type IdleWorkerEntry,
+  type Interface,
+  type ProductionPoolFactory,
+  type ProductionWorkerPoolOptions,
+  SESSION_WORKER_ENTRY,
+  Service as WorkerPoolsService,
+  type SessionBoundSpawner,
+  type SessionWorkerEntrySource,
+  type SessionWorkerInitSource,
+  type WorkerCap,
+  type WorkerGeneration,
+  type WorkerPoolSinks,
+  WorkerPools,
+  type WorkerPoolsStats,
+  createBunExecutorTransport,
+  createBunExecutorWorkerPool,
+  createIdleIsolateCap,
+  createProductionWorkerPool,
+  createSessionBoundExecutorWorker,
+  createWorkerCap,
+  describeSessionWorkerEntry,
+  fromPool,
+  layer as WorkerPoolsLayer,
+  liveSessionWorkerCount,
+  logRunIdleTimeoutWarning,
+  makeProduction,
+  node as WorkerPoolsNode,
+  resolveIdleWorkerCapacity,
+  resolveRunIdleTimeoutMs,
+  resolveSessionWorkerEntry,
+  runIdleTimeoutWarning,
+  spawnBunExecutorWorker,
+  withSessionWorkerPorts,
+  workerShutdownStats,
+} from "./worker-pools"
+
+export {
+  Service as WorkerPortsService,
+  type WorkerPortBackends,
+  type WorkerPortBackendsSource,
+  WorkerPorts,
+  type WorkerPortRegistry,
+  type WorkerPortRegistryOptions,
+  type WorkerPortsDiagnostics,
+  type WorkerPortsOptions,
+  type WorkerTransferredPorts,
+  createWorkerPortRegistry,
+  drainEgressPort,
+  isPidReport,
+  layer as WorkerPortsLayer,
+  make,
+  node as WorkerPortsNode,
+  servePidReportPort,
+} from "./worker-ports"
 
 export * as SessionHubModule from "./hub"

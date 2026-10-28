@@ -1300,3 +1300,193 @@ describe("retirement waits for a confirmed exit", () => {
     await dispatcher.terminateAll()
   })
 })
+
+describe("retirement exit cannot park the successor", () => {
+  test("a terminate that never settles yields to the bounded successor start", async () => {
+    const worker = new FakeSessionWorker(1, { mode: "cooperative" })
+    let terminations = 0
+    worker.terminate = () => {
+      terminations += 1
+      // The first retire never confirms; the teardown path still resolves.
+      return terminations === 1 ? new Promise<void>(() => {}) : Promise.resolve()
+    }
+    const spawned: FakeSessionWorker[] = []
+    const pool: WorkerPool = {
+      spawn: () => {
+        spawned.push(worker)
+        return worker
+      },
+      terminateAll: async () => {},
+    }
+    const dispatcher = createDispatcher({ pool, terminateTimeoutMs: 25 })
+
+    const first = dispatcher.dispatch({ sessionID: sid("ses_hung_exit") })
+    void first.catch(() => undefined)
+    await flush()
+    await dispatcher.cancel(sid("ses_hung_exit"))
+
+    const successor = dispatcher.dispatch({ sessionID: sid("ses_hung_exit") })
+    await pollUntil(() => worker.runs.length === 2, {
+      message: "the successor never started after the retirement deadline",
+      timeoutMs: 1_000,
+    })
+    worker.finish(sid("ses_hung_exit"))
+    await successor
+    expect(spawned.length).toBe(2)
+    await dispatcher.terminateAll()
+  })
+
+  test("a rejected session-release callback never parks the successor", async () => {
+    const pool = createFakeWorkerPool(1)
+    const dispatcher = createDispatcher({
+      pool,
+      onSessionReleased: () => {
+        throw new Error("lease release failed")
+      },
+      terminateTimeoutMs: 25,
+    })
+
+    const first = dispatcher.dispatch({ sessionID: sid("ses_release_failure") })
+    void first.catch(() => undefined)
+    await flush()
+    await dispatcher.cancel(sid("ses_release_failure"))
+
+    const successor = dispatcher.dispatch({ sessionID: sid("ses_release_failure") })
+    await flush()
+    pool.spawned[1].finish(sid("ses_release_failure"))
+    await successor
+    await dispatcher.terminateAll()
+  })
+})
+
+describe("a settled crash never hands a dead promise to a new caller", () => {
+  test("a caller arriving during the resume decision parks and starts fresh", async () => {
+    const pool = createFakeWorkerPool(1)
+    let decide!: (decision: { resume: false; sessionID: string; phase: "stream"; reason: "cancelled" }) => void
+    const decision = new Promise<{ resume: false; sessionID: string; phase: "stream"; reason: "cancelled" }>(
+      (resolve) => {
+        decide = resolve
+      },
+    )
+    const dispatcher = createDispatcher({
+      pool,
+      resumeDecisionTimeoutMs: 1_000,
+      resumeDecision: () => decision,
+    })
+
+    const sessionID = sid("ses_settled_crash")
+    const first = dispatcher.dispatch({ sessionID })
+    void first.catch(() => undefined)
+    await flush()
+    pool.spawned[0].crash(sessionID)
+    await flush()
+
+    // The run is already terminal (settled) but its resume decision is pending.
+    // A new caller must not receive the dead admitted promise.
+    const second = dispatcher.dispatch({ sessionID })
+    void second.catch(() => undefined)
+    expect(second).not.toBe(first)
+
+    decide({ resume: false, sessionID: String(sessionID), phase: "stream", reason: "cancelled" })
+    await expect(first).rejects.toBeInstanceOf(WorkerCrashedError)
+    await pollUntil(() => pool.spawned.length === 2, { message: "the parked caller never started fresh" })
+    pool.spawned[1].finish(sessionID)
+    await second
+    await dispatcher.terminateAll()
+  })
+})
+
+describe("auto-resume defers the crashed caller's settlement", () => {
+  test("the original caller resolves with the resumed run instead of the crash", async () => {
+    const pool = createFakeWorkerPool(1)
+    let resume!: () => void
+    const resumed = new Promise<void>((resolve) => {
+      resume = resolve
+    })
+    let attempts = 0
+    const dispatcher = createDispatcher({
+      pool,
+      resumeDecision: () => ({
+        resume: true,
+        sessionID: "ses_resumed",
+        attempt: 1,
+        phase: "stream",
+        fromMessageID: "msg_committed",
+      }),
+      onAutoResume: () => {
+        attempts += 1
+        return resumed
+      },
+    })
+
+    const sessionID = sid("ses_resumed")
+    const first = dispatcher.dispatch({ sessionID })
+    await flush()
+    pool.spawned[0].crash(sessionID)
+    await pollUntil(() => attempts === 1, { message: "the resume was never observed" })
+
+    let settled = false
+    void first.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      },
+    )
+    await flush()
+    expect(settled).toBe(false)
+
+    resume()
+    await expect(first).resolves.toBeUndefined()
+    await dispatcher.terminateAll()
+  })
+})
+
+describe("dead worker retirement", () => {
+  test("a worker that dies mid-run is retired once and its children are cascaded", async () => {
+    const pool = createFakeWorkerPool(2)
+    const parent = sid("ses_dead_parent")
+    const child = sid("ses_dead_child")
+    const cancelled: SessionID[] = []
+    const dispatcher = createDispatcher({
+      pool,
+      cancellation: {
+        childrenOf: (sessionID) => (sessionID === parent ? [child] : []),
+        onCancelled: (event) => cancelled.push(event.sessionID),
+      },
+    })
+
+    const parentRun = capture(dispatcher.dispatch({ sessionID: parent }))
+    const childRun = capture(dispatcher.dispatch({ sessionID: child }))
+    await flush()
+
+    const [parentWorker, childWorker] = pool.spawned
+    const parentRetires = captureTerminations(parentWorker)
+    const childRetires = captureTerminations(childWorker)
+
+    // The isolate dies without a typed crash; the dispatcher must still treat it
+    // as a crash, retire it exactly once, and never reuse the dead handle.
+    parentWorker.crashWith(parent, new Error("isolate exited"))
+
+    expect(await parentRun).toMatchObject({ ok: false, error: expect.any(WorkerCrashedError) })
+    expect(await childRun).toMatchObject({ ok: false, error: expect.any(Error) })
+    await flush()
+
+    expect(parentRetires()).toBe(1)
+    expect(childRetires()).toBe(1)
+    expect(cancelled).toContain(child)
+    expect(dispatcher.registry.has(parent)).toBe(false)
+    await dispatcher.terminateAll()
+  })
+})
+
+function captureTerminations(worker: FakeSessionWorker): () => number {
+  let count = 0
+  const terminate = worker.terminate.bind(worker)
+  worker.terminate = async () => {
+    count += 1
+    await terminate()
+  }
+  return () => count
+}

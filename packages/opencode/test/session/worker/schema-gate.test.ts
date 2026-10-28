@@ -7,6 +7,7 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { fileURLToPath } from "node:url"
 import { Database as BunDatabase } from "bun:sqlite"
 import { afterEach, describe, expect, test } from "bun:test"
 import { openConnection, type Connection } from "@opencode-ai/core/database/connection"
@@ -17,10 +18,13 @@ import {
   SchemaMismatch,
   assertSchemaIdentity,
   currentSchemaIdentity,
+  ensureProductionSchemaAsync,
   markSchemaIdentity,
   migrate,
   migrationContentHash,
   openGatedConnection,
+  resetSchemaEnsureCache,
+  schemaGateFilename,
   schemaIdentity,
 } from "@/session/db/schema"
 
@@ -231,4 +235,75 @@ describe("hub migration (D7)", () => {
     expect((error as SchemaMismatch).observed.version).toBe(0)
     expect((error as SchemaMismatch).observed.contentHash).not.toBe(currentSchemaIdentity().contentHash)
   })
+})
+
+
+describe("cross-process schema gate", () => {
+  test("two executors on the same fresh file serialize into one complete journal", async () => {
+    resetSchemaEnsureCache()
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-schema-gate-"))
+    directories.push(directory)
+    const filename = path.join(directory, "concurrent.db")
+
+    const [first, second] = await Promise.all([
+      ensureProductionSchemaAsync({ filename, liveWorkers: 0 }),
+      ensureProductionSchemaAsync({ filename, liveWorkers: 0 }),
+    ])
+
+    expect(first).toEqual(currentSchemaIdentity())
+    expect(second).toEqual(currentSchemaIdentity())
+    expect(fs.existsSync(schemaGateFilename(filename))).toBe(true)
+
+    const raw = openConnection({ filename })
+    connections.push(raw)
+    expect(schemaIdentity(raw)).toEqual(currentSchemaIdentity())
+    const journal = raw.all<{ id: string }>("SELECT id FROM migration ORDER BY id").map((row) => row.id)
+    expect(new Set(journal).size).toBe(journal.length)
+  }, 60_000)
+
+  test("two processes starting together still produce one complete schema", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-schema-gate-"))
+    directories.push(directory)
+    const filename = path.join(directory, "processes.db")
+    const modulePath = fileURLToPath(new URL("../../../src/session/db/schema.ts", import.meta.url))
+    const script = `
+      import { ensureProductionSchemaAsync } from ${JSON.stringify(modulePath)}
+      await Bun.sleep(50)
+      try {
+        await ensureProductionSchemaAsync({ filename: process.env.DB_FILE, liveWorkers: 0 })
+        console.log("ok")
+      } catch (error) {
+        console.error(error)
+        process.exit(1)
+      }
+    `
+    const cwd = path.resolve(import.meta.dir, "../../..")
+    const children = [0, 1].map(() =>
+      Bun.spawn([process.execPath, "-e", script], {
+        cwd,
+        env: { ...process.env, DB_FILE: filename },
+        stdout: "pipe",
+        stderr: "pipe",
+      }),
+    )
+    const results = await Promise.all(
+      children.map(async (child) => {
+        const [out, err] = await Promise.all([
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+        ])
+        return { exitCode: await child.exited, out: out.trim(), err: err.trim() }
+      }),
+    )
+    expect(results.map((result) => ({ exitCode: result.exitCode, out: result.out }))).toEqual([
+      { exitCode: 0, out: "ok" },
+      { exitCode: 0, out: "ok" },
+    ])
+
+    const raw = openConnection({ filename })
+    connections.push(raw)
+    expect(schemaIdentity(raw)).toEqual(currentSchemaIdentity())
+    const journal = raw.all<{ id: string }>("SELECT id FROM migration ORDER BY id").map((row) => row.id)
+    expect(new Set(journal).size).toBe(journal.length)
+  }, 90_000)
 })
