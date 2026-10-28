@@ -10,7 +10,7 @@
 // tested deterministically without spawning isolates.
 
 import { describe, expect, test } from "bun:test"
-import { Context, Deferred, Effect, Fiber, Latch, Layer, Logger } from "effect"
+import { Context, Deferred, Effect, Fiber, Latch, Layer, Logger, Scope } from "effect"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Auth } from "@/auth"
 import { Config } from "@/config/config"
@@ -28,20 +28,25 @@ import {
   createProductionSessionHub,
   createSessionHub,
   productionSessionHubLayer,
+  productionSessionHubNode,
   SessionHubService,
+  type ProductionHubServices,
   type SessionHub,
 } from "@/session/worker/hub"
 import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
 import { reapSupport } from "@/session/worker/pid-registry"
 import { sessionWorkerInit } from "../../lib/session-worker-init"
 import { pollUntil } from "../../lib/poll"
-import { SessionBusyError } from "@/session/worker/execute"
+import { SessionBusyError, type ExecutorWorkerPool } from "@/session/worker/execute"
 import { withTmpdirInstance } from "../../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../../lib/effect"
 import { flush, sid } from "../../lib/async"
 import { createRecordingScheduler } from "../../lib/scheduler"
 import { withParts } from "../../lib/session-parts"
-import { createFakeExecutorPool } from "../../lib/fake-worker-pool"
+import { createFakeExecutorPool, FakeExecutorWorker } from "../../lib/fake-worker-pool"
+import { createLazyExecutorWorkerPool } from "../../lib/lazy-worker-pool"
+import { fromPool } from "@/session/worker/worker-pools"
+import type { WorkerPorts } from "@/session/worker/worker-ports"
 
 const it = testEffect(Layer.empty)
 
@@ -885,6 +890,242 @@ describe("the production hub layer emits the narrative", () => {
         }),
       ).pipe(Effect.provide(Logger.layer([logger]))),
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Production service wiring — the layer owns the Wave-6 `WorkerPorts` and
+// `WorkerPools` services: building it spawns no isolate, a worker's ports attach
+// through the provided `WorkerPorts` service, and teardown disposes ports before
+// terminating the pool. The graph node keeps its nine declared deps.
+// ---------------------------------------------------------------------------
+
+describe("production hub service wiring", () => {
+  test("no isolate at build, ports attach through WorkerPorts, ports dispose before pool terminate", async () => {
+    const order: string[] = []
+    const created: number[] = []
+    const disposed: number[] = []
+    const lazy = createLazyExecutorWorkerPool({
+      create: async (id) => {
+        created.push(id)
+        return new FakeExecutorWorker(id)
+      },
+    })
+    const pool: ExecutorWorkerPool = {
+      get workers() {
+        return lazy.workers
+      },
+      spawn: (id) => lazy.spawn(id),
+      releaseSession: (sessionID, workerID) => lazy.releaseSession?.(sessionID, workerID),
+      terminateAll: async () => {
+        order.push("pool-terminate")
+        await lazy.terminateAll()
+      },
+      byID: (id) => lazy.byID(id),
+      resultFor: (sessionID) => lazy.resultFor(sessionID),
+    }
+    let services: ProductionHubServices | undefined
+    const channel = new MessageChannel()
+
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const context = yield* Layer.build(
+              productionSessionHubLayer({
+                count: 1,
+                poolFactory: () => pool,
+                ports: {
+                  egress: (workerID, port) => {
+                    port.start()
+                    return () => {
+                      order.push("ports-dispose")
+                      disposed.push(workerID)
+                    }
+                  },
+                },
+                onServices: (resolved) => {
+                  services = resolved
+                },
+              }).pipe(Layer.provide(productionWiringServices)),
+            )
+            const hub = Context.get(context, SessionHubService)
+
+            // Building the layer (and resolving the pool/port services) spawns
+            // no isolate: materialization happens only on dispatch.
+            expect(created).toEqual([])
+            expect(services?.workerPorts).toBeDefined()
+            expect(services?.workerPools.executorPool).toBe(pool)
+
+            // The attach reaches the layer-owned service, not a private registry.
+            hub.attachWorkerPorts(7, { egress: channel.port1 })
+            expect(disposed).toEqual([])
+            expect(yield* services!.workerPorts!.attached()).toEqual({ workerPorts: [7], hubProxy: [] })
+
+            yield* Effect.promise(() => hub.terminateAll())
+            expect(disposed).toEqual([7])
+            expect(order).toEqual(["ports-dispose", "pool-terminate"])
+          }),
+        ),
+      )
+    } finally {
+      channel.port1.close()
+      channel.port2.close()
+    }
+  })
+
+  test("a transient backend build failure is not cached; the next attach retries and succeeds", async () => {
+    // H/M1: `sharedPortSource` used to mark the build resolved BEFORE invoking
+    // the source, so one throw became a permanent "no backends" cache. The first
+    // attach must fail loud; the second must rebuild and attach the worker's port.
+    let builds = 0
+    const disposed: number[] = []
+    const pool = createFakeExecutorPool(1)
+    const hub = createProductionSessionHub({
+      init: sessionWorkerInit(),
+      poolFactory: () => pool,
+      ports: () => {
+        builds += 1
+        if (builds === 1) throw new Error("transient backend build failure")
+        return {
+          writer: {} as never,
+          egress: (workerID, port) => {
+            port.start()
+            return () => disposed.push(workerID)
+          },
+        }
+      },
+    })
+    const channel = new MessageChannel()
+    try {
+      expect(() => hub.attachWorkerPorts(1, { egress: channel.port1 })).toThrow("transient backend build failure")
+      expect(builds).toBe(1)
+
+      // The failure must not be cached: the retry builds again and attaches.
+      hub.attachWorkerPorts(1, { egress: channel.port1 })
+      expect(builds).toBe(2)
+      expect(disposed).toEqual([])
+
+      await hub.terminateAll()
+      expect(disposed).toEqual([1])
+    } finally {
+      channel.port1.close()
+      channel.port2.close()
+    }
+  })
+
+  test("layer scope terminates the pool exactly once, after disposing ports", async () => {
+    // H/M2: the redundant scope finalizer C terminated the pool a second time
+    // after the hub's own finalizer. Post-scope, the count must be exactly one and
+    // the ports must already be disposed when the pool terminate runs.
+    const order: string[] = []
+    const lazy = createLazyExecutorWorkerPool({
+      create: async (id) => new FakeExecutorWorker(id),
+    })
+    const pool: ExecutorWorkerPool = {
+      get workers() {
+        return lazy.workers
+      },
+      spawn: (id) => lazy.spawn(id),
+      releaseSession: (sessionID, workerID) => lazy.releaseSession?.(sessionID, workerID),
+      terminateAll: async () => {
+        order.push("pool-terminate")
+        await lazy.terminateAll()
+      },
+      byID: (id) => lazy.byID(id),
+      resultFor: (sessionID) => lazy.resultFor(sessionID),
+    }
+    const channel = new MessageChannel()
+
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const context = yield* Layer.build(
+              productionSessionHubLayer({
+                count: 1,
+                poolFactory: () => pool,
+                ports: {
+                  egress: (workerID, port) => {
+                    port.start()
+                    return () => order.push("ports-dispose")
+                  },
+                },
+              }).pipe(Layer.provide(productionWiringServices)),
+            )
+            const hub = Context.get(context, SessionHubService)
+            hub.attachWorkerPorts(7, { egress: channel.port1 })
+            // Intentionally no manual terminate: the layer scope owns teardown.
+          }),
+        ),
+      )
+
+      expect(order.filter((event) => event === "pool-terminate")).toHaveLength(1)
+      expect(order).toEqual(["ports-dispose", "pool-terminate"])
+      expect(order.indexOf("ports-dispose")).toBeLessThan(order.indexOf("pool-terminate"))
+    } finally {
+      channel.port1.close()
+      channel.port2.close()
+    }
+  })
+
+  test("a caller-provided scope does not finalize caller-owned port/pool services", async () => {
+    // H/M3: `options.scope` owns only services the hub creates internally. A
+    // pre-built `workerPorts`/`workerPools` stays caller-owned, so closing the
+    // passed scope must not dispose them.
+    let portDisposals = 0
+    let poolTerminations = 0
+    const ports: WorkerPorts = {
+      attachWorkerPorts: () => Effect.succeed(() => {}),
+      attachHubProxyPort: () => Effect.succeed(() => {}),
+      disposeWorker: () => Effect.void,
+      disposeAll: () => Effect.sync(() => void (portDisposals += 1)),
+      attached: () => Effect.succeed({ workerPorts: [], hubProxy: [] }),
+    }
+    const base = createFakeExecutorPool(1)
+    const pool: ExecutorWorkerPool = {
+      get workers() {
+        return base.workers
+      },
+      spawn: (id) => base.spawn(id),
+      terminateAll: async () => {
+        poolTerminations += 1
+      },
+      byID: (id) => base.byID(id),
+      resultFor: (sessionID) => base.resultFor(sessionID),
+    }
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const scope = yield* Scope.Scope
+          createProductionSessionHub({
+            init: sessionWorkerInit(),
+            scope,
+            workerPorts: ports,
+            workerPools: fromPool(pool),
+          })
+        }),
+      ),
+    )
+
+    expect(portDisposals).toBe(0)
+    expect(poolTerminations).toBe(0)
+  })
+
+  test("the production node still declares exactly its nine service deps", () => {
+    const names = productionSessionHubNode().dependencies.map((dependency) => dependency.name)
+    expect(names).toEqual([
+      "@opencode/Config",
+      "@opencode/Auth",
+      "@opencode/ModelsDev",
+      "@opencode/Provider",
+      "@opencode/RuntimeFlags",
+      "@opencode/SessionStatus",
+      "@opencode/Permission",
+      "@opencode/Question",
+      "@opencode/EventV2Bridge",
+    ])
   })
 })
 

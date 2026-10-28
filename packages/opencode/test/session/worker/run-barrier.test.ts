@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { Effect } from "effect"
 
 import {
   RUN_BARRIER_PHASES,
@@ -8,12 +9,18 @@ import {
   RunBarrierReportError,
   RunBarrierTimeout,
   createRunBarrier,
+  fromBarrier,
+  layer,
+  make,
+  node,
+  Service,
   type RunBarrier,
   type RunBarrierPhase,
   type RunBarrierPhases,
   type RunBarrierRun,
   type RunBarrierScheduler,
 } from "@/session/run-barrier"
+import { it } from "../../lib/effect"
 
 interface Deferred<T> {
   readonly promise: Promise<T>
@@ -317,9 +324,9 @@ describe("per-Session run barrier — real phase reports", () => {
     const barrier = createRunBarrier()
     const run = barrier.beginRun("s1")
 
-    expect(() =>
-      run.report({ sessionID: "s1", phase: "tools", observation: { kind: "none" } }),
-    ).toThrow(RunBarrierReportError)
+    expect(() => run.report({ sessionID: "s1", phase: "tools", observation: { kind: "none" } })).toThrow(
+      RunBarrierReportError,
+    )
   })
 
   test.each([...RUN_BARRIER_PHASES])("refuses a run whose %s reporter never arrived", async (missing) => {
@@ -429,4 +436,60 @@ describe("per-Session run barrier — real phase reports", () => {
     fake.advance(RUN_BARRIER_TIMEOUT_MS)
     await expect(pending).rejects.toBeInstanceOf(RunBarrierTimeout)
   })
+})
+
+describe("run barrier service", () => {
+  test("node exposes the unbound RunBarrier service tag", () => {
+    const entry = node()
+    expect(entry.kind).toBe("layer")
+    expect(entry.name).toBe("@opencode/RunBarrier")
+    expect(entry.service).toBe(Service)
+    expect(entry.dependencies).toEqual([])
+  })
+
+  it.live("layer installs a barrier that preserves report settlement", () =>
+    Effect.gen(function* () {
+      const barrier = yield* Service
+      const run = yield* barrier.beginRun("s1")
+      expect(run.commit("msg_1")).toBe(true)
+      expect(run.projector("session-row")).toBe(true)
+      expect(run.noTools()).toBe(true)
+      expect(run.promotion("no-job")).toBe(true)
+
+      expect(yield* barrier.wait("s1")).toEqual({ sessionID: "s1", status: "drained" })
+      expect(yield* barrier.state("s1")).toBe("drained")
+      expect(barrier.size).toBe(1)
+    }).pipe(Effect.provide(layer({ scheduler: createFakeScheduler().scheduler }))),
+  )
+
+  it.live("make and fromBarrier match the createRunBarrier adapter", () =>
+    Effect.gen(function* () {
+      const service = yield* make({ scheduler: createFakeScheduler().scheduler })
+      const raw = createRunBarrier({ scheduler: createFakeScheduler().scheduler })
+      expect(service.barrier).toBeDefined()
+      expect(fromBarrier(raw).barrier).toBe(raw)
+
+      const serviceRun = yield* service.beginRun("s1")
+      serviceRun.noCommit()
+      serviceRun.noTools()
+      serviceRun.promotion("no-job")
+      expect(yield* service.wait("s1")).toEqual({ sessionID: "s1", status: "drained" })
+
+      const rawRun = raw.beginRun("s1")
+      rawRun.noCommit()
+      rawRun.noTools()
+      rawRun.promotion("no-job")
+      expect(yield* Effect.promise(() => raw.wait("s1"))).toEqual({ sessionID: "s1", status: "drained" })
+
+      expect(yield* service.state("s1")).toBe(raw.state("s1"))
+      expect(service.size).toBe(raw.size)
+
+      yield* service.cancel("s2")
+      expect(yield* service.state("s2")).toBe("cancelled")
+      yield* service.reset("s2")
+      expect(yield* service.state("s2")).toBe("idle")
+      yield* service.abandon("s1")
+      expect(yield* service.state("s1")).toBe("idle")
+    }),
+  )
 })

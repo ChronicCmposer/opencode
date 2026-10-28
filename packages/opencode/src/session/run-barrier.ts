@@ -27,6 +27,9 @@
 // for a barrier whose owning run/worker is gone and can never settle). A live
 // worker keeps the refusal: timed-out is not a free pass.
 
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Context, Effect, Layer } from "effect"
+
 /** The hard bound every per-Session barrier is subject to. */
 export const RUN_BARRIER_TIMEOUT_MS = 5000
 
@@ -165,10 +168,7 @@ export class RunBarrierMissingReportError extends RunBarrierReportError {
     override readonly sessionID: string,
     readonly missing: readonly RunBarrierPhase[],
   ) {
-    super(
-      sessionID,
-      `run barrier for session ${sessionID} has no begun run; missing reports: ${missing.join(", ")}`,
-    )
+    super(sessionID, `run barrier for session ${sessionID} has no begun run; missing reports: ${missing.join(", ")}`)
     this.name = "RunBarrierMissingReportError"
   }
 }
@@ -351,7 +351,8 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
     return {
       sessionID: record.sessionID,
       report,
-      commit: (messageID) => report({ sessionID: record.sessionID, phase: "commits", observation: { kind: "commit", messageID } }),
+      commit: (messageID) =>
+        report({ sessionID: record.sessionID, phase: "commits", observation: { kind: "commit", messageID } }),
       projector: (projector) =>
         report({ sessionID: record.sessionID, phase: "projectors", observation: { kind: "projector", projector } }),
       tool: (callID) => report({ sessionID: record.sessionID, phase: "tools", observation: { kind: "tool", callID } }),
@@ -406,7 +407,9 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
       const state = stateOf(sessionID)
       if (state === "timed-out") return Promise.reject(new RunBarrierTimeout(sessionID, timeoutMs))
       if (state === "failed") {
-        return Promise.reject(failures.get(sessionID) ?? new RunBarrierError(`run barrier for session ${sessionID} previously failed`))
+        return Promise.reject(
+          failures.get(sessionID) ?? new RunBarrierError(`run barrier for session ${sessionID} previously failed`),
+        )
       }
       // A cancelled Session does not start a next run either; reset re-admits it.
       if (state === "cancelled") return Promise.resolve({ sessionID, status: "cancelled" })
@@ -544,5 +547,81 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
     },
   }
 }
+
+// ---------------------------------------------------------------------------
+// Effect service shape.
+//
+// The `RunBarrier` service is the same barrier behavior expressed as an Effect
+// service. `createRunBarrier` stays the Promise adapter; every service method
+// lifts one operation without changing the report set, timeout, or cancellation
+// semantics. State stays in the adapter's closure.
+// ---------------------------------------------------------------------------
+
+/** The Effect-facing barrier surface. `barrier` is the Promise adapter. */
+export interface Interface {
+  readonly barrier: RunBarrier
+  readonly beginRun: (sessionID: string) => Effect.Effect<RunBarrierRun>
+  readonly wait: (sessionID: string, phases?: RunBarrierPhases) => Effect.Effect<RunBarrierOutcome>
+  readonly cancel: (sessionID: string) => Effect.Effect<void>
+  readonly state: (sessionID: string) => Effect.Effect<RunBarrierState>
+  readonly reset: (sessionID: string) => Effect.Effect<void>
+  readonly abandon: (sessionID: string) => Effect.Effect<void>
+  readonly size: number
+}
+
+export class Service extends Context.Service<Service, Interface>()("@opencode/RunBarrier") {}
+
+/** Adapt the Promise barrier without owning, reordering, or retrying anything. */
+export function fromBarrier(barrier: RunBarrier): Interface {
+  const beginRun = Effect.fn("RunBarrier.beginRun")(function* (sessionID: string) {
+    return barrier.beginRun(sessionID)
+  })
+  const wait = Effect.fn("RunBarrier.wait")(function* (sessionID: string, phases?: RunBarrierPhases) {
+    return yield* Effect.promise(() =>
+      phases === undefined ? barrier.wait(sessionID) : barrier.wait(sessionID, phases),
+    )
+  })
+  const cancel = Effect.fn("RunBarrier.cancel")(function* (sessionID: string) {
+    barrier.cancel(sessionID)
+  })
+  const state = Effect.fn("RunBarrier.state")(function* (sessionID: string) {
+    return barrier.state(sessionID)
+  })
+  const reset = Effect.fn("RunBarrier.reset")(function* (sessionID: string) {
+    barrier.reset(sessionID)
+  })
+  const abandon = Effect.fn("RunBarrier.abandon")(function* (sessionID: string) {
+    barrier.abandon(sessionID)
+  })
+  return {
+    barrier,
+    beginRun,
+    wait,
+    cancel,
+    state,
+    reset,
+    abandon,
+    get size() {
+      return barrier.size
+    },
+  }
+}
+
+/** Build a barrier; no resource needs a scope. */
+export function make(options: RunBarrierOptions = {}): Effect.Effect<Interface> {
+  return Effect.sync(() => fromBarrier(createRunBarrier(options)))
+}
+
+/** Install a `RunBarrier` implementation into the context. */
+export function layer(options: RunBarrierOptions = {}): Layer.Layer<Service> {
+  return Layer.effect(Service, make(options))
+}
+
+/** The unbound graph node for {@link Service}; this lane does not wire a consumer. */
+export function node(options: RunBarrierOptions = {}): LayerNode.Node<Service, never, undefined> {
+  return LayerNode.make({ service: Service, layer: layer(options), deps: [] })
+}
+
+export * as RunBarrier from "./run-barrier"
 
 export * as SessionRunBarrier from "./run-barrier"

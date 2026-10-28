@@ -12,9 +12,18 @@ import path from "node:path"
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test"
 import { Database } from "bun:sqlite"
 import { pathToFileURL } from "node:url"
-import { DbExecutorClosedError, DbExecutorTimeoutError, createDbExecutor } from "@/session/worker/db-executor"
+import { Cause, Effect, Exit } from "effect"
+import {
+  DbExecutorClosedError,
+  DbExecutorTimeoutError,
+  createDbExecutor,
+  make,
+  node,
+  Service,
+} from "@/session/worker/db-executor"
 import { REAL_WORKER_TEST_TIMEOUT_MS } from "../lib/worker-timeouts"
 import { pollUntil } from "../lib/async"
+import { it } from "../lib/effect"
 
 setDefaultTimeout(REAL_WORKER_TEST_TIMEOUT_MS)
 
@@ -106,4 +115,43 @@ describe("db executor deadline hard-close", () => {
       probe.close()
     }
   })
+})
+
+describe("db executor service hard close", () => {
+  test("node exposes the unbound DbExecutor service tag", () => {
+    const entry = node({ filename: ":memory:" })
+    expect(entry.kind).toBe("layer")
+    expect(entry.name).toBe("@opencode/DbExecutor")
+    expect(entry.service).toBe(Service)
+    expect(entry.dependencies).toEqual([])
+  })
+
+  it.live("closing the service scope releases the native WAL lock", () =>
+    Effect.gen(function* () {
+      const { filename } = workspace()
+      const executor = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const scoped = yield* make({ filename })
+          yield* scoped.run("CREATE TABLE item (id INTEGER PRIMARY KEY)")
+          yield* scoped.run("INSERT INTO item (id) VALUES (1)")
+          return scoped
+        }),
+      )
+
+      // The scope finalizer closed the isolate's native handle before the test
+      // observes the service again; no request may be served by a live thread.
+      const exit = yield* Effect.exit(executor.run("SELECT 1 AS n"))
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(DbExecutorClosedError)
+
+      const probe = new Database(filename)
+      try {
+        probe.exec("PRAGMA busy_timeout = 0")
+        probe.exec("BEGIN IMMEDIATE")
+        probe.exec("ROLLBACK")
+      } finally {
+        probe.close()
+      }
+    }),
+  )
 })

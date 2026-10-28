@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Schema, Stream } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Event } from "@opencode-ai/schema/event"
@@ -6,6 +6,7 @@ import { Session } from "@opencode-ai/schema/session"
 import { SessionEvent } from "@opencode-ai/schema/session-event"
 import { SessionV1 } from "@opencode-ai/schema/session-v1"
 import { Database } from "@opencode-ai/core/database/database"
+import { Node } from "@opencode-ai/core/effect/app-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
@@ -1146,5 +1147,24 @@ describe("EventV2", () => {
 
       expect(received[0]?.data).toEqual(durableData(aggregateID, "replayed"))
     }),
+  )
+})
+
+describe("EventV2 service idiom", () => {
+  test("Service tag and global node over the database", () => {
+    expect(EventV2.Service.key).toBe("@opencode/Event")
+    expect(EventV2.node.kind).toBe("layer")
+    expect(EventV2.node.name).toBe("@opencode/Event")
+    expect(EventV2.node.service).toBe(EventV2.Service)
+    expect(EventV2.node.tag).toBe(Node.tags.values.global)
+    expect(EventV2.node.dependencies).toEqual([Database.node])
+  })
+
+  it.effect("the exported layer provides the same Service as the node", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      expect(typeof events.publish).toBe("function")
+      expect(typeof events.publishLive).toBe("function")
+    }).pipe(Effect.provide(EventV2.layer.pipe(Layer.provide(LayerNode.compile(Database.node))))),
   )
 })

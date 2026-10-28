@@ -21,7 +21,7 @@ import { Truncate } from "@/tool/truncate"
 import { Plugin } from "@/plugin"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { createBunSqliteConnection } from "@/session/writer/connection"
-import { LEDGER_SQL, createToolCallLedger } from "@/session/ledger/tool-call"
+import { LEDGER_SQL, createToolCallLedger, fromHandle, layer, make, node, Service } from "@/session/ledger/tool-call"
 import { createProxyReporting, type LifecycleReporting } from "@/session/ledger/lifecycle"
 import { WorkerDb, markSchemaIdentity, openWorkerDatabase, type WorkerDatabase } from "@/session/worker/db"
 import { migrationStatements } from "@/session/writer/migration.statements.gen"
@@ -30,7 +30,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { Effect, Layer, Schema, Semaphore } from "effect"
-import { testEffect } from "../lib/effect"
+import { it, testEffect } from "../lib/effect"
 
 const callID = "call-ledger"
 const sessionID = SessionID.make("ses_ledger")
@@ -210,10 +210,10 @@ describe("tool-call ledger on the production tool path", () => {
         "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [String(sessionID), "project-1", "ledger", "/tmp/project", "ledger", "1", 1, 1],
       )
-      seed.run(
-        "INSERT INTO event_sequence (aggregate_id, seq, worker_owner_id) VALUES (?, -1, ?)",
-        [String(sessionID), "worker-tools-ledger-generation"],
-      )
+      seed.run("INSERT INTO event_sequence (aggregate_id, seq, worker_owner_id) VALUES (?, -1, ?)", [
+        String(sessionID),
+        "worker-tools-ledger-generation",
+      ])
     } finally {
       seed.close()
     }
@@ -502,4 +502,64 @@ describe("tool-call ledger on the production tool path", () => {
     connection.exec("COMMIT")
     expect(ledger.list(sessionID)[0]?.state).toBe("finished")
   })
+})
+
+describe("tool-call ledger service", () => {
+  function freshConnection() {
+    const connection = createBunSqliteConnection({ filename: ":memory:" })
+    connection.exec(LEDGER_SQL)
+    return connection
+  }
+
+  test("node exposes the unbound ToolCallLedger service tag", () => {
+    const entry = node(freshConnection())
+    expect(entry.kind).toBe("layer")
+    expect(entry.name).toBe("@opencode/ToolCallLedger")
+    expect(entry.service).toBe(Service)
+    expect(entry.dependencies).toEqual([])
+  })
+
+  it.live("layer installs a ledger with the factory behavior", () =>
+    Effect.gen(function* () {
+      const ledger = yield* Service
+      const serviceSession = "ses_ledger_service"
+
+      yield* ledger.start({ callID: "call-service", sessionID: serviceSession, tool: "ledger" })
+      expect(yield* ledger.list(serviceSession)).toEqual([
+        expect.objectContaining({ callID: "call-service", state: "started", outcome: null }),
+      ])
+      expect(yield* ledger.hasSideEffectingStarted(serviceSession)).toBe(true)
+
+      yield* ledger.finish({ callID: "call-service", sessionID: serviceSession, outcome: "done" })
+      expect(yield* ledger.list(serviceSession)).toEqual([
+        expect.objectContaining({ callID: "call-service", state: "finished", outcome: "done" }),
+      ])
+      expect(yield* ledger.indeterminate(serviceSession)).toEqual([])
+    }).pipe(Effect.provide(layer(freshConnection()))),
+  )
+
+  it.live("make and fromHandle match the createToolCallLedger adapter", () =>
+    Effect.gen(function* () {
+      const service = yield* make(freshConnection())
+      const adapter = createToolCallLedger(freshConnection())
+      const serviceSession = "ses_ledger_adapter"
+      const input = { callID: "call-adapter", sessionID: serviceSession, tool: "ledger", timeStarted: 1_000 } as const
+
+      expect(service.ledger).toBeDefined()
+      expect(yield* service.start(input)).toEqual(adapter.start(input))
+      expect(yield* service.list(serviceSession)).toEqual(adapter.list(serviceSession))
+      expect(yield* service.hasSideEffectingStarted(serviceSession)).toBe(
+        adapter.hasSideEffectingStarted(serviceSession),
+      )
+
+      yield* service.finish({ callID: input.callID, sessionID: serviceSession, outcome: "done", timeFinished: 2_000 })
+      adapter.finish({ callID: input.callID, sessionID: serviceSession, outcome: "done", timeFinished: 2_000 })
+      expect(yield* service.list(serviceSession)).toEqual(adapter.list(serviceSession))
+      expect(yield* service.indeterminate(serviceSession)).toEqual(adapter.indeterminate(serviceSession))
+
+      const adapted = fromHandle(adapter)
+      expect(adapted.ledger).toBe(adapter)
+      expect(yield* adapted.list(serviceSession)).toEqual(adapter.list(serviceSession))
+    }),
+  )
 })

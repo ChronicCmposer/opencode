@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs"
-import { Effect } from "effect"
+import { Context, Effect, Layer } from "effect"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import type { Connection, WriteOutcome } from "@opencode-ai/core/database/connection"
 import type { RepositoryValues, WorkerRepository } from "@/session/worker/repository/types"
 import { connectedRepository } from "@/session/worker/repository/write"
@@ -152,9 +153,7 @@ export class ToolCallNotStartedError extends ToolCallLedgerError {
  */
 export class StaleWorkerGenerationError extends ToolCallLedgerError {
   constructor(sessionID: string, expected: string, actual: string | undefined) {
-    super(
-      `worker generation ${expected} is stale for session ${sessionID}: current lease owner is ${actual ?? "none"}`,
-    )
+    super(`worker generation ${expected} is stale for session ${sessionID}: current lease owner is ${actual ?? "none"}`)
     this.name = "StaleWorkerGenerationError"
   }
 }
@@ -279,11 +278,7 @@ function finishWith(repository: WorkerRepository, input: FinishInput, fence?: To
  * production tool path uses {@link startStandaloneWith} so a parallel tool
  * cannot record its start inside another tool's result transaction.
  */
-export function start(
-  source: ToolCallLedgerSource,
-  input: StartInput,
-  fence?: ToolCallFence,
-): ToolCallRow {
+export function start(source: ToolCallLedgerSource, input: StartInput, fence?: ToolCallFence): ToolCallRow {
   return startWith(repositoryFor(source), input, fence)
 }
 
@@ -302,11 +297,7 @@ function startStandaloneWith(
  * connection already owns; use {@link finishWithResult} when the result needs a
  * transaction the ledger owns.
  */
-export function finish(
-  source: ToolCallLedgerSource,
-  input: FinishInput,
-  fence?: ToolCallFence,
-): ToolCallRow {
+export function finish(source: ToolCallLedgerSource, input: FinishInput, fence?: ToolCallFence): ToolCallRow {
   return finishWith(repositoryFor(source), input, fence)
 }
 
@@ -421,6 +412,84 @@ export function createToolCallLedger(
     list: (sessionID) => listWith(repository, sessionID),
     hasSideEffectingStarted: (sessionID) => hasSideEffectingStartedWith(repository, sessionID),
   }
+}
+
+// ---------------------------------------------------------------------------
+// Effect service shape.
+//
+// The `ToolCallLedger` service is the same ledger behavior expressed as an
+// Effect service. `createToolCallLedger` stays the synchronous adapter; every
+// service method lifts one handle operation without changing the repository,
+// fence, or savepoint semantics. State stays in the adapter's closure.
+// ---------------------------------------------------------------------------
+
+/** The Effect-facing ledger surface. `ledger` is the synchronous adapter. */
+export interface Interface {
+  readonly ledger: ToolCallLedgerHandle
+  readonly startStandalone: (input: StartInput) => Effect.Effect<ToolCallRow>
+  readonly start: (input: StartInput) => Effect.Effect<ToolCallRow>
+  readonly finish: (input: FinishInput) => Effect.Effect<ToolCallRow>
+  readonly finishStandalone: (input: FinishInput) => Effect.Effect<ToolCallRow>
+  readonly finishWithResult: <T>(input: FinishInput, result: () => T) => Effect.Effect<T>
+  readonly indeterminate: (sessionID: string) => Effect.Effect<readonly ToolCallRow[]>
+  readonly list: (sessionID: string) => Effect.Effect<readonly ToolCallRow[]>
+  readonly hasSideEffectingStarted: (sessionID: string) => Effect.Effect<boolean>
+}
+
+export class Service extends Context.Service<Service, Interface>()("@opencode/ToolCallLedger") {}
+
+/** Adapt the synchronous handle without owning, reordering, or retrying anything. */
+export function fromHandle(ledger: ToolCallLedgerHandle): Interface {
+  const startStandalone = Effect.fn("ToolCallLedger.startStandalone")(function* (input: StartInput) {
+    return yield* ledger.startStandalone(input)
+  })
+  const start = Effect.fn("ToolCallLedger.start")(function* (input: StartInput) {
+    return ledger.start(input)
+  })
+  const finish = Effect.fn("ToolCallLedger.finish")(function* (input: FinishInput) {
+    return ledger.finish(input)
+  })
+  const finishStandalone = Effect.fn("ToolCallLedger.finishStandalone")(function* (input: FinishInput) {
+    return yield* ledger.finishStandalone(input)
+  })
+  const indeterminate = Effect.fn("ToolCallLedger.indeterminate")(function* (sessionID: string) {
+    return ledger.indeterminate(sessionID)
+  })
+  const list = Effect.fn("ToolCallLedger.list")(function* (sessionID: string) {
+    return ledger.list(sessionID)
+  })
+  const hasSideEffectingStarted = Effect.fn("ToolCallLedger.hasSideEffectingStarted")(function* (sessionID: string) {
+    return ledger.hasSideEffectingStarted(sessionID)
+  })
+  return {
+    ledger,
+    startStandalone,
+    start,
+    finish,
+    finishStandalone,
+    finishWithResult: (input, result) => Effect.sync(() => ledger.finishWithResult(input, result)),
+    indeterminate,
+    list,
+    hasSideEffectingStarted,
+  }
+}
+
+/** Build a ledger over the given source; no resource needs a scope. */
+export function make(source: ToolCallLedgerSource, options: ToolCallLedgerOptions = {}): Effect.Effect<Interface> {
+  return Effect.sync(() => fromHandle(createToolCallLedger(source, options)))
+}
+
+/** Install a `ToolCallLedger` implementation into the context. */
+export function layer(source: ToolCallLedgerSource, options: ToolCallLedgerOptions = {}): Layer.Layer<Service> {
+  return Layer.effect(Service, make(source, options))
+}
+
+/** The unbound graph node for {@link Service}; this lane does not wire a consumer. */
+export function node(
+  source: ToolCallLedgerSource,
+  options: ToolCallLedgerOptions = {},
+): LayerNode.Node<Service, never, undefined> {
+  return LayerNode.make({ service: Service, layer: layer(source, options), deps: [] })
 }
 
 export * as ToolCallLedger from "./tool-call"

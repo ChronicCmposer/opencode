@@ -1,5 +1,5 @@
 // Production hub layer/node/resolver wiring.
-import { Context, Effect, Fiber, Layer, Option } from "effect"
+import { Context, Effect, Fiber, Layer, Option, Scope } from "effect"
 import os from "node:os"
 import path from "node:path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -60,6 +60,7 @@ import {
   type SessionHub,
   type SessionHubOptions,
   type WorkerCrashed,
+  type WorkerPortSeams,
 } from "./hub"
 import {
   buildHubProxyHandlers,
@@ -83,15 +84,20 @@ import {
   logRunIdleTimeoutWarning,
   resolveRunIdleTimeoutMs,
   withSessionWorkerPorts,
+  WorkerPools as WorkerPoolsModule,
   type DescribedSessionWorkerEntry,
+  type Interface as WorkerPoolsInterface,
   type ProductionPoolFactory,
+  type ProductionWorkerPoolOptions,
   type SessionWorkerInitSource,
   type WorkerPoolSinks,
 } from "./worker-pools"
 import {
   drainEgressPort,
+  WorkerPorts as WorkerPortsModule,
   type WorkerPortBackends,
   type WorkerPortBackendsSource,
+  type WorkerPorts as WorkerPortsInterface,
   type WorkerTransferredPorts,
 } from "./worker-ports"
 import { SessionHubService } from "./hub"
@@ -549,6 +555,29 @@ export interface ProductionSessionHubOptions {
    * production pool omits it, so every run drains through its own reports.
    */
   readonly barrierPhases?: (sessionID: SessionID) => RunBarrierPhases
+  /**
+   * The layer scope that owns the Wave-6 `WorkerPorts` / `WorkerPools` services
+   * this hub creates internally. `productionSessionHubLayer` supplies it so those
+   * services' finalizers run with the layer; a caller-supplied `workerPorts` /
+   * `workerPools` is never finalized by this hub (see those options). A direct
+   * caller without a scope keeps the factory adapters.
+   */
+  readonly scope?: Scope.Scope
+  /**
+   * Receives the resolved port/pool services so the layer can order teardown
+   * (ports first, then the pool) and tests can observe the wiring.
+   */
+  readonly onServices?: (services: ProductionHubServices) => void
+  /** A pre-built, caller-owned port service; the hub never registers its finalizer. */
+  readonly workerPorts?: WorkerPortsInterface
+  /** A pre-built, caller-owned pool service; the hub never registers its finalizer. */
+  readonly workerPools?: WorkerPoolsInterface
+}
+
+/** The Wave-6 services the production hub composes for a worker's ports/pool. */
+export interface ProductionHubServices {
+  readonly workerPorts?: WorkerPortsInterface
+  readonly workerPools: WorkerPoolsInterface
 }
 
 /** Reaping is best-effort teardown: a failed kill must not block cancellation. */
@@ -625,6 +654,25 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   // the real hub process; no worker's `ocs<slot>` name can be clobbered.
   setThreadName("och")
   const log = options.log ?? noopWorkerLogger
+  const scope = options.scope
+  const runScoped = <A>(effect: Effect.Effect<A, never, Scope.Scope>): A => Effect.runSync(Scope.provide(scope!)(effect))
+  // One backend build for both the hub's dispose bookkeeping and the port
+  // service: a function source is memoized here, so neither owner can construct
+  // a second egress mesh. The resolved flag is set only AFTER the source
+  // succeeds, so a transient build failure rethrows on the next attach instead
+  // of being cached as "no backends".
+  const portSource = options.ports
+  let portBackendsBuilt = false
+  let portBackendsValue: WorkerPortBackends | undefined
+  const sharedPortSource: WorkerPortBackendsSource | undefined =
+    typeof portSource === "function"
+      ? () => {
+          if (portBackendsBuilt) return portBackendsValue as WorkerPortBackends
+          portBackendsValue = portSource()
+          portBackendsBuilt = true
+          return portBackendsValue
+        }
+      : portSource
   // One permit serializes every cold isolate spawn for this hub (and every
   // crash respawn, because the pool retains the same handle).
   const spawnGate =
@@ -699,7 +747,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
     typeof options.init === "function" ? options.init : () => options.init as SessionWorkerInit
   const resolveInit = async (sessionID?: SessionID): Promise<SessionWorkerInit> => {
     const init = await resolveSource(sessionID)
-    return options.ports === undefined ? init : withSessionWorkerPorts(init)
+    return sharedPortSource === undefined ? init : withSessionWorkerPorts(init)
   }
   // Persist every typed crash on the hub's off-loop DB thread unless the caller
   // supplied its own sink. The payload returned to the caller is the same value.
@@ -712,42 +760,67 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   // a test/custom factory receives it so `maxRunningWorkers` is never silently
   // ignored when the factory builds the pool.
   const maxRunning = options.maxRunningWorkers ?? os.availableParallelism()
-  const pool =
-    options.poolFactory !== undefined
-      ? options.poolFactory(resolveInit, sinks, { maxRunning })
-      : createProductionWorkerPool({
-          init: resolveInit,
-          log,
-          onPhase: (sessionID, phase) => lifecycle.phase(sessionID, phase),
-          // An idle-cap eviction is a full generation retirement: drop the
-          // dispatcher entry, terminate, and run the hub release (ports, asks,
-          // lease). Wired lazily because the hub is created after the pool.
-          onIdleEvicted: (sessionID) => hub?.dispatcher.retire(sessionID) ?? Promise.resolve(),
-          ...defined({
-            entry: describedEntry.entry,
-            databasePath: options.databasePath,
-            timeoutMs: options.timeoutMs,
-            runIdleTimeoutMs,
-            workKind: options.workKind,
-            env: options.env,
-            egressBarrier: options.egressBarrier,
-            onSessionRebound: options.onSessionRebound,
-            // The pool hook stays internal (init-cache cleanup); the dispatcher
-            // owns the caller's `onSessionReleased`, so wiring it here too would
-            // fire it twice per retirement.
-            spawnGate,
-            bootTimeoutMs: options.bootTimeoutMs,
-            onBootTelemetry: options.onBootTelemetry,
-            maxRunning,
-            ...(options.generationOf === undefined ? {} : { generationOf: options.generationOf }),
-            beforeSpawn: awaitBootGate,
+  const poolOptions: ProductionWorkerPoolOptions = {
+    init: resolveInit,
+    log,
+    onPhase: (sessionID, phase) => lifecycle.phase(sessionID, phase),
+    // An idle-cap eviction is a full generation retirement: drop the
+    // dispatcher entry, terminate, and run the hub release (ports, asks,
+    // lease). Wired lazily because the hub is created after the pool.
+    onIdleEvicted: (sessionID) => hub?.dispatcher.retire(sessionID) ?? Promise.resolve(),
+    ...defined({
+      entry: describedEntry.entry,
+      databasePath: options.databasePath,
+      timeoutMs: options.timeoutMs,
+      runIdleTimeoutMs,
+      workKind: options.workKind,
+      env: options.env,
+      egressBarrier: options.egressBarrier,
+      onSessionRebound: options.onSessionRebound,
+      // The pool hook stays internal (init-cache cleanup); the dispatcher
+      // owns the caller's `onSessionReleased`, so wiring it here too would
+      // fire it twice per retirement.
+      spawnGate,
+      bootTimeoutMs: options.bootTimeoutMs,
+      onBootTelemetry: options.onBootTelemetry,
+      maxRunning,
+      ...(options.generationOf === undefined ? {} : { generationOf: options.generationOf }),
+      beforeSpawn: awaitBootGate,
+    }),
+    // A same-session model switch replaces the isolate in place, so the
+    // dispatcher never retires it. Route it through the hub's full
+    // generation retirement (lost calls, ports, pending asks, lease).
+    onGenerationRetired: (sessionID, workerID) => hub?.releaseGeneration(sessionID, workerID),
+    ...sinks,
+  }
+  // Scope ownership: only services this hub creates internally are attached to
+  // `options.scope` (their `make` installs the scope finalizer). A caller-supplied
+  // `workerPorts` / `workerPools` stays caller-owned and is never registered for
+  // teardown here. Pools are constructed before ports so the services' LIFO
+  // finalizers dispose ports before terminating the pool; in production the
+  // layer's hub finalizer is the single owner of that ordering.
+  let workerPortSeams: WorkerPortSeams | undefined
+  const workerPools: WorkerPoolsInterface =
+    options.workerPools ??
+    (options.poolFactory !== undefined
+      ? WorkerPoolsModule.fromPool(options.poolFactory(resolveInit, sinks, { maxRunning }))
+      : scope === undefined
+        ? WorkerPoolsModule.fromPool(createProductionWorkerPool(poolOptions))
+        : runScoped(WorkerPoolsModule.makeProduction(poolOptions)))
+  const workerPorts: WorkerPortsInterface | undefined =
+    options.workerPorts ??
+    (scope === undefined
+      ? undefined
+      : runScoped(
+          WorkerPortsModule.make({
+            log,
+            backends: sharedPortSource,
+            hubProxyHandlersFor: (workerID) => workerPortSeams?.hubProxyHandlersFor(workerID),
+            hubProxyStreamingFor: (workerID) => workerPortSeams?.hubProxyStreamingFor(workerID),
+            onPidReport: (workerID, report) => workerPortSeams?.onPidReport?.(workerID, report),
           }),
-          // A same-session model switch replaces the isolate in place, so the
-          // dispatcher never retires it. Route it through the hub's full
-          // generation retirement (lost calls, ports, pending asks, lease).
-          onGenerationRetired: (sessionID, workerID) => hub?.releaseGeneration(sessionID, workerID),
-          ...sinks,
-        })
+        ))
+  const pool = workerPools.executorPool
   // The hub-side mirror of every worker child's process group: a
   // terminate reaps the worker's mirrored PGIDs and shutdown reaps the rest.
   // Filled by the worker's `{type:"pid-report"}` control-port frames below; a
@@ -765,12 +838,13 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
       // A bad/conflicting entry must not take the control port down.
     }
   }
+  options.onServices?.({ ...(workerPorts === undefined ? {} : { workerPorts }), workerPools })
   hub = createSessionHub({
     pool,
     log,
     lifecycle,
     ...defined({
-      ports: options.ports,
+      ports: sharedPortSource,
       db: options.db,
       cache: options.cache,
       onWorkerCrashed: crashSink,
@@ -787,6 +861,14 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
       barrierPhases: options.barrierPhases,
       onPidReport,
     }),
+    ...(workerPorts === undefined
+      ? {}
+      : {
+          workerPorts,
+          bindWorkerPortSeams: (seams: WorkerPortSeams) => {
+            workerPortSeams = seams
+          },
+        }),
     cancellation: (pool) =>
       createWorkerCancellation(pool, {
         ...options.cancellation,
@@ -863,6 +945,8 @@ export interface ProductionSessionHubNodeOptions {
   readonly generationOf?: (sessionID: SessionID) => string | Promise<string>
   /** The background-promotion decision the hub observed (see `SessionHubOptions`). */
   readonly promotionOutcome?: (sessionID: SessionID) => RunBarrierPromotionOutcome
+  /** Receives the resolved port/pool services (layer teardown ordering, tests). */
+  readonly onServices?: (services: ProductionHubServices) => void
 }
 
 /** The hub-authoritative services a per-session worker init is built from. */
@@ -1345,6 +1429,8 @@ export function productionSessionHubLayer(
   return Layer.effect(
     SessionHubService,
     Effect.gen(function* () {
+      // The layer scope owns the Wave-6 port/pool services created below.
+      const scope = yield* Scope.Scope
       const config = yield* Config.Service
       const auth = yield* Auth.Service
       const modelsDev = yield* ModelsDev.Service
@@ -1471,6 +1557,7 @@ export function productionSessionHubLayer(
           }))
       const hub = createProductionSessionHub({
         ...options,
+        scope,
         count,
         databasePath,
         init: resolvers.resolveInit,

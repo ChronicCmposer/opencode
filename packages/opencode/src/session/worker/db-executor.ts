@@ -8,8 +8,10 @@
 
 import { Database, type SQLQueryBindings } from "bun:sqlite"
 import { isMainThread, parentPort, threadId, workerData } from "node:worker_threads"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { executorPragmas, resolveWalConfig } from "@opencode-ai/core/database/pragmas"
 import { EXECUTOR_BUSY_RETRY_CONFIG, isBusyError, retryBusySync } from "@opencode-ai/core/database/transaction"
+import { Context, Effect, Layer, type Scope } from "effect"
 import { resolveWorkerEntry } from "./port"
 
 export type DbParams = ReadonlyArray<unknown> | Record<string, unknown>
@@ -362,13 +364,12 @@ if (!isMainThread && isDbExecutorWorkerData(workerData)) {
 }
 
 /** Resolve the executor isolate entry (env override, build define, source sibling). */
-export function resolveDbExecutorEntry(options: { readonly env?: Record<string, string | undefined> } = {}):
-  | string
-  | URL {
+export function resolveDbExecutorEntry(
+  options: { readonly env?: Record<string, string | undefined> } = {},
+): string | URL {
   return resolveWorkerEntry({
     env: options.env,
-    definedPath:
-      typeof OPENCODE_DB_EXECUTOR_PATH !== "undefined" ? OPENCODE_DB_EXECUTOR_PATH : undefined,
+    definedPath: typeof OPENCODE_DB_EXECUTOR_PATH !== "undefined" ? OPENCODE_DB_EXECUTOR_PATH : undefined,
     envVar: "OPENCODE_DB_EXECUTOR_PATH",
     fallback: new URL("./db-executor.ts", import.meta.url),
   })
@@ -595,10 +596,7 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
    * retry it within the shared executor budget instead of surfacing a transient
    * lock. Transactions keep their own whole-body retry inside the worker.
    */
-  const request = async (
-    build: (id: number) => DbExecutorRequest,
-    retryBusy: boolean,
-  ): Promise<unknown> => {
+  const request = async (build: (id: number) => DbExecutorRequest, retryBusy: boolean): Promise<unknown> => {
     let attempts = 0
     for (;;) {
       attempts += 1
@@ -633,9 +631,7 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
         true,
       ) as Promise<ReadonlyArray<Record<string, unknown>>>,
     transaction: (statements) =>
-      request((id) => ({ type: "transaction", id, statements }), false) as Promise<
-        ReadonlyArray<DbTransactionResult>
-      >,
+      request((id) => ({ type: "transaction", id, statements }), false) as Promise<ReadonlyArray<DbTransactionResult>>,
     get threadId() {
       return executorThreadId
     },
@@ -656,5 +652,76 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
     },
   }
 }
+
+// ---------------------------------------------------------------------------
+// Effect service shape.
+//
+// The `DbExecutor` service is the same executor behavior expressed as an Effect
+// service. The Promise executor stays the adapter (`createDbExecutor`); every
+// service method lifts one of its operations without changing ordering,
+// deadlines, retries, or teardown. State stays in the adapter's closure.
+// ---------------------------------------------------------------------------
+
+/**
+ * The Effect-facing executor surface. `executor` is the raw Promise adapter the
+ * service delegates to; the remaining members lift each operation.
+ */
+export interface Interface {
+  readonly executor: DbExecutor
+  readonly run: (sql: string, params?: DbParams) => Effect.Effect<DbRunResult>
+  readonly query: (sql: string, params?: DbParams) => Effect.Effect<ReadonlyArray<Record<string, unknown>>>
+  readonly transaction: (statements: ReadonlyArray<DbStatement>) => Effect.Effect<ReadonlyArray<DbTransactionResult>>
+  readonly close: () => Effect.Effect<void>
+  /** The isolate's real thread id; `0` until the ready frame arrives. */
+  readonly threadId: number
+}
+
+export class Service extends Context.Service<Service, Interface>()("@opencode/DbExecutor") {}
+
+/** Adapt the Promise executor without owning, reordering, or retrying anything. */
+export function fromExecutor(executor: DbExecutor): Interface {
+  const run = Effect.fn("DbExecutor.run")(function* (sql: string, params?: DbParams) {
+    return yield* Effect.promise(() => executor.run(sql, params))
+  })
+  const query = Effect.fn("DbExecutor.query")(function* (sql: string, params?: DbParams) {
+    return yield* Effect.promise(() => executor.query(sql, params))
+  })
+  const transaction = Effect.fn("DbExecutor.transaction")(function* (statements: ReadonlyArray<DbStatement>) {
+    return yield* Effect.promise(() => executor.transaction(statements))
+  })
+  const close = Effect.fn("DbExecutor.close")(function* () {
+    yield* Effect.promise(() => executor.close())
+  })
+  return {
+    executor,
+    run,
+    query,
+    transaction,
+    close,
+    get threadId() {
+      return executor.threadId
+    },
+  }
+}
+
+/** Build the executor on demand; the scope owns its native-handle close. */
+export function make(options: DbExecutorOptions): Effect.Effect<Interface, never, Scope.Scope> {
+  return Effect.acquireRelease(
+    Effect.sync(() => fromExecutor(createDbExecutor(options))),
+    (service) => service.close(),
+  )
+}
+
+/** Install a `DbExecutor` implementation into the context. */
+export function layer(options: DbExecutorOptions): Layer.Layer<Service> {
+  return Layer.effect(Service, make(options))
+}
+
+/** The unbound graph node for {@link Service}; this lane does not wire a consumer. */
+export function node(options: DbExecutorOptions): LayerNode.Node<Service, never, undefined> {
+  return LayerNode.make({ service: Service, layer: layer(options), deps: [] })
+}
+
+export * as DbExecutor from "./db-executor"
 
 export * as DbExecutorModule from "./db-executor"

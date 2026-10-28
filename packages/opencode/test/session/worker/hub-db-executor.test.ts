@@ -4,6 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import { threadId as mainThreadId } from "node:worker_threads"
 import { Database as BunDatabase } from "bun:sqlite"
+import { Cause, Effect, Exit } from "effect"
 import {
   createDbExecutor,
   DbExecutorClosedError,
@@ -11,8 +12,14 @@ import {
   DbExecutorRemoteError,
   DbExecutorRollbackError,
   DbExecutorTimeoutError,
+  fromExecutor,
+  layer,
+  make,
+  node,
+  Service,
   type DbExecutor,
 } from "@/session/worker/db-executor"
+import { it } from "../../lib/effect"
 import { DEFAULT_TEST_TIMEOUT_MS } from "../../lib/worker-timeouts"
 
 // Bun resets the per-file default to 5s. The deadline test's executor budget
@@ -291,4 +298,72 @@ describe("db executor hardening", () => {
       fs.rmSync(directory, { recursive: true, force: true })
     }
   })
+})
+
+describe("db executor service", () => {
+  test("node exposes the unbound DbExecutor service tag", () => {
+    const entry = node({ filename: ":memory:" })
+    expect(entry.kind).toBe("layer")
+    expect(entry.name).toBe("@opencode/DbExecutor")
+    expect(entry.service).toBe(Service)
+    expect(entry.dependencies).toEqual([])
+  })
+
+  it.live("layer installs an executor that forwards run/query/transaction", () =>
+    Effect.gen(function* () {
+      const executor = yield* Service
+      expect(executor.executor).toBeDefined()
+      expect(executor.threadId).toBe(0)
+
+      yield* executor.run("CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT)")
+      expect(
+        yield* executor.transaction([
+          { sql: "INSERT INTO item (name) VALUES (?)", params: ["a"] },
+          { sql: "INSERT INTO item (name) VALUES (?)", params: ["b"] },
+        ]),
+      ).toEqual([
+        { changes: 1, lastInsertRowid: 1 },
+        { changes: 1, lastInsertRowid: 2 },
+      ])
+      expect(yield* executor.query("SELECT name FROM item ORDER BY id")).toEqual([{ name: "a" }, { name: "b" }])
+      expect(executor.threadId).toBeGreaterThan(0)
+    }).pipe(Effect.provide(layer({ filename: ":memory:" }))),
+  )
+
+  it.live("make closes the Promise executor when its scope closes", () =>
+    Effect.gen(function* () {
+      const executor = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const scoped = yield* make({ filename: ":memory:" })
+          yield* scoped.run("SELECT 1 AS n")
+          return scoped
+        }),
+      )
+
+      const exit = yield* Effect.exit(executor.run("SELECT 1 AS n"))
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(DbExecutorClosedError)
+    }),
+  )
+
+  it.live("service methods match the Promise factory adapter", () =>
+    Effect.gen(function* () {
+      const raw = createDbExecutor({ filename: ":memory:" })
+      const service = fromExecutor(raw)
+      try {
+        expect(service.executor).toBe(raw)
+        yield* service.run("CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT)")
+        expect(yield* service.transaction([{ sql: "INSERT INTO item (name) VALUES (?)", params: ["a"] }])).toEqual([
+          { changes: 1, lastInsertRowid: 1 },
+        ])
+        // `fromExecutor` never owns or reorders the adapter's requests.
+        expect(service.threadId).toBe(raw.threadId)
+        expect(yield* service.query("SELECT name FROM item")).toEqual(
+          yield* Effect.promise(() => raw.query("SELECT name FROM item")),
+        )
+      } finally {
+        yield* service.close()
+      }
+    }),
+  )
 })

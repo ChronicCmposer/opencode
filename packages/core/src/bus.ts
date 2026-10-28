@@ -3,10 +3,11 @@ export * as Bus from "./bus"
 import { createHash, randomUUID } from "node:crypto"
 import fs from "node:fs"
 import path from "node:path"
-import { Schema } from "effect"
+import { Context, Effect, Layer, Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import { decodeDurablePayload, type SerializedEvent } from "./event"
 import { inImmediateTransaction, inImmediateTransactionAsync } from "./database/transaction"
+import { makeGlobalNode, type GlobalNode } from "./effect/app-node"
 
 /**
  * The synchronous connection a Bus writes through. It matches the worker
@@ -315,6 +316,9 @@ export interface Interface {
    */
   readonly deleteAggregate: (aggregateID: string) => number
 }
+
+/** The `Bus` service exposes the synchronous durable bus through the Effect context. */
+export class Service extends Context.Service<Service, Interface>()("@opencode/Bus") {}
 
 /** Where oversized payloads live and whether this schema can offload them. */
 export interface BlobStore {
@@ -1516,6 +1520,21 @@ export function create(options: Options): Interface {
     collectBlobs,
     deleteAggregate,
   }
+}
+
+/** Construct the `Bus` service from the same options {@link create} accepts. */
+export function make(options: Options): Effect.Effect<Interface> {
+  return Effect.sync(() => create(options))
+}
+
+/** Install a `Bus` service into the context; `create(options)` remains the adapter. */
+export function layer(options: Options): Layer.Layer<Service> {
+  return Layer.effect(Service, make(options))
+}
+
+/** The global graph node for {@link Service}, bound to one bus's options. */
+export function node(options: Options): GlobalNode<Service> {
+  return makeGlobalNode({ service: Service, layer: layer(options), deps: [] })
 }
 
 /** SQLite binds at most 999 parameters by default; chunk well below it. */

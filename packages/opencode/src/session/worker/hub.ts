@@ -13,7 +13,7 @@
 // pool-spawning layer node (`makeSessionHubNode`) provides it and tears the pool
 // down with the layer scope.
 
-import { Context } from "effect"
+import { Context, Effect } from "effect"
 import path from "node:path"
 import { InstanceRef } from "@/effect/instance-ref"
 import { SessionStatus } from "@/session/status"
@@ -55,6 +55,7 @@ import {
   type WorkerPortBackends,
   type WorkerPortBackendsSource,
   type WorkerPortRegistry,
+  type WorkerPorts as WorkerPortsInterface,
   type WorkerTransferredPorts,
 } from "./worker-ports"
 
@@ -226,6 +227,18 @@ export class SessionHubService extends Context.Service<SessionHubService, Sessio
  */
 export type CancellationSource = CancellationConfig | ((pool: ExecutorWorkerPool) => CancellationConfig)
 
+/**
+ * The hub's per-worker handler seams. A pre-built `WorkerPorts` service owns the
+ * port servers but must serve the same lifecycle-bound handlers the hub's private
+ * registry built; the hub publishes them here during construction, before any
+ * attach can occur (attaches only happen after a dispatch).
+ */
+export interface WorkerPortSeams {
+  readonly hubProxyHandlersFor: (workerID: number) => HubProxyHandlers | undefined
+  readonly hubProxyStreamingFor: (workerID: number) => Readonly<Record<string, HubProxyStreamHandler>> | undefined
+  readonly onPidReport?: (workerID: number, report: PidReport) => void
+}
+
 export interface SessionHubOptions {
   /** The executor pool; production workers spawn on the first dispatch, not at boot. */
   readonly pool: ExecutorWorkerPool
@@ -235,6 +248,17 @@ export interface SessionHubOptions {
    * ports; the production init advertises `capabilities.sessionWorkerPorts`.
    */
   readonly ports?: WorkerPortBackendsSource
+  /**
+   * A pre-resolved Wave-6 `WorkerPorts` service. When supplied the hub adapts its
+   * Effect API to the synchronous attach surface instead of building a private
+   * registry; the caller owns the service's scope and finalizers.
+   */
+  readonly workerPorts?: WorkerPortsInterface
+  /**
+   * Receives the hub's per-worker handler seams so a service constructed before
+   * the hub can serve the same lifecycle-bound handlers as the private registry.
+   */
+  readonly bindWorkerPortSeams?: (seams: WorkerPortSeams) => void
   /**
    * Invoked synchronously at the start of every `ensureRunning`/`startShell`,
    * before any async work, with the session being dispatched. Used by the
@@ -1137,13 +1161,46 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   // Assigned once the registry exists (below); read lazily by the attach thunks.
   let ports: WorkerPortRegistry
 
-  ports = createWorkerPortRegistry({
-    log,
-    backends: portBackends,
-    hubProxyHandlersFor,
-    hubProxyStreamingFor,
-    onPidReport: options.onPidReport,
-  })
+  // A pre-built service owns the port servers, but the hub still owns the
+  // per-worker handler seams (they bind reports to the reporting worker's
+  // session). Publish them before any attach can occur (attaches are post-dispatch).
+  const portService = options.workerPorts
+  if (portService !== undefined) {
+    options.bindWorkerPortSeams?.({
+      hubProxyHandlersFor,
+      hubProxyStreamingFor,
+      ...(options.onPidReport === undefined ? {} : { onPidReport: options.onPidReport }),
+    })
+  }
+
+  ports =
+    portService === undefined
+      ? createWorkerPortRegistry({
+          log,
+          backends: portBackends,
+          hubProxyHandlersFor,
+          hubProxyStreamingFor,
+          onPidReport: options.onPidReport,
+        })
+      : {
+          // The synchronous attach surface the pool sinks and SessionHub expose.
+          // Resolve the hub's backend memoization first so one build owns the
+          // backend resources and `terminateAll` still disposes them.
+          attachWorkerPorts: (workerID, transferred) => {
+            portBackends()
+            return Effect.runSync(portService.attachWorkerPorts(workerID, transferred))
+          },
+          attachHubProxyPort: (workerID, port) => {
+            portBackends()
+            return Effect.runSync(portService.attachHubProxyPort(workerID, port))
+          },
+          disposeWorker: (workerID) => {
+            Effect.runSync(portService.disposeWorker(workerID))
+          },
+          disposeAll: () => {
+            Effect.runSync(portService.disposeAll())
+          },
+        }
 
   /**
    * The served hub-proxy handler map for ONE worker: the caller's authorities,

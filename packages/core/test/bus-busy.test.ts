@@ -8,8 +8,10 @@ import os from "node:os"
 import path from "node:path"
 import { afterEach, describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
-import { Schema } from "effect"
+import { Effect, Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
+import { Node } from "../src/effect/app-node"
+import { LayerNode } from "../src/effect/layer-node"
 import { Bus } from "../src/bus"
 import { BusyExhaustedError } from "../src/database/transaction"
 
@@ -146,8 +148,57 @@ describe("Bus publish busy retry (M9 / D5)", () => {
     }
     const bus = Bus.create({ connection: failing, ownerID: "gen-1", definitions: [Note] })
 
-    expect(() => bus.publish([{ definition: Note, data: { sessionID: "s1", text: "x" } }])).toThrow(
-      /no such table/,
+    expect(() => bus.publish([{ definition: Note, data: { sessionID: "s1", text: "x" } }])).toThrow(/no such table/)
+  })
+})
+
+describe("Bus service idiom", () => {
+  test("Service tag, make adapter equivalence, and global node shape", async () => {
+    const fromFactory = Bus.create({ connection: connection(native()), ownerID: "gen-service" })
+    const fromMake = await Effect.runPromise(Bus.make({ connection: connection(native()), ownerID: "gen-service" }))
+
+    expect(Bus.Service.key).toBe("@opencode/Bus")
+    expect(Object.keys(fromMake).sort()).toEqual(Object.keys(fromFactory).sort())
+
+    const node = Bus.node({ connection: connection(native()), ownerID: "gen-service" })
+    expect(node.kind).toBe("layer")
+    expect(node.name).toBe("@opencode/Bus")
+    expect(node.service).toBe(Bus.Service)
+    expect(node.tag).toBe(Node.tags.values.global)
+    expect(node.dependencies).toEqual([])
+  })
+
+  test("layer and node provide a Bus equivalent to create", async () => {
+    const viaLayer = await Effect.runPromise(
+      Effect.gen(function* () {
+        return yield* Bus.Service
+      }).pipe(
+        Effect.provide(
+          Bus.layer({
+            connection: connection(native()),
+            ownerID: "gen-service",
+            definitions: [Note],
+          }),
+        ),
+      ),
     )
+    const viaNode = await Effect.runPromise(
+      Effect.gen(function* () {
+        return yield* Bus.Service
+      }).pipe(
+        Effect.provide(
+          LayerNode.compile(
+            Bus.node({
+              connection: connection(native()),
+              ownerID: "gen-service",
+              definitions: [Note],
+            }),
+          ),
+        ),
+      ),
+    )
+
+    expect(viaLayer.publish([{ definition: Note, data: { sessionID: "s1", text: "layer" } }])[0]?.durable?.seq).toBe(0)
+    expect(viaNode.publish([{ definition: Note, data: { sessionID: "s1", text: "node" } }])[0]?.durable?.seq).toBe(0)
   })
 })
