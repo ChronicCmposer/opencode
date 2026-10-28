@@ -1,4 +1,4 @@
-// FOUNDATION (dbwal-12-00) — shared logging seam for the session-worker subsystem.
+// Shared logging seam for the session-worker subsystem.
 //
 // Purely additive: a worker logger is a synchronous function that either no-ops
 // (flag-off / no logger wired) or forks a severity-matched Effect through the

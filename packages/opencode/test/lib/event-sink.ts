@@ -1,4 +1,4 @@
-// Wave 1 — a fake hub event subscriber for parity tests (spec Q1/Q12).
+// A fake hub event subscriber for parity tests (spec Q1/Q12).
 //
 // `createEventSink` subscribes to the REAL `EventV2.Service` (or `GlobalBus`) and
 // records every emission as an ordered `{ id, type, properties }`, so a test can

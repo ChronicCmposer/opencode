@@ -1,4 +1,4 @@
-// Shared deep-freeze helper (plan consolidation).
+// Shared deep-freeze helper.
 //
 // Both the 3.3 capture harness and the 3.12 golden helper must hand back deeply
 // immutable records/snapshots, so the recursive freeze lives in exactly one

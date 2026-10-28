@@ -72,7 +72,7 @@ afterEach(() => {
   rmSync(directory, { recursive: true, force: true })
 })
 
-describe("Bus W1.8 owner lease", () => {
+describe("Bus owner lease", () => {
   test("claim is exclusive and a stale owner cannot write", () => {
     expect(busA.claim("s1")).toEqual({ aggregateID: "s1", ownerID: "worker-1/gen-1", seq: -1 })
     expect(() => busB.claim("s1")).toThrow(Bus.StaleOwnerError)

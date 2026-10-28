@@ -1,4 +1,4 @@
-// W2 — hub-side egress receiver over the shared JSON events transport (Q6/Q16/Q21).
+// Hub-side egress receiver over the shared JSON events transport (Q6/Q16/Q21).
 //
 // Every port message is one shared-envelope JSON string. Event frames are
 // delivered to `onFrame` in arrival order; durable `(aggregateID, seq)` pairs

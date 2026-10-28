@@ -28,6 +28,14 @@ import { LLMError, UnknownProviderReason, Usage, type LLMEvent } from "@opencode
 import { Faults } from "@/testing/faults"
 
 const DOOM_LOOP_THRESHOLD = 3
+
+/**
+ * Upper bound on the abort settlement drain. A normal result commit resolves
+ * the call's `done` deferred as soon as its transaction and lifecycle report
+ * finish, so this bound only stops cleanup from wedging on a tool that never
+ * settles; it is not the abort window.
+ */
+const ABORT_RESULT_DRAIN_MS = 2_000
 export type Result = "compact" | "stop" | "continue"
 
 /**
@@ -46,11 +54,17 @@ export class ToolCallDuringSummaryError extends Schema.TaggedErrorClass<ToolCall
 }
 
 /**
- * The durable settlement of one tool call: finish the `tool_call` row and drop
- * the hub-observed in-flight entry. It runs inside the same transaction as the
- * result part, so a crash leaves either both or neither.
+ * The durable settlement of one tool call, split by commit boundary.
+ *
+ * `commit` is the ledger write that must join the result transaction, so a
+ * crash leaves either both the result and the finish or neither. `afterCommit`
+ * is the hub-observed finish: it runs only once the result transaction has
+ * committed, never while the writer is held. `settle` is the standalone path
+ * for abort/cleanup, where no transaction exists.
  */
-export type ToolSettlement = (outcome: "ok" | "error") => Effect.Effect<void>
+export type ToolSettlementPhase = "commit" | "afterCommit" | "settle"
+
+export type ToolSettlement = (outcome: "ok" | "error", phase: ToolSettlementPhase) => Effect.Effect<void>
 
 export interface Handle {
   readonly message: SessionV1.Assistant
@@ -68,11 +82,10 @@ export interface Handle {
     },
   ) => Effect.Effect<void>
   /**
-   * Hold a successful tool call's settlement until its result commits. The tool
-   * wrapper registers this after the effect returns; `completeToolCall` invokes
-   * it inside the result transaction, so success can never settle before its
-   * durable result exists. Optional only for reduced test handles; the real
-   * processor always provides it.
+   * Bridge the tool wrapper's settlement to the result commit. `commit` joins
+   * the result transaction; `afterCommit` runs only after that transaction has
+   * committed; `settle` is the standalone abort/cleanup path. Optional only for
+   * reduced test handles; the real processor always provides it.
    */
   readonly registerToolSettlement?: (toolCallID: string, settle: ToolSettlement) => void
   readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
@@ -164,19 +177,21 @@ const layer = Layer.effect(
       const registerToolSettlement = (toolCallID: string, settle: ToolSettlement): void => {
         settlements.set(toolCallID, settle)
       }
-      const takeToolSettlement = (toolCallID: string): ToolSettlement | undefined => {
+      const settleRegistered = Effect.fnUntraced(function* (
+        toolCallID: string,
+        outcome: "ok" | "error",
+        phase: ToolSettlementPhase,
+      ) {
         const settle = settlements.get(toolCallID)
-        settlements.delete(toolCallID)
-        return settle
-      }
-      const settleRegistered = Effect.fnUntraced(function* (toolCallID: string, outcome: "ok" | "error") {
-        const settle = takeToolSettlement(toolCallID)
         if (settle === undefined) return
+        // `commit` must stay registered until its transaction succeeds, so a
+        // rollback can still be settled as an error by cleanup.
+        if (phase !== "commit") settlements.delete(toolCallID)
         // Ledger bookkeeping must never turn a committed result into a run
         // failure; the durable row is the only thing callers can rely on.
-        yield* settle(outcome).pipe(
+        yield* settle(outcome, phase).pipe(
           Effect.catchCause((cause) =>
-            Effect.logError("tool settlement failed", { toolCallID, outcome, cause }),
+            Effect.logError("tool settlement failed", { toolCallID, outcome, phase, cause }),
           ),
         )
       })
@@ -212,6 +227,20 @@ const layer = Layer.effect(
         return part
       })
 
+      /**
+       * A result writer (abort path, duplicate event, or failed call) owns the
+       * call's `done` deferred: resolving it on every exit, including an
+       * interrupt, lets cleanup's settlement drain end as soon as the writer's
+       * decision is final instead of waiting out its bound.
+       */
+      const withResultDrain = <A, E, R>(toolCallID: string, effect: Effect.Effect<A, E, R>) => {
+        const call = ctx.toolcalls[toolCallID]
+        if (call === undefined) return effect
+        return effect.pipe(
+          Effect.ensuring(Deferred.succeed(call.done, undefined).pipe(Effect.ignore)),
+        )
+      }
+
       const completeToolCall = Effect.fn("SessionProcessor.completeToolCall")(function* (
         toolCallID: string,
         output: {
@@ -221,75 +250,87 @@ const layer = Layer.effect(
           attachments?: SessionV1.FilePart[]
         },
       ) {
-        const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") {
-          // The abort path may have written the result early; a later AI SDK
-          // result event still has to drain the pending settlement.
-          yield* settleRegistered(toolCallID, "ok")
-          return
-        }
-        const completed: SessionV1.ToolPart = {
-          ...match.part,
-          state: {
-            status: "completed",
-            input: match.part.state.input,
-            output: output.output,
-            metadata: output.metadata,
-            title: output.title,
-            time: { start: match.part.state.time.start, end: Date.now() },
-            attachments: output.attachments,
-          },
-        }
-        // The result part and the success settlement commit together on the
-        // worker's one connection. A crash at any point in this transaction rolls
-        // both back, leaving the call `started` (indeterminate) instead of a
-        // finished call whose result was lost and would be replayed.
-        yield* database.db
-          .transaction(
-            () =>
-              Effect.gen(function* () {
-                yield* session.updatePart(completed)
-                yield* settleRegistered(toolCallID, "ok")
-                Faults.crashWorker("tool:settled")
-              }),
-            { behavior: "immediate" },
-          )
-          .pipe(Effect.orDie)
-        yield* settleToolCall(toolCallID)
+        return yield* withResultDrain(
+          toolCallID,
+          Effect.gen(function* () {
+            const match = yield* readToolCall(toolCallID)
+            if (!match || match.part.state.status !== "running") {
+              // The abort path may have written the result early; a later AI SDK
+              // result event still has to drain the pending settlement.
+              yield* settleRegistered(toolCallID, "ok", "settle")
+              return
+            }
+            const completed: SessionV1.ToolPart = {
+              ...match.part,
+              state: {
+                status: "completed",
+                input: match.part.state.input,
+                output: output.output,
+                metadata: output.metadata,
+                title: output.title,
+                time: { start: match.part.state.time.start, end: Date.now() },
+                attachments: output.attachments,
+              },
+            }
+            // The result part and the success settlement commit together on the
+            // worker's one connection. A crash at any point in this transaction rolls
+            // both back, leaving the call `started` (indeterminate) instead of a
+            // finished call whose result was lost and would be replayed.
+            yield* database.db
+              .transaction(
+                () =>
+                  Effect.gen(function* () {
+                    yield* session.updatePart(completed)
+                    yield* settleRegistered(toolCallID, "ok", "commit")
+                    Faults.crashWorker("tool:settled")
+                  }),
+                { behavior: "immediate" },
+              )
+              .pipe(Effect.orDie)
+            yield* settleRegistered(toolCallID, "ok", "afterCommit")
+            yield* settleToolCall(toolCallID)
+          }),
+        )
       })
 
       const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
-        const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") {
-          yield* settleRegistered(toolCallID, "error")
-          return false
-        }
-        const failed: SessionV1.ToolPart = {
-          ...match.part,
-          state: {
-            status: "error",
-            input: match.part.state.input,
-            error: errorMessage(error),
-            // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
-            metadata: match.part.state.metadata,
-            time: { start: match.part.state.time.start, end: Date.now() },
-          },
-        }
-        yield* database.db
-          .transaction(
-            () =>
-              Effect.gen(function* () {
-                yield* session.updatePart(failed)
-                yield* settleRegistered(toolCallID, "error")
-              }),
-            { behavior: "immediate" },
-          )
-          .pipe(Effect.orDie)
-        if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
-          ctx.blocked = ctx.shouldBreak
-        }
-        yield* settleToolCall(toolCallID)
-        return true
+        return yield* withResultDrain(
+          toolCallID,
+          Effect.gen(function* () {
+            const match = yield* readToolCall(toolCallID)
+            if (!match || match.part.state.status !== "running") {
+              yield* settleRegistered(toolCallID, "error", "settle")
+              return false
+            }
+            const failed: SessionV1.ToolPart = {
+              ...match.part,
+              state: {
+                status: "error",
+                input: match.part.state.input,
+                error: errorMessage(error),
+                // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
+                metadata: match.part.state.metadata,
+                time: { start: match.part.state.time.start, end: Date.now() },
+              },
+            }
+            yield* database.db
+              .transaction(
+                () =>
+                  Effect.gen(function* () {
+                    yield* session.updatePart(failed)
+                    yield* settleRegistered(toolCallID, "error", "commit")
+                  }),
+                { behavior: "immediate" },
+              )
+              .pipe(Effect.orDie)
+            yield* settleRegistered(toolCallID, "error", "afterCommit")
+            if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
+              ctx.blocked = ctx.shouldBreak
+            }
+            yield* settleToolCall(toolCallID)
+            return true
+          }),
+        )
       })
 
       const finishReasoning = Effect.fn("SessionProcessor.finishReasoning")(function* (reasoningID: string) {
@@ -690,7 +731,7 @@ const layer = Layer.effect(
 
         yield* Effect.forEach(
           Object.values(ctx.toolcalls),
-          (call) => Deferred.await(call.done).pipe(Effect.timeout("250 millis"), Effect.ignore),
+          (call) => Deferred.await(call.done).pipe(Effect.timeout(ABORT_RESULT_DRAIN_MS), Effect.ignore),
           { concurrency: "unbounded" },
         )
 
@@ -699,7 +740,7 @@ const layer = Layer.effect(
           if (!match) {
             // The part is gone but a settlement may still be parked: never leak
             // a `started` row or an in-flight lifecycle entry.
-            yield* settleRegistered(toolCallID, "error")
+            yield* settleRegistered(toolCallID, "error", "settle")
             continue
           }
           const part = match.part
@@ -707,7 +748,7 @@ const layer = Layer.effect(
           // still running is being aborted and settles error. Draining here is
           // what prevents an interrupted result from leaking a `started` row.
           const returned = part.state.status === "completed"
-          yield* settleRegistered(toolCallID, returned ? "ok" : "error")
+          yield* settleRegistered(toolCallID, returned ? "ok" : "error", "settle")
           if (returned) continue
           const end = Date.now()
           const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
@@ -725,7 +766,7 @@ const layer = Layer.effect(
         // Defensive: a registration whose part vanished before the loop snapshot
         // must still be drained rather than leak its ledger row.
         for (const toolCallID of [...settlements.keys()]) {
-          yield* settleRegistered(toolCallID, "error")
+          yield* settleRegistered(toolCallID, "error", "settle")
         }
         ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()

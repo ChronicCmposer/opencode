@@ -580,7 +580,7 @@ describe("session HttpApi", () => {
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
   )
 
-  // W9 acceptance (HTTP abort route, end-to-end): a background `task` subagent
+  // HTTP abort route, end-to-end: a background `task` subagent
   // must not outlive its parent's abort. Drives the real prompt -> task tool ->
   // child session through the HTTP routes, aborts the parent, and asserts both
   // sessions return to idle ("idle" == absent from the status map).

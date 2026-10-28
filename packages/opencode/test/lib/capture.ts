@@ -1,8 +1,8 @@
-// Capture harness for golden-equivalence tests (plan task 3.3).
+// Capture harness for golden-equivalence tests.
 //
 // A single ordered timeline records the three observable channels that a
 // session pipeline emits: durable/non-durable `event`s, `db` writes, and
-// `worker` messages. Later phases (3.12, 13.8, 14.2) snapshot this timeline
+// `worker` messages. Later tests snapshot this timeline
 // and compare runs for full-row equivalence.
 //
 // Design: records are immutable and clock-injected so a capture is a pure,

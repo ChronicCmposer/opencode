@@ -1,4 +1,4 @@
-// Phase 6.1 / 6.2 — reduced session layer inside a real worker isolate.
+// Reduced session layer inside a real worker isolate.
 //
 // Proves the reduced layer (node table + client nodes + snapshot) boots in a
 // Bun worker and runs the pipeline against the hub's mock provider, and that

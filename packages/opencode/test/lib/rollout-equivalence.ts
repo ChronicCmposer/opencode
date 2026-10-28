@@ -1,4 +1,4 @@
-// Phase 14.2 — rollout golden-equivalence harness.
+// Rollout golden-equivalence harness.
 //
 // Proves the rollout claim: relocating a session's execution into a worker isolate
 // does not change its durable output. One mock-SSE session is run two ways —

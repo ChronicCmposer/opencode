@@ -67,8 +67,14 @@ export interface Options {
   readonly blobLimitBytes?: number
 }
 
-/** D16 inline bound: 16 MiB. */
-export const DEFAULT_BLOB_LIMIT_BYTES = 16 * 1024 * 1024
+/**
+ * D16 inline bound: 4 MiB. This is deliberately the same bound as the worker
+ * egress frame cap (`MAX_WORKER_FRAME_BYTES`); a payload larger than one frame
+ * must be stored by reference before the event is fanned out, or the egress
+ * batch that carries it is rejected as oversized. The two constants are pinned
+ * together by a regression test in `blob-integrity-p1fix.test.ts`.
+ */
+export const DEFAULT_BLOB_LIMIT_BYTES = 4 * 1024 * 1024
 
 export interface PublishEvent<D extends Event.Definition = Event.Definition> {
   readonly definition: D
@@ -604,6 +610,27 @@ const stageBlobPayloads = (batch: PreparedBatch, blob: BlobStore): void => {
   }
 }
 
+/**
+ * Re-assert a staged blob file inside the publisher's write transaction. Staging
+ * runs before `BEGIN IMMEDIATE` (no filesystem work while the write lock is
+ * held), but a concurrent GC may have unlinked the file between staging and the
+ * lock; because GC now unlinks while holding the same `BEGIN IMMEDIATE`, the
+ * file cannot disappear again once this check runs. A missing/wrong-sized file
+ * is rewritten from the (already validated) payload.
+ */
+const ensureStagedBlob = (blob: BlobStore, encoded: string): void => {
+  if (blob.dir === undefined) return
+  const hash = digest(encoded)
+  const file = blobFile(blob.dir, hash)
+  try {
+    const stat = fs.statSync(file)
+    if (stat.isFile() && stat.size === Buffer.byteLength(encoded)) return
+  } catch {
+    // Missing after a concurrent GC: rewrite below.
+  }
+  writeBlobFile(blob.dir, hash, encoded)
+}
+
 const writePrepared = (
   repository: DurableRepository,
   ownerID: string,
@@ -658,6 +685,9 @@ const writePrepared = (
     // Inline payloads are not duplicated into event_blob: the blob row exists
     // only when the bytes were actually offloaded to a file.
     if (size > blob.limitBytes) {
+      // Close the stage/commit race with a concurrent GC: a file unlinked while
+      // this publisher waited for the write lock is re-created under the lock.
+      ensureStagedBlob(blob, encoded)
       const hash = digest(encoded)
       repository.appendBlob({ aggregateID, seq, type, hash, size, filePath: hash })
       data = { __eventBlob: hash, size } satisfies BlobReference
@@ -700,7 +730,7 @@ const writeEvents = (
   return writePrepared(repository, ownerID, projectors, batch, touched, workerLease, leaseTimeoutMs, blob)
 }
 
-// The retry boundary is the whole `BEGIN IMMEDIATE … COMMIT` unit (D5/W1.2), so
+// The retry boundary is the whole `BEGIN IMMEDIATE … COMMIT` unit (D5), so
 // a busy statement can never leave a half-open transaction. The blocking
 // `Atomics.wait` backoff was removed: the sync path relies on the driver's
 // `busy_timeout`, and the worker path uses `inImmediateTransactionAsync`, which
@@ -1022,10 +1052,7 @@ export function create(options: Options): Interface {
   // Without a file the Bus cannot prove which directory its rows belong to, so
   // it leaves `blobDir` unset and file-backed collection fails loud.
   const filename = repository.filename
-  const derivedBlobDir =
-    filename === undefined || filename.length === 0 || filename === ":memory:" || filename.startsWith("file::memory:")
-      ? undefined
-      : path.join(path.dirname(filename), "event-blobs")
+  const derivedBlobDir = blobDirectoryFor(filename)
   const blobDir = options.blobDir ?? derivedBlobDir
   const blob: BlobStore = {
     ...(blobDir === undefined ? {} : { dir: blobDir }),
@@ -1274,6 +1301,31 @@ export function create(options: Options): Interface {
 /** SQLite binds at most 999 parameters by default; chunk well below it. */
 const BLOB_QUERY_CHUNK = 500
 
+/**
+ * The `event_blob` lookup for one aggregate's positions. Exposed so an async
+ * caller (the hub's off-loop executor) issues exactly the query the synchronous
+ * {@link loadBlobRows} path does; the two can never drift on table or columns.
+ */
+export function blobRowQuery(
+  aggregateID: string,
+  sequences: ReadonlyArray<number>,
+): { readonly sql: string; readonly params: ReadonlyArray<unknown> } {
+  const placeholders = sequences.map(() => "?").join(", ")
+  return {
+    sql: `SELECT seq, hash, data, file_path FROM event_blob WHERE aggregate_id = ? AND seq IN (${placeholders})`,
+    params: [aggregateID, ...sequences],
+  }
+}
+
+/** Index `event_blob` rows by their committed sequence. */
+export function blobRowsBySeq(
+  rows: ReadonlyArray<Record<string, unknown>>,
+): ReadonlyMap<number, Record<string, unknown>> {
+  const bySeq = new Map<number, Record<string, unknown>>()
+  for (const row of rows) bySeq.set(Number(row.seq), row)
+  return bySeq
+}
+
 /** Batch the `event_blob` lookup for one page of events. */
 export function loadBlobRows(
   connection: Connection,
@@ -1282,16 +1334,48 @@ export function loadBlobRows(
 ): ReadonlyMap<number, Record<string, unknown>> {
   const rows = new Map<number, Record<string, unknown>>()
   for (let offset = 0; offset < sequences.length; offset += BLOB_QUERY_CHUNK) {
-    const chunk = sequences.slice(offset, offset + BLOB_QUERY_CHUNK)
-    const placeholders = chunk.map(() => "?").join(", ")
-    for (const row of connection.all(
-      `SELECT seq, hash, data, file_path FROM event_blob WHERE aggregate_id = ? AND seq IN (${placeholders})`,
-      [aggregateID, ...chunk],
-    )) {
-      rows.set(Number(row.seq), row)
-    }
+    const query = blobRowQuery(aggregateID, sequences.slice(offset, offset + BLOB_QUERY_CHUNK))
+    for (const [seq, row] of blobRowsBySeq(connection.all(query.sql, query.params))) rows.set(seq, row)
   }
   return rows
+}
+
+/**
+ * Resolve one durable event's body from its `event_blob` row. `undefined` means
+ * the row is absent (the caller surfaces a typed resync); a corrupt row, a hash
+ * mismatch, or a path-traversing `file_path` fails loud through
+ * {@link resolveBlobData}.
+ */
+export function resolveBlobRow(
+  event: { readonly type: string; readonly aggregateID: string; readonly seq: number },
+  row: Record<string, unknown> | undefined,
+  blob: BlobStore,
+  files: Map<string, string> = new Map(),
+): Record<string, unknown> | undefined {
+  if (row === undefined) return undefined
+  return resolveBlobData(
+    {
+      id: "" as SerializedEvent["id"],
+      type: event.type,
+      aggregateID: event.aggregateID,
+      seq: event.seq,
+      data: { __eventBlob: String(row.hash), size: Number(row.size) },
+    },
+    row,
+    blob,
+    files,
+  )
+}
+
+/**
+ * The D16 content-addressed directory for a database file, or `undefined` for an
+ * in-memory/unknown file. The worker Bus, EventV2, and the hub resolver all
+ * derive the SAME directory from this one rule.
+ */
+export function blobDirectoryFor(filename: string | undefined): string | undefined {
+  if (filename === undefined || filename.length === 0) return undefined
+  if (filename === ":memory:" || filename.startsWith("file::memory:")) return undefined
+  return path.join(path.dirname(filename), "event-blobs")
 }
 
 /**
@@ -1402,13 +1486,11 @@ interface DeletedAggregate {
  * hashes: a rollback restores rows, and must therefore never run after a file
  * has already disappeared.
  *
- * Residual race (explicit): `publish` stages a content-addressed file before
- * `BEGIN IMMEDIATE`. A publisher that observed the file before this GC commits
- * can therefore insert a row after the post-commit zero-reference check. Closing
- * that interleaving needs staging revalidation inside the publisher's
- * transaction; this collector cannot see an uncommitted staging decision. What
- * this ordering does guarantee is that no rollback can orphan a row from its
- * file.
+ * The publisher/GC interleaving is closed by two paired guarantees:
+ * `unlinkUnreferenced` re-reads the refcount and unlinks inside one
+ * `BEGIN IMMEDIATE`, and `writePrepared` re-creates any staged file whose bytes
+ * went missing while it waited for that same lock (`ensureStagedBlob`). A row
+ * that references a file therefore always commits with the file present.
  */
 function collectBlobsLocked(
   repository: DurableRepository,
@@ -1475,18 +1557,23 @@ function hashesWithFiles(rows: ReadonlyArray<BlobRow>): ReadonlySet<string> {
 
 /**
  * Unlink files whose deleting transaction has already committed. The refcount is
- * re-read here, after the commit, so a row inserted by another aggregate (or a
- * replay/import) keeps the shared file alive.
+ * re-read and the unlink performed inside a fresh `BEGIN IMMEDIATE`, so the
+ * zero-reference decision and the file removal are atomic with respect to a
+ * concurrent publisher: a publisher either committed its row first (refcount > 0
+ * here) or is blocked on the write lock and re-creates the file inside its own
+ * transaction (`ensureStagedBlob`) before inserting the referencing row.
  */
 function unlinkUnreferenced(repository: DurableRepository, hashes: ReadonlySet<string>, blob: BlobStore): void {
   const directory = requireBlobDirectory(hashes, blob)
   if (directory === undefined) return
-  for (const hash of hashes) {
-    if (repository.blobReferences(hash) > 0) continue
-    try {
-      fs.unlinkSync(blobFile(directory, hash))
-    } catch {
-      // A missing file is already collected; the row is still gone.
+  repository.transaction(() => {
+    for (const hash of hashes) {
+      if (repository.blobReferences(hash) > 0) continue
+      try {
+        fs.unlinkSync(blobFile(directory, hash))
+      } catch {
+        // A missing file is already collected; the row is still gone.
+      }
     }
-  }
+  })
 }

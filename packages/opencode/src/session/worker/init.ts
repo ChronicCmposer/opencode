@@ -33,7 +33,7 @@ import {
   UnclassifiedPluginHookError,
   UnsupportedPluginHookError,
   isHubProxyHook,
-  pluginHookAdmissionError,
+  pluginHookStartupError,
 } from "@/plugin/routes"
 import type {
   ChatHeadersOutput,
@@ -48,7 +48,7 @@ import { stringHeaders } from "./headers"
 import type { PluginToolDescriptor } from "./plugin-tool-wire"
 
 // ---------------------------------------------------------------------------
-// Environment overlay (step 7)
+// Environment overlay
 // ---------------------------------------------------------------------------
 
 export interface BuildWorkerEnvOptions {
@@ -88,7 +88,7 @@ export const buildWorkerEnv = (options: BuildWorkerEnvOptions = {}): WorkerEnv =
 })
 
 // ---------------------------------------------------------------------------
-// Serializable model bootstrap (step 8)
+// Serializable model bootstrap
 // ---------------------------------------------------------------------------
 
 /**
@@ -448,10 +448,12 @@ function runPluginHook<T>(
 export const resolveWorkerPlugins = Effect.fn("WorkerPlugins.resolve")(function* (
   options: ResolveWorkerPluginsOptions,
 ) {
-  // Admission: a hook added after startup reaches the next run here. An
-  // unsupported or unclassified trigger is typed, never a silent skip.
+  // Startup admission: only a hook no route can ever serve is fatal here. A
+  // routed-but-unsupported hook (command compaction, text completion) is
+  // deferred to invocation, where the worker's trigger fails typed. This keeps a
+  // plugin that merely *declares* one from breaking worker startup.
   for (const source of options.sources) {
-    const error = pluginHookAdmissionError(source.name, source.hooks)
+    const error = pluginHookStartupError(source.name, source.hooks)
     if (error !== undefined) return yield* error
   }
 
@@ -512,7 +514,7 @@ export const resolveWorkerPlugins = Effect.fn("WorkerPlugins.resolve")(function*
 })
 
 // ---------------------------------------------------------------------------
-// Init assembly (step 9)
+// Init assembly
 // ---------------------------------------------------------------------------
 
 export interface BuildSessionWorkerInitOptions {

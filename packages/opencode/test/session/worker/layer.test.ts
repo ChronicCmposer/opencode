@@ -1,4 +1,4 @@
-// Phase 6.1 / 6.2 / 6.5 / 6.7 — reduced session layer tests (in-process).
+// Reduced session layer tests (in-process).
 
 import fs from "node:fs"
 import os from "node:os"
@@ -360,7 +360,7 @@ describe("boundary layers (6.x)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// f-w5-boundaries — a worker boundary is FUNCTIONAL, not a throwing mock.
+// A worker boundary is FUNCTIONAL, not a throwing mock.
 //
 // `boundaryReplacements` used to install `Layer.mock(Service, {})`, whose every
 // method throws `Unimplemented method "<name>"`. The session path reads neutral
@@ -375,7 +375,7 @@ const boundaryLayer = <A>(replacements: LayerNode.Replacements, source: LayerNod
   return found as Layer.Layer<A>
 }
 
-describe("boundary mocks are functional (f-w5)", () => {
+describe("boundary mocks are functional", () => {
   test("the production MCP boundary serves an empty catalog instead of throwing", async () => {
     const layer = boundaryLayer<MCP.Service>(boundaryReplacements(snapshot()), MCP.node)
     const result = await Effect.runPromise(
@@ -499,7 +499,7 @@ describe("node table report", () => {
 })
 
 // ---------------------------------------------------------------------------
-// o1-w2 — the worker Database is a real writer-backed Drizzle database.
+// The worker Database is a real writer-backed Drizzle database.
 //
 // The writer handle is backed by a real in-memory SQLite `SqlClient` so the
 // worker layer is compared apples-to-apples with the flag-OFF driver.
@@ -594,7 +594,7 @@ const crud = (db: EffectDrizzleSqlite.EffectSQLiteDatabase) =>
     return yield* db.select().from(widget).orderBy(widget.id).all()
   })
 
-describe("writer-backed worker Database (o1-w2)", () => {
+describe("writer-backed worker Database", () => {
   test("CRUD round-trip matches the flag-OFF driver", async () => {
     const flagNative = new BunDatabase(":memory:")
     const workerNative = new BunDatabase(":memory:")
@@ -684,7 +684,7 @@ describe("writer-backed worker Database (o1-w2)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// o1-w2 — the runnable graph gives Session/EventV2 the writer-backed Database.
+// The runnable graph gives Session/EventV2 the writer-backed Database.
 // ---------------------------------------------------------------------------
 
 const WorkerPing = EventV2.define({
@@ -693,7 +693,7 @@ const WorkerPing = EventV2.define({
   schema: { id: Schema.String },
 })
 
-describe("runnable graph persistence (o1-w2)", () => {
+describe("runnable graph persistence", () => {
   test("Session.get and a durable EventV2.publish succeed through the worker Database", async () => {
     const native = new BunDatabase(":memory:")
     try {
@@ -790,7 +790,7 @@ describe("runnable graph persistence (o1-w2)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// f-w2-provider — the worker runs exactly one serialized model.
+// The worker runs exactly one serialized model.
 //
 // `SessionPrompt` resolves the model from the session/user message, while the
 // reduced provider serves only the model the hub serialized. A mismatch must
@@ -814,7 +814,7 @@ const readReducedModel = (providerID: string, modelID: string) =>
     return yield* provider.getModel(ProviderV2.ID.make(providerID), ModelV2.ID.make(modelID))
   }).pipe(Effect.provide(reducedModelProviderLayer(reducedConfig)))
 
-describe("reduced worker provider — single serialized model (f-w2)", () => {
+describe("reduced worker provider — single serialized model", () => {
   test("serves the serialized provider/model pair", async () => {
     const model = await Effect.runPromise(readReducedModel("test", "test-model"))
     expect(model.api.id).toBe("test-api")
@@ -923,7 +923,7 @@ describe("reduced worker provider — consumes the real descriptor", () => {
 })
 
 // ---------------------------------------------------------------------------
-// f-w2-provider — non-serializable provider/model data is diagnosed at hub
+// Non-serializable provider/model data is diagnosed at hub
 // build (`resolveWorkerModel`, called by `buildSessionWorkerInit`), not carried
 // into `workerData` where `structuredClone` would reject it at spawn.
 // ---------------------------------------------------------------------------
@@ -972,7 +972,7 @@ const hubModelLayers = (input: HubModelLayerInput = {}) =>
 const resolveHubModel = (input: HubModelLayerInput = {}) =>
   Effect.runPromise(Effect.result(resolveWorkerModel().pipe(Effect.provide(hubModelLayers(input)))))
 
-describe("worker model serializability — detected at hub build (f-w2)", () => {
+describe("worker model serializability — detected at hub build", () => {
   test("a function in the selected model's headers is rejected", async () => {
     const result = await resolveHubModel({ modelHeaders: { authorization: (() => "token") as never } })
     expect(result._tag).toBe("Failure")

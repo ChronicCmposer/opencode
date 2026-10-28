@@ -1,4 +1,4 @@
-// Step 29 — the ready handshake carries the real worker build hash.
+// The ready handshake carries the real worker build hash.
 //
 // These tests spawn a REAL Bun worker isolate that installs the production
 // session executor (`execute.ts`), so the ready frame under test is the one the

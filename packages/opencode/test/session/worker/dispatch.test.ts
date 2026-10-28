@@ -32,7 +32,7 @@ import {
 import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
 import { createWorkerHarness } from "../../lib/worker-harness"
 import { withFaults } from "../../lib/faults"
-import { capture, flush, sid } from "../../lib/async"
+import { capture, flush, pollUntil, sid } from "../../lib/async"
 import { FaultPool, FakeSessionWorker, createFakeWorkerPool } from "../../lib/fake-worker-pool"
 import { createRecordingScheduler } from "../../lib/scheduler"
 
@@ -1209,6 +1209,94 @@ describe("idle worker death", () => {
 
     pool.spawned[1].finish(sid("ses_reuse"))
     await second
+    await dispatcher.terminateAll()
+  })
+})
+
+describe("async resume decision deadline", () => {
+  test("an unresolved decision settles the crash at the deadline and frees the session", async () => {
+    const pool = createFakeWorkerPool(1)
+    let decisions = 0
+    const dispatcher = createDispatcher({
+      pool,
+      resumeDecisionTimeoutMs: 30,
+      resumeDecision: () => {
+        decisions += 1
+        // A durable ledger read that never resolves must not pin the session.
+        return new Promise(() => {})
+      },
+    })
+
+    const crashed = dispatcher.dispatch({ sessionID: sid("ses_resume_deadline") })
+    await flush()
+    pool.spawned[0].crash(sid("ses_resume_deadline"))
+
+    const outcome = await Promise.race([
+      crashed.then(
+        () => ({ kind: "resolved" as const }),
+        (error: unknown) => ({ kind: "rejected" as const, error }),
+      ),
+      new Promise<{ kind: "timeout" }>((resolve) => setTimeout(() => resolve({ kind: "timeout" }), 2_000)),
+    ])
+    expect(outcome.kind).toBe("rejected")
+    expect(outcome.kind === "rejected" ? outcome.error : undefined).toBeInstanceOf(WorkerCrashedError)
+    expect(decisions).toBe(1)
+    expect(dispatcher.registry.has(sid("ses_resume_deadline"))).toBe(false)
+
+    // The dead run no longer owns the session: a new dispatch materializes a
+    // fresh worker instead of attaching to the dead promise.
+    const healthy = dispatcher.dispatch({ sessionID: sid("ses_resume_deadline") })
+    await flush()
+    expect(pool.spawned).toHaveLength(2)
+    pool.spawned[1].finish(sid("ses_resume_deadline"))
+    await healthy
+    await dispatcher.terminateAll()
+  })
+})
+
+describe("retirement waits for a confirmed exit", () => {
+  test("onSessionReleased fires only after terminate resolves, and its promise is awaited", async () => {
+    let resolveTerminate!: () => void
+    const terminated = new Promise<void>((resolve) => {
+      resolveTerminate = resolve
+    })
+    let resolveRelease!: () => void
+    const release = new Promise<void>((resolve) => {
+      resolveRelease = resolve
+    })
+    const released: string[] = []
+    const worker = new FakeSessionWorker(1, { mode: "cooperative" })
+    const terminate = worker.terminate.bind(worker)
+    worker.terminate = async () => {
+      await terminated
+      await terminate()
+    }
+    const pool: WorkerPool = { spawn: () => worker, terminateAll: async () => {} }
+    const dispatcher = createDispatcher({
+      pool,
+      onSessionReleased: async (sessionID) => {
+        await release
+        released.push(sessionID)
+      },
+    })
+
+    const run = dispatcher.dispatch({ sessionID: sid("ses_confirmed_exit") })
+    void run.catch(() => undefined)
+    await flush()
+    const cancelling = dispatcher.cancel(sid("ses_confirmed_exit"))
+    await flush()
+    // The isolate has not exited yet: no release may be observed.
+    expect(released).toEqual([])
+
+    resolveTerminate()
+    await flush()
+    // Termination resolved, but the async release callback is still pending.
+    expect(released).toEqual([])
+
+    resolveRelease()
+    await cancelling
+    await pollUntil(() => released.length === 1, { message: "the release callback never ran" })
+    expect(released).toEqual([sid("ses_confirmed_exit")])
     await dispatcher.terminateAll()
   })
 })

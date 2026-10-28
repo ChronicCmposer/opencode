@@ -1,4 +1,4 @@
-// W1.5 / D6 — the worker-writable table allowlist is derived from `session_id`.
+// The worker-writable table allowlist is derived from `session_id`.
 //
 // The generated allowlist is compared against the live schema. A table that
 // gains or loses `session_id` without a regenerated allowlist fails the gate.
@@ -39,7 +39,7 @@ afterEach(() => {
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
 })
 
-describe("table ownership (W1.5 / D6)", () => {
+describe("table ownership (D6)", () => {
   test("the generated allowlist is exactly the session_id tables in the schema", () => {
     const connection = migrated()
     expect(deriveSessionScopedTables(connection)).toEqual([...WORKER_WRITABLE_TABLES])

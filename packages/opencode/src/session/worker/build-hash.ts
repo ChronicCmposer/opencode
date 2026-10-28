@@ -210,11 +210,25 @@ export function resolveBuildHash(options: ResolveBuildHashOptions = {}): Resolve
     return { hash: defined, schemaVersion, source: "build", override: false }
   }
 
+  // A production/packaged run must carry the build-time hash. Falling back to a
+  // dev hash here would silently disable the ready-handshake check, so fail loud
+  // instead: a build that forgot the define is a build defect, not a runtime mode.
+  if (!dev) throw new MissingBuildHashError()
+
   return {
     hash: computeBuildHash({ entryBundle: DEV_ENTRY, schemaVersion }),
     schemaVersion,
     source: "dev",
     override: false,
+  }
+}
+
+/** Raised when a packaged/production run has no compiled-in build hash. */
+export class MissingBuildHashError extends Error {
+  readonly tag = "BUILD_HASH_MISSING"
+  constructor() {
+    super("session worker build hash is missing: a packaged build must define OPENCODE_BUILD_HASH")
+    this.name = "MissingBuildHashError"
   }
 }
 

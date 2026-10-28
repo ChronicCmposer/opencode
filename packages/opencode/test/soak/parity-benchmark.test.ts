@@ -1,4 +1,4 @@
-// Wave 6 benchmark acceptance harness.
+// Benchmark acceptance harness.
 //
 // This proves the persisted baseline path and the eight-session runner without
 // asserting machine-dependent numbers. The real worker/in-process recordings

@@ -109,7 +109,7 @@ describe("session action routes", () => {
     { git: true },
   )
 
-  // W9 acceptance (HTTP abort route): aborting a busy session must cancel the
+  // HTTP abort route: aborting a busy session must cancel the
   // real run and report the rich cancel outcome (mode/winner/acknowledged/
   // durationMs), not the idle no-op body. Uses a hanging shell so no provider
   // model is required. A child session of the aborted parent must end idle.
@@ -202,7 +202,7 @@ describe("session action routes", () => {
     { git: true, config: { formatter: false, lsp: false }, timeout: 20_000 },
   )
 
-  // W9 (`session.cancelled` consumer): the hub publishes `session.cancelled`
+  // The `session.cancelled` consumer: the hub publishes `session.cancelled`
   // with the resolved cancel outcome, but no client surface consumed it. This
   // guards that the event bridge is a working consumer channel for the exact
   // payload the hub emits. A first-class TUI/app handler is requested separately.

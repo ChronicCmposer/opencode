@@ -136,6 +136,37 @@ describe("createWorkerEventBridge", () => {
     }),
   )
 
+  it.effect("never downgrades a durable event to a non-durable emit", () =>
+    Effect.gen(function* () {
+      const plain: EventV2Event[] = []
+      let emitToListener: EventV2.Subscriber | undefined
+      const fake: EventSubscriber = {
+        listen: (listener) =>
+          Effect.sync(() => {
+            emitToListener = listener
+            return Effect.void
+          }),
+      }
+      // A sink that can only carry the verbatim event: forwarding a durable
+      // event through it would silently drop `(aggregateID, seq)`, so the bridge
+      // must refuse rather than downgrade durability.
+      const bridge = yield* createWorkerEventBridge(fake, { emit: (event) => plain.push(event) })
+
+      expect(() =>
+        Effect.runSync(
+          emitToListener!({
+            id: EventV2.ID.create(),
+            type: "test.worker.session",
+            data: { sessionID: "ses_1", text: "durable" },
+            durable: { aggregateID: "ses_1", seq: 4, version: 1 },
+          }),
+        ),
+      ).toThrow(/durable/)
+      expect(plain).toHaveLength(0)
+      yield* bridge.dispose
+    }),
+  )
+
   it.effect("drops worker-local telemetry (no sessionID)", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service

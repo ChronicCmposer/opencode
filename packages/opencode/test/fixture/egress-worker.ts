@@ -1,4 +1,4 @@
-// Phase 8.1 worker entry point (plan task 8.1).
+// Worker entry point.
 //
 // Creates a NEW dedicated `MessageChannel` for egress, a SEPARATE one for the
 // generic control link, and a THIRD for the EventV2 mesh control plane, then

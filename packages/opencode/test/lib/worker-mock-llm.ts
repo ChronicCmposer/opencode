@@ -1,4 +1,4 @@
-// Phase 3.5 — worker-reachable mock provider / SSE (plan task 3.5, BLOCKS 4–14).
+// Worker-reachable mock provider / SSE.
 //
 // `TestLLMServer` is a real TCP HTTP server that lives on the hub. A `Response`
 // or `ReadableStream` cannot cross a Bun worker boundary, but the base URL

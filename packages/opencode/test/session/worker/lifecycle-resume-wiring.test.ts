@@ -3,7 +3,7 @@
 // `createSessionHub` resume wiring, but the executor pool is a structural fake
 // and the test prepares the tracker directly. Real coverage (a real worker turn
 // that commits/crashes, the durable `tool_call` row, and the duplicate-side-
-// effect window) is `test/integration/resume-ledger-p0.test.ts`.
+// effect window) is `test/integration/resume-ledger.test.ts`.
 
 import { describe, expect, test } from "bun:test"
 import type { SessionID } from "@/session/schema"
@@ -89,7 +89,7 @@ async function runCrash(
 
 const phaseStream: RunHook = (sessionID, lifecycle) => lifecycle.phase(sessionID, "stream")
 
-describe("hub auto-resume wiring (C7 / D9)", () => {
+describe("hub auto-resume wiring (D9)", () => {
   test("resumes from the last committed message when no tool started", async () => {
     const decisions: Parameters<NonNullable<Parameters<typeof createSessionHub>[0]["resumeRun"]>>[0][] = []
     await runCrash(
@@ -195,7 +195,7 @@ describe("hub auto-resume wiring (C7 / D9)", () => {
   })
 })
 
-describe("async resume ownership (C7 / D9)", () => {
+describe("async resume ownership (D9)", () => {
   test("a dispatch while the resume decision is pending parks instead of racing the crash", async () => {
     const lifecycle = createLifecycleTracker()
     const sessionID = sid("ses_pending_decision")

@@ -1,7 +1,7 @@
-// Worker test harness (plan task 3.4).
+// Worker test harness.
 //
 // Spawns, observes and terminates Bun `Worker` threads, and injects a core
-// count so pool sizing in later phases (4.2) is deterministic in tests.
+// count so pool sizing in later tests is deterministic.
 //
 // Design: `spawn` is synchronous (Bun's `new Worker` is synchronous); every
 // message is buffered so a caller can `received()` one even if the worker

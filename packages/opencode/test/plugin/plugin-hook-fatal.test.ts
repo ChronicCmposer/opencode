@@ -1,9 +1,9 @@
-// W4.1 / D19 — a configured plugin that declares an unsupported invoked hook is
-// fatal at startup when session workers are enabled. It is never skipped and
-// there is no in-process fallback.
+// A configured plugin that merely *declares* a routed-but-
+// unsupported hook must not fail startup; the hook fails typed only when the
+// worker actually invokes it. A hook with no route at all stays a startup defect.
 
-import { describe, expect } from "bun:test"
-import { Cause, Effect, Exit } from "effect"
+import { describe, expect, test } from "bun:test"
+import { Cause, Effect, Exit, Layer } from "effect"
 import path from "path"
 import { pathToFileURL } from "url"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -17,8 +17,11 @@ import { Account } from "../../src/account/account"
 import { RuntimeFlags } from "../../src/effect/runtime-flags"
 import { Plugin } from "../../src/plugin/index"
 import { UnsupportedPluginHookError } from "../../src/plugin/routes"
+import { ModelClient, buildSessionWorkerLayer } from "../../src/session/worker/layer"
+import { createWorkerPluginHost } from "../../src/session/worker/plugin-host"
 import { TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
+import { workerSnapshot } from "../lib/snapshot"
 import { AccountTest } from "../fake/account"
 import { AuthTest } from "../fake/auth"
 import { NpmTest } from "../fake/npm"
@@ -61,7 +64,7 @@ function withProject<A, E, R>(source: string, self: Effect.Effect<A, E, R>) {
   })
 }
 
-const triggerSystemTransform = Effect.fn("PluginHookFatalTest.triggerSystemTransform")(function* () {
+const triggerSystemTransform = Effect.fn("PluginHookStartupTest.triggerSystemTransform")(function* () {
   const plugin = yield* Plugin.Service
   return yield* Effect.exit(
     plugin.trigger(
@@ -77,9 +80,30 @@ const triggerSystemTransform = Effect.fn("PluginHookFatalTest.triggerSystemTrans
   )
 })
 
+/** Build the reduced worker plugin layer and trigger a hook through it. */
+async function triggerWorkerHook(name: string): Promise<Exit.Exit<unknown, unknown>> {
+  const built = buildSessionWorkerLayer({
+    snapshot: workerSnapshot(),
+    env: { values: {} },
+    clients: {
+      writer: { query: async () => [], publish: async () => ({ seq: 1, committed: true }) },
+      egress: { emit: () => {} },
+      backgroundJob: { wait: async () => null, cancel: async () => {} },
+    },
+    modelClient: Layer.succeed(ModelClient, { complete: () => Effect.succeed({ text: "stub" }) }),
+    plugins: createWorkerPluginHost([{ name: "empty", hooks: {} }]),
+  })
+  return Effect.runPromise(
+    Effect.gen(function* () {
+      const plugin = (yield* Plugin.Service) as Plugin.Interface
+      return yield* plugin.trigger(name as never, {} as never, { env: {} })
+    }).pipe(Effect.provide(built.layer), Effect.exit),
+  )
+}
+
 describe("configured plugin hook route", () => {
   it.instance(
-    "fails startup on an unsupported invoked hook",
+    "loads a configured plugin declaring an uninvoked unsupported hook",
     () =>
       withProject(
         [
@@ -91,13 +115,9 @@ describe("configured plugin hook route", () => {
           "",
         ].join("\n"),
         Effect.gen(function* () {
+          // Startup must succeed: the plugin loads and a routed trigger works.
           const exit = yield* triggerSystemTransform()
-          expect(Exit.isFailure(exit)).toBe(true)
-          if (!Exit.isFailure(exit)) throw new Error("expected startup to fail")
-          expect(Cause.hasDies(exit.cause)).toBe(true)
-          const defect = exit.cause.reasons.filter(Cause.isDieReason).at(0)?.defect
-          expect(defect).toBeInstanceOf(UnsupportedPluginHookError)
-          expect((defect as UnsupportedPluginHookError).hook).toBe("command.execute.before")
+          expect(Exit.isSuccess(exit)).toBe(true)
         }),
       ),
     15_000,
@@ -133,4 +153,13 @@ describe("configured plugin hook route", () => {
       ),
     15_000,
   )
+})
+
+describe("worker invocation of an unsupported hook", () => {
+  test("fails typed only when the worker triggers the hook", async () => {
+    const exit = await triggerWorkerHook("command.execute.before")
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (!Exit.isFailure(exit)) throw new Error("expected the worker trigger to fail")
+    expect(Cause.squash(exit.cause)).toBeInstanceOf(UnsupportedPluginHookError)
+  })
 })

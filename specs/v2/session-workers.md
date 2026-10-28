@@ -93,7 +93,7 @@ No message is appended. A graph that is ready but not started takes the same pat
 
 ### D12 — Sequences and ownership
 
-There is no global or sender ordinal. Each aggregate has a contiguous sequence allocated inside `BEGIN IMMEDIATE` by an atomic upsert-returning block reservation, with `unique(aggregate_id, seq)`. Ownership is a worker-generation lease in `owner_id`. Reclaim is atomic and happens only after verifying that no commit is in flight for the old owner. Projectors are database-only and run in the committing process inside the same transaction.
+There is no global or sender ordinal. Each aggregate has a contiguous sequence allocated inside `BEGIN IMMEDIATE` by an atomic upsert-returning block reservation, with `unique(aggregate_id, seq)`. `event_sequence.owner_id` is the v1 sync owner and is never rewritten by a worker. Worker ownership is a separate generation lease in `event_sequence.worker_owner_id`, renewed on every write and by the background heartbeat (`worker_heartbeat_at`, `worker_expires_at`); an idle generation must not self-fence while it is alive. Reclaim is owner-scoped and atomic, and happens only after verifying that no commit is in flight for the old owner. A stale generation's next write is fenced by the owner mismatch. Projectors are database-only and run in the committing process inside the same transaction.
 
 ### D13 — Bus API
 
@@ -109,7 +109,7 @@ Send JSON strings over `postMessage`. Decode exactly once with Effect Schema at 
 
 ### D16 — Large durable payloads
 
-`event_blob` is keyed by `(aggregate_id, seq)` with type and hash, written in the same transaction, and bounded at 16 MiB. Payloads above that limit use a content-addressed file plus a database reference. Workers fetch blobs through the Bus. Garbage collection runs only after cursors and retention allow it.
+`event_blob` is keyed by `(aggregate_id, seq)` with `type`, `hash`, and `size`, written in the same transaction as the event row. Payloads at or below 4 MiB stay inline in `event.data`; a larger payload is written first to a content-addressed file under the blob directory and the row stores `hash`/`size` with `file_path` set. `data` remains only for rows written by the older inline-blob schema. `event_blob.hash` is indexed because GC probes references across every aggregate. Workers fetch blobs through the Bus and never receive a raw connection. GC deletes the row in the committing transaction and unlinks a file only when no row for that hash remains, so a concurrent publisher's file is never removed.
 
 ### D17 — Deltas and resync
 

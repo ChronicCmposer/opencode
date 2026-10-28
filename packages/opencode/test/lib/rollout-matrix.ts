@@ -1,4 +1,4 @@
-// Rollout/flag contract used by the Wave 6 matrix tests.
+// Rollout/flag contract used by the matrix tests.
 //
 // The production implementation may lag. These helpers define the two-state
 // contract, status projection validation, startup plugin validation, kill-switch

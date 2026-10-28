@@ -1,4 +1,4 @@
-// W1.6 / D7 — schema gate.
+// Schema gate.
 //
 // Version is `PRAGMA user_version` plus a migration-content hash. The hub
 // migrates only with zero live workers and marks the schema; a worker probes
@@ -79,7 +79,7 @@ afterEach(() => {
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
 })
 
-describe("worker schema gate (W1.6 / D7)", () => {
+describe("worker schema gate (D7)", () => {
   test("opens a database whose version and migration content match the build", () => {
     const { filename } = migrated()
     const gated = openGatedConnection({ filename })
@@ -144,7 +144,7 @@ describe("worker schema gate (W1.6 / D7)", () => {
   })
 })
 
-describe("hub migration (W1.6 / D7)", () => {
+describe("hub migration (D7)", () => {
   test("migrates and marks only with zero live workers", () => {
     const filename = databasePath()
     const connection = open(filename)

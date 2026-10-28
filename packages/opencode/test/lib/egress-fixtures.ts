@@ -1,4 +1,4 @@
-// Shared egress test fixtures (plan finding #183).
+// Shared egress test fixtures.
 //
 // The egress suites each rebuilt the same tiny event/frame shapes inline. These
 // builders are the single source of truth so a wire-shape change is made once.

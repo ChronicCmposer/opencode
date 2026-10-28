@@ -1,6 +1,6 @@
 // Fake MCP/LSP stdio server that ALSO builds a descendant process tree.
 //
-// Plan task 3.8 needs a child process that (a) behaves like an MCP or LSP stdio
+// The fake needs a child process that (a) behaves like an MCP or LSP stdio
 // server and (b) spawns descendants, so teardown can be proven to reap the
 // whole process group. The existing fakes (`mcp-lifecycle-stdio.ts`,
 // `lsp/fake-lsp-server.js`) cover full protocol fidelity but spawn no children;

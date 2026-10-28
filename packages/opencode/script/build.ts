@@ -34,6 +34,11 @@ const sessionWorkerBuildHash = await hashWorkerBundle({
   external: ["node-gyp"],
   plugins: [plugin],
 })
+// A packaged binary must always embed a real hash; an empty/failed hash would
+// make the worker ready handshake unverifiable.
+if (!/^[0-9a-f]{64}$/.test(sessionWorkerBuildHash)) {
+  throw new Error(`session worker build hash is not a sha256 digest: ${JSON.stringify(sessionWorkerBuildHash)}`)
+}
 
 const createEmbeddedWebUIBundle = async () => {
   console.log(`Building Web UI to embed in the binary`)

@@ -1,4 +1,4 @@
-// R2-M4 — the production hub must supply the synchronous child edge the
+// The production hub must supply the synchronous child edge the
 // dispatcher's crash/timeout cascade reads.
 //
 // The bug: `createProductionSessionHub` fell back to `childrenOf: () => []`
@@ -159,7 +159,7 @@ const sessionIdle = (sessionID: string, parentID?: string) => ({
   metadata: {},
 })
 
-describe("R2-M4 production crash cascade", () => {
+describe("production crash cascade", () => {
   test("the child index removes a released child from its parent", () => {
     const index = createSessionChildrenIndex()
     const parent = sid("ses_index_parent")

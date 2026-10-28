@@ -15,7 +15,7 @@ function ledgerConnection(): LedgerConnection {
   return connection
 }
 
-describe("tool_call ledger (W3.1/W3.2 / D10)", () => {
+describe("tool_call ledger (D10)", () => {
   test("the schema is unique on (call_id, session) and rejects a duplicate start", () => {
     const connection = ledgerConnection()
     const ledger = createToolCallLedger(connection)
@@ -71,7 +71,7 @@ describe("tool_call ledger (W3.1/W3.2 / D10)", () => {
   })
 })
 
-describe("worker_crash persistence (W3.3 / D8)", () => {
+describe("worker_crash persistence (D8)", () => {
   test("every phase persists and returns the identical typed payload", () => {
     const connection = ledgerConnection()
     for (const phase of WORKER_CRASH_PHASES) {

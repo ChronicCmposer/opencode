@@ -34,6 +34,9 @@ import {
   type OutcomeGate,
 } from "./cancel"
 
+/** Default deadline for an asynchronous crash resume decision. */
+const DEFAULT_RESUME_DECISION_TIMEOUT_MS = 5_000
+
 /** One session run: the key the worker executes, its subagent depth and its frame mode. */
 export type SessionRun = ExecutorRun
 
@@ -186,7 +189,7 @@ export interface DispatcherOptions {
    */
   readonly writeBarrier?: (sessionID: SessionID) => Promise<void> | undefined
   /** Hub-side cleanup when a session's worker is retired (reap/cancel/crash). */
-  readonly onSessionReleased?: (sessionID: SessionID, workerID?: number) => void
+  readonly onSessionReleased?: (sessionID: SessionID, workerID?: number) => unknown
   /** Invoked synchronously when a run actually starts (not when it parks). */
   readonly onRunStart?: (sessionID: SessionID) => void
   /** Persist the D8 payload before the crash is returned to the caller. */
@@ -205,6 +208,13 @@ export interface DispatcherOptions {
    * observe a crash before its resume decision.
    */
   readonly resumeDecision?: (payload: WorkerCrashed) => AutoResumeDecision | Promise<AutoResumeDecision>
+  /**
+   * How long a crash waits for an asynchronous resume decision. An unresolved
+   * decision must not pin the session's run ownership (a new dispatch would
+   * attach to the dead run forever), so after this deadline the run settles with
+   * no resume and the parked successor starts. Defaults to 5s; `0` disables it.
+   */
+  readonly resumeDecisionTimeoutMs?: number
   /** Observe an allowed auto-resume; re-dispatch stays with the hub owner. */
   readonly onAutoResume?: (decision: Extract<AutoResumeDecision, { resume: true }>, payload: WorkerCrashed) => void
 }
@@ -283,6 +293,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const writeBarrier = options.writeBarrier
   const schedule = options.schedule ?? defaultSchedule
   const reapMs = options.reapMs ?? resolveReapMs()
+  const resumeDecisionTimeoutMs = options.resumeDecisionTimeoutMs ?? DEFAULT_RESUME_DECISION_TIMEOUT_MS
 
   // The session→worker map. Workers outlive runs (reuse across turns) until
   // idle-reap or terminal cancel disposes them.
@@ -291,6 +302,11 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const waitersByKey = new Map<SessionID, Pending[]>()
   const idleTimers = new Map<SessionID, () => void>()
   const controllers = new Map<number, CancelController>()
+  /**
+   * The confirmed-exit promise for a retiring generation. A successor must not
+   * start until the old isolate is gone and its lease release has landed.
+   */
+  const terminating = new Map<SessionID, Promise<void>>()
   let terminated = false
 
   const cancelled = (sessionID: SessionID): SessionCancelledError =>
@@ -389,9 +405,23 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const worker = workers.dispose(sessionID)
     if (worker === undefined) return undefined
     if (retireOptions.keepController !== true) disposeController(worker.id)
-    void worker.terminate().catch(() => undefined)
-    pool.releaseSession?.(sessionID, worker.id)
-    options.onSessionReleased?.(sessionID, worker.id)
+    // Retirement is reported only after the isolate has actually exited. A
+    // still-live old generation could otherwise write after its lease was
+    // zeroed and re-stamp the expiry, starving the successor. The callback may
+    // be async (the hub's lease release is an executor round-trip); await it in
+    // the same chain so a successor waits for the release too.
+    let exit!: Promise<void>
+    exit = worker
+      .terminate()
+      .catch(() => undefined)
+      .then(async () => {
+        pool.releaseSession?.(sessionID, worker.id)
+        await options.onSessionReleased?.(sessionID, worker.id)
+      })
+      .finally(() => {
+        if (terminating.get(sessionID) === exit) terminating.delete(sessionID)
+      })
+    terminating.set(sessionID, exit)
     return worker
   }
 
@@ -431,6 +461,15 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     if (terminated) {
       pending.gate.claim("cancel")
       pending.reject(cancelled(pending.sessionID))
+      return
+    }
+    const exit = terminating.get(pending.sessionID)
+    if (exit !== undefined) {
+      // The previous generation is still exiting: never materialize a successor
+      // against a live old isolate. `start` re-enters once the exit is confirmed.
+      void exit.then(() => {
+        if (byKey.get(pending.sessionID) === pending) start(pending)
+      })
       return
     }
     clearIdle(pending.sessionID)
@@ -669,9 +708,33 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       retireWorker(pending.sessionID)
       const decision = options.resumeDecision?.(payload)
       if (decision instanceof Promise) {
+        // An async decision owns the terminal state only for a bounded window.
+        // If it never resolves, the session would stay owned by a dead run and
+        // every new `ensureRunning` would attach to that dead promise. Settle
+        // without a resume at the deadline; a late answer is ignored.
+        let settled = false
+        const settleOnce = (resolved: AutoResumeDecision | undefined): void => {
+          if (settled) return
+          settled = true
+          if (timer !== undefined) clearTimeout(timer)
+          settleCrash(pending, failure, payload, resolved)
+        }
+        const timer =
+          resumeDecisionTimeoutMs > 0
+            ? setTimeout(() => {
+                log(workerLogMessage("resume decision timed out"), {
+                  level: "WARN",
+                  sessionID: pending.sessionID,
+                  workerID: payload.workerID,
+                  timeoutMs: resumeDecisionTimeoutMs,
+                })
+                settleOnce(undefined)
+              }, resumeDecisionTimeoutMs)
+            : undefined
+        timer?.unref?.()
         void decision.then(
-          (resolved) => settleCrash(pending, failure, payload, resolved),
-          () => settleCrash(pending, failure, payload, undefined),
+          (resolved) => settleOnce(resolved),
+          () => settleOnce(undefined),
         )
         return
       }

@@ -1,4 +1,4 @@
-// B1 — DCP regression guard for `experimental.chat.messages.transform` under workers.
+// DCP regression guard for `experimental.chat.messages.transform` under workers.
 //
 // The original bug: `@tarquinen/opencode-dcp` prunes old tool results via
 // `experimental.chat.messages.transform`. With `OPENCODE_EXPERIMENTAL_SESSION_WORKERS=true`

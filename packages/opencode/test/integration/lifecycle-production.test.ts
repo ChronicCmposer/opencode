@@ -1,4 +1,4 @@
-// Production lifecycle wiring (REVIEW C7/M3, D8/D9/D10).
+// Production lifecycle wiring (D8/D9/D10).
 //
 // These tests drive the REAL production path: the production hub
 // (`createProductionSessionHub`), the real session-worker isolate (or a real
@@ -178,7 +178,7 @@ afterEach(() => {
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
 })
 
-describe("production lifecycle wiring (C7/M3)", () => {
+describe("production lifecycle wiring", () => {
   it.live(
     "a real tool turn records the durable started row and the committed assistant message",
     () =>
@@ -283,13 +283,14 @@ describe("production lifecycle wiring (C7/M3)", () => {
           expect(committed).not.toBeNull()
           expect(readState(filename, sessionID).messages.some((message) => message.id === committed)).toBe(true)
 
-          const second = dispatchPrompt(fixture, "second turn")
-          yield* llm.wait(2)
+          const before = yield* llm.calls
+          const second = crashPayload(dispatchPrompt(fixture, "second turn"))
+          yield* llm.wait(before + 1)
           const worker = fixture.hub.dispatcher.registry.worker(sid(sessionID))
           expect(worker).toBeDefined()
           yield* Effect.promise(() => worker!.terminate())
 
-          const payload = yield* Effect.promise(() => crashPayload(second))
+          const payload = yield* Effect.promise(() => second)
           expect(payload.lastCommittedMessageID).toBe(committed)
 
           const decision = decideAutoResume({

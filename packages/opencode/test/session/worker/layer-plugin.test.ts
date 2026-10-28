@@ -1,4 +1,4 @@
-// Phase 6.3 — worker plugin host tests (`chat.params` / `chat.headers` in-worker).
+// Worker plugin host tests (`chat.params` / `chat.headers` in-worker).
 
 import { describe, expect, test } from "bun:test"
 import { Cause, Effect, Exit, Layer } from "effect"

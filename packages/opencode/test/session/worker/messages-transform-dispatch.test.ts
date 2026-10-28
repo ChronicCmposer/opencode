@@ -1,4 +1,4 @@
-// A3 — worker `Plugin.Service` dispatch for `experimental.chat.messages.transform`.
+// Worker `Plugin.Service` dispatch for `experimental.chat.messages.transform`.
 //
 // The worker dispatch switch (`runWorkerPluginHook`) used to fall through to a
 // pass-through `default`, silently dropping the messages transform (the DCP

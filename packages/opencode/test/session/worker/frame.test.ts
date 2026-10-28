@@ -14,6 +14,7 @@ import {
   WORKER_FRAME_VERSION,
   UnsupportedFrameVersionError,
   ackFrame,
+  assertJsonRepresentable,
   createFramePrimitives,
   decodeWorkerFrame,
   durableMetaOf,
@@ -299,15 +300,19 @@ describe("worker frame size bound", () => {
 })
 
 describe("JSON payload encoding", () => {
-  test("rejects a non-JSON value instead of silently dropping it", () => {
+  test("the encoder is the plain-stringify fast path; the explicit guard rejects dropped values", () => {
+    // `encodeWorkerFrame` runs on the throughput hot path, so it does not walk
+    // the payload with a replacer. Untrusted reply boundaries call
+    // `assertJsonRepresentable`, which rejects a value JSON would silently drop.
+    expect(() => assertJsonRepresentable({ value: () => {} })).toThrow(ProtocolError)
     expect(() =>
       encodeWorkerFrame({
         v: WORKER_FRAME_VERSION,
         port: "hub-proxy",
         kind: "reply",
-        payload: { value: () => {} },
+        payload: { value: "ok" },
       }),
-    ).toThrow(ProtocolError)
+    ).not.toThrow()
   })
 
   test("rejects a bigint that JSON cannot represent", () => {

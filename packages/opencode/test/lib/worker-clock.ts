@@ -1,4 +1,4 @@
-// Phase 3.6 — cross-worker fake clock (plan task 3.6).
+// Cross-worker fake clock.
 //
 // Effect's `TestClock` is per-runtime and cannot cross an isolate boundary.
 // This module therefore splits the clock in two:

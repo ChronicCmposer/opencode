@@ -1,4 +1,4 @@
-// Phase 8.1 + 8.7 + 8.12 — hub egress over a real `MessagePort` (plan tasks 8.1, 8.7, 8.12).
+// Hub egress over a real `MessagePort`.
 //
 // A `MessageChannel` stands in for the worker↔hub egress port on the main
 // thread, exercising the actual port delivery semantics: framing/reassembly,

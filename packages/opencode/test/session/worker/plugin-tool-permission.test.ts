@@ -1,4 +1,4 @@
-// PT-4 — plugin-tool permission resolution on the HUB.
+// Plugin-tool permission resolution on the HUB.
 //
 // A plugin tool runs on the hub, so its `PluginToolContext.ask` must resolve
 // against the HUB-RESIDENT `Permission.Service` (never by re-entering the worker

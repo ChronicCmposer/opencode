@@ -184,10 +184,14 @@ export const layer = Layer.effect(
         // A hub-hosted run reports cancel/crash/control failures through its
         // promise rejection. Map them into the typed `RunError` channel so the
         // caller can branch on them; never let a rejection become a defect.
-        return yield* Effect.tryPromise({
+        // A clean cancel is the exception: the caller's `onInterrupt` is the run's
+        // intended result (flag-off parity), not a failure, so a cancelled prompt
+        // handler returns the interrupted message instead of `BadRequest`.
+        const run = Effect.tryPromise({
           try: () => hub.ensureRunning(sessionID, origin),
           catch: asRunError,
-        }).pipe(Effect.flatMap(parseSessionResult))
+        })
+        return yield* settleHubRun(run, onInterrupt)
       }
       const runners = yield* InstanceState.get(state)
       return yield* runners.ensureRunning(sessionID, work, onInterrupt)
@@ -211,12 +215,13 @@ export const layer = Layer.effect(
         if (ready !== undefined) yield* ready.open
         // `hub.startShell` performs its own busy assertion and rejects with a
         // worker-local `SessionBusyError`; map it onto the domain `Session.BusyError`.
-        return yield* Effect.tryPromise({
+        const run = Effect.tryPromise({
           try: () => hub.startShell(sessionID, shell),
           // A worker-local `SessionBusyError` maps onto the domain
           // `Session.BusyError`; every other failure is a typed run error.
           catch: (error) => (error instanceof SessionBusyError ? busyError(sessionID) : asRunError(error)),
-        }).pipe(Effect.flatMap(parseSessionResult))
+        })
+        return yield* settleHubRun(run, onInterrupt)
       }
       const runners = yield* InstanceState.get(state)
       return yield* runners
@@ -315,6 +320,33 @@ function completedOutcome(sessionID: SessionID): CancelOutcome {
  */
 function cooperativeOutcome(sessionID: SessionID, durationMs: number): CancelOutcome {
   return { sessionID, mode: "cooperative", winner: "cancel", acknowledged: false, durationMs }
+}
+
+/**
+ * Fold a hub-hosted run's outcome: a clean cancel yields the caller's
+ * `onInterrupt` result (the interrupted assistant message), exactly as the
+ * flag-off runner does, while every other typed failure still propagates.
+ */
+function settleHubRun(
+  run: Effect.Effect<SessionExecutionResult, RunError>,
+  onInterrupt: Effect.Effect<SessionV1.WithParts>,
+): Effect.Effect<SessionV1.WithParts, Exclude<RunError, SessionCancelledError>>
+function settleHubRun(
+  run: Effect.Effect<SessionExecutionResult, RunError | Session.BusyError>,
+  onInterrupt: Effect.Effect<SessionV1.WithParts>,
+): Effect.Effect<SessionV1.WithParts, Exclude<RunError, SessionCancelledError> | Session.BusyError>
+function settleHubRun(
+  run: Effect.Effect<SessionExecutionResult, RunError | Session.BusyError>,
+  onInterrupt: Effect.Effect<SessionV1.WithParts>,
+): Effect.Effect<SessionV1.WithParts, Exclude<RunError, SessionCancelledError> | Session.BusyError> {
+  return Effect.gen(function* () {
+    const result = yield* run.pipe(
+      Effect.map(Option.some),
+      Effect.catchTag("SessionCancelledError", () => Effect.succeed(Option.none<SessionExecutionResult>())),
+    )
+    if (Option.isNone(result)) return yield* onInterrupt
+    return yield* parseSessionResult(result.value)
+  })
 }
 
 /** Parse a worker's JSON result into the trusted `WithParts` at the hub boundary. */

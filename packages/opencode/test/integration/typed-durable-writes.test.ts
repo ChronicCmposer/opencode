@@ -1,4 +1,4 @@
-// Typed durable-write primitives (P0 boundary).
+// Typed durable-write primitives.
 //
 // The durable log has exactly one typed write boundary:
 // `Bus.DurableRepository`. EventV2 and Bus must issue every `event`,
@@ -321,18 +321,20 @@ describe("typed repository: Bus injection and refcounted GC", () => {
     expect(fs.readdirSync(database.blobDir)).toEqual([])
   })
 
-  test("the 16 MiB inline bound is the default and above it offloads by reference", () => {
-    expect(Bus.DEFAULT_BLOB_LIMIT_BYTES).toBe(16 * 1024 * 1024)
+  test("the frame-aligned 4 MiB inline bound is the default and above it offloads by reference", () => {
+    // The D16 inline bound must not exceed the worker egress frame cap (4 MiB),
+    // or an event that fits SQLite could never cross the events port.
+    expect(Bus.DEFAULT_BLOB_LIMIT_BYTES).toBe(4 * 1024 * 1024)
 
     const database = openLegacy()
     const bus = Bus.create({
       connection: database.connection,
-      ownerID: "gen-16mib",
+      ownerID: "gen-4mib",
       definitions: [Note],
       blobDir: database.blobDir,
     })
     expect(bus.read({ aggregateID: "s1" })).toEqual([])
-    expect(Bus.isBlobReference({ __eventBlob: "0".repeat(64), size: 16 * 1024 * 1024 + 1 })).toBe(true)
+    expect(Bus.isBlobReference({ __eventBlob: "0".repeat(64), size: 4 * 1024 * 1024 + 1 })).toBe(true)
     expect(Bus.isBlobReference({ __eventBlob: "0".repeat(64) })).toBe(false)
   })
 })

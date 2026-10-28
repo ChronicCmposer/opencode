@@ -108,7 +108,7 @@ export interface WorkerFrameCarrier {
  * another port or with a mismatched payload discriminant fails loud instead of
  * being blindly cast. There is no structured-clone fallback.
  */
-export interface WorkerFrameChannelOptions {
+export interface WorkerFrameChannelOptions<Frame = unknown> {
   /**
    * Host-boundary containment: receive a decode failure as a typed error instead
    * of an exception escaping the message listener. When supplied, the channel
@@ -116,28 +116,32 @@ export interface WorkerFrameChannelOptions {
    * so one malformed worker frame can never take the host down.
    */
   readonly onProtocolError?: (error: unknown) => void
+  /**
+   * Validate an outbound frame before it is encoded. Left unset on the egress
+   * hot path, where the encoder's plain fast path is deliberate. An untrusted
+   * control boundary (hub-proxy) supplies `assertJsonRepresentable` so a
+   * function or symbol payload fails loud instead of being silently dropped by
+   * `JSON.stringify`.
+   */
+  readonly validateOutbound?: (frame: Frame) => void
 }
 
 export function workerFrameChannel<Frame extends WorkerFrameCarrier>(
   port: MessagePort,
   portName: WorkerFramePort,
-  options: WorkerFrameChannelOptions = {},
+  options: WorkerFrameChannelOptions<Frame> = {},
 ): FrameChannel<Frame> {
   const channel = portFromMessagePort<string>(port)
   return {
     post: (frame) => {
-      const text = encodeWorkerFrame(
-        {
-          v: WORKER_FRAME_VERSION,
-          port: portName,
-          kind: frame.kind,
-          ...(frame.id === undefined ? {} : { id: frame.id }),
-          payload: frame,
-        },
-        // The events port is the throughput hot path: plain stringify, no
-        // replacer walk. Control ports stay strict and reject dropped values.
-        { strict: portName !== "events" },
-      )
+      options.validateOutbound?.(frame)
+      const text = encodeWorkerFrame({
+        v: WORKER_FRAME_VERSION,
+        port: portName,
+        kind: frame.kind,
+        ...(frame.id === undefined ? {} : { id: frame.id }),
+        payload: frame,
+      })
       channel.post(assertWorkerFrameSize(text))
     },
     onMessage: (handler) => {
@@ -397,7 +401,7 @@ export function peerLifecycle(
 }
 
 /**
- * Build a port-backed client, emitting the E2 peer lifecycle lines: an INFO
+ * Build a port-backed client, emitting the peer lifecycle lines: an INFO
  * `${peer} connected` once `build` succeeds, or a WARN `${peer} connect failed`
  * (with the error `reason`) before rethrowing. `build` is where the port is
  * started, so a start failure surfaces here.

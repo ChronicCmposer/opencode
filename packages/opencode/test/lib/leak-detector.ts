@@ -1,4 +1,4 @@
-// Leak detector (plan task 3.9).
+// Leak detector.
 //
 // After teardown, the three resources a session worker can strand are:
 //   1. Bun workers that were never terminated,

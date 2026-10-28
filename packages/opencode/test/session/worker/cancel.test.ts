@@ -1,4 +1,4 @@
-// Phase 11 — terminate-based cancel (plan tasks 11.1–11.9).
+// Terminate-based cancel.
 //
 // Covers the cancel module (control-port frames, grace controller, first-writer-
 // wins outcome gate) plus the additive dispatch wiring (cooperative vs terminate,
@@ -511,7 +511,7 @@ describe("11.9 completion wins the cancel race (Q11)", () => {
 
     const outcome = await dispatcher.cancelWithGrace(sid("ses_1"))
     expect(outcome).toMatchObject({ mode: "completed", winner: "completion", acknowledged: false })
-    // A2: the caller is reconciled with the reported winner — completion wins, so
+    // The caller is reconciled with the reported winner — completion wins, so
     // the dispatch promise RESOLVES (capture reports `{ ok: true }`).
     expect(await run).toEqual({ ok: true, value: undefined })
     // The run completed on its own: the per-session worker was neither
@@ -522,9 +522,9 @@ describe("11.9 completion wins the cancel race (Q11)", () => {
   })
 })
 
-// M5: a prompt dispatched while a cancel owns the grace window must not be
+// A prompt dispatched while a cancel owns the grace window must not be
 // promoted onto the worker the cancel is about to terminate.
-describe("M5 cancel-vs-new-dispatch race", () => {
+describe("cancel-vs-new-dispatch race", () => {
   test("a prompt arriving during grace runs cleanly on a fresh worker", async () => {
     const pool = createFakeWorkerPool(1, { onCancel: "ignore" })
     const scheduler = createRecordingScheduler<CancelScheduler>()
@@ -606,10 +606,10 @@ describe("12 D1 cancel requested logging", () => {
 })
 
 // ---------------------------------------------------------------------------
-// A11 — dispose settles in-flight requests; cancel returns a rejected promise.
+// Dispose settles in-flight requests; cancel returns a rejected promise.
 // ---------------------------------------------------------------------------
 
-describe("A11 dispose settles in-flight cancels", () => {
+describe("dispose settles in-flight cancels", () => {
   test("dispose rejects an in-flight cancel instead of leaving it pending", async () => {
     const pair = createPortPair()
     const scheduler = createRecordingScheduler<CancelScheduler>()

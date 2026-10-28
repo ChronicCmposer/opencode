@@ -1,4 +1,4 @@
-// Task 4 (Wave 1 follow-up) — the degraded (no hub-port) `ModelClient` path must
+// The degraded (no hub-port) `ModelClient` path must
 // run the worker-hosted plugin hooks, not the no-op pass-through, so a plugin's
 // `chat.params` / `chat.headers` mutations reach the reduced LLM.
 //

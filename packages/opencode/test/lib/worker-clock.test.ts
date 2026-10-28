@@ -1,4 +1,4 @@
-// Phase 3.6 — cross-worker fake clock (plan task 3.6).
+// Cross-worker fake clock.
 //
 // Effect's `TestClock` is per-runtime and cannot cross isolates. Instead the
 // worker owns a frame-driven clock state; the hub drives it over a dedicated

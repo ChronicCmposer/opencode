@@ -1,4 +1,4 @@
-// Phase 6.1 / 6.2 — worker fixture that boots the reduced session layer inside
+// Worker fixture that boots the reduced session layer inside
 // a real Bun worker isolate and runs the pipeline against the hub's mock
 // provider.
 //

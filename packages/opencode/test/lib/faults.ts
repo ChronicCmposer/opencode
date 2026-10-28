@@ -1,5 +1,4 @@
 // Test-facing entry point for the `OPENCODE_TEST_FAULTS` fault-injection seam
-// (plan task 3.7).
 //
 // The seam itself lives in `src/testing/faults.ts`: production call sites
 // (writer, pool) import it directly, it is gated by `OPENCODE_TEST_FAULTS`, and

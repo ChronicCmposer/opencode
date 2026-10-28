@@ -26,19 +26,15 @@ import {
   openWorkerDatabase,
   type WorkerDatabase,
 } from "@/session/worker/db"
-import {
-  TABLE_REGISTRY,
-  TableRegistryDriftError,
-  assertTableRegistry,
-  connectedRepository,
-  tableRegistry,
-} from "@/session/worker/repository"
+import { TABLE_REGISTRY, assertTableRegistry, tableRegistry } from "@/session/worker/repository/registry"
+import { connectedRepository } from "@/session/worker/repository/write"
 import { LEDGER_SQL } from "@/session/ledger/tool-call"
 import {
   ForeignKeyOwnershipError,
   HubOnlyWriteError,
   ImmutableColumnError,
   ScopeViolationError,
+  TableRegistryDriftError,
   UnknownColumnError,
   UnsupportedWriteError,
 } from "@/session/worker/repository/errors"
@@ -187,7 +183,8 @@ describe("public typed surface", () => {
       expect(source).not.toContain(parser)
     }
     expect(source).not.toMatch(/CREATE\s+TEMP\s+TABLE/i)
-    expect(source).not.toMatch(/CREATE\s+TEMP\s+TRIGGER/i)
+    // D6 is enforced on the trusted Drizzle path by per-connection TEMP triggers.
+    expect(source).toMatch(/CREATE\s+TEMP\s+TRIGGER/i)
 
     // A bound handle has no raw write capability: every write is repository-only.
     const surface = database as unknown as Record<string, unknown>

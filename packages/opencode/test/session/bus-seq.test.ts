@@ -53,7 +53,7 @@ afterEach(() => {
   for (const native of databases.splice(0)) native.close()
 })
 
-describe("Bus W1.7 sequence allocation", () => {
+describe("Bus sequence allocation", () => {
   test("keeps contiguous per-aggregate sequences across interleaved batches", () => {
     const { native, connection } = open()
     databases.push(native)

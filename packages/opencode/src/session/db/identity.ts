@@ -1,4 +1,4 @@
-// Schema identity hashing (D7 / M4).
+// Schema identity hashing (D7).
 //
 // The identity is `user_version` + the ordered migration journal ids + a hash of
 // the actual shipped SQL bodies. Hashing ids alone let a changed statement keep

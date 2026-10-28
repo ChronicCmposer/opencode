@@ -58,7 +58,7 @@ function crashPool(options: Omit<CrashOptions, "sessionID">): ExecutorWorkerPool
   }
 }
 
-describe("hub lifecycle wiring (M3 / D8)", () => {
+describe("hub lifecycle wiring (D8)", () => {
   test("every crash phase reaches the D8 payload from the hub's dispatcher", async () => {
     for (const phase of WORKER_CRASH_PHASES) {
       const lifecycle = createLifecycleTracker()

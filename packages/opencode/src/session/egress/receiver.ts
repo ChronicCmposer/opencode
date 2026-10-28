@@ -1,4 +1,4 @@
-// W2 — hub-side egress receiver over the events envelope (spec Q6/Q16/Q21).
+// Hub-side egress receiver over the events envelope (spec Q6/Q16/Q21).
 //
 // The hub end of a worker's dedicated egress port. Every incoming message is one
 // shared-envelope JSON string, decoded by the same codec as every other worker

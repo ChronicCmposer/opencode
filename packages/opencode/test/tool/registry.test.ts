@@ -58,7 +58,7 @@ const brokenPluginLayer = Layer.succeed(
   }),
 )
 
-// PT-2: a fake hub-proxied plugin whose `Plugin.Service.list()` exposes a
+// A fake hub-proxied plugin whose `Plugin.Service.list()` exposes a
 // synthetic `Hooks` built by `remotePluginToolHooks` — exactly the stub the
 // session worker ships. The worker `ToolRegistry` must register the id and route
 // its execution through the executor (never a local `fromPlugin` wrapper).
@@ -493,14 +493,14 @@ describe("tool.registry", () => {
       const ids = yield* registry.ids()
       expect(ids).toContain("read")
       expect(ids).toContain("broken_plugin_tool")
-      // Schema parity (PT-2): the registry's `fromPlugin` and the hub's descriptor
+      // Schema parity: the registry's `fromPlugin` and the hub's descriptor
       // extraction share `pluginToolJsonSchema`, so they cannot drift.
       const loaded = (yield* registry.all()).find((tool) => tool.id === "broken_plugin_tool")
       expect(loaded?.jsonSchema).toEqual(pluginToolJsonSchema(brokenDef))
     }),
   )
 
-  // PT-2: a hub-executed plugin tool ships only clone-safe descriptors; the
+  // A hub-executed plugin tool ships only clone-safe descriptors; the
   // worker's `Plugin.Service.list()` exposes a `RemotePluginToolDefinition`
   // whose `execute` proxies to the hub. The registry must register it and route
   // `execute` through the executor (never `fromPlugin`, which would call a local
@@ -520,7 +520,7 @@ describe("tool.registry", () => {
     }),
   )
 
-  // Step 44: a remote stub's constructed source matches the opinionated route
+  // A remote stub's constructed source matches the opinionated route
   // table exactly — the stub itself runs in the worker and forwards the call.
   withRemotePlugin.instance("the constructed source for a remote stub is remote-plugin", () =>
     Effect.gen(function* () {

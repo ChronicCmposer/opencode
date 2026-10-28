@@ -1,4 +1,4 @@
-// Polling helper (finding #137 consolidation).
+// Polling helper.
 //
 // The implementation now lives in `./async` with the other async primitives;
 // this module is the stable import path used by existing suites. New code may

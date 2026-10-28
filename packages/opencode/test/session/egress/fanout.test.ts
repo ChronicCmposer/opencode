@@ -1,4 +1,4 @@
-// Phase 8.6 + 8.8 — pre-encode once, bounded fan-out (plan tasks 8.6, 8.8).
+// Pre-encode once, bounded fan-out.
 //
 // The hub encodes each published frame exactly once and hands the SAME bytes to
 // every subscriber (no per-client re-encode). Each subscriber has a bound of 256;

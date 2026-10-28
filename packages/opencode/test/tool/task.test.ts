@@ -74,6 +74,8 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
 
 const it = testEffect(layer())
 const background = testEffect(layer({ experimentalBackgroundSubagents: true }))
+// Worker mode adds the hub-scoped direct-child rule; flag-off must not.
+const worker = testEffect(layer({ experimentalSessionWorkers: true }))
 
 function defer<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -539,6 +541,73 @@ describe("tool.task", () => {
       expect(kids).toHaveLength(1)
       expect(kids[0]?.id).toBe(result.metadata.sessionId)
       expect(result.metadata.sessionId).not.toBe("ses_missing")
+    }),
+  )
+
+  it.instance("flag-off resumes a non-direct task_id: the direct-child rule is worker-only", () =>
+    Effect.gen(function* () {
+      spawnCalls.length = 0
+      onSpawn = (request) => Effect.succeed(resultFor(request, "resumed non-direct"))
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const other = yield* sessions.create({ title: "Other parent" })
+      const nonDirect = yield* sessions.create({ parentID: other.id, title: "Sibling child" })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const result = yield* def.execute(
+        { description: "inspect bug", prompt: "continue", subagent_type: "general", task_id: nonDirect.id },
+        runContext(chat.id, assistant.id, stubOps()),
+      )
+
+      expect(spawnCalls[0]?.childID).toBe(nonDirect.id)
+      expect(result.metadata.sessionId).toBe(nonDirect.id)
+    }),
+  )
+
+  worker.instance("worker mode rejects a non-direct task_id before spawning", () =>
+    Effect.gen(function* () {
+      spawnCalls.length = 0
+      onSpawn = (request) => Effect.succeed(resultFor(request, "must not run"))
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const other = yield* sessions.create({ title: "Other parent" })
+      const nonDirect = yield* sessions.create({ parentID: other.id, title: "Sibling child" })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          { description: "inspect bug", prompt: "continue", subagent_type: "general", task_id: nonDirect.id },
+          runContext(chat.id, assistant.id, stubOps()),
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(String(Cause.squash(exit.cause))).toContain("not a direct child")
+      }
+      expect(spawnCalls).toHaveLength(0)
+    }),
+  )
+
+  worker.instance("worker mode still resumes a direct child", () =>
+    Effect.gen(function* () {
+      spawnCalls.length = 0
+      onSpawn = (request) => Effect.succeed(resultFor(request, "resumed direct"))
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "Direct child" })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const result = yield* def.execute(
+        { description: "inspect bug", prompt: "continue", subagent_type: "general", task_id: child.id },
+        runContext(chat.id, assistant.id, stubOps()),
+      )
+
+      expect(spawnCalls[0]?.childID).toBe(child.id)
+      expect(result.metadata.sessionId).toBe(child.id)
     }),
   )
 

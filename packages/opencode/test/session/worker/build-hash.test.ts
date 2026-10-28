@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   BuildMismatch,
+  MissingBuildHashError,
   PROTOCOL_SCHEMA_VERSION,
   buildHashStatus,
   computeBuildHash,
@@ -94,13 +95,12 @@ describe("production override gate", () => {
     ).toMatchObject({ buildHash: "build-hash", source: "build", override: false })
   })
 
-  test("NODE_ENV=production also ignores the override even without a build hash", () => {
-    const resolved = resolveBuildHash({
-      env: { NODE_ENV: "production", OPENCODE_BUILD_HASH_OVERRIDE: "local-hash" },
-    })
-    expect(resolved.source).toBe("dev")
-    expect(resolved.override).toBe(false)
-    expect(resolved.hash).not.toBe("local-hash")
+  test("NODE_ENV=production ignores the override and requires a compiled hash", () => {
+    expect(() =>
+      resolveBuildHash({
+        env: { NODE_ENV: "production", OPENCODE_BUILD_HASH_OVERRIDE: "local-hash" },
+      }),
+    ).toThrow(MissingBuildHashError)
   })
 
   test("development and test builds honour the override", () => {
@@ -112,6 +112,20 @@ describe("production override gate", () => {
       source: "override",
       override: true,
     })
+  })
+
+  test("a packaged production run without a compiled hash fails loud", () => {
+    expect(() => resolveBuildHash({ definedHash: undefined, env: { NODE_ENV: "production" } })).toThrow(
+      MissingBuildHashError,
+    )
+    // An override cannot rescue a production build either: it is ignored unless
+    // the explicit dev marker is set.
+    expect(() =>
+      resolveBuildHash({
+        definedHash: undefined,
+        env: { NODE_ENV: "production", OPENCODE_BUILD_HASH_OVERRIDE: "local" },
+      }),
+    ).toThrow(MissingBuildHashError)
   })
 })
 

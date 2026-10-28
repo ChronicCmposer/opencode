@@ -1,4 +1,4 @@
-// Phase 8.1 + 8.13 — egress across a real worker isolate (plan tasks 8.1, 8.13).
+// Egress across a real worker isolate.
 //
 // Spawns the egress fixture with `test/lib/worker-harness.ts`; the worker
 // transfers a dedicated egress port and a separate control port. Proves frames

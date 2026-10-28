@@ -1,4 +1,4 @@
-// P0 durable/resync: every local durable subscription that matches an overflow
+// Every local durable subscription that matches an overflow
 // must be told to resync, not just the first one. A gap signalled by the hub on
 // the events data port (a missed `(aggregateID, seq)` commit) is likewise
 // broadcast to every live subscription with the exact aggregate position, so the

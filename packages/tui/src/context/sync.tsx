@@ -32,6 +32,7 @@ import { batch, onMount } from "solid-js"
 import path from "path"
 import { useKV } from "./kv"
 import { usePermission } from "./permission"
+import { compareCodepointNumeric } from "../util/order"
 
 const emptyConsoleState: ConsoleState = {
   consoleManagedProviders: [],
@@ -58,8 +59,7 @@ function search<T, K>(items: T[], target: K, compare: (item: T, target: K) => nu
 
 /** Total order for ids, shared by every id-keyed cache (sessions, parts, requests). */
 function compareIds(candidate: string, target: string) {
-  if (candidate === target) return 0
-  return candidate < target ? -1 : 1
+  return compareCodepointNumeric(candidate, target)
 }
 
 /** Locate an entity by id; the ascending invariant for every id-keyed cache. */
@@ -185,7 +185,7 @@ export const {
     function listSessions() {
       return sdk.client.session
         .list({ start: Date.now() - 30 * 24 * 60 * 60 * 1000, ...sessionListQuery() })
-        .then((x) => (x.data ?? []).toSorted((a, b) => a.id.localeCompare(b.id)))
+        .then((x) => (x.data ?? []).toSorted((a, b) => compareIds(a.id, b.id)))
     }
 
     event.subscribe((event, { directory, workspace }) => {

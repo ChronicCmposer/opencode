@@ -27,7 +27,7 @@ const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 10))
 
 describe("createSpawnGate", () => {
   test("grants one permit at a time", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
 
     const first = await gate.acquire()
     const second = gate.acquire()
@@ -43,7 +43,7 @@ describe("createSpawnGate", () => {
   })
 
   test("releases are not on acquire or construction", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
     const first = await gate.acquire()
     const second = gate.acquire()
     const secondState = observe(second)
@@ -61,7 +61,7 @@ describe("createSpawnGate", () => {
   })
 
   test("queues concurrent acquisitions FIFO", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
     const first = await gate.acquire()
     const order: string[] = []
 
@@ -86,7 +86,7 @@ describe("createSpawnGate", () => {
   })
 
   test("a waiter is not rejected while it waits", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
     const first = await gate.acquire()
     const second = gate.acquire()
     const secondState = observe(second)
@@ -101,7 +101,7 @@ describe("createSpawnGate", () => {
   })
 
   test("a failed release frees the permit for the next waiter", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
     const first = await gate.acquire()
     const second = gate.acquire()
 
@@ -112,7 +112,7 @@ describe("createSpawnGate", () => {
   })
 
   test("release is idempotent", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
     const first = await gate.acquire()
     first.release()
     first.release()
@@ -131,7 +131,7 @@ describe("createSpawnGate", () => {
   })
 
   test("release with different outcomes still releases once", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
     const first = await gate.acquire()
     first.release("failed", new Error("worker boot failed"))
     first.release()
@@ -147,7 +147,7 @@ describe("createSpawnGate", () => {
   })
 
   test("times out a waiting acquisition with a descriptive error", async () => {
-    const gate = createSpawnGate({ timeoutMs: 20 })
+    const gate = createSpawnGate({ timeoutMs: 20, capacity: 1 })
     const first = await gate.acquire()
 
     const timeout = gate.acquire()
@@ -166,7 +166,7 @@ describe("createSpawnGate", () => {
   })
 
   test("release accepts an optional outcome and the permit has no fail method", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
 
     const first = await gate.acquire()
     expect("fail" in first).toBe(false)
@@ -187,5 +187,58 @@ describe("createSpawnGate", () => {
   test("rejects an invalid timeout at construction", () => {
     expect(() => createSpawnGate({ timeoutMs: 0 })).toThrow(/timeoutMs/)
     expect(() => createSpawnGate({ timeoutMs: Number.NaN })).toThrow(/timeoutMs/)
+  })
+
+  test("rejects an invalid capacity at construction", () => {
+    expect(() => createSpawnGate({ timeoutMs: 1_000, capacity: 0 })).toThrow(/capacity/)
+    expect(() => createSpawnGate({ timeoutMs: 1_000, capacity: 1.5 })).toThrow(/capacity/)
+  })
+})
+
+describe("cap-bounded parallel boots", () => {
+  test("admits capacity boots concurrently and queues the rest FIFO", async () => {
+    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 2 })
+    expect(gate.capacity).toBe(2)
+
+    const first = await gate.acquire()
+    const second = await gate.acquire()
+    expect(gate.active).toBe(2)
+    expect(gate.held).toBe(true)
+
+    const third = gate.acquire()
+    const thirdState = observe(third)
+    await tick()
+    expect(thirdState.settled).toBe(false)
+    expect(gate.waiting).toBe(1)
+
+    // A stalled boot occupies one slot, not the whole gate: releasing one slot
+    // admits exactly one waiter.
+    first.release()
+    const thirdPermit = await third
+    expect(gate.active).toBe(2)
+    expect(gate.waiting).toBe(0)
+
+    second.release()
+    thirdPermit.release()
+    expect(gate.active).toBe(0)
+    expect(gate.held).toBe(false)
+  })
+
+  test("defaults to a bounded parallel capacity, not a single permit", async () => {
+    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    expect(gate.capacity).toBeGreaterThan(1)
+    const permits = await Promise.all([gate.acquire(), gate.acquire()])
+    expect(gate.active).toBe(2)
+    for (const permit of permits) permit.release()
+  })
+
+  test("a stalled boot does not block an unrelated boot", async () => {
+    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 2 })
+    const stalled = await gate.acquire()
+    const other = await gate.acquire()
+    // The stalled holder never releases; the other boot still completes.
+    other.release()
+    expect(gate.active).toBe(1)
+    stalled.release()
   })
 })

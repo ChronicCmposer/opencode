@@ -1,4 +1,4 @@
-// Phase 3.5 worker entry point (plan task 3.5).
+// Worker entry point.
 //
 // Dependency-free: it imports only the worker-side SSE consumer, which uses
 // `fetch` and a text decoder — no Effect, no model SDK. The hub delivers a

@@ -280,7 +280,7 @@ export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
 }
 
 // ---------------------------------------------------------------------------
-// Client aggregation (step 22).
+// Client aggregation.
 // ---------------------------------------------------------------------------
 
 /**
@@ -299,6 +299,9 @@ type WriterQueryConnection = Pick<WorkerConnection, "all" | "values" | "run" | "
 
 const WRITER_TX_WRITE_REJECTED =
   "writer txQuery is read-only; use the typed repository or durable Bus for writes"
+
+/** One third of the 30s worker lease TTL: two missed beats still leave headroom. */
+const WORKER_LEASE_HEARTBEAT_MS = 10_000
 
 function writerQuery(
   connection: WriterQueryConnection,
@@ -350,6 +353,13 @@ export function createWorkerDatabaseWriter(
     sessionID?: string
     /** D16 content-addressed blob directory; defaults to a sibling of the DB. */
     blobDir?: string
+    /**
+     * Lease heartbeat cadence. Defaults to one third of the 30s worker lease TTL
+     * so an idle generation never self-fences between writes. `0` disables it.
+     */
+    heartbeatIntervalMs?: number
+    /** Per-database EventV2 binding; production passes `WorkerDatabase.eventBinding`. */
+    eventBinding?: EventV2.WorkerScope
   } = {},
 ): WorkerWriterClient {
   // D16 blobs live next to the database this writer actually opens: an explicit
@@ -366,9 +376,7 @@ export function createWorkerDatabaseWriter(
   const writeConnection = options.connection ?? ownedConnection ?? openWriterConnection(databaseFilename)
   const readConnection = options.queryConnection ?? writeConnection
   const ownerID = `worker-${options.workerID ?? threadId}-${process.pid}-${randomUUID()}`
-  // The event service commits durable events in this isolate; stamp it with the
-  // same generation lease so a stale generation's durable write is fenced.
-  EventV2.setWorkerLeaseOwner(ownerID)
+  if (options.eventBinding !== undefined) options.eventBinding.leaseOwner = ownerID
   // A session worker's Bus is scoped to its one session aggregate: publishing,
   // claiming, reading, or releasing another session's log is refused.
   const blobDir = options.blobDir ?? path.join(path.dirname(databaseFilename), "event-blobs")
@@ -392,7 +400,7 @@ export function createWorkerDatabaseWriter(
   const transactions = new Set<string>()
   let nextTransaction = 1
 
-  // C8/P0: claim only the worker-generation lease. The v1 sync owner
+  // Claim only the worker-generation lease. The v1 sync owner
   // (`event_sequence.owner_id`) belongs to sync replication and is never
   // rewritten here. A lease held by a live generation is refused; a dead
   // generation is reclaimed only at the observed sequence inside one
@@ -412,6 +420,24 @@ export function createWorkerDatabaseWriter(
     })
   }
   if (options.sessionID !== undefined) claimWorkerLease(options.sessionID)
+
+  // Keep the generation's lease live while it is idle. The Bus and EventV2 share
+  // the same `event_sequence` lease columns, so renewing through the Bus also
+  // renews the durable-event lease. A stale owner is ignored here: the next write
+  // fences it through the normal owner check.
+  const heartbeatIntervalMs = options.heartbeatIntervalMs ?? WORKER_LEASE_HEARTBEAT_MS
+  const heartbeatSessionID = options.sessionID
+  const heartbeat =
+    heartbeatSessionID !== undefined && heartbeatIntervalMs > 0
+      ? setInterval(() => {
+          try {
+            bus.heartbeat(heartbeatSessionID)
+          } catch {
+            // A superseded generation is fenced by its next write, not here.
+          }
+        }, heartbeatIntervalMs)
+      : undefined
+  heartbeat?.unref?.()
 
   const requireTransaction = (handle: string): void => {
     if (!transactions.has(handle)) throw new Error(`unknown or spent transaction handle "${handle}"`)
@@ -454,8 +480,9 @@ export function createWorkerDatabaseWriter(
       transactions.delete(handle)
     },
     dispose: () => {
+      if (heartbeat !== undefined) clearInterval(heartbeat)
       if (options.sessionID !== undefined) bus.release(options.sessionID)
-      EventV2.setWorkerLeaseOwner(undefined)
+      if (options.eventBinding !== undefined) options.eventBinding.leaseOwner = undefined
       ownedConnection?.close()
     },
   }
@@ -505,11 +532,11 @@ export interface WorkerClients {
  * that silently drops events; the writer is never a port because D5 has no
  * writer RPC.
  *
- * `workerID`, when supplied, is threaded onto every client so their E2 lifecycle
+ * `workerID`, when supplied, is threaded onto every client so their lifecycle
  * log lines carry the worker's owner id. It is omitted (never fabricated) when
  * the caller does not know it.
  *
- * `log`, when supplied, is threaded into the egress client so the E2 peer
+ * `log`, when supplied, is threaded into the egress client so the peer
  * lifecycle lines actually fire in the isolate. Absent keeps the no-op default.
  */
 export function buildWorkerClients(
@@ -534,6 +561,7 @@ export function buildWorkerClients(
             connection: options.database.connection,
             queryConnection: options.database.strictConnection,
             filename: options.database.filename,
+            eventBinding: options.database.eventBinding,
           }),
       ...(options.sessionID === undefined ? {} : { sessionID: options.sessionID }),
     }),
@@ -551,12 +579,15 @@ export function buildWorkerClients(
 
 /** The handle {@link bootstrapSessionWorker} returns: teardown plus live seams. */
 export interface SessionWorkerBootstrap {
-  /** Tear down the bootstrapped worker state. */
-  dispose(): void
+  /**
+   * Tear down the bootstrapped worker state. Resolves once the executor and
+   * background-job scopes have settled and the SQLite handle/WAL is closed.
+   */
+  dispose(): Promise<void>
 }
 
 // ---------------------------------------------------------------------------
-// Worker→hub PID reporting (P5 prerequisite).
+// Worker→hub PID reporting.
 // ---------------------------------------------------------------------------
 
 /**
@@ -588,7 +619,7 @@ export interface ControlPidReporterOptions {
 /**
  * Builds the worker's control-port PID reporter. Production uses
  * {@link createControlPidReporter} with the worker's forwarded `log`; the factory
- * seam lets a test hand the reporter a throwing port so the E4
+ * seam lets a test hand the reporter a throwing port so the
  * `pid report failed` path (and the forwarded `log`) is observable without a
  * real closed port.
  */
@@ -610,7 +641,7 @@ export function createControlPidReporter(
       try {
         port.postMessage(frame)
       } catch (error) {
-        // E4 — the port is closed. Emit the WARN before rethrowing so the report
+        // The port is closed. Emit the WARN before rethrowing so the report
         // is never silently dropped AND the reason is observable.
         log(workerLogMessage("pid report failed"), { level: "warn", workerID, reason: messageOf(error) })
         throw error
@@ -645,7 +676,7 @@ function modelConfig(model: SessionWorkerModel): WorkerModelConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Session work (step 27) + work-kind registry (step 28).
+// Session work and work-kind registry.
 // ---------------------------------------------------------------------------
 
 const rowToMessage = (row: unknown): PipelineMessage | undefined => {
@@ -697,7 +728,7 @@ export interface SessionWorkOptions {
   /**
    * The worker-lifetime graph context. When present, every run provides these
    * already-built services instead of rebuilding (and disposing) the layer, so
-   * the per-worker DB connection survives across turns (C3).
+   * the per-worker DB connection survives across turns.
    */
   readonly context?: Context.Context<unknown>
   /**
@@ -748,7 +779,7 @@ export interface SessionWorkOptions {
  * one-shot `SessionPipeline` reduction (pipeline-only graphs and the degraded
  * no-hub-port boot).
  *
- * A carried `prompt` (Solution 1 / B2) routes through the full
+ * A carried `prompt` routes through the full
  * `SessionPrompt.prompt` path — persist the user message for `sessionID`, then
  * loop — instead of the bare `loop` that expects the row to already exist.
  */
@@ -1041,7 +1072,7 @@ export function workerGraphReplacements(
  * The worker-side logger. The isolate runs no long-lived Effect fiber (each frame
  * is executed with `Effect.runPromise`), so a bridge is created synchronously from
  * the worker's own instance context. `bridge.fork` then runs each `Effect.logInfo`
- * on the default Effect runtime, so the E2 peer lifecycle lines reach the worker's
+ * on the default Effect runtime, so the peer lifecycle lines reach the worker's
  * output instead of being dropped by the no-op default.
  */
 export function workerBridgeLogger(snapshot: WorkerSnapshot, logging?: Layer.Layer<never>): WorkerLogger {
@@ -1051,7 +1082,7 @@ export function workerBridgeLogger(snapshot: WorkerSnapshot, logging?: Layer.Lay
   if (logging === undefined) return workerLoggerFromBridge(bridge)
   // The file sink opens asynchronously, so `Effect.runSync` cannot build it into
   // the bridge context. Provide the logging layer per emitted line instead — the
-  // bridge logger only emits a handful of E2 lifecycle lines.
+  // bridge logger only emits a handful of lifecycle lines.
   return workerLoggerFromBridge({
     ...bridge,
     fork: <A, E, R>(effect: Effect.Effect<A, E, R>): Fiber.Fiber<A, E> =>
@@ -1166,7 +1197,7 @@ export function hubProxyPluginToolList(
 export interface BootstrapSessionWorkerOptions {
   /**
    * Override the worker-side logger. Production omits it (a bridge logger is
-   * derived from the snapshot); a test may inject a recorder to observe the E2
+   * derived from the snapshot); a test may inject a recorder to observe the
    * lines the client construction emits.
    */
   readonly log?: WorkerLogger
@@ -1179,7 +1210,7 @@ export interface BootstrapSessionWorkerOptions {
   /**
    * Test seam: build the control-port PID reporter. Defaults to
    * `createControlPidReporter(port, workerID, { log })`, so the worker's forwarded
-   * `log` reaches the reporter's E4 `pid report failed` line.
+   * `log` reaches the reporter's `pid report failed` line.
    */
   readonly pidReporterFactory?: ControlPidReporterFactory
   /**
@@ -1192,7 +1223,7 @@ export interface BootstrapSessionWorkerOptions {
   readonly threadNamer?: ThreadNamer
   /**
    * Test seam: observe the hub-proxy control client bootstrap installs. Lets a
-   * test prove `dispose()` rejects its in-flight calls (M8).
+   * test prove `dispose()` rejects its in-flight calls.
    */
   readonly observeHubProxy?: (client: HubProxyClient) => void
   /**
@@ -1246,7 +1277,7 @@ export function bootstrapSessionWorker(
   const logging = options.logging ?? workerLoggingLayer({ id: `worker-${init.workerID ?? threadId}` })
   const log = options.log ?? workerBridgeLogger(init.snapshot, logging)
   // The control-port PID reporter's log is the worker's forwarded `log` (the same
-  // seam the client lifecycles use). A test may swap the factory to observe E4.
+  // seam the client lifecycles use). A test may swap the factory to observe the failure.
   const createPidReporter =
     options.pidReporterFactory ??
     ((port: MessagePort, workerID: number, forwarded: WorkerLogger) =>
@@ -1292,7 +1323,7 @@ export function bootstrapSessionWorker(
     try {
       // Dispose the outbound clients first: pending hub-proxy calls reject instead
       // of hanging past termination, and the egress listeners are removed before
-      // the graph/connection teardown (M8). Each disposal is independently guarded
+      // the graph/connection teardown. Each disposal is independently guarded
       // so a throw cannot skip the others or the native WAL close below.
       disposeSafely(() => hubProxyClient?.dispose())
       disposeSafely(() => clients?.egress.dispose())
@@ -1309,23 +1340,40 @@ export function bootstrapSessionWorker(
   /**
    * The one teardown for both the returned handle and a failed mid-bootstrap.
    * Every step is idempotent or best-effort, so it is safe on a partially built
-   * worker and safe after `closeResources` already ran. On the failure path this
-   * closes the SQLite handle/WAL locally instead of relying on isolate teardown.
+   * worker and safe after `closeResources` already ran. The executor's owned
+   * scope is torn down BEFORE the SQLite handle closes, so an in-flight run can
+   * never observe a closed database; only then do the clients and handle close.
    */
-  const disposeBootstrap = (): void => {
+  const disposeBootstrap = async (): Promise<void> => {
     installReporting(undefined)
     namer.onDispose()
     // Close the executor's owned scope so its runner-table fibers/finalizers
     // settle with the worker instead of leaking past bootstrap disposal.
     const executor = installed
-    if (executor !== undefined) void executor.dispose().catch(() => undefined)
+    if (executor !== undefined) await executor.dispose().catch(() => undefined)
     // The registry scope outlives every run, so close it explicitly with the
     // worker bootstrap; a still-running job is interrupted with the isolate.
     const jobs = backgroundJobScope
-    if (jobs !== undefined) void Effect.runPromise(Scope.close(jobs, Exit.void)).catch(() => undefined)
+    if (jobs !== undefined) await Effect.runPromise(Scope.close(jobs, Exit.void)).catch(() => undefined)
     // Close durable resources before the graph scope; close is idempotent.
     closeResources()
     // Close the worker-lifetime graph scope (DB/egress/bridge finalizers).
+    const graph = workerScope
+    if (graph !== undefined) await Effect.runPromise(Scope.close(graph, Exit.void)).catch(() => undefined)
+  }
+  /**
+   * Synchronous best-effort teardown for the mid-bootstrap failure path. The
+   * executor never started a run there, so closing the handle immediately cannot
+   * race in-flight work; the executor scope still gets its disposal started.
+   */
+  const disposeBootstrapSync = (): void => {
+    installReporting(undefined)
+    namer.onDispose()
+    const executor = installed
+    if (executor !== undefined) void executor.dispose().catch(() => undefined)
+    const jobs = backgroundJobScope
+    if (jobs !== undefined) void Effect.runPromise(Scope.close(jobs, Exit.void)).catch(() => undefined)
+    closeResources()
     const graph = workerScope
     if (graph !== undefined) void Effect.runPromise(Scope.close(graph, Exit.void)).catch(() => undefined)
   }
@@ -1336,6 +1384,8 @@ export function bootstrapSessionWorker(
     if (frame?.type !== "shutdown") return
     shutdownRequested = true
     try {
+      // A shutdown frame is a hard-close request: close the native handle while
+      // the realm still runs so the WAL lock is released before the thread dies.
       closeResources()
     } finally {
       // The hub's bounded ack wait may already have elapsed and terminated the
@@ -1348,7 +1398,7 @@ export function bootstrapSessionWorker(
   // A shutdown delivered synchronously during registration wins the whole boot:
   // never open a DB (or install an executor) for an isolate already being torn
   // down.
-  if (shutdownRequested) return { dispose() {} }
+  if (shutdownRequested) return { dispose: async () => {} }
 
   try {
     // The real `SessionPrompt` loop needs the worker's own WAL connection and an
@@ -1521,7 +1571,7 @@ export function bootstrapSessionWorker(
     // Build the graph exactly once on a worker-lifetime scope. Every turn provides
     // the cached context (the per-worker DB included) and only its own run scope;
     // the old per-run `Effect.provide(layer)` disposed the DB after the first turn
-    // (C3). The scope is closed by `dispose()`.
+    // The scope is closed by `dispose()`.
     workerScope = Effect.runSync(Scope.make())
 
     // The worker-local run control is registered once the first `run` resolves the
@@ -1553,7 +1603,7 @@ export function bootstrapSessionWorker(
         busy: (sessionID) => control?.busy(sessionID) ?? Promise.resolve(false),
       },
       // A running process-local background job keeps the isolate alive across an
-      // idle-reap window (M5). Kept separate from `busy`: a background job must
+      // idle-reap window. Kept separate from `busy`: a background job must
       // never block the next prompt.
       activeWork: createBackgroundWorkProbe(backgroundJobs),
       // Dynamic OS thread name (Linux-only, fail-soft): `ocs<slot>` at rest and
@@ -1571,13 +1621,13 @@ export function bootstrapSessionWorker(
 
     return {
       dispose() {
-        disposeBootstrap()
+        return disposeBootstrap()
       },
     }
   } catch (error) {
     // A failed mid-bootstrap closes locally (SQLite handle/WAL included)
     // before the error surfaces, so the isolate is never the only closer.
-    disposeBootstrap()
+    disposeBootstrapSync()
     throw error
   }
 }

@@ -1,4 +1,4 @@
-// The hub-proxy method lookup guard (review finding m1).
+// The hub-proxy method lookup guard.
 //
 // `serveHubProxy` dispatches on a plain object literal. A bare `handlers[method]`
 // lookup walks the prototype chain, so a frame naming an inherited

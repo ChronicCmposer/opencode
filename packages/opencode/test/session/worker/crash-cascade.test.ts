@@ -1,4 +1,4 @@
-// Phase 9.6 / 14 — parent CRASH = implicit cancel (plan task 9.6, decision line 53).
+// Parent CRASH = implicit cancel.
 //
 // A subagent parent that CRASHES must implicitly cancel its children, and the
 // cascade is children-first, bounded by the same grace window as an explicit

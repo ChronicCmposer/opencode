@@ -1,4 +1,4 @@
-// Phase 14.2 — full-row golden durable equivalence for the SAME mock-SSE session.
+// Full-row golden durable equivalence for the SAME mock-SSE session.
 //
 // One mock session (one streamed assistant reply) is executed twice:
 //   * flag OFF (hub path) — the session runs in-process on the hub, using the same

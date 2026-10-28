@@ -1,4 +1,4 @@
-// D19 / C4 — routed plugin hooks are REAL in a worker.
+// D19 — routed plugin hooks are REAL in a worker.
 //
 // The worker cannot run a plugin function itself (the plugin instance lives on
 // the hub), so `resolveWorkerPlugins` must never drop a routed hook and the
@@ -178,7 +178,7 @@ describe("tool.execute.before/after are real in a worker", () => {
     const real = await loadRealPlugin()
     try {
       const { resolved, layer, wired } = await productionWorker(real.hooks)
-      // C4: the routed hook is not silently dropped; the function stays hub-side.
+      // The routed hook is not silently dropped; the function stays hub-side.
       expect(resolved[0]?.hooks).toEqual({})
       expect(resolved[0]?.proxied).toContain("tool.execute.before")
       expect(resolved[0]?.proxied).toContain("tool.execute.after")
@@ -387,13 +387,23 @@ describe("admission through the production init factory", () => {
     }
   })
 
-  test("an unsupported hook added after startup fails the factory admission", async () => {
+  test("an unsupported hook added after startup is admitted and fails typed only when invoked", async () => {
     const real = await loadRealPlugin()
     try {
-      const result = await build({ ...real.hooks, "command.execute.before": (() => {}) as never })
-      expect(result._tag).toBe("Failure")
-      if (result._tag !== "Failure") throw new Error("expected admission failure")
-      expect(result.failure).toBeInstanceOf(UnsupportedPluginHookError)
+      // A routed-but-unsupported hook must not break startup: the worker only
+      // fails when it actually dispatches the hook (D19).
+      const hooks = { ...real.hooks, "command.execute.before": (() => {}) as never }
+      const result = await build(hooks)
+      expect(result._tag).toBe("Success")
+      if (result._tag !== "Success") throw new Error("expected startup admission")
+
+      const { layer } = await productionWorker(hooks)
+      const invoked = await trigger(layer, "command.execute.before", {}, { parts: [] })
+      expect(Exit.isFailure(invoked)).toBe(true)
+      if (!Exit.isFailure(invoked)) throw new Error("expected the worker trigger to fail")
+      const failure = Cause.squash(invoked.cause)
+      expect(failure).toBeInstanceOf(UnsupportedPluginHookError)
+      expect((failure as UnsupportedPluginHookError).hook).toBe("command.execute.before")
     } finally {
       await real.dispose()
     }

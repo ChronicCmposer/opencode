@@ -10,7 +10,10 @@
 // `{ id, type, properties }` — there is no `data` translation and no per-frame
 // numeric header (so no `u32` length can overflow). Encoding rejects a frame or
 // a coalesced batch above 4 MiB with a typed `FrameTooLargeError` before it is
-// posted; decoding applies the same bound to untrusted input.
+// posted; decoding applies the same bound to untrusted input. The one exception
+// is a DURABLE event whose body core already offloaded to the shared blob store:
+// it crosses as a small `{ __eventBlobPosition, frameBytes }` reference the hub
+// resolves by position, so a committed event is never lost to the frame cap.
 
 import {
   FrameTooLargeError,
@@ -18,11 +21,11 @@ import {
   ProtocolError,
   UnsupportedFrameVersionError,
   WORKER_FRAME_VERSION,
-  assertWorkerFrameSize,
+  blobPositionReferenceFrame,
   decodeWorkerFrame,
-  encodeWorkerFrame,
+  encodeWorkerFrameSized,
+  isEventBlobReference,
   parseEventsFrame,
-  workerFrameByteLength,
   type EventsAckPayload,
   type EventsEventPayload,
   type EventsFrame,
@@ -32,7 +35,7 @@ import {
   type AggregatePosition,
 } from "@/session/worker/frame"
 
-export { FrameTooLargeError, ProtocolError, UnsupportedFrameVersionError }
+export { FrameTooLargeError, ProtocolError, UnsupportedFrameVersionError, isEventBlobReference }
 export type {
   EventsAckPayload,
   EventsEventPayload,
@@ -112,21 +115,86 @@ function durablePositionOf(value: unknown): AggregatePosition | undefined {
   return { aggregateID, seq }
 }
 
+/**
+ * Encode one frame and measure it ONCE, enforcing the 4 MiB per-frame bound.
+ * Returning the measured size lets a batch total reuse it instead of encoding
+ * and measuring the same text twice.
+ */
+function encodeFrameSized(frame: WorkerFrameEnvelope): { readonly text: string; readonly bytes: number } {
+  const sized = encodeWorkerFrameSized(frame)
+  if (sized.bytes > MAX_FRAME_BYTES) throw new FrameTooLargeError(sized.bytes, MAX_FRAME_BYTES)
+  return sized
+}
+
 /** Encode one frame as the shared envelope JSON string, enforcing the 4 MiB bound. */
 export function encodeFrame(frame: WorkerFrameEnvelope): string {
-  return assertWorkerFrameSize(encodeWorkerFrame(frame), MAX_FRAME_BYTES)
+  return encodeFrameSized(frame).text
 }
 
 /**
  * Encode a coalesced batch, one JSON string per frame, preserving order. The
  * combined wire size is bounded by {@link MAX_BATCH_BYTES}: a batch too large to
- * transport is a typed rejection rather than a silent split or a stalled flush.
+ * transport is a typed rejection. The sender uses {@link encodeFrameChunks}
+ * instead so a durable frame is never lost to a batch total.
  */
 export function encodeFrames(frames: readonly WorkerFrameEnvelope[]): readonly string[] {
-  const encoded = frames.map(encodeFrame)
-  const total = encoded.reduce((sum, text) => sum + workerFrameByteLength(text), 0)
+  const encoded: string[] = []
+  let total = 0
+  for (const frame of frames) {
+    const sized = encodeFrameSized(frame)
+    total += sized.bytes
+    encoded.push(sized.text)
+  }
   if (total > MAX_BATCH_BYTES) throw new FrameTooLargeError(total, MAX_BATCH_BYTES)
   return encoded
+}
+
+/**
+ * Split a coalesced batch into chunks whose combined wire size stays within the
+ * transport bound, measuring each frame exactly once. A durable event frame that
+ * alone exceeds the bound is replaced by its committed blob-position reference
+ * (core already offloaded the body before fan-out), so the batch survives and no
+ * durable event is dropped by the cap. A non-durable frame that alone exceeds the
+ * bound is still a typed `FrameTooLargeError`; a batch that merely totals too
+ * much is split.
+ */
+export function encodeFrameChunks(
+  frames: readonly EventsFrame[],
+  limit: number = MAX_BATCH_BYTES,
+): readonly (readonly string[])[] {
+  const chunks: string[][] = []
+  let current: string[] = []
+  let total = 0
+  for (const frame of frames) {
+    const sized = encodeFrameOrReference(frame)
+    if (sized.bytes > limit) throw new FrameTooLargeError(sized.bytes, limit)
+    if (current.length > 0 && total + sized.bytes > limit) {
+      chunks.push(current)
+      current = []
+      total = 0
+    }
+    current.push(sized.text)
+    total += sized.bytes
+  }
+  if (current.length > 0) chunks.push(current)
+  return chunks
+}
+
+/**
+ * Encode one frame within the per-frame bound. A durable event body that does
+ * not fit is re-expressed as its blob-position reference and re-encoded; the
+ * substituted frame is tiny by construction. Everything else keeps the typed
+ * rejection, so a caller bug (or an over-cap non-durable delta) still fails loud.
+ */
+function encodeFrameOrReference(frame: EventsFrame): { readonly text: string; readonly bytes: number } {
+  try {
+    return encodeFrameSized(frame)
+  } catch (error) {
+    if (!(error instanceof FrameTooLargeError)) throw error
+    const reference = blobPositionReferenceFrame(frame, error.byteLength)
+    if (reference === undefined) throw error
+    return encodeFrameSized(reference)
+  }
 }
 
 /**

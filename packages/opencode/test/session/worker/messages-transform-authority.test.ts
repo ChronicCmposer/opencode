@@ -1,5 +1,5 @@
 // `messagesTransformAuthority` — the context→plugin-resolution half of the hub's
-// `messagesTransform` authority (review finding M2).
+// `messagesTransform` authority.
 //
 // `buildHubProxyHandlers` serves the wire; `messagesTransformAuthority` decides
 // whether a plugin is reachable in the worker's session context at all. Both of

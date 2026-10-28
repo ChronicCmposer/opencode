@@ -21,7 +21,7 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
-describe("boot cancellation (W3.6 / D11)", () => {
+describe("boot cancellation (D11)", () => {
   test("cancel while materializing aborts construction, releases one permit, and starts no run", async () => {
     const { permit, releases } = countingPermit()
     const materialize = deferred<{ id: string }>()

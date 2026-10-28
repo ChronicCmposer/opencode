@@ -492,6 +492,45 @@ describe("bound worker projector authority", () => {
     }
   })
 
+  test("a stale session.updated repeating unchanged hub columns still projects", async () => {
+    const testHarness = await harness()
+    try {
+      // The hub owns these columns and has already advanced them. A stale
+      // `Session.Info` that merely repeats the persisted values must be a no-op,
+      // not a policy violation: comparing the whole row would reject every
+      // unrelated worker update whenever billing/share/revert state is non-default.
+      admin(
+        testHarness.filename,
+        "UPDATE session SET cost = 7, tokens_input = 3, tokens_output = 4, tokens_reasoning = 1, tokens_cache_read = 2, tokens_cache_write = 5, share_url = ?, revert = ?, version = '2', time_created = 11 WHERE id = ?",
+        ["https://share.test/root", JSON.stringify({ messageID: ROOT_MESSAGE }), ROOT],
+      )
+      const before = sessionSnapshot(testHarness.filename)
+
+      const result = await outcome(testHarness, (events) =>
+        events.publish(SessionV1.Event.Updated, {
+          sessionID: ROOT,
+          info: info({
+            cost: 7,
+            tokens: { input: 3, output: 4, reasoning: 1, cache: { read: 2, write: 5 } },
+            share: { url: "https://share.test/root" },
+            revert: { messageID: ROOT_MESSAGE },
+            version: "2",
+            title: "renamed after stale",
+            time: { created: 11, updated: 2 },
+          }),
+        }),
+      )
+
+      expect(result.ok, `stale unchanged hub columns rejected: ${String(result.error)}`).toBe(true)
+      expect(sessionSnapshot(testHarness.filename)).toEqual(before)
+      expect(admin(testHarness.filename, "SELECT title FROM session WHERE id = ?", [ROOT])).toEqual([
+        { title: "renamed after stale" },
+      ])
+    } finally {
+      await testHarness.close()
+    }
+  })
+
   test("session.updated cannot widen permission in a bound worker", async () => {
     const testHarness = await harness()
     try {

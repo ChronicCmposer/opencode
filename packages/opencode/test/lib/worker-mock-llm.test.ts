@@ -1,4 +1,4 @@
-// Phase 3.5 — worker-reachable mock provider / SSE (plan task 3.5, BLOCKS 4–14).
+// Worker-reachable mock provider / SSE.
 //
 // Contract under test: the hub hosts a real `TestLLMServer` (TCP HTTP); a Bun
 // worker reaches it with plain `fetch` using a bootstrap payload that carries

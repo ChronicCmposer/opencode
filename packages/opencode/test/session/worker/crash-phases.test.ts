@@ -21,7 +21,7 @@ function crashDetails(phase: WorkerCrashPhase, lastCommittedMessageID: string | 
   return { phase, lastCommittedMessageID, inFlightCallIDs }
 }
 
-describe("WorkerCrashed crash matrix (W3.3/W3.4 / D8)", () => {
+describe("WorkerCrashed crash matrix (D8)", () => {
   test("all five phases persist and return the same payload, retryable false", async () => {
     const connection = ledgerConnection()
     const recorded: WorkerCrashed[] = []

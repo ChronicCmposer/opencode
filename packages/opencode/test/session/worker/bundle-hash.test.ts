@@ -1,4 +1,4 @@
-// Step 30 — the build hash covers the EMITTED worker bundle/module graph, not
+// The build hash covers the EMITTED worker bundle/module graph, not
 // the `session-worker.ts` source text. A change in a transitive import must
 // change the hash; an unrelated plugin file must not.
 

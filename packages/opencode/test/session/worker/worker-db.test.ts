@@ -65,7 +65,7 @@ afterEach(async () => {
   for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
 })
 
-describe("per-worker WAL connection (W1.1 / D5)", () => {
+describe("per-worker WAL connection (D5)", () => {
   test("two workers write different sessions concurrently over their own connections", async () => {
     const filename = temporaryDatabase()
     migrated(filename)
@@ -120,7 +120,7 @@ describe("per-worker WAL connection (W1.1 / D5)", () => {
   })
 })
 
-describe("worker schema gate (W1.6 / D7)", () => {
+describe("worker schema gate (D7)", () => {
   test("opens only when user_version and the migration journal match the build", async () => {
     const filename = temporaryDatabase()
     migrated(filename)
@@ -167,7 +167,7 @@ describe("worker schema gate (W1.6 / D7)", () => {
   })
 })
 
-describe("worker table ownership (W1.5 / D6)", () => {
+describe("worker table ownership (D6)", () => {
   test("the allowlist is exactly the session_id tables derived from the schema", () => {
     const filename = temporaryDatabase()
     migrated(filename)
@@ -204,7 +204,7 @@ describe("worker table ownership (W1.5 / D6)", () => {
     expect(database.connection.query("SELECT name FROM sqlite_master WHERE name = 'worker_owned'").all()).toEqual([])
   })
 
-  test("session.permission is hub-only while the hub connection can still write it (C9/D14)", async () => {
+  test("session.permission is hub-only while the hub connection can still write it (D14)", async () => {
     const filename = temporaryDatabase()
     migrated(filename)
     const database = await open(filename)
@@ -227,7 +227,7 @@ describe("worker table ownership (W1.5 / D6)", () => {
     expect(await Effect.runPromise(database.all("SELECT id FROM permission"))).toEqual([{ id: "permission-hub" }])
   })
 
-  test("the worker Bus publishes durable events through the guarded connection (C2)", async () => {
+  test("the worker Bus publishes durable events through the guarded connection", async () => {
     const filename = temporaryDatabase()
     migrated(filename)
     const database = await open(filename)
@@ -271,7 +271,7 @@ describe("worker table ownership (W1.5 / D6)", () => {
   })
 })
 
-describe("worker SQL guard bypass matrix (C9 / D14 / D21)", () => {
+describe("worker SQL guard bypass matrix (D14 / D21)", () => {
   const errorOf = async (effect: Effect.Effect<unknown, unknown>) =>
     Effect.runPromise(effect.pipe(Effect.flip)) as Promise<unknown>
 

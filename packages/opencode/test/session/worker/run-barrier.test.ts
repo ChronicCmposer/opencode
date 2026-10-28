@@ -1,11 +1,17 @@
 import { describe, expect, test } from "bun:test"
 
 import {
+  RUN_BARRIER_PHASES,
   RUN_BARRIER_TIMEOUT_MS,
   RunBarrierBusyError,
+  RunBarrierMissingReportError,
+  RunBarrierReportError,
   RunBarrierTimeout,
   createRunBarrier,
+  type RunBarrier,
+  type RunBarrierPhase,
   type RunBarrierPhases,
+  type RunBarrierRun,
   type RunBarrierScheduler,
 } from "@/session/run-barrier"
 
@@ -217,5 +223,176 @@ describe("per-Session run barrier", () => {
     barrier.reset("s1")
     expect(barrier.state("s1")).toBe("idle")
     expect(await barrier.wait("s1", phases())).toEqual({ sessionID: "s1", status: "drained" })
+  })
+})
+
+describe("per-Session run barrier — real phase reports", () => {
+  function reportAll(run: RunBarrierRun, skip?: RunBarrierPhase): void {
+    if (skip !== "commits") run.commit("msg_1")
+    if (skip !== "projectors") run.projector("session-row")
+    if (skip !== "tools") run.noTools()
+    if (skip !== "promotion") run.promotion("no-job")
+  }
+
+  test("drains only after commits, projectors, tools, and promotion are reported", async () => {
+    const fake = createFakeScheduler()
+    const barrier = createRunBarrier({ scheduler: fake.scheduler })
+    const run = barrier.beginRun("s1")
+    run.commit("msg_1")
+    run.projector("session-row")
+    run.promotion("no-job")
+
+    const pending = barrier.wait("s1")
+    await Promise.resolve()
+    expect(barrier.state("s1")).toBe("draining")
+
+    run.noTools()
+    expect(await pending).toEqual({ sessionID: "s1", status: "drained" })
+    expect(barrier.state("s1")).toBe("drained")
+    expect(fake.pending).toBe(0)
+  })
+
+  test("a missing reporter is never fabricated into a settlement", async () => {
+    const fake = createFakeScheduler()
+    const barrier = createRunBarrier({ scheduler: fake.scheduler })
+    const run = barrier.beginRun("s1")
+    reportAll(run, "tools")
+
+    const pending = barrier.wait("s1")
+    await Promise.resolve()
+    expect(barrier.state("s1")).toBe("draining")
+
+    fake.advance(RUN_BARRIER_TIMEOUT_MS)
+    await expect(pending).rejects.toBeInstanceOf(RunBarrierTimeout)
+    expect(barrier.state("s1")).toBe("timed-out")
+    // The next run is refused: a started run is not proof that tools settled.
+    await expect(barrier.wait("s1")).rejects.toBeInstanceOf(RunBarrierTimeout)
+  })
+
+  test("a zero-tool run settles tools only through an explicit noTools report", async () => {
+    const fake = createFakeScheduler()
+    const barrier = createRunBarrier({ scheduler: fake.scheduler })
+
+    const abandoned = barrier.beginRun("s1")
+    reportAll(abandoned, "tools")
+    const timedOut = barrier.wait("s1")
+    fake.advance(RUN_BARRIER_TIMEOUT_MS)
+    await expect(timedOut).rejects.toBeInstanceOf(RunBarrierTimeout)
+    barrier.reset("s1")
+
+    const run = barrier.beginRun("s1")
+    run.commit("msg_1")
+    run.projector("session-row")
+    run.promotion("no-job")
+    run.noTools()
+    expect(await barrier.wait("s1")).toEqual({ sessionID: "s1", status: "drained" })
+  })
+
+  test.each([...RUN_BARRIER_PHASES])("refuses a run whose %s reporter never arrived", async (missing) => {
+    const fake = createFakeScheduler()
+    const barrier = createRunBarrier({ scheduler: fake.scheduler })
+    const sessionID = `ses_missing_${missing}`
+    const run = barrier.beginRun(sessionID)
+    reportAll(run, missing)
+
+    const pending = barrier.wait(sessionID)
+    fake.advance(RUN_BARRIER_TIMEOUT_MS)
+    await expect(pending).rejects.toBeInstanceOf(RunBarrierTimeout)
+    expect(barrier.state(sessionID)).toBe("timed-out")
+  })
+
+  test("a run with an in-flight tool waits for the tool report, not for run start", async () => {
+    const fake = createFakeScheduler()
+    const barrier = createRunBarrier({ scheduler: fake.scheduler })
+    const run = barrier.beginRun("s1")
+    run.commit("msg_1")
+    run.projector("session-row")
+    run.promotion("no-job")
+
+    const pending = barrier.wait("s1")
+    await Promise.resolve()
+    expect(barrier.state("s1")).toBe("draining")
+
+    run.tool("call_write")
+    expect(await pending).toEqual({ sessionID: "s1", status: "drained" })
+  })
+
+  test("waiting without a begun run is a typed refusal", async () => {
+    const barrier = createRunBarrier()
+    await expect(barrier.wait("s1")).rejects.toBeInstanceOf(RunBarrierMissingReportError)
+    expect(barrier.state("s1")).toBe("failed")
+  })
+
+  test("a report for the wrong phase or observation is refused", async () => {
+    const fake = createFakeScheduler()
+    const barrier = createRunBarrier({ scheduler: fake.scheduler })
+    const run = barrier.beginRun("s1")
+
+    expect(() =>
+      run.report({ sessionID: "s1", phase: "projectors", observation: { kind: "commit", messageID: "msg_1" } }),
+    ).toThrow(RunBarrierReportError)
+
+    const pending = barrier.wait("s1")
+    await expect(pending).rejects.toBeInstanceOf(RunBarrierReportError)
+    expect(barrier.state("s1")).toBe("failed")
+  })
+
+  test("a report for another session is refused", async () => {
+    const barrier = createRunBarrier()
+    const run = barrier.beginRun("s1")
+    expect(() =>
+      run.report({ sessionID: "s2", phase: "commits", observation: { kind: "commit", messageID: "msg_1" } }),
+    ).toThrow(RunBarrierReportError)
+  })
+
+  test("a zero-tool and a real tool report cannot both settle the same run", async () => {
+    const barrier = createRunBarrier()
+    const run = barrier.beginRun("s1")
+    run.noTools()
+    expect(() => run.tool("call_after_no_tools")).toThrow(RunBarrierReportError)
+  })
+
+  test("a stale run token cannot settle the next run", async () => {
+    const fake = createFakeScheduler()
+    const barrier = createRunBarrier({ scheduler: fake.scheduler })
+    const first = barrier.beginRun("s1")
+    reportAll(first)
+    expect(await barrier.wait("s1")).toEqual({ sessionID: "s1", status: "drained" })
+
+    const second = barrier.beginRun("s1")
+    expect(first.commit("late_msg")).toBe(false)
+
+    const pending = barrier.wait("s1")
+    second.projector("session-row")
+    second.noTools()
+    second.promotion("no-job")
+    fake.advance(RUN_BARRIER_TIMEOUT_MS)
+    await expect(pending).rejects.toBeInstanceOf(RunBarrierTimeout)
+  })
+
+  test("cancellation wins while the report set is incomplete", async () => {
+    const fake = createFakeScheduler()
+    const barrier = createRunBarrier({ scheduler: fake.scheduler })
+    const run = barrier.beginRun("s1")
+    run.commit("msg_1")
+
+    const pending = barrier.wait("s1")
+    barrier.cancel("s1")
+
+    expect(await pending).toEqual({ sessionID: "s1", status: "cancelled" })
+    expect(barrier.state("s1")).toBe("cancelled")
+    fake.advance(RUN_BARRIER_TIMEOUT_MS)
+    expect(barrier.state("s1")).toBe("cancelled")
+  })
+
+  test("a begun run cannot overlap a still-draining run", async () => {
+    const fake = createFakeScheduler()
+    const barrier = createRunBarrier({ scheduler: fake.scheduler })
+    barrier.beginRun("s1")
+    const pending = barrier.wait("s1")
+
+    expect(() => barrier.beginRun("s1")).toThrow(RunBarrierBusyError)
+    fake.advance(RUN_BARRIER_TIMEOUT_MS)
+    await expect(pending).rejects.toBeInstanceOf(RunBarrierTimeout)
   })
 })

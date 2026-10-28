@@ -51,8 +51,10 @@ import {
 } from "@/session/db/allowlist.gen"
 import { hashIdentity, readPersistedBodyHash } from "@/session/db/identity"
 import { deriveSessionScopedTables } from "@/session/db/derive"
-import { createWriteCapability, makeRepository, assertTableRegistry } from "./repository"
-import type { WorkerRepository } from "./repository"
+import { createWriteCapability } from "./repository/capability"
+import { assertTableRegistry } from "./repository/registry"
+import { makeRepository } from "./repository/write"
+import type { WorkerRepository } from "./repository/types"
 import { DURABLE_LOG_TABLES, SESSION_IMMUTABLE_COLUMNS, WORKER_READABLE_HUB_TABLES } from "./repository/policy"
 import { WORKER_DB_KEY } from "./node-table"
 
@@ -174,7 +176,7 @@ export type WorkerDatabaseError =
 /** A table the worker repository may write (`session` plus the derived set). */
 export type WorkerWritableTable = "session" | (typeof WORKER_WRITABLE_TABLES)[number]
 
-export type { RepositoryConflict, RepositoryInsert, WorkerRepository } from "./repository"
+export type { RepositoryConflict, RepositoryInsert, WorkerRepository } from "./repository/types"
 export {
   ForeignKeyOwnershipError,
   HubOnlyWriteError,
@@ -184,7 +186,8 @@ export {
   UnknownColumnError,
   UnsupportedWriteError,
 } from "./repository/errors"
-export { TABLE_REGISTRY, TABLE_SCHEMA, assertTableRegistry, tableRegistry } from "./repository"
+export { TABLE_REGISTRY, assertTableRegistry, tableRegistry } from "./repository/registry"
+export { TABLE_SCHEMA } from "./repository/tables.gen"
 
 export interface WorkerBusCreateOptions {
   readonly ownerID: string
@@ -224,6 +227,8 @@ export interface WorkerDatabase {
   readonly repository: WorkerRepository
   /** Narrow Bus/EventV2 operations; no public raw trusted connection. */
   readonly bus: WorkerBus
+  /** Per-database EventV2 worker binding (lease generation, aggregate fence). */
+  readonly eventBinding: EventV2.WorkerScope
   /** Read rows. Reads of hub-owned state are allowed; writes are not. */
   readonly all: <Row = Record<string, unknown>>(
     sql: string,
@@ -376,6 +381,12 @@ export function openWorkerDatabase(
             assertSchema(scoped, options.filename)
             if (options.filename !== IN_MEMORY_FILENAME) assertTableRegistry(scoped)
             if (sessionID !== undefined) installBoundViews(scoped, sessionID)
+            // The typed repository already binds/validates its own writes. The
+            // Drizzle graph is a second, trusted write path (the in-worker
+            // projector and the EventV2 lease/commit); these per-connection TEMP
+            // triggers apply the same D6 scope fence to it, including deletes that
+            // cascade. They are never shared with another connection/process.
+            if (sessionID !== undefined) installScopeTriggers(scoped, SCOPED_TABLE_SET)
           },
           authorizer:
             sessionID === undefined
@@ -401,6 +412,10 @@ export function openWorkerDatabase(
                 filename: options.filename,
                 ...(options.pragmas === undefined ? {} : { pragmas: options.pragmas }),
                 foreignKeys: true,
+                initialize: (scoped) => {
+                  scoped.function(SCOPE_FUNCTION, () => sessionID)
+                  installScopeTriggers(scoped, DURABLE_LOG_TABLE_SET)
+                },
                 authorizer: makeBusAuthorizer(sessionID),
               }),
             catch: (error) => {
@@ -429,20 +444,19 @@ export function databaseLayer(database: WorkerDatabase): Layer.Layer<DatabaseSer
   return Layer.effect(
     DatabaseService.Service,
     Effect.gen(function* () {
-      EventV2.setWorkerSessionScope(database.sessionID)
       const operations = {
         deleteAggregate: (aggregateID: string, options?: { readonly blobDir?: string }) =>
           database.bus.deleteAggregate(aggregateID, options),
       }
-      EventV2.setWorkerDurableOperations(operations)
+      database.eventBinding.durable = operations
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
-          EventV2.clearWorkerSessionScope(database.sessionID)
-          EventV2.clearWorkerDurableOperations(operations)
+          if (database.eventBinding.durable === operations) database.eventBinding.durable = undefined
         }).pipe(Effect.andThen(database.close)),
       )
       const sql = Object.assign(yield* client, { config: { filename: database.filename } })
       const db = yield* EffectDrizzleSqlite.makeWithDefaults().pipe(Effect.provideService(SqlClient.SqlClient, sql))
+      EventV2.bindWorkerScope(db, database.eventBinding)
       return { db } satisfies DatabaseService.Interface
     }),
   ).pipe(Layer.provide(Reactivity.layer))
@@ -481,7 +495,7 @@ function makeWorkerDatabase(options: MakeWorkerDatabaseOptions): WorkerDatabase 
   // control (`BEGIN`/`COMMIT`/`ROLLBACK`); direct writes remain rejected.
   const strict = guardBoundConnection(connection)
   const drizzle = guardReadOnly(connection)
-  const drizzleRunner = trustedRunner(connection, options.withMain)
+  const drizzleRunner = trustedRunner(connection, options.withMain, sessionID)
   const bus = makeWorkerBus(options.busConnection, filename, sessionID)
 
   const all = <Row = Record<string, unknown>>(sql: string, params: QueryParams = []) =>
@@ -496,9 +510,11 @@ function makeWorkerDatabase(options: MakeWorkerDatabaseOptions): WorkerDatabase 
       catch: asWorkerDatabaseError,
     })
 
+  const eventBinding = EventV2.createWorkerScope(sessionID)
   const database = {
     filename,
     identity: options.identity,
+    eventBinding,
     ...(sessionID === undefined ? {} : { sessionID }),
     connection: connectionGuard,
     strictConnection: strict,
@@ -523,6 +539,9 @@ function makeWorkerDatabase(options: MakeWorkerDatabaseOptions): WorkerDatabase 
 // ---------------------------------------------------------------------------
 
 const SCOPE_FUNCTION = "worker_scope_session"
+
+/** Sentinel carried by the TEMP scope triggers; mapped to a typed denial. */
+const SCOPE_TRIGGER_PREFIX = "worker scope violation"
 
 /** SQLite authorizer action codes (sqlite3.h). */
 const SQLITE_DELETE = 9
@@ -574,6 +593,39 @@ function installBoundViews(connection: NodeConnection, sessionID: string): void 
       `CREATE TEMP VIEW ${quoteIdentifier(table)} AS SELECT ${columns
         .map(quoteIdentifier)
         .join(", ")} FROM main.${quoteIdentifier(table)} WHERE ${quoteIdentifier(scope)} = ${SCOPE_FUNCTION}()`,
+    )
+  }
+}
+
+/**
+ * Install a per-connection TEMP trigger for every scoped table. Unlike a `main`
+ * trigger these live only on this worker's handle (never the hub or a sibling),
+ * and they fire for any write the connection performs — the typed repository,
+ * the private Drizzle runner, or a cascade. A row whose scope column is not the
+ * bound session aborts the whole statement, so the Drizzle graph cannot delete,
+ * update, or insert across the D6 boundary even though it holds the trusted
+ * `main` route.
+ */
+function installScopeTriggers(connection: NodeConnection, tables: Iterable<string>): void {
+  for (const table of tables) {
+    const scope = scopeColumn(table)
+    if (scope === undefined) continue
+    // A private/degraded in-memory handle has no shipped tables yet; a missing
+    // table is not a trigger target (and must not fail the open).
+    if (tableColumns(connection, table).length === 0) continue
+    const target = `main.${quoteIdentifier(table)}`
+    const column = quoteIdentifier(scope)
+    const message = `${SCOPE_TRIGGER_PREFIX}: ${table}`.replaceAll("'", "''")
+    const trigger = (event: string) => quoteIdentifier(`worker_scope_${table}_${event}`)
+    const abort = `BEGIN SELECT RAISE(ABORT, '${message}'); END`
+    connection.exec(
+      `CREATE TEMP TRIGGER ${trigger("insert")} BEFORE INSERT ON ${target} WHEN NEW.${column} IS NOT ${SCOPE_FUNCTION}() ${abort}`,
+    )
+    connection.exec(
+      `CREATE TEMP TRIGGER ${trigger("update")} BEFORE UPDATE ON ${target} WHEN OLD.${column} IS NOT ${SCOPE_FUNCTION}() OR NEW.${column} IS NOT ${SCOPE_FUNCTION}() ${abort}`,
+    )
+    connection.exec(
+      `CREATE TEMP TRIGGER ${trigger("delete")} BEFORE DELETE ON ${target} WHEN OLD.${column} IS NOT ${SCOPE_FUNCTION}() ${abort}`,
     )
   }
 }
@@ -854,7 +906,21 @@ function guardReadOnly(connection: NodeConnection): WorkerConnection {
  * handle and it performs no SQL validation/rewriting beyond qualifying the
  * write target.
  */
-function trustedRunner(connection: NodeConnection, withMain: <T>(operation: () => T) => T): WorkerConnection {
+function trustedRunner(
+  connection: NodeConnection,
+  withMain: <T>(operation: () => T) => T,
+  sessionID: string | undefined,
+): WorkerConnection {
+  // A D6 trigger abort surfaces as a SQLite constraint error. Map it back to the
+  // same typed denial the repository/authorizer raises, so a trusted-path caller
+  // (projector, EventV2) never has to parse SQL text.
+  const guard = <T>(operation: () => T): T => {
+    try {
+      return operation()
+    } catch (error) {
+      throw mapScopeTriggerError(error, sessionID)
+    }
+  }
   // Drizzle's SqlClient executes writes through `query(...).all/values` too, so
   // every mode must honour the write route, not only `run`.
   const execute = (
@@ -871,13 +937,15 @@ function trustedRunner(connection: NodeConnection, withMain: <T>(operation: () =
         ? (connection.values<ReadonlyArray<unknown>>(sql, params) as ReadonlyArray<ReadonlyArray<unknown>>)
         : (connection.all(sql, params) as ReadonlyArray<Record<string, unknown>>)
     }
-    return withMain(() => {
-      const routed = routeWriteToMain(sql)
-      if (mode === "run") return connection.run(routed, params)
-      return mode === "values"
-        ? (connection.values<ReadonlyArray<unknown>>(routed, params) as ReadonlyArray<ReadonlyArray<unknown>>)
-        : (connection.all(routed, params) as ReadonlyArray<Record<string, unknown>>)
-    })
+    return guard(() =>
+      withMain(() => {
+        const routed = routeWriteToMain(sql)
+        if (mode === "run") return connection.run(routed, params)
+        return mode === "values"
+          ? (connection.values<ReadonlyArray<unknown>>(routed, params) as ReadonlyArray<ReadonlyArray<unknown>>)
+          : (connection.all(routed, params) as ReadonlyArray<Record<string, unknown>>)
+      }),
+    )
   }
   return {
     owner: connection.owner,
@@ -907,7 +975,7 @@ function trustedRunner(connection: NodeConnection, withMain: <T>(operation: () =
         connection.exec(sql)
         return
       }
-      withMain(() => connection.exec(routeWriteToMain(sql)))
+      withMain(() => guard(() => connection.exec(routeWriteToMain(sql))))
     },
     pragma: (name) => {
       assertReadOnlyPragma(name)
@@ -1201,6 +1269,21 @@ function quoteIdentifier(value: string): string {
 
 function reasonOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Translate a TEMP scope-trigger abort into the typed cross-session denial.
+ * Any other error (including the repository's own typed errors) passes through
+ * unchanged.
+ */
+function mapScopeTriggerError(error: unknown, sessionID: string | undefined): unknown {
+  if (sessionID === undefined) return error
+  const message = reasonOf(error)
+  const marker = `${SCOPE_TRIGGER_PREFIX}: `
+  const index = message.indexOf(marker)
+  if (index < 0) return error
+  const table = message.slice(index + marker.length).split(/[\s'"]/)[0] ?? "unknown"
+  return new CrossSessionAccessError({ table, sessionID })
 }
 
 function asWorkerDatabaseError(error: unknown): WorkerDatabaseError {

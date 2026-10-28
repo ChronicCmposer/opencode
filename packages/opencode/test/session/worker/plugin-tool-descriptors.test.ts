@@ -1,4 +1,4 @@
-// PT-2 — worker-side plugin tools: init descriptor shipping, the stub
+// Worker-side plugin tools: init descriptor shipping, the stub
 // `Plugin.Service.list()` exposure, schema parity and the degraded boot.
 //
 // The hub owns plugin loading, so a plugin tool's `execute` (which closes over
@@ -90,7 +90,7 @@ const listPlugins = (layer: ReturnType<typeof buildSessionWorkerLayer>) =>
     }).pipe(Effect.provide(layer.layer)),
   )
 
-describe("worker plugin tool descriptors (PT-2)", () => {
+describe("worker plugin tool descriptors", () => {
   test("list() exposes one remote definition per shipped descriptor", async () => {
     const hooks = await listPlugins(
       built({
@@ -156,7 +156,7 @@ describe("worker plugin tool descriptors (PT-2)", () => {
 // `SessionWorkerInit.pluginTools` shipping
 // ---------------------------------------------------------------------------
 
-describe("SessionWorkerInit.pluginTools (PT-2)", () => {
+describe("SessionWorkerInit.pluginTools", () => {
   test("parseSessionWorkerInit preserves shipped descriptors", () => {
     const pluginTools = [descriptor("compress")]
     const parsed = parseSessionWorkerInit({ ...sessionWorkerInit(), pluginTools })

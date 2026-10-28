@@ -1,4 +1,4 @@
-// Schema gate (D7 / M4 / M5).
+// Schema gate (D7).
 //
 // Identity is `PRAGMA user_version` plus the ordered migration journal ids plus
 // the hash of the shipped SQL bodies (persisted in `schema_meta`). Only the hub
@@ -13,13 +13,14 @@ import { Database } from "@opencode-ai/core/database/database"
 import { openConnection, type Connection, type ConnectionOptions } from "@opencode-ai/core/database/connection"
 import { inImmediateTransaction } from "@opencode-ai/core/database/transaction"
 import { ledgerStatements, migrationStatements } from "@/session/writer/migration.statements.gen"
+import { createDbExecutor, type DbExecutor } from "@/session/worker/db-executor"
 import {
   SCHEMA_BODY_HASH,
   SCHEMA_MIGRATION_IDS,
   SCHEMA_VERSION,
 } from "./allowlist.gen"
 import { hashIdentity, readPersistedBodyHash, writePersistedBodyHash } from "./identity"
-import { assertWorkerTableParity } from "./ownership"
+import { assertWorkerTableParity, type SqliteQuery } from "./ownership"
 
 export interface SchemaIdentity {
   readonly version: number
@@ -254,6 +255,160 @@ export function ensureProductionSchema(options: EnsureSchemaOptions): SchemaIden
     return identity
   } finally {
     connection.close()
+  }
+}
+
+/**
+ * Off-loop variant of {@link ensureProductionSchema} for the hub's construction
+ * path. Every probe, DDL statement, ledger write, and marker runs on the supplied
+ * `DbExecutor` thread, so a slow or busy file never blocks the hub's main loop.
+ *
+ * Semantics match the synchronous gate: an already-current file is probe-and-
+ * return (no live-worker refusal); a file that needs the opencode ledger refuses
+ * a non-zero live-worker count, applies the ledger and marker in one
+ * `BEGIN IMMEDIATE`, then verifies the same identity and worker table parity.
+ * A genuinely legacy file still needs core's incremental Effect migrations,
+ * which the hub has already run through `Database.layerFromPath` before this
+ * gate; the async path applies only the opencode-owned ledger, exactly like the
+ * sync path on a file.
+ */
+export interface EnsureSchemaAsyncOptions extends EnsureSchemaOptions {
+  /** Reuse a hub executor; one is created and closed when omitted. */
+  readonly executor?: DbExecutor
+}
+
+async function readIdentityAsync(executor: DbExecutor): Promise<SchemaIdentity> {
+  const version = Number(((await executor.query("PRAGMA user_version"))[0]?.user_version as number | undefined) ?? 0)
+  const hasMigration = (
+    await executor.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'migration'")
+  ).length > 0
+  const ids = hasMigration
+    ? (await executor.query("SELECT id FROM migration ORDER BY id")).map((row) => String(row.id))
+    : []
+  let bodyHash = ""
+  try {
+    const rows = await executor.query("SELECT content_hash FROM schema_meta WHERE id = 'schema'")
+    bodyHash = String(rows[0]?.content_hash ?? "")
+  } catch {
+    bodyHash = ""
+  }
+  return { version, contentHash: migrationContentHash({ version, ids, bodyHash }) }
+}
+
+/**
+ * `assertWorkerTableParity` over the executor. The schema walk is done with
+ * awaited queries and replayed through the shared derivation, so the async gate
+ * cannot drift from the synchronous one.
+ */
+async function assertWorkerTableParityAsync(executor: DbExecutor): Promise<void> {
+  const tables = await executor.query(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+  )
+  const foreignKeys = new Map<string, ReadonlyArray<Record<string, unknown>>>()
+  for (const row of tables) {
+    const table = String(row.name)
+    foreignKeys.set(table, await executor.query(`PRAGMA foreign_key_list("${table.replaceAll('"', '""')}")`))
+  }
+  const adapter: SqliteQuery = {
+    all: <T = Record<string, unknown>>(sql: string): ReadonlyArray<T> => {
+      if (sql.startsWith("SELECT name FROM sqlite_master")) return tables as ReadonlyArray<T>
+      const match = /PRAGMA foreign_key_list\("(.+)"\)/.exec(sql)
+      if (match === null) return []
+      return (foreignKeys.get(match[1]!.replaceAll('""', '"')) ?? []) as ReadonlyArray<T>
+    },
+  }
+  assertWorkerTableParity(adapter)
+}
+
+export async function ensureProductionSchemaAsync(options: EnsureSchemaAsyncOptions): Promise<SchemaIdentity> {
+  const inMemory = options.filename === ":memory:"
+  const expected = currentSchemaIdentity()
+  const cacheKey = inMemory ? undefined : path.resolve(options.filename)
+  if (cacheKey !== undefined) {
+    const ensured = ensuredDatabases.get(cacheKey)
+    if (ensured !== undefined) return ensured
+  }
+
+  // A live-worker refusal must not spawn an executor thread: the common case is a
+  // second hub sharing an already-provisioned file, and a spawn would itself be
+  // work the gate is meant to refuse. Probe the existing file synchronously (a
+  // read-only identity check, exactly like the sync gate's cache probe) and only
+  // migrate when zero workers are live.
+  if (options.executor === undefined && options.liveWorkers !== 0) {
+    const existing = inMemory ? undefined : openExistingConnection(options.filename)
+    if (existing !== undefined) {
+      try {
+        const observed = schemaIdentity(existing)
+        if (sameSchemaIdentity(expected, observed)) {
+          assertWorkerTableParity(existing)
+          if (cacheKey !== undefined) ensuredDatabases.set(cacheKey, expected)
+          return expected
+        }
+      } finally {
+        existing.close()
+      }
+    }
+    throw new LiveWorkersError(options.liveWorkers)
+  }
+
+  const owned = options.executor === undefined
+  const executor =
+    options.executor ??
+    createDbExecutor({
+      filename: options.filename,
+      ...(inMemory ? { pragmas: [] } : {}),
+      name: "hub-schema-ensure",
+    })
+  try {
+    const observed = await readIdentityAsync(executor)
+    if (sameSchemaIdentity(expected, observed)) {
+      await assertWorkerTableParityAsync(executor)
+      if (cacheKey !== undefined) ensuredDatabases.set(cacheKey, expected)
+      return expected
+    }
+
+    if (options.liveWorkers !== 0) throw new LiveWorkersError(options.liveWorkers)
+
+    if (inMemory) {
+      // The in-memory schema is self-contained: one transaction builds it, marks
+      // it, and advances the version. Verification happens below from the
+      // committed journal.
+      await executor.transaction([
+        ...migrationStatements.map((sql) => ({ sql })),
+        {
+          sql: `INSERT OR REPLACE INTO schema_meta (id, content_hash) VALUES ('schema', '${SCHEMA_BODY_HASH.replaceAll("'", "''")}')`,
+        },
+        { sql: `PRAGMA user_version = ${expected.version}` },
+      ])
+    } else {
+      // Core's incremental Effect migrations are idempotent; a current file is a
+      // quick probe-and-return. A legacy file may only be marked after core has
+      // caught up, and its journal may not contain an id this build does not
+      // ship (that is drift, not an upgrade).
+      applyCoreMigrations(options.filename)
+      const journal = (await executor.query("SELECT id FROM migration ORDER BY id")).map((row) => String(row.id))
+      const expectedIds = new Set(SCHEMA_MIGRATION_IDS)
+      const unknown = journal.filter((id) => !expectedIds.has(id))
+      if (unknown.length > 0) {
+        const content = migrationContentHash({ version: expected.version, ids: journal, bodyHash: SCHEMA_BODY_HASH })
+        throw new SchemaMismatch(expected, { version: expected.version, contentHash: content })
+      }
+      await executor.transaction([
+        ...ledgerStatements.map((sql) => ({ sql })),
+        {
+          sql: `INSERT OR REPLACE INTO schema_meta (id, content_hash) VALUES ('schema', '${SCHEMA_BODY_HASH.replaceAll("'", "''")}')`,
+        },
+        { sql: `PRAGMA user_version = ${expected.version}` },
+      ])
+    }
+
+    const identity = await readIdentityAsync(executor)
+    if (!sameSchemaIdentity(expected, identity)) throw new SchemaMismatch(expected, identity)
+    await assertWorkerTableParityAsync(executor)
+    if (cacheKey !== undefined) ensuredDatabases.set(cacheKey, expected)
+    return expected
+  } finally {
+    if (owned) await executor.close()
   }
 }
 

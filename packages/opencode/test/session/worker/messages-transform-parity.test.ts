@@ -1,4 +1,4 @@
-// B1/C1 — faithfulness contract for `experimental.chat.messages.transform`.
+// Faithfulness contract for `experimental.chat.messages.transform`.
 //
 // The SAME DCP-shaped transform must produce the SAME outbound LLM request (and
 // the same compaction conversation) whether session workers are ON or OFF:

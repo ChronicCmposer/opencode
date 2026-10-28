@@ -1,4 +1,4 @@
-// Phase 5.1–5.5 — session dispatch on the live V1 path, over real Bun workers.
+// Session dispatch on the live V1 path, over real Bun workers.
 //
 // A real `createDispatcher` schedules each session onto its own lazily
 // materialized executor worker (`execute.ts`) whose run-state machine lives
@@ -135,7 +135,7 @@ describe("5.4 hub forwards cancellation", () => {
   })
 })
 
-describe("12 B1 worker spawn logging", () => {
+describe("worker spawn logging", () => {
   test("a spawn bound to a session logs it with the given reason", () => {
     const entries: Array<{ message: string; fields: Record<string, unknown> }> = []
     const transport: ExecutorTransport = {

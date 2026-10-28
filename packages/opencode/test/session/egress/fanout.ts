@@ -1,5 +1,4 @@
-// Test-only egress fan-out (relocated from `src/session/egress/fanout.ts`, plan
-// finding B1). Production serves the worker events port through
+// Test-only egress fan-out (relocated from `src/session/egress/fanout.ts`). Production serves the worker events port through
 // `session/worker/hub.ts`; this bounded fan-out was never wired to a production
 // caller, so it lives under `test/` and backs the hub/SSE stream tests only.
 //

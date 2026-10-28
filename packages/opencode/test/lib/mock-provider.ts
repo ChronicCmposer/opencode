@@ -1,4 +1,4 @@
-// Step 3 — standalone OpenAI-compatible streaming mock provider.
+// Standalone OpenAI-compatible streaming mock provider.
 //
 // `startMockProvider()` serves a real TCP `/chat/completions` endpoint that emits
 // an OpenAI-style SSE stream, and returns the `{baseUrl, apiKey, model}`

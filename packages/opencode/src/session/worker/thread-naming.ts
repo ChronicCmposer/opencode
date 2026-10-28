@@ -6,7 +6,7 @@
 // injects `setName`, so production passes `setThreadName` while tests record
 // names without touching `/proc`.
 //
-// C1 wiring (`session-worker.ts`):
+// Wiring in `session-worker.ts`:
 //   boot                 -> bind(init.sessionID or the worker slot)
 //   execute onRunStart   -> bind(sessionID, true)
 //   execute onIdle       -> onIdle()

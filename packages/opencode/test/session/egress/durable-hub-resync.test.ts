@@ -1,4 +1,4 @@
-// P0 durable/resync: a worker's `(aggregateID, seq)` frame IS the durable
+// A worker's `(aggregateID, seq)` frame IS the durable
 // identity. The hub must mark it durable, invalidate the exact aggregate the
 // frame names (not a payload-derived guess), and when the worker's stream skips
 // a sequence it must ask the worker to resync from its database instead of

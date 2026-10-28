@@ -1,4 +1,4 @@
-// Step 32 — durable identity is the aggregate log's `(aggregateID, seq)`.
+// Durable identity is the aggregate log's `(aggregateID, seq)`.
 //
 // There is no sender-global ordinal: a durable frame that omits its aggregate
 // identity is rejected, and ordering is checked per aggregate, so two interleaved

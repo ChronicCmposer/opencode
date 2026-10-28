@@ -1,11 +1,11 @@
-// One global spawn permit for per-session workers.
+// Cap-bounded parallel spawn gate for per-session workers.
 //
-// A Bun `Worker` costs a thread and boots asynchronously. To keep a burst of
-// first prompts from spawning every session at once, the hub serializes
-// `new Worker` behind this single permit and releases it only when the spawned
-// worker has booted (its first frame / ready handshake). Waiters queue FIFO and
-// are never rejected by the gate while they wait; the only rejection is the
-// acquisition timeout, which fails that one spawn instead of the session.
+// A Bun `Worker` costs a thread and boots asynchronously. A burst of first
+// prompts must not spawn every session at once, but a single global permit also
+// serializes every cold boot behind one slow graph build. This gate is a
+// counting semaphore: up to `capacity` boots run concurrently and the rest queue
+// FIFO. A permit is released only when the spawned worker has booted (its first
+// frame / ready handshake), so a stalled boot occupies one slot, not the gate.
 //
 // Integration (owned by the hub/execute wiring, not this module):
 //
@@ -26,13 +26,18 @@
 
 export interface SpawnGateOptions {
   /**
-   * How long an `acquire` may wait for the permit before its spawn attempt
-   * fails. A positive, finite number of milliseconds.
+   * How long an `acquire` may wait for a slot before its spawn attempt fails.
+   * A positive, finite number of milliseconds.
    */
   readonly timeoutMs: number
+  /**
+   * How many boots may run concurrently. Defaults to 4; `1` preserves the old
+   * fully-serialized behavior. A positive integer.
+   */
+  readonly capacity?: number
 }
 
-/** Why a permit was released. Diagnostic only; both outcomes free the gate. */
+/** Why a permit was released. Diagnostic only; both outcomes free the slot. */
 export type SpawnOutcome = "ready" | "failed"
 
 export interface SpawnPermit {
@@ -46,15 +51,19 @@ export interface SpawnPermit {
 }
 
 export interface SpawnGateHandle {
-  /** Wait for the one global permit, resolving in FIFO order. */
+  /** Wait for a boot slot, resolving in FIFO order. */
   acquire(): Promise<SpawnPermit>
-  /** Whether the single permit is currently held (permit-count probes/tests). */
+  /** Whether at least one boot slot is currently held (permit-count probes/tests). */
   readonly held?: boolean
-  /** Number of FIFO waiters not yet granted the permit. */
+  /** How many boot slots are currently held. */
+  readonly active?: number
+  /** The maximum number of concurrent boots. */
+  readonly capacity?: number
+  /** Number of FIFO waiters not yet granted a slot. */
   readonly waiting?: number
 }
 
-/** A spawn could not obtain the global permit within the configured timeout. */
+/** A spawn could not obtain a boot slot within the configured timeout. */
 export class SpawnGateTimeoutError extends Error {
   readonly timeoutMs: number
 
@@ -71,42 +80,53 @@ interface Waiter {
   readonly timer: ReturnType<typeof setTimeout>
 }
 
+const DEFAULT_CAPACITY = 4
+
 export function createSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
-  const timeoutMs = requireTimeout(options.timeoutMs)
+  const timeoutMs = requirePositive("timeoutMs", options.timeoutMs)
+  const capacity = requirePositiveInteger("capacity", options.capacity ?? DEFAULT_CAPACITY)
   const waiters: Waiter[] = []
-  let held = false
+  let active = 0
 
   const permit = (): SpawnPermit => {
     let released = false
     const release = (): void => {
       if (released) return
       released = true
-      held = false
-      const waiter = waiters.shift()
-      if (waiter === undefined) return
-      clearTimeout(waiter.timer)
-      granted(waiter.resolve)
+      active -= 1
+      grantNext()
     }
     return { release }
   }
 
-  // Admit one waiter as the new holder. The permit is created only after
-  // `held` flips, so a grant can never race a second grant.
-  const granted = (resolve: (permit: SpawnPermit) => void): void => {
-    held = true
-    resolve(permit())
+  // Admit waiters while capacity remains. A grant creates the permit only after
+  // the slot is counted, so a grant can never race a second grant.
+  const grantNext = (): void => {
+    while (active < capacity) {
+      const waiter = waiters.shift()
+      if (waiter === undefined) return
+      clearTimeout(waiter.timer)
+      active += 1
+      waiter.resolve(permit())
+    }
   }
 
   return {
     get held() {
-      return held
+      return active > 0
+    },
+    get active() {
+      return active
+    },
+    get capacity() {
+      return capacity
     },
     get waiting() {
       return waiters.length
     },
     acquire() {
-      if (!held) {
-        held = true
+      if (active < capacity) {
+        active += 1
         return Promise.resolve(permit())
       }
       return new Promise<SpawnPermit>((resolve, reject) => {
@@ -117,7 +137,7 @@ export function createSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
           reject(new SpawnGateTimeoutError(timeoutMs))
         }, timeoutMs)
         // The acquisition deadline is a shutdown guard, not work: never keep the
-        // process alive waiting for a permit nobody will release.
+        // process alive waiting for a slot nobody will release.
         timer.unref?.()
         const waiter: Waiter = { resolve, reject, timer }
         waiters.push(waiter)
@@ -126,9 +146,16 @@ export function createSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
   }
 }
 
-function requireTimeout(value: number): number {
+function requirePositive(name: string, value: number): number {
   if (!Number.isFinite(value) || value <= 0) {
-    throw new Error(`spawn gate: timeoutMs must be a positive finite number, received ${value}`)
+    throw new Error(`spawn gate: ${name} must be a positive finite number, received ${value}`)
+  }
+  return value
+}
+
+function requirePositiveInteger(name: string, value: number): number {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`spawn gate: ${name} must be a positive integer, received ${value}`)
   }
   return value
 }

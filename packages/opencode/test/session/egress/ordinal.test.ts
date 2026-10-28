@@ -1,11 +1,11 @@
-// Phase 8.5 — writer-stamped, generation-scoped global ordinal (plan task 8.5).
+// Writer-stamped, generation-scoped global ordinal.
 //
-// PHASE 7 DEPENDENCY: the single-writer Worker is not landed yet. The wire frame
+// Dependency: the single-writer Worker is not landed yet. The wire frame
 // carries `{generation, ordinal}` as plain numbers. This module fixes the
 // interface assumption — the writer stamps a monotonic `ordinal` within a
 // `generation`, and ordering is `(generation, ordinal)` lexicographic so a
 // writer respawn (generation bump) never compares a new ordinal against an old
-// one. A monotonic fallback source is provided for tests until Phase 7 lands.
+// one. A monotonic fallback source is provided for tests.
 
 import { describe, expect, test } from "bun:test"
 import { EgressOrdinal, compareOrdinals, createMonotonicOrdinalSource } from "@/session/egress/ordinal"

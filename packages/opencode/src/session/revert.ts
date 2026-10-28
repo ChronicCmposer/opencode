@@ -1,5 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Effect, Layer, Context, Schema } from "effect"
+import { Effect, Layer, Context, Option, Schema } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Snapshot } from "../snapshot"
@@ -25,6 +25,21 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionRevert") {}
 
+/**
+ * Clears the `revert` column. The column is hub authority: a bound worker may
+ * not publish a `session.updated` that rewrites it to `null`, because the
+ * worker projection policy rejects any actual change to `revert`. The worker
+ * graph supplies a hub-proxy implementation; on the hub the authority is absent
+ * and `Session.clearRevert` is the real writer.
+ */
+export interface ClearRevertInterface {
+  readonly clear: (sessionID: SessionID) => Effect.Effect<void>
+}
+
+export class ClearRevertAuthority extends Context.Service<ClearRevertAuthority, ClearRevertInterface>()(
+  "@opencode/SessionRevert/ClearRevertAuthority",
+) {}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -34,6 +49,17 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const summary = yield* SessionSummary.Service
     const state = yield* SessionRunState.Service
+
+    /**
+     * Clear through the graph-provided authority when present (a bound worker
+     * must ask the hub), otherwise through the hub's real `Session.clearRevert`.
+     */
+    const clearRevert = (sessionID: SessionID): Effect.Effect<void> =>
+      Effect.gen(function* () {
+        const authority = yield* Effect.serviceOption(ClearRevertAuthority)
+        if (Option.isSome(authority)) return yield* authority.value.clear(sessionID)
+        return yield* sessions.clearRevert(sessionID)
+      })
 
     const revert = Effect.fn("SessionRevert.revert")(function* (input: RevertInput) {
       yield* state.assertNotBusy(input.sessionID)
@@ -94,7 +120,7 @@ const layer = Layer.effect(
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       if (!session.revert) return session
       if (session.revert.snapshot) yield* snap.restore(session.revert.snapshot)
-      yield* sessions.clearRevert(input.sessionID)
+      yield* clearRevert(input.sessionID)
       return yield* sessions.get(input.sessionID).pipe(Effect.orDie)
     })
 
@@ -120,7 +146,7 @@ const layer = Layer.effect(
           }
         }
       }
-      yield* sessions.clearRevert(sessionID)
+      yield* clearRevert(sessionID)
     })
 
     return Service.of({ revert, unrevert, cleanup })

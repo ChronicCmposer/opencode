@@ -1,4 +1,4 @@
-// Shared SSE stream parsing (plan consolidation).
+// Shared SSE stream parsing.
 //
 // The single reader/accumulator for OpenAI-compatible SSE streams. Every test
 // consumer — the worker-side mock-LLM chat parser, the mock-SSE session worker,

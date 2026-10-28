@@ -1,4 +1,4 @@
-// Phase 11.5 — hub-side mirrored PID/PGID registry (plan decision line 52).
+// Hub-side mirrored PID/PGID registry.
 //
 // The hub mirrors the child PGIDs a worker owns and group-kills them on
 // terminate (terminate() reaps no children — 3.10). A worker reports each
@@ -122,7 +122,7 @@ describe("11.5 mirrored PGID registry", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Worker→hub PID reporting (P5 prerequisite). The worker spawns a detached
+// Worker→hub PID reporting. The worker spawns a detached
 // shell child and reports `{ pid, pgid, label }` over its control port; the hub
 // mirrors each entry into this registry. `registerReported` is the hub-side
 // boundary that turns a report frame into registry entries.

@@ -1,9 +1,9 @@
-// Phase 12 — flag-on hub wiring: `run-state.ts` forwards `startShell` and
-// `cancel` to the hub, and the hub routes UI stop through the Phase 11
+// Flag-on hub wiring: `run-state.ts` forwards `startShell` and
+// `cancel` to the hub, and the hub routes UI stop through the
 // cooperative `cancelWithGrace` path.
 //
 // The flag-on/flag-off `ensureRunning` delegation matrix lives in
-// `rollout/flag-gating.test.ts` (finding #186). What is unique here is the
+// `rollout/flag-gating.test.ts`. What is unique here is the
 // control wiring: `startShell` opens the caller's `ready` latch (the hub cannot
 // carry it), maps a hub busy rejection to `Session.BusyError`, and `cancel`
 // reaches the hub. The hub runs over an in-memory executor pool so the wiring is
@@ -83,7 +83,7 @@ const recordingRunStateLayer = (calls: StatusCall[]) =>
 /**
  * `SessionRunState.layer` with a recording `SessionStatus` AND a `BackgroundJob`
  * stub that reports a fixed set of running jobs and records every `cancel`. Used
- * to pin the Phase 6.1 contract: cancel must cancel background subagents/jobs
+ * to pin the layer contract: cancel must cancel background subagents/jobs
  * (flag on and flag off) as well as reach the single terminal idle.
  */
 const recordingBackgroundRunStateLayer = (calls: StatusCall[], jobs: BackgroundJob.Info[], cancelled: string[]) =>
@@ -250,7 +250,7 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
 
     return Effect.all([flagOn, flagOff]).pipe(
       Effect.map(() => {
-        // Phase 6.1: the background subagent is cancelled on both paths — the
+        // The background subagent is cancelled on both paths — the
         // flag-on branch must not let it outlive the cancel.
         expect(flagOnCancelled).toEqual([job.id])
         expect(flagOffCancelled).toEqual([job.id])
@@ -300,7 +300,7 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
 // Integrated flag-on cancel — one scenario must observe the hub cancel outcome,
 // exactly one `session.status: idle`, AND the `session.cancelled` event.
 //
-// The audit (`o1-w4-audit.md` §5) found these facts covered by two separate
+// These facts were covered by two separate
 // tests (`hub-wiring.test.ts` idle; `hub.test.ts` outcome+event) with no single
 // integrated run. The shared blocking executor fake stays running until
 // cancelled and exposes a cooperative cancel port, so the dispatcher's
@@ -328,7 +328,7 @@ describe("12 — integrated flag-on cancel (outcome + idle + session.cancelled)"
     const sessionID = sid("ses_integrated")
     const flagOnCalls: StatusCall[] = []
     const flagOffCalls: StatusCall[] = []
-    // Phase 4: the executor cancel reaches the worker-local run-state (table B),
+    // The executor cancel reaches the worker-local run-state (table B),
     // whose `onIdle` publishes the terminal idle through the hub-proxy. The pool
     // simulates that emit; the hub-side `SessionRunState.cancel` must not add a
     // second one.
@@ -471,7 +471,7 @@ describe("12 — integrated flag-on cancel (outcome + idle + session.cancelled)"
 })
 
 // ---------------------------------------------------------------------------
-// Phase 4 consolidation — exactly ONE idle per flag-ON cancel, in every case.
+// Exactly ONE idle per flag-ON cancel, in every case.
 //
 // The executor cancel now routes into the worker-local run-state (table B),
 // whose `onIdle` publishes `session.status: idle` through the hub-proxy. The
@@ -585,7 +585,7 @@ describe("12 — exactly one flag-on cancel idle per case (ON ≡ OFF)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// W4 — parent cancel must settle every subagent child to exactly one idle.
+// Parent cancel must settle every subagent child to exactly one idle.
 //
 // The user bug: `SessionRunState.cancel` wrote the fallback idle only for the
 // requested session, so a child the hub cascade could not settle (never
@@ -594,7 +594,7 @@ describe("12 — exactly one flag-on cancel idle per case (ON ≡ OFF)", () => {
 // published its own idle; run-state writes the fallback for exactly the rest.
 // ---------------------------------------------------------------------------
 
-describe("W4 — parent cancel settles every child to exactly one idle", () => {
+describe("parent cancel settles every child to exactly one idle", () => {
   const idleCalls = (calls: StatusCall[]) => calls.filter((call) => call.status.type === "idle")
   const runningState = (hub: SessionHub, sessionID: SessionID) => (): true | undefined =>
     hub.dispatcher.registry.get(sessionID)?.state === "running" ? true : undefined
@@ -701,7 +701,7 @@ describe("W4 — parent cancel settles every child to exactly one idle", () => {
 })
 
 // ---------------------------------------------------------------------------
-// W12 observability — the production hub logs pool/entry/reap resolution and
+// Hub observability: the production hub logs pool/entry/reap resolution and
 // pid reports through the injected `log` seam.
 // ---------------------------------------------------------------------------
 
@@ -723,30 +723,31 @@ const lineFor = (lines: RecordedLogLine[], event: string): RecordedLogLine => {
 
 /** A production hub over an in-memory pool: no isolate is ever spawned. */
 const productionHubWithLog = (options: {
-  readonly count: number
+  readonly count?: number
   readonly env?: Record<string, string | undefined>
   readonly entry?: string | URL
   readonly log: WorkerLogger
 }): SessionHub =>
   createProductionSessionHub({
     init: sessionWorkerInit(),
-    count: options.count,
-    poolFactory: () => createFakeExecutorPool(options.count),
+    ...(options.count === undefined ? {} : { count: options.count }),
+    poolFactory: () => createFakeExecutorPool(options.count ?? 1),
     log: options.log,
     ...(options.env === undefined ? {} : { env: options.env }),
     ...(options.entry === undefined ? {} : { entry: options.entry }),
   })
 
-describe("W12 observability — hub construction resolution", () => {
-  test("A1 logs the resolved pool with count, override and parallelism (no warm headroom)", async () => {
+describe("hub construction resolution", () => {
+  test("logs the resolved pool with count and parallelism (no warm headroom)", async () => {
     const { log, lines } = recordingLog()
     const hub = productionHubWithLog({ count: 4, env: {}, log })
     try {
       const line = lineFor(lines, "pool resolved")
       expect(line.fields.workerCount).toBe(4)
-      expect(line.fields.override).toBe(false)
       expect(typeof line.fields.availableParallelism).toBe("number")
       expect(line.fields.availableParallelism as number).toBeGreaterThan(0)
+      // The removed env-count knob must not reappear as a stale diagnostic field.
+      expect("override" in line.fields).toBe(false)
       // v2 has no headroom reserve: per-session workers materialize on demand.
       expect("headroom" in line.fields).toBe(false)
     } finally {
@@ -754,19 +755,20 @@ describe("W12 observability — hub construction resolution", () => {
     }
   })
 
-  test("A1 reports the env override when OPENCODE_SESSION_WORKER_COUNT is set", async () => {
+  test("logs workerCount 0 when no count is configured (diagnostic only)", async () => {
     const { log, lines } = recordingLog()
-    const hub = productionHubWithLog({ count: 3, env: { OPENCODE_SESSION_WORKER_COUNT: "3" }, log })
+    const hub = productionHubWithLog({ env: {}, log })
     try {
       const line = lineFor(lines, "pool resolved")
-      expect(line.fields.workerCount).toBe(3)
-      expect(line.fields.override).toBe(true)
+      // `workerCount` is diagnostic, not a prewarm: no configured count means 0.
+      expect(line.fields.workerCount).toBe(0)
+      expect("override" in line.fields).toBe(false)
     } finally {
       await hub.terminateAll()
     }
   })
 
-  test("A2 logs the resolved worker entry and its source (explicit path)", async () => {
+  test("logs the resolved worker entry and its source (explicit path)", async () => {
     const { log, lines } = recordingLog()
     const hub = productionHubWithLog({ count: 1, env: {}, entry: "/opt/session-worker.js", log })
     try {
@@ -778,7 +780,7 @@ describe("W12 observability — hub construction resolution", () => {
     }
   })
 
-  test("A2 reports the env source when the entry comes from the environment", async () => {
+  test("reports the env source when the entry comes from the environment", async () => {
     const { log, lines } = recordingLog()
     const hub = productionHubWithLog({ count: 1, env: { OPENCODE_SESSION_WORKER_PATH: "/env/worker.js" }, log })
     try {
@@ -790,7 +792,7 @@ describe("W12 observability — hub construction resolution", () => {
     }
   })
 
-  test("A3 logs reap support for this platform", async () => {
+  test("logs reap support for this platform", async () => {
     const support = reapSupport()
     const { log, lines } = recordingLog()
     const hub = productionHubWithLog({ count: 1, env: {}, log })
@@ -802,7 +804,7 @@ describe("W12 observability — hub construction resolution", () => {
     }
   })
 
-  test("E3 logs a pid report with the mirrored entry count", async () => {
+  test("logs a pid report with the mirrored entry count", async () => {
     const { log, lines } = recordingLog()
     const hub = productionHubWithLog({ count: 1, env: {}, log })
     const channel = new MessageChannel()
@@ -830,11 +832,11 @@ describe("W12 observability — hub construction resolution", () => {
 })
 
 // ---------------------------------------------------------------------------
-// W12 production wiring — the hub-path narrative must emit through the
+// The hub-path narrative must emit through the
 // PRODUCTION layer, not only the test-only `createSessionHubLayer`.
 //
 // The verification agent found `productionSessionHubLayer` never created a
-// bridge logger, so `options.log` defaulted to `noopWorkerLogger` and A1/A2/A3
+// bridge logger, so `options.log` defaulted to `noopWorkerLogger` and the bring-up lines
 // (and every transitively forwarded event) were dormant on the real app graphs
 // (`app-runtime.ts`, `server/routes/instance/httpapi/server.ts`). This builds
 // that exact layer, provides the nine services it needs as mocks, injects a
@@ -854,8 +856,8 @@ const productionWiringServices = Layer.mergeAll(
   Layer.mock(EventV2Bridge.Service, {}),
 )
 
-describe("W12 production wiring — the production hub layer emits the narrative", () => {
-  test("productionSessionHubLayer creates a bridge logger so A1 emits (not the noop)", async () => {
+describe("the production hub layer emits the narrative", () => {
+  test("productionSessionHubLayer creates a bridge logger so the bring-up line emits (not the noop)", async () => {
     // The bridge logger forks `Effect.logInfo`; capture the raw Effect messages.
     const messages: unknown[] = []
     const logger = Logger.make<unknown, void>((entry) => {

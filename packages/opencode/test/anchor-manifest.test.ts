@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { ANCHORS, resolveAnchor, resolveAnchorResult } from "./lib/anchor-manifest"
 
-describe("anchor manifest (plan 3.2)", () => {
+describe("anchor manifest", () => {
   test("anchors are unique, well-formed and non-trivial", () => {
     const ids = ANCHORS.map((anchor) => anchor.id)
     expect(new Set(ids).size).toBe(ids.length)

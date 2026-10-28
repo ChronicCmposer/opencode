@@ -18,7 +18,7 @@ describe("POSIX thread CPU reader", () => {
   })
 
   // POSIX-only: /proc/thread-self/stat is a Linux facility. On Windows it does not
-  // exist, so this test is skipped there with a documented reason (plan: Windows
+  // exist, so this test is skipped there with a documented reason (Windows
   // verification is out of scope, `skipIf(win32)`).
   test.skipIf(process.platform === "win32")("reads the calling thread's CPU ticks from /proc", () => {
     const reading = readThreadCpuTicks()
@@ -110,7 +110,7 @@ describe("event-loop-gap probe", () => {
 })
 
 describe("metrics + loop-gap scenario", () => {
-  // The Phase 13.3 acceptance gate: record hub metrics while collecting a loop-gap
+  // The hub-load acceptance gate: record hub metrics while collecting a loop-gap
   // sample. Asserts scenario completion and collection only — never a timing bound.
   test("records hub metrics alongside a loop-gap sample", async () => {
     const metrics = createMetrics()

@@ -9,7 +9,7 @@
 // source) and only explodes in the packaged binary as
 // `ModuleNotFound resolving "/$bunfs/root/<worker>.ts"`.
 //
-// The writer-worker entry (D5/W1.4) and broker-worker entry (W4.3) are gone; no
+// The writer-worker entry (D5) and broker-worker entry are gone; no
 // Session worker needs either bundled entry.
 
 import { describe, expect, test } from "bun:test"

@@ -1,4 +1,4 @@
-// POSIX process-tree helpers (plan tasks 3.8 and 3.9).
+// POSIX process-tree helpers.
 //
 // Enumerates descendants, reads process-group ids, spawns a child detached as
 // its own group leader, and kills whole process groups. These are the exact

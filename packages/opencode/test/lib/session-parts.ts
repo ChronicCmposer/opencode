@@ -4,7 +4,7 @@
 // result path carries (`run-state.ts` decodes exactly this shape at the hub
 // boundary). Suites only ever compare one `withParts(...)` against another, so
 // the message fields are intentionally fixed: one definition, many callers
-// (finding #182).
+//.
 //
 // The value is built through the canonical schemas (branded ids via `.make`)
 // and merged with the caller's `Partial<User>` overrides, rather than cast past

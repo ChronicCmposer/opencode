@@ -1,5 +1,4 @@
-// W2 — worker durable-subscription cleanup on a failed `listen` (egress-client
-// finding). A `subscribeDurable` whose mesh `listen` request fails must not leave
+// Worker durable-subscription cleanup on a failed `listen`. A `subscribeDurable` whose mesh `listen` request fails must not leave
 // a stale local subscription behind: the entry is removed so a later durable push
 // can never reach a subscriber the hub never registered.
 

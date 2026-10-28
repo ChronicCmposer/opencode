@@ -1,4 +1,4 @@
-// Production boot cancellation (D11 / REVIEW C7): the real spawn/transport
+// Production boot cancellation (D11): the real spawn/transport
 // path owns the spawn permit through a boot lifecycle. A cancel before the
 // ready handshake returns the typed boot outcome, terminates the partially
 // materialized isolate, releases the one permit, and never runs work. The

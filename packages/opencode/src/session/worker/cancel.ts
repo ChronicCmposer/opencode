@@ -113,12 +113,12 @@ export interface CancelControllerOptions {
   readonly terminate: () => void | Promise<void>
   readonly graceMs?: number
   readonly schedule?: CancelScheduler
-  /** Reap the worker's mirrored PGIDs when the terminate path runs (plan 11.5). */
+  /** Reap the worker's mirrored PGIDs when the terminate path runs. */
   readonly reap?: () => void | Promise<void>
   readonly now?: () => number
-  /** The worker this controller belongs to, when known (observability D1). */
+  /** The worker this controller belongs to, when known. */
   readonly workerID?: number
-  /** Optional structured logger seam; absent defaults to a no-op (observability D1). */
+  /** Optional structured logger seam; absent defaults to a no-op. */
   readonly log?: WorkerLogger
 }
 

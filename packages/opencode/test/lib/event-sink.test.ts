@@ -1,4 +1,4 @@
-// Wave 1 — `event-sink` unit tests (spec Q1/Q12 parity harness support).
+// `event-sink` unit tests (spec Q1/Q12 parity harness support).
 //
 // The sink subscribes to the REAL `EventV2.Service` (or `GlobalBus`) and records
 // each emission as `{ id, type, properties }`. Durable events touch the database,

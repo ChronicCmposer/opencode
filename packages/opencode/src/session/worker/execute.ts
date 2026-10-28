@@ -37,7 +37,7 @@ export interface SessionExecutionResult {
 
 /**
  * One unit of session work over a session key. `prompt`, when present, is the
- * sub-agent turn the parent would have persisted (Solution 1 / B2): the worker
+ * sub-agent turn the parent would have persisted: the worker
  * runs the full `SessionPrompt.prompt` path — persist the user message, then
  * loop — instead of the bare `loop` that expects the message to already exist.
  * Optional so a prompt-less run (the existing foreground path) is unchanged.
@@ -456,7 +456,7 @@ export interface ExecutorRun {
   /** Frame to produce; defaults to `"run"` so a plain run stays `{sessionID, depth}`. */
   readonly mode?: SessionRunMode
   /**
-   * The sub-agent prompt to run on the worker (Solution 1 / B2). When present,
+   * The sub-agent prompt to run on the worker. When present,
    * the worker persists the user message for `sessionID` and loops, instead of
    * a bare `loop` that expects the message to already exist. Absent keeps a
    * plain run byte-for-byte unchanged.
@@ -515,7 +515,7 @@ export interface ExecutorWorker extends ExecutorSessionWorker {
   cancel(sessionID: SessionID): Promise<void>
   assertNotBusy(sessionID: SessionID): Promise<boolean>
   /**
-   * Idle-reap liveness probe (M5): whether `sessionID` still owns a running
+   * Idle-reap liveness probe: whether `sessionID` still owns a running
    * process-local background job. The dispatcher re-arms the reap timer instead
    * of retiring a worker that answers `true`. Distinct from `assertNotBusy`, so
    * background work never blocks a new prompt. Optional for test fakes.
@@ -523,14 +523,14 @@ export interface ExecutorWorker extends ExecutorSessionWorker {
   hasActiveWork?(sessionID: SessionID): Promise<boolean>
   resultFor(sessionID: SessionID): SessionExecutionResult | undefined
   /**
-   * Cooperative cancel control port (plan 11.2). `dispatch.ts`'s
+   * Cooperative cancel control port. `dispatch.ts`'s
    * `CancellationConfig.portFor` returns this so a cancel notifies the worker and
    * observes its ack within the grace window. Optional so minimal test fakes
    * remain valid; `createExecutorWorker` always provides it.
    */
   readonly cancelPort?: CancelPort
   /**
-   * Per-session write barrier (R4#16): resolves once the run's durable egress
+   * Per-session write barrier: resolves once the run's durable egress
    * write is acked. The dispatcher awaits it before releasing the worker to its
    * next run, so a re-dispatch never overtakes the prior run's egress. Optional
    * so minimal test fakes remain valid.
@@ -540,12 +540,12 @@ export interface ExecutorWorker extends ExecutorSessionWorker {
 
 export interface ExecutorCancelPortOptions {
   readonly cancel: (sessionID: SessionID) => Promise<void>
-  /** Optional structured logger seam; absent defaults to a no-op (observability D2). */
+  /** Optional structured logger seam; absent defaults to a no-op. */
   readonly log?: WorkerLogger
 }
 
 /**
- * The cancel dispositions a worker's cancel port can report (observability D2):
+ * The cancel dispositions a worker's cancel port can report:
  * `"cooperative"` means the worker accepted the cancel and will settle at a
  * checkpoint; `"terminate"` means it rejected it and the hub must terminate the
  * isolate. A session not yet on a worker is a dispatch-level concern, so it can
@@ -588,7 +588,7 @@ export function createExecutorCancelPort(options: ExecutorCancelPortOptions): Ca
   }
 }
 
-/** Why a worker isolate is spawning (observability B1). */
+/** Why a worker isolate is spawning. */
 export type WorkerSpawnReason = "initial" | "rebind" | "respawn"
 
 export interface ExecutorWorkerOptions {
@@ -604,12 +604,12 @@ export interface ExecutorWorkerOptions {
    * reply keeps its unbounded wait unless a caller opts in.
    */
   readonly runIdleTimeoutMs?: number
-  /** The session the isolate is bound to, when known at spawn (observability B1). */
+  /** The session the isolate is bound to, when known at spawn. */
   readonly sessionID?: SessionID
-  /** Why this isolate is spawning; defaults to `"initial"` (observability B1). */
+  /** Why this isolate is spawning; defaults to `"initial"`. */
   readonly reason?: WorkerSpawnReason
   /**
-   * Per-session durable-egress barrier (R4#16). When supplied, `execute` does
+   * Per-session durable-egress barrier. When supplied, `execute` does
    * not resolve until the run's egress write is acked, so the dispatcher cannot
    * hand the worker its next run early. Absent leaves the reply path unchanged.
    */
@@ -758,7 +758,7 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     const message = runIdleTimeoutMs > 0 ? await awaitReplyWithLiveness(transport, reply, runIdleTimeoutMs, nextId) : await reply
     if (message.type === "error") throw new Error(message.message)
     if (message.type !== "done") throw new Error(`unexpected executor reply: ${message.type}`)
-    // R4#16: do not resolve the run until its durable egress write is acked, so
+    // Do not resolve the run until its durable egress write is acked, so
     // the dispatcher cannot hand this worker the next run ahead of that write.
     await options.egressBarrier?.(run.sessionID)
     recordResult(message.result)

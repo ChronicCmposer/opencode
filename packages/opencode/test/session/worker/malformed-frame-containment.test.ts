@@ -1,4 +1,4 @@
-// Step 36 — a malformed inbound frame is contained at the host boundary.
+// A malformed inbound frame is contained at the host boundary.
 //
 // A worker peer that posts garbage must not throw out of the host's message
 // listener. The failure is surfaced as a typed channel error, the host reports

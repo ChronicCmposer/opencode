@@ -1,4 +1,4 @@
-// A5 — the two `experimental.chat.messages.transform` call sites must CONSUME the
+// The two `experimental.chat.messages.transform` call sites must CONSUME the
 // trigger's returned `{ messages }`, not rely on in-place mutation.
 //
 // The hook contract is "mutate `output.messages` in place". In-process the

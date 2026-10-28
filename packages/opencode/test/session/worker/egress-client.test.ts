@@ -1,4 +1,4 @@
-// W2 — worker-side egress client over the events envelope (spec Q6/Q7/Q21).
+// Worker-side egress client over the events envelope (spec Q6/Q7/Q21).
 //
 // `createWorkerEgressClient(port)` turns the worker's EventV2 events into framed
 // bytes on its dedicated egress `MessagePort`, reusing `egress/sender.ts` (data
@@ -244,7 +244,7 @@ describe("worker egress client drives durable mesh subscriptions", () => {
 })
 
 // ---------------------------------------------------------------------------
-// E2 — peer lifecycle logging. The data plane is "connected" once the sender is
+// Peer lifecycle logging. The data plane is "connected" once the sender is
 // adapted; the optional mesh control link is part of the same connect seam, so a
 // failed control-port start emits a WARN connect-failed line before rethrowing.
 // ---------------------------------------------------------------------------
@@ -258,7 +258,7 @@ function recordingLogger(records: RecordedLog[]): WorkerLogger {
   return (message, fields) => void records.push({ message, fields })
 }
 
-describe("worker egress client lifecycle logging (E2)", () => {
+describe("worker egress client lifecycle logging", () => {
   test("emits an INFO connect line with the peer and workerID", () => {
     const channel = new MessageChannel()
     const records: RecordedLog[] = []

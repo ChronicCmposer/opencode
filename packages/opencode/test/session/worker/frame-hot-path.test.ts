@@ -1,4 +1,4 @@
-// Step 38 — frame hot-path budget.
+// Frame hot-path budget.
 //
 // One encode/decode per frame, no per-frame `TextEncoder` allocation, and a
 // bounded p95 for both small control frames and a 4 MiB payload. The byte length

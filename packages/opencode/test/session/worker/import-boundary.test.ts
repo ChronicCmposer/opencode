@@ -1,9 +1,3 @@
-// Structural guard: `session/db` is not a barrel.
-//
-// Each sibling module is imported by its own path and re-exports its own
-// namespace (`export * as X from "./x"`), so ownership is visible at every call
-// site instead of hidden behind a package-level bucket.
-
 import fs from "node:fs"
 import path from "node:path"
 import { describe, expect, test } from "bun:test"
@@ -11,13 +5,31 @@ import { describe, expect, test } from "bun:test"
 const packageRoot = path.join(import.meta.dir, "../../..")
 const srcRoot = path.join(packageRoot, "src")
 const testRoot = path.join(packageRoot, "test")
-const dbRoot = path.join(srcRoot, "session/db")
 
-const SIBLINGS = ["allowlist.gen", "derive", "ownership", "schema"] as const
+interface Boundary {
+  readonly name: string
+  readonly directory: string
+  readonly importPattern: RegExp
+  readonly siblings: readonly string[]
+}
+
+const BOUNDARIES: readonly Boundary[] = [
+  {
+    name: "session/db",
+    directory: path.join(srcRoot, "session/db"),
+    importPattern: /(?:from|import)\s*\(?\s*["']@\/session\/db(?:\/index)?["']/,
+    siblings: ["allowlist.gen", "derive", "ownership", "schema"],
+  },
+  {
+    name: "session/worker/repository",
+    directory: path.join(srcRoot, "session/worker/repository"),
+    importPattern: /(?:from|import)\s*\(?\s*["']@\/session\/worker\/repository(?:\/index)?["']/,
+    siblings: ["capability", "durable", "errors", "policy", "registry", "tables.gen", "types", "write"],
+  },
+]
 
 function sourceFiles(root: string): string[] {
-  const entries = fs.readdirSync(root, { withFileTypes: true })
-  return entries.flatMap((entry) => {
+  return fs.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
     const entryPath = path.join(root, entry.name)
     if (entry.isDirectory()) return sourceFiles(entryPath)
     if (!/\.(ts|tsx|mts|cts)$/.test(entry.name)) return []
@@ -25,29 +37,29 @@ function sourceFiles(root: string): string[] {
   })
 }
 
-function importsBarrel(text: string): boolean {
-  return /(?:from|import)\s*\(?\s*["']@\/session\/db(?:\/index)?["']/.test(text)
+for (const boundary of BOUNDARIES) {
+  describe(`${boundary.name} import boundary`, () => {
+    test("the barrel is gone", () => {
+      expect(fs.existsSync(path.join(boundary.directory, "index.ts"))).toBe(false)
+    })
+
+    test("no source or test imports the barrel", () => {
+      const offenders = [...sourceFiles(srcRoot), ...sourceFiles(testRoot)].flatMap((file) => {
+        const text = fs.readFileSync(file, "utf8")
+        return boundary.importPattern.test(text) ? [path.relative(packageRoot, file)] : []
+      })
+      expect(offenders).toEqual([])
+    })
+
+    test("every hand-written sibling exposes its own namespace", () => {
+      const missing = boundary.siblings.flatMap((name) => {
+        if (name === "tables.gen") return []
+        const text = fs.readFileSync(path.join(boundary.directory, `${name}.ts`), "utf8")
+        const escaped = name.replace(".", "\\.")
+        const pattern = new RegExp(`export \\* as [A-Za-z_$][\\w$]* from "\\./${escaped}"`)
+        return pattern.test(text) ? [] : [name]
+      })
+      expect(missing).toEqual([])
+    })
+  })
 }
-
-describe("session/db import boundary", () => {
-  test("the barrel is gone", () => {
-    expect(fs.existsSync(path.join(dbRoot, "index.ts"))).toBe(false)
-  })
-
-  test("no source or test imports the barrel", () => {
-    const offenders = [...sourceFiles(srcRoot), ...sourceFiles(testRoot)].flatMap((file) => {
-      const text = fs.readFileSync(file, "utf8")
-      return importsBarrel(text) ? [path.relative(packageRoot, file)] : []
-    })
-    expect(offenders).toEqual([])
-  })
-
-  test("every sibling exposes its own namespace", () => {
-    const missing = SIBLINGS.flatMap((name) => {
-      const text = fs.readFileSync(path.join(dbRoot, `${name}.ts`), "utf8")
-      const pattern = new RegExp(`export \\* as [A-Za-z_$][\\w$]* from "\\./${name.replace(".", "\\.")}"`)
-      return pattern.test(text) ? [] : [name]
-    })
-    expect(missing).toEqual([])
-  })
-})

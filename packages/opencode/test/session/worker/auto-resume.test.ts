@@ -12,7 +12,7 @@ const base = {
   lastCommittedMessageID: "msg_1",
 }
 
-describe("auto-resume policy (W3.5 / D9)", () => {
+describe("auto-resume policy (D9)", () => {
   test("resumes from the last committed message when no side-effecting call started", () => {
     expect(decideAutoResume({ ...base, indeterminate: [{ callID: "read_1", sideEffecting: false }] })).toEqual({
       resume: true,

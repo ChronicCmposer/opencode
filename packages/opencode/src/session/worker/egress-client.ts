@@ -1,4 +1,4 @@
-// W2 — worker-side egress client over the events envelope (spec Q6/Q7/Q21).
+// Worker-side egress client over the events envelope (spec Q6/Q7/Q21).
 //
 // The reduced session-worker graph talks to the hub event channel through a
 // dedicated, transferred `MessagePort`. This module is the
@@ -113,7 +113,7 @@ export interface WorkerEgressSubscriptionClient extends WorkerEgressClient {
  * Adapt the worker's egress ports into a client. The data plane is the sender
  * over `port`; the optional control plane is the mesh client over `controlPort`.
  *
- * Emits the E2 peer lifecycle lines: an INFO `egress connected` once the sender
+ * Emits the peer lifecycle lines: an INFO `egress connected` once the sender
  * (and mesh, when supplied) is adapted, a WARN `egress connect failed` (with
  * `reason`) if construction throws, and an INFO `egress closed` at dispose.
  */

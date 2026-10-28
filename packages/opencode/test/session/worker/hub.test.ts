@@ -1,9 +1,9 @@
-// Phase 12.1–12.4 — pure hub, admission & HTTP/SSE liveness.
+// Pure hub, admission & HTTP/SSE liveness.
 //
 // The hub is the composition of the per-session dispatcher (one lazily
 // materialized worker per session, crash handling), the executor pool, and the
 // cooperative cancel path. These tests drive the hub over REAL Bun worker
-// isolates and assert the four Phase 12 properties:
+// isolates and assert the four hub properties:
 //
 //   12.1 the hub executes zero sessions (work runs in a worker isolate);
 //   12.2 each session is admitted on its own worker (no queue/headroom split);
@@ -27,6 +27,7 @@ import {
   createSessionBoundExecutorWorker,
   createSessionHub,
   createSessionHubLayer,
+  hubProxyAuthoritiesFor,
   createWorkerCancellation,
   describeSessionWorkerEntry,
   DEFAULT_RUN_IDLE_TIMEOUT_MS,
@@ -46,7 +47,7 @@ import {
   type WorkerPortBackends,
   type WorkerTransferredPorts,
 } from "@/session/worker/hub"
-import { ackFrame, endFrame, eventFrame, resyncFrame } from "@/session/worker/frame"
+import { ackFrame, endFrame, eventFrame, MAX_WORKER_FRAME_BYTES, resyncFrame } from "@/session/worker/frame"
 import { resolveSessionWorkerIdleTimeoutMs, SESSION_WORKER_IDLE_TIMEOUT_ENV } from "@/session/worker/pool"
 import { encodeFrame } from "@/session/egress/frame"
 import { createMeshWorkerClient, type DurableCommit } from "@/session/egress/mesh"
@@ -80,6 +81,7 @@ import { settleOf, sid } from "../../lib/async"
 import { lineFor, recordingLogger } from "../../lib/recorders"
 import { pollUntil } from "../../lib/poll"
 import { createHubProxyClient } from "@/session/worker/hub-proxy-wire"
+import { createFakeExecutorPool } from "../../lib/fake-worker-pool"
 import type { HubProxyMethod } from "@/session/worker/hub-proxy-wire"
 import { createWorkerEgressClient } from "@/session/worker/egress-client"
 import { createEgressReceiver } from "@/session/egress/receiver"
@@ -102,7 +104,7 @@ import { tmpdir } from "../../fixture/fixture"
 
 const it = testEffect(TestLLMServer.layer)
 
-/** The dependency-light executor fixture (Phase 5). */
+/** The dependency-light executor fixture. */
 const EXECUTOR_FIXTURE = new URL("../../fixture/session-execute-worker.ts", import.meta.url)
 /** The production worker entry (reduced layer as the work factory). */
 const SESSION_WORKER = new URL("../../../src/session/worker/session-worker.ts", import.meta.url)
@@ -396,7 +398,7 @@ describe("12.x executor transport buffering", () => {
     await transport.terminate()
   })
 
-  test("B2 a worker boot/import failure is logged as an error with its workerID", async () => {
+  test("a worker boot/import failure is logged as an error with its workerID", async () => {
     const { log, lines } = recordingLog()
     await withFakeWorker(
       async (fake, transport) => {
@@ -674,11 +676,11 @@ describe("13 cooperative cancel within grace", () => {
 })
 
 // ---------------------------------------------------------------------------
-// W11 — production depth plumbing: a depth ≥ 1 child must materialize its own
+// Production depth plumbing: a depth ≥ 1 child must materialize its own
 // per-session worker. Depth rides the run metadata; scheduling has no split.
 // ---------------------------------------------------------------------------
 
-describe("W11 production depth plumbing", () => {
+describe("production depth plumbing", () => {
   test("a depth ≥ 1 child admitted through the hub materializes its own worker", async () => {
     const childID = sid("ses_w11_depth_child")
     const created: ImmediateWorker[] = []
@@ -710,12 +712,12 @@ describe("W11 production depth plumbing", () => {
 })
 
 // ---------------------------------------------------------------------------
-// W11 — hub-side egress mesh. W5 wired the worker's `egressControl` port; the
+// Hub-side egress mesh. The worker's `egressControl` port is wired; the
 // hub must create ONE mesh, attach each worker's control port to it, and publish
 // durable commits on the commit path so `events.durable()` subscribers wake.
 // ---------------------------------------------------------------------------
 
-describe("W11 production egress mesh", () => {
+describe("production egress mesh", () => {
   test("the production egress backend attaches a mesh and publishes durable commits under load", async () => {
     const { publisher, published } = recordingPublisher()
     const backends = buildProductionPortBackends({
@@ -987,7 +989,7 @@ const productionReplacements: LayerNode.Replacements = [
     }),
   ],
   [RuntimeFlags.node, RuntimeFlags.layer({ experimentalSessionWorkers: true })],
-  // Hub-proxy authorities (plan decision 64). `SessionStatus.get` is left
+  // Hub-proxy authorities. `SessionStatus.get` is left
   // implemented — and reads the ambient `InstanceRef` — so the production
   // hub-proxy round-trip proves the handler runs under the dispatch context.
   [
@@ -1216,6 +1218,37 @@ describe("Q22 hub event sink", () => {
     expect(sink.ended).toBe(false)
   })
 
+  test("a durable worker event keeps its committed aggregate identity on republish", () => {
+    const { publisher, published } = recordingPublisher()
+    const sink = createHubEventSink({ publisher })
+
+    sink.event(
+      { id: "evt_9", type: "session.next.prompted", properties: { sessionID: "ses_a" } },
+      { durable: true, aggregateID: "ses_a", seq: 7 },
+    )
+
+    const republished = published[0] as unknown as {
+      readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+    }
+    expect(republished.durable).toEqual({ aggregateID: "ses_a", seq: 7, version: 1 })
+    // A non-durable event still carries no durable identity.
+    sink.event({ id: "evt_10", type: "session.error", properties: { message: "boom" } })
+    expect((published[1] as unknown as { durable?: unknown }).durable).toBeUndefined()
+  })
+
+  test("a durable frame's aggregate wins over the payload's sessionID for cache invalidation", () => {
+    const invalidated: string[] = []
+    const { publisher } = recordingPublisher()
+    const sink = createHubEventSink({ publisher, cache: { invalidate: (id) => void invalidated.push(id) } })
+
+    sink.event(
+      { id: "evt_11", type: "session.next.prompted", properties: { sessionID: "ses_payload" } },
+      { durable: true, aggregateID: "ses_committed", seq: 3 },
+    )
+
+    expect(invalidated).toEqual(["ses_committed"])
+  })
+
   test("end / resync / ack update flow control and never republish", () => {
     const { publisher, published } = recordingPublisher()
     const sink = createHubEventSink({ publisher })
@@ -1241,6 +1274,41 @@ describe("Q22 hub event sink", () => {
       channel.port2.postMessage(encodeFrame(endFrame()))
       await pollUntil(() => published.length === 1, { message: "event frame never decoded" })
       expect(published[0]).toEqual({ id: "evt_2", type: "message.part.delta", data: { delta: "hi" } })
+    } finally {
+      dispose()
+      channel.port1.close()
+      channel.port2.close()
+    }
+  })
+
+  test("a position reference without a resolver resyncs instead of publishing raw data", async () => {
+    const { publisher, published } = recordingPublisher()
+    const sink = createHubEventSink({ publisher })
+    const reference = {
+      __eventBlobPosition: { aggregateID: "ses_big", seq: 1 },
+      frameBytes: MAX_WORKER_FRAME_BYTES + 1,
+    }
+
+    // A direct call must never hand the raw reference to the live publisher.
+    sink.event({ id: "evt_big", type: "session.next.prompted", properties: reference })
+    expect(sink.resyncs).toBe(1)
+    expect(published).toEqual([])
+
+    // The same guard applies through the events-port pipeline.
+    const channel = new MessageChannel()
+    const dispose = serveEventsPort(channel.port1, sink)
+    try {
+      channel.port2.postMessage(
+        encodeFrame(
+          eventFrame({
+            event: { id: "evt_big", type: "session.next.prompted", properties: reference },
+            aggregateID: "ses_big",
+            seq: 1,
+          }),
+        ),
+      )
+      await pollUntil(() => sink.resyncs === 2, { message: "the events port published a raw reference" })
+      expect(published).toEqual([])
     } finally {
       dispose()
       channel.port1.close()
@@ -1503,7 +1571,7 @@ describe("Q9/Q23 session.cancelled", () => {
 })
 
 // ---------------------------------------------------------------------------
-// W2 — production cancellation authorities (Phase 5.3/6.2/6.4).
+// Production cancellation authorities.
 // ---------------------------------------------------------------------------
 
 /** The shared settlement primitive, adapted to this suite's rejection-or-undefined shape. */
@@ -1512,7 +1580,7 @@ const rejectionOf = async (promise: Promise<unknown>): Promise<unknown> => {
   return settled.ok ? undefined : settled.error
 }
 
-describe("W2 cancellation authorities", () => {
+describe("cancellation authorities", () => {
   test("an explicit childrenOf drives the children-first cascade", async () => {
     const parentID = sid("ses_parent")
     const childID = sid("ses_child")
@@ -1545,10 +1613,10 @@ describe("W2 cancellation authorities", () => {
 })
 
 // ---------------------------------------------------------------------------
-// W2 — the dispatching session's model is threaded into the worker init.
+// The dispatching session's model is threaded into the worker init.
 // ---------------------------------------------------------------------------
 
-describe("W2 session model threading", () => {
+describe("session model threading", () => {
   it.live("buildSessionWorkerInit receives the dispatching session's model", () =>
     Effect.gen(function* () {
       const captured: SessionWorkerInit[] = []
@@ -1622,11 +1690,11 @@ describe("W2 session model threading", () => {
 })
 
 // ---------------------------------------------------------------------------
-// W4 (P1/P2) — per-session worker model: a worker rebinds when a different
+// Per-session worker model: a worker rebinds when a different
 // session (which may carry a different model) is dispatched to it.
 // ---------------------------------------------------------------------------
 
-describe("W4 per-session worker model", () => {
+describe("per-session worker model", () => {
   test("one worker rebinds for a second session and resolves that session's model", async () => {
     const resolvedSessions: string[] = []
     const pool = createProductionWorkerPool({
@@ -1800,10 +1868,10 @@ describe("Fix 1 per-session working directory", () => {
 })
 
 // ---------------------------------------------------------------------------
-// W4 (P3) — the hub ships the resolved plugin effect into the worker init.
+// The hub ships the resolved plugin effect into the worker init.
 // ---------------------------------------------------------------------------
 
-describe("W4 plugin effect shipping", () => {
+describe("plugin effect shipping", () => {
   it.live("ships the resolved plugin effect in the worker init", () =>
     Effect.gen(function* () {
       const captured: SessionWorkerInit[] = []
@@ -1885,11 +1953,11 @@ describe("W4 plugin effect shipping", () => {
 })
 
 // ---------------------------------------------------------------------------
-// W4 (P5 prerequisite) — a worker pid-report on the control port fills the
+// A worker pid-report on the control port fills the
 // hub mirror so reap actually has targets.
 // ---------------------------------------------------------------------------
 
-describe("W4 pid-report receive", () => {
+describe("pid-report receive", () => {
   test("a pid-report frame populates the registry and reap uses it", async () => {
     const killed: number[] = []
     const registry = createPidRegistry({ reaper: { killGroup: (pgid) => killed.push(pgid) } })
@@ -1944,7 +2012,7 @@ describe("A define-aware session worker entry", () => {
   })
 })
 
-describe("A2 describeSessionWorkerEntry reports the resolution source", () => {
+describe("describeSessionWorkerEntry reports the resolution source", () => {
   test("an env override yields source \"env\" and the same entry", () => {
     const described = describeSessionWorkerEntry({ env: { OPENCODE_SESSION_WORKER_PATH: "/opt/worker.js" } })
     expect(described).toEqual({ entry: "/opt/worker.js", source: "env" })
@@ -1990,12 +2058,12 @@ describe("D worker isolate errors surface the underlying message + cause", () =>
 })
 
 // ---------------------------------------------------------------------------
-// Wave-2 consolidation #1: a dispatch with no ambient `InstanceRef` must still
+// A dispatch with no ambient `InstanceRef` must still
 // ship a REAL project identity to the worker, never the directory string (which
 // would leak into the worker snapshot as a project id).
 // ---------------------------------------------------------------------------
 
-describe("fallbackInstanceContext (Wave-2 consolidation)", () => {
+describe("fallbackInstanceContext", () => {
   test("yields a real project identity, never the directory as a project id", () => {
     const ctx = fallbackInstanceContext()
     expect(ctx.project).toBeDefined()
@@ -2166,12 +2234,12 @@ describe("Fix 2 real plugin hook input", () => {
 })
 
 // ---------------------------------------------------------------------------
-// W4 — `cancelWithReport` reconstructs the subagent cascade's settlement.
+// `cancelWithReport` reconstructs the subagent cascade's settlement.
 // The dispatcher discards a descendant's own outcome, so the hub reports which
 // descendants still need the caller's fallback idle. `run-state.ts` consumes it.
 // ---------------------------------------------------------------------------
 
-describe("W4 cancelWithReport", () => {
+describe("cancelWithReport", () => {
   test("a cooperatively settled child needs no fallback idle; the parent's outcome is returned", async () => {
     const parentID = sid("ses_rep_parent")
     const childID = sid("ses_rep_child")
@@ -2271,11 +2339,11 @@ describe("W4 cancelWithReport", () => {
 })
 
 // ---------------------------------------------------------------------------
-// W12 observability — session-bound worker rebind and hub port connections.
+// Hub observability: session-bound worker rebind and hub port connections.
 // ---------------------------------------------------------------------------
 
-describe("W12 observability — rebind and ports", () => {
-  test("B3 logs a rebound worker's session transition", async () => {
+describe("rebind and ports", () => {
+  test("logs a rebound worker's session transition", async () => {
     const { log, lines } = recordingLog()
     const worker = createSessionBoundExecutorWorker(5, async (id) => new ImmediateWorker(id), log)
     try {
@@ -2298,7 +2366,7 @@ describe("W12 observability — rebind and ports", () => {
     }
   })
 
-  test("B3 renders the rebound line through workerLoggerFromBridge with the bare ULID prefix", async () => {
+  test("renders the rebound line through workerLoggerFromBridge with the bare ULID prefix", async () => {
     const rendered: Array<{ readonly logLevel: string; readonly message: unknown }> = []
     // A bridge whose `fork` runs the logging effect synchronously under a
     // capturing logger, so this test observes what `workerLoggerFromBridge`
@@ -2347,7 +2415,7 @@ describe("W12 observability — rebind and ports", () => {
     }
   })
 
-  test("B3 does not log a rebind when the same session is reused", async () => {
+  test("does not log a rebind when the same session is reused", async () => {
     const { log, lines } = recordingLog()
     const worker = createSessionBoundExecutorWorker(6, async (id) => new ImmediateWorker(id), log)
     try {
@@ -2360,7 +2428,7 @@ describe("W12 observability — rebind and ports", () => {
     }
   })
 
-  test("E1 logs each connected hub port under its worker id", async () => {
+  test("logs each connected hub port under its worker id", async () => {
     const { log, lines } = recordingLog()
     const hub = createSessionHub({ pool: trackedLazyPool([]), log })
     const egress = new MessageChannel()
@@ -2384,15 +2452,15 @@ describe("W12 observability — rebind and ports", () => {
 })
 
 // ---------------------------------------------------------------------------
-// dbwal-12-07 WIRING — the production spawn/cancel helpers must forward their
-// `log` seam so B1 `worker spawning` and D2 `cancel outcome` actually fire.
+// The production spawn/cancel helpers must forward their
+// `log` seam so `worker spawning` and `cancel outcome` actually fire.
 // Before the wiring: `spawnBunExecutorWorker` built its executor without `log`
-// (B1 dormant), and `createSessionBoundExecutorWorker` / `createLazyExecutorWorker`
+// (spawning dormant), and `createSessionBoundExecutorWorker` / `createLazyExecutorWorker`
 // built their cancel ports without `log` (D2 dormant).
 // ---------------------------------------------------------------------------
 
-describe("dbwal-12-07 hub wiring — B1/D2 forward log through production paths", () => {
-  test("B1 spawnBunExecutorWorker forwards log into createExecutorWorker", async () => {
+describe("hub wiring — forward log through production paths", () => {
+  test("spawnBunExecutorWorker forwards log into createExecutorWorker", async () => {
     await withGlobalFakeWorker(async () => {
       const { log, lines } = recordingLog()
       const worker = spawnBunExecutorWorker(7, { entry: "fake://spawn", workKind: "slow", log })
@@ -2563,5 +2631,118 @@ describe("liveness watchdog wiring", () => {
         await hub.terminateAll()
       }
     })
+  })
+})
+
+describe("lifecycle reports are bound to the reporting worker's session", () => {
+  test("a bound worker may report its own session; a foreign session is rejected", async () => {
+    const hub = createSessionHub({
+      pool: createFakeExecutorPool(1),
+      ports: { hubProxy: { "sessionStatus.get": () => "pong" } },
+    })
+    const channel = new MessageChannel()
+    try {
+      // Bind worker 1 to one session without running it; the lifecycle guard reads
+      // the dispatcher's live key→worker map, exactly as a real attach does.
+      hub.dispatcher.registry.getOrCreate(sid("ses_bound"), () => ({ id: 1, alive: true, terminate: async () => {} }) as never)
+      const dispose = hub.attachHubProxyPort(1, channel.port1)
+      const client = createHubProxyClient(channel.port2)
+
+      await client.call("lifecycle.commit", ["ses_bound", "msg_own"])
+      await client.call("lifecycle.toolStarted", ["ses_bound", "call_own", true])
+      expect(hub.lifecycle.crashState("ses_bound").lastCommittedMessageID).toBe("msg_own")
+      expect(hub.lifecycle.indeterminate("ses_bound")).toEqual([{ callID: "call_own", sideEffecting: true }])
+
+      const foreign = await client.call("lifecycle.commit", ["ses_foreign", "msg_foreign"]).then(
+        () => ({ ok: true as const }),
+        (error: unknown) => ({ ok: false as const, message: error instanceof Error ? error.message : String(error) }),
+      )
+      expect(foreign.ok).toBe(false)
+      if (!foreign.ok) expect(foreign.message).toMatch(/bound to ses_bound/)
+      expect(hub.lifecycle.crashState("ses_foreign").lastCommittedMessageID).toBeNull()
+
+      client.dispose()
+      dispose()
+    } finally {
+      channel.port1.close()
+      channel.port2.close()
+      await hub.terminateAll()
+    }
+  })
+})
+
+describe("session.clearRevert is a hub authority bound to the worker's session", () => {
+  test("the bound session clears; a foreign session is rejected before the authority runs", async () => {
+    const cleared: string[] = []
+    const authorities = hubProxyAuthoritiesFor({
+      run: (effect) => Effect.runPromise(effect),
+      boundSessionID: sid("ses_revert_own"),
+      subagentDepth: 1,
+      recordDepth: () => {},
+      registerChild: () => {},
+      sessionStatus: {
+        get: () => Effect.succeed({ type: "idle" as const }),
+        list: () => Effect.succeed(new Map()),
+        set: () => Effect.void,
+      },
+      permission: {
+        ask: () => Effect.succeed(undefined as never),
+        reply: () => Effect.succeed(undefined as never),
+        list: () => Effect.succeed([]),
+      },
+      question: {
+        ask: () => Effect.succeed(undefined as never),
+        reply: () => Effect.succeed(undefined as never),
+        reject: () => Effect.succeed(undefined as never),
+        list: () => Effect.succeed([]),
+      },
+      clearRevert: async (sessionID) => {
+        cleared.push(sessionID)
+      },
+    })
+
+    await authorities.clearRevert!("ses_revert_own")
+    expect(cleared).toEqual(["ses_revert_own"])
+    await expect(authorities.clearRevert!("ses_revert_foreign")).rejects.toThrow(/may not clear a session revert/)
+    expect(cleared).toEqual(["ses_revert_own"])
+  })
+})
+
+describe("the worker job mirror authority is session-bound", () => {
+  test("an unbound authority map exposes no backgroundJob", () => {
+    const backgroundJob = {
+      register: async () => {},
+      settle: async () => {},
+      awaitPromotion: async () => false,
+    }
+    const deps = {
+      run: <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect),
+      subagentDepth: 1,
+      recordDepth: () => {},
+      registerChild: () => {},
+      sessionStatus: {
+        get: () => Effect.succeed({ type: "idle" as const }),
+        list: () => Effect.succeed(new Map()),
+        set: () => Effect.void,
+      },
+      permission: {
+        ask: () => Effect.succeed(undefined as never),
+        reply: () => Effect.succeed(undefined as never),
+        list: () => Effect.succeed([]),
+      },
+      question: {
+        ask: () => Effect.succeed(undefined as never),
+        reply: () => Effect.succeed(undefined as never),
+        reject: () => Effect.succeed(undefined as never),
+        list: () => Effect.succeed([]),
+      },
+      backgroundJob,
+    }
+
+    const unbound = hubProxyAuthoritiesFor({ ...deps, boundSessionID: undefined })
+    expect(unbound.backgroundJob).toBeUndefined()
+
+    const bound = hubProxyAuthoritiesFor({ ...deps, boundSessionID: sid("ses_job_bound") })
+    expect(bound.backgroundJob).toBe(backgroundJob)
   })
 })

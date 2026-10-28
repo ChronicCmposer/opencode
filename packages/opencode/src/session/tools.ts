@@ -13,11 +13,17 @@ import { Truncate } from "@/tool/truncate"
 import { Plugin } from "@/plugin"
 import type { TaskPromptOps } from "@/tool/task"
 import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
-import { Effect, Exit, Option } from "effect"
-import { createToolCallLedger, ToolCallNotStartedError, type ToolCallLedgerHandle } from "./ledger/tool-call"
+import { Cause, Effect, Exit, Option } from "effect"
+import {
+  createToolCallLedger,
+  ToolCallNotStartedError,
+  type LedgerExclusive,
+  type ToolCallLedgerHandle,
+} from "./ledger/tool-call"
 import type { LifecycleReporting } from "./ledger/lifecycle"
 import { Faults } from "@/testing/faults"
 import { WorkerDb } from "./worker/db"
+import { Database } from "@opencode-ai/core/database/database"
 import { Session } from "./session"
 import { SessionProcessor } from "./processor"
 import { PartID } from "./schema"
@@ -91,34 +97,88 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     // previous no-ledger behavior instead of failing every call.
     const repository = workerDb.value.repository
     if (typeof repository?.insert !== "function" || typeof repository?.select !== "function") return undefined
-    return createToolCallLedger(repository)
+    // Standalone ledger writes must wait for the worker's result transactions.
+    // The Database service owns the one connection semaphore every processor
+    // transaction holds; without it (reduced test graphs) the write stays local.
+    const database = yield* Effect.serviceOption(Database.Service)
+    const exclusive: LedgerExclusive | undefined = Option.isSome(database)
+      ? <A>(operation: () => A) =>
+          database.value.db
+            .transaction(() => Effect.sync(operation), { behavior: "immediate" })
+            .pipe(Effect.orDie)
+      : undefined
+    return createToolCallLedger(repository, exclusive === undefined ? {} : { exclusive })
   })
 
   /**
-   * Settle the durable row and the hub-observed in-flight entry exactly once.
-   * Settlement is bookkeeping: a ledger/port fault must never replace the tool's
-   * own result or failure, so it is logged and swallowed.
+   * Write the durable ledger finish. `commit` joins the owning result
+   * transaction (a plain UPDATE); `settle` acquires the connection's exclusive
+   * owner first. Settlement is bookkeeping: a ledger fault must never replace
+   * the tool's own result or failure, so it is logged and swallowed.
    */
-  const settleToolCall = (callID: string, outcome: "ok" | "error"): Effect.Effect<void> =>
-    Effect.gen(function* () {
-      if (ledger !== undefined) {
-        try {
-          ledger.finish({ callID, sessionID: input.session.id, outcome })
-        } catch (error) {
-          // A finish after a duplicate start (or a replayed result) must not turn
-          // a successful tool into a failure.
-          if (!(error instanceof ToolCallNotStartedError)) {
-            yield* Effect.logError("tool ledger finish failed", {
-              callID,
-              sessionID: input.session.id,
-              error,
-            })
-          }
-        }
+  const finishLedger = (
+    ledgerKey: string,
+    outcome: "ok" | "error",
+    phase: "commit" | "settle",
+  ): Effect.Effect<void> => {
+    if (ledger === undefined) return Effect.void
+    const finish = { callID: ledgerKey, sessionID: input.session.id, outcome }
+    const write = phase === "commit" ? Effect.sync(() => ledger.finish(finish)) : ledger.finishStandalone(finish)
+    return write.pipe(
+      Effect.asVoid,
+      Effect.catchCause((cause) => {
+        const error = Cause.squash(cause)
+        // A duplicate finish (abort result, then the processor's event) must not
+        // turn a successful tool into a failure.
+        if (error instanceof ToolCallNotStartedError) return Effect.void
+        return Effect.logError("tool ledger finish failed", { callID: ledgerKey, sessionID: input.session.id, error })
+      }),
+    )
+  }
+
+  /**
+   * Settle the durable row and the hub-observed in-flight entry exactly once.
+   *
+   * `commit` runs inside the result transaction and writes only the ledger.
+   * `afterCommit` runs once that transaction has committed and reports the
+   * finish to the hub, so the hub is never awaited while the writer is held.
+   * `settle` is the standalone abort/cleanup path: no transaction exists, so it
+   * writes the ledger under the connection semaphore and then reports.
+   *
+   * The first outcome wins: a failure that settles before a late success keeps
+   * the row finished `error`; a committed result ignores a later error.
+   */
+  const createSettlement = (callID: string, ledgerKey: string): SessionProcessor.ToolSettlement => {
+    let settled: "ok" | "error" | undefined
+    let hubFinished = false
+    const finishHub = (outcome: "ok" | "error"): Effect.Effect<void> =>
+      Effect.suspend(() => {
+        if (hubFinished) return Effect.void
+        hubFinished = true
+        const finished = input.lifecycle?.toolFinished(input.session.id, callID)
+        if (finished === undefined) return Effect.void
+        return Effect.promise(() => finished).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("tool lifecycle finish failed", { callID, sessionID: input.session.id, outcome, cause }),
+          ),
+        )
+      })
+    return (outcome, phase) => {
+      if (phase === "commit") {
+        if (settled !== undefined) return Effect.void
+        // Left unmarked until `afterCommit`: a rolled-back transaction must
+        // still be settled by cleanup.
+        return finishLedger(ledgerKey, outcome, "commit")
       }
-      const finished = input.lifecycle?.toolFinished(input.session.id, callID)
-      if (finished !== undefined) yield* Effect.promise(() => finished)
-    })
+      if (settled !== undefined) return Effect.void
+      settled = outcome
+      if (phase === "afterCommit") return finishHub(outcome)
+      return Effect.gen(function* () {
+        yield* finishLedger(ledgerKey, outcome, "settle")
+        yield* finishHub(outcome)
+      })
+    }
+  }
 
   /**
    * Record `started` before the effect and settle it on every exit path. A
@@ -129,32 +189,25 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
    * defects and interruptions settle `error` immediately so a cancelled tool
    * releases the barrier's `tools` phase.
    *
-   * The row is a plain statement on the worker connection, never a `BEGIN`, so a
-   * tool that already owns a transaction composes instead of nesting.
+   * `start` is always standalone: it waits for the connection's exclusive owner
+   * (the Effect transaction semaphore), so a parallel tool's row can never be
+   * written inside another tool's result transaction and erased by its rollback.
    */
   const withToolLedger = <A, E, R>(tool: string, callID: string, effect: Effect.Effect<A, E, R>) => {
     if (ledger === undefined && input.lifecycle === undefined) return effect
     // Only settle a call this wrapper actually recorded: a duplicate `start`
     // throws before the row exists and must not finish someone else's call.
     let recorded = false
-    // Success and failure can race (an abort-path result commit inside the
-    // effect, then the processor's result event). The first settlement wins.
-    let settled = false
-    const settleOnce = (outcome: "ok" | "error"): Effect.Effect<void> =>
-      Effect.suspend(() => {
-        if (settled) return Effect.void
-        settled = true
-        return settleToolCall(callID, outcome).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logError("tool call settlement failed", { callID, sessionID: input.session.id, cause }),
-          ),
-        )
-      })
+    // The provider may reuse a call id; the durable ledger keys each call by
+    // its owning assistant message so the second call never collides with (or
+    // settles) the first. Lifecycle and the processor keep the provider id.
+    const ledgerKey = `${input.processor.message.id}:${callID}`
+    const settlement = createSettlement(callID, ledgerKey)
     const registered = input.processor.registerToolSettlement !== undefined
     return Effect.gen(function* () {
       recorded = false
       if (ledger !== undefined) {
-        ledger.start({ callID, sessionID: input.session.id, tool, sideEffecting: true })
+        yield* ledger.startStandalone({ callID: ledgerKey, sessionID: input.session.id, tool, sideEffecting: true })
       }
       recorded = true
       // Wait for the hub to observe the start BEFORE the effect runs: a crash
@@ -166,7 +219,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       // aborted signal commits its result inside the effect, and that commit
       // must be able to drain the settlement. On success the registration is
       // left for the durable result commit; every other exit settles error.
-      if (registered) input.processor.registerToolSettlement!(callID, settleOnce)
+      if (registered) input.processor.registerToolSettlement!(callID, settlement)
       Faults.crashWorker("tool:effect")
       const value = yield* effect
       // The side effect has happened but its durable result has not: a crash
@@ -177,12 +230,12 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     }).pipe(
       Effect.onExit((exit) => {
         if (!recorded) return Effect.void
-        if (!Exit.isSuccess(exit)) return settleOnce("error")
+        if (!Exit.isSuccess(exit)) return settlement("error", "settle")
         // Success settles only with its durable result. Without a processor hook
         // (reduced caller) fall back to settling here rather than leaking a
         // `started` row.
         if (registered) return Effect.void
-        return settleOnce("ok")
+        return settlement("ok", "settle")
       }),
     )
   }

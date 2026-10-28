@@ -29,7 +29,7 @@ const cacheOf = (cache: HubTruthCache | undefined): HubTruthCache => {
   return cache
 }
 
-describe("W1.9 hub truth cache", () => {
+describe("hub truth cache", () => {
   test("is keyed by (aggregate_id, seq) and never authoritative across a restart", async () => {
     const hub = createSessionHub({ pool: emptyPool() })
     const cache = cacheOf(hub.cache)

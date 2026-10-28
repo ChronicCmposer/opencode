@@ -1,4 +1,4 @@
-// Plan task 3.8: fake MCP/LSP child-process fixture.
+// Fake MCP/LSP child-process fixture.
 //
 // Spawns the `mcp-lsp-descendants` fixture detached (its own process group) so
 // it hosts a minimal MCP or LSP stdio server *and* builds a descendant tree.

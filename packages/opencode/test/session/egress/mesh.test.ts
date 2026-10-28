@@ -1,4 +1,4 @@
-// Phase 8.9 + 8.10 + 8.11 — EventV2 cross-isolate mesh (plan tasks 8.9–8.11).
+// EventV2 cross-isolate mesh.
 //
 // The hub registry keys subscriptions by `(worker, pattern)`; a worker `listen`
 // request/reply flows over its control port, and matching durable commits wake

@@ -83,6 +83,7 @@ export type HubProxyMethod =
   | "session.get"
   | "session.children"
   | "session.cancel"
+  | "session.clearRevert"
   | "lifecycle.commit"
   | "lifecycle.phase"
   | "lifecycle.toolStarted"
@@ -147,7 +148,13 @@ const DISPOSED_MESSAGE = "hub proxy client disposed"
  * mapping.
  */
 export function createHubProxyClient(port: MessagePort, options: HubProxyClientOptions = {}): HubProxyClient {
-  const channel = workerFrameChannel<HubProxyFrame>(port, "hub-proxy")
+  // Requests carry untrusted plugin/model values. The shared encoder's fast path
+  // deliberately does not walk the payload (egress hot path), so this control
+  // boundary validates explicitly: a function/symbol that JSON would silently
+  // drop rejects the call with a typed `ProtocolError` before any frame posts.
+  const channel = workerFrameChannel<HubProxyFrame>(port, "hub-proxy", {
+    validateOutbound: assertJsonRepresentable,
+  })
   let nextId = 1
 
   const requests = createRequestChannel<HubProxyFrame, HubProxyReply, number>(channel, {

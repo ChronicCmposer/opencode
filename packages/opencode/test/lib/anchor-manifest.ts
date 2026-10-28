@@ -1,20 +1,20 @@
 /**
- * Anchor manifest (plan task 3.2).
+ * Anchor manifest.
  *
- * Each anchor names a *symbol* the plan's decisions rely upon — never a line
+ * Each anchor names a *symbol* the design decisions rely upon — never a line
  * number. The manifest is data: {@link ANCHORS} lists `(module, symbol)` pairs
  * and {@link resolveAnchor} loads the module namespace at test time. If a
  * relied-upon export is renamed or removed, its anchor fails at the symbol,
- * which is the stable contract the plan depends on.
+ * which is the stable contract the design depends on.
  *
  * `module: null` means the symbol lives on `globalThis` (platform primitives
- * proven in Phase 2).
+ * proven in the harness).
  */
 
 export interface Anchor {
   /** Stable identifier used in diagnostics. */
   readonly id: string
-  /** Plan task or decision this anchor backs. */
+  /** Design decision this anchor backs. */
   readonly plan: string
   /** Module specifier, or `null` for a `globalThis` member. */
   readonly module: string | null
@@ -23,7 +23,7 @@ export interface Anchor {
 }
 
 export const ANCHORS: readonly Anchor[] = [
-  // Live V1 path the plan relocates (run-state.ts + effect/runner.ts).
+  // Live V1 path (run-state.ts + effect/runner.ts).
   { id: "run-state.service", plan: "3.1 live V1 path", module: "@/session/run-state", symbol: "Service" },
   { id: "run-state.node", plan: "3.1 live V1 path", module: "@/session/run-state", symbol: "node" },
   { id: "runner.make", plan: "3.1 live V1 path", module: "@/effect/runner", symbol: "make" },
@@ -86,7 +86,7 @@ export const ANCHORS: readonly Anchor[] = [
   { id: "app-layer", plan: "6.1 reduced AppLayer", module: "@/effect/app-runtime", symbol: "AppLayer" },
   { id: "background-job.service", plan: "9.2 BackgroundJob client", module: "@/background/job", symbol: "Service" },
 
-  // Transport / platform primitives proven in Phase 2.
+  // Transport / platform primitives proven in the harness.
   { id: "worker", plan: "2.1/4.x Bun Worker", module: null, symbol: "Worker" },
   { id: "message-port", plan: "8.1 MessagePort egress", module: null, symbol: "MessagePort" },
   { id: "response", plan: "2.2 non-transferable", module: null, symbol: "Response" },

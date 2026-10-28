@@ -5,7 +5,7 @@
 // itself are atomic, and a nested call joins the caller's open transaction.
 
 import type { WriteOutcome } from "@opencode-ai/core/database/connection"
-import type { RepositoryConnection, WriteCapability } from "./capability"
+import { createWriteCapability, type RepositoryConnection, type WriteCapability } from "./capability"
 import {
   ForeignKeyOwnershipError,
   HubOnlyWriteError,
@@ -796,3 +796,16 @@ export function makeRepository(capability: WriteCapability): WorkerRepository {
     },
   } as unknown as WorkerRepository
 }
+
+/** A typed repository over an unbound connection (ledger-only DBs and tests). */
+export function connectedRepository(connection: RepositoryConnection): WorkerRepository {
+  return makeRepository(
+    createWriteCapability({
+      connection,
+      scopeFunction: "worker_scope_session",
+      withMain: (operation) => operation(),
+    }),
+  )
+}
+
+export * as RepositoryWrite from "./write"

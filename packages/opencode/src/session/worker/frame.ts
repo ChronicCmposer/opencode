@@ -108,6 +108,36 @@ export interface EventsAckPayload {
 }
 
 /**
+ * Marker key on an events `event` payload whose body is too large for one worker
+ * frame. The durable commit already offloaded the body to the shared blob store
+ * (D16), and the frame carries this small POSITION instead, so the hub can read
+ * it back from the same SQLite file rather than losing the event to the 4 MiB cap.
+ */
+export const EVENT_BLOB_POSITION_KEY = "__eventBlobPosition"
+
+/** A committed durable position the hub can resolve from the shared blob store. */
+export interface EventBlobPosition {
+  readonly aggregateID: string
+  readonly seq: number
+}
+
+/** The wire form of a durable event whose body did not fit one frame. */
+export interface EventBlobReference {
+  readonly __eventBlobPosition: EventBlobPosition
+  /** Wire size of the frame this reference replaced (an upper bound, for diagnostics). */
+  readonly frameBytes: number
+}
+
+/** True when an event payload is a resolvable blob-position reference. */
+export function isEventBlobReference(value: unknown): value is EventBlobReference {
+  if (!isRecord(value)) return false
+  if (typeof value["frameBytes"] !== "number") return false
+  const position = value[EVENT_BLOB_POSITION_KEY]
+  if (!isRecord(position)) return false
+  return typeof position["aggregateID"] === "string" && typeof position["seq"] === "number"
+}
+
+/**
  * The four events-port frames: an EventV2 `event`, the end-of-stream `end`, a
  * backpressure `resync`, and an `ack`.
  */
@@ -309,18 +339,33 @@ export function jsonErrorOf(error: unknown): string {
 
 /**
  * Serialise a frame to its JSON wire text. Inverse of `decodeWorkerFrame`.
- * `strict` (the default) walks the payload with a replacer so a function or
- * symbol is rejected instead of silently dropped. The events hot path opts out
- * and uses plain `JSON.stringify`; boundaries that carry untrusted reply values
- * call {@link assertJsonRepresentable} explicitly.
+ *
+ * The fast path is a plain `JSON.stringify`: this runs on the egress throughput
+ * hot path, and a replacer walk per frame is measurable there. Only a value that
+ * plain serialisation REJECTS (a bigint, a cycle) takes the slow path, where
+ * {@link assertJsonRepresentable} names the offending value. A boundary that
+ * carries untrusted reply values and must reject silently-dropped functions or
+ * symbols calls {@link assertJsonRepresentable} explicitly before encoding.
  */
-export function encodeWorkerFrame(frame: WorkerFrameEnvelope, options: { readonly strict?: boolean } = {}): string {
+export function encodeWorkerFrame(frame: WorkerFrameEnvelope): string {
   try {
-    return options.strict === false ? JSON.stringify(frame) : JSON.stringify(frame, rejectNonJson)
+    return JSON.stringify(frame)
   } catch (error) {
-    if (error instanceof ProtocolError) throw error
+    // Slow path only: explain the failure with the strict walk when it can, then
+    // fall back to the serializer's own message.
+    try {
+      assertJsonRepresentable(frame)
+    } catch (rejection) {
+      if (rejection instanceof ProtocolError) throw rejection
+    }
     throw new ProtocolError(`frame is not JSON-serialisable (not structured-cloneable): ${jsonErrorOf(error)}`)
   }
+}
+
+/** Encode a frame and measure its UTF-8 size exactly once. */
+export function encodeWorkerFrameSized(frame: WorkerFrameEnvelope): { readonly text: string; readonly bytes: number } {
+  const text = encodeWorkerFrame(frame)
+  return { text, bytes: workerFrameByteLength(text) }
 }
 
 /**
@@ -481,6 +526,32 @@ export function durableMetaOf(frame: EventsFrame): WriterOrdinal | undefined {
   const { generation, ordinal } = frame.payload
   if (generation === undefined || ordinal === undefined) return undefined
   return { generation, ordinal }
+}
+
+/**
+ * The frame to post when a durable event body is larger than one worker frame:
+ * the same event, with its properties replaced by the committed
+ * {@link EventBlobReference}. Returns `undefined` for anything that cannot be
+ * resolved by position — a non-event frame, or a non-durable delta — so the
+ * caller keeps its typed `FrameTooLargeError` for those.
+ */
+export function blobPositionReferenceFrame(
+  frame: EventsFrame,
+  frameBytes: number,
+): EventsFrame | undefined {
+  if (frame.kind !== "event") return undefined
+  const position = durableAggregateMetaOf(frame)
+  if (position === undefined) return undefined
+  return eventFrame({
+    ...frame.payload,
+    event: {
+      ...frame.payload.event,
+      properties: {
+        [EVENT_BLOB_POSITION_KEY]: { aggregateID: position.aggregateID, seq: position.seq },
+        frameBytes,
+      } satisfies EventBlobReference,
+    },
+  })
 }
 
 /** Spread `{ id }` only when present, so absent correlation stays absent. */

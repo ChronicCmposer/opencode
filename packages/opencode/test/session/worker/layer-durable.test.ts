@@ -3,8 +3,9 @@
 // in-isolate EventV2 so its subscribers observe the cross-isolate wakeup.
 //
 // The commit already durably committed in the hub writer, so the bridge
-// republishes it LIVE-ONLY (never re-commits) and verbatim (`{ id, type, data }`,
-// where `data` is the EventV2 `properties` reference).
+// republishes it LIVE-ONLY (never re-commits) and verbatim (`{ id, type, data,
+// durable }`, where `data` is the EventV2 `properties` reference and `durable`
+// is the committed `{ aggregateID, seq, version }` identity).
 
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer, ManagedRuntime } from "effect"
@@ -60,8 +61,9 @@ describe("republishDurableCommit", () => {
 
     expect(published).toHaveLength(1)
     expect(published[0]).toMatchObject({ id: "evt_3", type: DURABLE_TYPE, data: { sessionID, ordinal: 3 } })
-    // Live-only: no durable metadata is fabricated on the republished payload.
-    expect(published[0].durable).toBeUndefined()
+    // Live-only: the republish never re-commits, but the committed durable
+    // identity crosses unchanged so the isolate can locate the exact position.
+    expect(published[0].durable).toEqual({ aggregateID: sessionID, seq: 3, version: 1 })
     // The republish is marked so the worker bridge never re-forwards it (the mesh
     // delivers the worker its own commit back).
     expect(published[0].metadata).toEqual({ [DURABLE_WAKEUP_METADATA_KEY]: true })

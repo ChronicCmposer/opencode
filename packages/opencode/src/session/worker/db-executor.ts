@@ -9,6 +9,7 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite"
 import { isMainThread, parentPort, threadId, workerData } from "node:worker_threads"
 import { resolveWalConfig, walPragmas } from "@opencode-ai/core/database/pragmas"
+import { retryBusySync } from "@opencode-ai/core/database/transaction"
 import { resolveWorkerEntry } from "./port"
 
 export type DbParams = ReadonlyArray<unknown> | Record<string, unknown>
@@ -146,6 +147,12 @@ export interface DbExecutorOptions {
   readonly pragmas?: ReadonlyArray<string>
   /** Per-request deadline; `0` disables it. Defaults to 30s. */
   readonly timeoutMs?: number
+  /**
+   * Idle WAL checkpoint cadence. `0` disables it; defaults to
+   * `resolveWalConfig().checkpointIntervalMs`. The checkpoint runs inside the
+   * executor thread, so a truncating checkpoint never blocks the hub loop.
+   */
+  readonly checkpointIntervalMs?: number
   /** Worker entry override (tests / packaged builds). */
   readonly entry?: string | URL
   readonly env?: Record<string, string | undefined>
@@ -162,6 +169,7 @@ export interface DbExecutorWorkerData {
   readonly filename: string
   readonly pragmas?: ReadonlyArray<string>
   readonly create?: boolean
+  readonly checkpointIntervalMs?: number
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000
@@ -219,22 +227,29 @@ function runStatement(db: Database, statement: DbStatement): DbRunResult {
   return { changes: Number(result.changes), lastInsertRowid: Number(result.lastInsertRowid) }
 }
 
+/**
+ * Run `work` inside one `BEGIN IMMEDIATE` transaction. A busy failure at any
+ * point rolls back and retries the whole body, never a single statement: a
+ * half-applied transaction is not observable to the caller.
+ */
 function runTransaction(db: Database, statements: ReadonlyArray<DbStatement>): ReadonlyArray<DbTransactionResult> {
-  db.exec("BEGIN IMMEDIATE")
-  try {
-    const results = statements.map((statement) => runStatement(db, statement))
-    db.exec("COMMIT")
-    return results
-  } catch (error) {
+  return retryBusySync(() => {
+    db.exec("BEGIN IMMEDIATE")
     try {
-      db.exec("ROLLBACK")
-    } catch (rollbackError) {
-      // The original failure is the cause; the failed rollback is attached so
-      // neither is lost. The message handler poisons the thread afterwards.
-      throw new RollbackFailure(error, rollbackError)
+      const results = statements.map((statement) => runStatement(db, statement))
+      db.exec("COMMIT")
+      return results
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK")
+      } catch (rollbackError) {
+        // The original failure is the cause; the failed rollback is attached so
+        // neither is lost. The message handler poisons the thread afterwards.
+        throw new RollbackFailure(error, rollbackError)
+      }
+      throw error
     }
-    throw error
-  }
+  })
 }
 
 function execute(db: Database, request: DbExecutorRequest): unknown {
@@ -250,18 +265,43 @@ function execute(db: Database, request: DbExecutorRequest): unknown {
   }
 }
 
+/** Minimal handle the checkpoint scheduler needs; a fake satisfies it in tests. */
+export interface CheckpointTarget {
+  exec(sql: string): void
+}
+
+/**
+ * Start a periodic passive WAL checkpoint on the executor thread. Returns a stop
+ * function. A checkpoint failure is swallowed: the next interval retries, and a
+ * busy database must not crash the executor.
+ */
+export function scheduleCheckpoint(target: CheckpointTarget, intervalMs: number): () => void {
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return () => {}
+  const timer = setInterval(() => {
+    try {
+      target.exec("PRAGMA wal_checkpoint(PASSIVE)")
+    } catch {
+      // A concurrently held write lock is expected; the next tick retries.
+    }
+  }, intervalMs)
+  timer.unref?.()
+  return () => clearInterval(timer)
+}
+
 function startWorkerThread(data: DbExecutorWorkerData): void {
   const transport = parentPort
   if (transport === null) throw new Error("db executor worker started without a parent port")
   const db = new Database(data.filename, { create: data.create ?? true })
   try {
     for (const pragma of data.pragmas ?? []) db.exec(pragma)
+    const stopCheckpoint = scheduleCheckpoint(db, data.checkpointIntervalMs ?? 0)
     let poisoned = false
     transport.postMessage({ type: "ready", threadId } satisfies DbExecutorResponse)
     transport.on("message", (message: DbExecutorRequest) => {
       // A close is honoured even by a poisoned handle: releasing the native
       // handle is the whole point, and it must never be answered with a retry.
       if (message.type === "close") {
+        stopCheckpoint()
         try {
           db.close()
         } catch {
@@ -289,6 +329,7 @@ function startWorkerThread(data: DbExecutorWorkerData): void {
         if (error instanceof RollbackFailure) {
           // The transaction state is unknown; never reuse this handle.
           poisoned = true
+          stopCheckpoint()
           try {
             db.close()
           } catch {
@@ -387,11 +428,13 @@ const closeWorkerDatabase = async (worker: Worker | undefined, id: number): Prom
 export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
   const entry = options.entry ?? resolveDbExecutorEntry({ env: options.env })
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  const resolvedWal = resolveWalConfig(options.env)
+  const checkpointIntervalMs = options.checkpointIntervalMs ?? resolvedWal.checkpointIntervalMs
   // Applied inside the worker before the ready frame; the default is the shared
   // WAL tuning (journal mode, synchronous, cache, foreign keys, size cap) plus a
   // driver-level busy timeout, so a concurrently held write lock waits instead
   // of surfacing SQLITE_BUSY immediately.
-  const pragmas = options.pragmas ?? walPragmas(resolveWalConfig(options.env))
+  const pragmas = options.pragmas ?? walPragmas(resolvedWal)
   let worker: Worker | undefined
   let ready: Promise<void> | undefined
   let closed = false
@@ -407,11 +450,19 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
     pending.clear()
   }
 
-  const retire = (error: Error): void => {
+  const retire = (error: Error, orderly = false): void => {
     const current = worker
     worker = undefined
     ready = undefined
     failPending(error)
+    if (current === undefined) return
+    // A timeout may have left the thread mid-transaction: ask it to close the
+    // native handle (bounded) before terminating, so the WAL lock is released
+    // even when the request itself will never answer.
+    if (orderly) {
+      void closeWorkerDatabase(current, nextId++).then(() => terminateWorker(current))
+      return
+    }
     void terminateWorker(current)
   }
 
@@ -425,6 +476,7 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
           kind: "db-executor",
           filename: options.filename,
           pragmas,
+          checkpointIntervalMs,
           ...(options.create === undefined ? {} : { create: options.create }),
         } satisfies DbExecutorWorkerData,
       } as unknown as WorkerOptions
@@ -486,6 +538,7 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
                 new DbExecutorTimeoutError(
                   `db executor request ${id} timed out after ${timeoutMs}ms; the transaction may have committed`,
                 ),
+                true,
               )
             }, timeoutMs)
           : undefined

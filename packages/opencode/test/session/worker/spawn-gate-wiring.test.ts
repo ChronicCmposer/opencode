@@ -77,7 +77,7 @@ const runFrame = (id: number, session: string): SessionExecutorInbound => ({
 describe("spawn-gate wiring", () => {
   test("concurrent cold sessions serialize construction and release only on boot-ready", async () => {
     await withFakeWorker(async () => {
-      const gate = createSpawnGate({ timeoutMs: 1_000 })
+      const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
       const first = createBunExecutorTransport({ entry: "fake://first", spawnGate: gate })
       const second = createBunExecutorTransport({ entry: "fake://second", spawnGate: gate })
       const firstReady = settleOf(first.waitFor((message) => message.type === "ready"))
@@ -112,7 +112,7 @@ describe("spawn-gate wiring", () => {
 
   test("a boot cancel while waiting for the global permit resolves at once and never constructs", async () => {
     await withFakeWorker(async () => {
-      const gate = createSpawnGate({ timeoutMs: 1_000 })
+      const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
       const holder = createBunExecutorTransport({ entry: "fake://holder", spawnGate: gate })
       holder.post(runFrame(1, "ses_holder"))
       await flush()
@@ -145,7 +145,7 @@ describe("spawn-gate wiring", () => {
 
   test("a malformed ports frame fails the spawn loud and releases the gate", async () => {
     await withFakeWorker(async () => {
-      const gate = createSpawnGate({ timeoutMs: 1_000 })
+      const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
       const transport = createBunExecutorTransport({ entry: "fake://bad-ports", spawnGate: gate })
       const run = settleOf(transport.waitFor(() => true))
       transport.post(runFrame(1, "ses_bad"))
@@ -174,7 +174,7 @@ describe("spawn-gate wiring", () => {
 
   test("a port-less hub-proxy or malformed ready frame fails the spawn loud", async () => {
     await withFakeWorker(async () => {
-      const gate = createSpawnGate({ timeoutMs: 1_000 })
+      const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
       const badProxy = createBunExecutorTransport({ entry: "fake://bad-proxy", spawnGate: gate })
       const proxyRun = settleOf(badProxy.waitFor(() => true))
       badProxy.post(runFrame(1, "ses_proxy"))
@@ -209,7 +209,7 @@ describe("spawn-gate wiring", () => {
 
   test("a ready frame with the wrong build hash fails the spawn loud", async () => {
     await withFakeWorker(async () => {
-      const gate = createSpawnGate({ timeoutMs: 1_000 })
+      const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
       const transport = createBunExecutorTransport({ entry: "fake://wrong-hash", spawnGate: gate })
       const run = settleOf(transport.waitFor(() => true))
       transport.post(runFrame(1, "ses_hash"))
@@ -235,7 +235,7 @@ describe("spawn-gate wiring", () => {
 
   test("a spawn timeout fails the spawn, not later sessions", async () => {
     await withFakeWorker(async () => {
-      const gate = createSpawnGate({ timeoutMs: 20 })
+      const gate = createSpawnGate({ timeoutMs: 20, capacity: 1 })
       const holder = createBunExecutorTransport({ entry: "fake://holder", spawnGate: gate })
       holder.post(runFrame(1, "ses_holder"))
       await flush()
@@ -270,7 +270,7 @@ describe("spawn-gate wiring", () => {
 
   test("a crash respawn acquires the same gate", async () => {
     await withFakeWorker(async () => {
-      const gate = createSpawnGate({ timeoutMs: 1_000 })
+      const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
       const first = spawnBunExecutorWorker(1, { entry: "fake://first", workKind: "session", spawnGate: gate })
       const firstRun = settleOf(first.execute({ sessionID: sid("ses_first"), depth: 0 }))
       await flush()
@@ -333,7 +333,7 @@ describe("spawn-gate wiring", () => {
 
   test("a ports frame keeps the gate held and the boot timer armed until ready", async () => {
     await withFakeWorker(async () => {
-      const gate = createSpawnGate({ timeoutMs: 1_000 })
+      const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
       const first = createBunExecutorTransport({ entry: "fake://first", spawnGate: gate })
       first.post(runFrame(1, "ses_first"))
       await flush()
@@ -362,7 +362,7 @@ describe("spawn-gate wiring", () => {
 
   test("a ports frame followed by no ready times out boot and releases the gate", async () => {
     await withFakeWorker(async () => {
-      const gate = createSpawnGate({ timeoutMs: 1_000 })
+      const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
       const hung = createBunExecutorTransport({
         entry: "fake://hung",
         spawnGate: gate,

@@ -1,6 +1,6 @@
 // Writer-stamped, generation-scoped global ordinal.
 //
-// PHASE 7 DEPENDENCY (interface assumption, documented):
+// Dependency (interface assumption, documented):
 //   The single-writer Worker is responsible for stamping a global,
 //   monotonically increasing `ordinal` at commit, scoped to a `generation`.
 //   `generation` is bumped whenever the writer is respawned (crash/resupervision),

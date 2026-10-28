@@ -1,4 +1,4 @@
-// Event-loop-gap probe worker fixture (plan task 3.14).
+// Event-loop-gap probe worker fixture.
 //
 // Runs the probe off the main thread so tests can prove the harness collects a
 // loop-gap sample on a worker thread and that the POSIX `/proc/thread-self`

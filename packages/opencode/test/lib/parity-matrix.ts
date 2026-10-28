@@ -8,7 +8,7 @@
 //
 // The matrix never skips silently. Every cell is planned as `run`, `todo`
 // (owner named), or `worker-only` (owner named and explicitly listed). A cell
-// that is merely "not implemented" cannot disappear from the plan.
+// that is merely "not implemented" cannot disappear from the matrix.
 
 import type { SinkEvent } from "./event-sink"
 import type { MockProviderOptions } from "./mock-provider"

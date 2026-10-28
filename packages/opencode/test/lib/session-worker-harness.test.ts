@@ -1,4 +1,4 @@
-// Step 2 — boot the real `session-worker.ts` entry and observe its control frames.
+// Boot the real `session-worker.ts` entry and observe its control frames.
 //
 // Contract: the production entry installs the executor on the default worker
 // channel and announces `ready`. A full hub-port boot transfers its relay ports

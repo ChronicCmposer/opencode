@@ -1,4 +1,4 @@
-// Plan task 3.9: leak detector for workers, MessagePorts and child PGIDs.
+// Leak detector for workers, MessagePorts and child PGIDs.
 //
 // Unit cases drive the detector with injected probes so the *detection logic*
 // is deterministic; integration cases reuse `worker-harness` for workers and

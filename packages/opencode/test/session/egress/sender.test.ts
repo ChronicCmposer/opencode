@@ -1,4 +1,4 @@
-// W2 — worker-side egress sender over the shared JSON events transport (Q7/Q16).
+// Worker-side egress sender over the shared JSON events transport (Q7/Q16).
 //
 // The sender turns coalesced batches of `event` frames into shared-envelope JSON
 // strings, one port message per frame, bounded at 4 MiB per frame and per batch.
@@ -6,7 +6,7 @@
 // `(generation, ordinal)` when no writer meta is supplied.
 
 import { describe, expect, test } from "bun:test"
-import { FrameTooLargeError, decodeFrame } from "@/session/egress/frame"
+import { decodeFrame } from "@/session/egress/frame"
 import { createEgressSender } from "@/session/egress/sender"
 import { type EventV2Event, ackFrame, endFrame, eventFrame } from "@/session/worker/frame"
 import { pollUntil } from "../../lib/poll"
@@ -82,15 +82,42 @@ describe("egress sender", () => {
     expect(decodeFrame(chunks[1]!)).toEqual(ackFrame({ count: 1 }))
   })
 
-  test("rejects an over-bound durable before posting it", () => {
+  test("splits an over-cap batch before posting so every message stays within 4 MiB", async () => {
     const channel = new MessageChannel()
-    const sender = createEgressSender({ port: channel.port1 })
-    const huge = { id: "big", type: "message.updated", properties: { pad: "x".repeat(4 * 1024 * 1024) } }
-    expect(() => sender.pushDurable(huge, { aggregateID: "agg", seq: 1 })).toThrow(FrameTooLargeError)
+    const chunks = captureRaw(channel)
+    const sender = createEgressSender({ port: channel.port1, maxBatch: 2 })
+    const pad = "x".repeat(2.5 * 1024 * 1024)
+
+    // Two individually valid deltas whose combined wire size exceeds the batch
+    // cap. The sender must split them rather than lose or throw away either one.
+    sender.pushDelta(deltaEvent("a", pad))
+    sender.pushDelta(deltaEvent("b", pad))
+
+    await pollUntil(() => chunks.length === 2)
+    expect(chunks.every((text) => Buffer.byteLength(text, "utf8") <= 4 * 1024 * 1024)).toBe(true)
+    expect(chunks.map((text) => decodeFrame(text).kind)).toEqual(["event", "event"])
     channel.port1.close()
   })
 
-  test("a delta-only batch is not acked", async () => {
+  test("represents an over-bound durable as a blob-position reference before posting", async () => {
+    const channel = new MessageChannel()
+    const chunks = captureRaw(channel)
+    const sender = createEgressSender({ port: channel.port1 })
+    const huge = { id: "big", type: "message.updated", properties: { pad: "x".repeat(4 * 1024 * 1024) } }
+    // A committed durable event must never be lost to the frame cap: it crosses
+    // as a small position reference the hub resolves from the shared blob store.
+    expect(() => sender.pushDurable(huge, { aggregateID: "agg", seq: 1 })).not.toThrow()
+    await pollUntil(() => chunks.length === 2)
+    expect(chunks.every((text) => Buffer.byteLength(text, "utf8") <= 4 * 1024 * 1024)).toBe(true)
+    const frame = decodeFrame(chunks[0]!)
+    expect(frame.kind === "event" ? frame.payload.event.properties : undefined).toMatchObject({
+      __eventBlobPosition: { aggregateID: "agg", seq: 1 },
+    })
+    expect(decodeFrame(chunks[1]!)).toEqual(ackFrame({ count: 1 }))
+    channel.port1.close()
+  })
+
+  test("a delta-only batch carries the run-end flush ack but no durable ack", async () => {
     const channel = new MessageChannel()
     const chunks = captureRaw(channel)
     const sender = createEgressSender({ port: channel.port1 })
@@ -98,12 +125,17 @@ describe("egress sender", () => {
     sender.pushDelta(deltaEvent("a"))
     sender.end()
 
-    await pollUntil(() => chunks.length === 2)
-    // Only the delta frame and the end frame — no ack for non-durable deltas.
-    expect(chunks.map(decodeFrame)).toEqual([eventFrame({ event: deltaEvent("a") }), endFrame()])
+    await pollUntil(() => chunks.length === 3)
+    // The delta, the zero-count run-end boundary, then the end frame — no ack
+    // counting a durable delivery.
+    expect(chunks.map(decodeFrame)).toEqual([
+      eventFrame({ event: deltaEvent("a") }),
+      ackFrame({ count: 0 }),
+      endFrame(),
+    ])
   })
 
-  test("end flushes buffered deltas then posts the end frame", async () => {
+  test("end flushes buffered deltas then posts the flush ack and end frame", async () => {
     const channel = new MessageChannel()
     const chunks = captureRaw(channel)
     const sender = createEgressSender({ port: channel.port1 })
@@ -112,8 +144,14 @@ describe("egress sender", () => {
     expect(sender.buffered).toBe(1)
     sender.end()
 
-    await pollUntil(() => chunks.length === 2)
-    expect(chunks.map(decodeFrame)).toEqual([eventFrame({ event: deltaEvent("a") }), endFrame()])
+    await pollUntil(() => chunks.length === 3)
+    expect(chunks.map(decodeFrame)).toEqual([
+      eventFrame({ event: deltaEvent("a") }),
+      ackFrame({ count: 0 }),
+      endFrame(),
+    ])
     expect(sender.ended).toBe(true)
+    sender.end()
+    expect(chunks.length).toBe(3)
   })
 })

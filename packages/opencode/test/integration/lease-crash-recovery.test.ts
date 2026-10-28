@@ -1,4 +1,4 @@
-// P0: a hard-crashed worker generation never runs `dispose()`, so its worker
+// a hard-crashed worker generation never runs `dispose()`, so its worker
 // lease stays live in the dead isolate until the 30 s TTL. The hub already knows
 // the generation is retired (crash/terminate), so retirement must mark the lease
 // dead; otherwise the immediate successor boot dies with `Bus.LeaseConflict`.
@@ -199,7 +199,7 @@ afterEach(() => {
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
 })
 
-describe("P0: a crashed generation's lease is reclaimed immediately", () => {
+describe("a crashed generation's lease is reclaimed immediately", () => {
   it.live(
     "the immediate successor claims after a hard crash without waiting for the TTL",
     () =>
@@ -252,7 +252,7 @@ describe("P0: a crashed generation's lease is reclaimed immediately", () => {
   )
 })
 
-describe("P0: retirement release is ordered before the successor boots", () => {
+describe("retirement release is ordered before the successor boots", () => {
   it.live(
     "a cancelled generation's release lands before an immediate re-dispatch",
     () =>

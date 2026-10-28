@@ -1,4 +1,4 @@
-// Wave 6 flag and kill-switch matrix.
+// Flag and kill-switch matrix.
 //
 // The two-state resolver and the build-hash status projection exist today, so
 // they are asserted directly. Production startup validation, typed schema
@@ -102,8 +102,8 @@ describe("startup validation contract", () => {
 })
 
 describe("lagging production assertions", () => {
-  test.todo("configured unsupported plugin hook fails hub startup — owner plugin (W4.1)")
-  test.todo("SchemaMismatch is typed when a worker observes a different schema — owner writer-db (W1.6)")
-  test.todo("kill switch blocks new hub dispatches and drains existing Sessions — owner layer-graph (W6.3)")
-  test.todo("status endpoint exposes mode, disabled reason, and build hash — owner session-root (W6.3)")
+  test.todo("configured unsupported plugin hook fails hub startup — owner plugin")
+  test.todo("SchemaMismatch is typed when a worker observes a different schema — owner writer-db")
+  test.todo("kill switch blocks new hub dispatches and drains existing Sessions — owner layer-graph")
+  test.todo("status endpoint exposes mode, disabled reason, and build hash — owner session-root")
 })

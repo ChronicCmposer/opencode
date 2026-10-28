@@ -15,7 +15,7 @@
 //   Point  : an opaque, call-site-chosen label (e.g. `worker:run`,
 //            `writer:commit`, `writer:tx`). A directive only fires at its exact
 //            point, so faults can be scoped to one step of a pipeline.
-//   Kinds  : three, matching the plan's named symbols.
+//   Kinds  : three, matching the named symbols.
 //
 //            | kind           | scenario(s) injected                              | hook result         |
 //            |----------------|---------------------------------------------------|---------------------|

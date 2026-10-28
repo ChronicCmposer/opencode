@@ -30,7 +30,7 @@ const recordingClient = () => {
   return { calls, client }
 }
 
-describe("W4.5 — hub-owned permission and question state", () => {
+describe("hub-owned permission and question state", () => {
   test("the node table classifies both authorities as hub-proxy", () => {
     expect(boundaryOf(Permission.Service.key)).toBe("hub-proxy")
     expect(boundaryOf(Question.Service.key)).toBe("hub-proxy")
@@ -69,7 +69,7 @@ describe("W4.5 — hub-owned permission and question state", () => {
   })
 })
 
-describe("W4.4 — MCP/LSP are hub-only in the worker graph", () => {
+describe("MCP/LSP are hub-only in the worker graph", () => {
   test("MCP, LSP and their child-process dependencies are excluded from session workers", () => {
     expect(boundaryOf("@opencode/MCP")).toBe("excluded")
     expect(boundaryOf("@opencode/LSP")).toBe("excluded")
@@ -78,7 +78,7 @@ describe("W4.4 — MCP/LSP are hub-only in the worker graph", () => {
   })
 })
 
-describe("W4.4 — a worker never spawns MCP/LSP children", () => {
+describe("a worker never spawns MCP/LSP children", () => {
   test("the worker LSP boundary answers without spawning a language server", async () => {
     const spawn = spyOn(LSPServer.Typescript, "spawn")
     try {

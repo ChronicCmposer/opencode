@@ -1,4 +1,4 @@
-// Phase 3.13 — Effect-in-a-worker bootstrap (plan task 3.13).
+// Effect-in-a-worker bootstrap.
 //
 // Proves that a Bun `Worker` isolate can (a) import `effect` and run a trivial
 // Effect program that returns a value, and (b) resolve the repo `@/` alias to

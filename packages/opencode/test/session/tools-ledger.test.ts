@@ -1,4 +1,4 @@
-// Production tool path ledger (C7/M11, D10).
+// Production tool path ledger (D10).
 //
 // These tests drive the real `SessionTools.resolve` tool wrapper (not a mock of
 // the wrapper): a real SQLite connection backs the ledger, a real registry tool
@@ -28,12 +28,14 @@ import { openConnection } from "@opencode-ai/core/database/connection"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Schema, Semaphore } from "effect"
 import { testEffect } from "../lib/effect"
 
 const callID = "call-ledger"
 const sessionID = SessionID.make("ses_ledger")
 const messageID = MessageID.ascending()
+// The tool path keys the durable ledger by the owning assistant message.
+const ledgerKey = `${messageID}:${callID}`
 
 const agent: Agent.Info = {
   name: "build",
@@ -92,36 +94,52 @@ function layerWith(tool: RegisteredTool) {
   )
 }
 
-const settlements = new Map<string, (outcome: "ok" | "error") => Effect.Effect<void>>()
+type LedgerTestProcessor = Pick<
+  SessionProcessor.Handle,
+  "message" | "updateToolCall" | "completeToolCall" | "registerToolSettlement"
+>
 
-const processor = {
-  message: {
-    id: messageID,
-    sessionID,
-    role: "assistant",
-    parentID: MessageID.ascending(),
-    agent: "build",
-    mode: "build",
-    path: { cwd: "/tmp", root: "/tmp" },
-    cost: 0,
-    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-    modelID: ModelV2.ID.make("test-model"),
-    providerID: ProviderV2.ID.make("test"),
-    time: { created: 1 },
-  } satisfies SessionV1.Assistant,
-  updateToolCall: () => Effect.succeed(undefined),
-  // Mirrors the processor's durable result commit: the registration is drained
-  // only when the result part is committed.
-  completeToolCall: (toolCallID: string) =>
-    Effect.gen(function* () {
-      const settle = settlements.get(toolCallID)
-      settlements.delete(toolCallID)
-      if (settle !== undefined) yield* settle("ok")
-    }),
-  registerToolSettlement: (toolCallID: string, settle: (outcome: "ok" | "error") => Effect.Effect<void>) => {
-    settlements.set(toolCallID, settle)
-  },
-} satisfies Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall" | "registerToolSettlement">
+/**
+ * One processor handle per assistant message. Each owns its settlement map, so
+ * a provider call id reused across messages is a distinct ledger row while the
+ * provider id stays the processor/lifecycle key.
+ */
+function makeProcessor(id: MessageID = messageID) {
+  const local = new Map<string, SessionProcessor.ToolSettlement>()
+  const value = {
+    message: {
+      id,
+      sessionID,
+      role: "assistant",
+      parentID: MessageID.ascending(),
+      agent: "build",
+      mode: "build",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ModelV2.ID.make("test-model"),
+      providerID: ProviderV2.ID.make("test"),
+      time: { created: 1 },
+    } satisfies SessionV1.Assistant,
+    updateToolCall: () => Effect.succeed(undefined),
+    // Mirrors the processor's durable result commit: the registration is drained
+    // only when the result part is committed.
+    completeToolCall: (toolCallID: string) =>
+      Effect.gen(function* () {
+        const settle = local.get(toolCallID)
+        if (settle === undefined) return
+        yield* settle("ok", "commit")
+        local.delete(toolCallID)
+        yield* settle("ok", "afterCommit")
+      }),
+    registerToolSettlement: (toolCallID: string, settle: SessionProcessor.ToolSettlement) => {
+      local.set(toolCallID, settle)
+    },
+  } satisfies LedgerTestProcessor
+  return { processor: value, settlements: local }
+}
+
+const { processor, settlements } = makeProcessor()
 
 /** Commit the result part, which is what settles a successful call. */
 function commitResult(toolCallID = callID) {
@@ -148,6 +166,7 @@ function ledgerForTest() {
 async function resolveTool(
   toolDefinition: RegisteredTool,
   ledger: ReturnType<typeof createToolCallLedger>,
+  proc: LedgerTestProcessor = processor,
 ) {
   const tools = await Effect.runPromise(
     Effect.gen(function* () {
@@ -155,7 +174,7 @@ async function resolveTool(
         agent,
         model,
         session: { id: sessionID, permission: [] } as unknown as Session.Info,
-        processor,
+        processor: proc,
         bypassAgentCheck: false,
         messages: [],
         promptOps: {} as never,
@@ -217,7 +236,7 @@ describe("tool-call ledger on the production tool path", () => {
       // still be `started` so a crash here is indeterminate, not replayable.
       expect(
         database.connection.all("SELECT state, outcome FROM tool_call WHERE call_id = ? AND session_id = ?", [
-          callID,
+          ledgerKey,
           String(sessionID),
         ]),
       ).toEqual([{ state: "started", outcome: null }])
@@ -226,7 +245,7 @@ describe("tool-call ledger on the production tool path", () => {
 
       expect(
         database.connection.all("SELECT state, outcome FROM tool_call WHERE call_id = ? AND session_id = ?", [
-          callID,
+          ledgerKey,
           String(sessionID),
         ]),
       ).toEqual([{ state: "finished", outcome: "ok" }])
@@ -255,16 +274,16 @@ describe("tool-call ledger on the production tool path", () => {
     // The side effect happened but its result has not committed: a crash here
     // must leave the row `started` so recovery refuses to replay the effect.
     expect(ledger.list(sessionID)).toEqual([
-      expect.objectContaining({ callID, sessionID, tool: "ledger", state: "started", outcome: null }),
+      expect.objectContaining({ callID: ledgerKey, sessionID, tool: "ledger", state: "started", outcome: null }),
     ])
     expect(ledger.indeterminate(sessionID)).toEqual([
-      expect.objectContaining({ callID, state: "indeterminate", sideEffecting: true }),
+      expect.objectContaining({ callID: ledgerKey, state: "indeterminate", sideEffecting: true }),
     ])
 
     await commitResult()
 
     expect(ledger.list(sessionID)).toEqual([
-      expect.objectContaining({ callID, sessionID, tool: "ledger", state: "finished", outcome: "ok" }),
+      expect.objectContaining({ callID: ledgerKey, sessionID, tool: "ledger", state: "finished", outcome: "ok" }),
     ])
     expect(ledger.indeterminate(sessionID)).toEqual([])
   })
@@ -290,7 +309,7 @@ describe("tool-call ledger on the production tool path", () => {
 
     await expect(run(execute)).rejects.toThrow()
     expect(ledger.list(sessionID)).toEqual([
-      expect.objectContaining({ callID, state: "finished", outcome: "error" }),
+      expect.objectContaining({ callID: ledgerKey, state: "finished", outcome: "error" }),
     ])
     expect(ledger.indeterminate(sessionID)).toEqual([])
   })
@@ -311,14 +330,104 @@ describe("tool-call ledger on the production tool path", () => {
     // commit inside the effect drains it exactly once.
     expect(settlements.has(callID)).toBe(false)
     expect(ledger.list(sessionID)).toEqual([
-      expect.objectContaining({ callID, state: "finished", outcome: "ok" }),
+      expect.objectContaining({ callID: ledgerKey, state: "finished", outcome: "ok" }),
     ])
 
     // A later AI SDK result event settles nothing a second time.
     await commitResult()
     expect(ledger.list(sessionID)).toEqual([
-      expect.objectContaining({ callID, state: "finished", outcome: "ok" }),
+      expect.objectContaining({ callID: ledgerKey, state: "finished", outcome: "ok" }),
     ])
+  })
+
+  test("an abort settlement wins over a late success", async () => {
+    const { ledger } = ledgerForTest()
+    settlements.delete(callID)
+    const execute = await resolveTool(
+      tool(() => Effect.succeed({ title: "ledger", metadata: {}, output: "done" })),
+      ledger,
+    )
+
+    // The effect returned, so the registration waits for a result commit.
+    await run(execute)
+    const settle = settlements.get(callID)
+    if (settle === undefined) throw new Error("settlement was not registered")
+
+    // Abort cleanup settles error and removes the registration. A later result
+    // event must not overwrite the durable row or settle the hub twice.
+    await Effect.runPromise(settle("error", "settle"))
+    settlements.delete(callID)
+    await commitResult()
+
+    expect(ledger.list(sessionID)).toEqual([
+      expect.objectContaining({ callID: ledgerKey, state: "finished", outcome: "error" }),
+    ])
+    expect(ledger.indeterminate(sessionID)).toEqual([])
+  })
+
+  test("a provider call id reused across messages gets a fresh ledger row", async () => {
+    const { ledger } = ledgerForTest()
+    const first = makeProcessor(MessageID.ascending())
+    const second = makeProcessor(MessageID.ascending())
+    const firstKey = `${first.processor.message.id}:${callID}`
+    const secondKey = `${second.processor.message.id}:${callID}`
+
+    const executeA = await resolveTool(
+      tool(() => Effect.succeed({ title: "first", metadata: {}, output: "first" })),
+      ledger,
+      first.processor,
+    )
+    const executeB = await resolveTool(
+      tool(() => Effect.succeed({ title: "second", metadata: {}, output: "second" })),
+      ledger,
+      second.processor,
+    )
+
+    // The provider reuses the id; the second call must not throw
+    // ToolCallAlreadyStartedError nor touch the first call's row.
+    await run(executeA)
+    await run(executeB)
+
+    expect(ledger.list(sessionID).map((row) => row.callID)).toEqual([firstKey, secondKey])
+    expect(ledger.list(sessionID).every((row) => row.state === "started")).toBe(true)
+
+    await Effect.runPromise(first.processor.completeToolCall(callID))
+    await Effect.runPromise(second.processor.completeToolCall(callID))
+
+    expect(ledger.list(sessionID)).toEqual([
+      expect.objectContaining({ callID: firstKey, state: "finished", outcome: "ok" }),
+      expect.objectContaining({ callID: secondKey, state: "finished", outcome: "ok" }),
+    ])
+    expect(ledger.indeterminate(sessionID)).toEqual([])
+  })
+
+  test("a parallel start survives another tool's rollback", async () => {
+    const { connection } = ledgerForTest()
+    const semaphore = Effect.runSync(Semaphore.make(1))
+    const exclusive = <A>(operation: () => A) => semaphore.withPermits(1)(Effect.sync(operation))
+    const ledger = createToolCallLedger(connection, { exclusive })
+    settlements.delete(callID)
+    const execute = await resolveTool(
+      tool(() => Effect.succeed({ title: "ledger", metadata: {}, output: "done" })),
+      ledger,
+    )
+
+    // Another tool owns the connection and its result transaction. The start of
+    // this tool must wait for that owner instead of joining its transaction.
+    Effect.runSync(semaphore.take(1))
+    connection.exec("BEGIN IMMEDIATE")
+    const running = run(execute)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // The other tool rolls back. A joined start would be erased here.
+    connection.exec("ROLLBACK")
+    Effect.runSync(semaphore.release(1))
+    await running
+
+    expect(ledger.list(sessionID)).toEqual([
+      expect.objectContaining({ callID: ledgerKey, sessionID, tool: "ledger", state: "started", outcome: null }),
+    ])
+    expect(ledger.indeterminate(sessionID)).toHaveLength(1)
   })
 
   test("finish joins an open result transaction instead of nesting one", async () => {

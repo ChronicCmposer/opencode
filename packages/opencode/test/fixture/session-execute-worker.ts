@@ -1,6 +1,6 @@
-// Phase 5 — session-executor worker fixture.
+// Session-executor worker fixture.
 //
-// A dependency-light worker entry that installs the Phase 5 executor with a
+// A dependency-light worker entry that installs the session executor with a
 // controllable work factory. The hub sends only a work *kind* (a string), never
 // a closure. Durations let the tests observe the hub loop staying idle and two
 // sessions running concurrently on two isolates.

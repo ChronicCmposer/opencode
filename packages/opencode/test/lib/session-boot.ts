@@ -15,7 +15,7 @@ import { createWorkerHarness } from "./worker-harness"
 /**
  * Boot waits are more tolerant than per-message waits: a cold worker pays the
  * full module-graph load, which can stretch past the per-message budget when the
- * whole test directory runs in parallel (Phase 13.6 flake).
+ * whole test directory runs in parallel (flake isolation).
  */
 const DEFAULT_BOOT_TIMEOUT_MS = 30_000
 /** A worker that misses its per-attempt budget is retried on a fresh worker, bounded here. */

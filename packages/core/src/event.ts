@@ -10,7 +10,6 @@ import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
 import { Bus } from "./bus"
 import { isDeepStrictEqual } from "node:util"
-import path from "node:path"
 import type { SqlClient } from "effect/unstable/sql/SqlClient"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
 
@@ -25,7 +24,7 @@ export const latestSequence = Effect.fn("EventV2.latestSequence")(function* (
   db: Database.Interface["db"],
   aggregateID: string,
 ) {
-  assertAggregateScope("event_sequence", aggregateID)
+  assertAggregateScope(workerScopeOf(db), "event_sequence", aggregateID)
   const row = yield* db
     .select({ seq: EventSequenceTable.seq })
     .from(EventSequenceTable)
@@ -57,21 +56,6 @@ export class StaleOwnerError extends Schema.TaggedErrorClass<StaleOwnerError>()(
 }) {}
 
 /**
- * The worker generation that owns durable writes in this isolate. A worker
- * isolate runs exactly one generation, so a module-local current owner is
- * sufficient; the hub never sets it and therefore keeps the v1 sync semantics.
- */
-let workerLeaseOwner: string | undefined
-
-/**
- * The one session aggregate a worker isolate may publish. The hub never binds
- * it. A bound worker's durable writes, reads, claims, and removals are refused
- * for any other aggregate, so the EventV2 path has the same aggregate fence the
- * synchronous Bus applies.
- */
-let workerSessionScope: string | undefined
-
-/**
  * The narrow durable-log operations a bound worker's EventV2 aggregate deletion
  * may use. The worker DB owns a viewless Bus handle with a session-bound
  * authorizer and exposes only these operations (never a raw connection); the
@@ -82,45 +66,39 @@ export interface WorkerDurableOperations {
   deleteAggregate(aggregateID: string, options?: { readonly blobDir?: string }): number
 }
 
-let workerDurableOperations: WorkerDurableOperations | undefined
+/** The per-database worker binding: lease generation, aggregate fence, deletion capability. */
+export interface WorkerScope {
+  leaseOwner?: string
+  sessionID?: string
+  durable?: WorkerDurableOperations
+}
+
+const workerScopes = new WeakMap<object, WorkerScope>()
+
+/** Create the binding a worker database carries for its EventV2 layer. */
+export function createWorkerScope(sessionID?: string): WorkerScope {
+  return sessionID === undefined ? {} : { sessionID }
+}
+
+/** Attach a worker binding to the database instance it scopes. */
+export function bindWorkerScope(db: object, scope: WorkerScope): void {
+  workerScopes.set(db, scope)
+}
+
+/** The binding for one database, or `undefined` for an unbound hub database. */
+export function workerScopeOf(db: object): WorkerScope | undefined {
+  return workerScopes.get(db)
+}
 
 /** Durable writes renew the worker lease; a dead generation stops renewing. */
 const WORKER_LEASE_TTL_MS = 30_000
 
-/** Bind (or clear) the current worker-generation lease owner for durable writes. */
-export function setWorkerLeaseOwner(ownerID: string | undefined): void {
-  workerLeaseOwner = ownerID
-}
-
-/** Bind (or clear) the one session aggregate this worker may publish. */
-export function setWorkerSessionScope(sessionID: string | undefined): void {
-  workerSessionScope = sessionID
-}
-
-/** Bind (or clear) the narrow durable operations used by worker deletion. */
-export function setWorkerDurableOperations(operations: WorkerDurableOperations | undefined): void {
-  workerDurableOperations = operations
-}
-
-/** Clear the operations only when they still belong to the caller. */
-export function clearWorkerDurableOperations(operations: WorkerDurableOperations | undefined): void {
-  if (operations === undefined || workerDurableOperations === operations) workerDurableOperations = undefined
-}
-
-/**
- * Clear the session scope only when it still belongs to the caller, so one
- * worker graph's disposal cannot unbind a different graph in the same realm.
- */
-export function clearWorkerSessionScope(sessionID: string | undefined): void {
-  if (sessionID === undefined || workerSessionScope === sessionID) workerSessionScope = undefined
-}
-
 /** Fail loud when a bound worker addresses another session's aggregate. */
-function assertAggregateScope(type: string, aggregateID: string): void {
-  if (workerSessionScope !== undefined && aggregateID !== workerSessionScope) {
+function assertAggregateScope(scope: WorkerScope | undefined, type: string, aggregateID: string): void {
+  if (scope?.sessionID !== undefined && aggregateID !== scope.sessionID) {
     throw new InvalidDurableEventError({
       type,
-      message: `Aggregate ${aggregateID} is outside the worker's bound session ${workerSessionScope}`,
+      message: `Aggregate ${aggregateID} is outside the worker's bound session ${scope.sessionID}`,
     })
   }
 }
@@ -224,7 +202,7 @@ export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
   },
 ) {
   const after = input.after ?? -1
-  assertAggregateScope("event", input.aggregateID)
+  assertAggregateScope(workerScopeOf(db), "event", input.aggregateID)
   const rows = yield* db
     .select()
     .from(EventTable)
@@ -378,10 +356,7 @@ function busConnection(client: DurableClient): Bus.Connection {
  * global database's directory.
  */
 function defaultBlobDirectory(client: DurableClient): string | undefined {
-  const filename = clientFilename(client)
-  if (filename === undefined || filename.length === 0) return undefined
-  if (filename === ":memory:" || filename.startsWith("file::memory:")) return undefined
-  return path.join(path.dirname(filename), "event-blobs")
+  return Bus.blobDirectoryFor(clientFilename(client))
 }
 
 function durableClient(db: Database.Interface["db"]): DurableClient | undefined {
@@ -489,11 +464,12 @@ export const deleteAggregate = (
   aggregateID: string,
   options: { readonly blobDir?: string } = {},
 ): Effect.Effect<number> => {
-  assertAggregateScope("event", aggregateID)
+  const worker = workerScopeOf(db)
+  assertAggregateScope(worker, "event", aggregateID)
   const client = (db as Database.Interface["db"] & { readonly $client?: DurableClient }).$client
   if (client === undefined) return removeRows(db, aggregateID)
   const blobDir = options.blobDir ?? defaultBlobDirectory(client)
-  if (workerSessionScope !== undefined && workerDurableOperations === undefined) {
+  if (worker?.sessionID !== undefined && worker.durable === undefined) {
     return Effect.die(
       new InvalidDurableEventError({
         type: "event",
@@ -502,8 +478,8 @@ export const deleteAggregate = (
     )
   }
   return Effect.sync(() => {
-    if (workerDurableOperations !== undefined) {
-      return workerDurableOperations.deleteAggregate(aggregateID, blobDir === undefined ? {} : { blobDir })
+    if (worker?.durable !== undefined) {
+      return worker.durable.deleteAggregate(aggregateID, blobDir === undefined ? {} : { blobDir })
     }
     const bus = Bus.create({
       connection: busConnection(client),
@@ -540,6 +516,7 @@ export const layerWith = (options?: LayerOptions) =>
       // TODO: Bind durable projectors to exact type+version before supporting incompatible historical payloads.
       const listeners = new Array<Subscriber>()
       const { db } = yield* Database.Service
+      const worker = workerScopeOf(db)
       // Typed durable-write methods for the Effect-owned EventV2 transaction.
       // They are the only place this layer writes `event`, `event_sequence`, or
       // `event_blob`; the commit body composes them inside `db.transaction`.
@@ -639,8 +616,8 @@ export const layerWith = (options?: LayerOptions) =>
                     aggregate_id: input.aggregateID,
                     seq: input.seq,
                     owner_id: input.ownerID,
-                    worker_owner_id: workerLeaseOwner,
-                    worker_heartbeat_at: workerLeaseOwner === undefined ? undefined : Date.now(),
+                    worker_owner_id: worker?.leaseOwner,
+                    worker_heartbeat_at: worker?.leaseOwner === undefined ? undefined : Date.now(),
                   },
                 ])
                 .run()
@@ -745,11 +722,11 @@ export const layerWith = (options?: LayerOptions) =>
                 }),
               )
             } else {
-              if (workerSessionScope !== undefined && aggregateID !== workerSessionScope) {
+              if (worker?.sessionID !== undefined && aggregateID !== worker.sessionID) {
                 yield* Effect.die(
                   new InvalidDurableEventError({
                     type: event.type,
-                    message: `Aggregate ${aggregateID} is outside the worker's bound session ${workerSessionScope}`,
+                    message: `Aggregate ${aggregateID} is outside the worker's bound session ${worker.sessionID}`,
                   }),
                 )
               }
@@ -773,11 +750,11 @@ export const layerWith = (options?: LayerOptions) =>
                       () =>
                         Effect.gen(function* () {
                           const row = yield* writes.sequence(aggregateID)
-                          if (workerLeaseOwner !== undefined) {
-                            if (row?.workerOwnerID !== undefined && row.workerOwnerID !== workerLeaseOwner) {
+                          if (worker?.leaseOwner !== undefined) {
+                            if (row?.workerOwnerID !== undefined && row.workerOwnerID !== worker.leaseOwner) {
                               yield* Effect.die(
                                 new StaleOwnerError({
-                                  message: `Aggregate ${aggregateID} worker lease is held by ${row.workerOwnerID}, not ${workerLeaseOwner}`,
+                                  message: `Aggregate ${aggregateID} worker lease is held by ${row.workerOwnerID}, not ${worker.leaseOwner}`,
                                 }),
                               )
                             }
@@ -787,7 +764,7 @@ export const layerWith = (options?: LayerOptions) =>
                             // above, so an expired same-owner lease is never stolen.
                             yield* writes.claimLease({
                               aggregateID,
-                              ownerID: workerLeaseOwner,
+                              ownerID: worker.leaseOwner,
                               leaseTimeoutMs: WORKER_LEASE_TTL_MS,
                             })
                           }
@@ -1064,7 +1041,7 @@ export const layerWith = (options?: LayerOptions) =>
       }
 
       function claim(aggregateID: string, ownerID: string) {
-        assertAggregateScope("event_sequence", aggregateID)
+        assertAggregateScope(workerScopeOf(db), "event_sequence", aggregateID)
         return writes.claimSyncOwner({ aggregateID, ownerID })
       }
 
@@ -1076,7 +1053,7 @@ export const layerWith = (options?: LayerOptions) =>
       const streamAll = (): Stream.Stream<Payload> => Stream.fromPubSub(pubsub.all)
 
       const readAfter = (aggregateID: string, after: number) => {
-        assertAggregateScope("event", aggregateID)
+        assertAggregateScope(workerScopeOf(db), "event", aggregateID)
         return (options?.beforeAggregateRead?.(aggregateID) ?? Effect.void).pipe(
           Effect.andThen(
             db

@@ -1,8 +1,8 @@
-// C2 (finding M2, integration half) — the per-worker `messagesTransform`
+// The per-worker `messagesTransform`
 // authority resolves the plugin from a REAL session context and fires its hook
 // across a REAL control port.
 //
-// B4's unit suite pins `messagesTransformAuthority`'s branches with a hand-fed
+// The unit suite pins `messagesTransformAuthority`'s branches with a hand-fed
 // `Option`. This suite closes the remaining gap: it builds the authority exactly
 // as `hubProxyFor` does (read `Plugin.Service` from the captured session context,
 // run the hook under that context), routes it through the production

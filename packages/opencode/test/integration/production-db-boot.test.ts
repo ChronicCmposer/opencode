@@ -6,7 +6,7 @@
 // applying the shipped statements. The hub is the real
 // `createProductionSessionHub`; the worker is the real `session-worker.ts`
 // isolate. On a fresh file the worker used to fail `SchemaMismatch` forever
-// (C1: user_version 0 and no ledger), which is the RED this test pins.
+// (user_version 0 and no ledger), which is the RED this test pins.
 
 import fs from "node:fs"
 import os from "node:os"
@@ -15,7 +15,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { openConnection } from "@opencode-ai/core/database/connection"
-import { currentSchemaIdentity, schemaIdentity } from "@/session/db/schema"
+import { currentSchemaIdentity, ensureProductionSchemaAsync, schemaIdentity } from "@/session/db/schema"
 import { MessageID } from "@/session/schema"
 import { createProductionSessionHub } from "@/session/worker/hub"
 import { sessionWorkerInit } from "../lib/session-worker-init"
@@ -82,7 +82,7 @@ afterEach(() => {
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
 })
 
-describe("production DB boot (C1 / D7)", () => {
+describe("production DB boot (D7)", () => {
   it.live(
     "boots a real worker through the production hub on a fresh app-migrated DB and runs one turn",
     () =>
@@ -96,6 +96,9 @@ describe("production DB boot (C1 / D7)", () => {
         // Only the normal application migration path touches the file here.
         yield* migrateLikeProduction(filename)
         seedSession(filename, sessionID)
+        // The hub's off-loop boot gate is the production schema path; run the
+        // same function the hub awaits before spawning.
+        yield* Effect.promise(() => ensureProductionSchemaAsync({ filename, liveWorkers: 0 }))
         yield* llm.text("production-db-boot")
 
         const outcome = yield* Effect.promise(async () => {
@@ -139,12 +142,12 @@ describe("production DB boot (C1 / D7)", () => {
         })
 
         const observed = readSchema(filename)
-        // C1 is closed: the hub migrated the fresh app database before spawn.
+        // The hub migrated the fresh app database before spawn.
         expect(observed.version).toBe(currentSchemaIdentity().version)
         expect(observed.identity).toEqual(currentSchemaIdentity())
         expect(observed.ledger.map((row) => row.name)).toEqual(["tool_call", "worker_crash"])
 
-        // C1 and C2 are both closed: the hub migrates the fresh app database
+        // Both invariants are closed: the hub migrates the fresh app database
         // before spawn, and the worker Bus may publish durable events through
         // its own connection. The turn must therefore finish cleanly.
         expect(outcome).toBeUndefined()

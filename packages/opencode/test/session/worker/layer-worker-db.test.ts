@@ -1,4 +1,4 @@
-// W1.1 / W1.5 / W1.6 — the worker graph is backed by its own WAL connection.
+// The worker graph is backed by its own WAL connection.
 //
 // The per-worker DB node replaces the writer-proxied Database replacement. The
 // node appears exactly once, the graph's `Database.Service` is the connection
@@ -85,7 +85,7 @@ afterEach(async () => {
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
 })
 
-describe("per-worker DB node (W1.1)", () => {
+describe("per-worker DB node", () => {
   test("databaseLayer alone provides Database.Service", async () => {
     const filename = temporaryDatabase()
     migrated(filename)
@@ -124,7 +124,7 @@ describe("per-worker DB node (W1.1)", () => {
     expect(database.connection.closed).toBe(true)
   })
 
-  test("two consecutive runs on one worker keep the per-worker DB open (C3)", async () => {
+  test("two consecutive runs on one worker keep the per-worker DB open", async () => {
     const filename = temporaryDatabase()
     migrated(filename)
     const database = await workerDatabase(filename)

@@ -1,4 +1,4 @@
-// Wave 2 — session-worker runtime tests (TDD plan steps 22, 27, 28).
+// Session-worker runtime tests.
 //
 // The production entry is import-safe outside a worker (it only bootstraps when
 // `workerData` is present), so the pure aggregation / registry / work builders
@@ -157,7 +157,7 @@ const buildLayer = (overrides: Partial<SessionLayerOptions> = {}) =>
     ...overrides,
   })
 
-describe("worker background-work probe (M5)", () => {
+describe("worker background-work probe", () => {
   const job = (overrides: Partial<BackgroundJob.Info> & Pick<BackgroundJob.Info, "id">): BackgroundJob.Info => ({
     type: "task",
     status: "running",
@@ -205,7 +205,7 @@ describe("worker background-work probe (M5)", () => {
   })
 })
 
-describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () => {
+describe("bootstrapSessionWorker control-port transfer", () => {
   const fakeScope = () => {
     const frames: Array<{ data: unknown; transfer: readonly Transferable[] }> = []
     const scope = {
@@ -388,7 +388,40 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
     expect(disposed).toBe(1)
   })
 
-  test("dispose rejects pending hub-proxy calls and removes egress listeners (M8)", async () => {
+  test("dispose tears the executor down before closing the worker DB", async () => {
+    const { scope } = fakeScope()
+    let releaseExecutor!: () => void
+    const executorGate = new Promise<void>((resolve) => {
+      releaseExecutor = resolve
+    })
+    let writerDisposed = false
+    const handle = bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope, {
+      observeWriter: (writer) => {
+        const dispose = writer.dispose.bind(writer)
+        writer.dispose = () => {
+          writerDisposed = true
+          dispose()
+        }
+      },
+      installExecutor: () => ({
+        handle: async () => ({ type: "pong", id: 0 }),
+        dispose: async () => {
+          await executorGate
+        },
+      }),
+    })
+
+    const disposing = handle.dispose()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    // The executor still owns its scope, so the DB/writer must not be closed yet.
+    expect(writerDisposed).toBe(false)
+
+    releaseExecutor()
+    await disposing
+    expect(writerDisposed).toBe(true)
+  })
+
+  test("dispose rejects pending hub-proxy calls and removes egress listeners", async () => {
     const { scope } = fakeScope()
     const recorder = recordingLogger()
     let client: import("@/session/worker/hub-proxy-wire").HubProxyClient | undefined
@@ -420,12 +453,12 @@ describe("bootstrapSessionWorker control-port transfer (steps 22 / Wave 4)", () 
     expect(recorder.lines.map((entry) => entry.message)).toContain(workerLogMessage("egress closed"))
   })
 
-  test("wires a real logger into the E2 client lifecycles (not the noop default)", () => {
+  test("wires a real logger into the client lifecycles (not the noop default)", () => {
     const { scope } = fakeScope()
     const recorder = recordingLogger()
     bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope, { log: recorder.log })
     const messages = recorder.lines.map((entry) => entry.message)
-    // Each port-backed peer emits its E2 connected line at construction; without
+    // Each port-backed peer emits its connected line at construction; without
     // a real logger these were dormant in production.
     expect(messages).toContain(workerLogMessage("egress connected"))
   })
@@ -467,10 +500,10 @@ describe("child-result subscription (9.4)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Step 22 — client aggregation.
+// Client aggregation.
 // ---------------------------------------------------------------------------
 
-describe("buildWorkerClients (step 22)", () => {
+describe("buildWorkerClients", () => {
   const emptyChannels = () => ({
     egress: new MessageChannel(),
   })
@@ -479,7 +512,7 @@ describe("buildWorkerClients (step 22)", () => {
     expect(() => buildWorkerClients({})).toThrow(MissingWorkerPortError)
     expect(() => buildWorkerClients({})).toThrow(/egress/)
 
-    // D5/W4.3: there is no writer port/RPC and no broker. The writer is opened
+    // D5: there is no writer port/RPC and no broker. The writer is opened
     // over the worker's own WAL connection once the egress relay is present.
     const channels = emptyChannels()
     const clients = buildWorkerClients({ egress: channels.egress.port1 })
@@ -522,7 +555,7 @@ describe("buildWorkerClients (step 22)", () => {
     }
   })
 
-  test("forwards a supplied log into the egress E2 lifecycle", () => {
+  test("forwards a supplied log into the egress lifecycle", () => {
     const channels = emptyChannels()
     const recorder = recordingLogger()
     const clients = buildWorkerClients(
@@ -599,7 +632,7 @@ describe("worker database writer blob directory (D16)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// P5 prerequisite — worker→hub PID reporting.
+// Worker→hub PID reporting.
 //
 // A worker's shell tool spawns a detached child (its own process group). The
 // worker reports `{ pid, pgid, label }` over its control/hub-proxy port so the
@@ -655,7 +688,7 @@ function shellToolHarness(
   )
 }
 
-describe("worker→hub PID reporting (P5 prerequisite)", () => {
+describe("worker→hub PID reporting", () => {
   test("the control reporter posts the frozen pid-report frame over the port", async () => {
     const channel = new MessageChannel()
     const received = new Promise<PidReport>((resolve) => {
@@ -719,11 +752,11 @@ describe("worker→hub PID reporting (P5 prerequisite)", () => {
     ])
   })
 
-  test("bootstrap forwards its log into the control pid reporter so E4 fires on a closed port", () => {
+  test("bootstrap forwards its log into the control pid reporter so the failure line fires on a closed port", () => {
     // `bootstrapSessionWorker` builds the reporter over an open MessageChannel and
     // does not expose it, so the forwarding cannot be observed from outside. The
     // `pidReporterFactory` seam hands the test the reporter bootstrap built — and
-    // the exact `log` it forwarded — so a throwing port can exercise E4 without a
+    // the exact `log` it forwarded — so a throwing port can exercise the failure path without a
     // real closed port (Bun silently accepts a post to a peer-closed port).
     const scope = {
       postMessage(_data: unknown, _transfer?: readonly Transferable[]) {},
@@ -763,8 +796,8 @@ describe("worker→hub PID reporting (P5 prerequisite)", () => {
     })
 
     // The reporter exists and carries the forwarded log: reporting on the broken
-    // port logs E4 (WARN) through it before rethrowing. The same `log` also carries
-    // the E2 client connect lines, so assert on the E4 line specifically.
+    // port logs the WARN through it before rethrowing. The same `log` also carries
+    // the client connect lines, so assert on the failure line specifically.
     expect(reporter).toBeDefined()
     expect(() => reporter!.report({ pid: 101, pgid: 101, label: "shell:echo hi" })).toThrow("port closed")
     const failed = recorder.lines.filter((entry) => entry.message === workerLogMessage("pid report failed"))
@@ -938,10 +971,10 @@ describe("worker-local AppProcess PID reporting (Fix 2)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Step 28 — work-kind registry.
+// Work-kind registry.
 // ---------------------------------------------------------------------------
 
-describe("createWorkRegistry (step 28)", () => {
+describe("createWorkRegistry", () => {
   const marker: SessionWork = (sessionID) => Effect.succeed({ sessionID, value: { kind: "session" } })
 
   test("resolves a registered kind to its factory", () => {
@@ -968,10 +1001,10 @@ describe("createWorkRegistry (step 28)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Step 27 — real session work.
+// Real session work.
 // ---------------------------------------------------------------------------
 
-describe("createSessionWork (step 27)", () => {
+describe("createSessionWork", () => {
   test("reads messages from the writer seam and returns the pipeline result", async () => {
     const built = buildLayer()
     const asked: string[] = []
@@ -1011,13 +1044,13 @@ describe("createSessionWork (step 27)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// B2 — the carried sub-agent prompt. A dispatched child's prompt crosses the
+// The carried sub-agent prompt. A dispatched child's prompt crosses the
 // executor frame; the worker must persist that user message and loop rather
 // than call a bare `loop` that expects the row to already exist. A prompt-less
 // run is unchanged.
 // ---------------------------------------------------------------------------
 
-describe("B2 carried prompt (createSessionWork)", () => {
+describe("carried prompt (createSessionWork)", () => {
   /** A `SessionPrompt` service that records which entry point was taken. */
   const promptServiceLayer = (record: string[]): Layer.Layer<unknown, unknown> =>
     Layer.succeed(SessionPrompt.Service, {
@@ -1079,7 +1112,7 @@ describe("B2 carried prompt (createSessionWork)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// B3 — the carried shell. A dispatched shell's input crosses the executor frame;
+// The carried shell. A dispatched shell's input crosses the executor frame;
 // the worker must replay the caller's full `SessionPrompt.shell` path (persist +
 // shell + settle) rather than the bare `loop`. The run's `sessionID` is
 // authoritative, so a stale id on the carried shell never wins. The executor
@@ -1087,7 +1120,7 @@ describe("B2 carried prompt (createSessionWork)", () => {
 // is `createSessionWork(sessionID, carriedPrompt, carriedShell)`.
 // ---------------------------------------------------------------------------
 
-describe("B3 carried shell (createSessionWork)", () => {
+describe("carried shell (createSessionWork)", () => {
   /** A `SessionPrompt` service that records the shell input; loop/prompt die. */
   const shellServiceLayer = (record: Array<Record<string, unknown>>): Layer.Layer<unknown, unknown> =>
     Layer.succeed(SessionPrompt.Service, {
@@ -1672,7 +1705,7 @@ describe("worker snapshot tracking without vcs (Fix B)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Wave-2 consolidation #2: a git-backed project must not crash the worker.
+// A git-backed project must not crash the worker.
 //
 // The worker has no OS child-process authority (`AppProcess` is a hub-owned
 // node), so the real `Snapshot` service dies with `UnimplementedError` the
@@ -1681,7 +1714,7 @@ describe("worker snapshot tracking without vcs (Fix B)", () => {
 // unavailable in the isolate.
 // ---------------------------------------------------------------------------
 
-describe("worker Snapshot boundary for a git-backed project (Wave-2 consolidation #2)", () => {
+describe("worker Snapshot boundary for a git-backed project", () => {
   const gitConfig: WorkerModelConfig = {
     providerID: "mock",
     modelID: "mock-model",
@@ -1752,7 +1785,7 @@ describe("worker event bridge tolerates a project-less instance (Fix B guard)", 
 })
 
 // ---------------------------------------------------------------------------
-// Phase 1 — the worker receives the REAL model descriptor, not a bare identity.
+// The worker receives the REAL model descriptor, not a bare identity.
 // ---------------------------------------------------------------------------
 
 describe("worker model descriptor", () => {
@@ -1796,7 +1829,7 @@ describe("worker model descriptor", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Phase 4 + 6.3 — cancelling a worker-local session must STOP the real
+// Cancelling a worker-local session must STOP the real
 // `SessionPrompt.loop` (the worker-local `SessionRunState` runner, table B), not
 // just the executor's outer machine (table A). The old cancel path interrupted
 // the outer fiber while table B's `runLoop` survived; the run control seam routes
@@ -1819,7 +1852,7 @@ async function waitUntil(
   throw new Error(`timed out: ${message}`)
 }
 
-describe("real SessionPrompt.loop cancellation (Phase 4 + 6.3)", () => {
+describe("real SessionPrompt.loop cancellation", () => {
   /**
    * An OpenAI-compatible SSE provider that emits a partial assistant turn and
    * then never closes the response, so the loop stays blocked inside the stream

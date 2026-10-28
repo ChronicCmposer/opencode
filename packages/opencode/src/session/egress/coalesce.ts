@@ -1,4 +1,4 @@
-// W2 — delta coalescing window over the events envelope (spec Q7).
+// Delta coalescing window over the events envelope (spec Q7).
 //
 // Non-durable deltas are the high-frequency channel (streamed text, part
 // updates). Buffering them for a short window and flushing as ONE batch of
@@ -18,7 +18,7 @@ import { type EventsFrame, type EventV2Event, endFrame, eventFrame } from "@/ses
 
 import type { DurableMeta } from "./frame"
 
-/** Default coalescing window, matching the TUI's 16 ms batching (plan line 69). */
+/** Default coalescing window, matching the TUI's 16 ms batching. */
 export const COALESCE_WINDOW_MS = 16
 /** Default maximum deltas per frame before an eager threshold flush. */
 export const COALESCE_MAX_BATCH = 256

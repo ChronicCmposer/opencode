@@ -1,4 +1,4 @@
-// C8 / W1.8 / P0 — a worker generation claims only its own worker lease at
+// A worker generation claims only its own worker lease at
 // generation start. A lease held by a live generation is refused; a dead one is
 // reclaimed only at the observed sequence, atomically, so a raced commit fences
 // the reclaim instead of being dropped. The v1 sync owner is never rewritten.
@@ -62,7 +62,7 @@ afterEach(async () => {
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
 })
 
-describe("worker generation owner lease (C8/P0)", () => {
+describe("worker generation owner lease", () => {
   test("a live generation is not reclaimed; a disposed generation is", async () => {
     const filename = migratedDatabase()
     const first = await worker(filename)
@@ -155,6 +155,40 @@ describe("worker generation owner lease (C8/P0)", () => {
     ).toThrow(Bus.LeaseConflictError)
 
     gen1.dispose()
+  })
+
+  test("a worker heartbeat renews an idle lease and stops on dispose", async () => {
+    const filename = migratedDatabase()
+    const first = await worker(filename)
+    // Observe the lease from an independent handle: the writer owns (and closes)
+    // the connection it was given.
+    const observer = openConnection({ filename })
+    const lease = () =>
+      observer.all<{ worker_expires_at: number }>(
+        "SELECT worker_expires_at FROM event_sequence WHERE aggregate_id = ?",
+        ["session-lease"],
+      )[0]
+    try {
+      const gen = createWorkerDatabaseWriter({
+        connection: first.connection,
+        workerID: 1,
+        sessionID: "session-lease",
+        heartbeatIntervalMs: 20,
+      })
+      await gen.publish(durable("gen-1"))
+
+      // Simulate the TTL elapsing between writes: the heartbeat must renew it.
+      observer.run("UPDATE event_sequence SET worker_expires_at = 0 WHERE aggregate_id = ?", ["session-lease"])
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      expect(lease()?.worker_expires_at).toBeGreaterThan(0)
+
+      gen.dispose()
+      observer.run("UPDATE event_sequence SET worker_expires_at = 0 WHERE aggregate_id = ?", ["session-lease"])
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      expect(lease()?.worker_expires_at).toBe(0)
+    } finally {
+      observer.close()
+    }
   })
 
   test("the sync owner is never rewritten by a worker claim", async () => {

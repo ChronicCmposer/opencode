@@ -1,10 +1,10 @@
-// PT-5 — DCP parity end-to-end: a plugin tool executes on the hub, and the
+// DCP parity end-to-end: a plugin tool executes on the hub, and the
 // `experimental.chat.messages.transform` that runs NEXT (also on the hub) sees
 // the mutation.
 //
 // `@tarquinen/opencode-dcp` coordinates its `compress` tool and its
 // `experimental.chat.messages.transform` hook through ONE in-memory `state`
-// object (`.parallel-implement/dcp-compress-research.md`): the tool writes the
+// object: the tool writes the
 // compression blocks, the transform reads them to rewrite the outbound
 // messages. Under session workers plugins live on the hub, so BOTH sides must
 // run there. The worker only ships clone-safe descriptors and forwards each tool

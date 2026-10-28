@@ -1,51 +1,10 @@
-// Session worker configuration.
-//
-// Workers are materialized lazily, one per session, so there is no sized pool.
-// `OPENCODE_SESSION_WORKER_COUNT` and `OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION`
-// are obsolete: when set, each produces one warning and is otherwise ignored.
-//
-// `OPENCODE_SESSION_WORKER_REAP_MS` (default 300000) is the idle window after
-// which a session worker with no in-flight run and no queued prompt is reaped.
-// `OPENCODE_SESSION_WORKER_IDLE_TIMEOUT_MS` arms the run/startShell watchdog.
-//
-// Dispatch/scheduling and the worker lifecycle live in `execute.ts`/`hub.ts`.
-
 import { isPositiveInt } from "@/util/parse"
 
-export const WORKER_COUNT_ENV = "OPENCODE_SESSION_WORKER_COUNT"
-export const OVERSUBSCRIPTION_ENV = "OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION"
 export const SESSION_WORKER_IDLE_TIMEOUT_ENV = "OPENCODE_SESSION_WORKER_IDLE_TIMEOUT_MS"
 export const REAP_MS_ENV = "OPENCODE_SESSION_WORKER_REAP_MS"
 export const DEFAULT_REAP_MS = 300_000
 
 export type Env = Record<string, string | undefined>
-
-/**
- * Warn when the obsolete absolute-count knob is still set. One worker per
- * session replaces the sized pool, so the value is ignored; an empty or absent
- * value is not "set" and produces no warning.
- */
-export function obsoleteWorkerCountWarning(env: Env = process.env): string | undefined {
-  return obsoleteKnobWarning(env, WORKER_COUNT_ENV)
-}
-
-/** Warn when the obsolete oversubscription-factor knob is still set. */
-export function obsoleteOversubscriptionWarning(env: Env = process.env): string | undefined {
-  return obsoleteKnobWarning(env, OVERSUBSCRIPTION_ENV)
-}
-
-/** Every obsolete-knob warning, in a stable order (count, then factor). */
-export function removedKnobWarnings(env: Env = process.env): string[] {
-  return [obsoleteWorkerCountWarning(env), obsoleteOversubscriptionWarning(env)].filter(
-    (warning): warning is string => warning !== undefined,
-  )
-}
-
-function obsoleteKnobWarning(env: Env, name: string): string | undefined {
-  const raw = env[name]
-  if (raw === undefined || raw.trim() === "") return undefined
-  return `${name} is obsolete; ignored (one worker per session)`
-}
 
 export interface IdleTimeoutOptions {
   /** Environment source for the override; defaults to `process.env`. */

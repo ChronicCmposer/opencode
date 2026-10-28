@@ -1,4 +1,4 @@
-// Phase 5.1–5.4 — session execution seam (plan tasks 5.1–5.4, 5.6).
+// Session execution seam.
 //
 // The run-state machine (`Runner` per session key) is a portable unit: the hub
 // runs it in-process when the rollout flag is off, the worker runs it when the
@@ -62,7 +62,7 @@ const noopTransport = (): ExecutorTransport => {
 
 /**
  * Run `body` against a fresh Effect scope, closing it when `body` settles so the
- * machine's forked fibers never outlive the test (finding #55).
+ * machine's forked fibers never outlive the test.
  */
 const withScope = <A>(body: (scope: Scope.Scope) => Promise<A>): Promise<A> =>
   Effect.gen(function* () {
@@ -385,7 +385,7 @@ describe("WS3 onRunStart run-start seam", () => {
   })
 })
 
-describe("5.4 SessionRunControl seam (Phase 4 + 6.3)", () => {
+describe("SessionRunControl seam", () => {
   test("cancel routes to the provided run control, not the executor machine", () =>
     withScope(async (scope) => {
       const machine = createSessionRunMachine({ scope })
@@ -692,7 +692,7 @@ describe("13 executor cancel port", () => {
   })
 })
 
-describe("12 B1 worker spawning logging", () => {
+describe("worker spawning logging", () => {
   test("createExecutorWorker emits 'worker spawning' with the default reason", () => {
     const { log, entries } = recordingLog()
     createExecutorWorker({ id: 7, transport: noopTransport(), workKind: "session", log })
@@ -877,13 +877,13 @@ describe("liveness watchdog (execute)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// B2 — the sub-agent prompt crosses the executor frame. A dispatched child runs
+// The sub-agent prompt crosses the executor frame. A dispatched child runs
 // on a headroom worker whose `SessionWork` only knew how to `loop`; the prompt
 // the parent would have persisted is carried on the run frame so the worker can
 // persist + loop instead of reading a message that does not exist yet.
 // ---------------------------------------------------------------------------
 
-describe("B2 run prompt transport", () => {
+describe("run prompt transport", () => {
   /**
    * A transport that records every posted frame and answers the most recent
    * `run`/`startShell` with a `done` reply, so `execute` settles. The reply is
@@ -971,8 +971,8 @@ describe("B2 run prompt transport", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Shell dispatch (Part 1), result-map bounding (A9), pool cancel port (A10) and
-// the durable-egress write barrier (2.6 / R4#16).
+// Shell dispatch, result-map bounding, pool cancel port and
+// the durable-egress write barrier.
 // ---------------------------------------------------------------------------
 
 /** A transport that answers the most recent run/startShell with a distinct result. */
@@ -1002,7 +1002,7 @@ function replyingTransport(): { readonly transport: ExecutorTransport; readonly 
   }
 }
 
-describe("Part 1 shell dispatch over the executor frame", () => {
+describe("shell dispatch over the executor frame", () => {
   const shell = { sessionID: sid("ses_1"), agent: "build", command: "ls" }
 
   test("a startShell frame carries the shell command to the work", () =>
@@ -1044,7 +1044,7 @@ describe("Part 1 shell dispatch over the executor frame", () => {
   })
 })
 
-describe("A9 one last result per executor (no result map)", () => {
+describe("one last result per executor (no result map)", () => {
   test("a later run replaces the previous session's result", async () => {
     const { transport } = replyingTransport()
     const worker = createExecutorWorker({ id: 1, transport, workKind: "session" })
@@ -1069,7 +1069,7 @@ describe("A9 one last result per executor (no result map)", () => {
   })
 })
 
-describe("A10 the pool spawn wrapper exposes the cancel port", () => {
+describe("the pool spawn wrapper exposes the cancel port", () => {
   test("a spawned pool worker carries its cancel port", async () => {
     const pool = createExecutorWorkerPool({
       spawn: (id) => createExecutorWorker({ id, transport: noopTransport() }),
@@ -1107,7 +1107,7 @@ describe("2.6 durable-egress write barrier", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Addressed control errors (finding 5). A worker rejects `cancel` /
+// Addressed control errors. A worker rejects `cancel` /
 // `assertNotBusy` / `hasActiveWork` with a structured `error` frame; the
 // executor must settle immediately (never wait out the deadline) and preserve
 // the remote tag so callers can branch on it.

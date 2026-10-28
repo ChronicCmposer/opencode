@@ -1,4 +1,4 @@
-// W2 — worker event channel codec over the SHARED JSON transport (D15).
+// Worker event channel codec over the SHARED JSON transport (D15).
 //
 // The egress channel no longer carries a binary `[u32 length][body]` frame. Each
 // port message IS one shared `WorkerFrameEnvelope` JSON string, encoded and
@@ -18,6 +18,7 @@ import {
   decodeFrame,
   decodeFrames,
   encodeFrame,
+  encodeFrameChunks,
   encodeFrames,
   type EventsFrame,
 } from "@/session/egress/frame"
@@ -116,6 +117,72 @@ describe("egress frame codec (shared JSON transport)", () => {
       caught = error
     }
     expect(caught).toBeInstanceOf(FrameTooLargeError)
+  })
+
+  test("encodeFrameChunks splits a batch that would exceed the 4 MiB batch cap", () => {
+    const big = (id: string) =>
+      eventFrame({ event: { id, type: "t", properties: { pad: "x".repeat(2.5 * 1024 * 1024) } } })
+    const chunks = encodeFrameChunks([big("a"), big("b"), endFrame()])
+
+    // Nothing is dropped: the batch is split, and every chunk stays within the
+    // one bound the transport enforces before posting.
+    expect(chunks.flat()).toHaveLength(3)
+    expect(chunks.length).toBeGreaterThan(1)
+    for (const chunk of chunks) {
+      const bytes = chunk.reduce((sum, text) => sum + workerFrameByteLength(text), 0)
+      expect(bytes).toBeLessThanOrEqual(MAX_BATCH_BYTES)
+    }
+    expect(chunks.flat().map((text) => decodeFrame(text).kind)).toEqual(["event", "event", "end"])
+  })
+
+  test("encodeFrameChunks still rejects one frame that alone exceeds the cap", () => {
+    const huge = eventFrame({ event: { id: "big", type: "t", properties: { pad: "x".repeat(MAX_FRAME_BYTES) } } })
+    expect(() => encodeFrameChunks([huge])).toThrow(FrameTooLargeError)
+  })
+
+  test("the hot path uses plain JSON.stringify, never the strict replacer", () => {
+    const original = JSON.stringify
+    let replacers = 0
+    JSON.stringify = ((value: unknown, replacer?: unknown, space?: unknown) => {
+      if (typeof replacer === "function") replacers += 1
+      return original(value as never, replacer as never, space as never)
+    }) as typeof JSON.stringify
+    try {
+      encodeFrame(eventFrame({ event }))
+      expect(replacers).toBe(0)
+    } finally {
+      JSON.stringify = original
+    }
+  })
+
+  test("encodeFrame measures the UTF-8 frame size exactly once", () => {
+    const original = Buffer.byteLength
+    let measurements = 0
+    Buffer.byteLength = ((...args: Parameters<typeof Buffer.byteLength>) => {
+      measurements += 1
+      return original(...args)
+    }) as typeof Buffer.byteLength
+    try {
+      encodeFrame(eventFrame({ event }))
+      expect(measurements).toBe(1)
+    } finally {
+      Buffer.byteLength = original
+    }
+  })
+
+  test("encodeFrames measures each frame once, not once to encode and again to total", () => {
+    const original = Buffer.byteLength
+    let measurements = 0
+    Buffer.byteLength = ((...args: Parameters<typeof Buffer.byteLength>) => {
+      measurements += 1
+      return original(...args)
+    }) as typeof Buffer.byteLength
+    try {
+      encodeFrames([eventFrame({ event }), endFrame()])
+      expect(measurements).toBe(2)
+    } finally {
+      Buffer.byteLength = original
+    }
   })
 
   test("rejects a batch whose total wire size exceeds 4 MiB with a typed rejection", () => {

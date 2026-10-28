@@ -1,6 +1,6 @@
-// Phase 13.1 session-worker fixture — mock-SSE workload over the Phase 5 executor.
+// Session-worker fixture — mock-SSE workload over the session executor.
 //
-// Installs the Phase 5 executor with a `"sse"` work kind: each session fetches a
+// Installs the session executor with a `"sse"` work kind: each session fetches a
 // streamed reply from the hub's mock provider and burns CPU synchronously (the
 // simulated per-delta assembly cost). Because the burn is synchronous, a busy
 // session pins exactly this worker thread.

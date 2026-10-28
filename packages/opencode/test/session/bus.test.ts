@@ -60,7 +60,7 @@ afterEach(() => {
   for (const native of databases.splice(0)) native.close()
 })
 
-describe("Bus W1.7", () => {
+describe("Bus", () => {
   test("publishes a batch with contiguous durable sequences", () => {
     const { native, connection } = open()
     databases.push(native)
@@ -121,7 +121,7 @@ describe("Bus W1.7", () => {
   })
 })
 
-describe("Bus W1.9 cache contract", () => {
+describe("Bus cache contract", () => {
   test("is event-invalidated, state-version fenced, and restart-safe", () => {
     const { native, connection } = open()
     databases.push(native)

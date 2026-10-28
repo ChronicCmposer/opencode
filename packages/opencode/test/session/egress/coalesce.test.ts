@@ -1,4 +1,4 @@
-// W2 — delta coalescing window over the events envelope (spec Q7).
+// Delta coalescing window over the events envelope (spec Q7).
 //
 // Non-durable deltas buffer for a 16 ms window and flush as ONE batch of `event`
 // frames on idle, on threshold, or when a durable boundary / end arrives. Durable

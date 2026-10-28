@@ -1,4 +1,4 @@
-// Plan finding B1: `egress/hub.ts` and `egress/fanout.ts` had no production
+// The test-only egress hub and fan-out had no production
 // caller (~340 lines of production-dead code). They now live under `test/` and
 // back the hub/SSE stream tests only. These assertions are the grep guard that
 // keeps them from silently drifting back into `src/`.
@@ -20,7 +20,7 @@ function typescriptFiles(dir: string): string[] {
   return files
 }
 
-describe("egress production boundary (plan finding B1)", () => {
+describe("egress production boundary", () => {
   test("the unused hub/fanout live under test/, not src/", () => {
     expect(existsSync(join(SRC, "session/egress/hub.ts"))).toBe(false)
     expect(existsSync(join(SRC, "session/egress/fanout.ts"))).toBe(false)

@@ -227,7 +227,7 @@ const E2E_TABLES: ReadonlySet<string> = new Set(["session", "message", "part", "
  * Assemble the in-process worker E2E context. The worker graph is the production
  * `RUNNABLE_SESSION_NODES` plus the projector and functional boundary mocks; the
  * `Database` replacement is the per-worker WAL connection, so this exercises the
- * real worker DB wiring (W1.1/W1.4) without a writer isolate.
+ * real worker DB wiring without a writer isolate.
  */
 export function createE2EContext(options: E2EContextOptions): E2EContext {
   const { snapshot, modelConfig } = options
@@ -259,7 +259,7 @@ export function createE2EContext(options: E2EContextOptions): E2EContext {
     diagnostics: () => Effect.succeed({}),
     documentSymbol: () => Effect.succeed([]),
   })
-  // PENDING-plugin (W4.1): pass un-routed triggers through while delegating
+  // PENDING-plugin: pass un-routed triggers through while delegating
   // the hosted hooks to `options.plugins`.
   const pluginReplacements: LayerNode.Replacements = [pluginPassThroughReplacement(options.plugins)]
   const extraNodes = options.nodes ?? []
@@ -278,7 +278,7 @@ export function createE2EContext(options: E2EContextOptions): E2EContext {
     ...(options.plugins === undefined ? {} : { plugins: options.plugins }),
     ...(hubProxies === undefined ? {} : { hubProxies }),
     replacements: [
-      // `SessionProjector` runs IN the worker (o1-w3): `Session.updateMessage` /
+      // `SessionProjector` runs IN the worker: `Session.updateMessage` /
       // `updatePart` publish durable events, and the projector materializes the
       // `session`/`message`/`part` rows the loop reads back. It is already in
       // `RUNNABLE_SESSION_NODES`; this explicit entry keeps it present when a

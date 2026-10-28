@@ -1,4 +1,4 @@
-// Shared boot-measurement helpers (plan consolidation).
+// Shared boot-measurement helpers.
 //
 // The 3.11 boot/RSS harness (`boot-memory.ts`) and the 13.6 session-worker boot
 // harness (`session-boot.ts`) both summarise a level of boot timings the same

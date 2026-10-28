@@ -1,4 +1,4 @@
-// Step 1 — `SessionWorkerInit` builder for session-worker tests.
+// `SessionWorkerInit` builder for session-worker tests.
 //
 // The production entry (`src/session/worker/session-worker.ts`) parses a
 // `{snapshot, env, model}` payload out of `workerData` and fails loud on a

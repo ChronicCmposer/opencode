@@ -1,4 +1,4 @@
-// W2 — worker-side egress sender over the events envelope (spec Q7/Q16).
+// Worker-side egress sender over the events envelope (spec Q7/Q16).
 //
 // The worker owns a dedicated `MessagePort` to the hub. Every batch the
 // coalescer emits is encoded once as shared-envelope JSON strings and posted one
@@ -14,7 +14,7 @@
 import { ackFrame, type EventsFrame, type EventV2Event } from "@/session/worker/frame"
 
 import { createCoalescer, type Coalescer, type CoalescerScheduler } from "./coalesce"
-import { durableMetaOf, encodeFrame, encodeFrames, type DurableMeta } from "./frame"
+import { durableMetaOf, encodeFrame, encodeFrameChunks, type DurableMeta } from "./frame"
 
 export interface EgressSenderOptions {
   readonly port: MessagePort
@@ -27,7 +27,10 @@ export interface EgressSender {
   pushDelta(event: EventV2Event): void
   /** Push a durable boundary event; its aggregate identity is mandatory. */
   pushDurable(event: EventV2Event, meta: DurableMeta): void
-  /** Flush buffered deltas and emit the end frame. */
+  /**
+   * Flush buffered deltas, post a zero-count RUN-END flush ack after the last
+   * durable frame, then emit the end frame.
+   */
   end(): void
   readonly buffered: number
   readonly ended: boolean
@@ -39,9 +42,15 @@ export function createEgressSender(options: EgressSenderOptions): EgressSender {
     maxBatch: options.maxBatch,
     scheduler: options.scheduler,
     onBatch: (frames: readonly EventsFrame[]) => {
-      // Encode the batch once (per-frame and per-batch 4 MiB checks) and post
-      // each shared-envelope JSON string as its own message.
-      for (const text of encodeFrames(frames)) options.port.postMessage(text)
+      // Encode and size the whole batch BEFORE posting anything, then split it
+      // into chunks that each fit the 4 MiB transport cap. A batch that merely
+      // totals too much is split, never dropped; a DURABLE frame whose body alone
+      // exceeds the cap crosses as its blob-position reference (core already
+      // offloaded the body), and a non-durable one stays a typed error.
+      const chunks = encodeFrameChunks(frames)
+      for (const chunk of chunks) {
+        for (const text of chunk) options.port.postMessage(text)
+      }
       const durables = frames.filter((frame) => durableMetaOf(frame) !== undefined).length
       if (durables === 0) return
       options.port.postMessage(encodeFrame(ackFrame({ count: durables })))
@@ -51,7 +60,16 @@ export function createEgressSender(options: EgressSenderOptions): EgressSender {
   return {
     pushDelta: (event) => coalescer.pushDelta(event),
     pushDurable: (event, meta) => coalescer.pushDurable(event, requireDurableMeta(meta)),
-    end: () => coalescer.end(),
+    end: () => {
+      if (coalescer.ended) return
+      // Flush pending deltas first, then post the RUN-END flush boundary: a
+      // zero-count ack after every durable frame. The hub's run barrier can wait
+      // for it to know the events port drained before the run reply (which
+      // crosses a different channel) is considered final.
+      coalescer.flush()
+      options.port.postMessage(encodeFrame(ackFrame({ count: 0 })))
+      coalescer.end()
+    },
     get buffered() {
       return coalescer.buffered
     },

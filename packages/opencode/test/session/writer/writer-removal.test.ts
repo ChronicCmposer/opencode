@@ -1,4 +1,4 @@
-// W1.4 source-graph guard: the writer isolate, its RPC/port wrappers and the
+// Source-graph guard: the writer isolate, its RPC/port wrappers and the
 // write-through cache must not come back. Only `connection.ts` (the per-worker
 // WAL helper) may remain under `src/session/writer`.
 
@@ -18,7 +18,7 @@ const WRITER_DIR = path.join(SRC, "session/writer")
  */
 const PENDING_CONSUMERS: Readonly<Record<string, string>> = {}
 
-/** Scripts that still mention a deleted writer entry (none after W1.4 cleanup). */
+/** Scripts that still mention a deleted writer entry (none after the writer removal). */
 const PENDING_SCRIPT_CONSUMERS: Readonly<Record<string, string>> = {}
 
 const DELETED_MODULE_IMPORT =
@@ -43,7 +43,7 @@ const TEST_ROOT = path.join(PACKAGE_ROOT, "test")
 const relativeTest = (file: string) => path.relative(TEST_ROOT, file).split(path.sep).join("/")
 const SELF = "session/writer/writer-removal.test.ts"
 
-describe("W1.4 writer removal (source graph)", () => {
+describe("writer removal (source graph)", () => {
   test("only the connection helper and the generated snapshot remain", () => {
     expect(readdirSync(WRITER_DIR).sort()).toEqual(["connection.ts", "migration.statements.gen.ts"])
   })

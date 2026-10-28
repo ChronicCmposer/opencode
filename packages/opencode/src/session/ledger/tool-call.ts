@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs"
+import { Effect } from "effect"
 import type { Connection, WriteOutcome } from "@opencode-ai/core/database/connection"
-import { connectedRepository, type RepositoryValues, type WorkerRepository } from "@/session/worker/repository"
+import type { RepositoryValues, WorkerRepository } from "@/session/worker/repository/types"
+import { connectedRepository } from "@/session/worker/repository/write"
 import { LEDGER_SQL_FALLBACK } from "./sql/fallback.gen"
 
 export const TOOL_CALL_STATES = ["started", "finished", "indeterminate"] as const
@@ -60,6 +62,18 @@ export interface FinishInput {
   readonly sessionID: string
   readonly outcome: string
   readonly timeFinished?: number
+}
+
+/**
+ * Serialize a standalone ledger write with the worker's other connection owner.
+ * The tool path supplies the Effect SQL transaction acquirer, so a `started`
+ * row cannot be written inside another tool's result transaction (and cannot be
+ * erased by that transaction's rollback).
+ */
+export type LedgerExclusive = <A>(operation: () => A) => Effect.Effect<A>
+
+export interface ToolCallLedgerOptions {
+  readonly exclusive?: LedgerExclusive
 }
 
 export class ToolCallLedgerError extends Error {
@@ -160,11 +174,21 @@ function finishWith(repository: WorkerRepository, input: FinishInput): ToolCallR
 }
 
 /**
- * Mark a call started before its effect begins. A duplicate `(call_id, session)`
- * fails loud: replaying the effect is never the recovery path.
+ * Mark a call started. Direct callers run outside a result transaction; the
+ * production tool path uses {@link startStandaloneWith} so a parallel tool
+ * cannot record its start inside another tool's result transaction.
  */
 export function start(source: ToolCallLedgerSource, input: StartInput): ToolCallRow {
   return startWith(repositoryFor(source), input)
+}
+
+function startStandaloneWith(
+  repository: WorkerRepository,
+  exclusive: LedgerExclusive | undefined,
+  input: StartInput,
+): Effect.Effect<ToolCallRow> {
+  const write = () => startWith(repository, input)
+  return exclusive === undefined ? Effect.sync(write) : exclusive(write)
 }
 
 /**
@@ -174,6 +198,15 @@ export function start(source: ToolCallLedgerSource, input: StartInput): ToolCall
  */
 export function finish(source: ToolCallLedgerSource, input: FinishInput): ToolCallRow {
   return finishWith(repositoryFor(source), input)
+}
+
+function finishStandaloneWith(
+  repository: WorkerRepository,
+  exclusive: LedgerExclusive | undefined,
+  input: FinishInput,
+): Effect.Effect<ToolCallRow> {
+  const write = () => finishWith(repository, input)
+  return exclusive === undefined ? Effect.sync(write) : exclusive(write)
 }
 
 /**
@@ -237,19 +270,30 @@ export function hasSideEffectingStarted(source: ToolCallLedgerSource, sessionID:
 }
 
 export interface ToolCallLedgerHandle {
+  /** Standalone start: waits for the connection's exclusive owner first. */
+  readonly startStandalone: (input: StartInput) => Effect.Effect<ToolCallRow>
+  /** Legacy synchronous start for direct callers outside a result transaction. */
   readonly start: (input: StartInput) => ToolCallRow
+  /** Joining finish: a plain write that joins the owning result transaction. */
   readonly finish: (input: FinishInput) => ToolCallRow
+  /** Standalone finish for abort/cleanup paths that own no transaction. */
+  readonly finishStandalone: (input: FinishInput) => Effect.Effect<ToolCallRow>
   readonly finishWithResult: <T>(input: FinishInput, result: () => T) => T
   readonly indeterminate: (sessionID: string) => readonly ToolCallRow[]
   readonly list: (sessionID: string) => readonly ToolCallRow[]
   readonly hasSideEffectingStarted: (sessionID: string) => boolean
 }
 
-export function createToolCallLedger(source: ToolCallLedgerSource): ToolCallLedgerHandle {
+export function createToolCallLedger(
+  source: ToolCallLedgerSource,
+  options: ToolCallLedgerOptions = {},
+): ToolCallLedgerHandle {
   const repository = repositoryFor(source)
   return {
+    startStandalone: (input) => startStandaloneWith(repository, options.exclusive, input),
     start: (input) => startWith(repository, input),
     finish: (input) => finishWith(repository, input),
+    finishStandalone: (input) => finishStandaloneWith(repository, options.exclusive, input),
     finishWithResult: (input, result) => finishWithResultWith(repository, input, result),
     indeterminate: (sessionID) => indeterminateWith(repository, sessionID),
     list: (sessionID) => listWith(repository, sessionID),

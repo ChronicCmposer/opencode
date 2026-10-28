@@ -1,4 +1,4 @@
-// C1 (finding M1) — the REAL hub-proxy boundary for
+// The REAL hub-proxy boundary for
 // `experimental.chat.messages.transform`.
 //
 // The "ON" suites historically simulated the hub-proxy outcome with an

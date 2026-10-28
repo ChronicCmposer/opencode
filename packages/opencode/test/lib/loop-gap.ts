@@ -1,20 +1,20 @@
-// Event-loop-gap probe (plan task 3.14).
+// Event-loop-gap probe.
 //
 // Measures the maximum event-loop stall on a thread over a window, backing the
-// Phase 13.3 hub-load budget and the "main loop idle" / "hub loop I/O-only"
+// Hub-load budget and the "main loop idle" / "hub loop I/O-only"
 // observability requirements.
 //
 // The gap itself is measured by TIMER DRIFT: a repeating timer at `intervalMs`;
 // each tick's lateness (`now - lastTickAt`) is the loop's stall, and `maxGapMs`
 // is the largest observed lateness. This is portable and is the same technique
-// used by the Phase 2 spike (`spikes/multicore/parallelism-check.ts`).
+// used by the parallelism spike (`spikes/multicore/parallelism-check.ts`).
 //
 // On Linux the probe additionally reads the calling thread's CPU time from
 // `/proc/thread-self/stat` (an alias for `/proc/self/task/<tid>/stat`) before and
 // after the window. That CPU delta is the HUB-LOAD signal: a busy hub loop
 // accrues CPU, an I/O-only loop does not. The reader is POSIX-only; on Windows it
 // returns `undefined` with a documented reason and the probe falls back to
-// `source: "timer"` (plan: Windows verification is out of scope).
+// `source: "timer"` (Windows verification is out of scope).
 //
 // This harness RECORDS raw numbers. It never asserts a machine-dependent timing
 // threshold — acceptance is scenario completion plus sample collection.

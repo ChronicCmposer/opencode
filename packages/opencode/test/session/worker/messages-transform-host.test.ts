@@ -1,4 +1,4 @@
-// A1 — worker plugin host: `experimental.chat.messages.transform` hub-proxy tests.
+// Worker plugin host: `experimental.chat.messages.transform` hub-proxy tests.
 //
 // Mirrors the `experimental.chat.system.transform` cases in
 // `layer-plugin.test.ts`: plugin function hooks run first (registration order),

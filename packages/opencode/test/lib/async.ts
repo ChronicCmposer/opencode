@@ -1,4 +1,4 @@
-// Shared async test primitives (findings #136/#137 consolidation).
+// Shared async test primitives.
 //
 // Everything a test needs to observe queued work, bound a promise, or wait for
 // an abort lives here. `poll.ts` re-exports {@link pollUntil} so older imports

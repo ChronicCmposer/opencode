@@ -1,6 +1,6 @@
-// Metrics collector (plan task 3.14).
+// Metrics collector.
 //
-// A tiny counters/gauges registry for the hub-load budget (Phase 13.3) and the
+// A tiny counters/gauges registry for the hub-load budget and the
 // "main loop idle" / "hub loop I/O-only" observability requirements. Counters are
 // monotonic (default 0); gauges hold the last value. A snapshot is a frozen,
 // isolated copy, so a recorded sample can never be mutated after the fact.

@@ -7,6 +7,7 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { Location } from "@opencode-ai/core/location"
 import { Project } from "@opencode-ai/core/project"
 import { AbsolutePath } from "@opencode-ai/core/schema"
+import { Durable } from "@opencode-ai/schema/durable-event-manifest"
 import type { InstanceContext } from "@/project/instance-context"
 import type { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { Context, Effect, Layer } from "effect"
@@ -38,6 +39,14 @@ export interface LiveEvent {
   readonly type: string
   readonly data: unknown
   readonly location?: Location.Ref
+  /**
+   * The committed durable position when the event already committed in its
+   * originating isolate. A live republish never re-commits, so the position is
+   * carried verbatim onto the `Payload` for the `GlobalBus` `sync` envelope.
+   * `version` resolves from the durable manifest when the producer knows only
+   * the aggregate and sequence.
+   */
+  readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version?: number }
 }
 
 /** The hub's live-only publish seam: emit an event without a durable commit. */
@@ -64,13 +73,26 @@ export function createLiveEventPublisher(
   options: LiveEventPublisherOptions = {},
 ): LiveEventPublisher {
   const location = () => options.location?.()
+  // The payload's durable `version` is required; a producer that knows only the
+  // committed aggregate and sequence takes it from the shipped manifest, exactly
+  // as the hub sink does, then falls back to the first schema version.
+  const durableOf = (event: LiveEvent): EventV2.Payload["durable"] =>
+    event.durable === undefined
+      ? undefined
+      : {
+          aggregateID: event.durable.aggregateID,
+          seq: event.durable.seq,
+          version: event.durable.version ?? Durable.get(event.type)?.durable?.version ?? 1,
+        }
   const toPayload = (event: LiveEvent): EventV2.Payload => {
     const resolved = event.location ?? location()
+    const durable = durableOf(event)
     return {
       id: event.id === undefined ? EventV2.ID.create() : EventV2.ID.make(event.id),
       type: event.type,
       data: event.data,
       ...(resolved === undefined ? {} : { location: resolved }),
+      ...(durable === undefined ? {} : { durable }),
     }
   }
   // `publishLive` is the live-only seam: no Definition lookup and no durable

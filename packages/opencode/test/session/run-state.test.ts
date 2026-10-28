@@ -1,4 +1,4 @@
-// p1-entry — the `SessionRunState.startShell` flag seam.
+// The `SessionRunState.startShell` flag seam.
 //
 // Frozen contract: `startShell` takes a trailing optional `shell` payload. Flag
 // ON (hub present + `experimentalSessionWorkers`) the shell rides the hub
@@ -222,8 +222,9 @@ describe("SessionRunState — hub rejections are typed", () => {
     return { ...base, ...overrides } satisfies SessionHub
   }
 
-  it.live("ensureRunning surfaces a hub cancel as a typed failure, not a defect", () => {
+  it.live("ensureRunning honors onInterrupt when the hub reports a clean cancel", () => {
     const sessionID = sid("ses_cancel_typed")
+    const interrupted = withParts(sessionID)
     const hub = failingHub({
       ensureRunning: async () => {
         throw new SessionCancelledError({ message: "cancelled", sessionID })
@@ -233,14 +234,40 @@ describe("SessionRunState — hub rejections are typed", () => {
     return withTmpdirInstance()(
       Effect.gen(function* () {
         const state = yield* SessionRunState.Service
-        const exit = yield* state
-          .ensureRunning(sessionID, Effect.succeed(withParts(sessionID)), Effect.succeed(withParts(sessionID)))
-          .pipe(Effect.exit)
+        // Flag-off parity: a clean cancel is the caller's interrupted result, not
+        // a typed failure. The HTTP prompt handler therefore returns 200.
+        const result = yield* state.ensureRunning(
+          sessionID,
+          Effect.succeed(interrupted),
+          Effect.succeed(withParts(sessionID)),
+        )
 
-        expect(Exit.isFailure(exit)).toBe(true)
-        if (!Exit.isFailure(exit)) return
-        expect(Cause.hasDies(exit.cause)).toBe(false)
-        expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionCancelledError)
+        expect(result).toEqual(interrupted)
+      }).pipe(Effect.provide(runStateLayer), Effect.provideService(SessionHubService, hub), Effect.provide(flagsOn)),
+    )
+  })
+
+  it.live("startShell honors onInterrupt when the hub reports a clean cancel", () => {
+    const sessionID = sid("ses_shell_cancel_typed")
+    const interrupted = withParts(sessionID)
+    const hub = failingHub({
+      startShell: async () => {
+        throw new SessionCancelledError({ message: "cancelled", sessionID })
+      },
+    })
+
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const result = yield* state.startShell(
+          sessionID,
+          Effect.succeed(interrupted),
+          Effect.succeed(withParts(sessionID)),
+          undefined,
+          { sessionID, agent: "build", command: "echo cancel" },
+        )
+
+        expect(result).toEqual(interrupted)
       }).pipe(Effect.provide(runStateLayer), Effect.provideService(SessionHubService, hub), Effect.provide(flagsOn)),
     )
   })

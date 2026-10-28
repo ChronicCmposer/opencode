@@ -1,5 +1,11 @@
-// W4.1 / D19 — a hook added after startup is a typed admission failure on the
-// next worker run.
+// Startup only fails for a hook no route can ever serve.
+//
+// A configured-but-uninvoked *unsupported* hook
+// (`command.execute.before`, compaction, `text.complete`) must not fail worker
+// startup; it fails typed at the moment the worker invokes it. Invocation is
+// pinned by `test/integration/plugin-hook-startup.test.ts`,
+// `layer-plugin.test.ts`, and `test/plugin/plugin-hook-fatal.test.ts`. An
+// unclassified trigger still has no route at all, so it stays a startup defect.
 //
 // This suite drives the PRODUCTION assembly (`buildSessionWorkerInit` with the
 // hub's `(model) => resolveWorkerPlugins(...)` resolver), not the resolver in
@@ -17,7 +23,7 @@ import { Config } from "@/config/config"
 import { InstanceRef } from "@/effect/instance-ref"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Provider } from "@/provider/provider"
-import { UnclassifiedPluginHookError, UnsupportedPluginHookError } from "@/plugin/routes"
+import { UnclassifiedPluginHookError } from "@/plugin/routes"
 import { buildSessionWorkerInit, resolveWorkerPlugins } from "@/session/worker/init"
 
 const modelLayers = () =>
@@ -73,12 +79,13 @@ const resolve = (hooks: Record<string, unknown>) =>
   )
 
 describe("worker plugin hook admission", () => {
-  test("rejects an unsupported hook added after startup", async () => {
+  test("admits a configured unsupported hook at startup instead of rejecting it", async () => {
     const result = await resolve({ "command.execute.before": async () => {} })
-    expect(result._tag).toBe("Failure")
-    if (result._tag !== "Failure") throw new Error("expected admission failure")
-    expect(result.failure).toBeInstanceOf(UnsupportedPluginHookError)
-    expect((result.failure as UnsupportedPluginHookError).hook).toBe("command.execute.before")
+    expect(result._tag).toBe("Success")
+    if (result._tag !== "Success") throw new Error("expected startup admission")
+    // Admitted, not silently dropped: the plugin ships and the worker fails
+    // typed only when it actually dispatches the unsupported trigger.
+    expect(result.success.plugins?.map((plugin) => plugin.name)).toEqual(["dynamic"])
   })
 
   test("rejects an unclassified hook added after startup", async () => {

@@ -1,10 +1,3 @@
-// Session worker pool configuration and the production pool wrapper.
-//
-// The sized pool is gone: one lazily-materialized worker per session replaces
-// `OPENCODE_SESSION_WORKER_COUNT` / `OPENCODE_SESSION_WORKER_OVERSUBSCRIPTION`.
-// Those knobs only produce obsolete warnings now. `OPENCODE_SESSION_WORKER_REAP_MS`
-// still bounds an idle worker's lifetime.
-
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
@@ -22,17 +15,7 @@ import {
   buildWorkerEnv,
   resolveWorkerModel,
 } from "@/session/worker/init"
-import {
-  DEFAULT_REAP_MS,
-  OVERSUBSCRIPTION_ENV,
-  REAP_MS_ENV,
-  WORKER_COUNT_ENV,
-  obsoleteOversubscriptionWarning,
-  obsoleteWorkerCountWarning,
-  reapMsWarning,
-  removedKnobWarnings,
-  resolveReapMs,
-} from "@/session/worker/pool"
+import { DEFAULT_REAP_MS, REAP_MS_ENV, reapMsWarning, resolveReapMs } from "@/session/worker/pool"
 import { createProductionWorkerPool } from "@/session/worker/hub"
 import { buildWorkerSnapshot, createEpochSequence, nextEpoch } from "@/session/worker/snapshot"
 import { assertStructuredCloneable, sessionWorkerInit } from "../../lib/session-worker-init"
@@ -88,50 +71,6 @@ describe("reap window", () => {
   test("warns only when the value is present but unusable", () => {
     expect(reapMsWarning({})).toBeUndefined()
     expect(reapMsWarning({ [REAP_MS_ENV]: "1" })).toBeUndefined()
-  })
-})
-
-describe("removed pool knobs", () => {
-  test("absent and empty knobs produce no warnings", () => {
-    expect(removedKnobWarnings({})).toEqual([])
-    expect(obsoleteWorkerCountWarning({})).toBeUndefined()
-    expect(obsoleteOversubscriptionWarning({})).toBeUndefined()
-
-    const empty = { [WORKER_COUNT_ENV]: "", [OVERSUBSCRIPTION_ENV]: "   " }
-    expect(removedKnobWarnings(empty)).toEqual([])
-    expect(obsoleteWorkerCountWarning(empty)).toBeUndefined()
-    expect(obsoleteOversubscriptionWarning(empty)).toBeUndefined()
-  })
-
-  test("each set knob yields exactly one warning naming it as obsolete and ignored", () => {
-    const count = obsoleteWorkerCountWarning({ [WORKER_COUNT_ENV]: "5" })
-    if (count === undefined) throw new Error("expected an obsolete worker-count warning")
-    expect(count).toContain(WORKER_COUNT_ENV)
-    expect(count).toContain("obsolete; ignored")
-    const countWarnings = removedKnobWarnings({ [WORKER_COUNT_ENV]: "5" })
-    expect(countWarnings).toHaveLength(1)
-    expect(countWarnings[0]).toBe(count)
-
-    const oversubscription = obsoleteOversubscriptionWarning({ [OVERSUBSCRIPTION_ENV]: "3" })
-    if (oversubscription === undefined) throw new Error("expected an obsolete oversubscription warning")
-    expect(oversubscription).toContain(OVERSUBSCRIPTION_ENV)
-    expect(oversubscription).toContain("obsolete; ignored")
-    const oversubscriptionWarnings = removedKnobWarnings({ [OVERSUBSCRIPTION_ENV]: "3" })
-    expect(oversubscriptionWarnings).toHaveLength(1)
-    expect(oversubscriptionWarnings[0]).toBe(oversubscription)
-  })
-
-  test("both knobs yield exactly two warnings in a stable order", () => {
-    const warnings = removedKnobWarnings({ [WORKER_COUNT_ENV]: "5", [OVERSUBSCRIPTION_ENV]: "3" })
-    expect(warnings).toHaveLength(2)
-    expect(warnings[0]).toContain(WORKER_COUNT_ENV)
-    expect(warnings[1]).toContain(OVERSUBSCRIPTION_ENV)
-  })
-
-  test("malformed values are still only reported as obsolete and never throw", () => {
-    const env = { [WORKER_COUNT_ENV]: "abc", [OVERSUBSCRIPTION_ENV]: "0" }
-    expect(() => removedKnobWarnings(env)).not.toThrow()
-    expect(removedKnobWarnings(env)).toHaveLength(2)
   })
 })
 
@@ -451,7 +390,7 @@ describe("buildSessionWorkerInit", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Production pool wrapper (step 10).
+// Production pool wrapper.
 // ---------------------------------------------------------------------------
 
 describe("createProductionWorkerPool", () => {

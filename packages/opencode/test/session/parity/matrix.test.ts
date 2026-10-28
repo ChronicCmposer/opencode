@@ -1,4 +1,4 @@
-// Wave 6 parity matrix registration.
+// Parity matrix registration.
 //
 // The harness (`test/lib/parity-matrix`) is complete; the production driver for
 // every cell is not. Each cell is therefore registered explicitly: a cell with a

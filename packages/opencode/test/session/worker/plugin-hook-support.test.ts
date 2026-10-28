@@ -1,6 +1,10 @@
-// W4.1 / D19 — the worker hook route table is derived from the hooks the source
+// The worker hook route table is derived from the hooks the source
 // actually invokes. A new `plugin.trigger` is a red test until its route is
 // recorded, and an unsupported or unclassified hook is never a silent skip.
+//
+// Admission has two boundaries, pinned separately: startup tolerates a
+// configured `unsupported` hook (it is only a defect when dispatched) but still
+// rejects a hook with no route at all; invocation always fails typed.
 
 import { describe, expect, test } from "bun:test"
 import { readdirSync, readFileSync } from "node:fs"
@@ -11,8 +15,10 @@ import {
   UnsupportedPluginHookError,
   WORKER_HOOK_ROUTES,
   assertPluginHookAdmission,
+  assertPluginHookStartup,
   isDeclaredOnlyHook,
   pluginHookAdmissionError,
+  pluginHookStartupError,
   workerHookRoute,
 } from "@/plugin/routes"
 
@@ -103,6 +109,21 @@ describe("worker hook route table", () => {
     expect(error).toBeInstanceOf(UnsupportedPluginHookError)
     expect(error?.hook).toBe("command.execute.before")
     expect(pluginHookAdmissionError("configured", { "chat.message": async () => {} })).toBeUndefined()
+  })
+
+  test("startup tolerates a configured unsupported hook", () => {
+    const hooks = { "command.execute.before": async () => {} }
+    expect(pluginHookStartupError("configured", hooks)).toBeUndefined()
+    expect(() => assertPluginHookStartup("configured", hooks)).not.toThrow()
+    expect(pluginHookStartupError("configured", { "chat.message": async () => {} })).toBeUndefined()
+  })
+
+  test("startup still rejects an unclassified hook", () => {
+    const hooks = { "future.trigger": async () => {} }
+    const error = pluginHookStartupError("dynamic", hooks)
+    expect(error).toBeInstanceOf(UnclassifiedPluginHookError)
+    expect(error?.hook).toBe("future.trigger")
+    expect(() => assertPluginHookStartup("dynamic", hooks)).toThrow(UnclassifiedPluginHookError)
   })
 
   test("an unclassified function hook throws instead of falling through", () => {

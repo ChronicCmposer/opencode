@@ -39,6 +39,12 @@ function isBusyCode(code: string): boolean {
   return BUSY_CODES.some((base) => code === base || code.startsWith(`${base}_`))
 }
 
+/** SQLITE_BUSY (5) and SQLITE_LOCKED (6), including extended-code suffixes. */
+function isBusyNumericCode(code: number): boolean {
+  const primary = code & 0xff
+  return primary === 5 || primary === 6
+}
+
 /**
  * True when `error` is a lock/busy failure a whole-transaction retry may
  * recover from. Recognizes native `code`/`sqliteCode` values (including
@@ -52,6 +58,8 @@ export function isBusyError(error: unknown): boolean {
   if (!isNativeSqliteError(error)) return false
   if (typeof error.sqliteCode === "string" && isBusyCode(error.sqliteCode)) return true
   if (typeof error.code === "string" && isBusyCode(error.code)) return true
+  if (typeof error.errno === "number" && isBusyNumericCode(error.errno)) return true
+  if (typeof error.errcode === "number" && isBusyNumericCode(error.errcode)) return true
   const message = error.message
   return (
     typeof message === "string" &&

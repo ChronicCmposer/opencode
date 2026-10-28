@@ -1,4 +1,4 @@
-// Step 1 — `SessionWorkerInit` builder + structured-clone round-trip helper.
+// `SessionWorkerInit` builder + structured-clone round-trip helper.
 //
 // The production entry parses `SessionWorkerInit` (`{snapshot, env, model}`) out
 // of `workerData` and fails loud on a malformed payload. Tests need one

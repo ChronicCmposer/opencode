@@ -1,5 +1,4 @@
-// Test-only hub-side egress session (relocated from `src/session/egress/hub.ts`,
-// plan finding B1). Production serves the worker events port through
+// Test-only hub-side egress session (relocated from `src/session/egress/hub.ts`). Production serves the worker events port through
 // `session/worker/hub.ts`; this hub+SSE stream abstraction was never wired to a
 // production route, so it lives under `test/` and backs the hub/worker-egress
 // stream tests only.

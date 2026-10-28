@@ -1,4 +1,4 @@
-// Fix C — migration codegen drift guard (plan task: fail on drift).
+// Migration codegen drift guard: fail on drift.
 //
 // `src/session/writer/migration.statements.gen.ts` is generated from the core
 // schema + journal by `script/migration-statements.ts`. The writer isolate ships

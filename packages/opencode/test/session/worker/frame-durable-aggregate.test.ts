@@ -1,4 +1,4 @@
-// Step 32 — durable frames must carry complete aggregate identity.
+// Durable frames must carry complete aggregate identity.
 //
 // The durable wire identity is `(aggregateID, seq)`, independent of the legacy
 // sender-global `(generation, ordinal)` pair kept for mesh/control compatibility.

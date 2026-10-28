@@ -165,7 +165,12 @@ export const TaskTool = Tool.define(
       // (grandchild) or a sibling is inside another run's authority; the hub
       // spawn would reject it, but fail here before any permission ask or row
       // work so the task never acts on an id it may not resume.
-      if (session !== undefined && session.parentID !== ctx.sessionID) {
+      //
+      // This is a worker-boundary rule: in flag-off mode `sessions.get` returns
+      // any persisted row and resuming a non-direct task was always allowed. The
+      // hub-scoped read already rejects a foreign id with `SessionScopeError`
+      // above, so only worker mode adds the explicit parent check.
+      if (flags.experimentalSessionWorkers && session !== undefined && session.parentID !== ctx.sessionID) {
         return yield* Effect.fail(
           new Error(
             `Task ${params.task_id} is not a direct child of this session; only direct children can be resumed`,

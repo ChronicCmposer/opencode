@@ -266,7 +266,7 @@ describe("messages.transform clone guard at the isolate boundary", () => {
         { messages: payload },
       ])) as MessagesTransformOutput
 
-      // W2.1: the port boundary is JSON, so dates become ISO strings and
+      // The port boundary is JSON, so dates become ISO strings and
       // explicit `undefined` properties are omitted.
       const json = JSON.parse(JSON.stringify(payload)) as unknown
       expect(returned.messages).toStrictEqual(json as unknown[])
@@ -305,7 +305,7 @@ describe("messages.transform clone guard at the isolate boundary", () => {
         caught = error
       }
 
-      // W2.1: the encoder rejects a non-JSON payload with a typed ProtocolError
+      // The encoder rejects a non-JSON payload with a typed ProtocolError
       // before any frame crosses; it is not a `HubProxyRemoteError` reply.
       expect((caught as { tag?: string }).tag).toBe("PROTOCOL")
       expect((caught as Error).message).toMatch(/not JSON-serialisable/)

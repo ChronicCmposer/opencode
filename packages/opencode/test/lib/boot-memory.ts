@@ -1,4 +1,4 @@
-// Boot/memory measurement harness (plan task 3.11).
+// Boot/memory measurement harness.
 //
 // Records how long each session worker takes to boot and the process RSS at K and
 // at K+2 workers. These are MACHINE-DEPENDENT numbers: the harness only collects

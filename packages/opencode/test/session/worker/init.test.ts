@@ -1,4 +1,4 @@
-// Phase 1 — the worker model bootstrap carries the REAL model descriptor.
+// The worker model bootstrap carries the REAL model descriptor.
 //
 // The hub used to ship a bare identity (`apiId/npm/baseUrl/apiKey/headers`), so
 // the worker's reduced provider invented `capabilities`/`limit`/`options` and
@@ -246,7 +246,7 @@ const instanceCtx = {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 6.3 / P3 — the hub resolves plugin hooks into structuredClone-safe data
+// The hub resolves plugin hooks into structuredClone-safe data
 // (a hook *function* can never cross `workerData`).
 // ---------------------------------------------------------------------------
 

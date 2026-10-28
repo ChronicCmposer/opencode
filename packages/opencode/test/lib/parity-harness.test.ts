@@ -1,10 +1,10 @@
-// Wave 1/3 — `parity-harness` tests (spec Q1/Q12/Q15).
+// `parity-harness` tests (spec Q1/Q12/Q15).
 //
 // The harness runs ONE identical session script through an injected runner twice:
 // `flag:false` (in-process / flag-OFF) and `flag:true` (worker / flag-ON),
 // capturing each side's event sequence with `event-sink`.
 //
-// Wave 3 wires the assertion to REAL production paths:
+// The harness wires the assertion to REAL production paths:
 //
 //   * flag-OFF runs the full `RUNNABLE_SESSION_NODES` worker graph in-process and
 //     captures its `EventV2` directly — the non-worker baseline;
@@ -489,7 +489,7 @@ function event(id: string, type: string, properties: unknown) {
 }
 
 // ---------------------------------------------------------------------------
-// Real `SessionPrompt.loop` flag-ON ≡ flag-OFF (o1-w4 audit gap 1).
+// Real `SessionPrompt.loop` flag-ON ≡ flag-OFF.
 //
 // The synthetic `runBridgeSide` above publishes deltas directly; this section
 // runs the ACTUAL `SessionPrompt.loop` over the writer-backed Database with the
@@ -669,7 +669,7 @@ function loopRunner(directory: string): ParityRunner {
   }
 }
 
-describe("real SessionPrompt.loop flag-ON ≡ flag-OFF (o1-w4 gap 1)", () => {
+describe("real SessionPrompt.loop flag-ON ≡ flag-OFF", () => {
   it("the hub event sequence equals the in-process graph sequence, per delivery channel", async () => {
     await using tmp = await tmpdir()
     const result = await runParitySession({

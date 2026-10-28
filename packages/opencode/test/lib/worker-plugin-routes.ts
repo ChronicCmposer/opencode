@@ -1,4 +1,4 @@
-// PENDING-plugin (W4.1) — test-side plugin route pass-through.
+// PENDING-plugin — test-side plugin route pass-through.
 //
 // The fatal-admission contract is covered by `test/lib/rollout-matrix.test.ts`
 // and `test/session/parity/flag-matrix.test.ts`; worker suites that exercise

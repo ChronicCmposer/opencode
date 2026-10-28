@@ -36,7 +36,9 @@ export interface WorkerEventSink {
   readonly emit: (event: EventV2Event) => void
   /**
    * Durable events bypass coalescing and carry their committed aggregate
-   * `(aggregateID, seq)`; omitted sinks fall back to `emit`.
+   * `(aggregateID, seq)`. A sink without this seam cannot preserve a durable
+   * event's identity, so forwarding one to it fails loud rather than downgrading
+   * the event to a plain delta.
    */
   readonly emitDurable?: (event: EventV2Event, meta: { readonly aggregateID: string; readonly seq: number }) => void
 }
@@ -93,9 +95,19 @@ export function createWorkerEventBridge(
       if (disposed) return
       if (!isForwardable(event)) return
       const wire = toEventV2Event(event)
-      if (event.durable !== undefined && sink.emitDurable !== undefined) {
+      if (event.durable !== undefined) {
+        // A durable event's committed `(aggregateID, seq)` is part of its
+        // identity. A sink that cannot carry it must not receive the event as a
+        // plain delta: silently downgrading would lose the durable cursor.
+        if (sink.emitDurable === undefined) {
+          throw new Error(
+            `durable worker event "${event.type}" requires a durable sink; this sink has no emitDurable`,
+          )
+        }
         sink.emitDurable(wire, { aggregateID: event.durable.aggregateID, seq: event.durable.seq })
-      } else sink.emit(wire)
+        return
+      }
+      sink.emit(wire)
     }
 
     const unsubscribe = yield* events.listen((event) => Effect.sync(() => forward(event)))

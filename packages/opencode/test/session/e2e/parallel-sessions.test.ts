@@ -1,4 +1,4 @@
-// Phase 13.1/13.3/13.5/13.6 — end-to-end proof over the mock-SSE session pool.
+// End-to-end proof over the mock-SSE session pool.
 //
 // Contract under test: the mock-SSE harness drives N concurrent sessions through
 // the REAL `createDispatcher` pool, each session fetching a streamed reply from

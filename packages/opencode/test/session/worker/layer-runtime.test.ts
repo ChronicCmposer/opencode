@@ -1,4 +1,4 @@
-// Wave 2 — reduced session layer runtime tests (TDD plan steps 23–26).
+// Reduced session layer runtime tests.
 //
 //   * 23 writer-backed Drizzle Database
 //   * 24 hub-proxy authorities (SessionStatus / Permission / Question)
@@ -46,7 +46,7 @@ import { workerSnapshot } from "../../lib/snapshot"
 const sid = (value: string) => SessionID.make(value)
 
 // ---------------------------------------------------------------------------
-// Step 23 — writer-backed Drizzle Database.
+// Writer-backed Drizzle Database.
 //
 // `writerDatabaseLayer(writer)` yields a real Drizzle `Database` whose
 // `select` / `insert` / `update` / `delete` return Effects. The writer handle
@@ -88,7 +88,7 @@ function writerOverSqlite(native: BunDatabase): WriterClientHandle {
   }
 }
 
-describe("writerDatabaseLayer (step 23)", () => {
+describe("writerDatabaseLayer", () => {
   test("yields a real Drizzle Database that round-trips CRUD through the writer", async () => {
     const native = new BunDatabase(":memory:")
     try {
@@ -141,10 +141,10 @@ describe("writerDatabaseLayer (step 23)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Step 24 — hub-proxy authorities.
+// Hub-proxy authorities.
 // ---------------------------------------------------------------------------
 
-describe("hub-proxy nodes (step 24)", () => {
+describe("hub-proxy nodes", () => {
   test("SessionStatus round-trips get/set/list over a port", async () => {
     const channel = new MessageChannel()
     const store = new Map<string, SessionStatus.Info>()
@@ -237,7 +237,7 @@ describe("hub-proxy nodes (step 24)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Step 25 — reduced in-worker Provider.
+// Reduced in-worker Provider.
 // ---------------------------------------------------------------------------
 
 const modelConfig = (model: {
@@ -254,7 +254,7 @@ const modelConfig = (model: {
   headers: {},
 })
 
-describe("reducedModelProviderLayer (step 25)", () => {
+describe("reducedModelProviderLayer", () => {
   test("getLanguage produces a real model call against the mock provider", async () => {
     await using provider = startMockProvider({ chunks: ["hel", "lo"] })
     const config = modelConfig(provider)
@@ -288,10 +288,10 @@ describe("reducedModelProviderLayer (step 25)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Step 26 — LLM.stream-backed ModelClient.
+// LLM.stream-backed ModelClient.
 // ---------------------------------------------------------------------------
 
-describe("llmModelClientLayer (step 26)", () => {
+describe("llmModelClientLayer", () => {
   test("concatenates the streamed text-delta events of one LLM turn", async () => {
     const events = [
       { type: "text-delta", id: "t1", text: "wor" },
@@ -330,11 +330,11 @@ describe("llmModelClientLayer (step 26)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// B3 — the reduced LLM sub-graph must route `Permission` to the hub authority
+// The reduced LLM sub-graph must route `Permission` to the hub authority
 // (fail loud on a denial) and never install a silent no-op.
 // ---------------------------------------------------------------------------
 
-describe("B3 — permission boundary in the reduced LLM sub-graph", () => {
+describe("permission boundary in the reduced LLM sub-graph", () => {
   const permissionLayerFor = (hubProxies?: HubProxyClients): Layer.Layer<Permission.Service> => {
     const config = modelConfig({ baseUrl: "http://127.0.0.1:1/v1", apiKey: "k", model: "m" })
     const entry = llmBoundaryReplacements(workerSnapshot(), config, hubProxies).find(

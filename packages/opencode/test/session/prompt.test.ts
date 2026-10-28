@@ -1631,7 +1631,7 @@ it.instance(
   10_000,
 )
 
-// W9 acceptance (parallel-session-worker): a background `task` subagent must not
+// A background `task` subagent must not
 // outlive its parent's cancel. The child runs in its own session (and, flag-on,
 // on a separate worker); cancelling the parent through `prompt.cancel` must idle
 // the child and leave no running background job. This is the end-to-end

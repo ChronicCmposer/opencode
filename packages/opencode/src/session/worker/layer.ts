@@ -282,28 +282,31 @@ export class WorkerEventBridge extends Context.Service<WorkerEventBridge, Worker
 export const WORKER_DURABLE_WAKE_PATTERN = "*"
 
 /**
- * The aggregate a durable commit belongs to, or `undefined` when the commit's
- * type names no durable definition this build knows. The mesh frame carries the
- * event verbatim (`{ id, type, properties }`) with no aggregate of its own, so it
- * is parsed from the payload exactly as core's durable commit does: the
- * definition's `durable.aggregate` field names the payload property. An unknown
- * type is skipped rather than fatal — the commit is still republished live-only —
- * so a synthetic or version-skewed durable event never breaks the control port.
- * A KNOWN durable type whose payload omits the aggregate field is malformed and
+ * Parse a durable commit into this build's definition: the aggregate it belongs
+ * to and the definition version, or `undefined` when the commit's type names no
+ * durable definition this build knows. The mesh frame carries the event verbatim
+ * (`{ id, type, properties }`) with no aggregate of its own, so it is parsed from
+ * the payload exactly as core's durable commit does: the definition's
+ * `durable.aggregate` field names the payload property. An unknown type is
+ * skipped rather than fatal — the commit is still republished live-only — so a
+ * synthetic or version-skewed durable event never breaks the control port. A
+ * KNOWN durable type whose payload omits the aggregate field is malformed and
  * fails loud.
  */
-function durableAggregateOf(commit: DurableCommit): string | undefined {
-  const aggregate = Latest.get(commit.event.type)?.durable?.aggregate
-  if (aggregate === undefined) return undefined
+function durablePositionOf(
+  commit: DurableCommit,
+): { readonly aggregateID: string; readonly version: number } | undefined {
+  const durable = Latest.get(commit.event.type)?.durable
+  if (durable === undefined) return undefined
   const properties = commit.event.properties
   const aggregateID =
     properties !== null && typeof properties === "object"
-      ? (properties as Readonly<Record<string, unknown>>)[aggregate]
+      ? (properties as Readonly<Record<string, unknown>>)[durable.aggregate]
       : undefined
   if (typeof aggregateID !== "string") {
-    throw new Error(`durable commit "${commit.event.type}" is missing string aggregate field ${aggregate}`)
+    throw new Error(`durable commit "${commit.event.type}" is missing string aggregate field ${durable.aggregate}`)
   }
-  return aggregateID
+  return { aggregateID, version: durable.version }
 }
 
 /** Wake one aggregate's `durable()` subscribers so they re-read SQLite. */
@@ -325,8 +328,14 @@ function wakeAggregate(
  * Synchronous because the mesh delivery runs on the synchronous control-port
  * handler.
  *
- * The republished payload is stamped with {@link DURABLE_WAKEUP_METADATA_KEY} so
- * the worker's own event bridge ({@link createWorkerEventBridge}) does not
+ * The republished payload keeps the committed position (`durable.aggregateID` /
+ * `durable.seq`) the mesh delivered, stamped with the definition version from
+ * this build's manifest, so the isolate's durable subscribers and the sync
+ * envelope see the original position. A commit whose type this build does not
+ * know has no version to stamp and crosses live-only.
+ *
+ * The payload is stamped with {@link DURABLE_WAKEUP_METADATA_KEY} so the
+ * worker's own event bridge ({@link createWorkerEventBridge}) does not
  * re-forward it: the mesh delivers a worker its OWN durable commit back too, and
  * re-forwarding would make the hub publish that event a second time.
  */
@@ -334,11 +343,21 @@ export function republishDurableCommit(
   events: Pick<EventV2.Interface, "publishLive" | "wakeDurable">,
   commit: DurableCommit,
 ): void {
+  const position = durablePositionOf(commit)
   Effect.runSync(
     events.publishLive({
       id: EventV2.ID.make(commit.event.id),
       type: commit.event.type,
       data: commit.event.properties,
+      ...(position === undefined
+        ? {}
+        : {
+            durable: {
+              aggregateID: commit.meta.aggregateID,
+              seq: commit.meta.seq,
+              version: position.version,
+            },
+          }),
       metadata: { [DURABLE_WAKEUP_METADATA_KEY]: true },
     }),
   )
@@ -346,9 +365,8 @@ export function republishDurableCommit(
   // `durable()` subscribers only need waking so their aggregate stream re-reads
   // and observes it. A reduced handle without the seam, or a commit whose type
   // this build does not know, skips the wake.
-  const aggregateID = durableAggregateOf(commit)
-  if (aggregateID === undefined) return
-  wakeAggregate(events, aggregateID)
+  if (position === undefined) return
+  wakeAggregate(events, position.aggregateID)
 }
 
 /**
@@ -658,6 +676,19 @@ export function sessionSpawnProxyLayer(
 /** The client the session-spawn proxy multiplexes over. */
 export function sessionSpawnClient(clients: HubProxyClients): HubProxyClient {
   return clients.subagent ?? clients.sessionStatus
+}
+
+/**
+ * Worker-side clear-revert authority. `revert` is hub-owned session state, so a
+ * bound worker asks the hub to clear it over the control port instead of
+ * publishing a worker-authored `session.updated` with `revert: null` (which the
+ * projection policy refuses as an actual change to a hub column).
+ */
+export function clearRevertProxyLayer(client: HubProxyClient): Layer.Layer<SessionRevert.ClearRevertAuthority> {
+  return Layer.succeed(SessionRevert.ClearRevertAuthority, {
+    clear: (sessionID: SessionID) =>
+      hubProxyCall<void>(client, "session.clearRevert", [{ sessionID }]).pipe(Effect.orDie),
+  })
 }
 
 /**
@@ -1341,6 +1372,17 @@ function workerProjectionPolicy(): SessionProjector.ProjectionPolicy {
         // directory/workspace identity and must not originate in a worker.
         if (event.type === SessionEvent.Moved.type) {
           return yield* rejectProjection(event, event.data.sessionID, "session location is hub authority")
+        }
+
+        // Revert state is hub authority in every shape, not only the
+        // `Session.Info` image: the dedicated revert branches write the same
+        // hub-owned `revert` column without consulting the column whitelist.
+        if (
+          event.type === SessionEvent.RevertEvent.Staged.type ||
+          event.type === SessionEvent.RevertEvent.Cleared.type ||
+          event.type === SessionEvent.RevertEvent.Committed.type
+        ) {
+          return yield* rejectProjection(event, event.data.sessionID, "session revert is hub authority")
         }
 
         if (event.type === SessionV1.Event.Updated.type) {
@@ -2444,10 +2486,17 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
     options.hubProxies === undefined
       ? withPid
       : Layer.merge(withPid, sessionSpawnProxyLayer(sessionSpawnClient(options.hubProxies), options.boundSessionID))
+  // The clear-revert authority is a non-graph seam: `SessionRevert` reads it
+  // optionally, so a hub-only graph keeps `Session.clearRevert` while a worker
+  // routes the hub-owned write over its control port.
+  const withClearRevert =
+    options.hubProxies === undefined
+      ? layer
+      : Layer.merge(layer, clearRevertProxyLayer(options.hubProxies.sessionStatus))
   // `logging` is not a graph node either: it contributes only context references
   // (the file sink + minimum level), so merging it leaves the graph and its
   // node-table assertion untouched. Absent keeps the layer unchanged.
-  const withLogging = options.logging === undefined ? layer : Layer.merge(layer, options.logging)
+  const withLogging = options.logging === undefined ? withClearRevert : Layer.merge(withClearRevert, options.logging)
   // The strict projection authority is a non-graph seam too. Only a BOUND worker
   // (one with a durable session aggregate) may publish session events; an
   // unbound/degraded graph keeps the hub's projection behavior unchanged.

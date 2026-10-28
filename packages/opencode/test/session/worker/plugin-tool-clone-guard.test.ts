@@ -1,4 +1,4 @@
-// PT-5 — the clone guard on the `pluginTool.execute` reply path.
+// The clone guard on the `pluginTool.execute` reply path.
 //
 // `pluginToolAuthority` runs a plugin tool on the hub and returns a clone-safe
 // `{ title, output, metadata, attachments }` that crosses the worker control
@@ -97,7 +97,7 @@ describe("pluginTool.execute reply clone guard", () => {
   })
 
 
-  // W2.1 replaced the structured-clone reply path with a JSON-string boundary:
+  // The structured-clone reply path with a JSON-string boundary:
   // a non-JSON value is rejected by the encoder (ProtocolError) before any
   // post, so there is no DataCloneError fallback frame left to assert. The
   // remote-error contract above and `hub-proxy-clone-failure.test.ts` cover the

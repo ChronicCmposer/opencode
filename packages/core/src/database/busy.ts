@@ -38,7 +38,12 @@ export interface NativeSqliteError {
   readonly name?: unknown
   readonly code?: unknown
   readonly sqliteCode?: unknown
+  /** Bun's `SQLiteError` extended code (`5` = BUSY, `6` = LOCKED). */
   readonly errno?: unknown
+  /** `node:sqlite`'s extended code (`5` = BUSY, `6` = LOCKED). */
+  readonly errcode?: unknown
+  /** `node:sqlite`'s human-readable code text (`"database is locked"`). */
+  readonly errstr?: unknown
   readonly message?: unknown
 }
 
@@ -55,9 +60,19 @@ export function isNativeSqliteError(error: unknown): error is NativeSqliteError 
   const candidate = error as NativeSqliteError
   if (candidate.name === "SQLiteError") return true
   if (typeof candidate.errno === "number") return true
+  // `node:sqlite` reports `errcode`/`errstr` and a generic `ERR_SQLITE_ERROR`
+  // code instead of bun's `SQLITE_*` code + `errno`.
+  if (typeof candidate.errcode === "number") return true
+  if (typeof candidate.errstr === "string") return true
   if (typeof candidate.sqliteCode === "string") return true
   const code = candidate.code
   return (typeof code === "string" && code.startsWith("SQLITE_")) || typeof code === "number"
+}
+
+/** SQLITE_BUSY and SQLITE_LOCKED share this low byte; extended codes pack it. */
+function isBusyNumericCode(code: number): boolean {
+  const primary = code & 0xff
+  return primary === 5 || primary === 6
 }
 
 function hasBusyCode(error: NativeSqliteError): boolean {
@@ -65,13 +80,20 @@ function hasBusyCode(error: NativeSqliteError): boolean {
   if (typeof code === "string" && isBusyCode(code)) return true
   // The writer-side classifier reads `sqliteCode`; mirror that for parity.
   const sqliteCode = error.sqliteCode
-  return typeof sqliteCode === "string" && isBusyCode(sqliteCode)
+  if (typeof sqliteCode === "string" && isBusyCode(sqliteCode)) return true
+  if (typeof error.errno === "number" && isBusyNumericCode(error.errno)) return true
+  if (typeof error.errcode === "number" && isBusyNumericCode(error.errcode)) return true
+  return false
 }
 
 function hasBusyMessage(error: NativeSqliteError): boolean {
   const message = error.message
   if (typeof message !== "string") return false
-  return message.includes("SQLITE_BUSY") || message.includes("SQLITE_LOCKED") || message.includes(LOCKED_MESSAGE)
+  if (message.includes("SQLITE_BUSY") || message.includes("SQLITE_LOCKED") || message.includes(LOCKED_MESSAGE)) {
+    return true
+  }
+  const errstr = error.errstr
+  return typeof errstr === "string" && errstr.includes(LOCKED_MESSAGE)
 }
 
 /**
@@ -84,7 +106,15 @@ function hasBusyMessage(error: NativeSqliteError): boolean {
  */
 export function isBusySqlError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false
-  if (isSqlError(error) && error.reason._tag === "LockTimeoutError") return true
+  if (isSqlError(error)) {
+    if (error.reason._tag === "LockTimeoutError") return true
+    // Effect's `classifySqliteError` does not recognize `node:sqlite`'s
+    // `ERR_SQLITE_ERROR` shape, so it folds the raw driver error into an
+    // `UnknownError` reason. Recover the native cause and classify it here.
+    const cause = (error.reason as { readonly cause?: unknown }).cause
+    if (cause !== undefined) return isNativeSqliteError(cause) && (hasBusyCode(cause) || hasBusyMessage(cause))
+    return false
+  }
   return isNativeSqliteError(error) && (hasBusyCode(error) || hasBusyMessage(error))
 }
 

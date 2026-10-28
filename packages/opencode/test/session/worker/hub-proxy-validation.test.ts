@@ -1,4 +1,4 @@
-// Step 37 — hub-proxy request payload validation and exactly-once replies.
+// Hub-proxy request payload validation and exactly-once replies.
 //
 // The control port is attacker-adjacent: every inbound request payload is
 // validated at the boundary. A missing/non-numeric id is a typed protocol error

@@ -1,4 +1,4 @@
-// W1.2 — BEGIN IMMEDIATE plus bounded whole-transaction retry (D5).
+// BEGIN IMMEDIATE plus bounded whole-transaction retry (D5).
 //
 // A busy write must never be retried one statement at a time: either the whole
 // `BEGIN IMMEDIATE … COMMIT` unit succeeds or it is retried as a unit. A busy

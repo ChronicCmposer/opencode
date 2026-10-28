@@ -1,4 +1,4 @@
-// Shared executor-transport adapter for dispatch test suites (finding #188).
+// Shared executor-transport adapter for dispatch test suites.
 //
 // The `worker/session-execute-worker.ts` fixture speaks the executor protocol
 // over the shared worker harness. Both `execute-worker.test.ts` and

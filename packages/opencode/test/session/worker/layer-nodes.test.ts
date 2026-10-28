@@ -1,4 +1,4 @@
-// Phase 6.3 / 6.5 — node-table validation tests.
+// Node-table validation tests.
 //
 // The table is the mechanical guard that keeps the session worker layer from
 // instantiating hub/writer/broker-owned nodes. These tests pin the pure
@@ -234,7 +234,7 @@ describe("assertSessionLayer", () => {
   })
 })
 
-describe("required session node set (step 29)", () => {
+describe("required session node set", () => {
   test("every required session node is classified (never unknown)", () => {
     for (const key of REQUIRED_SESSION_NODE_KEYS) expect(lookupNode(key)).toBeDefined()
   })

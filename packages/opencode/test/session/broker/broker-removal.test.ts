@@ -1,4 +1,4 @@
-// W4.3 / D20 — the broker is deleted, not disabled.
+// The broker is deleted, not disabled (D20).
 //
 // The tool routing point is the only local/hub decision. A broker file, client,
 // port, layer node, build worker entry, source import, or non-.ts asset cannot
@@ -46,7 +46,7 @@ async function packageFiles(): Promise<string[]> {
   return [...(await filesUnder(src)), ...(await filesUnder(script)), path.join(root, "package.json")]
 }
 
-describe("W4.3 — broker deletion guard", () => {
+describe("broker deletion guard", () => {
   test("the broker source and worker client are gone", async () => {
     expect(await Bun.file(path.join(src, "session/broker/broker.ts")).exists()).toBe(false)
     expect(await Bun.file(path.join(src, "session/broker/broker-worker.ts")).exists()).toBe(false)

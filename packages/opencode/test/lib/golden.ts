@@ -1,4 +1,4 @@
-// Golden-capture helper (plan task 3.12).
+// Golden-capture helper.
 //
 // Records the durable event stream a session pipeline commits so two runs — for
 // example rollout flag off vs flag on — can be compared for FULL-row equivalence.

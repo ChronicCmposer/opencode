@@ -1,4 +1,4 @@
-// Phase 14.1 — the session-worker pool is behind `RuntimeFlags.experimentalSessionWorkers`
+// The session-worker pool is behind `RuntimeFlags.experimentalSessionWorkers`
 // (`OPENCODE_EXPERIMENTAL_SESSION_WORKERS`), defaulting OFF.
 //
 // Two levels of proof:
@@ -10,7 +10,7 @@
 //     dispatches to the pool and the in-hub work effect never runs.
 //
 // The pool here is a spy so "untouched" is an observable fact, not an assumption.
-// This file is the canonical home of the delegation matrix (finding #186); the
+// This file is the canonical home of the delegation matrix; the
 // `startShell`/`cancel` delegation wiring that is unique to the hub lives in
 // `worker/hub-wiring.test.ts`.
 

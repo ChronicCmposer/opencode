@@ -1,4 +1,4 @@
-// Step 2 — harness for the real session-worker entry.
+// Harness for the real session-worker entry.
 //
 // `bootSessionWorker` spawns `src/session/worker/session-worker.ts` with a
 // structured-cloned `SessionWorkerInit` as `workerData`, then waits for the
@@ -7,7 +7,7 @@
 //
 //   * `{type:"ports", egress, egressControl}` — the egress plus dedicated control
 //     relays. D5 removed the writer port/RPC (the worker opens its own WAL
-//     connection) and W4.3 removed the broker;
+//     connection) and the broker removal;
 //   * `{type:"hub-proxy", port}` — the multiplexed hub control link.
 //
 // Those frames are captured from the buffered messages once `ready` arrives; a

@@ -13,7 +13,7 @@
 // fields are normalized before comparing, so only behavioral divergence fails.
 
 import { describe, expect, test } from "bun:test"
-import { Effect } from "effect"
+import { Deferred, Effect, Fiber } from "effect"
 import { SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
 import { normalizeTrace, runScenario, type Scenario } from "../../lib/parity-harness"
@@ -56,6 +56,49 @@ const statusScenario = (directory: string): Scenario<StatusTrace, SessionStatus.
     }),
 })
 
+/**
+ * A live run that is interrupted while busy. The run's finalizer settles the
+ * session to idle, so the observable cancel outcome is "busy then idle" — the
+ * same settlement a worker must perform when its run is cancelled. Reading the
+ * final status back is what makes the hub-proxy and in-process paths comparable.
+ *
+ * The interruption is driven by a `Deferred` readiness signal, not a sleep, so
+ * the cancel can never race the run's start.
+ */
+const cancelScenario = (directory: string): Scenario<StatusTrace, SessionStatus.Service> => ({
+  name: "session-cancel-settles-idle",
+  snapshot: workerSnapshot({ directory }),
+  modelConfig: {
+    providerID: "mock",
+    modelID: "mock",
+    apiId: "mock",
+    baseUrl: "http://127.0.0.1:1",
+    apiKey: "test",
+  },
+  run: () =>
+    Effect.gen(function* () {
+      const status = yield* SessionStatus.Service
+      const sessionID = SessionID.descending()
+      const started = yield* Deferred.make<void>()
+
+      yield* status.set(sessionID, { type: "busy" })
+      const running = yield* Effect.gen(function* () {
+        yield* Deferred.succeed(started, undefined)
+        return yield* Effect.never
+      }).pipe(
+        Effect.ensuring(status.set(sessionID, { type: "idle" })),
+        Effect.exit,
+        Effect.forkChild,
+      )
+
+      yield* Deferred.await(started)
+      yield* Fiber.interrupt(running)
+      const settled = yield* status.get(sessionID)
+
+      return { sessionID, statuses: ["busy", settled.type] }
+    }),
+})
+
 describe("session worker flag parity", () => {
   test("the worker side reports the normalized status lifecycle", async () => {
     await using tmp = await tmpdir()
@@ -80,13 +123,26 @@ describe("session worker flag parity", () => {
     expect(normalizeTrace(on.value)).toEqual(normalizeTrace(off.value))
   }, 60_000)
 
-  // Phase 11 gate: terminate-based cancel + PID reaping must look the same from
-  // both flag states (cancel settles the run, status ends idle/cancelled, no
-  // session is left busy). It is skipped, not failing, because `runScenario`
-  // has no prompt/cancel driver yet: a real cancel needs the provider-driven
-  // session loop in `test/lib/parity-session.ts`.
-  // TODO(Phase 11): add a synchronized cancel scenario (promise-gated prompt,
-  // abort, then await settlement) and assert equal normalized traces; replace
-  // `.skip` with `test` once the driver exists. Do not add fixed sleeps.
-  test.skip("phase 11 gate: cancel settles identically under both flag states", () => {})
+  test("cancelling a live run settles status idle under the worker side", async () => {
+    await using tmp = await tmpdir()
+    const trace = await runScenario(true, cancelScenario(tmp.path))
+
+    expect(trace.flagOn).toBe(true)
+    expect(normalizeTrace(trace.value)).toEqual({
+      sessionID: "ses_<id>",
+      statuses: ["busy", "idle"],
+    })
+  }, 30_000)
+
+  test("flag ON and flag OFF settle a cancelled run identically", async () => {
+    await using tmp = await tmpdir()
+    const scenario = cancelScenario(tmp.path)
+
+    const off = await runScenario(false, scenario)
+    const on = await runScenario(true, scenario)
+
+    expect(off.flagOn).toBe(false)
+    expect(on.flagOn).toBe(true)
+    expect(normalizeTrace(on.value)).toEqual(normalizeTrace(off.value))
+  }, 60_000)
 })

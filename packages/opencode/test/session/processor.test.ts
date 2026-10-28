@@ -209,6 +209,20 @@ const interruptToolLLM = Layer.succeed(
 const interruptToolEnv = LayerNode.compile(root, [...replacements, [LLM.node, interruptToolLLM]])
 const itInterruptTool = testEffect(interruptToolEnv)
 
+// Emits a tool call and then hangs; the test commits its result late, after the
+// old fixed abort window.
+const delayedResultLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(LLMEvent.toolCall({ id: "call-delayed", name: "ledger", input: {} })).pipe(
+        Stream.concat(Stream.fromEffect(Effect.never)),
+      ),
+  }),
+)
+const delayedResultEnv = LayerNode.compile(root, [...replacements, [LLM.node, delayedResultLLM]])
+const itDelayedResult = testEffect(delayedResultEnv)
+
 const streamInput = (sessionID: SessionID, parent: SessionV1.User, model: Provider.Model): LLM.StreamInput => ({
   user: {
     id: parent.id,
@@ -288,9 +302,11 @@ itInterruptTool.live("session.processor cleanup drains a registered settlement i
         const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
 
         const outcomes: Array<"ok" | "error"> = []
-        handle.registerToolSettlement?.("call-interrupt", (outcome) =>
+        handle.registerToolSettlement?.("call-interrupt", (outcome, phase) =>
           Effect.sync(() => {
-            outcomes.push(outcome)
+            // Cleanup owns the abort/result-less path; commit/afterCommit are
+            // reserved for a result that actually committed.
+            if (phase === "settle") outcomes.push(outcome)
           }),
         )
 
@@ -318,4 +334,92 @@ itInterruptTool.live("session.processor cleanup drains a registered settlement i
       }),
     { config: cfg },
   ),
+)
+
+const delayedCallID = "call-delayed"
+
+function findingToolPart(messageID: MessageID) {
+  return MessageV2.parts(messageID).pipe(
+    Effect.map((parts) => parts.find((part): part is SessionV1.ToolPart => part.type === "tool")),
+  )
+}
+
+function runningToolPart(messageID: MessageID) {
+  return findingToolPart(messageID).pipe(Effect.map((part) => (part?.state.status === "running" ? part : undefined)))
+}
+
+itDelayedResult.live(
+  "session.processor cleanup drains a result committed just after the old abort window",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const { processors, session } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "late result")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = testModel
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+          const outcomes: Array<"ok" | "error"> = []
+          handle.registerToolSettlement?.(delayedCallID, (outcome, phase) =>
+            Effect.sync(() => {
+              // `commit` is the durable ledger write; the report/standalone
+              // phases are the settlement decision cleanup observes.
+              if (phase !== "commit") outcomes.push(outcome)
+            }),
+          )
+
+          const run = yield* handle.process(streamInput(chat.id, parent, mdl)).pipe(Effect.forkChild)
+          yield* pollWithTimeout(runningToolPart(msg.id), "timed out waiting for the running tool part")
+
+          // A legitimately slow abort-path result: it lands after the old
+          // fixed 250 ms window but before the settlement drain gives up.
+          yield* handle
+            .completeToolCall(delayedCallID, { title: "delayed", metadata: {}, output: "done" })
+            .pipe(Effect.delay("350 millis"), Effect.forkChild)
+          yield* Fiber.interrupt(run)
+
+          const part = yield* findingToolPart(msg.id)
+          expect(part?.state.status).toBe("completed")
+          expect(outcomes).toEqual(["ok"])
+        }),
+      { config: cfg },
+    ),
+)
+
+itDelayedResult.live(
+  "session.processor cleanup keeps a result that landed before the abort",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const { processors, session } = yield* boot()
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "pre-settled")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = testModel
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+          const outcomes: Array<"ok" | "error"> = []
+          handle.registerToolSettlement?.(delayedCallID, (outcome, phase) =>
+            Effect.sync(() => {
+              if (phase !== "commit") outcomes.push(outcome)
+            }),
+          )
+
+          const run = yield* handle.process(streamInput(chat.id, parent, mdl)).pipe(Effect.forkChild)
+          yield* pollWithTimeout(runningToolPart(msg.id), "timed out waiting for the running tool part")
+
+          yield* handle.completeToolCall(delayedCallID, { title: "done", metadata: {}, output: "done" })
+          yield* Fiber.interrupt(run)
+
+          const part = yield* findingToolPart(msg.id)
+          expect(part?.state.status).toBe("completed")
+          expect(outcomes).toEqual(["ok"])
+        }),
+      { config: cfg },
+    ),
 )

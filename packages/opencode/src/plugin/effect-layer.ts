@@ -33,7 +33,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Service, experimentalWebSocketsEnabled } from "./index"
 import type { TriggerName } from "./index"
-import { assertPluginHookAdmission } from "./routes"
+import { assertPluginHookStartup } from "./routes"
 
 type State = {
   hooks: Hooks[]
@@ -226,12 +226,15 @@ export const effectLayer = Layer.effect(
             Effect.catch(() => Effect.void),
           )
 
-          // A configured plugin that declares an unsupported worker hook stops
-          // startup when workers are enabled. Loading errors above stay loud but
-          // non-fatal; a route gap is a configuration defect with no fallback.
+          // A configured plugin that declares a worker hook with no route at all
+          // stops startup when workers are enabled. A routed-but-unsupported hook
+          // (`command.execute.before`, compaction, `text.complete`) is deferred:
+          // it fails typed only when the worker actually invokes it, so a plugin
+          // that merely declares it does not break startup. Loading errors above
+          // stay loud but non-fatal.
           if (flags.experimentalSessionWorkers) {
             yield* Effect.sync(() => {
-              for (const hook of hooks.slice(firstNewHook)) assertPluginHookAdmission(load.spec, hook)
+              for (const hook of hooks.slice(firstNewHook)) assertPluginHookStartup(load.spec, hook)
             })
           }
         }

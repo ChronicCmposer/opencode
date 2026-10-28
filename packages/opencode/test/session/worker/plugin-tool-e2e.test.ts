@@ -1,4 +1,4 @@
-// PT-4 — plugin-provided tools end to end over a REAL hub-proxy port.
+// Plugin-provided tools end to end over a REAL hub-proxy port.
 //
 // The worker cannot run a plugin tool itself: the plugin instance (and therefore
 // its `execute`) lives on the hub (decision 70). This suite wires the genuine

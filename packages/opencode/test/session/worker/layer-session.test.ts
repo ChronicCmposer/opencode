@@ -1,4 +1,4 @@
-// Wave 4 — session-worker production wiring tests.
+// Session-worker production wiring tests.
 //
 //   * the full `RUNNABLE_SESSION_NODES` graph BOOTS against the functional
 //     boundary layers (BackgroundJob + the 9 excluded nodes);
@@ -372,7 +372,7 @@ describe("full-graph prompt path against the mock provider", () => {
     }
   }, 60_000)
 
-  test("the DEFAULT production boundary carries SessionPrompt.loop past the mock boundary (f-w5)", async () => {
+  test("the DEFAULT production boundary carries SessionPrompt.loop past the mock boundary", async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-layer-default-"))
     await using provider = startMockProvider({ chunks: ["pas", "t"] })
     const snapshot = workerSnapshot({ directory })
@@ -396,7 +396,7 @@ describe("full-graph prompt path against the mock provider", () => {
         // and LSP are intentionally left to `boundaryReplacements`.
         replacements: [
           ...workerGraphReplacements(config),
-          // PENDING-plugin (W4.1): keep this boundary test focused on MCP/LSP
+          // PENDING-plugin: keep this boundary test focused on MCP/LSP
           // while the remaining invoked hooks gain routes.
           pluginPassThroughReplacement(),
         ],
