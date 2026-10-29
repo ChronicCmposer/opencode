@@ -25,6 +25,17 @@ export interface Interface {
   readonly init: () => Effect.Effect<void>
 }
 
+const hookNames = new WeakMap<Hooks, string>()
+
+/** Record the display name (internal plugin name or config specifier) of a loaded plugin's hooks. */
+export function nameHooks(hooks: Hooks, name: string) {
+  hookNames.set(hooks, name)
+}
+
+export function hooksName(hooks: Hooks): string | undefined {
+  return hookNames.get(hooks)
+}
+
 export class Service extends Context.Service<Service, Interface>()("@opencode/Plugin") {}
 
 export function experimentalWebSocketsEnabled(input: { enabled: boolean; channel?: string }) {

@@ -377,7 +377,7 @@ export type {
 } from "./hub-proxy-wire"
 
 /** Rebuild a hub authority's typed domain error from its wire form. */
-function restoreHubProxyError(error: unknown): Error {
+export function restoreHubProxyError(error: unknown): Error {
   if (!(error instanceof HubProxyRemoteError)) return error instanceof Error ? error : new Error(String(error))
   switch (error.tag) {
     case "PermissionRejectedError":

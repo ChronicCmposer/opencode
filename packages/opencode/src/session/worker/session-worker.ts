@@ -80,6 +80,7 @@ import {
   reducedLlmLayer,
   reducedModelProviderLayer,
   refreshablePluginTools,
+  restoreHubProxyError,
   type HubProxyClient,
   type HubProxyClients,
   type PipelineMessage,
@@ -1149,17 +1150,21 @@ export function hubProxyPluginTool(hubProxy: HubProxyClient | undefined): Plugin
   if (hubProxy === undefined) return undefined
   return {
     execute: (input, onProgress) =>
-      hubProxy.call(
-        "pluginTool.execute",
-        [input],
-        // The hub streams mid-execute `ToolContext.metadata` updates back as
-        // `pluginTool.metadata` event frames; every other event method is for a
-        // different concern and is dropped. The sink is optional, so a caller
-        // that does not surface progress pays nothing.
-        (method, payload) => {
-          if (method === "pluginTool.metadata") onProgress?.(payload as PluginToolProgress)
-        },
-      ) as Promise<PluginToolExecuteResult>,
+      hubProxy
+        .call(
+          "pluginTool.execute",
+          [input],
+          // The hub streams mid-execute `ToolContext.metadata` updates back as
+          // `pluginTool.metadata` event frames; every other event method is for a
+          // different concern and is dropped. The sink is optional, so a caller
+          // that does not surface progress pays nothing.
+          (method, payload) => {
+            if (method === "pluginTool.metadata") onProgress?.(payload as PluginToolProgress)
+          },
+        )
+        .catch((error: unknown) => {
+          throw restoreHubProxyError(error)
+        }) as Promise<PluginToolExecuteResult>,
   }
 }
 

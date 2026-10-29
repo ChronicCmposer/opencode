@@ -31,7 +31,7 @@ import { registerAdapter } from "@/control-plane/adapters"
 import type { WorkspaceAdapter } from "@/control-plane/types"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { Service, experimentalWebSocketsEnabled } from "./index"
+import { Service, experimentalWebSocketsEnabled, nameHooks } from "./index"
 import type { TriggerName } from "./index"
 import { assertPluginHookStartup } from "./routes"
 
@@ -161,7 +161,10 @@ export const effectLayer = Layer.effect(
             Effect.tapError((error) => Effect.logError("failed to load internal plugin", { name: plugin.name, error })),
             Effect.option,
           )
-          if (init._tag === "Some") hooks.push(init.value)
+          if (init._tag === "Some") {
+            hooks.push(init.value)
+            nameHooks(init.value, plugin.name)
+          }
         }
 
         const plugins = flags.pure ? [] : (cfg.plugin_origins ?? [])
@@ -225,6 +228,8 @@ export const effectLayer = Layer.effect(
             }),
             Effect.catch(() => Effect.void),
           )
+
+          for (const hook of hooks.slice(firstNewHook)) nameHooks(hook, load.spec)
 
           // A configured plugin that declares a worker hook with no route at all
           // stops startup when workers are enabled. A routed-but-unsupported hook

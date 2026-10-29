@@ -40,6 +40,8 @@ export interface MockProviderOptions extends MockProviderScript {
   /** Per-request scripts; the last one repeats once the queue drains. */
   readonly scripts?: readonly MockProviderScript[]
   readonly hostname?: string
+  /** Pick a script from the request body; `undefined` falls back to the queued scripts. */
+  readonly select?: (body: Record<string, unknown>) => MockProviderScript | undefined
 }
 
 /** One observed request, for assertions. */
@@ -195,7 +197,7 @@ export function startMockProvider(options: MockProviderOptions = {}): MockProvid
       requests.push({ url: url.pathname, authorization: request.headers.get("authorization") ?? undefined, body })
       settleWaits()
 
-      const script = scriptFor(scripts, requests.length - 1)
+      const script = options.select?.(body) ?? scriptFor(scripts, requests.length - 1)
       if (script.status !== undefined) {
         return new Response(JSON.stringify(script.errorBody ?? {}), {
           status: script.status,

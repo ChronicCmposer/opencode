@@ -202,7 +202,12 @@ const resolveContextPluginSources = Effect.fn("ProductionHub.resolveContextPlugi
   if (Option.isNone(plugin)) return undefined
   const hooks = yield* Effect.provide(plugin.value.list(), context)
   if (hooks.length === 0) return undefined
-  return hooks.map((hook, index): WorkerPluginSource => ({ name: `plugin-${index}`, hooks: hook as WorkerPluginHooks }))
+  return hooks.map(
+    (hook, index): WorkerPluginSource => ({
+      name: Plugin.hooksName(hook) ?? `plugin-${index}`,
+      hooks: hook as WorkerPluginHooks,
+    }),
+  )
 })
 
 export interface WorkerCancellationOptions {

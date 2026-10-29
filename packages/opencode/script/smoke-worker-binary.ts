@@ -23,11 +23,11 @@
 //
 // Exit code is 0 on PASS and 1 on FAIL; both print a human-readable report.
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
-import { startMockProvider } from "../test/lib/mock-provider"
+import { startMockProvider, type MockProviderScript } from "../test/lib/mock-provider"
 import { readSsePayloads } from "../test/lib/sse"
 import { testProviderConfig } from "../test/lib/test-provider"
 
@@ -67,6 +67,11 @@ const SMOKE_PLUGIN = `export default async () => ({
   "experimental.compaction.autocontinue": async () => {},
 })
 `
+
+/** Prompt marker that makes the mock model call the write tool. */
+const TOOL_TURN_PROMPT = "Write the smoke file."
+const TOOL_TURN_FILE = "smoke-tool.txt"
+const TOOL_TURN_CONTENT = "written by the smoke tool turn"
 
 const SERVER_PASSWORD = "smoke-worker-gate"
 const SERVER_USERNAME = "opencode"
@@ -195,8 +200,13 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
     throw new Error(`packaged binary not found at ${binary}; build it first (bun run script/build.ts --single)`)
   }
 
-  await using provider = startMockProvider({ chunks: ["Hel", "lo"] })
-  const home = mkdtempSync(path.join(tmpdir(), "oc-smoke-worker-"))
+  const home = realpathSync(mkdtempSync(path.join(tmpdir(), "oc-smoke-worker-")))
+  const worktree = path.join(home, "worktree")
+  const toolTurnPath = path.join(worktree, TOOL_TURN_FILE)
+  await using provider = startMockProvider({
+    chunks: ["Hel", "lo"],
+    select: (body) => selectToolTurnScript(body, toolTurnPath),
+  })
   const pluginFile = path.join(home, "smoke-plugin.js")
   writeFileSync(pluginFile, SMOKE_PLUGIN)
   const configJSON = JSON.stringify({
@@ -204,8 +214,9 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
     model: "test/test-model",
     plugin: [pathToFileURL(pluginFile).href],
   })
-  const worktree = path.join(home, "worktree")
   mkdirSync(worktree, { recursive: true })
+  const git = Bun.spawnSync(["git", "init", "--quiet"], { cwd: worktree })
+  if (git.exitCode !== 0) throw new Error(`git init failed: ${git.stderr.toString()}`)
 
   const stdout: string[] = []
   const stderr: string[] = []
@@ -271,6 +282,17 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
     if (!markerSeen) missing.push(`text.complete marker ${TEXT_COMPLETE_MARKER}`)
     // A failed turn still streams parts and goes idle; the error only shows as this event.
     if (eventTypeSeen.has("session.error")) missing.push("no session.error")
+
+    // Tool turn: a second session in the git-initialized worktree writes a file.
+    const toolSession = await createSession(url, worktree)
+    await promptAsync(url, worktree, toolSession, TOOL_TURN_PROMPT)
+    const toolDeadline = Date.now() + EVENT_TIMEOUT_MS
+    while (Date.now() < toolDeadline && !toolTurnWrote(toolTurnPath)) await sleep(POLL_INTERVAL_MS)
+    if (!toolTurnWrote(toolTurnPath)) missing.push(`tool turn write of ${TOOL_TURN_FILE}`)
+    // Let the follow-up reply land so a late failure still shows up as session.error.
+    await sleep(1_000)
+    if (eventTypeSeen.has("session.error") && !missing.includes("no session.error")) missing.push("no session.error")
+
     const signatures = findSignatures(stdout, stderr)
     const passed = missing.length === 0 && signatures.length === 0
     return result(passed, {
@@ -298,6 +320,34 @@ interface KillableServer {
   readonly exitCode: number | null
   readonly exited: Promise<number>
   readonly kill: (signal?: number | NodeJS.Signals) => void
+}
+
+/**
+ * Script for the tool-turn prompt only: the first model request calls `write`,
+ * the follow-up (last message is the tool result) replies with text. Title and
+ * other tool-less requests, and the plain greeting prompt, use the default script.
+ */
+function selectToolTurnScript(body: Record<string, unknown>, filePath: string): MockProviderScript | undefined {
+  const tools = body["tools"]
+  if (!Array.isArray(tools) || tools.length === 0) return undefined
+  const messages = Array.isArray(body["messages"])
+    ? (body["messages"] as Array<{ role?: unknown; content?: unknown }>)
+    : []
+  if (!JSON.stringify(messages).includes(TOOL_TURN_PROMPT)) return undefined
+  if (messages.at(-1)?.role === "tool") return { chunks: ["Wrote the file."] }
+  return {
+    toolCalls: [
+      {
+        id: "call_smoke_write",
+        name: "write",
+        arguments: JSON.stringify({ filePath, content: TOOL_TURN_CONTENT }),
+      },
+    ],
+  }
+}
+
+function toolTurnWrote(filePath: string): boolean {
+  return existsSync(filePath) && readFileSync(filePath, "utf8") === TOOL_TURN_CONTENT
 }
 
 /** Terminate the child, escalating to SIGKILL so a wedged server cannot hang the gate. */
@@ -336,13 +386,18 @@ async function createSession(url: string, directory: string): Promise<string> {
   return body.id
 }
 
-async function promptAsync(url: string, directory: string, sessionID: string): Promise<void> {
+async function promptAsync(
+  url: string,
+  directory: string,
+  sessionID: string,
+  text = "Reply with a short greeting.",
+): Promise<void> {
   const response = await fetch(`${url}/session/${sessionID}/prompt_async`, {
     method: "POST",
     headers: { ...authHeaders(), "content-type": "application/json", "x-opencode-directory": directory },
     body: JSON.stringify({
       model: { providerID: "test", modelID: "test-model" },
-      parts: [{ type: "text", text: "Reply with a short greeting." }],
+      parts: [{ type: "text", text }],
     }),
   })
   if (response.status !== 204) {

@@ -11,7 +11,9 @@
 //   * all three degrade to `undefined` without a hub client.
 
 import { describe, expect, test } from "bun:test"
-import type { HubProxyClient, HubProxyMethod } from "@/session/worker/hub-proxy-wire"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { Question } from "@/question"
+import { HubProxyRemoteError, type HubProxyClient, type HubProxyMethod } from "@/session/worker/hub-proxy-wire"
 import {
   hubProxyPluginTool,
   hubProxyPluginToolAbort,
@@ -108,6 +110,32 @@ describe("hubProxyPluginTool progress forwarding", () => {
     await executor.execute(input)
 
     expect(calls).toEqual([{ method: "pluginTool.execute", args: [input] }])
+  })
+})
+
+describe("hubProxyPluginTool typed errors", () => {
+  const failing = (tag: string, data?: unknown): HubProxyClient => ({
+    call: async () => {
+      throw new HubProxyRemoteError("hub failure", { tag, data })
+    },
+    dispose: () => {},
+  })
+
+  test("restores permission and question rejections so the processor blocks the loop", async () => {
+    const run = (tag: string, data?: unknown) => hubProxyPluginTool(failing(tag, data))!.execute(input)
+    expect(await run("PermissionRejectedError").catch((e) => e)).toBeInstanceOf(PermissionV1.RejectedError)
+    const corrected = await run("PermissionCorrectedError", { feedback: "use b" }).catch((e) => e)
+    expect(corrected).toBeInstanceOf(PermissionV1.CorrectedError)
+    expect(corrected.feedback).toBe("use b")
+    expect(await run("QuestionRejectedError").catch((e) => e)).toBeInstanceOf(Question.RejectedError)
+  })
+
+  test("keeps the unknown-plugin-tool signal as a remote error", async () => {
+    const error = await hubProxyPluginTool(failing("HubProxyAuthorities.UnknownPluginTool"))!
+      .execute(input)
+      .catch((e) => e)
+    expect(error).toBeInstanceOf(HubProxyRemoteError)
+    expect(error.tag).toBe("HubProxyAuthorities.UnknownPluginTool")
   })
 })
 
