@@ -25,14 +25,14 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionRevert") {}
 
 /**
- * Clears the `revert` column. The column is hub authority: a bound worker may
- * not publish a `session.updated` that rewrites it to `null`, because the
- * worker projection policy rejects any actual change to `revert`. The worker
- * graph supplies a hub-proxy implementation; on the hub the authority is absent
- * and `Session.clearRevert` is the real writer.
+ * Hub authority for discarding a staged revert. `revert` is a hub column, so a
+ * bound worker may not publish a `session.updated` that clears it; the worker
+ * graph supplies a hub-proxy implementation and the hub applies the deletion and
+ * the clear in one database transaction. On the hub the authority is absent and
+ * `Session.discardReverted` is the real writer.
  */
 export interface ClearRevertInterface {
-  readonly clear: (sessionID: SessionID) => Effect.Effect<void>
+  readonly discard: (input: Session.DiscardReverted) => Effect.Effect<void>
 }
 
 export class ClearRevertAuthority extends Context.Service<ClearRevertAuthority, ClearRevertInterface>()(
@@ -49,15 +49,11 @@ const layer = Layer.effect(
     const summary = yield* SessionSummary.Service
     const state = yield* SessionRunState.Service
 
-    /**
-     * Clear through the graph-provided authority when present (a bound worker
-     * must ask the hub), otherwise through the hub's real `Session.clearRevert`.
-     */
-    const clearRevert = (sessionID: SessionID): Effect.Effect<void> =>
+    const discard = (input: Session.DiscardReverted): Effect.Effect<void> =>
       Effect.gen(function* () {
         const authority = yield* Effect.serviceOption(ClearRevertAuthority)
-        if (Option.isSome(authority)) return yield* authority.value.clear(sessionID)
-        return yield* sessions.clearRevert(sessionID)
+        if (Option.isSome(authority)) return yield* authority.value.discard(input)
+        return yield* sessions.discardReverted(input)
       })
 
     const revert = Effect.fn("SessionRevert.revert")(function* (input: RevertInput) {
@@ -119,17 +115,11 @@ const layer = Layer.effect(
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       if (!session.revert) return session
       if (session.revert.snapshot) yield* snap.restore(session.revert.snapshot)
-      yield* clearRevert(input.sessionID)
+      yield* discard({ sessionID: input.sessionID, messageIDs: [], parts: [] })
       return yield* sessions.get(input.sessionID).pipe(Effect.orDie)
     })
 
-    /**
-     * Apply a staged revert. The clear is committed **first**: if the process
-     * dies or the hub clear fails after that, the session no longer points at
-     * rows that may already be gone. A crash after the clear leaves the suffix
-     * in place (a retry finds no revert and is a safe no-op) instead of leaving
-     * a dangling revert pointer at deleted rows.
-     */
+    /** The revert clear and every deletion commit together, so no revert pointer dangles at deleted rows. */
     const cleanup = Effect.fn("SessionRevert.cleanup")(function* (session: Session.Info) {
       if (!session.revert) return
       const sessionID = session.id
@@ -138,21 +128,13 @@ const layer = Layer.effect(
       const index = msgs.findIndex((msg) => msg.info.id === messageID)
       const target = index < 0 ? undefined : msgs[index]
       const remove = index < 0 ? [] : msgs.slice(index + (session.revert.partID ? 1 : 0))
-      yield* clearRevert(sessionID)
-      for (const msg of remove) {
-        yield* sessions.removeMessage({ sessionID, messageID: msg.info.id })
-      }
-      if (session.revert.partID && target) {
-        const partID = session.revert.partID
-        const idx = target.parts.findIndex((part) => part.id === partID)
-        if (idx >= 0) {
-          const removeParts = target.parts.slice(idx)
-          target.parts = target.parts.slice(0, idx)
-          for (const part of removeParts) {
-            yield* sessions.removePart({ sessionID, messageID: target.info.id, partID: part.id })
-          }
-        }
-      }
+      const partID = session.revert.partID
+      const partIdx = partID && target ? target.parts.findIndex((part) => part.id === partID) : -1
+      const parts =
+        target && partIdx >= 0
+          ? target.parts.slice(partIdx).map((part) => ({ messageID: target.info.id, partID: part.id }))
+          : []
+      yield* discard({ sessionID, messageIDs: remove.map((msg) => msg.info.id), parts })
     })
 
     return Service.of({ revert, unrevert, cleanup })

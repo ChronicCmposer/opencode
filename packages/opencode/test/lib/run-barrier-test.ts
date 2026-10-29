@@ -85,12 +85,14 @@ export function reportRun(run: RunBarrierRun, reports: RunPhaseReports = {}): Ru
 }
 
 /** Open a run, report it, and wait for the real service to admit the next one. */
-export function drainRun(barrier: RunBarrier.Interface, sessionID: string, reports: RunPhaseReports = {}) {
-  return Effect.suspend(() => {
-    reportRun(barrier.beginRun(sessionID), reports)
-    return barrier.wait(sessionID)
-  })
-}
+export const drainRun = Effect.fn("test.drainRun")(function* (
+  barrier: RunBarrier.Interface,
+  sessionID: string,
+  reports: RunPhaseReports = {},
+) {
+  reportRun(yield* barrier.beginRun(sessionID), reports)
+  return yield* barrier.wait(sessionID)
+})
 
 /** Advance the test clock past the barrier's typed 5 s bound. */
 export const advanceBarrierTimeout = () => TestClock.adjust(RUN_BARRIER_TIMEOUT_MS)

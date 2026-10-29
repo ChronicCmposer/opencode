@@ -117,12 +117,12 @@ describe("Step 5 dispatch idiom", () => {
     // A barrier that settles immediately: the test observes the report the hub
     // hands it, not a real 5 s drain.
     const barrier = {
-      beginRun: () => runHandle,
+      beginRun: () => Effect.succeed(runHandle),
       wait: () => Effect.succeed({ sessionID, status: "drained" as const }),
       cancel: () => Effect.void,
       state: () => "idle" as const,
-      reset: () => undefined,
-      abandon: () => undefined,
+      reset: () => Effect.void,
+      abandon: () => Effect.void,
       get size() {
         return 0
       },

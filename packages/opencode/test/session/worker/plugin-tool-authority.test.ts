@@ -112,7 +112,7 @@ describe("resolveContextPluginToolDescriptors", () => {
     ])
     const context = Context.make(Plugin.Service, plugin) as unknown as Context.Context<never>
 
-    const descriptors = await resolveContextPluginToolDescriptors(context)
+    const descriptors = await Effect.runPromise(resolveContextPluginToolDescriptors(context))
 
     expect(descriptors.map((descriptor) => descriptor.id)).toEqual(["compress", "prune"])
     expect(descriptors[0]?.description).toBe("compress a range")
@@ -120,9 +120,9 @@ describe("resolveContextPluginToolDescriptors", () => {
   })
 
   test("no context or no plugin: resolves to no descriptors", async () => {
-    expect(await resolveContextPluginToolDescriptors(undefined)).toEqual([])
+    expect(await Effect.runPromise(resolveContextPluginToolDescriptors(undefined))).toEqual([])
 
     const context = Context.make(Plugin.Service, fakePlugin([])) as unknown as Context.Context<never>
-    expect(await resolveContextPluginToolDescriptors(context)).toEqual([])
+    expect(await Effect.runPromise(resolveContextPluginToolDescriptors(context))).toEqual([])
   })
 })

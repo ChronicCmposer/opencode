@@ -148,7 +148,10 @@ export class ParentCrashedError extends SessionCancelledError {
     readonly parentSessionID: SessionID,
     readonly childSessionID: SessionID,
   ) {
-    super({ message: `parent session ${parentSessionID} crashed; child ${childSessionID} was cancelled`, sessionID: childSessionID })
+    super({
+      message: `parent session ${parentSessionID} crashed; child ${childSessionID} was cancelled`,
+      sessionID: childSessionID,
+    })
     this.name = "ParentCrashedError"
   }
 }
@@ -240,9 +243,9 @@ export interface DispatcherOptions {
    */
   readonly writeBarrierTimeoutMs?: number
   /**
-   * Refuse a run whose bundle can no longer be admitted (e.g. a compiled
-   * `BuildMismatch`). Checked before every waiter promotion, not only at hub
-   * entry: a run that parks behind a crash must not respawn the stale bundle.
+   * Refuse a run that can no longer be admitted. Checked before every waiter
+   * promotion, not only at hub entry, so a run parked behind a crash is
+   * re-checked before it spawns.
    */
   readonly assertAdmissible?: (sessionID: SessionID) => void
   /** Hub-side cleanup when a session's worker is retired (reap/cancel/crash). */
@@ -291,10 +294,7 @@ export interface DispatcherOptions {
    * returned promise is the resumed run: the original crashed caller waits for
    * it instead of observing `WorkerCrashedError` while its replacement runs.
    */
-  readonly onAutoResume?: (
-    decision: Extract<AutoResumeDecision, { resume: true }>,
-    payload: WorkerCrashed,
-  ) => unknown
+  readonly onAutoResume?: (decision: Extract<AutoResumeDecision, { resume: true }>, payload: WorkerCrashed) => unknown
   /**
    * The hub's authoritative commit outcome for a completed run, read before the
    * hub deletes its active-run record. Carried into the barrier and the run's
@@ -541,11 +541,7 @@ function buildDispatcher(
    * The deadline is Effect's interruptible clock, not a raw host timer: the
    * timeout fiber is interrupted the moment the source settles.
    */
-  const boundedPromise = <A>(
-    promise: Promise<A>,
-    timeoutMs: number,
-    onTimeout: () => void,
-  ): Promise<A | undefined> => {
+  const boundedPromise = <A>(promise: Promise<A>, timeoutMs: number, onTimeout: () => void): Promise<A | undefined> => {
     /**
      * Run the deadline diagnostic without letting it escape. From an Effect
      * timeout callback a throw would be a defect that still resolves the caller
@@ -830,11 +826,7 @@ function buildDispatcher(
         // Effect log inside the retirement carries the ids the forwarding logger
         // renders into the user-visible prefix.
         Effect.annotateLogs({ sessionID, workerID: worker.id }),
-        Effect.onExit(() =>
-          Effect.uninterruptible(
-            releaseEffect.pipe(Effect.andThen(Effect.sync(completeRetired))),
-          ),
-        ),
+        Effect.onExit(() => Effect.uninterruptible(releaseEffect.pipe(Effect.andThen(Effect.sync(completeRetired))))),
       ),
     )
     return scope === "generation" ? runPromise(Deferred.await(exit)) : Promise.resolve()
@@ -1019,13 +1011,14 @@ function buildDispatcher(
         Effect.timeoutOrElse({
           duration: terminateTimeoutMs,
           orElse: () =>
-            Effect.sync(() =>
-              void bridge?.fork(
-                Effect.logWarning(workerLogMessage("retirement barrier timed out"), {
-                  sessionID,
-                  timeoutMs: terminateTimeoutMs,
-                }),
-              ),
+            Effect.sync(
+              () =>
+                void bridge?.fork(
+                  Effect.logWarning(workerLogMessage("retirement barrier timed out"), {
+                    sessionID,
+                    timeoutMs: terminateTimeoutMs,
+                  }),
+                ),
             ),
         }),
       ),
@@ -1046,10 +1039,7 @@ function buildDispatcher(
     rejectRun(pending, cancelled(pending.sessionID))
   }
 
-  const start = (
-    pending: Pending,
-    startOptions: { readonly permitLiveRetirement?: boolean } = {},
-  ): void => {
+  const start = (pending: Pending, startOptions: { readonly permitLiveRetirement?: boolean } = {}): void => {
     // The build guard is user code: run it before mutating ownership, so a guard
     // that re-enters dispatch/terminateAll cannot observe a half-written state.
     const blocked = terminated ? undefined : inadmissible(pending.sessionID)
@@ -1082,8 +1072,7 @@ function buildDispatcher(
     // check above happened before it ran, so re-check before spawning: the
     // successor must wait for the old close and lease release. A retirement that
     // already timed out is bypassed explicitly (it stays visible for diagnostics).
-    const replaced =
-      startOptions.permitLiveRetirement === true ? undefined : retiringDone.get(pending.sessionID)
+    const replaced = startOptions.permitLiveRetirement === true ? undefined : retiringDone.get(pending.sessionID)
     if (replaced !== undefined) {
       deferUntilRetired(pending, replaced)
       return
@@ -1152,7 +1141,8 @@ function buildDispatcher(
       Deferred.doneUnsafe(pending.barrierDone, Effect.void)
     }
     const reported = pool.resultFor?.(pending.sessionID)?.committed
-    const carried = options.commitOutcome?.(pending.sessionID) ?? (reported === undefined ? undefined : { committed: reported })
+    const carried =
+      options.commitOutcome?.(pending.sessionID) ?? (reported === undefined ? undefined : { committed: reported })
     let barrier: Promise<void> | undefined
     try {
       barrier = writeBarrier?.(pending.sessionID, carried)
@@ -1172,13 +1162,16 @@ function buildDispatcher(
       finish()
       return
     }
-    void boundedPromise(barrier, writeBarrierTimeoutMs, () =>
-      void bridge?.fork(
-        Effect.logWarning(workerLogMessage("session write barrier timed out"), {
-          sessionID: pending.sessionID,
-          timeoutMs: writeBarrierTimeoutMs,
-        }),
-      ),
+    void boundedPromise(
+      barrier,
+      writeBarrierTimeoutMs,
+      () =>
+        void bridge?.fork(
+          Effect.logWarning(workerLogMessage("session write barrier timed out"), {
+            sessionID: pending.sessionID,
+            timeoutMs: writeBarrierTimeoutMs,
+          }),
+        ),
     ).then(finish, finish)
   }
 
@@ -1249,10 +1242,8 @@ function buildDispatcher(
       inFlightCallIDs: reported?.inFlightCallIDs ?? state?.inFlightCallIDs ?? [],
       reason: reported?.reason ?? describeFailure(error),
     })
-    // Carry the typed underlying failure (e.g. `BuildMismatch`) on the in-memory
-    // payload without changing its observable/persisted shape. The resume
-    // decision reads it to return the typed cause as-is instead of re-classifying
-    // a string reason.
+    // Carry the typed underlying failure on the in-memory payload without
+    // changing its observable/persisted shape.
     const cause = reported?.cause ?? error
     if (cause instanceof Error) {
       Object.defineProperty(payload, "cause", { value: cause, enumerable: false, configurable: false })
@@ -1408,24 +1399,17 @@ function buildDispatcher(
       options.recordCrash?.(payload)
       options.onCrash?.(payload)
       const cause = error instanceof WorkerCrashedError ? (error.cause ?? error) : error
-      const failure =
-        errorTagOf(cause) === "BuildMismatch" && cause instanceof Error
-          ? // A stale bundle is a typed, non-retryable failure: return it as-is
-            // (the hub's resume decision also blocks a respawn until it changes).
-            cause
-          : new WorkerCrashedError({
-              message:
-                error instanceof WorkerCrashedError
-                  ? error.message
-                  : `worker ${payload.workerID} crashed: ${payload.reason}`,
-              workerID: payload.workerID,
-              sessionID: payload.sessionID,
-              phase: payload.phase,
-              lastCommittedMessageID: payload.lastCommittedMessageID,
-              inFlightCallIDs: payload.inFlightCallIDs,
-              reason: payload.reason,
-              cause,
-            })
+      const failure = new WorkerCrashedError({
+        message:
+          error instanceof WorkerCrashedError ? error.message : `worker ${payload.workerID} crashed: ${payload.reason}`,
+        workerID: payload.workerID,
+        sessionID: payload.sessionID,
+        phase: payload.phase,
+        lastCommittedMessageID: payload.lastCommittedMessageID,
+        inFlightCallIDs: payload.inFlightCallIDs,
+        reason: payload.reason,
+        cause,
+      })
       crashChildren(pending.sessionID)
       retireWorker(pending.sessionID)
       const decision = options.resumeDecision?.(payload)
@@ -1444,14 +1428,17 @@ function buildDispatcher(
         // Effect clock bounds it and a late answer cannot settle twice.
         const decisionWindow =
           resumeDecisionTimeoutMs > 0
-            ? boundedPromise(decision, resumeDecisionTimeoutMs, () =>
-                void bridge?.fork(
-                  Effect.logWarning(workerLogMessage("resume decision timed out"), {
-                    sessionID: pending.sessionID,
-                    workerID: payload.workerID,
-                    timeoutMs: resumeDecisionTimeoutMs,
-                  }),
-                ),
+            ? boundedPromise(
+                decision,
+                resumeDecisionTimeoutMs,
+                () =>
+                  void bridge?.fork(
+                    Effect.logWarning(workerLogMessage("resume decision timed out"), {
+                      sessionID: pending.sessionID,
+                      workerID: payload.workerID,
+                      timeoutMs: resumeDecisionTimeoutMs,
+                    }),
+                  ),
               )
             : decision
         void decisionWindow.then(
@@ -1488,14 +1475,13 @@ function buildDispatcher(
     // A settlement can admit a successor as a side effect (auto-resume dispatches
     // synchronously), so a parked waiter must never overwrite a live owner.
     const parked = runs.has(sessionID) ? undefined : waiters.get(sessionID)
-    const decision: NextWaiterDecision =
-      runs.has(sessionID)
-        ? { kind: "owned" }
-        : parked === undefined || parked.length === 0
-          ? { kind: "idle" }
-          : blocked !== undefined
-            ? { kind: "blocked", error: blocked, waiters: parked }
-            : { kind: "promote", next: parked[0], remaining: parked.length - 1 }
+    const decision: NextWaiterDecision = runs.has(sessionID)
+      ? { kind: "owned" }
+      : parked === undefined || parked.length === 0
+        ? { kind: "idle" }
+        : blocked !== undefined
+          ? { kind: "blocked", error: blocked, waiters: parked }
+          : { kind: "promote", next: parked[0], remaining: parked.length - 1 }
     if (decision.kind === "blocked") waiters.delete(sessionID)
     if (decision.kind === "promote") {
       const remaining = parked!.slice(1)
@@ -1578,13 +1564,16 @@ function buildDispatcher(
     }
 
     if (barrierInFlight && owned !== undefined) {
-      await boundedPromise(owned.barrierDonePromise, writeBarrierTimeoutMs, () =>
-        void bridge?.fork(
-          Effect.logWarning(workerLogMessage("session write barrier timed out"), {
-            sessionID,
-            timeoutMs: writeBarrierTimeoutMs,
-          }),
-        ),
+      await boundedPromise(
+        owned.barrierDonePromise,
+        writeBarrierTimeoutMs,
+        () =>
+          void bridge?.fork(
+            Effect.logWarning(workerLogMessage("session write barrier timed out"), {
+              sessionID,
+              timeoutMs: writeBarrierTimeoutMs,
+            }),
+          ),
       )
     }
 
@@ -1874,9 +1863,7 @@ function buildDispatcher(
       Effect.forEach(
         exits,
         (exit) =>
-          Deferred.await(exit).pipe(
-            Effect.timeoutOrElse({ duration: terminateTimeoutMs, orElse: () => Effect.void }),
-          ),
+          Deferred.await(exit).pipe(Effect.timeoutOrElse({ duration: terminateTimeoutMs, orElse: () => Effect.void })),
         { concurrency: "unbounded", discard: true },
       ),
     )
@@ -1884,10 +1871,10 @@ function buildDispatcher(
     // Release timers and standby fibers; a wedged release is bounded by the
     // timeout rather than awaited forever.
     await runPromise(
-      Effect.all(
-        [FiberMap.clear(engine.reaping), FiberSet.clear(engine.background)],
-        { concurrency: "unbounded", discard: true },
-      ).pipe(Effect.timeoutOrElse({ duration: terminateTimeoutMs, orElse: () => Effect.void })),
+      Effect.all([FiberMap.clear(engine.reaping), FiberSet.clear(engine.background)], {
+        concurrency: "unbounded",
+        discard: true,
+      }).pipe(Effect.timeoutOrElse({ duration: terminateTimeoutMs, orElse: () => Effect.void })),
     )
     await pool.terminateAll().catch(() => undefined)
     cancellation?.reapAll?.()
@@ -1910,8 +1897,7 @@ function buildDispatcher(
     registry: workers,
     workerForSession: (sessionID) => workers.get(sessionID)?.workerID,
     dispatch,
-    dispatchEffect: (request) =>
-      Effect.tryPromise({ try: () => dispatch(request), catch: (error) => error }),
+    dispatchEffect: (request) => Effect.tryPromise({ try: () => dispatch(request), catch: (error) => error }),
     cancel,
     cancelWithGrace,
     retire,
@@ -1956,7 +1942,8 @@ export const layer = (options: DispatcherOptions): Layer.Layer<Service> =>
     }),
   )
 
-export const node = (options: DispatcherOptions) => LayerNode.make({ service: Service, layer: layer(options), deps: [] })
+export const node = (options: DispatcherOptions) =>
+  LayerNode.make({ service: Service, layer: layer(options), deps: [] })
 
 /**
  * Compatibility constructor for callers that still hold a Promise-shaped

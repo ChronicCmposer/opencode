@@ -2786,7 +2786,7 @@ describe("lifecycle reports are bound to the reporting worker's session", () => 
   })
 })
 
-describe("session.clearRevert is a hub authority bound to the worker's session", () => {
+describe("session.discardReverted is a hub authority bound to the worker's session", () => {
   test("the bound session clears; a foreign session is rejected before the authority runs", async () => {
     const cleared: string[] = []
     const authorities = hubProxyAuthoritiesFor({
@@ -2811,14 +2811,16 @@ describe("session.clearRevert is a hub authority bound to the worker's session",
         reject: () => Effect.succeed(undefined as never),
         list: () => Effect.succeed([]),
       },
-      clearRevert: async (sessionID) => {
-        cleared.push(sessionID)
+      discardReverted: async (request) => {
+        cleared.push(request.sessionID)
       },
     })
 
-    await authorities.clearRevert!("ses_revert_own")
+    await authorities.discardReverted!({ sessionID: "ses_revert_own", messageIDs: ["msg_1"], parts: [] })
     expect(cleared).toEqual(["ses_revert_own"])
-    await expect(authorities.clearRevert!("ses_revert_foreign")).rejects.toThrow(/may not clear a session revert/)
+    await expect(
+      authorities.discardReverted!({ sessionID: "ses_revert_foreign", messageIDs: [], parts: [] }),
+    ).rejects.toThrow(/may not discard a session revert/)
     expect(cleared).toEqual(["ses_revert_own"])
   })
 })

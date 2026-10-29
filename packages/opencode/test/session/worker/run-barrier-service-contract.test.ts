@@ -18,27 +18,25 @@ import { testEffect } from "../../lib/effect"
 
 const it = testEffect(LayerNode.compile(LayerNode.group([RunBarrier.node])))
 
-function drain(barrier: RunBarrier.Interface, sessionID: string) {
-  return Effect.suspend(() => {
-    const run = barrier.beginRun(sessionID)
-    run.commit(`msg_${sessionID}`)
-    run.projector("session-row")
-    run.noTools()
-    run.promotion("no-job")
-    return barrier.wait(sessionID)
-  })
-}
+const drain = Effect.fn("test.drain")(function* (barrier: RunBarrier.Interface, sessionID: string) {
+  const run = yield* barrier.beginRun(sessionID)
+  run.commit(`msg_${sessionID}`)
+  run.projector("session-row")
+  run.noTools()
+  run.promotion("no-job")
+  return yield* barrier.wait(sessionID)
+})
 
 describe("run barrier service contract", () => {
   it.effect("cancellation wins over an incomplete report set", () =>
     Effect.gen(function* () {
       const barrier = yield* RunBarrier.Service
-      const run = barrier.beginRun("s1")
+      const run = yield* barrier.beginRun("s1")
       run.commit("msg_1")
 
       const waiting = yield* barrier.wait("s1").pipe(Effect.forkChild)
       yield* Effect.yieldNow
-      barrier.cancel("s1")
+      yield* barrier.cancel("s1")
 
       expect(yield* Fiber.join(waiting)).toEqual({ sessionID: "s1", status: "cancelled" })
       expect(barrier.state("s1")).toBe("cancelled")
@@ -48,7 +46,7 @@ describe("run barrier service contract", () => {
   it.effect("the 5 s bound expires with a typed RunBarrierTimeout and refuses the next run", () =>
     Effect.gen(function* () {
       const barrier = yield* RunBarrier.Service
-      const run = barrier.beginRun("s1")
+      const run = yield* barrier.beginRun("s1")
       run.commit("msg_1")
       run.projector("session-row")
       run.noTools()
@@ -80,7 +78,7 @@ describe("run barrier service contract", () => {
   it.effect("a no-commit run records { committed: null }", () =>
     Effect.gen(function* () {
       const barrier = yield* RunBarrier.Service
-      const run = barrier.beginRun("s1")
+      const run = yield* barrier.beginRun("s1")
       expect(run.commitOutcome()).toBeUndefined()
       run.noCommit()
       expect(run.commitOutcome()).toEqual({ committed: null })

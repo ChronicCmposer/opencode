@@ -12,16 +12,14 @@ import { testEffect } from "../../lib/effect"
 
 const barrierIt = testEffect(LayerNode.compile(LayerNode.group([RunBarrier.node])))
 
-function drain(barrier: RunBarrier.Interface, sessionID: string) {
-  return Effect.suspend(() => {
-    const run = barrier.beginRun(sessionID)
-    run.commit(`msg_${sessionID}`)
-    run.projector("session-row")
-    run.noTools()
-    run.promotion("no-job")
-    return barrier.wait(sessionID)
-  })
-}
+const drain = Effect.fn("test.drain")(function* (barrier: RunBarrier.Interface, sessionID: string) {
+  const run = yield* barrier.beginRun(sessionID)
+  run.commit(`msg_${sessionID}`)
+  run.projector("session-row")
+  run.noTools()
+  run.promotion("no-job")
+  return yield* barrier.wait(sessionID)
+})
 
 describe("bounded lifecycle maps (MINOR)", () => {
   barrierIt.effect("run-barrier keeps at most the LRU number of session states", () =>

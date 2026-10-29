@@ -31,8 +31,12 @@ type Lifecycle = ReturnType<typeof createLifecycleTracker>
  * observation lands (commit handler, tool finish, projector settle), never from
  * the fact that the run started.
  */
-function createObservedRun(barrier: RunBarrier.Interface, lifecycle: Lifecycle, sessionID: string) {
-  const run = barrier.beginRun(sessionID)
+const createObservedRun = Effect.fn("test.createObservedRun")(function* (
+  barrier: RunBarrier.Interface,
+  lifecycle: Lifecycle,
+  sessionID: string,
+) {
+  const run = yield* barrier.beginRun(sessionID)
   return {
     run,
     commit(messageID: string) {
@@ -59,7 +63,7 @@ function createObservedRun(barrier: RunBarrier.Interface, lifecycle: Lifecycle, 
       run.promotion(outcome)
     },
   }
-}
+})
 
 /** Fork a wait, advance the test clock past the bound, and return its exit. */
 const timeoutWait = (barrier: RunBarrier.Interface, sessionID: string) =>
@@ -75,7 +79,7 @@ describe("run barrier phase reporters", () => {
     Effect.gen(function* () {
       const barrier = yield* RunBarrier.Service
       const lifecycle = createLifecycleTracker()
-      const observed = createObservedRun(barrier, lifecycle, "ses_reported")
+      const observed = yield* createObservedRun(barrier, lifecycle, "ses_reported")
 
       observed.commit("msg_1")
       observed.projector()
@@ -90,7 +94,7 @@ describe("run barrier phase reporters", () => {
     Effect.gen(function* () {
       const barrier = yield* RunBarrier.Service
       const lifecycle = createLifecycleTracker()
-      const observed = createObservedRun(barrier, lifecycle, "ses_no_projector")
+      const observed = yield* createObservedRun(barrier, lifecycle, "ses_no_projector")
 
       observed.commit("msg_1")
       observed.finish()
@@ -109,7 +113,7 @@ describe("run barrier phase reporters", () => {
     Effect.gen(function* () {
       const barrier = yield* RunBarrier.Service
       const lifecycle = createLifecycleTracker()
-      const observed = createObservedRun(barrier, lifecycle, "ses_tool_stuck")
+      const observed = yield* createObservedRun(barrier, lifecycle, "ses_tool_stuck")
 
       observed.toolStarted("call_write")
       observed.commit("msg_1")
@@ -127,7 +131,7 @@ describe("run barrier phase reporters", () => {
     Effect.gen(function* () {
       const barrier = yield* RunBarrier.Service
       const lifecycle = createLifecycleTracker()
-      const observed = createObservedRun(barrier, lifecycle, "ses_tool_real")
+      const observed = yield* createObservedRun(barrier, lifecycle, "ses_tool_real")
 
       observed.toolStarted("call_write")
       observed.commit("msg_1")
@@ -144,7 +148,7 @@ describe("run barrier phase reporters", () => {
     Effect.gen(function* () {
       const barrier = yield* RunBarrier.Service
       const lifecycle = createLifecycleTracker()
-      const observed = createObservedRun(barrier, lifecycle, "ses_wrong_kind")
+      const observed = yield* createObservedRun(barrier, lifecycle, "ses_wrong_kind")
 
       observed.commit("msg_1")
       expect(() =>
@@ -165,7 +169,7 @@ describe("run barrier phase reporters", () => {
     Effect.gen(function* () {
       const barrier = yield* RunBarrier.Service
       const lifecycle = createLifecycleTracker()
-      const observed = createObservedRun(barrier, lifecycle, "ses_cancel_missing")
+      const observed = yield* createObservedRun(barrier, lifecycle, "ses_cancel_missing")
 
       observed.commit("msg_1")
       // The projector was never reported, so the run is still open.
@@ -173,7 +177,7 @@ describe("run barrier phase reporters", () => {
 
       const pending = yield* barrier.wait("ses_cancel_missing").pipe(Effect.forkChild)
       yield* Effect.yieldNow
-      barrier.cancel("ses_cancel_missing")
+      yield* barrier.cancel("ses_cancel_missing")
 
       expect(yield* Fiber.join(pending)).toEqual({ sessionID: "ses_cancel_missing", status: "cancelled" })
       expect(barrier.state("ses_cancel_missing")).toBe("cancelled")

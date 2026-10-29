@@ -470,6 +470,12 @@ export class BusyError extends Schema.TaggedErrorClass<BusyError>()("SessionBusy
 
 export type NotFound = NotFoundError
 
+export interface DiscardReverted {
+  readonly sessionID: SessionID
+  readonly messageIDs: ReadonlyArray<MessageID>
+  readonly parts: ReadonlyArray<{ readonly messageID: MessageID; readonly partID: PartID }>
+}
+
 export interface Interface {
   readonly list: (input?: ListInput) => Effect.Effect<Info[]>
   readonly listGlobal: (input?: GlobalListInput) => Effect.Effect<GlobalInfo[]>
@@ -502,6 +508,8 @@ export interface Interface {
     summary: Info["summary"]
   }) => Effect.Effect<void>
   readonly clearRevert: (sessionID: SessionID) => Effect.Effect<void>
+  /** Clear `revert` and delete the reverted messages and parts in one database transaction. */
+  readonly discardReverted: (input: DiscardReverted) => Effect.Effect<void>
   readonly setSummary: (input: { sessionID: SessionID; summary: Info["summary"] }) => Effect.Effect<void>
   readonly setShare: (input: { sessionID: SessionID; share: Info["share"] }) => Effect.Effect<void>
   readonly setWorkspace: (input: { sessionID: SessionID; workspaceID: Info["workspaceID"] }) => Effect.Effect<void>
@@ -960,6 +968,20 @@ const layer: Layer.Layer<
       yield* patch(sessionID, { time: { updated: Date.now() }, revert: null }).pipe(Effect.orDie)
     })
 
+    const discardReverted = Effect.fn("Session.discardReverted")(function* (input: DiscardReverted) {
+      yield* db.transaction(() =>
+        Effect.gen(function* () {
+          yield* clearRevert(input.sessionID)
+          for (const messageID of input.messageIDs) {
+            yield* removeMessage({ sessionID: input.sessionID, messageID })
+          }
+          for (const part of input.parts) {
+            yield* removePart({ sessionID: input.sessionID, ...part })
+          }
+        }),
+      ).pipe(Effect.orDie)
+    })
+
     const setSummary = Effect.fn("Session.setSummary")(function* (input: {
       sessionID: SessionID
       summary: Info["summary"]
@@ -1078,6 +1100,7 @@ const layer: Layer.Layer<
       setPermission,
       setRevert,
       clearRevert,
+      discardReverted,
       setSummary,
       setShare,
       setWorkspace,
