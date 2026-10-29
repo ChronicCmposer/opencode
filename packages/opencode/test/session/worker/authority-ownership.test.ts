@@ -12,6 +12,11 @@ import {
 } from "@/session/worker/layer"
 import { LSP } from "@/lsp/lsp"
 import { MCP } from "@/mcp"
+import {
+  buildHubProxyHandlers,
+  mcpAuthorityFor,
+  type HubProxyAuthorities,
+} from "@/session/worker/hub-proxy-authorities"
 import * as LSPServer from "@/lsp/server"
 import type { QuestionID } from "@/question/schema"
 
@@ -104,5 +109,54 @@ describe("a worker never spawns MCP/LSP children", () => {
       }).pipe(Effect.provide(mcpBoundaryLayer())),
     )
     expect(result).toEqual({ status: {}, tools: {}, clients: {} })
+  })
+})
+
+describe("hub-served MCP reads", () => {
+  const fakeMcp = {
+    clients: () =>
+      Effect.succeed({
+        docs: { getServerCapabilities: () => ({ resources: {} }) },
+        plain: { getServerCapabilities: () => ({}) },
+      }),
+    instructions: () => Effect.succeed([{ name: "docs", instructions: "Use docs.", tools: [] }]),
+    resources: (name?: string) =>
+      Effect.succeed({ "docs:readme": { name: "readme", uri: "file:///readme", client: name ?? "docs" } }),
+    resourceTemplates: () => Effect.succeed({}),
+    readResource: (client: string, uri: string) => Effect.succeed({ contents: [{ uri, text: `from ${client}` }] }),
+  } as unknown as MCP.Interface
+
+  const hubClient = (): HubProxyClient => {
+    const handlers = buildHubProxyHandlers(
+      {
+        mcp: mcpAuthorityFor((effect) => Effect.runPromise(effect.pipe(Effect.provideService(MCP.Service, fakeMcp)))),
+      } as HubProxyAuthorities,
+      (effect) => Effect.runPromise(effect),
+    )
+    return {
+      call: async (method, args) => handlers[method]!(...args),
+      dispose: () => {},
+    }
+  }
+
+  test("a worker reads instructions, resources, capabilities and resource contents from the hub", async () => {
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const mcp = yield* MCP.Service
+        const clients = yield* mcp.clients()
+        return {
+          instructions: yield* mcp.instructions(),
+          resources: yield* mcp.resources("docs"),
+          capabilities: Object.fromEntries(
+            Object.entries(clients).map(([name, c]) => [name, c.getServerCapabilities()]),
+          ),
+          read: yield* mcp.readResource("docs", "file:///readme"),
+        }
+      }).pipe(Effect.provide(mcpBoundaryLayer(hubClient()))),
+    )
+    expect(result.instructions).toEqual([{ name: "docs", instructions: "Use docs.", tools: [] }])
+    expect(Object.keys(result.resources)).toEqual(["docs:readme"])
+    expect(result.capabilities).toEqual({ docs: { resources: {} }, plain: {} })
+    expect(result.read).toEqual({ contents: [{ uri: "file:///readme", text: "from docs" }] })
   })
 })

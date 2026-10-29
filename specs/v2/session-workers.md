@@ -127,7 +127,7 @@ The run barrier is per Session. It waits for durable commits, projectors, tool s
 
 ### D20 — One tool routing point
 
-Route tools at one point: local worker or hub. Delete `broker/*` and the port/client/layer nodes. MCP and LSP run on the hub with the Session working directory and context. Workers never spawn MCP or LSP processes. V1 already runs LSP hub-only outside the worker path; preserve that parity. Do not delete LSP.
+Route tools at one point: local worker or hub. Delete `broker/*` and the port/client/layer nodes. MCP and LSP run on the hub with the Session working directory and context. Workers never spawn MCP or LSP processes. A worker reads MCP instructions, resources, resource templates, client capabilities and resource contents from the hub over the hub-proxy (`mcp.*` methods), served in the session's instance context; MCP tool calls already route to the hub. V1 already runs LSP hub-only outside the worker path; preserve that parity. Do not delete LSP.
 
 ### D21 — Permissions, questions, and cancellation
 

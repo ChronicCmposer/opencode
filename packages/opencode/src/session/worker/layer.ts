@@ -750,22 +750,61 @@ export function workerDbBoundaryLayer(): Layer.Layer<WorkerDb> {
 
 // --------------------------------------------------------------------------- Functional boundary layers for the hub-owned authorities.
 
-/** The MCP boundary: a worker owns no servers, so every catalog read is empty. */
-export function mcpBoundaryLayer(): Layer.Layer<MCP.Service> {
+type McpClient = Effect.Success<ReturnType<MCP.Interface["clients"]>>[string]
+type McpCapabilities = ReturnType<McpClient["getServerCapabilities"]>
+type McpResult<K extends "resources" | "resourceTemplates" | "readResource"> = Effect.Success<
+  ReturnType<MCP.Interface[K]>
+>
+type ServerInstructions = Effect.Success<ReturnType<MCP.Interface["instructions"]>>[number]
+
+/** The MCP boundary: a worker owns no servers; catalog reads go to the hub's MCP service, and without a hub they are empty. */
+export function mcpBoundaryLayer(hub?: HubProxyClient): Layer.Layer<MCP.Service> {
+  const fromHub = <A>(method: HubProxyMethod, args: readonly unknown[]) =>
+    hubProxyCall<A>(hub!, method, args).pipe(Effect.orDie)
   return failLoudBoundary("MCP", MCP.Service, {
     status: () => Effect.succeed({}),
-    clients: () => Effect.succeed({}),
-    instructions: () => Effect.succeed([]),
+    clients:
+      hub === undefined
+        ? () => Effect.succeed({})
+        : () =>
+            fromHub<Record<string, { capabilities: McpCapabilities }>>("mcp.clients", []).pipe(
+              Effect.map((clients) =>
+                Object.fromEntries(
+                  Object.entries(clients).map(([name, info]) => [name, remoteMcpClient(name, info.capabilities)]),
+                ),
+              ),
+            ),
+    instructions:
+      hub === undefined ? () => Effect.succeed([]) : () => fromHub<ServerInstructions[]>("mcp.instructions", []),
     tools: () => Effect.succeed({}),
     prompts: () => Effect.succeed({}),
-    resources: () => Effect.succeed({}),
-    resourceTemplates: () => Effect.succeed({}),
+    resources:
+      hub === undefined
+        ? () => Effect.succeed({})
+        : (clientName) => fromHub<McpResult<"resources">>("mcp.resources", [clientName]),
+    resourceTemplates:
+      hub === undefined
+        ? () => Effect.succeed({})
+        : (clientName) => fromHub<McpResult<"resourceTemplates">>("mcp.resourceTemplates", [clientName]),
     getPrompt: () => Effect.succeed(undefined),
-    readResource: () => Effect.succeed(undefined),
+    readResource:
+      hub === undefined
+        ? () => Effect.succeed(undefined)
+        : (clientName, uri) => fromHub<McpResult<"readResource">>("mcp.readResource", [clientName, uri]),
     hasStoredTokens: () => Effect.succeed(false),
     getAuthStatus: () => Effect.succeed("not_authenticated"),
     supportsOAuth: () => Effect.succeed(false),
   })
+}
+
+/** A worker-side stand-in for a hub MCP client: only its capabilities are readable; anything else fails loud. */
+function remoteMcpClient(name: string, capabilities: McpCapabilities): McpClient {
+  return new Proxy({ getServerCapabilities: () => capabilities } as object, {
+    get(target, member) {
+      if (typeof member === "symbol" || member in target) return Reflect.get(target, member)
+      throw new SessionLayerBoundaryError(`MCP client ${name}`, member)
+    },
+  }) as McpClient
 }
 
 /** The LSP boundary: a worker owns no language servers, so every read is empty. */
@@ -1155,7 +1194,7 @@ export function boundaryReplacements(
     [ModelsDev.node, snapshotModelsDevLayer(snapshot)],
     [Database.node, database === undefined ? databaseBoundaryLayer() : workerDatabaseLayer(database)],
     // `SessionProjector` deliberately has NO boundary replacement: it runs IN the worker.
-    [MCP.node, mcpBoundaryLayer()],
+    [MCP.node, mcpBoundaryLayer(boundaries.hubProxies?.sessionStatus)],
     [LSP.node, lspBoundaryLayer()],
     [McpAuth.node, mcpAuthBoundaryLayer()],
     [Npm.node, npmBoundaryLayer()],
