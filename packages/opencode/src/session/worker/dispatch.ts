@@ -518,6 +518,14 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const idleTimers = new Map<SessionID, IdleTimer>()
   /** Forked fibers that outlive the synchronous call site, drained on shutdown. */
   const backgroundFibers = new Set<Fiber.Fiber<void>>()
+  /**
+   * The bounded release+finish work for a live retirement. The exit Deferred is
+   * only signalled after this settles, so shutdown can join a watchdog-detached
+   * release instead of tearing the pool down underneath it.
+   */
+  const retirementReleases = new Map<SessionID, () => Promise<void>>()
+  /** Retirement fibers, stopped after their release settles so shutdown is bounded. */
+  const retirementFibers = new Set<Fiber.Fiber<void>>()
   const controllers = new Map<number, CancelController>()
   /**
    * The confirmed-exit signal for a retiring generation. A successor must not
@@ -569,15 +577,31 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     timeoutMs: number,
     onTimeout: () => void,
   ): Promise<A | undefined> => {
+    /**
+     * Run the deadline diagnostic without letting it escape. From a timer
+     * callback a throw would be an uncaught host exception; the deadline must
+     * still resolve the caller. The failure itself is reported as one more
+     * diagnostic, guarded because the logger is the seam that may have failed.
+     */
+    const reportTimeout = (): void => {
+      try {
+        onTimeout()
+      } catch (error) {
+        try {
+          log(workerLogMessage("timeout diagnostic failed"), {
+            level: "WARN",
+            reason: messageOf(error),
+          })
+        } catch {
+          // No reporter left: settling the deadline is the only safe outcome.
+        }
+      }
+    }
     if (timeoutMs <= 0) {
       // The deadline already expired: observe the source so a rejection is never
       // unhandled, but never wait for it.
       promise.catch(() => undefined)
-      try {
-        onTimeout()
-      } catch {
-        // A diagnostic seam must not turn an expired deadline into a hang.
-      }
+      reportTimeout()
       return Promise.resolve(undefined)
     }
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -585,11 +609,8 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       promise,
       new Promise<undefined>((resolve) => {
         timer = setTimeout(() => {
-          try {
-            onTimeout()
-          } finally {
-            resolve(undefined)
-          }
+          reportTimeout()
+          resolve(undefined)
         }, timeoutMs)
         timer.unref?.()
       }),
@@ -792,15 +813,24 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const finish = (): void => {
       if (finished) return
       finished = true
-      if (terminating.get(sessionID) === exit) terminating.delete(sessionID)
+      if (terminating.get(sessionID) === exit) {
+        terminating.delete(sessionID)
+        retirementReleases.delete(sessionID)
+      }
       Deferred.doneUnsafe(exit, Effect.void)
     }
+    /**
+     * Run the release hook and only then signal the exit. The exit Deferred is
+     * the successor's confirmation, so resolving it before an asynchronous lease
+     * release lands would admit the successor against a still-live generation.
+     */
+    const releaseThenFinish = (): Promise<void> => release().then(finish, finish)
+    retirementReleases.set(sessionID, releaseThenFinish)
     // A wedged terminate must not leak the fiber, pin the barrier, or wedge
     // idle-cap eviction. At the deadline, run the release hook and confirm the
     // exit ourselves; a late terminate only joins the same idempotent release.
-    // The fiber is then detached from the shutdown drain and interrupted: it may
-    // still be parked on a terminate promise that never settles, but it can no
-    // longer act (release is memoized and `finish` is guarded).
+    // The fiber is interrupted only after that release settles, so its `ensuring`
+    // cannot signal the exit while the async release hook is still pending.
     let retirementFiber: Fiber.Fiber<void> | undefined
     const watchdog = setTimeout(() => {
       if (finished) return
@@ -810,31 +840,37 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
         workerID: worker.id,
         timeoutMs: terminateTimeoutMs,
       })
-      void release().finally(finish)
-      if (retirementFiber !== undefined) {
+      void releaseThenFinish().then(() => {
+        if (retirementFiber === undefined) return
         backgroundFibers.delete(retirementFiber)
+        retirementFibers.delete(retirementFiber)
         retirementFiber.interruptUnsafe()
-      }
+      })
     }, Math.max(0, terminateTimeoutMs))
     watchdog.unref?.()
-    retirementFiber = Effect.runFork(
+    const fiber = Effect.runFork(
       Effect.promise(async () => {
         // Retirement is reported only after the isolate exits. The watchdog
         // above bounds the observable wait; this fiber is interrupted during
         // shutdown if the isolate never settles.
         await worker.terminate().catch(() => undefined)
-        await release()
+        await releaseThenFinish()
       }).pipe(
         Effect.ensuring(
           Effect.sync(() => {
             clearTimeout(watchdog)
-            // Exactly once, even if an unexpected defect escaped the release.
-            finish()
+            // An interrupted terminate may never reach the release, so start it
+            // here. It still signals the exit (through `finish`) only after the
+            // lease release lands; shutdown joins the same promise.
+            void releaseThenFinish()
           }),
         ),
       ),
     )
-    trackFiber(retirementFiber)
+    retirementFiber = fiber
+    retirementFibers.add(fiber)
+    fiber.addObserver(() => retirementFibers.delete(fiber))
+    trackFiber(fiber)
     return worker
   }
 
@@ -873,10 +909,12 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   /**
    * Wait for a retiring generation's exit, but never forever: a rejected or
    * wedged terminate settles at the deadline so the successor can start instead
-   * of parking the session. A rejection is logged and treated as settled.
+   * of parking the session. Returns whether the exit actually settled, so a
+   * timed-out (still-live) retirement stays visible in diagnostics.
    */
-  const awaitTerminating = (sessionID: SessionID, exit: Deferred.Deferred<void>): Effect.Effect<void> =>
+  const awaitTerminating = (sessionID: SessionID, exit: Deferred.Deferred<void>): Effect.Effect<boolean> =>
     Deferred.await(exit).pipe(
+      Effect.map(() => true),
       Effect.catchCause((cause) =>
         Effect.sync(() => {
           log(workerLogMessage("retirement exit failed"), {
@@ -884,6 +922,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
             sessionID,
             reason: messageOf(Cause.squash(cause)),
           })
+          return true
         }),
       ),
       Effect.timeoutOrElse({
@@ -896,6 +935,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
               timeoutMs: terminateTimeoutMs,
               reason: "the retiring generation never confirmed its exit; starting the successor",
             })
+            return false
           }),
       }),
     )
@@ -913,15 +953,19 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
           // A successor must re-observe ownership after this turn, never re-enter
           // the caller's stack synchronously when the exit signal is already set.
           yield* Effect.yieldNow
-          yield* awaitTerminating(pending.sessionID, exit)
-          if (terminating.get(pending.sessionID) === exit) terminating.delete(pending.sessionID)
+          const settled = yield* awaitTerminating(pending.sessionID, exit)
+          // A timed-out retirement is still live. Keep it in `terminating` so
+          // `retiringCount`/`awaitRelease` remain accurate; the successor still
+          // starts (bounded), but through the explicit bypass below instead of
+          // deleting evidence of the live generation.
+          if (settled && terminating.get(pending.sessionID) === exit) terminating.delete(pending.sessionID)
           if (stateOf().runs.get(pending.sessionID) !== pending) return
           if (stateOf().terminated) {
             pending.gate.claim("cancel")
             rejectRun(pending, cancelled(pending.sessionID))
             return
           }
-          start(pending)
+          start(pending, { permitLiveRetirement: !settled })
         }),
       ),
     )
@@ -960,7 +1004,10 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   /** The explicit release barrier for a retirement that is already in flight. */
   const awaitRelease = (sessionID: SessionID): Promise<void> => retirementBarrier(sessionID)
 
-  const start = (pending: Pending): void => {
+  const start = (
+    pending: Pending,
+    startOptions: { readonly permitLiveRetirement?: boolean } = {},
+  ): void => {
     // The build guard is user code: run it before taking the ownership permit,
     // so a guard that re-enters dispatch/terminateAll cannot find the lock held.
     // Shutdown still wins because the transition below re-checks the latch.
@@ -983,7 +1030,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       nextWaiter(pending.sessionID)
       return
     }
-    const exiting = terminating.get(pending.sessionID)
+    const exiting = startOptions.permitLiveRetirement === true ? undefined : terminating.get(pending.sessionID)
     if (exiting !== undefined) {
       deferUntilRetired(pending, exiting)
       return
@@ -992,8 +1039,10 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     replaceDeadIdleWorker(pending.sessionID)
     // `replaceDeadIdleWorker` may have just started an orderly retirement. The
     // check above happened before it ran, so re-check before spawning: the
-    // successor must wait for the old close and lease release.
-    const replaced = terminating.get(pending.sessionID)
+    // successor must wait for the old close and lease release. A retirement that
+    // already timed out is bypassed explicitly (it stays visible for diagnostics).
+    const replaced =
+      startOptions.permitLiveRetirement === true ? undefined : terminating.get(pending.sessionID)
     if (replaced !== undefined) {
       deferUntilRetired(pending, replaced)
       return
@@ -1785,6 +1834,26 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
         ).catch(() => undefined),
       ),
     )
+    // Settle every live retirement's bounded release before signalling its exit.
+    // The exit is the successor's confirmation, so it must not resolve while an
+    // async release hook is pending. This also joins a release the watchdog
+    // detached (or one an interrupted fiber started) before the pool is torn down.
+    const releases = [...retirementReleases.values()]
+    await Promise.all(releases.map((releaseThenFinish) => releaseThenFinish().catch(() => undefined)))
+    // Deferred-start fibers are parked on these exits. Resolve them before the
+    // drain so shutdown does not charge each one another full terminate deadline.
+    const exits = [...terminating.values()]
+    terminating.clear()
+    retirementReleases.clear()
+    for (const exit of exits) Deferred.doneUnsafe(exit, Effect.void)
+    // A retirement fiber may still be parked on a terminate promise that never
+    // settles. Its release already ran above, so stop it instead of paying the
+    // drain deadline a second time.
+    for (const fiber of retirementFibers) {
+      backgroundFibers.delete(fiber)
+      retirementFibers.delete(fiber)
+      fiber.interruptUnsafe()
+    }
     // Drain the retirement/reap/deferred-start fibers we forked so none can run
     // `pool.releaseSession`/`onSessionReleased` after the pool is torn down. A
     // fiber still wedged after the deadline is interrupted rather than awaited.
@@ -1802,11 +1871,6 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       ),
     )
     for (const fiber of background) fiber.interruptUnsafe()
-    // Any retirement that outlived its fiber (or was interrupted) still owes its
-    // waiters a settlement; clear the map only after doing so.
-    const exits = [...terminating.values()]
-    terminating.clear()
-    for (const exit of exits) Deferred.doneUnsafe(exit, Effect.void)
     await pool.terminateAll().catch(() => undefined)
     cancellation?.reapAll?.()
   }

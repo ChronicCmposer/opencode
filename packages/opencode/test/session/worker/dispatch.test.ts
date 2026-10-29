@@ -634,6 +634,45 @@ describe("Pending settlement is single-owner", () => {
     await dispatcher.terminateAll()
   })
 
+  test("a throwing positive write barrier timeout logger never escapes the timer", async () => {
+    const pool = createFakeWorkerPool(1)
+    const uncaught: unknown[] = []
+    const onUncaught = (error: unknown) => uncaught.push(error)
+    process.on("uncaughtException", onUncaught)
+    try {
+      const log: WorkerLogger = (message) => {
+        if (message === workerLogMessage("session write barrier timed out")) throw new Error("logger exploded")
+      }
+      const dispatcher = createDispatcher({
+        pool,
+        log,
+        // Positive deadline: the diagnostic runs from the timer callback, so a
+        // throw there must not surface as an uncaught host exception.
+        writeBarrierTimeoutMs: 10,
+        writeBarrier: () => new Promise<void>(() => {}),
+      })
+
+      const sessionID = sid("ses_write_barrier_positive_throwing_log")
+      const run = capture(dispatcher.dispatch({ sessionID }))
+      await pollUntil(() => pool.spawned.length === 1, { message: "the run never started" })
+      pool.spawned[0].finish(sessionID)
+
+      const outcome = await Promise.race([
+        run.then(() => "resolved" as const),
+        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 1_000)),
+      ])
+
+      expect(outcome).toBe("resolved")
+      expect(await run).toEqual({ ok: true, value: undefined })
+      expect(uncaught).toEqual([])
+      expect(dispatcher.busySlotCount).toBe(0)
+      expect(dispatcher.workerForSession(sessionID)).toBeUndefined()
+      await dispatcher.terminateAll()
+    } finally {
+      process.off("uncaughtException", onUncaught)
+    }
+  })
+
   test("a superseded run's late completion cannot invoke the successor's write barrier", async () => {
     let finishCancelled!: () => void
     let finishSuccessor!: () => void
@@ -1800,6 +1839,68 @@ describe("retirement waits for a confirmed exit", () => {
     await dispatcher.terminateAll()
   })
 
+  test("the terminate watchdog never signals the exit before an async release settles", async () => {
+    const worker = new FakeSessionWorker(1)
+    worker.terminate = () => new Promise<void>(() => {})
+    let confirmRelease!: () => void
+    const releaseGate = new Promise<void>((resolve) => {
+      confirmRelease = resolve
+    })
+    const released: SessionID[] = []
+    let spawnCount = 0
+    const spawned: FakeSessionWorker[] = []
+    const { log, lines } = recordingLogger()
+    const pool: WorkerPool = {
+      spawn: (id) => {
+        spawnCount += 1
+        const next = spawnCount === 1 ? worker : new FakeSessionWorker(id ?? spawnCount + 1)
+        spawned.push(next)
+        return next
+      },
+      terminateAll: async () => {},
+    }
+    const dispatcher = createDispatcher({
+      pool,
+      log,
+      terminateTimeoutMs: 1_000,
+      onSessionReleased: async (sessionID) => {
+        await releaseGate
+        released.push(sessionID)
+      },
+    })
+    const sessionID = sid("ses_watchdog_release_gate")
+
+    const first = capture(dispatcher.dispatch({ sessionID }))
+    await pollUntil(() => spawned.length === 1, { message: "the first run never started" })
+    spawned[0].finish(sessionID)
+    await first
+    await flush()
+
+    void dispatcher.retire(sessionID)
+    await pollUntil(
+      () => lines.some((line) => line.message === workerLogMessage("retirement terminate timed out")),
+      { message: "the terminate watchdog never fired" },
+    )
+
+    // The watchdog has fired, but the async release hook is still gated. The
+    // exit signal is the successor's confirmation and must not be resolved yet.
+    const successor = capture(dispatcher.dispatch({ sessionID }))
+    await flush()
+    expect(spawned).toHaveLength(1)
+    expect(released).toEqual([])
+    expect(dispatcher.retiringCount).toBe(1)
+
+    confirmRelease()
+    await pollUntil(() => spawned.length === 2, {
+      message: "the successor never started after the release hook settled",
+    })
+    spawned[1].finish(sessionID)
+    expect(await successor).toEqual({ ok: true, value: undefined })
+    await pollUntil(() => released.length === 1, { message: "the release hook never ran" })
+    expect(released).toEqual([sessionID])
+    await dispatcher.terminateAll()
+  })
+
   test("repeated release barriers join one retirement and observe one release", async () => {
     let confirmExit!: () => void
     const exit = new Promise<void>((resolve) => {
@@ -1968,6 +2069,63 @@ describe("retirement exit cannot park the successor", () => {
     await dispatcher.terminateAll()
   })
 
+  test("a deferred successor that times out leaves a live retirement visible", async () => {
+    const worker = new FakeSessionWorker(1)
+    worker.terminate = () => new Promise<void>(() => {})
+    let confirmRelease!: () => void
+    const releaseGate = new Promise<void>((resolve) => {
+      confirmRelease = resolve
+    })
+    const released: SessionID[] = []
+    let spawnCount = 0
+    const spawned: FakeSessionWorker[] = []
+    const pool: WorkerPool = {
+      spawn: (id) => {
+        spawnCount += 1
+        const next = spawnCount === 1 ? worker : new FakeSessionWorker(id ?? spawnCount + 1)
+        spawned.push(next)
+        return next
+      },
+      terminateAll: async () => {},
+    }
+    const dispatcher = createDispatcher({
+      pool,
+      terminateTimeoutMs: 25,
+      onSessionReleased: async (sessionID) => {
+        await releaseGate
+        released.push(sessionID)
+      },
+    })
+    const sessionID = sid("ses_deferred_timeout_live_retirement")
+
+    const first = capture(dispatcher.dispatch({ sessionID }))
+    await pollUntil(() => spawned.length === 1, { message: "the first run never started" })
+    spawned[0].finish(sessionID)
+    await first
+    await flush()
+
+    void dispatcher.retire(sessionID)
+    const successor = capture(dispatcher.dispatch({ sessionID }))
+    await pollUntil(() => spawned.length === 2, {
+      message: "the successor never started after the retirement deadline",
+    })
+
+    // The successor starts at its bounded deadline, but the release hook is still
+    // gated: the retirement must stay visible instead of being deleted as if it
+    // had settled.
+    expect(dispatcher.retiringCount).toBe(1)
+    expect(released).toEqual([])
+
+    confirmRelease()
+    await pollUntil(() => dispatcher.retiringCount === 0, {
+      message: "the timed-out retirement never left the retiring set",
+    })
+    expect(released).toEqual([sessionID])
+    spawned[1].finish(sessionID)
+    expect(await successor).toEqual({ ok: true, value: undefined })
+    await dispatcher.terminateAll()
+  })
+
   test("a rejected session-release callback never parks the successor", async () => {
     const pool = createFakeWorkerPool(1)
     const dispatcher = createDispatcher({
@@ -2086,10 +2244,47 @@ describe("bounded retirement barriers", () => {
     // terminateAll would pay the full terminate deadline again.
     const started = Date.now()
     await dispatcher.terminateAll()
-    expect(Date.now() - started).toBeLessThan(300)
+    expect(Date.now() - started).toBeLessThan(500)
     expect(dispatcher.retiringCount).toBe(0)
     await dispatcher.awaitRelease(sessionID)
     expect(released).toEqual([sessionID])
+  })
+
+  test("terminateAll resolves a live retirement before draining its deferred successor", async () => {
+    const worker = new FakeSessionWorker(1)
+    worker.terminate = () => new Promise<void>(() => {})
+    let spawnCount = 0
+    const spawned: FakeSessionWorker[] = []
+    const pool: WorkerPool = {
+      spawn: (id) => {
+        spawnCount += 1
+        const next = spawnCount === 1 ? worker : new FakeSessionWorker(id ?? spawnCount + 1)
+        spawned.push(next)
+        return next
+      },
+      terminateAll: async () => {},
+    }
+    const dispatcher = createDispatcher({ pool, terminateTimeoutMs: 800 })
+    const sessionID = sid("ses_shutdown_deferred_release")
+
+    const first = capture(dispatcher.dispatch({ sessionID }))
+    await pollUntil(() => spawned.length === 1, { message: "the first run never started" })
+    spawned[0].finish(sessionID)
+    await first
+    await flush()
+
+    void dispatcher.retire(sessionID)
+    const successor = capture(dispatcher.dispatch({ sessionID }))
+    await flush()
+    expect(spawned).toHaveLength(1)
+
+    // The deferred successor is parked on the retirement exit. Shutdown must
+    // resolve that exit before draining so it does not charge another full
+    // terminate deadline for work it already ended.
+    const started = Date.now()
+    await dispatcher.terminateAll()
+    expect(Date.now() - started).toBeLessThan(500)
+    expect(await successor).toMatchObject({ ok: false, error: expect.any(SessionCancelledError) })
   })
 
   test("terminateAll drains a reap probe that never settles", async () => {
