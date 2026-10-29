@@ -6,10 +6,9 @@
 // therefore what lets both transactions and statements recover from a lock held
 // by a worker connection. Retries are additive to the fixed `busy_timeout`: a busy
 // failure is retried with bounded exponential backoff, and once the budget is
-// spent the effect still fails loud with `BusyRetriesExhaustedError`.
+// spent the effect still fails loud with `BusyExhaustedError`.
 
-import * as Effect from "effect/Effect"
-import * as Schema from "effect/Schema"
+import { Effect, Schedule, Schema } from "effect"
 import { isSqlError } from "effect/unstable/sql/SqlError"
 import { resolveBusyRetryConfig, type BusyRetryConfig } from "./pragmas"
 
@@ -118,28 +117,31 @@ export function isBusySqlError(error: unknown): boolean {
   return isNativeSqliteError(error) && (hasBusyCode(error) || hasBusyMessage(error))
 }
 
-export interface BusyRetryOptions {
-  readonly retries?: number
-  readonly baseDelayMs?: number
-  readonly maxDelayMs?: number
-  readonly sleep?: (ms: number) => Effect.Effect<void>
-}
-
-/** Raised as a typed failure once the retry budget is spent. */
-export class BusyRetriesExhaustedError extends Schema.TaggedErrorClass<BusyRetriesExhaustedError>()(
-  "Busy.BusyRetriesExhaustedError",
+/** Typed terminal failure: the bounded busy-retry budget was spent. */
+export class BusyExhaustedError extends Schema.TaggedErrorClass<BusyExhaustedError>("BusyExhaustedError")(
+  "Database.BusyExhausted",
   {
     attempts: Schema.Number,
-    lastCause: Schema.Defect(),
+    lastCause: Schema.Unknown,
   },
 ) {
-  override get message(): string {
+  readonly tag = "SQLITE_BUSY_EXHAUSTED"
+
+  constructor(
+    override readonly attempts: number,
+    override readonly lastCause: unknown,
+  ) {
+    super({ attempts, lastCause })
+    this.name = "BusyExhaustedError"
+  }
+
+  override get message() {
     return `SQLite remained busy after ${this.attempts} attempt(s)`
   }
 }
 
 /** Resolve the optional knobs against the environment, without reading env unnecessarily. */
-function resolveRetryConfig(options: BusyRetryOptions): BusyRetryConfig {
+function resolveRetryConfig(options: Partial<BusyRetryConfig>): BusyRetryConfig {
   if (options.retries !== undefined && options.baseDelayMs !== undefined && options.maxDelayMs !== undefined) {
     return { retries: options.retries, baseDelayMs: options.baseDelayMs, maxDelayMs: options.maxDelayMs }
   }
@@ -151,33 +153,42 @@ function resolveRetryConfig(options: BusyRetryOptions): BusyRetryConfig {
   }
 }
 
+/** Delay before retry number `failedAttempt` (1-based): doubling, capped at `maxDelayMs`. */
+export function busyDelayMs(config: BusyRetryConfig, failedAttempt: number): number {
+  return Math.min(config.baseDelayMs * 2 ** (failedAttempt - 1), config.maxDelayMs)
+}
+
 /**
- * Retry `effect` with bounded exponential backoff whenever it fails with a busy
- * SQL error. Non-busy failures and successes pass through unchanged. Once
- * `retries` additional attempts are exhausted the effect fails with the typed
- * `BusyRetriesExhaustedError` carrying the attempt count and the last cause, so
- * a caller can recover deliberately instead of observing an uncatchable defect.
- * The SQLite `Connection` adapters fold this reason back into their `SqlError`
- * channel at the driver boundary, where the interface requires it.
+ * The one busy-retry policy: doubling delays capped at `maxDelayMs`, at most
+ * `retries` retries. Synchronous callers that cannot run a `Schedule` use the
+ * same numbers through {@link busyDelayMs}.
+ */
+export function busyRetrySchedule(config: BusyRetryConfig) {
+  return Schedule.exponential(config.baseDelayMs, 2).pipe(
+    Schedule.either(Schedule.spaced(config.maxDelayMs)),
+    Schedule.both(Schedule.recurs(config.retries)),
+  )
+}
+
+/**
+ * Retry `effect` under {@link busyRetrySchedule} whenever it fails with a busy
+ * SQL error. Non-busy failures and successes pass through unchanged. Once the
+ * retries are spent the effect fails with the typed `BusyExhaustedError`
+ * carrying the attempt count and the last cause. The SQLite `Connection`
+ * adapters fold this error back into their `SqlError` channel at the driver
+ * boundary, where the interface requires it.
  */
 export function withBusyRetry<A, E, R>(
   effect: Effect.Effect<A, E, R>,
-  options: BusyRetryOptions = {},
-): Effect.Effect<A, E | BusyRetriesExhaustedError, R> {
-  const { retries, baseDelayMs, maxDelayMs } = resolveRetryConfig(options)
-  const sleep = options.sleep ?? Effect.sleep
-
-  const attempt = (retriesRemaining: number, attemptsMade: number): Effect.Effect<A, E | BusyRetriesExhaustedError, R> =>
-    Effect.catch(effect, (error) => {
-      if (!isBusySqlError(error)) return Effect.fail(error)
-      if (retriesRemaining <= 0) {
-        return Effect.fail(new BusyRetriesExhaustedError({ attempts: attemptsMade, lastCause: error }))
-      }
-      const delay = Math.min(baseDelayMs * 2 ** (attemptsMade - 1), maxDelayMs)
-      return Effect.andThen(sleep(delay), attempt(retriesRemaining - 1, attemptsMade + 1))
-    })
-
-  return attempt(retries, 1)
+  options: Partial<BusyRetryConfig> = {},
+): Effect.Effect<A, E | BusyExhaustedError, R> {
+  const config = resolveRetryConfig(options)
+  return effect.pipe(
+    Effect.retry({ schedule: busyRetrySchedule(config), while: isBusySqlError }),
+    Effect.mapError((error): E | BusyExhaustedError =>
+      isBusySqlError(error) ? new BusyExhaustedError(config.retries + 1, error) : error,
+    ),
+  )
 }
 
 export { resolveBusyRetryConfig } from "./pragmas"

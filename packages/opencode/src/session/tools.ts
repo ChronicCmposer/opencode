@@ -26,7 +26,6 @@ import type { LifecycleReporting } from "./ledger/lifecycle"
 import { Faults } from "@/testing/faults"
 import { WorkerDb } from "./worker/db"
 import { Database } from "@opencode-ai/core/database/database"
-import { withBusyRetry } from "@opencode-ai/core/database/busy"
 import { Session } from "./session"
 import { SessionProcessor } from "./processor"
 import { PartID } from "./schema"
@@ -107,9 +106,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       ? <A>(operation: () => A) =>
           database.value.db
             .transaction(() => Effect.sync(operation), { behavior: "immediate" })
-            // Busy ledger writes own no outer transaction, so the whole
-            // exclusive transaction replays instead of a single statement.
-            .pipe(withBusyRetry, Effect.orDie)
+            .pipe(Effect.orDie)
       : undefined
     return yield* ToolCallLedger.makeFromWorker(workerDb.value, exclusive === undefined ? {} : { exclusive })
   })

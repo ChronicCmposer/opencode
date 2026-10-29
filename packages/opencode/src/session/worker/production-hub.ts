@@ -5,7 +5,6 @@ import path from "node:path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Database } from "@opencode-ai/core/database/database"
-import { openConnection } from "@opencode-ai/core/database/connection"
 import { Auth } from "@/auth"
 import { Config } from "@/config/config"
 import { Provider } from "@/provider/provider"
@@ -628,18 +627,44 @@ function ignoreReapFailure(reap: () => void): void {
 
 /**
  * Best-effort startup sweep of leases left by earlier hub-process generations.
- * A `worker-<id>-<pid>-<uuid>` owner whose PID is gone is marked reclaimable so
- * the next admission does not wait for its TTL; a live generation is untouched.
+ * A `worker-<id>-<pid>-<hostScope>-<uuid>` owner minted in this host scope whose
+ * PID is gone is marked reclaimable so the next admission does not wait for its
+ * TTL; a live generation, or one from another host or PID namespace, is
+ * untouched and left to expire.
  *
- * Runs once, after the schema gate has migrated the file, over a short-lived
- * connection. A failure is logged and swallowed: the successor reclaim path
- * still fences correctly, so this is defense-in-depth, never a boot blocker.
+ * Runs once, after the schema gate has migrated the file, on the DB executor
+ * thread as a single transaction. A failure is logged and swallowed: the
+ * successor reclaim path still fences correctly, so this is defense-in-depth,
+ * never a boot blocker.
  */
-export function sweepDeadLeasesAtStartup(filename: string, bridge?: EffectBridge.Shape): number {
-  let connection: ReturnType<typeof openConnection> | undefined
+export async function sweepDeadLeasesAtStartup(
+  filename: string,
+  executor: DbExecutor | undefined,
+  bridge?: EffectBridge.Shape,
+): Promise<number> {
+  const owned =
+    executor === undefined
+      ? DbExecutor.makePromiseExecutor({ filename, create: false, name: "hub-lease-sweep" })
+      : undefined
+  const target = executor ?? owned!
   try {
-    connection = openConnection({ filename, create: false, busyTimeoutMs: 250 })
-    const released = DurableLog.create({ connection, ownerID: "hub-startup-lease-sweep" }).releaseDeadLeases()
+    const rows = await target.query(
+      "SELECT aggregate_id, worker_owner_id FROM event_sequence WHERE worker_owner_id IS NOT NULL AND (worker_expires_at IS NULL OR worker_expires_at <> 0)",
+    )
+    const dead = rows.filter(
+      (row) =>
+        typeof row.aggregate_id === "string" &&
+        typeof row.worker_owner_id === "string" &&
+        DurableLog.isDeadWorkerOwner(row.worker_owner_id),
+    )
+    if (dead.length === 0) return 0
+    const results = await target.transaction(
+      dead.map((row) => ({
+        sql: "UPDATE event_sequence SET worker_expires_at = 0 WHERE aggregate_id = ? AND worker_owner_id = ?",
+        params: [row.aggregate_id, row.worker_owner_id],
+      })),
+    )
+    const released = results.reduce((total, result) => total + result.changes, 0)
     if (released > 0) {
       void bridge?.fork(Effect.logInfo(workerLogMessage("startup lease sweep"), { released }))
     }
@@ -652,7 +677,7 @@ export function sweepDeadLeasesAtStartup(filename: string, bridge?: EffectBridge
     )
     return 0
   } finally {
-    connection?.close()
+    await owned?.close()
   }
 }
 
@@ -740,9 +765,10 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
     }).then(
       () => {
         // The schema gate has migrated/verified the file, so the lease table is
-        // safe to sweep. Schedule after this promise resolves and never await:
-        // a slow or failing sweep must not delay the first worker admission.
-        setTimeout(() => sweepDeadLeasesAtStartup(databasePath, bridge), 0)
+        // safe to sweep. The sweep runs off-loop on the executor and is never
+        // awaited: a slow or failing sweep must not delay the first worker
+        // admission.
+        void sweepDeadLeasesAtStartup(databasePath, options.db, bridge)
         return undefined
       },
       (error: unknown) => {

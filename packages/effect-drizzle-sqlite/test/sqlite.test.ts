@@ -11,7 +11,7 @@ import type { SqlClient as SqlClientService } from "effect/unstable/sql/SqlClien
 import { isSqlError } from "effect/unstable/sql/SqlError"
 // effect-drizzle-sqlite is intentionally generic and does not depend on
 // @opencode-ai/core, so the integration test reaches the retry helper directly.
-import { BusyRetriesExhaustedError, withBusyRetry } from "../../core/src/database/busy"
+import { BusyExhaustedError, withBusyRetry } from "../../core/src/database/busy"
 import { EffectDrizzleSqlite } from "../src"
 
 const users = sqliteTable("users", {
@@ -155,11 +155,12 @@ test("recovers a contended transactional write under bounded busy retry", async 
         const db = yield* EffectDrizzleSqlite.makeWithDefaults()
         yield* db.run(sql`pragma busy_timeout = 0`)
 
-        // The holder owns the write lock until the first backoff sleep releases
-        // it, so the first attempt fails busy and a later attempt commits.
+        // The holder owns the write lock until a timer releases it, so the first
+        // attempt fails busy and a later attempt commits.
+        setTimeout(release, 20)
         yield* withBusyRetry(
           db.transaction((tx) => tx.insert(users).values({ name: "Recovered" }), { behavior: "immediate" }),
-          { retries: 10, baseDelayMs: 1, maxDelayMs: 5, sleep: () => Effect.sync(release) },
+          { retries: 20, baseDelayMs: 5, maxDelayMs: 20 },
         )
 
         expect(yield* db.select().from(users)).toEqual([{ id: 1, name: "Recovered" }])
@@ -187,17 +188,17 @@ test("fails loudly when the busy retry budget is exhausted", async () => {
         const db = yield* EffectDrizzleSqlite.makeWithDefaults()
         yield* db.run(sql`pragma busy_timeout = 0`)
 
-        // `BusyRetriesExhaustedError` is a typed `Schema.TaggedErrorClass`, so it
+        // `BusyExhaustedError` is a typed `Schema.TaggedErrorClass`, so it
         // rides the error channel: `Effect.flip` surfaces it as a plain value.
         return yield* withBusyRetry(
           db.transaction((tx) => tx.insert(users).values({ name: "Blocked" }), { behavior: "immediate" }),
-          { retries: 2, baseDelayMs: 1, maxDelayMs: 1, sleep: () => Effect.void },
+          { retries: 2, baseDelayMs: 1, maxDelayMs: 1 },
         ).pipe(Effect.flip)
       }).pipe(Effect.provide(SqliteClient.layer({ filename, disableWAL: true })), Effect.scoped),
     )
 
-    expect(outcome).toBeInstanceOf(BusyRetriesExhaustedError)
-    const error = outcome as BusyRetriesExhaustedError
+    expect(outcome).toBeInstanceOf(BusyExhaustedError)
+    const error = outcome as BusyExhaustedError
     expect(error.attempts).toBe(3)
     expect(isSqlError(error.lastCause)).toBe(true)
   } finally {

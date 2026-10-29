@@ -14,8 +14,8 @@ import { randomUUID } from "node:crypto"
 import { Schema } from "effect"
 import { Database, type SQLQueryBindings } from "bun:sqlite"
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue, type StatementSync } from "node:sqlite"
-import { isBusySqlError } from "./busy"
-import { resolveWorkerCacheSizeKib, walPragmas } from "./pragmas"
+import { resolveWorkerCacheSizeKib, walPragmas, type BusyRetryConfig } from "./pragmas"
+import { retryBusySync } from "./transaction"
 
 /** SQLite stays locked for this long before the sync driver reports busy. */
 export const WORKER_BUSY_TIMEOUT_MS = 250
@@ -24,27 +24,76 @@ export const WORKER_BUSY_TIMEOUT_MS = 250
  * Open-time busy budget. Switching a fresh handle to WAL needs a brief write
  * lock; a process that starts while a peer is checkpointing or migrating must
  * wait it out instead of failing boot with `SQLITE_BUSY`. The driver's own
- * `busy_timeout` covers most of the window, and this bounded replay covers the
- * cases SQLite reports busy without waiting.
+ * `busy_timeout` is the only wait: the open path is synchronous and must never
+ * park the thread, so the replays are immediate and the worst case is bounded
+ * by `OPEN_BUSY_RETRIES * busy_timeout`.
  */
-const OPEN_BUSY_RETRIES = 8
-const OPEN_BUSY_BASE_DELAY_MS = 20
-const OPEN_BUSY_MAX_DELAY_MS = 400
-
-/** Blocking pause shared by the boot paths that cannot yield to the event loop. */
-export function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
-}
+const OPEN_BUSY_RETRY: BusyRetryConfig = Object.freeze({ retries: 4, baseDelayMs: 0, maxDelayMs: 0 })
 
 function retryOpenWhileBusy<T>(open: () => T): T {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      return open()
-    } catch (error) {
-      if (!isBusySqlError(error) || attempt >= OPEN_BUSY_RETRIES) throw error
-      sleepSync(Math.min(OPEN_BUSY_BASE_DELAY_MS * 2 ** attempt, OPEN_BUSY_MAX_DELAY_MS))
-    }
+  return retryBusySync(open, OPEN_BUSY_RETRY)
+}
+
+export interface SqliteRuntime {
+  readonly version: string
+  readonly compileOptions: ReadonlyArray<string>
+}
+
+export class SqliteDriverMismatchError extends Schema.TaggedErrorClass<SqliteDriverMismatchError>(
+  "SqliteDriverMismatchError",
+)("Database.SqliteDriverMismatch", {
+  detail: Schema.String,
+}) {
+  override get message() {
+    return `bun:sqlite and node:sqlite are different SQLite builds: ${this.detail}`
   }
+}
+
+/** Describe how two SQLite builds differ, or `undefined` when they match. */
+export function sqliteRuntimeMismatch(bun: SqliteRuntime, node: SqliteRuntime): string | undefined {
+  if (bun.version !== node.version) return `version ${bun.version} (bun) vs ${node.version} (node)`
+  const bunOptions = new Set(bun.compileOptions)
+  const nodeOptions = new Set(node.compileOptions)
+  const onlyBun = [...bunOptions].filter((option) => !nodeOptions.has(option)).sort()
+  const onlyNode = [...nodeOptions].filter((option) => !bunOptions.has(option)).sort()
+  if (onlyBun.length === 0 && onlyNode.length === 0) return undefined
+  return `compile options differ (bun only: ${onlyBun.join(",") || "none"}; node only: ${onlyNode.join(",") || "none"})`
+}
+
+function bunSqliteRuntime(): SqliteRuntime {
+  const handle = new Database(":memory:")
+  try {
+    const row = handle.query("SELECT sqlite_version() AS version").get() as { version: string }
+    const options = handle.query("PRAGMA compile_options").all() as Array<{ compile_options: string }>
+    return { version: row.version, compileOptions: options.map((option) => option.compile_options) }
+  } finally {
+    handle.close()
+  }
+}
+
+function nodeSqliteRuntime(): SqliteRuntime {
+  const handle = new DatabaseSync(":memory:")
+  try {
+    const row = handle.prepare("SELECT sqlite_version() AS version").get() as unknown as { version: string }
+    const options = handle.prepare("PRAGMA compile_options").all() as unknown as Array<{ compile_options: string }>
+    return { version: row.version, compileOptions: options.map((option) => option.compile_options) }
+  } finally {
+    handle.close()
+  }
+}
+
+let driverParityVerified = false
+
+/**
+ * The hub and the workers share one WAL file through different drivers. Refuse
+ * to run when the two bundled SQLite builds differ, since a version or
+ * compile-option skew changes locking and WAL behavior across processes.
+ */
+export function assertSqliteDriverParity(): void {
+  if (driverParityVerified) return
+  const detail = sqliteRuntimeMismatch(bunSqliteRuntime(), nodeSqliteRuntime())
+  if (detail !== undefined) throw new SqliteDriverMismatchError({ detail })
+  driverParityVerified = true
 }
 
 /**

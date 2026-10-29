@@ -22,7 +22,8 @@ import { Database as DatabaseService } from "@opencode-ai/core/database/database
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Integration } from "@opencode-ai/core/integration"
 import {
-  BusyRetriesExhaustedError,
+  BusyExhaustedError,
+  busyDelayMs,
   isBusySqlError,
   isNativeSqliteError,
   resolveBusyRetryConfig,
@@ -36,7 +37,6 @@ import {
 } from "@opencode-ai/core/database/sqlite-adapter"
 import { ConnectionClosedError } from "@opencode-ai/core/database/connection"
 import {
-  BusyExhaustedError,
   TransactionPoisonedError,
   TransactionRollbackError,
   inImmediateTransaction,
@@ -113,55 +113,25 @@ describe("isNativeSqliteError", () => {
 })
 
 describe("withBusyRetry", () => {
-  test("retries a busy failure until it succeeds, with bounded exponential backoff", async () => {
+  test("retries a busy failure until it succeeds", async () => {
     let attempts = 0
-    const delays: number[] = []
     const effect = Effect.suspend(() => {
       attempts += 1
       return attempts <= 2 ? Effect.fail(busyFailure) : Effect.succeed("committed")
     })
 
-    const result = await Effect.runPromise(
-      withBusyRetry(effect, {
-        retries: 5,
-        baseDelayMs: 10,
-        maxDelayMs: 100,
-        sleep: (ms) =>
-          Effect.sync(() => {
-            delays.push(ms)
-          }),
-      }),
-    )
+    const result = await Effect.runPromise(withBusyRetry(effect, { retries: 5, baseDelayMs: 1, maxDelayMs: 4 }))
 
     expect(result).toBe("committed")
     expect(attempts).toBe(3)
-    expect(delays).toEqual([10, 20])
   })
 
-  test("caps the backoff at maxDelayMs", async () => {
-    let attempts = 0
-    const delays: number[] = []
-    const effect = Effect.suspend(() => {
-      attempts += 1
-      return attempts <= 4 ? Effect.fail(busyFailure) : Effect.succeed("ok")
-    })
-
-    await Effect.runPromise(
-      withBusyRetry(effect, {
-        retries: 5,
-        baseDelayMs: 10,
-        maxDelayMs: 25,
-        sleep: (ms) =>
-          Effect.sync(() => {
-            delays.push(ms)
-          }),
-      }),
-    )
-
-    expect(delays).toEqual([10, 20, 25, 25])
+  test("backoff doubles and caps at maxDelayMs", () => {
+    const config = { retries: 5, baseDelayMs: 10, maxDelayMs: 25 }
+    expect([1, 2, 3, 4].map((failed) => busyDelayMs(config, failed))).toEqual([10, 20, 25, 25])
   })
 
-  test("exhausts with a typed BusyRetriesExhaustedError carrying attempts and last cause (R5#2)", async () => {
+  test("exhausts with a typed BusyExhaustedError carrying attempts and last cause", async () => {
     let attempts = 0
     const effect = Effect.suspend(() => {
       attempts += 1
@@ -169,11 +139,11 @@ describe("withBusyRetry", () => {
     })
 
     const error = await Effect.runPromise(
-      withBusyRetry(effect, { retries: 2, baseDelayMs: 1, maxDelayMs: 2, sleep: () => Effect.void }).pipe(Effect.flip),
+      withBusyRetry(effect, { retries: 2, baseDelayMs: 1, maxDelayMs: 2 }).pipe(Effect.flip),
     )
 
-    expect(error).toBeInstanceOf(BusyRetriesExhaustedError)
-    const exhausted = error as BusyRetriesExhaustedError
+    expect(error).toBeInstanceOf(BusyExhaustedError)
+    const exhausted = error as BusyExhaustedError
     expect(exhausted.attempts).toBe(3)
     expect(exhausted.lastCause).toEqual(busyFailure)
     expect(attempts).toBe(3)
@@ -187,10 +157,10 @@ describe("withBusyRetry", () => {
     })
 
     const error = await Effect.runPromise(
-      withBusyRetry(effect, { retries: 0, baseDelayMs: 1, maxDelayMs: 1, sleep: () => Effect.void }).pipe(Effect.flip),
+      withBusyRetry(effect, { retries: 0, baseDelayMs: 1, maxDelayMs: 1 }).pipe(Effect.flip),
     )
 
-    expect(error).toBeInstanceOf(BusyRetriesExhaustedError)
+    expect(error).toBeInstanceOf(BusyExhaustedError)
     expect(attempts).toBe(1)
   })
 
@@ -202,7 +172,7 @@ describe("withBusyRetry", () => {
     })
 
     const error = await Effect.runPromise(
-      withBusyRetry(effect, { retries: 5, baseDelayMs: 1, maxDelayMs: 1, sleep: () => Effect.void }).pipe(Effect.flip),
+      withBusyRetry(effect, { retries: 5, baseDelayMs: 1, maxDelayMs: 1 }).pipe(Effect.flip),
     )
 
     expect(error).toBe(nonBusyFailure)
@@ -210,7 +180,7 @@ describe("withBusyRetry", () => {
   })
 
   test("a successful attempt passes through unchanged", async () => {
-    const result = await Effect.runPromise(withBusyRetry(Effect.succeed(42), { sleep: () => Effect.void }))
+    const result = await Effect.runPromise(withBusyRetry(Effect.succeed(42), {}))
     expect(result).toBe(42)
   })
 })

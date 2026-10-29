@@ -2,7 +2,6 @@ import { readFileSync } from "node:fs"
 import { Context, Effect, Layer, Option, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
-import { withBusyRetry } from "@opencode-ai/core/database/busy"
 import type { Connection, WriteOutcome } from "@opencode-ai/core/database/connection"
 import type { RepositoryValues, WorkerRepository } from "@/session/worker/repository/types"
 import { connectedRepository } from "@/session/worker/repository/write"
@@ -844,9 +843,7 @@ export const workerLayer: Layer.Layer<Service> = Layer.effect(
       ? <A>(operation: () => A) =>
           database.value.db
             .transaction(() => Effect.sync(operation), { behavior: "immediate" })
-            // A busy ledger write owns no outer transaction, so the whole
-            // exclusive transaction replays instead of a single statement.
-            .pipe(withBusyRetry, Effect.orDie)
+            .pipe(Effect.orDie)
       : undefined
     // The lease owner is read per operation: a worker claims its lease after the
     // graph is built, so capturing it here would miss the first write.
