@@ -266,6 +266,34 @@ describe("one isolate-terminate authority", () => {
     })
   })
 
+  test("a terminate during the generation probe never constructs an isolate", async () => {
+    await withFakeWorker(async () => {
+      let releaseProbe!: () => void
+      const probe = new Promise<string>((resolve) => {
+        releaseProbe = () => resolve("model-a")
+      })
+      const { pool, dispose } = await createProductionPool(options({ generationOf: () => probe }))
+      try {
+        const worker = pool.spawn()
+        const run = worker.execute({ sessionID: sid("ses_authority_probe"), depth: 0 })
+        const outcome = run.then(
+          () => undefined,
+          (error: unknown) => error,
+        )
+        await flush()
+
+        const terminating = worker.terminate()
+        releaseProbe()
+        await terminating
+
+        expect(await outcome).toBeInstanceOf(Error)
+        expect(FakeWorker.instances).toHaveLength(0)
+      } finally {
+        await dispose()
+      }
+    })
+  })
+
   test("pool shutdown is bounded when the init resolver never settles", async () => {
     await withFakeWorker(async () => {
       const { pool, dispose } = await createProductionPool(

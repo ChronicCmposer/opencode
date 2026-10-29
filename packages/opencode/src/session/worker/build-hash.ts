@@ -5,7 +5,9 @@
 // runtime env are deliberately excluded, so a plugin change never forces a
 // worker rebuild and a protocol change always does.
 //
-// The ready handshake carries the hash. A hub and worker that disagree fail with
+// The ready handshake carries the hash. A compiled binary embeds one hash for
+// hub and worker alike, so there the check is a consistency assertion; only a
+// separately built worker entry or the development override can diverge. A hub and worker that disagree fail with
 // a typed `BuildMismatch`; there is no fallback to the in-process path. A
 // development-only override (`OPENCODE_BUILD_HASH_OVERRIDE`) is logged at error
 // level and surfaced through `buildHashStatus` so status consumers can see that

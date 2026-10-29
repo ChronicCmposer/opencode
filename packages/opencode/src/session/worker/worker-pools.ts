@@ -73,6 +73,8 @@ export interface SpawnGateOptions {
 
 export interface SpawnGateHandle {
   acquire(signal?: AbortSignal): Promise<SpawnPermit>
+  /** Interrupt every pending holder fiber; later acquisitions are not supported. */
+  close?(): Promise<void>
   /** Whether at least one boot slot is currently held. */
   readonly held?: boolean
   /** Exact count of currently held boot slots. */
@@ -137,6 +139,7 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
   const timeoutMs = requirePositive("timeoutMs", options.timeoutMs)
   const capacity = requirePositiveInteger("capacity", options.capacity ?? DEFAULT_SPAWN_CAPACITY)
   const semaphore = Semaphore.makeUnsafe(capacity)
+  const scope = Scope.makeUnsafe()
   // Plain counters: every mutation below is synchronous, so JavaScript's single
   // thread already gives the gate the atomicity it needs.
   let activeCount = 0
@@ -175,28 +178,6 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
     waitingCounted = true
     waitingCount += 1
 
-    const fiber = WorkerRuntime.runFork(
-      Effect.raceFirst(
-        hold,
-        Deferred.await(aborted).pipe(Effect.andThen(Effect.interrupt)),
-      ).pipe(
-        Effect.catchCause(() => Effect.void),
-        Effect.ensuring(
-          Effect.sync(() => {
-            detach()
-            if (waitingCounted) {
-              waitingCounted = false
-              waitingCount = Math.max(0, waitingCount - 1)
-            }
-            if (holding) {
-              holding = false
-              activeCount = Math.max(0, activeCount - 1)
-            }
-          }),
-        ),
-      ),
-    )
-
     const permit = (): SpawnPermit => {
       let releasedOnce = false
       return {
@@ -208,29 +189,49 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
       }
     }
 
-    return WorkerRuntime.runPromise(
-      Effect.raceFirst(
-        Deferred.await(granted).pipe(Effect.map(permit)),
-        Deferred.await(aborted).pipe(Effect.andThen(Effect.fail(new SpawnGateAbortedError()))),
-      ).pipe(
-        Effect.timeoutOrElse({
-          duration: timeoutMs,
-          orElse: () => Effect.fail(new SpawnGateTimeoutError(timeoutMs)),
+    const holder = Effect.raceFirst(
+      hold,
+      Deferred.await(aborted).pipe(Effect.andThen(Effect.interrupt)),
+    ).pipe(
+      Effect.catchCause(() => Effect.void),
+      Effect.ensuring(
+        Effect.sync(() => {
+          detach()
+          if (waitingCounted) {
+            waitingCounted = false
+            waitingCount = Math.max(0, waitingCount - 1)
+          }
+          if (holding) {
+            holding = false
+            activeCount = Math.max(0, activeCount - 1)
+          }
         }),
       ),
-    ).then(
-      (value) => value,
-      (error: unknown) => {
-        // A failed acquisition must leave the queue: interrupt the pending
-        // `withPermits` scope so it can never construct afterwards.
-        WorkerRuntime.runFork(Fiber.interrupt(fiber))
-        throw error
-      },
+    )
+
+    // The holder lives in the gate's scope so it outlives this call while held;
+    // a failed or interrupted acquisition interrupts it so it can never
+    // construct afterwards.
+    return WorkerRuntime.runPromise(
+      Effect.gen(function* () {
+        const fiber = yield* Effect.forkIn(holder, scope)
+        return yield* Effect.raceFirst(
+          Deferred.await(granted).pipe(Effect.map(permit)),
+          Deferred.await(aborted).pipe(Effect.andThen(Effect.fail(new SpawnGateAbortedError()))),
+        ).pipe(
+          Effect.timeoutOrElse({
+            duration: timeoutMs,
+            orElse: () => Effect.fail(new SpawnGateTimeoutError(timeoutMs)),
+          }),
+          Effect.onError(() => Fiber.interrupt(fiber)),
+        )
+      }),
     )
   }
 
   return {
     acquire,
+    close: () => WorkerRuntime.runPromise(Scope.close(scope, Exit.void)),
     get held() {
       return activeCount > 0
     },
@@ -1685,91 +1686,6 @@ function withIdleIsolateCap(pool: ExecutorWorkerPool, cap: IdleIsolateCap): Idle
   }
 }
 
-/**
- * The mutable materialization state shared by every worker whose isolate is
- * created on first use. The `materialize` policy owns the *why* (a session-bound
- * factory rebinds); this helper owns the worker surface and the terminate race.
- */
-interface MaterializingWorkerState {
-  /** The live isolate, or `undefined` before the first materialization. */
-  inner: ExecutorWorker | undefined
-  /** Set once `terminate` runs; a late materialization must never publish. */
-  terminated: boolean
-  /** The in-flight materialization, so concurrent executes share one isolate. */
-  materializing: Promise<ExecutorWorker> | undefined
-}
-
-/**
- * Build the `ExecutorWorker` surface around a `materialize` policy, which
- * resolves the isolate for a run's session and writes it back to `state.inner`.
- * The helper enforces the terminate race: a terminate during materialization
- * discards the fresh isolate rather than publishing a live worker. Before the
- * first materialization, `cancel`/`assertNotBusy`/`resultFor` are no-ops, which
- * is correct because no session can run on a worker that was never started.
- */
-function createMaterializingExecutorWorker(
-  id: number,
-  materialize: (run: import("./execute").ExecutorRun, state: MaterializingWorkerState) => Promise<ExecutorWorker>,
-  bridge: EffectBridge.Shape | undefined,
-  cap?: WorkerCap,
-): ExecutorWorker {
-  const state: MaterializingWorkerState = { inner: undefined, terminated: false, materializing: undefined }
-  // One close for the whole generation. A repeated terminate (idle eviction,
-  // then the dispatcher's dead-idle replacement) joins this promise instead of
-  // returning before the isolate exits and its lease release lands.
-  let termination: Promise<void> | undefined
-  const worker: ExecutorWorker = {
-    id,
-    get alive() {
-      return !state.terminated && (state.inner === undefined || state.inner.alive)
-    },
-    execute: async (run) => {
-      // Cap the number of concurrently *running* foreground workers; extra
-      // sessions queue here in FIFO order instead of oversubscribing the CPU.
-      // A depth >= 1 child takes headroom at its own depth, so a parent that
-      // awaits a foreground `task` child never deadlocks on the parent's slot.
-      const release = await cap?.acquire(run.depth)
-      try {
-        return await (await materialize(run, state)).execute(run)
-      } finally {
-        release?.()
-      }
-    },
-    cancel: (sessionID) => (state.inner === undefined ? Promise.resolve() : state.inner.cancel(sessionID)),
-    cancelBoot: () => state.inner?.cancelBoot?.() ?? Promise.resolve(undefined),
-    assertNotBusy: (sessionID) =>
-      state.inner === undefined ? Promise.resolve(false) : state.inner.assertNotBusy(sessionID),
-    resultFor: (sessionID) => state.inner?.resultFor(sessionID),
-    // The materialized isolate owns the real probes. Forward them so the idle
-    // cap can see background work; before materialization (or on a minimal
-    // inner) the safe defaults are "no work" and "nothing to await".
-    hasActiveWork: (sessionID) => state.inner?.hasActiveWork?.(sessionID) ?? Promise.resolve(false),
-    awaitEgress: (sessionID) => state.inner?.awaitEgress?.(sessionID) ?? Promise.resolve(),
-    cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID), ...(bridge === undefined ? {} : { bridge }) }),
-    terminate: () => {
-      if (termination !== undefined) return termination
-      state.terminated = true
-      const materializing = state.materializing
-      state.materializing = undefined
-      const current = state.inner
-      state.inner = undefined
-      termination = (async () => {
-        if (current !== undefined) {
-          await current.terminate()
-          return
-        }
-        // A retire raced the first materialization: the worker it is about to
-        // publish must still be closed (orderly) instead of leaked.
-        if (materializing !== undefined) {
-          await materializing.then((worker) => worker.terminate()).catch(() => undefined)
-        }
-      })()
-      return termination
-    },
-  }
-  return worker
-}
-
 // ---------------------------------------------------------------------------
 // Production pool + hub factories (steps 10 + 13 + 14).
 // ---------------------------------------------------------------------------
@@ -1989,109 +1905,6 @@ export type SessionBoundSpawner = (
   sessionID: SessionID,
   init?: SessionWorkerInit,
 ) => Promise<ExecutorWorker>
-
-/**
- * A worker whose isolate is bound to ONE dispatched session. A worker isolate
- * owns exactly one serialized model (`reducedModelProviderLayer` rejects any
- * other with `WorkerModelMismatchError`), so when the dispatcher hands this
- * worker a *different* session it terminates the old isolate and respawns under
- * the same id with that session's init. Reuse across turns of the same session
- * (the common case) keeps the isolate.
- */
-export function createSessionBoundExecutorWorker(
-  id: number,
-  spawnFor: SessionBoundSpawner,
-  bridge?: EffectBridge.Shape,
-  /**
-   * Runs when this isolate rebinds to a different session. The old session's
-   * hub-side state is no longer reachable from this worker.
-   */
-  onSessionRebound?: (sessionID: SessionID) => unknown,
-  cap?: WorkerCap,
-  /**
-   * The generation for a dispatch: a changed key (a different requested or
-   * persisted model) retires the isolate even though the session id is the same,
-   * so a legitimate mid-session model switch rebuilds the worker instead of
-   * surfacing `WorkerModelMismatchError` on the next turn.
-   */
-  generationOf?: (sessionID: SessionID, model?: import("./execute").WorkerRunModel) => Promise<WorkerGeneration>,
-  /**
-   * Full retirement for a same-session generation change. Awaited after the old
-   * isolate exits and before the successor spawns, so the successor never boots
-   * against the retired generation's live lease or hub-side state.
-   */
-  onGenerationRetired?: (sessionID: SessionID, workerID?: number) => void | Promise<void>,
-): ExecutorWorker {
-  let boundSession: SessionID | undefined
-  let boundGeneration: string | undefined
-  return createMaterializingExecutorWorker(
-    id,
-    async (run, state) => {
-      const sessionID = run.sessionID
-      if (state.terminated) throw new Error(`executor worker ${id} is terminated`)
-      const resolved = generationOf === undefined ? { generation: sessionID } : await generationOf(sessionID, run.model)
-      const generation = resolved.generation
-      if (state.inner !== undefined && boundSession === sessionID && boundGeneration === generation) {
-        return state.inner
-      }
-      const previousSession = boundSession
-      const previousGeneration = boundGeneration
-      const previous = state.inner
-      state.inner = undefined
-      boundSession = sessionID
-      boundGeneration = generation
-      // Retire the previous isolate for ANY generation change, including the
-      // same session moving to a new model. A rebind releases the old session's
-      // state; a same-session generation change runs the hub's full retirement
-      // path (the dispatcher never sees an in-place replacement).
-      if (previousSession !== undefined && previous !== undefined) {
-        const rebound = previousSession !== sessionID
-        void bridge?.fork(
-          Effect.logInfo(workerLogMessage(rebound ? "worker rebound" : "worker generation changed"), {
-            workerID: id,
-            ...(rebound
-              ? { fromSession: previousSession, toSession: sessionID }
-              : { fromGeneration: previousGeneration, toGeneration: generation }),
-            sessionID,
-          }),
-        )
-      }
-      const retiredSession = previousSession
-      const retiredIsRebind = retiredSession !== undefined && retiredSession !== sessionID
-      state.materializing = Promise.resolve()
-        // Retire the old isolate first so two models never share one worker.
-        .then(() => previous?.terminate().catch(() => undefined))
-        .then(async () => {
-          if (retiredSession === undefined || previous === undefined) return
-          try {
-            if (retiredIsRebind) await onSessionRebound?.(retiredSession)
-            else await onGenerationRetired?.(retiredSession, id)
-          } catch (error) {
-            // Cleanup must never fail the new run; the successor still boots.
-            void bridge?.fork(
-              Effect.logWarning(workerLogMessage("worker retirement callback failed"), {
-                workerID: id,
-                sessionID: retiredSession,
-                error: error instanceof Error ? error.message : String(error),
-              }),
-            )
-          }
-        })
-        .then(() => spawnFor(id, sessionID, resolved.init))
-        .then((worker) => {
-          if (state.terminated) {
-            void worker.terminate()
-            throw new Error(`executor worker ${id} is terminated`)
-          }
-          state.inner = worker
-          return worker
-        })
-      return state.materializing
-    },
-    bridge,
-    cap,
-  )
-}
 
 /** One init build shared by every concurrent caller for the same key. */
 interface InitFlight {
@@ -2449,6 +2262,7 @@ export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Eff
             if (terminated) throw new Error(`executor worker ${id} is terminated`)
             const materialized = (async () => {
               const generation = await generationOf(run.sessionID, run.model)
+              if (terminated) throw new Error(`executor worker ${id} is terminated`)
               const key = generationKey(run.sessionID, generation.generation)
               if (boundKey !== undefined && boundKey !== key) {
                 const previousSession = boundSession
@@ -2470,6 +2284,7 @@ export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Eff
                   )
                 }
               }
+              if (terminated) throw new Error(`executor worker ${id} is terminated`)
               boundSession = run.sessionID
               boundKey = key
               lookups.set(key, { sessionID: run.sessionID, workerID: id, init: generation.init })

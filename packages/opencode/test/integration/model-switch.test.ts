@@ -9,9 +9,10 @@
 //     switch proves the old isolate was retired rather than reused with a stale
 //     reduced provider.
 
+import { createSessionBoundExecutorWorker } from "../lib/lazy-worker-pool"
 import { describe, expect, test } from "bun:test"
 import { Effect, Scope } from "effect"
-import { createSessionBoundExecutorWorker, makeProduction } from "@/session/worker/hub"
+import { makeProduction } from "@/session/worker/hub"
 import type { ProductionWorkerPoolOptions } from "@/session/worker/hub"
 import type { ExecutorWorkerPool } from "@/session/worker/execute"
 import type { ExecutorWorker } from "@/session/worker/execute"

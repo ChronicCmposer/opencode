@@ -22,7 +22,6 @@ import {
   createEgressDeliveryBarrier,
   createHubEventSink,
   createProductionSessionHub,
-  createSessionBoundExecutorWorker,
   createSessionHub,
   createSessionHubLayer,
   hubProxyAuthoritiesFor,
@@ -50,7 +49,11 @@ import {
 } from "@/session/worker/hub"
 import { RunBarrier } from "@/session/run-barrier"
 import { createTestBarrier } from "../../lib/run-barrier-test"
-import { createLazyExecutorWorker, createLazyExecutorWorkerPool } from "../../lib/lazy-worker-pool"
+import {
+  createLazyExecutorWorker,
+  createLazyExecutorWorkerPool,
+  createSessionBoundExecutorWorker,
+} from "../../lib/lazy-worker-pool"
 import {
   ackFrame,
   blobPositionReferenceFrame,

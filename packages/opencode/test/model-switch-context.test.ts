@@ -6,6 +6,7 @@
 // deleting `contextBySession` while the successor was already running, so a
 // permission request from the next turn found no `InstanceRef` directory.
 
+import { createSessionBoundExecutorWorker } from "./lib/lazy-worker-pool"
 import { describe, expect, test } from "bun:test"
 import { Context, Deferred, Effect, Fiber, Layer, Option } from "effect"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
@@ -33,7 +34,6 @@ import {
 } from "@/session/worker/execute"
 import {
   createProductionSessionHub,
-  createSessionBoundExecutorWorker,
   productionSessionHubLayer,
   SessionHubService,
   type ProductionPoolFactory,
