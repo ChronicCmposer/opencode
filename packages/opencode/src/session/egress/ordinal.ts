@@ -1,19 +1,4 @@
 // Writer-stamped, generation-scoped global ordinal.
-//
-// Dependency (interface assumption, documented):
-//   The single-writer Worker is responsible for stamping a global,
-//   monotonically increasing `ordinal` at commit, scoped to a `generation`.
-//   `generation` is bumped whenever the writer is respawned (crash/resupervision),
-//   so ordinals from a dead writer can never be compared against a live one.
-//   The egress frame carries `{generation, ordinal}` as plain `number` fields;
-//   no schema change.
-//
-//   We expose `OrdinalSource` as the seam the writer will
-//   implement, plus `createMonotonicOrdinalSource` as a deterministic fallback.
-//
-// Ordering is `(generation, ordinal)` lexicographic: a higher generation always
-// wins, so a writer restart resets the ordinal without breaking commit order for
-// consumers.
 
 export interface WriterOrdinal {
   readonly generation: number
@@ -39,8 +24,8 @@ export interface MonotonicOrdinalOptions {
 }
 
 /**
- * Deterministic stand-in for the writer ordinal: increments the ordinal
- * by one per call within a fixed generation.
+ * Deterministic stand-in for the writer ordinal: increments the ordinal by one per call within a fixed
+ * generation.
  */
 export function createMonotonicOrdinalSource(options: MonotonicOrdinalOptions = {}): OrdinalSource {
   const generation = options.generation ?? 1

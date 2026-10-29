@@ -12,20 +12,12 @@ import { Database } from "./database/database"
 import { inImmediateTransaction, inImmediateTransactionAsync } from "./database/transaction"
 import { makeGlobalNode, type GlobalNode } from "./effect/app-node"
 
-/**
- * The synchronous connection a DurableLog writes through. It matches the worker
- * connection surface (`all`/`run`/`exec`) so a per-worker WAL connection can be
- * passed directly; the DurableLog owns `BEGIN IMMEDIATE` for its own operations.
- */
+/** The synchronous connection a DurableLog writes through. */
 export interface Connection {
   all(sql: string, params?: ReadonlyArray<unknown>): ReadonlyArray<Record<string, unknown>>
   run(sql: string, params?: ReadonlyArray<unknown>): { readonly changes: number }
   exec(sql: string): void
-  /**
-   * The file this connection owns, when the driver exposes it. A DurableLog with no
-   * explicit `blobDir` derives its content-addressed directory from this file so
-   * a custom-file database never shares (or unlinks) another database's blobs.
-   */
+  /** The file this connection owns, when the driver exposes it. */
   readonly filename?: string
 }
 
@@ -34,70 +26,42 @@ export interface CacheInvalidation {
 }
 
 export interface Options {
-  /**
-   * Raw connection for the legacy path. A caller inside the worker repository
-   * boundary passes {@link Options.repository} instead, so no raw handle crosses
-   * the capability.
-   */
+  /** Raw connection for the legacy path. */
   readonly connection?: Connection
-  /**
-   * The typed durable-write boundary. When present it owns every `event`,
-   * `event_sequence`, and `event_blob` statement; `connection` is then unused.
-   */
+  /** The typed durable-write boundary. */
   readonly repository?: DurableRepository
   /** Worker-generation lease stamped onto every aggregate this DurableLog writes. */
   readonly ownerID: string
-  /**
-   * Worker lease TTL in milliseconds. Zero/absent means no time-based expiry
-   * (legacy callers); production workers set a positive TTL so a reclaim from a
-   * live generation is refused until the lease expires or is released.
-   */
+  /** Worker lease TTL in milliseconds. */
   readonly leaseTimeoutMs?: number
   /** Definitions used to decode stored events; defaults to the global durable manifest. */
   readonly definitions?: ReadonlyArray<Event.Definition>
   readonly cache?: CacheInvalidation
-  /**
-   * The one aggregate this DurableLog may touch (a worker's session). Any other
-   * aggregate is refused, so a session-scoped DurableLog cannot read or write another
-   * session's durable log.
-   */
+  /** The one aggregate this DurableLog may touch (a worker's session). */
   readonly aggregateID?: string
   /**
-   * D16 content-addressed directory for payloads above {@link blobLimitBytes}.
-   * Absent means an oversized payload is refused rather than silently truncated.
+   * D16 content-addressed directory for payloads above {@link blobLimitBytes}. Absent means an oversized
+   * payload is refused rather than silently truncated.
    */
   readonly blobDir?: string
-  /**
-   * Inline durable payload bound; above it the payload is stored by reference.
-   * Defaults to {@link DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES} (one worker frame
-   * minus envelope headroom), never the raw frame cap.
-   */
+  /** Inline durable payload bound; above it the payload is stored by reference. */
   readonly blobLimitBytes?: number
 }
 
 /**
- * D16 schema bound: 4 MiB, the same bound as the worker egress frame cap
- * (`MAX_WORKER_FRAME_BYTES`). This stays the public schema/event bound; the
- * default DurableLog inline threshold below is smaller so a stored-inline body still
- * fits its envelope.
+ * D16 schema bound: 4 MiB, the same bound as the worker egress frame cap (`MAX_WORKER_FRAME_BYTES`).
  */
 export const DEFAULT_BLOB_LIMIT_BYTES = 4 * 1024 * 1024
 
 /**
- * Space reserved inside one worker frame for the envelope: the port/kind/id
- * fields, the committed `(aggregateID, seq)` metadata, and JSON punctuation.
- * 64 KiB is far above the measured envelope overhead, so an inline body at the
- * threshold can always be framed.
+ * Space reserved inside one worker frame for the envelope: the port/kind/id fields, the committed
+ * `(aggregateID, seq)` metadata, and JSON punctuation.
  */
 export const ENVELOPE_HEADROOM_BYTES = 64 * 1024
 
 /**
- * Default DurableLog inline bound: one frame minus {@link ENVELOPE_HEADROOM_BYTES}.
- * A payload at or below this is stored inline AND always fits its frame. A
- * payload between this bound and {@link DEFAULT_BLOB_LIMIT_BYTES} would be
- * inline in the row but too large once framed, so the egress sender would have
- * to substitute a position reference that no `event_blob` row can resolve.
- * Offloading at this bound keeps the stored row and the frame aligned.
+ * Default DurableLog inline bound: one frame minus {@link ENVELOPE_HEADROOM_BYTES}. A payload at or below
+ * this is stored inline AND always fits its frame.
  */
 export const DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES = DEFAULT_BLOB_LIMIT_BYTES - ENVELOPE_HEADROOM_BYTES
 
@@ -126,10 +90,7 @@ export interface ReclaimInput {
   readonly nextOwnerID: string
   /** Clock for a live-lease decision; defaults to `Date.now()`. */
   readonly now?: number
-  /**
-   * Override the dead-generation probe. Defaults to {@link isDeadWorkerOwner},
-   * which reclaims an unexpired lease only when its encoded PID is gone.
-   */
+  /** Override the dead-generation probe. */
   readonly isDeadOwner?: (ownerID: string) => boolean
 }
 
@@ -200,18 +161,11 @@ export interface ReclaimLeaseInput {
   readonly isDeadOwner?: (ownerID: string) => boolean
 }
 
-/**
- * Startup sweep: mark every lease whose owner process is gone reclaimable.
- * Production calls it once from the hub's post-migration boot path, best-effort;
- * the successor's owner+seq reclaim fence does not depend on the sweep.
- */
+/** Startup sweep: mark every lease whose owner process is gone reclaimable. */
 export interface ReleaseDeadLeasesInput {
   /** Restrict the sweep to one aggregate; absent scans every aggregate. */
   readonly aggregateID?: string
-  /**
-   * Proves an owner generation is dead. Defaults to
-   * {@link isDeadWorkerOwner}; a live/unknown owner is never released.
-   */
+  /** Proves an owner generation is dead. */
   readonly isDeadOwner?: (ownerID: string) => boolean
 }
 
@@ -220,21 +174,11 @@ export interface BlobRow {
   readonly seq: number
   readonly hash: string
   readonly filePath: string | null
-  /**
-   * The pre-D16 inline payload. Present only for a legacy row whose
-   * `file_path` is null; a current row stores its bytes in the blob file.
-   */
+  /** The pre-D16 inline payload. */
   readonly data?: string | null
 }
 
-/**
- * The only durable-log write boundary. Every statement against `event`,
- * `event_sequence`, and `event_blob` is one typed method; callers never receive
- * a raw `run`/`exec`/`all` surface. Methods are transaction-agnostic primitives:
- * `transaction`/`transactionAsync` own `BEGIN IMMEDIATE`, and a caller that
- * already holds a transaction (EventV2, `publishInTransaction`) calls them
- * directly inside it.
- */
+/** The only durable-log write boundary. */
 export interface DurableRepository {
   readonly workerLease: boolean
   readonly blobTable: boolean
@@ -249,10 +193,7 @@ export interface DurableRepository {
   readonly renewLease: (input: LeaseOwnerInput & { readonly leaseTimeoutMs: number }) => number
   readonly releaseLease: (input: LeaseOwnerInput) => number
   readonly reclaimLease: (input: ReclaimLeaseInput & { readonly leaseTimeoutMs: number }) => number
-  /**
-   * Mark every lease owned by a provably dead generation reclaimable
-   * (`worker_expires_at = 0`). Never touches a live generation's lease.
-   */
+  /** Mark every lease owned by a provably dead generation reclaimable (`worker_expires_at = 0`). */
   readonly releaseDeadLeases: (input: ReleaseDeadLeasesInput) => number
   /** v1 sync claim: set `owner_id` unconditionally. */
   readonly claimSyncOwner: (input: LeaseOwnerInput) => number
@@ -276,11 +217,7 @@ export interface Interface {
   /** Absent when the DurableLog was built from a typed repository alone. */
   readonly connection?: Connection
   readonly ownerID: string
-  /**
-   * Schema capability: true when the journal has the dedicated
-   * `worker_owner_id` lease column. A worker writer must check this before it
-   * claims; a false value means `owner_id` is v1 sync state only.
-   */
+  /** Schema capability: true when the journal has the dedicated `worker_owner_id` lease column. */
   readonly workerLease: boolean
   readonly publish: (events: PublishEvents) => readonly Event.Payload[]
   /** Publish inside a caller-owned `BEGIN IMMEDIATE`; does not commit or invalidate the cache. */
@@ -288,9 +225,8 @@ export interface Interface {
   /** Run `work` inside `BEGIN IMMEDIATE` and invalidate touched cache keys after commit. */
   readonly transaction: <T>(work: (tx: Transaction) => T) => T
   /**
-   * Async twin of {@link transaction}: the body stays synchronous/atomic, but a
-   * busy backoff yields to the event loop. Workers use this path so a lock held
-   * by another connection never blocks cancel or streaming progress.
+   * Async twin of {@link transaction}: the body stays synchronous/atomic, but a busy backoff yields to the
+   * event loop.
    */
   readonly transactionAsync: <T>(work: (tx: Transaction) => T) => Promise<T>
   /** Async twin of {@link publish} (worker path). */
@@ -301,27 +237,21 @@ export interface Interface {
   readonly read: (input: { readonly aggregateID: string; readonly after?: number }) => readonly Event.Payload[]
   readonly claim: (aggregateID: string, nextOwnerID?: string) => Lease
   readonly reclaim: (input: ReclaimInput) => Lease
-  /**
-   * Mark dead-generation leases reclaimable; preserves live-generation fencing.
-   * The production hub sweeps once after schema ensure, so a restart need not
-   * wait for a dead generation's lease TTL.
-   */
+  /** Mark dead-generation leases reclaimable; preserves live-generation fencing. */
   readonly releaseDeadLeases: (input?: ReleaseDeadLeasesInput) => number
   /** Renew this generation's lease; a stale owner cannot extend it. */
   readonly heartbeat: (aggregateID: string) => void
   /** Mark this generation's lease dead so a successor can reclaim it. */
   readonly release: (aggregateID: string) => void
   /**
-   * Retention/cursor GC: delete durable events and their blob rows below
-   * `beforeSeq`, plus any orphaned blob rows whose event is already gone, then
-   * unlink only content-addressed files with zero remaining references. Returns
-   * the number of `event_blob` rows removed.
+   * Retention/cursor GC: delete durable events and their blob rows below `beforeSeq`, plus any orphaned blob
+   * rows whose event is already gone, then unlink only content-addressed files with zero remaining
+   * references.
    */
   readonly collectBlobs: (input: { readonly aggregateID: string; readonly beforeSeq: number }) => number
   /**
-   * Aggregate-deletion GC: delete one aggregate's whole durable log and blob
-   * rows, then unlink only files with zero references across every aggregate.
-   * Returns the number of durable events removed.
+   * Aggregate-deletion GC: delete one aggregate's whole durable log and blob rows, then unlink only files
+   * with zero references across every aggregate.
    */
   readonly deleteAggregate: (aggregateID: string) => number
 }
@@ -395,21 +325,12 @@ function fsyncPath(target: string, flags: "r" | "r+"): void {
   }
 }
 
-/**
- * Flush a blob file's data through a WRITABLE descriptor. Some platforms reject
- * `fsync` on a read-only handle, and the temp file was just written by this
- * process, so `r+` is both valid and the descriptor whose data must be durable.
- */
+/** Flush a blob file's data through a WRITABLE descriptor. */
 function fsyncFile(file: string): void {
   fsyncPath(file, "r+")
 }
 
-/**
- * Flush a directory entry after a rename. Some filesystems/platforms refuse to
- * fsync a directory handle; that is a capability gap, not a failed write, so
- * only the known "unsupported" codes are tolerated. Every other error (EIO,
- * ENOSPC, ...) still fails the write loud.
- */
+/** Flush a directory entry after a rename. */
 function fsyncDirectory(directory: string): void {
   try {
     fsyncPath(directory, "r")
@@ -421,15 +342,8 @@ function fsyncDirectory(directory: string): void {
 }
 
 /**
- * Store `payload` under its content hash with a temp-file + rename, so a reader
- * never observes a partially written blob. The temp file is fsynced BEFORE the
- * rename makes it visible, and the directory is fsynced afterwards, so a crash
- * cannot leave a committed `event_blob` row pointing at a zero-length or missing
- * file. An existing file is trusted only after its size and hash are revalidated;
- * a torn file is atomically replaced. The dedupe fast path still re-syncs the
- * existing file and its directory entry: a prior process may have created the
- * file without a durability barrier, and the caller is about to commit a row
- * that points at it.
+ * Store `payload` under its content hash with a temp-file + rename, so a reader never observes a partially
+ * written blob.
  */
 export function writeBlobFile(directory: string, hash: string, payload: string): void {
   const file = blobFile(directory, hash)
@@ -469,9 +383,7 @@ export class StaleOwnerError extends Schema.TaggedErrorClass<StaleOwnerError>()(
 }) {}
 
 /**
- * A worker lease was requested against a schema that predates the dedicated
- * `worker_owner_id` column. Failing typed keeps a worker generation out of the
- * v1 sync `owner_id` column instead of silently repurposing it.
+ * A worker lease was requested against a schema that predates the dedicated `worker_owner_id` column.
  */
 export class WorkerLeaseUnsupportedError extends Schema.TaggedErrorClass<WorkerLeaseUnsupportedError>()(
   "DurableLog.WorkerLeaseUnsupported",
@@ -504,11 +416,7 @@ export class StaleStateVersionError extends Schema.TaggedErrorClass<StaleStateVe
 }) {}
 
 /**
- * Reserve `block` contiguous sequences for one aggregate with a single
- * upsert-returning statement. The inserted `seq` is `block - 1`, so a fresh
- * aggregate ends at `block - 1` (first `0`) while an existing aggregate at `L`
- * ends at `L + block` (first `L + 1`). The reservation is rolled back with the
- * surrounding transaction, so a failed commit never leaves a gap.
+ * Reserve `block` contiguous sequences for one aggregate with a single upsert-returning statement.
  */
 const RESERVE_BLOCK = `
   INSERT INTO event_sequence (aggregate_id, seq, owner_id)
@@ -546,11 +454,8 @@ const INSERT_EVENT = "INSERT INTO event (id, aggregate_id, seq, type, data) VALU
 const INSERT_BLOB =
   "INSERT INTO event_blob (aggregate_id, seq, type, hash, size, data, file_path) VALUES (?, ?, ?, ?, ?, NULL, ?)"
 
-// A released lease is `worker_expires_at = 0` (whether `releaseLease` cleared
-// the owner or `releaseDeadLeases` kept it). Renewal must never re-stamp that
-// row: doing so would resurrect the old generation's lease and defeat the
-// ledger fence. An ownerless row with a NULL expiry is a fresh row, not a
-// release, so the first writer may still claim it here.
+// A released lease is `worker_expires_at = 0` (whether `releaseLease` cleared the owner or
+// `releaseDeadLeases` kept it).
 const RENEW_LEASE = `
   UPDATE event_sequence SET worker_owner_id = ?, worker_heartbeat_at = ?, worker_expires_at = ?
   WHERE aggregate_id = ?
@@ -609,25 +514,17 @@ function readHostScope(): string {
   return createHash("sha256").update(identity).digest("hex").slice(0, 8)
 }
 
-/**
- * Identifies the host, boot, and PID namespace this process runs in. A PID in an
- * owner string is only meaningful to a process that shares this scope.
- */
+/** Identifies the host, boot, and PID namespace this process runs in. */
 export const HOST_SCOPE = readHostScope()
 
-/**
- * `worker-<id>-<pid>-<hostScope>-<uuid>` is the worker generation identity. The
- * host scope lets a sweeper decide whether the PID can be probed at all.
- */
+/** `worker-<id>-<pid>-<hostScope>-<uuid>` is the worker generation identity. */
 export function workerOwnerID(workerID: string | number, pid: number = process.pid): string {
   return `worker-${workerID}-${pid}-${HOST_SCOPE}-${randomUUID()}`
 }
 
 /**
- * A lease is "provably dead" only when its owner was minted in this process's
- * host scope and that PID no longer exists. An owner from another host or PID
- * namespace, a legacy shape, or an unparseable identity is treated as live so a
- * peer's lease is only ever reclaimed by expiry.
+ * A lease is "provably dead" only when its owner was minted in this process's host scope and that PID no
+ * longer exists.
  */
 export function isDeadWorkerOwner(ownerID: string): boolean {
   const parts = ownerID.split("-")
@@ -766,10 +663,7 @@ export const assertWritableOwner = (
     }
     return
   }
-  // A released lease has `worker_expires_at = 0` (and `releaseLease` clears the
-  // owner). That state is fenced: the old generation must not re-stamp a lease
-  // its successor will reclaim. An unclaimed row (owner NULL, no expiry) is not
-  // a release; the write below claims it for the first writer.
+  // A released lease has `worker_expires_at = 0` (and `releaseLease` clears the owner).
   if (current?.workerExpiresAt === 0) {
     throw new StaleOwnerError({
       message: `Aggregate ${aggregateID} worker lease has been released`,
@@ -781,10 +675,8 @@ export const assertWritableOwner = (
       message: `Aggregate ${aggregateID} worker lease is held by ${current.workerOwnerID}, not ${ownerID}`,
     })
   }
-  // A same-owner lease is renewable even after its TTL elapsed: the generation
-  // is still the lease owner, so the write below re-stamps `worker_expires_at`. A
-  // genuinely superseded owner never reaches here — the owner mismatch above
-  // fences it — so an expired lease can only be renewed by its own generation.
+  // A same-owner lease is renewable even after its TTL elapsed: the generation is still the lease owner, so
+  // the write below re-stamps `worker_expires_at`.
 }
 
 interface PreparedBatch {
@@ -803,11 +695,7 @@ const prepareBatch = (inputs: PublishEvents, scopeAggregateID: string | undefine
   return { aggregateID, events }
 }
 
-/**
- * Write oversized payload files before `BEGIN IMMEDIATE`. The content hash makes
- * this idempotent, so a failed transaction leaves at worst an unreferenced file,
- * never a row pointing at a missing one.
- */
+/** Write oversized payload files before `BEGIN IMMEDIATE`. */
 const stageBlobPayloads = (batch: PreparedBatch, blob: BlobStore): void => {
   for (const event of batch.events) {
     const encoded = JSON.stringify(event.encoded)
@@ -829,14 +717,7 @@ const stageBlobPayloads = (batch: PreparedBatch, blob: BlobStore): void => {
   }
 }
 
-/**
- * Re-assert a staged blob file inside the publisher's write transaction. Staging
- * runs before `BEGIN IMMEDIATE` (no filesystem work while the write lock is
- * held), but a concurrent GC may have unlinked the file between staging and the
- * lock; because GC now unlinks while holding the same `BEGIN IMMEDIATE`, the
- * file cannot disappear again once this check runs. A missing/wrong-sized file
- * is rewritten from the (already validated) payload.
- */
+/** Re-assert a staged blob file inside the publisher's write transaction. */
 export const ensureStagedBlob = (blob: BlobStore, encoded: string): void => {
   if (blob.dir === undefined) return
   const hash = digest(encoded)
@@ -871,13 +752,7 @@ export interface LeaseWriter {
   readonly renewLease: (input: LeaseOwnerInput & { readonly leaseTimeoutMs: number }) => Effect.Effect<number>
 }
 
-/**
- * The async twin of {@link DurableRepository} for EventV2's authoritative
- * transaction. The worker client acquires its connection asynchronously, so
- * EventV2 cannot call the synchronous primitives; both paths share the SQL
- * constants below and the same {@link writePreparedEvent}/
- * {@link renewWorkerLease} implementation.
- */
+/** The async twin of {@link DurableRepository} for EventV2's authoritative transaction. */
 export interface EffectDurableRepository extends PreparedEventWriter, LeaseWriter {
   readonly sequence: (aggregateID: string) => Effect.Effect<SequenceState | undefined>
   readonly appendSequence: (input: AppendSequenceInput) => Effect.Effect<number>
@@ -887,10 +762,7 @@ export interface EffectDurableRepository extends PreparedEventWriter, LeaseWrite
 }
 
 /**
- * The one blob/event row writer shared by the DurableLog batch path and EventV2's
- * Effect-owned transaction. An oversized body is re-staged under the caller's
- * write lock (closing the stage/GC race) and stored by reference; an inline body
- * is inserted verbatim. The caller owns sequence reservation and lease renewal.
+ * The one blob/event row writer shared by the DurableLog batch path and EventV2's Effect-owned transaction.
  */
 export function writePreparedEvent(
   writer: PreparedEventWriter,
@@ -935,10 +807,7 @@ export function writePreparedEvent(
   })
 }
 
-/**
- * Renew a worker generation's lease with the one conditional update both publish
- * paths use. `changes !== 1` means this generation no longer owns the aggregate.
- */
+/** Renew a worker generation's lease with the one conditional update both publish paths use. */
 export function renewWorkerLease(
   writer: LeaseWriter,
   input: { readonly aggregateID: string; readonly ownerID: string; readonly leaseTimeoutMs: number },
@@ -1038,12 +907,7 @@ const writePrepared = (
   return payloads
 }
 
-/**
- * Publish inside an already-open transaction. Staging happens in that scope, so
- * a rollback can leave an unreferenced content-addressed file (never a row
- * pointing at a missing one); top-level `publish`/`publishAsync` stage before
- * `BEGIN IMMEDIATE` instead.
- */
+/** Publish inside an already-open transaction. */
 const writeEvents = (
   repository: DurableRepository,
   ownerID: string,
@@ -1060,11 +924,8 @@ const writeEvents = (
   return writePrepared(repository, ownerID, projectors, batch, touched, workerLease, leaseTimeoutMs, blob)
 }
 
-// The retry boundary is the whole `BEGIN IMMEDIATE … COMMIT` unit (D5), so
-// a busy statement can never leave a half-open transaction. The blocking
-// `Atomics.wait` backoff was removed: the sync path relies on the driver's
-// `busy_timeout`, and the worker path uses `inImmediateTransactionAsync`, which
-// yields between attempts so cancellation/stream progress keeps running.
+// The retry boundary is the whole `BEGIN IMMEDIATE … COMMIT` unit, so a busy statement can never leave a
+// half-open transaction.
 
 /** Hub-side cache fenced by a monotonically increasing state version. */
 export class StateCache<T> {
@@ -1103,11 +964,7 @@ export class StateCache<T> {
   }
 }
 
-/**
- * The typed durable-write boundary over one synchronous connection. It owns every
- * SQL statement against the durable log; its callers get no raw write surface.
- * `workerLease`/`blobTable` are schema capabilities, fixed at creation.
- */
+/** The typed durable-write boundary over one synchronous connection. */
 export function createDurableRepository(connection: Connection): DurableRepository {
   const workerLease = supportsWorkerLease(connection)
   const blobTable =
@@ -1176,9 +1033,8 @@ export function createDurableRepository(connection: Connection): DurableReposito
 
   const releaseLease = (input: LeaseOwnerInput): number => {
     if (!workerLease) return 0
-    // Clearing the owner is the fence: a retired-but-alive generation can no
-    // longer match its own lease on the next write, and the successor's claim
-    // sees an unowned row instead of a live PID.
+    // Clearing the owner is the fence: a retired-but-alive generation can no longer match its own lease on
+    // the next write, and the successor's claim sees an unowned row instead of a live PID.
     return connection.run(
       "UPDATE event_sequence SET worker_owner_id = NULL, worker_expires_at = 0 WHERE aggregate_id = ? AND worker_owner_id = ?",
       [input.aggregateID, input.ownerID],
@@ -1186,9 +1042,8 @@ export function createDurableRepository(connection: Connection): DurableReposito
   }
 
   const reclaimLease = (input: ReclaimLeaseInput & { readonly leaseTimeoutMs: number }): number => {
-    // Fail before the row lookup/UPDATE: a schema without the worker lease
-    // column can never host a worker generation, and `owner_id` is v1 sync
-    // state that a reclaim must not overwrite.
+    // Fail before the row lookup/UPDATE: a schema without the worker lease column can never host a worker
+    // generation, and `owner_id` is v1 sync state that a reclaim must not overwrite.
     if (!workerLease) {
       throw new WorkerLeaseUnsupportedError({
         type: "event_sequence",
@@ -1200,9 +1055,7 @@ export function createDurableRepository(connection: Connection): DurableReposito
       throw new UnknownAggregateError({ message: `Aggregate ${input.aggregateID} has no lease row` })
     }
     const now = input.now ?? Date.now()
-    // A released lease has no owner. That is the authoritative "the previous
-    // generation is gone" signal, so a successor may reclaim it even though the
-    // stored expected owner no longer matches.
+    // A released lease has no owner.
     const released = current.workerOwnerID === undefined
     if (!released && current.workerOwnerID !== input.expectedOwnerID) {
       throw new StaleOwnerError({
@@ -1349,10 +1202,8 @@ export function createDurableRepository(connection: Connection): DurableReposito
 }
 
 /**
- * The async twin of {@link createDurableRepository}: the same statements, issued
- * through the Effect SQL client EventV2's transaction owns. It is the one
- * implementation of EventV2's durable SQL; the synchronous repository and this
- * adapter share every table/column decision above.
+ * The async twin of {@link createDurableRepository}: the same statements, issued through the Effect SQL
+ * client EventV2's transaction owns.
  */
 export function createEffectDurableRepository(
   client: SqlClient,
@@ -1412,9 +1263,7 @@ export function create(options: Options): Interface {
   const connection = options.connection
   const leaseTimeoutMs = options.leaseTimeoutMs ?? 0
   const scopeAggregateID = options.aggregateID
-  // Older callers/tests create the event table without D16's blob table. Such a
-  // DurableLog can still publish inline payloads, but an oversized payload fails loud
-  // rather than being stored unbounded inline.
+  // Older callers/tests create the event table without D16's blob table.
   const hasBlobTable = repository.blobTable
   // Without a file the DurableLog cannot prove which directory its rows belong to, so
   // it leaves `blobDir` unset and file-backed collection fails loud.
@@ -1538,9 +1387,7 @@ export function create(options: Options): Interface {
     return repository.sequence(aggregateID)?.seq ?? -1
   }
 
-  // Reads only. On a schema without the worker lease this is the v1 sync owner,
-  // never a claimable worker generation: the worker writer checks `workerLease`
-  // and refuses before it can interpret this value as a lease.
+  // Reads only.
   const ownerOf = (aggregateID: string): string | undefined => {
     assertAggregate(aggregateID)
     const current = repository.sequence(aggregateID)
@@ -1687,11 +1534,7 @@ export function make(options: Options): Effect.Effect<Interface> {
   return Effect.sync(() => create(options))
 }
 
-/**
- * Adapt one Effect SQL client to the synchronous connection a `DurableLog` owns.
- * The client's statements complete synchronously when the caller is not holding
- * its single connection; the hub and EventV2 capability paths use this adapter.
- */
+/** Adapt one Effect SQL client to the synchronous connection a `DurableLog` owns. */
 /** A connection for a database-less graph: probes read empty, writes change nothing. */
 const INERT_CONNECTION: Connection = {
   all: () => [],
@@ -1722,19 +1565,13 @@ export function layer(options: Options): Layer.Layer<Service> {
   return Layer.effect(Service, make(options))
 }
 
-/**
- * The `DurableLog` service over the `Database` service's SQL client. EventV2's
- * node depends on this so the durable writer is always present in the graph; a
- * direct `EventV2.layerWith` caller must provide it (or `layer(options)`).
- */
+/** The `DurableLog` service over the `Database` service's SQL client. */
 export const layerFromDatabase: Layer.Layer<Service, never, Database.Service> = Layer.effect(
   Service,
   Effect.gen(function* () {
     const { db } = yield* Database.Service
     const client = (db as Database.Interface["db"] & { readonly $client?: SqlClient }).$client
-    // A boundary/degraded Database has no SQL client. Provide an inert service
-    // (no worker lease, no blob table) so a live-only graph still builds; a
-    // durable commit on that graph fails in EventV2's own client guard.
+    // A boundary/degraded Database has no SQL client.
     return create({
       connection: client === undefined ? INERT_CONNECTION : connectionFromClient(client),
       ownerID: `durable-log-${process.pid}-${randomUUID()}`,
@@ -1757,11 +1594,7 @@ export function nodeWith(options: Options): GlobalNode<Service> {
 /** SQLite binds at most 999 parameters by default; chunk well below it. */
 const BLOB_QUERY_CHUNK = 500
 
-/**
- * The `event_blob` lookup for one aggregate's positions. Exposed so an async
- * caller (the hub's off-loop executor) issues exactly the query the synchronous
- * {@link loadBlobRows} path does; the two can never drift on table or columns.
- */
+/** The `event_blob` lookup for one aggregate's positions. */
 export function blobRowQuery(
   aggregateID: string,
   sequences: ReadonlyArray<number>,
@@ -1796,12 +1629,7 @@ export function loadBlobRows(
   return rows
 }
 
-/**
- * Resolve one durable event's body from its `event_blob` row. `undefined` means
- * the row is absent (the caller surfaces a typed resync); a corrupt row, a hash
- * mismatch, or a path-traversing `file_path` fails loud through
- * {@link resolveBlobData}.
- */
+/** Resolve one durable event's body from its `event_blob` row. */
 export function resolveBlobRow(
   event: { readonly type: string; readonly aggregateID: string; readonly seq: number },
   row: Record<string, unknown> | undefined,
@@ -1824,9 +1652,7 @@ export function resolveBlobRow(
 }
 
 /**
- * The D16 content-addressed directory for a database file, or `undefined` for an
- * in-memory/unknown file. The worker DurableLog, EventV2, and the hub resolver all
- * derive the SAME directory from this one rule.
+ * The D16 content-addressed directory for a database file, or `undefined` for an in-memory/unknown file.
  */
 export function blobDirectoryFor(filename: string | undefined): string | undefined {
   if (filename === undefined || filename.length === 0) return undefined
@@ -1834,12 +1660,7 @@ export function blobDirectoryFor(filename: string | undefined): string | undefin
   return path.join(path.dirname(filename), "event-blobs")
 }
 
-/**
- * Resolve `event.data` that points at `event_blob`. The row's own hash must
- * match the stored reference before any content is trusted; a file-backed row's
- * path must be a content hash, and its bytes are re-hashed, so a corrupted,
- * renamed or path-traversing row fails loud instead of decoding wrong data.
- */
+/** Resolve `event.data` that points at `event_blob`. */
 export function resolveBlobData(
   event: SerializedEvent,
   row: Record<string, unknown> | undefined,
@@ -1894,13 +1715,7 @@ export function resolveBlobData(
   return parseStoredData(payload)
 }
 
-/**
- * A blob row or its event is below the retention cursor, or the event is gone.
- * The aggregate on the correlated `event` lookup is bound explicitly rather than
- * compared to `b.aggregate_id`: the worker scope guard requires each table
- * reference to carry its own bound scope predicate, so a column-to-column
- * correlation is rejected and retention would be unusable on a scoped DurableLog.
- */
+/** A blob row or its event is below the retention cursor, or the event is gone. */
 const COLLECTABLE_BLOBS = `
   SELECT b.seq, b.hash, b.file_path
   FROM event_blob AS b
@@ -1937,16 +1752,7 @@ interface DeletedAggregate {
 }
 
 /**
- * Delete the retained event rows first, then their blob rows, so an event row
- * can never survive its blob. The caller commits before unlinking the returned
- * hashes: a rollback restores rows, and must therefore never run after a file
- * has already disappeared.
- *
- * The publisher/GC interleaving is closed by two paired guarantees:
- * `unlinkUnreferenced` re-reads the refcount and unlinks inside one
- * `BEGIN IMMEDIATE`, and `writePrepared` re-creates any staged file whose bytes
- * went missing while it waited for that same lock (`ensureStagedBlob`). A row
- * that references a file therefore always commits with the file present.
+ * Delete the retained event rows first, then their blob rows, so an event row can never survive its blob.
  */
 function collectBlobsLocked(
   repository: DurableRepository,
@@ -1982,10 +1788,7 @@ function deleteInlineAggregateLocked(repository: DurableRepository, aggregateID:
   return events
 }
 
-/**
- * The directory a collection needs, or undefined when every row is inline.
- * A file-backed candidate without a directory fails before row deletion.
- */
+/** The directory a collection needs, or undefined when every row is inline. */
 function requireBlobDirectory(hashes: ReadonlySet<string>, blob: BlobStore): string | undefined {
   if (hashes.size === 0) return undefined
   if (blob.dir === undefined) {
@@ -2007,14 +1810,7 @@ function hashesWithFiles(rows: ReadonlyArray<BlobRow>): ReadonlySet<string> {
   return hashes
 }
 
-/**
- * Unlink files whose deleting transaction has already committed. The refcount is
- * re-read and the unlink performed inside a fresh `BEGIN IMMEDIATE`, so the
- * zero-reference decision and the file removal are atomic with respect to a
- * concurrent publisher: a publisher either committed its row first (refcount > 0
- * here) or is blocked on the write lock and re-creates the file inside its own
- * transaction (`ensureStagedBlob`) before inserting the referencing row.
- */
+/** Unlink files whose deleting transaction has already committed. */
 function unlinkUnreferenced(repository: DurableRepository, hashes: ReadonlySet<string>, blob: BlobStore): void {
   const directory = requireBlobDirectory(hashes, blob)
   if (directory === undefined) return

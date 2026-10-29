@@ -1,32 +1,15 @@
 // Dedicated control channel.
-//
-// Cancel, `listen`, durable-wake and resync must never queue behind a burst of
-// delta frames, so a SEPARATE `MessagePort` carries control traffic for every
-// worker. This module is the shared request/reply +
-// notification plumbing both ends use; the concrete EventV2 mesh protocol lives
-// in `mesh.ts`.
 
 import type { AggregatePosition, EventV2Event } from "./frame"
 
-/**
- * Permissive control-frame envelope: the transport base every frame satisfies.
- *
- * Kept structurally open (`[key: string]: unknown`) so a protocol can carry its
- * own fields and so unknown / forward-compatible frames survive the boundary.
- * Prefer the typed {@link ControlFrame} union for consumer-side handling.
- */
+/** Permissive control-frame envelope: the transport base every frame satisfies. */
 export interface ControlEnvelope {
   readonly type: string
   readonly id?: number
   readonly [key: string]: unknown
 }
 
-/**
- * Every typed control frame.
- *
- * `id` is present on requests and their replies; `durable` / `resync` are
- * hub→worker pushes; `durable.ack` / `resync.ack` acknowledge them back.
- */
+/** Every typed control frame. */
 export type ControlFrame =
   | { readonly type: "ping"; readonly id: number }
   | { readonly type: "pong"; readonly id: number }
@@ -47,11 +30,7 @@ export type ControlInbound = Exclude<ControlFrame, ControlOutbound>
 /** A request frame: the link stamps `id`, so callers may omit it. */
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
 
-/**
- * The frames a caller may send as a request: only request/reply pairs. Replies
- * (`pong`, `listen.ok`) and push-only frames (`durable`, `resync`, `durable.ack`,
- * `resync.ack`) are unrepresentable here — pushes go through {@link ControlLink.notify}.
- */
+/** The frames a caller may send as a request: only request/reply pairs. */
 type ControlRequestFrame = Extract<ControlFrame, { readonly type: "ping" | "listen" | "unlisten" }>
 export type ControlRequest = DistributiveOmit<ControlRequestFrame, "id"> & { readonly id?: number }
 
@@ -128,17 +107,7 @@ function isKnownControlType(data: unknown): boolean {
   return isControlRecord(data) && typeof data.type === "string" && KNOWN_CONTROL_TYPES.has(data.type)
 }
 
-/**
- * Parse an untrusted port message into a trusted {@link ControlFrame}.
- *
- * Every KNOWN variant is validated field-by-field — a numeric `id`, a string
- * `pattern`, an `{ aggregateID, seq }` / EventV2 `{ id, type, properties }`
- * body, a non-negative-integer ack `count` — and rebuilt as a correctly-typed
- * union member, so a frame with a malformed body never enters internal logic as a
- * trusted frame: it returns `undefined` and the caller surfaces it loudly. An
- * UNKNOWN `type` is passed through so forward-compatible frames still reach
- * `onMessage`.
- */
+/** Parse an untrusted port message into a trusted {@link ControlFrame}. */
 function parseControlFrame(data: unknown): ControlFrame | undefined {
   if (!isControlRecord(data) || typeof data.type !== "string") return undefined
   switch (data.type) {
@@ -258,9 +227,8 @@ export function createControlLink(port: MessagePort, options: ControlLinkOptions
       try {
         port.postMessage(frame)
       } catch (error) {
-        // A closed or hostile port must not escape as an opaque throw: record it
-        // as the link's last error and let the caller decide (the mesh rolls back
-        // the delivery it was accounting for).
+        // A closed or hostile port must not escape as an opaque throw: record it as the link's last error and
+        // let the caller decide (the mesh rolls back the delivery it was accounting for).
         const failure = error instanceof Error ? error : new Error(String(error))
         lastError = failure
         throw failure

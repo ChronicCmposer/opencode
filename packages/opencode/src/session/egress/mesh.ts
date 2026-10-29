@@ -1,14 +1,4 @@
 // EventV2 cross-isolate mesh.
-//
-// `events.listen` is isolate-local, so a worker's `durable()` subscribers can
-// only be woken by the hub. The hub keeps a registry keyed by `(worker, pattern)`
-// — a worker sends a `listen` request over its control port and receives
-// `durable` frames for matching commits (task 8.10). Each worker's outbound
-// backlog is bounded by an OUTSTANDING-DELIVERY COUNTER (~256): every delivery
-// the worker has not yet acknowledged occupies one slot. An over-full worker
-// drops the commit and is sent a `resync` instruction instead of blocking the
-// mesh (task 8.11); acknowledging a delivery frees its slot, so a draining
-// worker keeps receiving.
 
 import { createControlLink, isNonNegativeInteger, type ControlInbound, type ControlOutbound } from "./control"
 import type { AggregatePosition, EventV2Event } from "./frame"
@@ -58,13 +48,7 @@ export interface EgressMesh {
   subscriptions(): readonly MeshSubscription[]
 }
 
-/**
- * Match an event type against a subscription pattern.
- *
- * `"*"` matches everything, a trailing `"*"` is a prefix match, and everything
- * else is an exact match. Kept deliberately small — the hub registry only needs
- * to route per-worker wakeups.
- */
+/** Match an event type against a subscription pattern. */
 export function matchesMeshPattern(pattern: string, type: string): boolean {
   if (pattern === "*") return true
   if (pattern.endsWith("*")) return type.startsWith(pattern.slice(0, -1))
@@ -206,8 +190,7 @@ export function createEgressMesh(options: EgressMeshOptions = {}): EgressMesh {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Transport wiring
+// --------------------------------------------------------------------------- Transport wiring
 // ---------------------------------------------------------------------------
 
 export interface MeshWorkerAttachment {
@@ -215,9 +198,8 @@ export interface MeshWorkerAttachment {
 }
 
 /**
- * Parse a `durable.ack` count: absent means a single delivery; anything other
- * than a non-negative integer fails loud, so a corrupt ack can never inflate or
- * corrupt the outstanding-delivery counter.
+ * Parse a `durable.ack` count: absent means a single delivery; anything other than a non-negative integer
+ * fails loud, so a corrupt ack can never inflate or corrupt the outstanding-delivery counter.
  */
 function requireAckCount(value: unknown): number {
   if (value === undefined) return 1

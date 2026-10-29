@@ -18,9 +18,7 @@ import {
   ToolCallLedger,
   ToolCallNotStartedError,
   ToolCallNotStartedServiceError,
-  fromHandle,
   type LedgerExclusive,
-  type ToolCallLedgerHandle,
 } from "./ledger/tool-call"
 import type { LifecycleReporting } from "./ledger/lifecycle"
 import { Faults } from "@/testing/faults"
@@ -63,12 +61,6 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
-  /**
-   * A synchronous ledger handle for direct/test callers. Production passes no
-   * handle: the per-worker `ToolCallLedger` service is resolved from the graph,
-   * and a hub process (no worker service) records nothing.
-   */
-  ledger?: ToolCallLedgerHandle
   /** The hub-observed run truth; mirrors in-flight calls for auto-resume when supplied. */
   lifecycle?: Pick<LifecycleReporting, "toolStarted" | "toolFinished">
 }) {
@@ -91,7 +83,6 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   // supply a synchronous handle (tests). A hub process has no service, so it
   // records nothing.
   const ledger = yield* Effect.gen(function* () {
-    if (input.ledger !== undefined) return fromHandle(input.ledger)
     const service = yield* Effect.serviceOption(ToolCallLedger.Service)
     if (Option.isSome(service) && service.value.available) return service.value
     // A reduced caller may provide the worker database without the ledger

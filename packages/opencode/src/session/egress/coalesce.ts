@@ -1,18 +1,4 @@
 // Delta coalescing window over the events envelope (spec Q7).
-//
-// Non-durable deltas are the high-frequency channel (streamed text, part
-// updates). Buffering them for a short window and flushing as ONE batch of
-// `event` frames keeps the hub fan-out cheap without delaying durable boundaries:
-//
-//   * `pushDelta`  — buffers a non-durable event frame; flushes on idle (window
-//                    elapsed) or on threshold (batch full).
-//   * `pushDurable`— flushes buffered deltas first, then emits the durable frame
-//                    immediately. Durable events are never coalesced/reordered,
-//                    and every one carries its aggregate `(aggregateID, seq)`.
-//   * `end`        — flushes buffered deltas, then emits the `end` frame.
-//
-// The clock and timer are injected so the window is deterministic in tests, and
-// so production can drive it from the cross-worker fake clock.
 
 import { Schema } from "effect"
 

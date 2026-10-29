@@ -42,10 +42,7 @@ function isResumablePhase(phase: WorkerCrashPhase): boolean {
   return (RESUMABLE_PHASES as readonly string[]).includes(phase)
 }
 
-/**
- * Decide whether a crash may auto-resume. Cancel always wins, the cap is per run,
- * and any side-effecting orphaned call permanently makes the attempt ambiguous.
- */
+/** Decide whether a crash may auto-resume. */
 export function decideAutoResume(input: AutoResumeInput): AutoResumeDecision {
   if (typeof input.sessionID !== "string" || input.sessionID.length === 0) {
     throw new Error("auto-resume requires a non-empty sessionID")

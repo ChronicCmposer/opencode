@@ -1,14 +1,4 @@
-// Schema gate (D7).
-//
-// Identity is `PRAGMA user_version` plus the ordered migration journal ids plus
-// the hash of the shipped SQL bodies (persisted in `schema_meta`). Any process
-// that owns a hub or the core `Database` layer may migrate, serialized by the
-// sidecar lease in `@opencode-ai/core/database/schema-gate`; a session worker is
-// never one of them. The migrating hub applies the statements, writes the body
-// hash, verifies the journal, and marks `user_version` while it holds the lease,
-// refusing to migrate when it has live workers. A worker probes read-only and
-// refuses a mismatch with `SchemaMismatch`: it never runs DDL and never marks
-// schema state.
+// Schema gate.
 
 import { Effect, Schema, Stream } from "effect"
 import { Reactivity } from "effect/unstable/reactivity"
@@ -80,10 +70,8 @@ export class SchemaMismatch extends Schema.TaggedErrorClass<SchemaMismatch>("Sch
 }
 
 /**
- * The migration path opens one `BEGIN IMMEDIATE` batch and must fail the whole
- * batch on a busy statement, never replay a single DML statement inside it. A
- * custom executor without `queryInTransaction` cannot honour that (F1), so the
- * path fails fast instead of silently falling back to retrying `query`.
+ * The migration path opens one `BEGIN IMMEDIATE` batch and must fail the whole batch on a busy statement,
+ * never replay a single DML statement inside it.
  */
 export class MissingQueryInTransactionError extends Schema.TaggedErrorClass<MissingQueryInTransactionError>(
   "MissingQueryInTransactionError",
@@ -172,17 +160,13 @@ export function assertSchemaIdentity(connection: Connection): SchemaIdentity {
   return observed
 }
 
-/**
- * Hub-only marker. It persists the body hash, verifies the migration journal,
- * then writes `PRAGMA user_version`, so an incomplete migration cannot be marked
- * complete. The caller owns the transaction when atomicity with the DDL matters.
- */
+/** Hub-only marker. */
 export function markSchemaIdentity(connection: Connection): SchemaIdentity {
   const expected = currentSchemaIdentity()
   writePersistedBodyHash(connection, SCHEMA_BODY_HASH)
-  // Verify the journal and body at the *expected* version, then write the
-  // version: the marker is what makes the real version match, so including the
-  // old version in this comparison would refuse every fresh migration.
+  // Verify the journal and body at the *expected* version, then write the version: the marker is what makes
+  // the real version match, so including the old version in this comparison would refuse every fresh
+  // migration.
   const content = {
     version: expected.version,
     contentHash: migrationContentHash({
@@ -205,12 +189,7 @@ export interface MigrateOptions {
   readonly statements?: ReadonlyArray<string>
 }
 
-/**
- * Apply the shipped statements on the hub connection, then mark the schema. The
- * zero-live-worker guard runs before any statement, and the whole read → DDL →
- * verify → mark sequence is one `BEGIN IMMEDIATE` transaction: a crash between
- * the DDL and the marker rolls both back, so the next boot retries consistently.
- */
+/** Apply the shipped statements on the hub connection, then mark the schema. */
 export function migrate(options: MigrateOptions): SchemaIdentity {
   if (options.liveWorkers !== 0) throw new LiveWorkersError(options.liveWorkers)
   const statements = options.statements ?? migrationStatements
@@ -232,15 +211,7 @@ export interface EnsureSchemaOptions {
   readonly onMigrationBusy?: () => void
 }
 
-/**
- * Databases this process has already ensured. Core's migration path and the
- * opencode ledger are process-wide one-time work; repeating them on every hub
- * construction re-opens the file and replays the journal. Keyed by the resolved
- * filename so a relative/absolute alias of the same file shares one entry.
- *
- * Deliberately not persisted: a new process must re-probe and apply anything a
- * previous process did not finish.
- */
+/** Databases this process has already ensured. */
 const ensuredDatabases = new Map<string, SchemaIdentity>()
 
 /** Test seam: forget process-level ensure results (each test owns fresh files). */
@@ -257,39 +228,23 @@ function openExistingConnection(filename: string): Connection | undefined {
   }
 }
 
-// --- Cross-process schema gate ---------------------------------------------
-//
-// The lease lives in core (`@opencode-ai/core/database/schema-gate`) so core's
-// `Database` layer and this hub-side ensure share one acquisition, renewal, and
-// release implementation. `schemaGateFilename` is re-exported for callers that
-// asserted on the sidecar path before the move.
+// --- Cross-process schema gate --------------------------------------------- The lease lives in core
+// (`@opencode-ai/core/database/schema-gate`) so core's `Database` layer and this hub-side ensure share one
+// acquisition, renewal, and release implementation.
 
 export { SchemaGateTimeoutError, schemaGateFilename }
 
-/**
- * Hub boot schema-ensure. A fresh app-migrated database is upgraded with the
- * shipped statements (the opencode-owned ledger and the identity marker) and
- * marked. An already-current database is left untouched. The zero-live-worker
- * guard and `BEGIN IMMEDIATE` make the check and the write one atomic step, so
- * two concurrent hubs cannot interleave read/verify/mark. Once a file is
- * ensured in this process, later hubs reuse that result instead of re-running
- * core's migration journal and the ledger.
- */
+/** Hub boot schema-ensure. */
 export function ensureProductionSchema(options: EnsureSchemaOptions): SchemaIdentity {
-  // A private in-memory database cannot share core's migration connection, so it
-  // uses the self-contained statement list on the one handle opened below. A real
-  // file is upgraded incrementally through the normal `DatabaseMigration.apply`
-  // path; replaying the final schema there would stamp every migration id with
-  // `INSERT OR IGNORE` and skip real data migrations.
+  // A private in-memory database cannot share core's migration connection, so it uses the self-contained
+  // statement list on the one handle opened below.
   const inMemory = options.filename === ":memory:"
   const expected = currentSchemaIdentity()
   const cacheKey = inMemory ? undefined : path.resolve(options.filename)
   if (cacheKey !== undefined) {
     const ensured = ensuredDatabases.get(cacheKey)
     if (ensured !== undefined) return ensured
-    // An already-current file needs no core migration at all. Probing first also
-    // keeps a second hub in this process from re-opening and replaying the
-    // journal; only a genuinely legacy/missing file takes the migration path.
+    // An already-current file needs no core migration at all.
     const existing = openExistingConnection(options.filename)
     if (existing !== undefined) {
       try {
@@ -303,9 +258,7 @@ export function ensureProductionSchema(options: EnsureSchemaOptions): SchemaIden
       }
     }
   }
-  // The zero-live-worker guard protects DDL/migration only. A cached or already
-  // current database is probe-and-return above, so a second hub sharing an
-  // ensured file does not fail just because workers are now live.
+  // The zero-live-worker guard protects DDL/migration only.
   if (options.liveWorkers !== 0) throw new LiveWorkersError(options.liveWorkers)
   const connection = openConnection({ filename: options.filename })
   const gate = inMemory ? undefined : openSchemaGate(options.filename)
@@ -319,10 +272,7 @@ export function ensureProductionSchema(options: EnsureSchemaOptions): SchemaIden
       })
       return currentSchemaIdentity()
     }
-    // Two processes now serialize on the database row, not on a process-local
-    // cache. Core's incremental journal, the ledger, and the marker all run
-    // while the gate is held. This entry point is synchronous and never waits:
-    // a held gate is refused, and a caller that must wait uses the async ensure.
+    // Two processes now serialize on the database row, not on a process-local cache.
     if (!attemptSchemaGate(gate!, token).acquired) throw new SchemaGateTimeoutError()
     try {
       if (sameSchemaIdentity(expected, schemaIdentity(connection))) {
@@ -331,9 +281,9 @@ export function ensureProductionSchema(options: EnsureSchemaOptions): SchemaIden
         return expected
       }
       applyCoreMigrations(options.filename, options.onMigrationBusy)
-      // Ownership is authoritative through the whole sequence: re-prove it
-      // immediately before the ledger/marker commit so a lease stolen during
-      // core's migration cannot be used to write the final marker.
+      // Ownership is authoritative through the whole sequence: re-prove it immediately before the
+      // ledger/marker commit so a lease stolen during core's migration cannot be used to write the final
+      // marker.
       renewSchemaGate(gate!, token)
       inImmediateTransaction(connection, (tx) => {
         // On a file, only the opencode-owned ledger and marker are ours; core
@@ -357,18 +307,7 @@ export function ensureProductionSchema(options: EnsureSchemaOptions): SchemaIden
   }
 }
 
-/**
- * Off-loop variant of {@link ensureProductionSchema} for the hub's construction
- * path. Every probe, DDL statement, ledger write, and marker runs on the supplied
- * `DbExecutor` thread, so a slow or busy file never blocks the hub's main loop.
- *
- * Semantics match the synchronous gate: an already-current file is probe-and-
- * return (no live-worker refusal); a file that needs migration refuses a
- * non-zero live-worker count, holds the same cross-process gate, runs core's
- * incremental Effect journal through the executor connection, then applies the
- * ledger and marker in one `BEGIN IMMEDIATE` and verifies the same identity and
- * worker table parity. No migration SQL runs on the hub's main thread.
- */
+/** Off-loop variant of {@link ensureProductionSchema} for the hub's construction path. */
 export interface EnsureSchemaAsyncOptions extends EnsureSchemaOptions {
   /** Reuse a hub executor; one is created and closed when omitted. */
   readonly executor?: DbExecutor
@@ -395,11 +334,7 @@ async function readIdentityAsync(executor: DbExecutor): Promise<SchemaIdentity> 
   return { version, contentHash: migrationContentHash({ version, ids, bodyHash }) }
 }
 
-/**
- * `assertWorkerTableParity` over the executor. The schema walk is done with
- * awaited queries and replayed through the shared derivation, so the async gate
- * cannot drift from the synchronous one.
- */
+/** `assertWorkerTableParity` over the executor. */
 async function assertWorkerTableParityAsync(executor: DbExecutor): Promise<void> {
   const tables = await executor.query(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -430,11 +365,8 @@ export async function ensureProductionSchemaAsync(options: EnsureSchemaAsyncOpti
     if (ensured !== undefined) return ensured
   }
 
-  // A live-worker refusal must not spawn an executor thread: the common case is a
-  // second hub sharing an already-provisioned file, and a spawn would itself be
-  // work the gate is meant to refuse. Probe the existing file synchronously (a
-  // read-only identity check, exactly like the sync gate's cache probe) and only
-  // migrate when zero workers are live.
+  // A live-worker refusal must not spawn an executor thread: the common case is a second hub sharing an
+  // already-provisioned file, and a spawn would itself be work the gate is meant to refuse.
   if (options.executor === undefined && options.liveWorkers !== 0) {
     const existing = inMemory ? undefined : openExistingConnection(options.filename)
     if (existing !== undefined) {
@@ -454,9 +386,8 @@ export async function ensureProductionSchemaAsync(options: EnsureSchemaAsyncOpti
 
   const openExecutor = (): { readonly executor: DbExecutor; readonly owned: boolean } => {
     if (options.executor !== undefined) return { executor: options.executor, owned: false }
-    // TEMPORARY EDGE: this async gate is not Effect yet, so it acquires the
-    // DbExecutor service through the Promise facade and closes its scope in the
-    // gate's `finally`. The service remains the single implementation.
+    // TEMPORARY EDGE: this async gate is not Effect yet, so it acquires the DbExecutor service through the
+    // Promise facade and closes its scope in the gate's `finally`.
     return {
       owned: true,
       executor: makePromiseExecutor({
@@ -491,21 +422,17 @@ export async function ensureProductionSchemaAsync(options: EnsureSchemaAsyncOpti
     }
   }
 
-  // Take the cross-process gate before migrating. An executor this call owns is
-  // opened only after acquisition, so a peer is not switching WAL/pragma while it
-  // opens; a caller-supplied executor (the hub's) is already open, and the gate
-  // serializes the migration itself rather than the open.
+  // Take the cross-process gate before migrating.
   const gate = openSchemaGate(options.filename)
   const token = newGateToken()
   let executor: DbExecutor | undefined
   let ownsExecutor = false
   try {
     await waitForSchemaGateAsync(gate, token, undefined, options.onGateWait)
-    // Everything after acquisition is inside the finally that releases the
-    // lease: a throw opening the executor or starting renewal must not leave the
-    // row live for the full TTL. Renewal starts last, once setup can no longer
-    // throw, and the executor is closed here (after the migration settles) so a
-    // lost lease still closes it before the gate is released.
+    // Everything after acquisition is inside the finally that releases the lease: a throw opening the
+    // executor or starting renewal must not leave the row live for the full TTL. Renewal starts last, once
+    // setup can no longer throw, and the executor is closed here (after the migration settles) so a lost
+    // lease still closes it before the gate is released.
     try {
       const opened = openExecutor()
       executor = opened.executor
@@ -525,18 +452,7 @@ export async function ensureProductionSchemaAsync(options: EnsureSchemaAsyncOpti
   }
 }
 
-/**
- * The migration body while the gate is held. Every phase is preceded by an
- * ownership re-proof so a lease lost mid-migration fails here instead of writing
- * the ledger/marker on a lock another process now owns.
- *
- * Lease-loss guarantee (deliberately not "the core batch is aborted mid-flight"):
- * a loss is observed after the core batch and again immediately before the one
- * commit that writes the ledger/marker, so that commit never happens on a stolen
- * lease. The core batch itself is allowed to finish before the executor closes;
- * it is serialized by `BEGIN IMMEDIATE` and re-reads the journal in the same
- * transaction (`applyBatched`), so a peer cannot interleave with it.
- */
+/** The migration body while the gate is held. */
 async function migrateUnderGate(
   options: EnsureSchemaAsyncOptions,
   executor: DbExecutor,
@@ -557,10 +473,10 @@ async function migrateUnderGate(
   if (options.liveWorkers !== 0) throw new LiveWorkersError(options.liveWorkers)
 
   renewSchemaGate(gate, token)
-  // Core's incremental Effect migrations run through the executor-backed
-  // client as one `BEGIN IMMEDIATE` batch, so no statement is ever replayed
-  // separately and a legacy file is only marked after core has caught up.
-  await applyCoreMigrationsOnExecutor(executor, options.onMigrationBusy)
+  // Core's incremental Effect migrations run through the executor-backed client as one `BEGIN IMMEDIATE`
+  // batch, so no statement is ever replayed separately and a legacy file is only marked after core has caught
+  // up.
+  await Effect.runPromise(applyCoreMigrationsOnExecutor(executor, options.onMigrationBusy))
   renewSchemaGate(gate, token)
   const journal = (await executor.query("SELECT id FROM migration ORDER BY id")).map((row) => String(row.id))
   const expectedIds = new Set(SCHEMA_MIGRATION_IDS)
@@ -585,13 +501,7 @@ async function migrateUnderGate(
   return await verifyIdentityAsync(executor, expected, cacheKey)
 }
 
-/**
- * Resolve when either the migration settles or the lease is lost. A loss fails
- * the ensure, but the already-started body is awaited first so its executor is
- * closed before the gate is released. The body observes the loss at its next
- * ownership re-proof, which is always before the ledger/marker commit; the core
- * batch is not interrupted mid-flight (see {@link migrateUnderGate}).
- */
+/** Resolve when either the migration settles or the lease is lost. */
 async function raceLeaseLoss<T>(renewal: SchemaGateRenewal, work: Promise<T>): Promise<T> {
   try {
     return await Promise.race([work, renewal.lost])
@@ -614,13 +524,7 @@ async function verifyIdentityAsync(
   return expected
 }
 
-/**
- * Run core's incremental journal on `filename` on the calling thread. The
- * synchronous helper cannot suspend, so it never uses the adapter's async
- * `Effect.sleep` backoff: transaction control is retried at its own boundary and
- * the whole batch is replayed with a blocking bounded retry. The batch is one
- * `BEGIN IMMEDIATE`, so a busy failure rolled it back and replay is safe.
- */
+/** Run core's incremental journal on `filename` on the calling thread. */
 function applyCoreMigrations(filename: string, onBusy?: () => void): void {
   const connection = openConnection({ filename })
   try {
@@ -640,11 +544,7 @@ function applyCoreMigrations(filename: string, onBusy?: () => void): void {
   }
 }
 
-/**
- * The synchronous twin of {@link executorConnection}: every statement runs on
- * the calling thread. Transaction-control statements are retried in place (a
- * busy BEGIN did not begin, a busy COMMIT did not commit); ordinary DML is not.
- */
+/** The synchronous twin of {@link executorConnection}: every statement runs on the calling thread. */
 function synchronousConnection(connection: Connection, onBusy?: () => void): SqlConnection {
   const executeRaw = (sql: string, params: ReadonlyArray<unknown>) =>
     Effect.try({
@@ -691,11 +591,7 @@ function executorSqlError(cause: unknown): SqlError {
   })
 }
 
-/**
- * An Effect SQL connection whose statements are forwarded to the hub executor
- * thread. Core's Effect migration bodies are tiny; the SQL they issue (including
- * their transactions) runs off the hub loop on the executor's handle.
- */
+/** An Effect SQL connection whose statements are forwarded to the hub executor thread. */
 function executorConnection(executor: DbExecutor): SqlConnection {
   const queryInTransaction = executor.queryInTransaction
   if (queryInTransaction === undefined) throw new MissingQueryInTransactionError()
@@ -728,43 +624,33 @@ function executorConnection(executor: DbExecutor): SqlConnection {
 const CORE_MIGRATION_RETRY = { retries: 4, baseDelayMs: 25, maxDelayMs: 500 }
 
 /**
- * Run core's incremental journal off-loop over the executor connection as ONE
- * `BEGIN IMMEDIATE` transaction (`applyBatched`): read the journal, apply every
- * pending migration, and record it in the same batch. A busy failure rolled the
- * batch back, so replaying the whole batch is safe and no single statement is
- * ever retried inside an open transaction.
+ * Run core's incremental journal off-loop over the executor connection as ONE `BEGIN IMMEDIATE` transaction
+ * (`applyBatched`): read the journal, apply every pending migration, and record it in the same batch.
  */
-async function applyCoreMigrationsOnExecutor(executor: DbExecutor, onBusy?: () => void): Promise<void> {
-  const client = await Effect.runPromise(
-    make({
-      acquirer: Effect.succeed(executorConnection(executor)),
-      compiler: Statement.makeCompilerSqlite(),
-      spanAttributes: [["db.system.name", "sqlite"]],
-    }).pipe(Effect.provide(Reactivity.layer)),
-  )
-  const db = await Effect.runPromise(
-    EffectDrizzleSqlite.makeWithDefaults().pipe(Effect.provideService(SqlClient, client)),
-  )
-  await Effect.runPromise(
-    withBusyRetry(
-      DatabaseMigration.applyBatched(db).pipe(
-        Effect.tapError((error) => Effect.sync(() => (isBusyError(error) ? onBusy?.() : undefined))),
-      ),
-      CORE_MIGRATION_RETRY,
+const applyCoreMigrationsOnExecutor = Effect.fn("SchemaGate.applyCoreMigrations")(function* (
+  executor: DbExecutor,
+  onBusy?: () => void,
+) {
+  const client = yield* make({
+    acquirer: Effect.succeed(executorConnection(executor)),
+    compiler: Statement.makeCompilerSqlite(),
+    spanAttributes: [["db.system.name", "sqlite"]],
+  }).pipe(Effect.provide(Reactivity.layer))
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults().pipe(Effect.provideService(SqlClient, client))
+  yield* withBusyRetry(
+    DatabaseMigration.applyBatched(db).pipe(
+      Effect.tapError((error) => Effect.sync(() => (isBusyError(error) ? onBusy?.() : undefined))),
     ),
+    CORE_MIGRATION_RETRY,
   )
-}
+})
 
 export interface GatedConnection {
   readonly connection: Connection
   readonly identity: SchemaIdentity
 }
 
-/**
- * Open a per-worker WAL connection and refuse a mixed schema. The probe and the
- * refusal are read-only, and a missing database file is never created as a side
- * effect of the probe; the handle is closed before the typed error escapes.
- */
+/** Open a per-worker WAL connection and refuse a mixed schema. */
 export function openGatedConnection(options: ConnectionOptions): GatedConnection {
   const connection = openConnection({ ...options, create: false })
   try {

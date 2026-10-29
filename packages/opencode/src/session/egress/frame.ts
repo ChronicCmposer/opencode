@@ -1,20 +1,4 @@
 // Worker event channel over the SHARED JSON transport (spec Q6/Q7/Q21, D15).
-//
-// The events port no longer uses a binary `[u32 length][body]` framing. Every
-// port message is exactly one shared `WorkerFrameEnvelope` JSON string, encoded
-// and parsed by `session/worker/frame.ts`; the events family (`event`/`end`/
-// `resync`/`ack`) is validated there too. This gives the worker one codec and
-// one bound across the events, writer, job, and hub-proxy ports.
-//
-// The `event` variant carries the EventV2 event VERBATIM as
-// `{ id, type, properties }` — there is no `data` translation and no per-frame
-// numeric header (so no `u32` length can overflow). Encoding rejects a frame or
-// a coalesced batch above 4 MiB with a typed `FrameTooLargeError` before it is
-// posted; decoding applies the same bound to untrusted input. The one exception
-// is a DURABLE event that does not fit its envelope: it crosses as a small
-// `{ __eventBlobPosition, frameBytes }` reference the hub resolves by position
-// from either the shared blob store OR the committed inline `event.data` row, so
-// a committed event is never lost to the frame cap.
 
 import {
   FrameTooLargeError,
@@ -57,39 +41,27 @@ export const MAX_FRAME_BYTES = MAX_WORKER_FRAME_BYTES
 export const MAX_BATCH_BYTES = MAX_WORKER_FRAME_BYTES
 
 /**
- * Envelope space reserved inside one frame: port/kind/id, committed
- * `(aggregateID, seq)` metadata, and JSON punctuation. The core D16 inline bound
- * reserves the same headroom, so a body stored inline is guaranteed to fit.
+ * Envelope space reserved inside one frame: port/kind/id, committed `(aggregateID, seq)` metadata, and JSON
+ * punctuation.
  */
 export const ENVELOPE_HEADROOM_BYTES = 64 * 1024
 
 /** Largest event body that always fits one frame with its envelope. */
 export const MAX_INLINE_EVENT_BYTES = MAX_FRAME_BYTES - ENVELOPE_HEADROOM_BYTES
 
-/**
- * A committed position in one aggregate's durable log. This is the ONLY durable
- * identity on the wire: there is no sender-global ordinal (D12/D17). The shape
- * is the shared envelope's, so the codec and the sender/receiver cannot drift.
- */
+/** A committed position in one aggregate's durable log. */
 export type { AggregatePosition }
 
 /** Durable aggregate metadata carried by every durable `event` frame. */
 export type DurableMeta = AggregatePosition
 
 /**
- * The aggregate identity a durable `event` frame carries, or `undefined` for a
- * non-durable delta / a non-`event` frame. Present only when BOTH `aggregateID`
- * and `seq` are set; the shared parser rejects a half-specified identity, so it
- * can never be mistaken for a delta.
+ * The aggregate identity a durable `event` frame carries, or `undefined` for a non-durable delta / a
+ * non-`event` frame.
  */
 export { durableAggregateMetaOf as durableMetaOf } from "@/session/worker/frame"
 
-/**
- * A resync's optional durable position. The shared events body schema owns the
- * `pattern`; the aggregate identity rides beside it as forward-compatible
- * payload metadata (exactly like `event` frames), so an older peer that ignores
- * it still resyncs by pattern.
- */
+/** A resync's optional durable position. */
 export interface DurableResyncPayload extends EventsResyncPayload {
   readonly aggregateID?: string
   readonly seq?: number
@@ -127,11 +99,7 @@ function durablePositionOf(value: unknown): AggregatePosition | undefined {
   return { aggregateID, seq }
 }
 
-/**
- * Encode one frame and measure it ONCE, enforcing the 4 MiB per-frame bound.
- * Returning the measured size lets a batch total reuse it instead of encoding
- * and measuring the same text twice.
- */
+/** Encode one frame and measure it ONCE, enforcing the 4 MiB per-frame bound. */
 function encodeFrameSized(frame: WorkerFrameEnvelope): { readonly text: string; readonly bytes: number } {
   const sized = encodeWorkerFrameSized(frame)
   if (sized.bytes > MAX_FRAME_BYTES) throw new FrameTooLargeError(sized.bytes, MAX_FRAME_BYTES)
@@ -143,12 +111,7 @@ export function encodeFrame(frame: WorkerFrameEnvelope): string {
   return encodeFrameSized(frame).text
 }
 
-/**
- * Encode a coalesced batch, one JSON string per frame, preserving order. The
- * combined wire size is bounded by {@link MAX_BATCH_BYTES}: a batch too large to
- * transport is a typed rejection. The sender uses {@link encodeFrameChunks}
- * instead so a durable frame is never lost to a batch total.
- */
+/** Encode a coalesced batch, one JSON string per frame, preserving order. */
 export function encodeFrames(frames: readonly WorkerFrameEnvelope[]): readonly string[] {
   const encoded: string[] = []
   let total = 0
@@ -162,16 +125,8 @@ export function encodeFrames(frames: readonly WorkerFrameEnvelope[]): readonly s
 }
 
 /**
- * Split a coalesced batch into chunks whose combined wire size stays within the
- * transport bound, measuring each frame exactly once. A durable event frame that
- * alone exceeds the bound is replaced by its committed blob-position reference
- * (core already offloaded the body before fan-out), so the batch survives and no
- * durable event is dropped by the cap.
- *
- * A non-durable frame is advisory stream data. When `onDrop` is supplied, a
- * non-durable frame that alone exceeds the bound is dropped and reported rather
- * than failing the whole batch; without it the codec keeps its typed rejection.
- * A batch that merely totals too much is always split, never dropped.
+ * Split a coalesced batch into chunks whose combined wire size stays within the transport bound, measuring
+ * each frame exactly once.
  */
 export interface EncodeFrameChunksOptions {
   /** Total wire bound per chunk; defaults to {@link MAX_BATCH_BYTES}. */
@@ -229,14 +184,8 @@ function isCoreBlobReference(value: unknown): value is CoreBlobReference {
 }
 
 /**
- * The frame to encode when the event ALREADY carries a resolvable reference,
- * checked before any serialisation. An `{ __eventBlobPosition }` frame is sent
- * as-is (never re-wrapped), and EVERY durable core `{ __eventBlob, size }` marker
- * is turned into the committed position reference the hub can resolve. The
- * marker's own frame is tiny, so its declared `size` must not gate the rewrite:
- * a body in the window between the inline bound and the frame cap otherwise
- * crossed unresolved. A non-durable marker has no position and keeps its legacy
- * pass-through (`blobPositionReferenceFrame` returns `undefined`).
+ * The frame to encode when the event ALREADY carries a resolvable reference, checked before any
+ * serialisation.
  */
 function referenceFrameOf(frame: EventsFrame): EventsFrame | undefined {
   if (frame.kind !== "event") return undefined
@@ -246,12 +195,7 @@ function referenceFrameOf(frame: EventsFrame): EventsFrame | undefined {
   return blobPositionReferenceFrame(frame, properties.size)
 }
 
-/**
- * Encode one frame within the per-frame bound. A durable event body that does
- * not fit is re-expressed as its blob-position reference and re-encoded; the
- * substituted frame is tiny by construction. Everything else keeps the typed
- * rejection, so a caller bug (or an over-cap non-durable delta) still fails loud.
- */
+/** Encode one frame within the per-frame bound. */
 function encodeFrameOrReference(frame: EventsFrame): { readonly text: string; readonly bytes: number } {
   const existingReference = referenceFrameOf(frame)
   if (existingReference !== undefined) return encodeFrameSized(existingReference)
@@ -261,20 +205,14 @@ function encodeFrameOrReference(frame: EventsFrame): { readonly text: string; re
     if (!(error instanceof FrameTooLargeError)) throw error
     const reference = blobPositionReferenceFrame(frame, error.byteLength)
     if (reference === undefined) throw error
-    // The substituted frame must be the small, resolvable reference — never the
-    // original body re-encoded (which would overflow again) and never a
-    // half-formed marker the hub cannot resolve by position.
+    // The substituted frame must be the small, resolvable reference — never the original body re-encoded
+    // (which would overflow again) and never a half-formed marker the hub cannot resolve by position.
     if (reference.kind !== "event" || !isEventBlobReference(reference.payload.event.properties)) throw error
     return encodeFrameSized(reference)
   }
 }
 
-/**
- * Decode one wire message (a JSON string) into a trusted events frame. The
- * shared parser validates the body; the raw envelope is still available for
- * forward-compatible metadata the body schema does not own, so a resync's
- * `(aggregateID, seq)` position is restored here rather than dropped.
- */
+/** Decode one wire message (a JSON string) into a trusted events frame. */
 export function decodeFrame(text: string): DecodedEventsFrame {
   const envelope = decodeWorkerFrame(text)
   const frame = parseEventsFrame(envelope)

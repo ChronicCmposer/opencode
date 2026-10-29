@@ -1,16 +1,4 @@
 // Per-session lifecycle truth shared by the hub, the crash ledger and auto-resume.
-//
-// The hub observes three facts while a run is in flight:
-//
-//   1. the last assistant message that was durably committed,
-//   2. the tool calls that started but have not finished, and
-//   3. the four commit-side phases a run barrier must drain.
-//
-// None of these may be inferred from a live event stream: a crash can interrupt
-// delivery before the event is observed. The tracker keeps the latest observed
-// value per session, bounded by an LRU so an abandoned session cannot grow the
-// maps forever. It is deliberately synchronous so the dispatcher's crash path
-// (which must never block on the DB thread) can read it directly.
 
 import { Schema } from "effect"
 
@@ -246,13 +234,7 @@ export function createLifecycleTracker(options: LifecycleTrackerOptions = {}): L
 
 export * as LifecycleLedger from "./lifecycle"
 
-/**
- * The worker-side reporting seam. A session worker runs the real prompt in its
- * own isolate, so it cannot touch the hub-owned tracker directly: every fact
- * that must survive a crash is reported over the hub-proxy control port before
- * the effect it guards. The methods return a promise so the tool path can wait
- * for the hub to observe `toolStarted` before running the effect.
- */
+/** The worker-side reporting seam. */
 export interface LifecycleReporting {
   commit(sessionID: string, messageID: string): Promise<void>
   toolStarted(sessionID: string, callID: string, sideEffecting?: boolean): Promise<void>
@@ -270,11 +252,7 @@ export function resetCommitted(sessionID: string): void {
   committedBySession.delete(sessionID)
 }
 
-/**
- * The committed message this isolate observed for its current run. The run's
- * `done` reply carries this value, so the hub barrier never depends on the
- * best-effort `lifecycle.commit` RPC landing in time (F11).
- */
+/** The committed message this isolate observed for its current run. */
 export function committedMessage(sessionID: string): string | null | undefined {
   // No reporting seam means this is not a real worker run (unit tests, pipeline
   // reductions): leave the historical result shape untouched.
@@ -293,9 +271,7 @@ export function reporting(): LifecycleReporting | undefined {
 }
 
 /**
- * Bound for the lifecycle reports that may be dropped on teardown
- * (`toolStarted`, `toolFinished`, `phase`). `commit` deliberately awaits its
- * acknowledgement without this deadline so a crash cannot read a stale tracker.
+ * Bound for the lifecycle reports that may be dropped on teardown (`toolStarted`, `toolFinished`, `phase`).
  */
 export const LIFECYCLE_RPC_TIMEOUT_MS = 5_000
 
@@ -346,15 +322,7 @@ function withDeadline<T>(
   })
 }
 
-/**
- * Build the hub-proxy backed reporting seam. `toolStarted` is the one
- * authority-bearing report: it must reject when the hub has not observed the
- * call, so the tool path can fail closed before its side effect. `commit` is
- * ordering-bearing too, but its failure is swallowed: the durable message row
- * remains the truth, while a crash immediately after `await commit()` must
- * still see the hub tracker updated. The remaining reports are best effort: a
- * torn-down port during cancel must not turn a tool into a failure.
- */
+/** Build the hub-proxy backed reporting seam. */
 export function createProxyReporting(
   call: (method: string, args: readonly unknown[]) => Promise<unknown>,
   options: ProxyReportingOptions = {},
@@ -368,10 +336,7 @@ export function createProxyReporting(
       () => undefined,
     )
   return {
-    // Record the commit locally first, then await the hub's acknowledgement
-    // within the lifecycle deadline. The run `done` reply carries the local
-    // record for the successful path; a late or lost ack must not wedge the
-    // run, and a torn-down port still resolves the caller.
+    // Record the commit locally first, then await the hub's acknowledgement within the lifecycle deadline.
     commit: async (sessionID, messageID) => {
       if (typeof messageID === "string" && messageID.length > 0) committedBySession.set(sessionID, messageID)
       try {

@@ -1,8 +1,4 @@
 // Private write capability.
-//
-// The raw `main` connection and the `withMain` authorizer bracket are handed to
-// the repository factory only. The public repository exposes typed methods and
-// never the capability, connection, or transaction handle.
 
 import type { Connection } from "@opencode-ai/core/database/connection"
 
@@ -16,6 +12,8 @@ export interface WriteCapability {
   /** SQL function the live bound views call to resolve the session fence. */
   readonly scopeFunction: string
   /** Allow the authorizer to attribute the current statement to the repository. */
+  /** Max statements per outermost repository transaction; defaults to 500. */
+  readonly statementBudget?: number
   readonly withMain: <T>(operation: () => T) => T
 }
 
@@ -24,6 +22,7 @@ export function createWriteCapability(input: WriteCapability): WriteCapability {
     connection: input.connection,
     ...(input.sessionID === undefined ? {} : { sessionID: input.sessionID }),
     scopeFunction: input.scopeFunction,
+    ...(input.statementBudget === undefined ? {} : { statementBudget: input.statementBudget }),
     withMain: input.withMain,
   })
 }

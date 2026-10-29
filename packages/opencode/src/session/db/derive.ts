@@ -1,13 +1,4 @@
-// Schema-derived table ownership (D6).
-//
-// A table is worker-writable exactly when it has a real foreign-key path to the
-// `session` aggregate: it carries a `session_id` foreign key, or it references a
-// table that does (`part.message_id` is the one transitive case). A bare
-// `session_id` column with no foreign key is NOT ownership evidence, so adding
-// the column to an unrelated table cannot silently widen the allowlist.
-//
-// This is derived from the live schema, never maintained by hand, so adding or
-// removing the key without regenerating the allowlist is a drift failure.
+// Schema-derived table ownership.
 
 export interface SqliteQuery {
   all<T = Record<string, unknown>>(sql: string, params?: ReadonlyArray<unknown>): ReadonlyArray<T>
@@ -46,11 +37,7 @@ export function tableForeignKeys(connection: SqliteQuery, table: string): readon
     .map((row) => ({ table: row.table, from: row.from }))
 }
 
-/**
- * Tables that own session-scoped rows and are therefore worker-writable. The
- * `session` root is itself excluded; every other table reachable through a
- * foreign key is included, in sorted order.
- */
+/** Tables that own session-scoped rows and are therefore worker-writable. */
 export function deriveSessionScopedTables(connection: SqliteQuery): readonly string[] {
   const tables = listSchemaTables(connection)
   const scoped = new Set<string>(["session"])

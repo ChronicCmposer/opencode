@@ -1,9 +1,4 @@
 // Typed repository surface.
-//
-// Table and column names come from the generated registry, so a typo is a
-// compile error at the call site and an `UnknownColumnError` at runtime (for
-// untyped callers). Values stay `unknown` because SQLite stores JSON/text
-// scalars and the repository validates shape, not application decoding.
 
 import type { WriteOutcome } from "@opencode-ai/core/database/connection"
 import type { TABLE_SCHEMA } from "./tables.gen"
@@ -21,11 +16,7 @@ export type RepositoryRow<T extends TableName> = Partial<Record<ColumnOf<T>, unk
 
 export interface RepositoryConflict<T extends WritableTable = WritableTable> {
   readonly columns: readonly ColumnOf<T>[]
-  /**
-   * Columns to update on conflict. An array carries the insert's `excluded`
-   * values; a record carries explicit values for the same validation pipeline as
-   * `update` (including immutable/depth checks).
-   */
+  /** Columns to update on conflict. */
   readonly update?: readonly ColumnOf<T>[] | RepositoryValues<T>
 }
 
@@ -44,11 +35,7 @@ export interface RepositoryBatch<T extends WritableTable = WritableTable> {
   readonly values: readonly RepositoryValues<T>[]
 }
 
-/**
- * The public typed repository. There is deliberately no `run`, `all`, `exec`,
- * `query`, `connection`, or transaction handle: every statement is generated
- * from the registry and every write binds the worker's session.
- */
+/** The public typed repository. */
 export interface WorkerRepository {
   insert<T extends WritableTable>(table: T, values: RepositoryValues<T>): WriteOutcome
   insert<T extends WritableTable>(input: RepositoryInsert<T>): WriteOutcome

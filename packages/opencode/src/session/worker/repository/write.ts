@@ -1,9 +1,4 @@
 // Typed write engine.
-//
-// Batches and writes that validate against the stored row (immutable fields,
-// hub-owned metadata) run in one savepoint, so validation and the write are
-// atomic and a nested call joins the caller's open transaction. Other
-// single-statement writes skip the savepoint; see `insertOne`.
 
 import type { WriteOutcome } from "@opencode-ai/core/database/connection"
 import { createWriteCapability, type RepositoryConnection, type WriteCapability } from "./capability"
@@ -12,6 +7,7 @@ import {
   HubOnlyWriteError,
   ImmutableColumnError,
   ScopeViolationError,
+  StatementBudgetExceededError,
   TransactionScopeError,
   UnknownColumnError,
   UnsupportedWriteError,
@@ -73,15 +69,7 @@ function jsonNumber(value: number): number | null {
   return Number.isFinite(value) ? (value === 0 ? 0 : value) : null
 }
 
-/**
- * Compare one written JSON field with JSON semantics, without serializing it.
- * Metadata values are usually scalars (`depth`), so the scalar path avoids a
- * full `JSON.stringify` per row. Object key order is irrelevant; array order is
- * not. `undefined` object members are omitted, array holes/undefined become
- * `null`, non-finite numbers serialize as `null`, and `-0` equals `0`. Only
- * plain objects/arrays compare structurally: a Date/Map is never equal to an
- * empty object merely because both expose no enumerable keys.
- */
+/** Compare one written JSON field with JSON semantics, without serializing it. */
 export function sameJsonValue(left: unknown, right: unknown): boolean {
   const normalizedLeft = typeof left === "number" ? jsonNumber(left) : left
   const normalizedRight = typeof right === "number" ? jsonNumber(right) : right
@@ -295,12 +283,7 @@ function skipCteParens(sql: string, cursor: CteCursor): boolean {
   return false
 }
 
-/**
- * Keyword of the statement after a `WITH` CTE list. SQLite CTE bodies are
- * parenthesized and the main statement follows the final body, so a small
- * grammar walk is both conservative and exact. Anything unparseable returns
- * undefined and the caller keeps `with` (a read).
- */
+/** Keyword of the statement after a `WITH` CTE list. */
 function cteStatementKeyword(sql: string): string | undefined {
   const cursor: CteCursor = { index: 0 }
   if (readCteWord(sql, cursor) !== "with") return undefined
@@ -327,20 +310,16 @@ function cteStatementKeyword(sql: string): string | undefined {
 }
 
 /**
- * Classify a SQL statement by its leading keyword, ignoring leading whitespace,
- * comments, and opening parentheses. Lowercase; empty when there is no word.
- *
- * A `WITH` statement is classified by its top-level statement after the CTE
- * bodies: `WITH … INSERT/UPDATE/DELETE/REPLACE` is a write, while `WITH … SELECT`
- * stays a read. This is the one lexical classifier the worker uses, so the
- * statement router (`db.ts`) and the transaction fence cannot disagree about
- * what a statement does.
+ * Classify a SQL statement by its leading keyword, ignoring leading whitespace, comments, and opening
+ * parentheses.
  */
 export function leadingKeyword(sql: string): string {
   const start = skipLeadingTrivia(sql)
   const keyword = /^[A-Za-z_][A-Za-z0-9_]*/.exec(sql.slice(start))?.[0]?.toLowerCase() ?? ""
   return keyword === "with" ? (cteStatementKeyword(sql) ?? keyword) : keyword
 }
+
+const DEFAULT_STATEMENT_BUDGET = 500
 
 function assertNoTransactionControl(sql: string): void {
   const keyword = leadingKeyword(sql)
@@ -351,20 +330,15 @@ function assertNoTransactionControl(sql: string): void {
 
 interface TransactionFence {
   depth: number
+  statements: number
+  readonly budget: number
   readonly original: RepositoryConnection
 }
 
-/**
- * Transaction control belongs to the savepoint engine, never to an `atomic`
- * callback. While a callback runs, every raw statement method on the shared
- * connection rejects COMMIT/ROLLBACK/etc before SQLite sees it, so a callback
- * cannot commit its write past the savepoint or roll back the caller's outer
- * transaction. Calls are synchronous, so the fence is a re-entrant bracket
- * (nested atomics share it) restored on the outermost exit.
- */
+/** Transaction control belongs to the savepoint engine, never to an `atomic` callback. */
 const transactionFences = new WeakMap<RepositoryConnection, TransactionFence>()
 
-function installTransactionFence(connection: RepositoryConnection): TransactionFence {
+function installTransactionFence(connection: RepositoryConnection, budget: number): TransactionFence {
   const existing = transactionFences.get(connection)
   if (existing !== undefined) {
     existing.depth += 1
@@ -376,22 +350,27 @@ function installTransactionFence(connection: RepositoryConnection): TransactionF
     exec: connection.exec,
     values: connection.values,
   }
-  const fence: TransactionFence = { depth: 1, original }
+  const fence: TransactionFence = { depth: 1, statements: 0, budget, original }
+  const admit = (sql: string) => {
+    assertNoTransactionControl(sql)
+    fence.statements += 1
+    if (fence.statements > fence.budget) throw new StatementBudgetExceededError({ limit: fence.budget })
+  }
   transactionFences.set(connection, fence)
   connection.all = ((sql: string, params?: unknown) => {
-    assertNoTransactionControl(sql)
+    admit(sql)
     return original.all(sql, params as never)
   }) as unknown as RepositoryConnection["all"]
   connection.run = ((sql: string, params?: unknown) => {
-    assertNoTransactionControl(sql)
+    admit(sql)
     return original.run(sql, params as never)
   }) as unknown as RepositoryConnection["run"]
   connection.exec = ((sql: string) => {
-    assertNoTransactionControl(sql)
+    admit(sql)
     original.exec(sql)
   }) as unknown as RepositoryConnection["exec"]
   connection.values = ((sql: string, params?: unknown) => {
-    assertNoTransactionControl(sql)
+    admit(sql)
     return original.values(sql, params as never)
   }) as unknown as RepositoryConnection["values"]
   return fence
@@ -407,10 +386,7 @@ function releaseTransactionFence(connection: RepositoryConnection, fence: Transa
   transactionFences.delete(connection)
 }
 
-/**
- * Bind the session on insert. A caller may repeat the bound value but may never
- * supply a different one: the column is authoritative, not advisory.
- */
+/** Bind the session on insert. */
 function insertValues(capability: WriteCapability, entry: TableRegistryEntry, input: Row, operation: string): Row {
   const values: Row = { ...input }
   columnsOf(entry, values)
@@ -592,10 +568,7 @@ function assertImmutable(
 }
 
 /**
- * Session rows carry hub-owned billing/share/revert state in addition to the
- * immutable identity columns. A repository update may repeat an unchanged
- * identity value (the projector does), but it may only CHANGE a worker-owned
- * projection column; everything else is hub authority.
+ * Session rows carry hub-owned billing/share/revert state in addition to the immutable identity columns.
  */
 function assertSessionUpdateColumns(
   capability: WriteCapability,
@@ -715,12 +688,7 @@ function currentRows(capability: WriteCapability, entry: TableRegistryEntry, whe
   return all(entry, capability, where)
 }
 
-/**
- * The ownership half of an upsert's conflict write. Validation reads the target
- * row first, but the row can change between that read and the statement; the
- * `DO UPDATE ... WHERE` predicate re-checks ownership inside SQLite's write so a
- * vanished or foreign row can never be repointed.
- */
+/** The ownership half of an upsert's conflict write. */
 function conflictOwnershipWhere(
   capability: WriteCapability,
   entry: TableRegistryEntry,
@@ -775,11 +743,7 @@ function insertStatement(
   }
 }
 
-/**
- * The session root is update-only. A worker may project onto an existing root,
- * but the statement can never INSERT: if the hub removed the row, the UPDATE
- * matches nothing instead of re-minting it with the caller's depth/parent.
- */
+/** The session root is update-only. */
 function sessionUpsertStatement(
   capability: WriteCapability,
   entry: TableRegistryEntry,
@@ -825,13 +789,9 @@ function deleteStatement(entry: TableRegistryEntry, where: Row): { readonly sql:
 
 let savepointCounter = 0
 
-/**
- * Run validation+write atomically; nested calls join the caller's transaction.
- * The main-table authorizer bracket is applied per internal statement, never
- * around the caller-supplied callback: a callback keeps the bound read fence.
- */
+/** Run validation+write atomically; nested calls join the caller's transaction. */
 function atomic<T>(capability: WriteCapability, work: () => T): T {
-  const fence = installTransactionFence(capability.connection)
+  const fence = installTransactionFence(capability.connection, capability.statementBudget ?? DEFAULT_STATEMENT_BUDGET)
   const exec = fence.original.exec
   try {
     savepointCounter += 1
@@ -856,26 +816,17 @@ function atomic<T>(capability: WriteCapability, work: () => T): T {
 }
 
 /**
- * Validation that compares assigned values against the stored row (immutable
- * columns, session-column rules) must see the same row the write changes.
+ * Validation that compares assigned values against the stored row (immutable columns, session-column rules)
+ * must see the same row the write changes.
  */
 function validatesAgainstStoredRow(entry: TableRegistryEntry): boolean {
   return entry.immutable.length > 0 || entry.table === "session" || HUB_OWNED_METADATA[entry.table] !== undefined
 }
 
 /**
- * Single-statement writes are already atomic in SQLite, and validation only
- * reads, so the per-write SAVEPOINT/RELEASE round trip is pure overhead for
- * plain inserts and for updates and upserts on tables without immutable or
- * session columns. Updates and upserts that validate against the stored row run
- * inside the savepoint so the check and the write share one snapshot. Batches
- * and caller-supplied `atomic` callbacks keep the savepoint.
- *
- * For the remaining tables, validation (scope/ownership reads) and the write are
- * NOT snapshot-atomic against a concurrent hub writer. The SQLite statement
- * itself is atomic, and an upsert's ownership predicate is re-checked inside the
- * write, so a vanished/foreign row cannot be repointed; a caller that needs a
- * read-write snapshot must wrap the call in `atomic`/its own transaction.
+ * Single-statement writes are already atomic in SQLite, and validation only reads, so the per-write
+ * SAVEPOINT/RELEASE round trip is pure overhead for plain inserts and for updates and upserts on tables
+ * without immutable or session columns.
  */
 function insertOne(
   capability: WriteCapability,
@@ -884,9 +835,7 @@ function insertOne(
   conflict: RepositoryConflict | undefined,
 ): WriteOutcome {
   const values = insertValues(capability, entry, input, "insert")
-  // The session root is hub authority. A worker projects data onto an
-  // existing row (update/upsert), but it may never mint the root itself: a
-  // forged row could reset metadata.depth/parent_id and buy spawn headroom.
+  // The session root is hub authority.
   if (entry.table === "session" && conflict === undefined) {
     throw new UnsupportedWriteError({
       operation: "insert",
@@ -1025,9 +974,8 @@ export function makeRepository(capability: WriteCapability): WorkerRepository {
     },
     delete(table: any, where: any) {
       const entry = writeEntry(table, "delete")
-      // The session root is hub authority: a worker projects data onto the row
-      // but may never remove it (which would allow a forged re-insert to reset
-      // metadata.depth/parent_id and misclassify the next spawn).
+      // The session root is hub authority: a worker projects data onto the row but may never remove it (which
+      // would allow a forged re-insert to reset metadata.depth/parent_id and misclassify the next spawn).
       if (entry.table === "session") {
         throw new UnsupportedWriteError({
           operation: "delete",

@@ -21,7 +21,7 @@ import { Truncate } from "@/tool/truncate"
 import { Plugin } from "@/plugin"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { createBunSqliteConnection } from "@/session/writer/connection"
-import { LEDGER_SQL, createToolCallLedger, fromHandle, layer, make, node, Service } from "@/session/ledger/tool-call"
+import { LEDGER_SQL, createToolCallLedger, layer, make, node, Service } from "@/session/ledger/tool-call"
 import { createProxyReporting, type LifecycleReporting } from "@/session/ledger/lifecycle"
 import { WorkerDb, markSchemaIdentity, openWorkerDatabase, type WorkerDatabase } from "@/session/worker/db"
 import { migrationStatements } from "@/session/writer/migration.statements.gen"
@@ -166,9 +166,10 @@ function ledgerForTest() {
 
 async function resolveTool(
   toolDefinition: RegisteredTool,
-  ledger: ReturnType<typeof createToolCallLedger>,
+  connection: ReturnType<typeof createBunSqliteConnection>,
   proc: LedgerTestProcessor = processor,
   lifecycle?: Pick<LifecycleReporting, "toolStarted" | "toolFinished">,
+  ledgerOptions: Parameters<typeof layer>[1] = {},
 ) {
   const tools = await Effect.runPromise(
     Effect.gen(function* () {
@@ -180,10 +181,9 @@ async function resolveTool(
         bypassAgentCheck: false,
         messages: [],
         promptOps: {} as never,
-        ledger,
         ...(lifecycle === undefined ? {} : { lifecycle }),
       })
-    }).pipe(Effect.provide(layerWith(toolDefinition))),
+    }).pipe(Effect.provide(Layer.mergeAll(layerWith(toolDefinition), layer(connection, ledgerOptions)))),
   )
   const execute = tools[toolDefinition.id]?.execute
   if (!execute) throw new Error("tool is missing execute")
@@ -266,7 +266,7 @@ describe("tool-call ledger on the production tool path", () => {
   })
 
   test("records started before the effect and finishes only with the result commit", async () => {
-    const { ledger } = ledgerForTest()
+    const { connection, ledger } = ledgerForTest()
     let observed: string | undefined
     const execute = await resolveTool(
       tool(() =>
@@ -275,7 +275,7 @@ describe("tool-call ledger on the production tool path", () => {
           return { title: "ledger", metadata: {}, output: "done" }
         }),
       ),
-      ledger,
+      connection,
     )
 
     await run(execute)
@@ -299,7 +299,7 @@ describe("tool-call ledger on the production tool path", () => {
   })
 
   test("an unacknowledged lifecycle start fails the tool closed before its effect", async () => {
-    const { ledger } = ledgerForTest()
+    const { connection, ledger } = ledgerForTest()
     const local = makeProcessor()
     let ran = false
     const execute = await resolveTool(
@@ -309,7 +309,7 @@ describe("tool-call ledger on the production tool path", () => {
           return { title: "ledger", metadata: {}, output: "done" }
         }),
       ),
-      ledger,
+      connection,
       local.processor,
       createProxyReporting(
         (method) => (method === "lifecycle.toolStarted" ? new Promise(() => {}) : Promise.resolve()),
@@ -327,7 +327,7 @@ describe("tool-call ledger on the production tool path", () => {
   })
 
   test("a hard crash between start and finish leaves an indeterminate row", () => {
-    const { ledger } = ledgerForTest()
+    const { connection, ledger } = ledgerForTest()
     // A process that dies between `start` and the exit handler writes nothing;
     // the durable row is the only record, and recovery reads it as indeterminate.
     ledger.start({ callID, sessionID: String(sessionID), tool: "ledger", sideEffecting: true })
@@ -339,10 +339,10 @@ describe("tool-call ledger on the production tool path", () => {
   })
 
   test("a defect finishes the row as error instead of blocking the run forever", async () => {
-    const { ledger } = ledgerForTest()
+    const { connection, ledger } = ledgerForTest()
     const execute = await resolveTool(
       tool(() => Effect.die(new Error("simulated tool defect"))),
-      ledger,
+      connection,
     )
 
     await expect(run(execute)).rejects.toThrow()
@@ -353,11 +353,11 @@ describe("tool-call ledger on the production tool path", () => {
   })
 
   test("a pre-aborted signal drains the settlement inside the tool effect", async () => {
-    const { ledger } = ledgerForTest()
+    const { connection, ledger } = ledgerForTest()
     settlements.delete(callID)
     const execute = await resolveTool(
       tool(() => Effect.succeed({ title: "ledger", metadata: {}, output: "done" })),
-      ledger,
+      connection,
     )
 
     const controller = new AbortController()
@@ -379,12 +379,12 @@ describe("tool-call ledger on the production tool path", () => {
   })
 
   test("an abandoned settlement leaves the row indeterminate, then a late success settles ok", async () => {
-    const { ledger } = ledgerForTest()
+    const { connection, ledger } = ledgerForTest()
     const local = makeProcessor()
     local.settlements.delete(callID)
     const execute = await resolveTool(
       tool(() => Effect.succeed({ title: "ledger", metadata: {}, output: "done" })),
-      ledger,
+      connection,
       local.processor,
     )
 
@@ -411,7 +411,7 @@ describe("tool-call ledger on the production tool path", () => {
   })
 
   test("a provider call id reused across messages gets a fresh ledger row", async () => {
-    const { ledger } = ledgerForTest()
+    const { connection, ledger } = ledgerForTest()
     const first = makeProcessor(MessageID.ascending())
     const second = makeProcessor(MessageID.ascending())
     const firstKey = `${first.processor.message.id}:${callID}`
@@ -419,12 +419,12 @@ describe("tool-call ledger on the production tool path", () => {
 
     const executeA = await resolveTool(
       tool(() => Effect.succeed({ title: "first", metadata: {}, output: "first" })),
-      ledger,
+      connection,
       first.processor,
     )
     const executeB = await resolveTool(
       tool(() => Effect.succeed({ title: "second", metadata: {}, output: "second" })),
-      ledger,
+      connection,
       second.processor,
     )
 
@@ -447,14 +447,16 @@ describe("tool-call ledger on the production tool path", () => {
   })
 
   test("a parallel start survives another tool's rollback", async () => {
-    const { connection } = ledgerForTest()
+    const { connection, ledger } = ledgerForTest()
     const semaphore = Effect.runSync(Semaphore.make(1))
     const exclusive = <A>(operation: () => A) => semaphore.withPermits(1)(Effect.sync(operation))
-    const ledger = createToolCallLedger(connection, { exclusive })
     settlements.delete(callID)
     const execute = await resolveTool(
       tool(() => Effect.succeed({ title: "ledger", metadata: {}, output: "done" })),
-      ledger,
+      connection,
+      processor,
+      undefined,
+      { exclusive },
     )
 
     // Another tool owns the connection and its result transaction. The start of
@@ -488,7 +490,7 @@ describe("tool-call ledger on the production tool path", () => {
           return { title: "ledger", metadata: {}, output: "done" }
         }),
       ),
-      ledger,
+      connection,
     )
 
     await run(execute)
@@ -538,7 +540,7 @@ describe("tool-call ledger service", () => {
     }).pipe(Effect.provide(layer(freshConnection()))),
   )
 
-  it.live("make and fromHandle match the createToolCallLedger adapter", () =>
+  it.live("make matches the createToolCallLedger adapter", () =>
     Effect.gen(function* () {
       const service = yield* make(freshConnection())
       const adapter = createToolCallLedger(freshConnection())
@@ -556,10 +558,6 @@ describe("tool-call ledger service", () => {
       adapter.finish({ callID: input.callID, sessionID: serviceSession, outcome: "done", timeFinished: 2_000 })
       expect(yield* service.list(serviceSession)).toEqual(adapter.list(serviceSession))
       expect(yield* service.indeterminate(serviceSession)).toEqual(adapter.indeterminate(serviceSession))
-
-      const adapted = fromHandle(adapter)
-      expect(adapted.ledger).toBe(adapter)
-      expect(yield* adapted.list(serviceSession)).toEqual(adapter.list(serviceSession))
     }),
   )
 })

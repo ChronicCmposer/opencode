@@ -1,9 +1,4 @@
-// Schema identity hashing (D7).
-//
-// The identity is `user_version` + the ordered migration journal ids + a hash of
-// the actual shipped SQL bodies. Hashing ids alone let a changed statement keep
-// the same identity, so the body hash is part of every comparison. The body hash
-// is persisted in `schema_meta` by the hub migration; a worker never writes it.
+// Schema identity hashing.
 
 import { createHash } from "node:crypto"
 

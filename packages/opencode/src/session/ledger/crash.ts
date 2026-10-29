@@ -103,10 +103,7 @@ function rowFromRecord(record: Record<string, unknown>): CrashRow {
   }
 }
 
-/**
- * Persist the payload and return the same value. A crash after the durable commit
- * is recorded with `phase: "commit"` and the committed message id, never replayed.
- */
+/** Persist the payload and return the same value. */
 export function record(connection: LedgerConnection, input: RecordCrashInput): WorkerCrashed {
   const payload = workerCrashed(input)
   connection.run(
@@ -143,10 +140,7 @@ export interface AsyncLedgerExecutor {
   run(sql: string, params?: ReadonlyArray<unknown>): Promise<unknown>
 }
 
-/**
- * Persist the payload through an async executor (the hub's DB thread) and return
- * the same value. The SQL and validation match {@link record}.
- */
+/** Persist the payload through an async executor (the hub's DB thread) and return the same value. */
 export async function recordAsync(
   executor: AsyncLedgerExecutor,
   input: RecordCrashInput,

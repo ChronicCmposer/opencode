@@ -1,6 +1,6 @@
 // The ToolCallLedger service boundary is additive: the synchronous
 // `createToolCallLedger` adapter keeps throwing the legacy error classes, while
-// `fromHandle` maps those same throws to typed, tagged service failures. These
+// the service maps those same throws to typed, tagged service failures. These
 // tests pin both halves of that contract plus the finishWithResult span name.
 
 import { describe, expect, test } from "bun:test"
@@ -16,7 +16,6 @@ import {
   ToolCallNotStartedServiceError,
   ToolCallStaleGenerationServiceError,
   createToolCallLedger,
-  fromHandle,
   make,
 } from "@/session/ledger/tool-call"
 import { createBunSqliteConnection } from "@/session/writer/connection"
@@ -102,15 +101,13 @@ describe("tool-call ledger service errors", () => {
   )
 
   it.live("leaves a non-ledger defect as a defect", () => {
-    const handle = createToolCallLedger(freshConnection())
-    const service = fromHandle({
-      ...handle,
-      start: () => {
-        throw new Error("not a ledger failure")
-      },
-    })
+    const connection = freshConnection()
+    connection.run = () => {
+      throw new Error("not a ledger failure")
+    }
 
     return Effect.gen(function* () {
+      const service = yield* make(connection)
       const exit = yield* Effect.exit(service.start({ callID: "defect-call", sessionID, tool: "ledger" }))
       expect(Exit.isFailure(exit)).toBe(true)
       if (!Exit.isFailure(exit)) return

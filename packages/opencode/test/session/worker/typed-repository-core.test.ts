@@ -27,13 +27,15 @@ import {
   type WorkerDatabase,
 } from "@/session/worker/db"
 import { TABLE_REGISTRY, assertTableRegistry, tableRegistry } from "@/session/worker/repository/registry"
-import { connectedRepository } from "@/session/worker/repository/write"
+import { connectedRepository, makeRepository } from "@/session/worker/repository/write"
+import { createWriteCapability } from "@/session/worker/repository/capability"
 import { LEDGER_SQL } from "@/session/ledger/tool-call"
 import {
   ForeignKeyOwnershipError,
   HubOnlyWriteError,
   ImmutableColumnError,
   ScopeViolationError,
+  StatementBudgetExceededError,
   TableRegistryDriftError,
   UnknownColumnError,
   UnsupportedWriteError,
@@ -559,5 +561,27 @@ describe("typed transaction scope and connected repository", () => {
     } finally {
       connection.close()
     }
+  })
+})
+
+describe("statement budget", () => {
+  test("a transaction past its budget fails with a typed error", () => {
+    const connection = openConnection({ filename: ":memory:" })
+    connection.exec(LEDGER_SQL)
+    const repository = makeRepository(
+      createWriteCapability({
+        connection,
+        scopeFunction: "worker_scope_session",
+        statementBudget: 3,
+        withMain: (operation) => operation(),
+      }),
+    )
+    expect(() =>
+      repository.atomic(() => {
+        for (let index = 0; index < 10; index++) repository.select("tool_call")
+      }),
+    ).toThrow(StatementBudgetExceededError)
+    expect(() => repository.atomic(() => repository.select("tool_call"))).not.toThrow()
+    connection.close()
   })
 })

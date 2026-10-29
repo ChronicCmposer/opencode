@@ -31,7 +31,7 @@ import { Truncate } from "@/tool/truncate"
 import { Plugin } from "@/plugin"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { createBunSqliteConnection } from "@/session/writer/connection"
-import { LEDGER_SQL, createToolCallLedger, type ToolCallLedgerHandle } from "@/session/ledger/tool-call"
+import { LEDGER_SQL, ToolCallLedger, createToolCallLedger } from "@/session/ledger/tool-call"
 import { createLifecycleTracker, type LifecycleTracker } from "@/session/ledger/lifecycle"
 import { RunBarrier, RunBarrierTimeout } from "@/session/run-barrier"
 import { createProductionSessionHub, type SessionHub } from "@/session/worker/hub"
@@ -161,7 +161,7 @@ function ledgerForTest() {
 
 async function resolveTool(
   toolDefinition: RegisteredTool,
-  ledger: ToolCallLedgerHandle,
+  connection: ReturnType<typeof createBunSqliteConnection>,
   lifecycle: LifecycleTracker,
 ) {
   const tools = await Effect.runPromise(
@@ -174,10 +174,9 @@ async function resolveTool(
         bypassAgentCheck: false,
         messages: [],
         promptOps: {} as never,
-        ledger,
         lifecycle: reportingFor(lifecycle),
       })
-    }).pipe(Effect.provide(layerWith(toolDefinition))),
+    }).pipe(Effect.provide(Layer.mergeAll(layerWith(toolDefinition), ToolCallLedger.layer(connection)))),
   )
   const execute = tools[toolDefinition.id]?.execute
   if (!execute) throw new Error("tool is missing execute")
@@ -206,10 +205,10 @@ function finishRun(barrier: RunBarrier.Interface, lifecycle: LifecycleTracker) {
 describe("interrupted tool finishes and releases the run barrier", () => {
   barrierIt.effect("an interrupted side-effecting tool finishes `error` and the next run is admitted", () =>
     Effect.gen(function* () {
-      const { ledger } = ledgerForTest()
+      const { connection, ledger } = ledgerForTest()
       const lifecycle = createLifecycleTracker()
       const barrier = yield* RunBarrier.Service
-      const execute = yield* Effect.promise(() => resolveTool(tool(() => Effect.interrupt), ledger, lifecycle))
+      const execute = yield* Effect.promise(() => resolveTool(tool(() => Effect.interrupt), connection, lifecycle))
 
       expect(Exit.isFailure(yield* Effect.exit(Effect.promise(() => run(execute))))).toBe(true)
 
@@ -236,10 +235,10 @@ describe("interrupted tool finishes and releases the run barrier", () => {
 
   barrierIt.effect("a defect also finishes the row instead of leaving it pending", () =>
     Effect.gen(function* () {
-      const { ledger } = ledgerForTest()
+      const { connection, ledger } = ledgerForTest()
       const lifecycle = createLifecycleTracker()
       const execute = yield* Effect.promise(() =>
-        resolveTool(tool(() => Effect.die(new Error("simulated tool defect"))), ledger, lifecycle),
+        resolveTool(tool(() => Effect.die(new Error("simulated tool defect"))), connection, lifecycle),
       )
 
       expect(Exit.isFailure(yield* Effect.exit(Effect.promise(() => run(execute))))).toBe(true)
@@ -253,10 +252,10 @@ describe("interrupted tool finishes and releases the run barrier", () => {
 
   barrierIt.effect("an interrupted tool cannot leave a timed-out barrier behind", () =>
     Effect.gen(function* () {
-      const { ledger } = ledgerForTest()
+      const { connection, ledger } = ledgerForTest()
       const lifecycle = createLifecycleTracker()
       const barrier = yield* RunBarrier.Service
-      const execute = yield* Effect.promise(() => resolveTool(tool(() => Effect.interrupt), ledger, lifecycle))
+      const execute = yield* Effect.promise(() => resolveTool(tool(() => Effect.interrupt), connection, lifecycle))
 
       expect(Exit.isFailure(yield* Effect.exit(Effect.promise(() => run(execute))))).toBe(true)
       const first = yield* finishRun(barrier, lifecycle)

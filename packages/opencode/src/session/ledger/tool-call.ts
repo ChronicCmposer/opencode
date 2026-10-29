@@ -12,25 +12,13 @@ export const TOOL_CALL_STATES = ["started", "finished", "indeterminate"] as cons
 
 export type ToolCallState = (typeof TOOL_CALL_STATES)[number]
 
-/**
- * The ledger's raw connection shape. It remains the hub/test seam (and the
- * crash ledger's connection), but the tool-call writes themselves go through
- * the typed repository: a `WorkerRepository` is the worker's only write path.
- */
+/** The ledger's raw connection shape. */
 export type LedgerConnection = Connection
 
-/**
- * The typed ledger surface. `WorkerRepository` is the worker's write path;
- * `LedgerConnection` is accepted only so the hub and the ledger's unit tests can
- * build an unbound repository over their own connection.
- */
+/** The typed ledger surface. */
 export type ToolCallLedgerSource = WorkerRepository | LedgerConnection
 
-/**
- * The hub-only schema. A worker never executes DDL; tests and the migration
- * generator apply `sql/001-tool-call.sql`. The generated fallback is the bundled-binary
- * copy (a compiled entry has no adjacent `.sql` file).
- */
+/** The hub-only schema. */
 
 export const LEDGER_SQL = (() => {
   try {
@@ -40,12 +28,7 @@ export const LEDGER_SQL = (() => {
   }
 })()
 
-/**
- * The generation-fence column is additive. `CREATE TABLE IF NOT EXISTS` cannot
- * add it to a `tool_call` table that a P0 build already created, so the hub must
- * issue this ALTER before it marks that database current. Without it the worker
- * boot registry gate sees a column drift and every fenced write fails.
- */
+/** The generation-fence column is additive. */
 const FENCE_COLUMN = "worker_owner_id"
 const ADD_FENCE_COLUMN = `ALTER TABLE tool_call ADD COLUMN ${FENCE_COLUMN} TEXT`
 
@@ -108,21 +91,12 @@ export interface FinishInput {
   readonly timeFinished?: number
 }
 
-/**
- * Serialize a standalone ledger write with the worker's other connection owner.
- * The tool path supplies the Effect SQL transaction acquirer, so a `started`
- * row cannot be written inside another tool's result transaction (and cannot be
- * erased by that transaction's rollback).
- */
+/** Serialize a standalone ledger write with the worker's other connection owner. */
 export type LedgerExclusive = <A>(operation: () => A) => Effect.Effect<A>
 
 export interface ToolCallLedgerOptions {
   readonly exclusive?: LedgerExclusive
-  /**
-   * Bind every write to one worker generation. When set, a start/finish whose
-   * generation is not the session's current event-sequence lease owner is
-   * rejected inside the same transaction as the write.
-   */
+  /** Bind every write to one worker generation. */
   readonly fence?: ToolCallFence
 }
 
@@ -158,11 +132,7 @@ export class ToolCallNotStartedError extends ToolCallLedgerError {
   }
 }
 
-/**
- * A write from a superseded worker generation. The session's event-sequence
- * lease already belongs to another owner, so this isolate may no longer record
- * or settle tool calls for it.
- */
+/** A write from a superseded worker generation. */
 export class StaleWorkerGenerationError extends ToolCallLedgerError {
   constructor(sessionID: string, expected: string, actual: string | undefined) {
     super(`worker generation ${expected} is stale for session ${sessionID}: current lease owner is ${actual ?? "none"}`)
@@ -171,13 +141,7 @@ export class StaleWorkerGenerationError extends ToolCallLedgerError {
   }
 }
 
-/**
- * The service-level failure for a ledger operation. Every tagged class wraps the
- * exact legacy throw in `cause` (so callers can still recover with `instanceof`)
- * and carries the legacy error's stable `tag` (`TOOL_CALL_LEDGER`). Only the
- * Effect service raises these; the synchronous adapter keeps throwing the legacy
- * classes unchanged.
- */
+/** The service-level failure for a ledger operation. */
 const serviceErrorFields = {
   operation: Schema.String,
   message: Schema.String,
@@ -216,11 +180,7 @@ export type ServiceError =
   | ToolCallNotStartedServiceError
   | ToolCallStaleGenerationServiceError
 
-/**
- * A synchronous outcome with no thrown control flow. The transaction callbacks
- * return one of these so the service can raise a typed error in its generator;
- * the legacy handle unwraps it into the exact class direct callers expect.
- */
+/** A synchronous outcome with no thrown control flow. */
 type LedgerFailure =
   | { readonly kind: "invalid"; readonly message: string }
   | { readonly kind: "alreadyStarted"; readonly callID: string; readonly sessionID: string }
@@ -261,10 +221,7 @@ function failureServiceError(operation: string, failure: LedgerFailure): Service
   }
 }
 
-/**
- * Map a legacy throw to its tagged service error. Anything that is not a legacy
- * ledger error is not ours to reinterpret, so it stays a defect.
- */
+/** Map a legacy throw to its tagged service error. */
 function serviceError(operation: string, error: unknown): ServiceError | undefined {
   if (!(error instanceof ToolCallLedgerError)) return undefined
   const fields = { operation, message: error.message, legacyTag: error.tag, cause: error }
@@ -272,19 +229,6 @@ function serviceError(operation: string, error: unknown): ServiceError | undefin
   if (error instanceof ToolCallNotStartedError) return new ToolCallNotStartedServiceError(fields)
   if (error instanceof StaleWorkerGenerationError) return new ToolCallStaleGenerationServiceError(fields)
   return new ToolCallLedgerServiceError(fields)
-}
-
-/** Lift a handle operation, turning a legacy throw into a typed service error. */
-function mapLegacyErrors<A, E, R>(
-  operation: string,
-  effect: Effect.Effect<A, E, R>,
-): Effect.Effect<A, E | ServiceError, R> {
-  return effect.pipe(
-    Effect.catchDefect((defect) => {
-      const failure = serviceError(operation, defect)
-      return failure === undefined ? Effect.die(defect) : Effect.fail(failure)
-    }),
-  )
 }
 
 function requireText(value: string, field: string): string {
@@ -336,8 +280,7 @@ function isTypedRepository(source: ToolCallLedgerSource): source is WorkerReposi
 }
 
 /**
- * Resolve the typed write surface: a worker repository, or an unbound repository
- * over a raw connection. Both carry the same savepoint-scoped `atomic`.
+ * Resolve the typed write surface: a worker repository, or an unbound repository over a raw connection.
  */
 function repositoryFor(source: ToolCallLedgerSource): WorkerRepository {
   if (isTypedRepository(source)) return source
@@ -350,12 +293,7 @@ function stored(repository: WorkerRepository, callID: string, sessionID: string)
   return row as Record<string, unknown>
 }
 
-/**
- * The lease-generation fence. A released lease has `worker_owner_id = NULL` and
- * `worker_expires_at = 0`; either state means this generation may no longer
- * write. An absent `event_sequence` row is fenced the same way: no lease exists,
- * so no generation may record a call.
- */
+/** The lease-generation fence. */
 function currentGenerationFailure(
   repository: WorkerRepository,
   sessionID: string,
@@ -481,11 +419,7 @@ function finishWith(repository: WorkerRepository, input: FinishInput, fence?: To
   return unwrap(attemptFinish(repository, input, fence))
 }
 
-/**
- * Mark a call started. Direct callers run outside a result transaction; the
- * production tool path uses the service's `startStandalone` so a parallel tool
- * cannot record its start inside another tool's result transaction.
- */
+/** Mark a call started. */
 export function start(source: ToolCallLedgerSource, input: StartInput, fence?: ToolCallFence): ToolCallRow {
   return startWith(repositoryFor(source), input, fence)
 }
@@ -500,11 +434,7 @@ function startStandaloneWith(
   return exclusive === undefined ? Effect.sync(write) : Effect.suspend(() => exclusive(write))
 }
 
-/**
- * Finish a started call. This write joins whatever transaction the worker's one
- * connection already owns; use {@link finishWithResult} when the result needs a
- * transaction the ledger owns.
- */
+/** Finish a started call. */
 export function finish(source: ToolCallLedgerSource, input: FinishInput, fence?: ToolCallFence): ToolCallRow {
   return finishWith(repositoryFor(source), input, fence)
 }
@@ -519,16 +449,7 @@ function finishStandaloneWith(
   return exclusive === undefined ? Effect.sync(write) : Effect.suspend(() => exclusive(write))
 }
 
-/**
- * Run the result write and the ledger finish atomically. A failure anywhere rolls
- * both back, so a crash between them leaves the orphaned `started` row instead of
- * a finished call whose result was lost.
- *
- * The scope comes from the repository's savepoint capability, never a raw
- * `BEGIN`/`COMMIT`: the worker connection is shared with the durable result
- * transaction, and a nested savepoint composes with that owner. With no outer
- * transaction the scope commits the pair itself.
- */
+/** Run the result write and the ledger finish atomically. */
 function finishWithResultWith<T>(
   repository: WorkerRepository,
   input: FinishInput,
@@ -577,11 +498,7 @@ export interface ToolCallLedgerHandle {
   readonly hasSideEffectingStarted: (sessionID: string) => boolean
 }
 
-/**
- * The synchronous adapter. New code calls the Effect service; this remains for
- * direct callers that cannot yet compose effects (the ledger's unit tests and
- * the legacy hub seam). Production `src` callers use {@link Service}.
- */
+/** The synchronous adapter. */
 export function createToolCallLedger(
   source: ToolCallLedgerSource,
   options: ToolCallLedgerOptions = {},
@@ -600,14 +517,7 @@ export function createToolCallLedger(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Effect service shape.
-//
-// The `ToolCallLedger` service owns the ledger behavior. Its methods run the
-// repository write and the generation fence in one savepoint and raise a typed
-// failure with `yield*`; nothing is thrown through the service boundary. The
-// synchronous handle above is a shim over the same primitives.
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Effect service shape.
 
 /** The Effect-facing ledger surface. */
 export interface Interface {
@@ -668,71 +578,6 @@ function makeService(
   }
 }
 
-/** Adapt a synchronous handle to the Effect surface (compatibility seam). */
-export function fromHandle(ledger: ToolCallLedgerHandle): Interface {
-  const startStandalone = Effect.fn("ToolCallLedger.startStandalone")(function* (input: StartInput) {
-    // `suspend` defers handle construction into the Effect so a synchronous throw
-    // from an `exclusive` acquirer is mapped like any other legacy failure.
-    return yield* mapLegacyErrors("startStandalone", Effect.suspend(() => ledger.startStandalone(input)))
-  })
-  const start = Effect.fn("ToolCallLedger.start")(function* (input: StartInput) {
-    return yield* mapLegacyErrors(
-      "start",
-      Effect.sync(() => ledger.start(input)),
-    )
-  })
-  const finish = Effect.fn("ToolCallLedger.finish")(function* (input: FinishInput) {
-    return yield* mapLegacyErrors(
-      "finish",
-      Effect.sync(() => ledger.finish(input)),
-    )
-  })
-  const finishStandalone = Effect.fn("ToolCallLedger.finishStandalone")(function* (input: FinishInput) {
-    // `suspend` defers handle construction into the Effect so a synchronous throw
-    // from an `exclusive` acquirer is mapped like any other legacy failure.
-    return yield* mapLegacyErrors("finishStandalone", Effect.suspend(() => ledger.finishStandalone(input)))
-  })
-  const finishWithResult = Effect.fn("ToolCallLedger.finishWithResult")(function* <T>(
-    input: FinishInput,
-    result: () => T,
-  ) {
-    return yield* mapLegacyErrors(
-      "finishWithResult",
-      Effect.sync(() => ledger.finishWithResult(input, result)),
-    )
-  })
-  const indeterminate = Effect.fn("ToolCallLedger.indeterminate")(function* (sessionID: string) {
-    return yield* mapLegacyErrors(
-      "indeterminate",
-      Effect.sync(() => ledger.indeterminate(sessionID)),
-    )
-  })
-  const list = Effect.fn("ToolCallLedger.list")(function* (sessionID: string) {
-    return yield* mapLegacyErrors(
-      "list",
-      Effect.sync(() => ledger.list(sessionID)),
-    )
-  })
-  const hasSideEffectingStarted = Effect.fn("ToolCallLedger.hasSideEffectingStarted")(function* (sessionID: string) {
-    return yield* mapLegacyErrors(
-      "hasSideEffectingStarted",
-      Effect.sync(() => ledger.hasSideEffectingStarted(sessionID)),
-    )
-  })
-  return {
-    available: true,
-    ledger,
-    startStandalone,
-    start,
-    finish,
-    finishStandalone,
-    finishWithResult,
-    indeterminate,
-    list,
-    hasSideEffectingStarted,
-  }
-}
-
 /** Build a ledger over the given source; no resource needs a scope. */
 export function make(source: ToolCallLedgerSource, options: ToolCallLedgerOptions = {}): Effect.Effect<Interface> {
   return Effect.sync(() => makeService(repositoryFor(source), options))
@@ -744,11 +589,7 @@ export interface WorkerLedgerSource {
   readonly eventBinding: { leaseOwner?: string }
 }
 
-/**
- * Build the ledger service from a worker database. The fence follows the
- * worker scope's lease owner on every write, so a lease claimed after the graph
- * is built is still enforced.
- */
+/** Build the ledger service from a worker database. */
 export function makeFromWorker(
   workerDb: WorkerLedgerSource,
   options: Omit<ToolCallLedgerOptions, "fence"> = {},
@@ -827,12 +668,7 @@ function unavailableService(): Interface {
   }
 }
 
-/**
- * The production layer. The repository and the generation fence come from
- * `WorkerDb.Service`; the connection's exclusive transaction comes from the
- * optional `Database.Service`. A reduced graph with no usable worker database
- * yields an unavailable service so callers keep their no-ledger behavior.
- */
+/** The production layer. */
 export const workerLayer: Layer.Layer<Service> = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -859,10 +695,7 @@ export const workerLayer: Layer.Layer<Service> = Layer.effect(
   }),
 )
 
-/**
- * The production graph node. `WorkerDb` is read through `serviceOption` so the
- * node adds no hard dependency and a reduced graph still builds.
- */
+/** The production graph node. */
 export const workerNode: LayerNode.Node<Service, never, undefined> = LayerNode.make({
   service: Service,
   layer: workerLayer,

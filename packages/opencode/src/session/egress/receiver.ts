@@ -1,23 +1,4 @@
 // Hub-side egress receiver over the events envelope (spec Q6/Q16/Q21).
-//
-// The hub end of a worker's dedicated egress port. Every incoming message is one
-// shared-envelope JSON string, decoded ONCE at the port boundary by the same
-// codec as every other worker port (`decodeFrame` -> `decodeWorkerFrame`, so the
-// 4 MiB cap and safe-json prototype guards apply). The listener is registered by
-// a `Stream.callback` + `Effect.acquireRelease`, and the decoded messages are
-// driven through `Stream.runForEach` so event delivery, blob resolution, gap
-// healing, `end`, `resync`, and `ack` all observe arrival order — which is commit
-// order for a single worker.
-//
-// Durable `(aggregateID, seq)` pairs are checked for per-aggregate order, so an
-// out-of-order or gapped frame within one aggregate fails loud while interleaved
-// aggregates never look gapped. The `end`/`resync`/`ack` control frames are
-// surfaced distinctly rather than swallowed.
-//
-// Backpressure (spec Q16): when a caller supplies a `pressure` probe and it
-// reports pressure, a non-durable delta is DROPPED and a resync is surfaced.
-// The production hub passes no probe, so it never drops for pressure; durable
-// events are never dropped either way.
 
 import { Cause, Effect, Queue, Schema, Stream } from "effect"
 
@@ -35,9 +16,8 @@ import {
 type EventFrame = Extract<EventsFrame, { readonly kind: "event" }>
 
 /**
- * Raised when a durable event violates PER-AGGREGATE order: a repeated/lower
- * seq, or a gap in that aggregate's sequence. Named so callers can distinguish
- * it from a framing error and decide to fail loud or resync.
+ * Raised when a durable event violates PER-AGGREGATE order: a repeated/lower seq, or a gap in that
+ * aggregate's sequence.
  */
 export class DurableOrderError extends Schema.TaggedErrorClass<DurableOrderError>("DurableOrderError")(
   "Egress.DurableOrder",
@@ -72,22 +52,20 @@ export interface EgressPortOptions {
   /** Called once on the first framing/ordering error; the receiver then stops. */
   readonly onError?: (error: Error) => void
   /**
-   * Recoverable-frame policy: when supplied, a frame that fails decode/size
-   * checks or whose delivery throws is dropped, counted as a resync and reported
-   * here, and the port STAYS OPEN. Without it the first such failure is fatal.
+   * Recoverable-frame policy: when supplied, a frame that fails decode/size checks or whose delivery throws
+   * is dropped, counted as a resync and reported here, and the port STAYS OPEN. Without it the first such
+   * failure is fatal.
    */
   readonly onFrameRejected?: (error: Error) => void
   /**
-   * Durable-gap policy: when supplied, a gap/out-of-order frame is surfaced here
-   * (with the position that arrived and the last accepted one) and the port
-   * STAYS OPEN so the consumer can heal from a database snapshot. The handler may
-   * return an Effect so healing completes before the gapped frame is delivered.
-   * Without it the receiver keeps its fail-loud contract and closes the port.
+   * Durable-gap policy: when supplied, a gap/out-of-order frame is surfaced here (with the position that
+   * arrived and the last accepted one) and the port STAYS OPEN so the consumer can heal from a database
+   * snapshot.
    */
   readonly onDurableGap?: (got: AggregatePosition, last: AggregatePosition) => unknown
   /**
-   * Backpressure signal: when it returns `true`, non-durable deltas are dropped
-   * (and a resync surfaced) instead of delivered. Durable events always deliver.
+   * Backpressure signal: when it returns `true`, non-durable deltas are dropped (and a resync surfaced)
+   * instead of delivered.
    */
   readonly pressure?: () => boolean
 }
@@ -114,19 +92,14 @@ export interface EgressPortStats {
 
 export interface EgressPortConnection {
   readonly stats: EgressPortStats
-  /**
-   * The ordered stream program. It fails only for a fatal port error, which has
-   * already been reported through `onError`; run it with the hub's runner.
-   */
+  /** The ordered stream program. */
   readonly program: Effect.Effect<void, Error>
   /** Synchronous, idempotent teardown: detach the listener and close the port once. */
   readonly close: () => void
 }
 
 /**
- * Decode one worker port message into either an events frame or a typed failure,
- * never parsing JSON ad hoc. Framing/ordering failures are surfaced to the
- * ordered stream so they are reported exactly once before the port closes.
+ * Decode one worker port message into either an events frame or a typed failure, never parsing JSON ad hoc.
  */
 type PortMessage =
   | { readonly _tag: "frame"; readonly frame: DecodedEventsFrame; readonly text: string }
@@ -144,14 +117,7 @@ function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error))
 }
 
-/**
- * Build the single live events-port pipeline. The returned `program` decodes each
- * message at the port, then sequentially:
- *   * enforces per-aggregate durable order (duplicate/stale drop, gap policy),
- *   * applies non-durable backpressure,
- *   * surfaces `end`/`resync`/`ack`,
- *   * reports the first malformed frame once and closes the port.
- */
+/** Build the single live events-port pipeline. */
 export function createEgressPort(port: MessagePort, options: EgressPortOptions): EgressPortConnection {
   let received = 0
   let dropped = 0
@@ -186,17 +152,15 @@ export function createEgressPort(port: MessagePort, options: EgressPortOptions):
 
   const handleEvent = (frame: EventFrame, text: string): Effect.Effect<void, Error> =>
     Effect.gen(function* () {
-      // The canonical durability test (present only when BOTH `aggregateID` and
-      // `seq` are set), shared with the sender and fan-out so the three never
-      // drift on exactly which frames are durable.
+      // The canonical durability test (present only when BOTH `aggregateID` and `seq` are set), shared with
+      // the sender and fan-out so the three never drift on exactly which frames are durable.
       const meta = durableMetaOf(frame)
       if (meta !== undefined) {
         const last = lastByAggregate.get(meta.aggregateID)
         if (last !== undefined) {
           if (meta.seq <= last.seq) {
-            // A duplicate/stale frame is idempotent and must never rewind the
-            // per-aggregate cursor or trigger a resync. Without a gap policy the
-            // receiver keeps its fail-loud contract.
+            // A duplicate/stale frame is idempotent and must never rewind the per-aggregate cursor or trigger
+            // a resync.
             if (options.onDurableGap === undefined) {
               yield* fail(new DurableOrderError("out-of-order", meta, last))
               return
@@ -204,9 +168,8 @@ export function createEgressPort(port: MessagePort, options: EgressPortOptions):
             return
           }
           if (meta.seq !== last.seq + 1) {
-            // A gap is recoverable when the consumer owns a resync policy:
-            // surface it, await any healing, and keep the stream alive. The
-            // observed position still advances so later frames deliver in order.
+            // A gap is recoverable when the consumer owns a resync policy: surface it, await any healing, and
+            // keep the stream alive.
             if (options.onDurableGap === undefined) {
               yield* fail(new DurableOrderError("gap", meta, last))
               return
@@ -319,22 +282,15 @@ export function createEgressPort(port: MessagePort, options: EgressPortOptions):
     lastDurable: (aggregateID) => lastByAggregate.get(aggregateID),
   }
 
-  // Every callback — `onFrame`, `onEnd`, `onResync`, `onAck`, `onDurableGap`,
-  // and the backpressure probe — runs inside the ordered stream. A synchronous
-  // throw surfaces as a defect and a handler Effect that fails surfaces as a
-  // typed failure; both are fatal for the port and must be reported through the
-  // one `fail` path so `onError`/`lastError` observe the underlying error. An
-  // interrupt (dispose or external cancellation) is not a delivery failure: it
-  // is re-raised untouched, leaving the port silent while its scope finalizer
-  // detaches the listener.
+  // Every callback — `onFrame`, `onEnd`, `onResync`, `onAck`, `onDurableGap`, and the backpressure probe —
+  // runs inside the ordered stream.
   const reportFatal = (cause: Cause.Cause<Error>): Effect.Effect<never, Error> =>
     Cause.hasInterruptsOnly(cause) ? Effect.failCause(cause) : fail(asError(Cause.squash(cause)))
 
   return {
     stats,
-    // Process one message per scheduler turn: a port message is its own arrival
-    // turn, and downstream consumers must be able to drain a delivered frame
-    // before a later terminal frame finalizes the stream.
+    // Process one message per scheduler turn: a port message is its own arrival turn, and downstream
+    // consumers must be able to drain a delivered frame before a later terminal frame finalizes the stream.
     program: Stream.runForEach(stream, (message) =>
       Effect.gen(function* () {
         yield* process(message).pipe(
@@ -368,10 +324,8 @@ export interface EgressReceiver {
 }
 
 /**
- * Synchronous facade over the one decoded events pipeline, retained for callers
- * that observe the receiver directly (the no-publisher drain and the receiver
- * tests). Production hub serving runs the SAME {@link createEgressPort} program
- * through the hub's `EffectBridge` instead of a private runtime.
+ * Synchronous facade over the one decoded events pipeline, retained for callers that observe the receiver
+ * directly (the no-publisher drain and the receiver tests).
  */
 export function createEgressReceiver(options: EgressReceiverOptions): EgressReceiver {
   const connection = createEgressPort(options.port, options)

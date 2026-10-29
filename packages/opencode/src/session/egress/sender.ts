@@ -1,15 +1,4 @@
 // Worker-side egress sender over the events envelope (spec Q7/Q16).
-//
-// The worker owns a dedicated `MessagePort` to the hub. Every batch the
-// coalescer emits is encoded once as shared-envelope JSON strings and posted one
-// message per frame; the 4 MiB transport bound applies per frame and per batch.
-// Every durable frame carries its aggregate `(aggregateID, seq)`; there is no
-// sender-global ordinal fallback, so a durable without identity is a caller bug.
-//
-// Events-port ack handshake (spec Q16): after a batch that carried durable
-// frames, the sender posts an `ack` frame whose `count` is the number of durable
-// hand-offs in that batch. The hub receiver surfaces it via `onAck`, so durable
-// progress is observable across the port rather than only implied by the events.
 
 import { Effect } from "effect"
 import type { EffectBridge } from "@/effect/bridge"
@@ -45,8 +34,8 @@ export interface EgressSender {
   /** Push a durable boundary event; its aggregate identity is mandatory. */
   pushDurable(event: EventV2Event, meta: DurableMeta): void
   /**
-   * Flush buffered deltas, post a zero-count RUN-END flush ack after the last
-   * durable frame, then emit the end frame.
+   * Flush buffered deltas, post a zero-count RUN-END flush ack after the last durable frame, then emit the
+   * end frame.
    */
   end(): void
   readonly buffered: number
@@ -59,12 +48,8 @@ export function createEgressSender(options: EgressSenderOptions): EgressSender {
     maxBatch: options.maxBatch,
     scheduler: options.scheduler,
     onBatch: (frames: readonly EventsFrame[]) => {
-      // Encode and size the whole batch BEFORE posting anything, then split it
-      // into chunks that each fit the 4 MiB transport cap. A batch that merely
-      // totals too much is split, never dropped; a DURABLE frame whose body alone
-      // exceeds the cap crosses as its blob-position reference (core already
-      // offloaded the body), and an advisory non-durable one is dropped with a
-      // warning so it cannot take the rest of the batch and its ack with it.
+      // Encode and size the whole batch BEFORE posting anything, then split it into chunks that each fit the
+      // 4 MiB transport cap.
       const chunks = encodeFrameChunks(frames, {
         onDrop: (frame, error) => {
           void options.bridge?.fork(
@@ -94,10 +79,8 @@ export function createEgressSender(options: EgressSenderOptions): EgressSender {
     },
     end: () => {
       if (coalescer.ended) return
-      // Flush pending deltas first, then post the RUN-END flush boundary: a
-      // zero-count ack after every durable frame. The hub's run barrier can wait
-      // for it to know the events port drained before the run reply (which
-      // crosses a different channel) is considered final.
+      // Flush pending deltas first, then post the RUN-END flush boundary: a zero-count ack after every
+      // durable frame.
       coalescer.flush()
       options.port.postMessage(encodeFrame(ackFrame({ count: 0 })))
       coalescer.end()

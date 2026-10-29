@@ -1,7 +1,4 @@
 // Typed repository errors.
-//
-// Every failure carries the table (and column/parent where relevant) so callers
-// never have to parse a SQL string or a generic "statement rejected" reason.
 
 import { Schema } from "effect"
 
@@ -83,6 +80,18 @@ export class TransactionScopeError extends Schema.TaggedErrorClass<TransactionSc
 ) {
   override get message() {
     return `worker repository does not expose transaction control: "${this.keyword}" is repository-scoped`
+  }
+}
+
+/** A repository transaction issued more statements than its budget allows. */
+export class StatementBudgetExceededError extends Schema.TaggedErrorClass<StatementBudgetExceededError>()(
+  "WorkerRepository.StatementBudgetExceededError",
+  {
+    limit: Schema.Number,
+  },
+) {
+  override get message() {
+    return `worker repository transaction exceeded its statement budget of ${this.limit}`
   }
 }
 

@@ -74,12 +74,7 @@ export interface DeltaSubscription {
   readonly healing: number
 }
 
-/**
- * The reported cursor before any position has been observed. Distinct from `0`,
- * which is a real first event. Internally the cursor is `undefined` (the unseen
- * sentinel) so a first observation SEEDS it instead of looking like a gap from
- * -1 — an existing aggregate's first observed sequence is often far above 0.
- */
+/** The reported cursor before any position has been observed. */
 export const UNSEEN_SEQUENCE = -1
 
 export function createDeltaSubscription(options: DeltaSubscriptionOptions): DeltaSubscription {
@@ -160,16 +155,13 @@ export function createDeltaSubscription(options: DeltaSubscriptionOptions): Delt
         return
       }
       lastDeltaSeq = seq
-      // The first observed delta SEEDS this subscription's local sequence. A
-      // subscription attached mid-stream must not read the whole durable log
-      // just because its first local sequence is not 0.
+      // The first observed delta SEEDS this subscription's local sequence.
       if (previous === undefined || seq === previous + 1) {
         options.onDelta(delta)
         return
       }
-      // The gapped frame is superseded by the snapshot; the cursor was already
-      // advanced so later contiguous deltas keep flowing. The durable cursor was
-      // already observed, so the heal range is empty: never re-read its history.
+      // The gapped frame is superseded by the snapshot; the cursor was already advanced so later contiguous
+      // deltas keep flowing.
       const cursor = lastDurableSeq ?? UNSEEN_SEQUENCE
       heal(cursor, cursor)
     },
@@ -188,10 +180,7 @@ export function createDeltaSubscription(options: DeltaSubscriptionOptions): Delt
         deliverDurable(durable)
         return
       }
-      // A missing durable is a lost cursor, not a droppable delta. Heal at
-      // `seq - 1` from the last observed commit so the snapshot reads only the
-      // skipped range `previous+1..seq-1`; the durable at `seq` itself is
-      // delivered below exactly once.
+      // A missing durable is a lost cursor, not a droppable delta.
       heal(seq - 1, previous)
       deliverDurable(durable)
     },
@@ -213,14 +202,10 @@ export function createDeltaSubscription(options: DeltaSubscriptionOptions): Delt
   }
 }
 
-// ---------------------------------------------------------------------------
-// Durable snapshot from the event log
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Durable snapshot from the event
+// log ---------------------------------------------------------------------------
 
-/**
- * The read seam a snapshot needs. `WorkerWriterClient.query` satisfies it, as
- * does a test double; the egress layer does not own the database connection.
- */
+/** The read seam a snapshot needs. */
 export type SnapshotQuery = (method: "all", sql: string, params: readonly unknown[]) => Promise<unknown>
 
 const SNAPSHOT_SQL =
@@ -247,12 +232,7 @@ function decodeData(value: unknown): unknown {
   }
 }
 
-/**
- * Build a snapshot reader over the durable `event` log. With no `after` cursor it
- * returns every event at or below the requested `(aggregate_id, seq)` cursor, in
- * commit order. With an `after` cursor it reads only the bounded missing range
- * `(after, seq]`, so healing a gap never scans the whole aggregate history.
- */
+/** Build a snapshot reader over the durable `event` log. */
 export function createEventLogSnapshotReader(query: SnapshotQuery): SnapshotReader {
   return async (aggregateID, seq, after) => {
     const aggregate = requireAggregateID(aggregateID)

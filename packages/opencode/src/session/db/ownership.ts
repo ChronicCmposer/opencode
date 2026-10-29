@@ -1,8 +1,4 @@
-// Table ownership split (D6).
-//
-// `WORKER_WRITABLE_TABLES` and `SCHEMA_TABLES` are generated from the shipped
-// schema (`script/migration-statements.ts`). Runtime classification is derived
-// from SQLite itself so the generated allowlist can be checked for drift.
+// Table ownership split.
 
 import { Schema } from "effect"
 
@@ -12,8 +8,8 @@ import { deriveSessionScopedTables, listSchemaTables, type SqliteQuery } from ".
 export { SCHEMA_TABLES, WORKER_WRITABLE_TABLES }
 
 /**
- * The durable log is written by the DurableLog, not by session-scoped DML, so it is not
- * part of the generated `session_id` allowlist. The DurableLog owns its access rule.
+ * The durable log is written by the DurableLog, not by session-scoped DML, so it is not part of the generated
+ * `session_id` allowlist.
  */
 export const DURABLE_LOG_TABLES: readonly string[] = Object.freeze(["event", "event_sequence", "event_blob"])
 
@@ -95,11 +91,7 @@ export function assertTableAllowlist(connection: SqliteQuery): void {
   }
 }
 
-/**
- * Boot/migration parity gate for the generated worker table set. Unlike the full
- * allowlist assertion this tolerates unrelated installer tables, but any drift in
- * the session-scoped (worker-writable) set is fatal.
- */
+/** Boot/migration parity gate for the generated worker table set. */
 export function assertWorkerTableParity(connection: SqliteQuery): void {
   const observed = deriveSessionScopedTables(connection)
   const sessionScoped = drift(WORKER_WRITABLE_TABLES, observed)
