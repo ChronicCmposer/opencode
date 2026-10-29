@@ -14,8 +14,8 @@ import { randomUUID } from "node:crypto"
 import { Schema } from "effect"
 import { Database, type SQLQueryBindings } from "bun:sqlite"
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue, type StatementSync } from "node:sqlite"
-import { resolveWorkerCacheSizeKib, walPragmas, type BusyRetryConfig } from "./pragmas"
-import { retryBusySync } from "./transaction"
+import { resolveWorkerCacheSizeKib, walPragmas } from "./pragmas"
+import { isBusySqlError } from "./busy"
 
 /** SQLite stays locked for this long before the sync driver reports busy. */
 export const WORKER_BUSY_TIMEOUT_MS = 250
@@ -23,15 +23,28 @@ export const WORKER_BUSY_TIMEOUT_MS = 250
 /**
  * Open-time busy budget. Switching a fresh handle to WAL needs a brief write
  * lock; a process that starts while a peer is checkpointing or migrating must
- * wait it out instead of failing boot with `SQLITE_BUSY`. The driver's own
- * `busy_timeout` is the only wait: the open path is synchronous and must never
- * park the thread, so the replays are immediate and the worst case is bounded
- * by `OPEN_BUSY_RETRIES * busy_timeout`.
+ * wait it out instead of failing boot with `SQLITE_BUSY`. The driver's
+ * `busy_timeout` covers most of the window; SQLite also reports busy without
+ * invoking the busy handler in some WAL states, so the replay backs off too.
+ * Opening happens at boot or on a worker thread, never on a hot path.
  */
-const OPEN_BUSY_RETRY: BusyRetryConfig = Object.freeze({ retries: 4, baseDelayMs: 0, maxDelayMs: 0 })
+export const OPEN_BUSY_RETRIES = 8
+const OPEN_BUSY_BASE_DELAY_MS = 20
+const OPEN_BUSY_MAX_DELAY_MS = 400
 
-function retryOpenWhileBusy<T>(open: () => T): T {
-  return retryBusySync(open, OPEN_BUSY_RETRY)
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+export function retryOpenWhileBusy<T>(open: () => T, sleep: (ms: number) => void = sleepSync): T {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return open()
+    } catch (error) {
+      if (!isBusySqlError(error) || attempt >= OPEN_BUSY_RETRIES) throw error
+      sleep(Math.min(OPEN_BUSY_BASE_DELAY_MS * 2 ** attempt, OPEN_BUSY_MAX_DELAY_MS))
+    }
+  }
 }
 
 export interface SqliteRuntime {

@@ -315,6 +315,8 @@ export interface EnsureSchemaAsyncOptions extends EnsureSchemaOptions {
   readonly renewIntervalMs?: number
   /** Test seam: fires when the gate is held by a peer and this call waits. */
   readonly onGateWait?: () => void
+  /** Refuses worker mode when the hub and worker SQLite drivers differ; tests substitute it. */
+  readonly assertDriverParity?: () => void
 }
 
 async function readIdentityAsync(executor: DbExecutor): Promise<SchemaIdentity> {
@@ -356,7 +358,8 @@ async function assertWorkerTableParityAsync(executor: DbExecutor): Promise<void>
 }
 
 export async function ensureProductionSchemaAsync(options: EnsureSchemaAsyncOptions): Promise<SchemaIdentity> {
-  assertSqliteDriverParity()
+  const assertDriverParity = options.assertDriverParity ?? assertSqliteDriverParity
+  assertDriverParity()
   const inMemory = options.filename === ":memory:"
   const expected = currentSchemaIdentity()
   const cacheKey = inMemory ? undefined : path.resolve(options.filename)

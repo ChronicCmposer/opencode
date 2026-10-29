@@ -571,7 +571,8 @@ export function awaitReplyWithLiveness(
 
 export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWorker {
   const { transport } = options
-  const runPromise = makeRunner()
+  const runnerScope = Scope.makeUnsafe()
+  const runPromise = makeRunner(runnerScope)
   const bridge = options.bridge
   const workKind = options.workKind ?? DEFAULT_WORK_KIND
   const waitOptions = options.timeoutMs === undefined ? undefined : { timeoutMs: options.timeoutMs }
@@ -691,6 +692,7 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
       // can destroy a realm still holding the WAL write lock/lease.
       await transport.close?.().catch(() => undefined)
       await transport.terminate()
+      await Effect.runPromise(Scope.close(runnerScope, Exit.void))
     },
   }
 }

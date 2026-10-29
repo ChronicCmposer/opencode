@@ -799,12 +799,15 @@ export function serveEventsPort(
     onResync: (payload) => sink.resync(payload),
     onAck: (payload) => {
       sink.ack(payload)
-      // The run-end flush ack: a rejected frame may have been the run's last durable, so read every seen aggregate up to the committed head.
-      if (!rejected || payload?.count !== 0 || sink.heal === undefined) return
+      if (payload?.count !== 0) return
+      // The run-end flush ack: a rejected frame may have been the run's last durable, so read every aggregate seen this run up to the committed head.
+      const seen = [...aggregates]
+      aggregates.clear()
+      if (!rejected || sink.heal === undefined) return
       rejected = false
       const heal = sink.heal
       void Promise.all(
-        [...aggregates].map((aggregateID) =>
+        seen.map((aggregateID) =>
           Promise.resolve(heal({ aggregateID, seq: Number.MAX_SAFE_INTEGER, inclusive: true })),
         ),
       ).catch(() => {})

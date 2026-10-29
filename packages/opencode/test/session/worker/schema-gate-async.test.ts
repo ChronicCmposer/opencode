@@ -7,7 +7,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { afterEach, describe, expect, test } from "bun:test"
-import { openConnection } from "@opencode-ai/core/database/connection"
+import { SqliteDriverMismatchError, openConnection } from "@opencode-ai/core/database/connection"
 import {
   SchemaGateLostError,
   acquireSchemaGate,
@@ -48,6 +48,21 @@ afterEach(() => {
 })
 
 describe("async executor schema gate", () => {
+  test("a driver mismatch refuses boot before the database is touched", async () => {
+    const filename = databasePath()
+
+    const boot = ensureProductionSchemaAsync({
+      filename,
+      liveWorkers: 0,
+      assertDriverParity: () => {
+        throw new SqliteDriverMismatchError({ detail: "version 3.51.0 (bun) vs 3.45.0 (node)" })
+      },
+    })
+
+    await expect(boot).rejects.toBeInstanceOf(SqliteDriverMismatchError)
+    expect(fs.existsSync(filename)).toBe(false)
+  })
+
   test("two callers on a fresh file produce one complete journal", async () => {
     const filename = databasePath()
 
