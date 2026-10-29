@@ -23,6 +23,7 @@ import {
   WorkerPluginNotSerializableError,
   buildSessionWorkerInit,
   resolveWorkerModel,
+  workerModelIncompatibility,
   resolveWorkerPlugins,
 } from "@/session/worker/init"
 import { createWorkerPluginHost } from "@/session/worker/plugin-host"
@@ -201,6 +202,59 @@ describe("resolveWorkerModel descriptor", () => {
     if (result._tag !== "Failure") return
     expect(result.failure).toBeInstanceOf(WorkerModelNotSerializableError)
     expect((result.failure as WorkerModelNotSerializableError).field).toBe("fetch")
+  })
+})
+
+describe("workerModelIncompatibility", () => {
+  const incompatibility = (input: ModelLayerInput = {}, auth?: Auth.Info) =>
+    Effect.runPromise(
+      workerModelIncompatibility({}).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            modelLayers(input),
+            ...(auth === undefined ? [] : [Layer.mock(Auth.Service, { get: () => Effect.succeed(auth) })]),
+          ),
+        ),
+      ),
+    )
+
+  test("accepts a serializable model on a supported SDK with an API key", async () => {
+    expect(await incompatibility()).toBeUndefined()
+  })
+
+  test("rejects provider options that carry a fetch function", async () => {
+    expect(await incompatibility({ providerOptions: { fetch: () => {} } })).toContain("fetch")
+  })
+
+  test("rejects an OAuth credential", async () => {
+    const oauth = new Auth.Oauth({ type: "oauth", refresh: "r", access: "a", expires: 0 })
+    expect(await incompatibility({}, oauth)).toContain("OAuth")
+  })
+
+  test("rejects an SDK package the worker cannot build", async () => {
+    const result = await Effect.runPromise(
+      workerModelIncompatibility({}).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            modelLayers(),
+            Layer.mock(Provider.Service, {
+              defaultModel: () =>
+                Effect.succeed({
+                  providerID: ProviderV2.ID.make(FIXTURE_PROVIDER),
+                  modelID: ModelV2.ID.make(FIXTURE_MODEL),
+                }),
+              getProvider: () => Effect.succeed(providerInfo),
+              getModel: () =>
+                Effect.succeed({
+                  ...fixtureModel,
+                  api: { ...fixtureModel.api, npm: "@ai-sdk/amazon-bedrock" },
+                } as unknown as Provider.Model),
+            }),
+          ),
+        ),
+      ),
+    )
+    expect(result).toContain("@ai-sdk/amazon-bedrock")
   })
 })
 

@@ -177,6 +177,8 @@ export interface SessionHub {
   cancelWithReport(sessionID: SessionID): Promise<CancelReport>
   cancelAll(): Promise<void>
   terminateAll(): Promise<void>
+  /** Why the session's model cannot run in a worker (`undefined` when it can). Runs in the caller's fiber. */
+  workerIncompatibility?(sessionID: SessionID): Effect.Effect<string | undefined>
 }
 
 export class SessionHubService extends Context.Service<SessionHubService, SessionHub>()("@opencode/SessionHub") {}
@@ -203,6 +205,8 @@ export interface SessionHubOptions {
   readonly onDispatch?: (sessionID: SessionID) => void
   /** Resolve a session's subagent depth (`metadata.depth`) for the dispatch path. */
   readonly depthOf?: (sessionID: SessionID) => number | undefined
+  /** Why a session's model cannot run in a worker, evaluated in the dispatching fiber. */
+  readonly workerIncompatibility?: (sessionID: SessionID) => Effect.Effect<string | undefined>
   readonly cancellation?: CancellationSource
   /** Release one retired generation's hub-owned resources (ports, pending asks bound to the worker, lease). */
   readonly onGenerationReleased?: (sessionID: SessionID, workerID?: number) => unknown
@@ -1399,6 +1403,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     releaseGeneration,
     lifecycle,
     barrier,
+    ...(options.workerIncompatibility === undefined ? {} : { workerIncompatibility: options.workerIncompatibility }),
     ensureRunningEffect: (sessionID, origin) =>
       Effect.gen(function* () {
         // Capture the caller's ambient context synchronously; awaiting first would resume outside this fiber and lose it.

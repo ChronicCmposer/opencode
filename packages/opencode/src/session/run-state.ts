@@ -80,6 +80,22 @@ export const layer = Layer.effect(
       }),
     )
 
+    // One mode per session: a session whose model a worker cannot serve (OAuth/fetch-bearing provider, unsupported SDK) runs in-process, and stays there.
+    const inProcessSessions = new Set<SessionID>()
+    const hubFor = Effect.fn("SessionRunState.hubFor")(function* (sessionID: SessionID) {
+      const hub = yield* hubIfEnabled
+      if (hub === undefined || inProcessSessions.has(sessionID)) return undefined
+      if (hub.workerIncompatibility === undefined) return hub
+      const reason = yield* hub.workerIncompatibility(sessionID)
+      if (reason === undefined) return hub
+      inProcessSessions.add(sessionID)
+      yield* Effect.logInfo("session runs in-process: model is not worker-compatible", { sessionID, reason })
+      return undefined
+    })
+    const hubIfRouted = Effect.fn("SessionRunState.hubIfRouted")(function* (sessionID: SessionID) {
+      return inProcessSessions.has(sessionID) ? undefined : yield* hubIfEnabled
+    })
+
     // The run-state machine is the portable `Runner` table shared with the
     // session worker (`session/worker/execute.ts`): flag off it lives here in
     // the hub, flag on it lives inside the worker isolate.
@@ -102,7 +118,7 @@ export const layer = Layer.effect(
     )
 
     const assertNotBusy = Effect.fn("SessionRunState.assertNotBusy")(function* (sessionID: SessionID) {
-      const hub = yield* hubIfEnabled
+      const hub = yield* hubIfRouted(sessionID)
       if (hub !== undefined) {
         // Fail closed: only the hub can prove a worker dead, and it reports that
         // as `false`. A probe that throws is not proof of idleness, so the
@@ -120,7 +136,7 @@ export const layer = Layer.effect(
     })
 
     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
-      const hub = yield* hubIfEnabled
+      const hub = yield* hubIfRouted(sessionID)
       if (hub !== undefined) {
         // The hub cancels the session; `SessionPrompt.cancel` has already walked
         // `Session.children` children-first, so this call only needs the
@@ -186,7 +202,7 @@ export const layer = Layer.effect(
       work: Effect.Effect<SessionV1.WithParts>,
       origin?: DispatchOrigin,
     ) {
-      const hub = yield* hubIfEnabled
+      const hub = yield* hubFor(sessionID)
       if (hub !== undefined) {
         // The hub exposes the run as an Effect, so its cancel/crash/control
         // failures arrive in the typed `RunError` channel directly (never as a
@@ -215,7 +231,7 @@ export const layer = Layer.effect(
       ready?: Latch.Latch,
       shell?: ShellInput,
     ) {
-      const hub = yield* hubIfEnabled
+      const hub = yield* hubFor(sessionID)
       if (hub !== undefined) {
         // The hub protocol carries the session id and the shell command: the
         // worker resolves the work by kind and owns the interrupt, so the
@@ -241,7 +257,7 @@ export const layer = Layer.effect(
     })
 
     const awaitBusy = Effect.fn("SessionRunState.awaitBusy")(function* (sessionID: SessionID) {
-      if ((yield* hubIfEnabled) !== undefined) return
+      if ((yield* hubIfRouted(sessionID)) !== undefined) return
       const { runners, busyLatches } = yield* InstanceState.get(state)
       if (runners.busy(sessionID)) return
       const latch = busyLatches.get(sessionID) ?? Deferred.makeUnsafe<void>()

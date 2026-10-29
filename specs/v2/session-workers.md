@@ -147,7 +147,7 @@ Run the repository-wide comment purge only after the re-baseline, as package-sco
 
 ### D25 — Flag and rollout
 
-There are two flag states: off and on. Startup validates configured plugins. Infrastructure failures are typed; there is no fallback. The kill switch affects new Sessions only; existing Sessions drain. Remove the flag one release after full parity is green. Keep the kill switch for two releases. Status exposes mode and disabled reason.
+There are two flag states: off and on. Startup validates configured plugins. Infrastructure failures are typed; there is no fallback. Model compatibility is not an infrastructure failure: at dispatch, a Session whose model a worker cannot serve (provider or model options containing functions, as OAuth and plugin loaders produce; an OAuth credential; an AI SDK package outside `session/worker/sdk-packages.ts`) runs in-process for its whole life, logged once at info. The kill switch affects new Sessions only; existing Sessions drain. Remove the flag one release after full parity is green. Keep the kill switch for two releases. Status exposes mode and disabled reason.
 
 ### D26 — Parity suite
 
