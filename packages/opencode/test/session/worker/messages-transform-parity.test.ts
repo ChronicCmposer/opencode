@@ -128,7 +128,7 @@ function hubProxyHost(): { host: WorkerPluginHost; dispose: () => void } {
   const bridge = hubProxyMessagesTransform(client)
   if (bridge === undefined) throw new Error("hub proxy client did not yield a messages transform bridge")
   return {
-    host: createWorkerPluginHost([], { messagesTransform: bridge }),
+    host: createWorkerPluginHost([{ name: "hub", hooks: {}, proxied: ["experimental.chat.messages.transform"] }], { messagesTransform: bridge }),
     dispose() {
       disposeServer()
       client.dispose()

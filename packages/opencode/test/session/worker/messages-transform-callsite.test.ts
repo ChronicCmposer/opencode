@@ -40,6 +40,8 @@ import { workerGraphReplacements } from "@/session/worker/session-worker"
 import { createE2EContext, memoizeWorkerLayer, type E2EContext, type MemoizedWorkerLayer } from "../../lib/e2e-context"
 import { pluginPassThroughReplacement } from "../../lib/worker-plugin-routes"
 import { startMockProvider, type MockProviderHandle } from "../../lib/mock-provider"
+
+const hubTransformPlugin = { name: "hub-transform", hooks: {}, proxied: ["experimental.chat.messages.transform"] }
 import { workerSnapshot } from "../../lib/snapshot"
 
 /** A sentinel the transform appends, proving the transformed array reached the model. */
@@ -77,7 +79,7 @@ function stampMarker(messages: MessageLike[]): void {
  * test prove the call site reconciled the returned array back into it.
  */
 function freshArrayHostCapturing(onMessages: (messages: MessageLike[]) => void = () => {}): WorkerPluginHost {
-  return createWorkerPluginHost([], {
+  return createWorkerPluginHost([hubTransformPlugin], {
     messagesTransform: async (_input, output) => {
       onMessages(output.messages as MessageLike[])
       const cloned = structuredClone(output.messages) as MessageLike[]

@@ -359,7 +359,7 @@ describe("messages.transform clone guard at the isolate boundary", () => {
     expect(hubProxyMessagesTransform(undefined)).toBeUndefined()
 
     const messagesTransform = hubProxyMessagesTransform(undefined)
-    const host = createWorkerPluginHost([], messagesTransform === undefined ? undefined : { messagesTransform })
+    const host = createWorkerPluginHost([{ name: "hub", hooks: {}, proxied: ["experimental.chat.messages.transform"] }], messagesTransform === undefined ? undefined : { messagesTransform })
     const output: MessagesTransformOutput = { messages: [{ role: "user", content: "base" }] }
 
     const result = await triggerMessagesTransform(
