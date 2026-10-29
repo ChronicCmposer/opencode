@@ -5,7 +5,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
 import { RuntimeFlags } from "@/effect/runtime-flags"
-import { Effect, Latch, Layer, Option, Schema, Scope, Context } from "effect"
+import { Deferred, Effect, Latch, Layer, Option, Schema, Scope, Context } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
 import type { DispatchOrigin } from "./origin"
@@ -38,6 +38,8 @@ export type RunError = SessionCancelledError | WorkerCrashedError | SessionRunFa
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
   readonly cancel: (sessionID: SessionID) => Effect.Effect<CancelOutcome | undefined>
+  /** Completes once the session's run is busy in the local run table. */
+  readonly awaitBusy: (sessionID: SessionID) => Effect.Effect<void>
   readonly ensureRunning: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
@@ -84,13 +86,18 @@ export const layer = Layer.effect(
     const state = yield* InstanceState.make(
       Effect.fn("SessionRunState.state")(function* () {
         const scope = yield* Scope.Scope
+        const busyLatches = new Map<SessionID, Deferred.Deferred<void>>()
         const runners = Runner.createRunnerTable<SessionID, SessionV1.WithParts>({
           scope,
           onIdle: (sessionID) => status.set(sessionID, { type: "idle" }),
-          onBusy: (sessionID) => status.set(sessionID, { type: "busy" }),
+          onBusy: (sessionID) => {
+            const latch = busyLatches.get(sessionID)
+            if (latch !== undefined) Deferred.doneUnsafe(latch, Effect.void)
+            return status.set(sessionID, { type: "busy" })
+          },
         })
         yield* Effect.addFinalizer(() => runners.cancelAll)
-        return runners
+        return { runners, busyLatches }
       }),
     )
 
@@ -108,7 +115,7 @@ export const layer = Layer.effect(
         if (busy) yield* busyError(sessionID)
         return
       }
-      const runners = yield* InstanceState.get(state)
+      const { runners } = yield* InstanceState.get(state)
       if (runners.busy(sessionID)) yield* busyError(sessionID)
     })
 
@@ -163,7 +170,7 @@ export const layer = Layer.effect(
         return report.outcome
       }
       yield* cancelBackgroundJobs(background, sessionID)
-      const runners = yield* InstanceState.get(state)
+      const { runners } = yield* InstanceState.get(state)
       if (!runners.busy(sessionID)) {
         yield* status.set(sessionID, { type: "idle" })
         return completedOutcome(sessionID)
@@ -197,7 +204,7 @@ export const layer = Layer.effect(
         if (Option.isNone(outcome)) return yield* onInterrupt
         return yield* parseSessionResult(outcome.value)
       }
-      const runners = yield* InstanceState.get(state)
+      const { runners } = yield* InstanceState.get(state)
       return yield* runners.ensureRunning(sessionID, work, onInterrupt)
     })
 
@@ -227,13 +234,24 @@ export const layer = Layer.effect(
         })
         return yield* settleHubRun(interruptibleHubRun(run, hub, sessionID, onInterrupt), onInterrupt)
       }
-      const runners = yield* InstanceState.get(state)
+      const { runners } = yield* InstanceState.get(state)
       return yield* runners
         .startShell(sessionID, work, ready, onInterrupt)
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
-    return Service.of({ assertNotBusy, cancel, ensureRunning, startShell })
+    const awaitBusy = Effect.fn("SessionRunState.awaitBusy")(function* (sessionID: SessionID) {
+      if ((yield* hubIfEnabled) !== undefined) return
+      const { runners, busyLatches } = yield* InstanceState.get(state)
+      if (runners.busy(sessionID)) return
+      const latch = busyLatches.get(sessionID) ?? Deferred.makeUnsafe<void>()
+      busyLatches.set(sessionID, latch)
+      yield* Deferred.await(latch).pipe(
+        Effect.ensuring(Effect.sync(() => busyLatches.get(sessionID) === latch && busyLatches.delete(sessionID))),
+      )
+    })
+
+    return Service.of({ assertNotBusy, cancel, ensureRunning, startShell, awaitBusy })
   }),
 )
 

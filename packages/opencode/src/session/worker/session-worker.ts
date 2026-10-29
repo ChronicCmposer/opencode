@@ -25,7 +25,7 @@
 
 import path from "node:path"
 import { threadId, workerData } from "node:worker_threads"
-import { Cause, Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Scope } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Scope } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { isRole, setProcessRole } from "@/effect/process-role"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -708,6 +708,11 @@ export function writerReadMessages(
     )
 }
 
+/** The executor control plus an Effect signal that the run table has marked the session busy. */
+export interface WorkerRunControl extends SessionRunControl {
+  readonly awaitBusy: (sessionID: SessionID) => Effect.Effect<void>
+}
+
 export interface SessionWorkOptions {
   /**
    * The worker-lifetime graph context. When present, every run provides these
@@ -752,7 +757,7 @@ export interface SessionWorkOptions {
    * so an executor cancel actually stops the loop (and `assertNotBusy` stops
    * lying). Pipeline-only graphs have no `SessionRunState`, so nothing registers.
    */
-  readonly registerControl?: (control: SessionRunControl) => void
+  readonly registerControl?: (control: WorkerRunControl) => void
   /**
    * Consume a cancel that arrived before the first graph build registered a
    * control. A pre-run cancel must not be lost: the run interrupts at its start
@@ -811,6 +816,7 @@ export function createSessionWork(options: SessionWorkOptions): SessionWork {
                   Effect.match({ onFailure: () => true, onSuccess: () => false }),
                 ),
               ),
+            awaitBusy: (id) => withInstance(runState.value.awaitBusy(id)),
           })
         }
       }
@@ -1568,14 +1574,14 @@ export function bootstrapSessionWorker(
 
     // The worker-local run control is registered once the first `run` resolves the
     // worker's `SessionRunState`; the executor proxy reads it live.
-    let control: SessionRunControl | undefined
+    let control: WorkerRunControl | undefined
     // A cancel can arrive while the first run is still building its graph, before
     // any control exists. Latch it here and let the run consume it at start (or
     // after the build). The latch is scoped to a run that is actually in flight:
     // an idle cancel must never interrupt the NEXT run (pipeline-only graphs
     // never register a control at all).
     const preRunCancels = new Set<SessionID>()
-    const activeRuns = new Set<SessionID>()
+    const activeRuns = new Map<SessionID, Deferred.Deferred<void>>()
     const sessionWork = createSessionWork({
       layer: runtime.layer,
       scope: workerScope,
@@ -1589,7 +1595,8 @@ export function bootstrapSessionWorker(
       consumePreRunCancel: (sessionID) => preRunCancels.delete(sessionID),
     })
     const work = productionWorkRegistry((sessionID, prompt, shell) => {
-      activeRuns.add(sessionID)
+      const ended = Deferred.makeUnsafe<void>()
+      activeRuns.set(sessionID, ended)
       return sessionWork(sessionID, prompt, shell).pipe(
         // A run's pre-run latch dies with the run: a cancel delivered after its
         // last consume point can never outlive it into the next turn.
@@ -1597,6 +1604,7 @@ export function bootstrapSessionWorker(
           Effect.sync(() => {
             activeRuns.delete(sessionID)
             preRunCancels.delete(sessionID)
+            Deferred.doneUnsafe(ended, Effect.void)
           }),
         ),
       )
@@ -1613,11 +1621,9 @@ export function bootstrapSessionWorker(
         cancel: (sessionID) => {
           const registered = control
           if (registered !== undefined) {
-            if (!activeRuns.has(sessionID)) return registered.cancel(sessionID)
-            // The run exists but may not be busy yet (its prompt is still being
-            // persisted): hold the cancel until the run table sees it, or the
-            // run ends first.
-            return WorkerRuntime.runPromise(cancelOnceBusy(registered, sessionID, activeRuns))
+            const ended = activeRuns.get(sessionID)
+            if (ended === undefined) return registered.cancel(sessionID)
+            return WorkerRuntime.runPromise(cancelOnceBusy(registered, sessionID, ended))
           }
           // No graph/control yet: latch the cancel only for a run that is
           // building. With no run in flight there is nothing to cancel, so the
@@ -1658,22 +1664,21 @@ export function bootstrapSessionWorker(
 }
 
 /**
- * Deliver a cancel to a run that has been admitted but is not yet busy in the
- * run table. Resolves once the cancel was delivered or the run is gone.
+ * Deliver a cancel to a run that is admitted but not yet busy in the run table
+ * (its prompt is still being persisted). Resolves once the cancel is delivered
+ * or the run ends first.
  */
 export const cancelOnceBusy = (
-  control: SessionRunControl,
+  control: WorkerRunControl,
   sessionID: SessionID,
-  activeRuns: ReadonlySet<SessionID>,
+  ended: Deferred.Deferred<void>,
 ): Effect.Effect<void> =>
   Effect.gen(function* () {
-    while (activeRuns.has(sessionID)) {
-      if (yield* Effect.promise(() => control.busy(sessionID))) {
-        yield* Effect.promise(() => control.cancel(sessionID))
-        return
-      }
-      yield* Effect.sleep(Duration.millis(10))
-    }
+    const busy = yield* Effect.raceFirst(
+      control.awaitBusy(sessionID).pipe(Effect.as(true)),
+      Deferred.await(ended).pipe(Effect.as(false)),
+    )
+    if (busy) yield* Effect.tryPromise(() => control.cancel(sessionID)).pipe(Effect.orDie)
   })
 
 /**
