@@ -61,7 +61,8 @@ export const ENVELOPE_HEADROOM_BYTES = 64 * 1024
 
 /**
  * Default DurableLog inline bound: one frame minus {@link ENVELOPE_HEADROOM_BYTES}. A payload at or below
- * this is stored inline AND always fits its frame.
+ * this is stored inline AND always fits its frame; a larger inline payload would be stored but too big to
+ * send, so the sender would have to drop it.
  */
 export const DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES = DEFAULT_BLOB_LIMIT_BYTES - ENVELOPE_HEADROOM_BYTES
 
@@ -226,7 +227,7 @@ export interface Interface {
   readonly transaction: <T>(work: (tx: Transaction) => T) => T
   /**
    * Async twin of {@link transaction}: the body stays synchronous/atomic, but a busy backoff yields to the
-   * event loop.
+   * event loop. Workers use this path so a held write lock never blocks cancel or streaming progress.
    */
   readonly transactionAsync: <T>(work: (tx: Transaction) => T) => Promise<T>
   /** Async twin of {@link publish} (worker path). */
@@ -528,7 +529,9 @@ export function workerOwnerID(workerID: string | number, pid: number = process.p
  */
 export function isDeadWorkerOwner(ownerID: string): boolean {
   const parts = ownerID.split("-")
-  if (parts[0] !== "worker" || parts.length < 8) return false
+  // Exactly nine segments: worker, id, pid, host scope, and the five-part uuid. Owners minted before the
+  // host scope was added have eight and are never judged dead; they wait for their TTL.
+  if (parts[0] !== "worker" || parts.length !== 9) return false
   if (parts[3] !== HOST_SCOPE) return false
   const pid = Number(parts[2])
   if (!Number.isSafeInteger(pid) || pid <= 0) return false

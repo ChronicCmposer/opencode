@@ -331,7 +331,7 @@ export function serveHubProxy(
         })
       }
     }
-    // Own-property guard: a bare lookup would resolve inherited `Object.prototype` members (`toString`, `valueOf`.
+    // Own-property guard: a bare lookup would resolve inherited `Object.prototype` members (`toString`, `valueOf`).
     const streamHandler = ownLookup(streaming, method)
     if (streamHandler !== undefined) {
       Promise.resolve()

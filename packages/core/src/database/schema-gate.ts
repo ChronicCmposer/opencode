@@ -256,6 +256,8 @@ export function startSchemaGateRenewal(
     try {
       renewSchemaGate(connection, token)
     } catch (cause) {
+      // Busy only means this tick could not write; the lease is still ours until it expires.
+      if (cause instanceof BusyExhaustedError && Date.now() < token.expiresAt) return
       stop()
       settleLost?.(
         cause instanceof SchemaGateLostError ? cause : new SchemaGateLostError({ cause }),

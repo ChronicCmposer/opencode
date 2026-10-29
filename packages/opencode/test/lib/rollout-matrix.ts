@@ -19,15 +19,12 @@ export function rolloutStateFromFlag(enabled: boolean): RolloutState {
   return enabled ? "on" : "off"
 }
 
-/** The status contract D25 requires: mode, disabled reason, and build identity. */
+/** The status contract D25 requires: mode, disabled reason, and protocol schema version. */
 export interface RolloutStatus {
   readonly mode: RolloutState
   /** Non-empty when `mode` is `off`; `null` when enabled. */
   readonly disabledReason: string | null
-  readonly buildHash: string
   readonly protocolSchemaVersion: number
-  readonly buildHashSource: "build" | "override" | "dev"
-  readonly override: boolean
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -43,55 +40,30 @@ function readString(value: unknown, label: string): string {
 export function parseRolloutStatus(value: unknown, path = "<rollout-status>"): RolloutStatus {
   if (!isRecord(value)) throw new Error(`${path} must be an object`)
   const mode = parseRolloutState(value.mode)
-  const buildHash = readString(value.buildHash, `${path}.buildHash`)
   const protocolSchemaVersion = value.protocolSchemaVersion
   if (typeof protocolSchemaVersion !== "number" || !Number.isInteger(protocolSchemaVersion) || protocolSchemaVersion < 0) {
     throw new Error(`${path}.protocolSchemaVersion must be a non-negative integer`)
   }
-  if (value.buildHashSource !== "build" && value.buildHashSource !== "override" && value.buildHashSource !== "dev") {
-    throw new Error(`${path}.buildHashSource must be "build", "override", or "dev"`)
-  }
-  if (typeof value.override !== "boolean") throw new Error(`${path}.override must be a boolean`)
 
   if (mode === "on") {
     if (value.disabledReason !== null) throw new Error(`${path}.disabledReason must be null when the mode is on`)
-    return {
-      mode,
-      disabledReason: null,
-      buildHash,
-      protocolSchemaVersion,
-      buildHashSource: value.buildHashSource,
-      override: value.override,
-    }
+    return { mode, disabledReason: null, protocolSchemaVersion }
   }
 
   const disabledReason = readString(value.disabledReason, `${path}.disabledReason`)
-  return {
-    mode,
-    disabledReason,
-    buildHash,
-    protocolSchemaVersion,
-    buildHashSource: value.buildHashSource,
-    override: value.override,
-  }
+  return { mode, disabledReason, protocolSchemaVersion }
 }
 
-/** Build the status projection at a boundary that already knows the build hash. */
+/** Build the status projection from the flag state. */
 export function createRolloutStatus(input: {
   readonly enabled: boolean
   readonly disabledReason?: string | null
-  readonly buildHash: string
   readonly protocolSchemaVersion: number
-  readonly buildHashSource: "build" | "override" | "dev"
-  readonly override: boolean
 }): RolloutStatus {
   return parseRolloutStatus({
     mode: rolloutStateFromFlag(input.enabled),
     disabledReason: input.enabled ? null : input.disabledReason,
-    buildHash: input.buildHash,
     protocolSchemaVersion: input.protocolSchemaVersion,
-    buildHashSource: input.buildHashSource,
-    override: input.override,
   })
 }
 
@@ -143,7 +115,7 @@ export function assertConfiguredHooksSupported(input: {
 }
 
 /** Infrastructure failures that must stay typed; there is no silent fallback. */
-export const ROLLOUT_INFRA_FAILURES = ["BuildMismatch", "SchemaMismatch", "BusyExhausted"] as const
+export const ROLLOUT_INFRA_FAILURES = ["SchemaMismatch", "BusyExhausted"] as const
 export type RolloutInfraFailure = (typeof ROLLOUT_INFRA_FAILURES)[number]
 
 /** Read the schema/Effect error tag without trusting the value shape. */

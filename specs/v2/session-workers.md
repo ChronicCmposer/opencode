@@ -147,7 +147,7 @@ Run the repository-wide comment purge only after the re-baseline, as package-sco
 
 ### D25 — Flag and rollout
 
-There are two flag states: off and on. Startup validates configured plugins. Infrastructure failures are typed; there is no fallback. The kill switch affects new Sessions only; existing Sessions drain. Remove the flag one release after full parity is green. Keep the kill switch for two releases. Status exposes mode, disabled reason, and build hash.
+There are two flag states: off and on. Startup validates configured plugins. Infrastructure failures are typed; there is no fallback. The kill switch affects new Sessions only; existing Sessions drain. Remove the flag one release after full parity is green. Keep the kill switch for two releases. Status exposes mode and disabled reason.
 
 ### D26 — Parity suite
 
@@ -195,7 +195,6 @@ Landed on the green baseline: layer/graph, dispatch/runtime, and test-infra. Arc
 | Cross-session leakage. | `test-infra` | Leakage suite across 8 concurrent Sessions. | Any cross-session row, event, or cache hit. |
 | Crash after commit duplicates effects. | `dispatch-lifecycle` | Phase matrix including commit-after-durable. | Any replayed side effect or reused dead worker. |
 | Schema gate race during spawn. | `writer-db` | Zero-live-worker migration test and `SchemaMismatch` test. | Worker starts against mixed schema. |
-| Build hash drift between hub and worker bundle. | `control-bus` | Mismatch test and status-reported hash. | Any silent fallback or unreported override. |
 | Hook route drift. | `plugin` | Source-derived 14-entry route test; startup fatal test. | New trigger without a route. |
 | Delta gap or resync storm. | `control-bus` | Resync count and bounded-queue overflow. | Resync loop or dropped durable event. |
 | Worker cap memory and spawn-gate queue growth. | `dispatch-lifecycle` | RSS at CPU-core cap; spawn-gate wait time. | OOM or unbounded waiter growth. |
@@ -212,7 +211,7 @@ Landed on the green baseline: layer/graph, dispatch/runtime, and test-infra. Arc
 6. **Transport.** JSON strings cross `postMessage`; Schema decodes once; the 4 MiB test passes; deltas resync without dropping durables; the 5-second run barrier times out without starting the next run.
 7. **Tools and plugins.** One tool routing point; broker and port/client/layer nodes are gone; MCP/LSP run on the hub; the 14-entry hook route table fails startup on configured unsupported hooks; permission/question state stays hub-owned.
 8. **Effect and structure.** Hub boundaries have an import-boundary test; changed modules expose `Foo.Service` and follow Effect naming; no new Promise service internals.
-9. **Rollout.** Two flag states only; kill switch drains existing Sessions and blocks new ones; status exposes mode, disabled reason, and build hash; flag removal waits one release after full parity green; kill switch remains two releases.
+9. **Rollout.** Two flag states only; kill switch drains existing Sessions and blocks new ones; status exposes mode and disabled reason; flag removal waits one release after full parity green; kill switch remains two releases.
 10. **Comments.** Purge only after re-baseline, in package-scoped comment-only commits, with this spec as the rationale; no `.parallel-implement` or plan references remain in source; 1% remains a guideline.
 
 ## Glossary

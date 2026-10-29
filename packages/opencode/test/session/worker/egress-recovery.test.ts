@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test"
 import { decodeFrame, encodeFrame } from "@/session/egress/frame"
 import type { LiveEvent, LiveEventPublisher } from "@/event-v2-bridge"
 import { createEgressDeliveryBarrier, createHubEventSink, serveEventsPort } from "@/session/worker/hub"
-import { blobPositionReferenceFrame, eventFrame, MAX_WORKER_FRAME_BYTES } from "@/session/worker/frame"
+import { ackFrame, blobPositionReferenceFrame, eventFrame, MAX_WORKER_FRAME_BYTES } from "@/session/worker/frame"
 import { flush, pollUntil, sid, withDeadline } from "../../lib/async"
 
 const AGGREGATE = "ses_recovery"
@@ -82,6 +82,46 @@ describe("egress recovery", () => {
       await pollUntil(() => published.length === 1, { message: "the unresolved durable was never healed" })
       expect(published[0]?.data).toEqual(body)
       await pollUntil(() => resyncs.length === 1, { message: "the worker was not asked to resend" })
+    } finally {
+      dispose()
+      channel.port1.close()
+      channel.port2.close()
+    }
+  })
+
+  test("a durable that lands while its oversized predecessor heals is not lost", async () => {
+    const { publisher, published } = recordingPublisher()
+    const body = { sessionID: AGGREGATE, text: "committed" }
+    const sink = createHubEventSink({
+      publisher,
+      readDurable: async (_aggregateID, after, upTo) =>
+        after < 1 && upTo >= 1 ? [{ seq: 1, event: { id: "evt_big", type: "session.message", properties: body } }] : [],
+    })
+    sink.event(
+      { id: "evt_2", type: "session.message", properties: { sessionID: AGGREGATE, seq: 2 } },
+      { durable: true, aggregateID: AGGREGATE, seq: 2 },
+    )
+    sink.resync({ aggregateID: AGGREGATE, seq: 1 })
+    await pollUntil(() => published.length === 2, { message: "the lost position was never published" })
+    expect(published.map((event) => event.data)).toContainEqual(body)
+  })
+
+  test("a rejected last durable is healed when the run-end ack arrives", async () => {
+    const { publisher, published } = recordingPublisher()
+    const sink = createHubEventSink({
+      publisher,
+      readDurable: async (_aggregateID, after) =>
+        after < 2
+          ? [{ seq: 2, event: { id: "evt_2", type: "session.message", properties: { sessionID: AGGREGATE, seq: 2 } } }]
+          : [],
+    })
+    const channel = new MessageChannel()
+    const dispose = serveEventsPort(channel.port1, sink, () => {})
+    try {
+      channel.port2.postMessage(durable(1))
+      channel.port2.postMessage("{not json")
+      channel.port2.postMessage(encodeFrame(ackFrame({ count: 0 })))
+      await pollUntil(() => published.length === 2, { message: "the rejected last durable was not healed" })
     } finally {
       dispose()
       channel.port1.close()

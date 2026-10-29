@@ -31,18 +31,15 @@ describe("rollout flag is two-state only", () => {
 })
 
 describe("status projection", () => {
-  test("build identity and mode are carried together", () => {
+  test("protocol version and mode are carried together", () => {
     const status = parseRolloutStatus(
       createRolloutStatus({
         enabled: false,
         disabledReason: "operator kill switch",
-        buildHash: "deadbeef",
         protocolSchemaVersion: 7,
-        buildHashSource: "build",
-        override: false,
       }),
     )
-    expect(status).toMatchObject({ mode: "off", disabledReason: "operator kill switch", buildHash: "deadbeef" })
+    expect(status).toMatchObject({ mode: "off", disabledReason: "operator kill switch", protocolSchemaVersion: 7 })
   })
 })
 
@@ -63,8 +60,7 @@ describe("kill-switch contract", () => {
 })
 
 describe("typed infrastructure failures", () => {
-  test("build mismatch and busy exhaustion do not collapse to a generic error", () => {
-    expect(isRolloutInfraFailure(Object.assign(new Error("mismatch"), { _tag: "BuildMismatch" }), "BuildMismatch")).toBe(true)
+  test("busy exhaustion does not collapse to a generic error", () => {
     expect(
       isRolloutInfraFailure(
         new BusyExhaustedError(5, new Error("locked")),

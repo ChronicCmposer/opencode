@@ -12,12 +12,7 @@ import {
   rolloutStateFromFlag,
 } from "./rollout-matrix"
 
-const build = {
-  buildHash: "abc123",
-  protocolSchemaVersion: 7,
-  buildHashSource: "build" as const,
-  override: false,
-}
+const build = { protocolSchemaVersion: 7 }
 
 describe("two-state rollout", () => {
   test("only off and on parse; a third state fails loud", () => {
@@ -29,9 +24,9 @@ describe("two-state rollout", () => {
     expect(() => parseRolloutState(undefined)).toThrow(/invalid rollout state/)
   })
 
-  test("the status projection carries mode, reason, and build identity", () => {
+  test("the status projection carries mode, reason, and protocol schema version", () => {
     const off = createRolloutStatus({ enabled: false, disabledReason: "kill switch", ...build })
-    expect(off).toMatchObject({ mode: "off", disabledReason: "kill switch", buildHash: "abc123" })
+    expect(off).toMatchObject({ mode: "off", disabledReason: "kill switch", protocolSchemaVersion: 7 })
 
     const on = createRolloutStatus({ enabled: true, disabledReason: "ignored", ...build })
     expect(on).toMatchObject({ mode: "on", disabledReason: null })
@@ -39,8 +34,8 @@ describe("two-state rollout", () => {
     expect(() => createRolloutStatus({ enabled: false, ...build })).toThrow(/disabledReason/)
     expect(() => createRolloutStatus({ enabled: true, disabledReason: "why", ...build })).not.toThrow()
     expect(() =>
-      parseRolloutStatus({ mode: "off", disabledReason: "x", ...build, buildHash: "" }),
-    ).toThrow(/buildHash/)
+      parseRolloutStatus({ mode: "off", disabledReason: "x", protocolSchemaVersion: -1 }),
+    ).toThrow(/protocolSchemaVersion/)
   })
 })
 
@@ -93,15 +88,14 @@ describe("startup plugin validation", () => {
 })
 
 describe("typed infrastructure failures", () => {
-  test("build mismatch and busy exhaustion stay typed", () => {
-    expect(isRolloutInfraFailure(Object.assign(new Error("mismatch"), { _tag: "BuildMismatch" }), "BuildMismatch")).toBe(true)
+  test("busy exhaustion stays typed", () => {
     expect(
       isRolloutInfraFailure(
         new BusyExhaustedError(5, new Error("locked")),
         "BusyExhausted",
       ),
     ).toBe(true)
-    expect(isRolloutInfraFailure(new Error("plain"), "BuildMismatch")).toBe(false)
+    expect(isRolloutInfraFailure(new Error("plain"), "BusyExhausted")).toBe(false)
   })
 
   test("schema mismatch is recognized by tag once the owner lands it", () => {

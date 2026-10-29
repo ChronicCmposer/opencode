@@ -696,8 +696,8 @@ function buildDispatcher(
 
   /**
    * Detach the controller a replaced generation used. An in-flight cancel keeps
-   * its controller until it settles (the successor run may be the one it is
-   * cancelling); later cancels get a fresh controller for the new generation.
+   * its controller until it settles, then the cancel path disposes it (the
+   * successor run may be the one it is cancelling); later cancels get a fresh controller for the new generation.
    */
   const detachController = (workerID: number): void => {
     const controller = controllers.get(workerID)
@@ -1777,6 +1777,7 @@ function buildDispatcher(
     }
 
     owned.phase = { ...owned.phase, cancelPending: true }
+    const controller = controllerFor(config, worker, port)
     let resolved: CancelOutcome = {
       sessionID,
       mode: "terminated",
@@ -1785,7 +1786,7 @@ function buildDispatcher(
       durationMs: 0,
     }
     try {
-      const outcome = await controllerFor(config, worker, port).cancel(sessionID, {
+      const outcome = await controller.cancel(sessionID, {
         complete: owned.completionPromise,
       })
       resolved =
@@ -1794,6 +1795,8 @@ function buildDispatcher(
           : outcome
       return resolved
     } finally {
+      // A controller detached mid-cancel is disposed once its last cancel settles.
+      if (controllers.get(worker.id) !== controller && controller.pending === 0) controller.dispose()
       owned.phase = { ...owned.phase, cancelPending: false }
       // The controller terminates/reaps on the forced path; a cooperative or
       // completed outcome keeps the worker. Only the captured run is released.

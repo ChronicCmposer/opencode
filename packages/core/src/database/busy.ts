@@ -153,18 +153,21 @@ function resolveRetryConfig(options: Partial<BusyRetryConfig>): BusyRetryConfig 
   }
 }
 
-/** Delay before retry number `failedAttempt` (1-based): doubling, capped at `maxDelayMs`. */
+/** Growth factor between busy retries; the default budget sleeps about 3.1s in total. */
+const BUSY_BACKOFF_FACTOR = 10
+
+/** Delay before retry number `failedAttempt` (1-based): tenfold growth, capped at `maxDelayMs`. */
 export function busyDelayMs(config: BusyRetryConfig, failedAttempt: number): number {
-  return Math.min(config.baseDelayMs * 2 ** (failedAttempt - 1), config.maxDelayMs)
+  return Math.min(config.baseDelayMs * BUSY_BACKOFF_FACTOR ** (failedAttempt - 1), config.maxDelayMs)
 }
 
 /**
- * The one busy-retry policy: doubling delays capped at `maxDelayMs`, at most
+ * The one busy-retry policy: tenfold-growing delays capped at `maxDelayMs`, at most
  * `retries` retries. Synchronous callers that cannot run a `Schedule` use the
  * same numbers through {@link busyDelayMs}.
  */
 export function busyRetrySchedule(config: BusyRetryConfig) {
-  return Schedule.exponential(config.baseDelayMs, 2).pipe(
+  return Schedule.exponential(config.baseDelayMs, BUSY_BACKOFF_FACTOR).pipe(
     Schedule.either(Schedule.spaced(config.maxDelayMs)),
     Schedule.both(Schedule.recurs(config.retries)),
   )

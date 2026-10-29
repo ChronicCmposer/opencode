@@ -542,7 +542,12 @@ export function createHubEventSink(options: HubEventSinkOptions): HubEventSink {
     resync(payload) {
       resyncs += 1
       if (readDurable !== undefined && payload?.aggregateID !== undefined && payload.seq !== undefined) {
-        void serializedHeal({ aggregateID: payload.aggregateID, seq: payload.seq, inclusive: true }).catch(() => {})
+        void serializedHeal({
+          aggregateID: payload.aggregateID,
+          seq: payload.seq,
+          after: payload.seq - 1,
+          inclusive: true,
+        }).catch(() => {})
       }
     },
     ack() {
@@ -709,6 +714,8 @@ export function serveEventsPort(
   bridge?: EffectBridge.Shape,
 ): () => void {
   let closed = false
+  const aggregates = new Set<string>()
+  let rejected = false
   /** Ask the worker to re-read its own log; a dead peer only loses the request. */
   const requestResync = (payload: DurableResyncPayload): void => {
     if (closed) return
@@ -723,6 +730,7 @@ export function serveEventsPort(
     meta: { readonly aggregateID: string; readonly seq: number } | undefined,
   ): void => {
     if (closed) return
+    if (meta !== undefined) aggregates.add(meta.aggregateID)
     sink.event(event, {
       durable: meta !== undefined,
       ...(meta === undefined ? {} : { aggregateID: meta.aggregateID, seq: meta.seq }),
@@ -784,11 +792,23 @@ export function serveEventsPort(
       }),
     onFrameRejected: (error) => {
       onError?.(error)
+      rejected = true
       requestResync({})
     },
     onEnd: () => sink.end(),
     onResync: (payload) => sink.resync(payload),
-    onAck: (payload) => sink.ack(payload),
+    onAck: (payload) => {
+      sink.ack(payload)
+      // The run-end flush ack: a rejected frame may have been the run's last durable, so read every seen aggregate up to the committed head.
+      if (!rejected || payload?.count !== 0 || sink.heal === undefined) return
+      rejected = false
+      const heal = sink.heal
+      void Promise.all(
+        [...aggregates].map((aggregateID) =>
+          Promise.resolve(heal({ aggregateID, seq: Number.MAX_SAFE_INTEGER, inclusive: true })),
+        ),
+      ).catch(() => {})
+    },
     ...(onError === undefined ? {} : { onError }),
   })
   // `createEgressPort` reports every fatal callback throw/defect or failing handler through `onError` (and `lastError`) exactly once before its program.

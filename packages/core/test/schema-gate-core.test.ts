@@ -16,6 +16,7 @@ import {
   openSchemaGate,
   releaseSchemaGate,
   renewSchemaGate,
+  startSchemaGateRenewal,
   schemaGateFilename,
   withSchemaGate,
 } from "../src/database/schema-gate"
@@ -267,6 +268,33 @@ describe("core database schema gate", () => {
     expect(lost.cause).toBe(cause)
     expect(lost).toBeInstanceOf(Error)
   })
+
+  test("renewal survives a transient busy failure while the lease is unexpired", async () => {
+    await using tmp = await tmpdir()
+    const gate = openSchemaGate(path.join(tmp.path, "busy-renew.sqlite"))
+    const token = newGateToken(10_000)
+    expect(acquireSchemaGate(gate, token)).toBe(true)
+    const before = token.expiresAt
+    let busyTicks = 2
+    const flaky: Pick<Connection, "run"> = {
+      run: (sql, params) => {
+        if (busyTicks > 0) {
+          busyTicks -= 1
+          throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" })
+        }
+        return gate.run(sql, params)
+      },
+    }
+    const renewal = startSchemaGateRenewal(flaky, token, 20)
+    try {
+      const outcome = await Promise.race([renewal.lost.then(() => "lost", () => "lost"), Bun.sleep(300).then(() => "held")])
+      expect(outcome).toBe("held")
+      expect(token.expiresAt).toBeGreaterThan(before)
+    } finally {
+      renewal.stop()
+      gate.close()
+    }
+  }, 10_000)
 
   test("a successful migration releases the lease", async () => {
     await using tmp = await tmpdir()

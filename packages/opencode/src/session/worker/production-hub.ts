@@ -1029,7 +1029,7 @@ export function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSess
   }
   // The session currently being dispatched.
   let dispatchedSession: SessionID | undefined
-  // Every dispatch records the session's own ambient instance/context BEFORE the pool materializes its worker (`onDispatch` runs synchronously at the top.
+  // Every dispatch records the session's own ambient instance/context BEFORE the pool materializes its worker (`onDispatch` runs synchronously at the top).
   const instanceOfSession = (sessionID: SessionID | undefined): InstanceContext | undefined =>
     sessionID === undefined ? undefined : instanceBySession.get(sessionID)
   const contextOfSession = (sessionID: SessionID | undefined): Context.Context<never> | undefined =>
@@ -1347,7 +1347,7 @@ export function productionSessionHubLayer(
         options.backends?.readDurable ?? createDurableHealReader({ query: (sql, params) => db.query(sql, params) })
       // The hub is assigned after the pool is built; the resolver's per-worker lookups run lazily on the first port attach (post-assignment).
       let hubRef: SessionHub | undefined
-      // The per-session resolvers (the session → instance/context registry, the live publishers.
+      // The per-session resolvers (the session → instance/context registry, the live publishers).
       const requestHooksViaHub =
         options.ports === undefined ||
         typeof options.ports === "function" ||

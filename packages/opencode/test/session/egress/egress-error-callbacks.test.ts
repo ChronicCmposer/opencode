@@ -43,6 +43,7 @@ describe("egress fatal callback reporting", () => {
       })
       expect(errors).toEqual([thrown])
       expect(receiver.lastError).toBe(thrown)
+      expect(channel.port1.onmessage).toBeNull()
       // The port is dead: later frames are neither delivered nor reported again.
       channel.port2.postMessage(eventText())
       await pollUntil(() => false, { timeoutMs: 20 }).catch(() => {})
@@ -70,6 +71,7 @@ describe("egress fatal callback reporting", () => {
       })
       expect(errors).toEqual([failure])
       expect(receiver.lastError).toBe(failure)
+      expect(channel.port1.onmessage).toBeNull()
     } finally {
       receiver.close()
       channel.port1.close()
@@ -96,6 +98,7 @@ describe("egress fatal callback reporting", () => {
       })
       expect(errors).toEqual([thrown])
       expect(receiver.lastError).toBe(thrown)
+      expect(channel.port1.onmessage).toBeNull()
     } finally {
       receiver.close()
       channel.port1.close()

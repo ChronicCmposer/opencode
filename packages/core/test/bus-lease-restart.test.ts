@@ -154,6 +154,12 @@ describe("DurableLog lease after a hub restart", () => {
     expect(DurableLog.isDeadWorkerOwner(owner(1, DEAD_PID))).toBe(true)
   })
 
+  test("a legacy owner without a host scope is never judged dead", () => {
+    const legacy = `worker-1-${DEAD_PID}-${crypto.randomUUID()}`
+    expect(legacy.split("-")).toHaveLength(8)
+    expect(DurableLog.isDeadWorkerOwner(legacy)).toBe(false)
+  })
+
   test("startup clears only dead-generation leases and keeps live fencing", () => {
     const database = open()
     const deadOwner = owner(1, DEAD_PID)

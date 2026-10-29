@@ -24,7 +24,7 @@ export interface TransactionConnection {
   exec(sql: string): void
 }
 
-/** Default budget (5 retries, 10ms doubling, capped at 1s). */
+/** Default budget (5 retries, 10ms growing tenfold, capped at 1s). */
 export const DEFAULT_BUSY_RETRY_CONFIG: BusyRetryConfig = Object.freeze({
   retries: 5,
   baseDelayMs: 10,

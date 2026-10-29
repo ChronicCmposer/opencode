@@ -12,7 +12,8 @@ import os from "node:os"
 import path from "node:path"
 import { Database as BunDatabase } from "bun:sqlite"
 import { afterEach, describe, expect, test } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Duration, Effect, Fiber, Layer } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import { SqlClient } from "effect/unstable/sql/SqlClient"
 import { layer as reactivityLayer } from "effect/unstable/reactivity/Reactivity"
 import { LockTimeoutError, SqlError } from "effect/unstable/sql/SqlError"
@@ -126,9 +127,32 @@ describe("withBusyRetry", () => {
     expect(attempts).toBe(3)
   })
 
-  test("backoff doubles and caps at maxDelayMs", () => {
-    const config = { retries: 5, baseDelayMs: 10, maxDelayMs: 25 }
-    expect([1, 2, 3, 4].map((failed) => busyDelayMs(config, failed))).toEqual([10, 20, 25, 25])
+  test("backoff grows tenfold and caps at maxDelayMs", () => {
+    const config = { retries: 5, baseDelayMs: 10, maxDelayMs: 1000 }
+    expect([1, 2, 3, 4].map((failed) => busyDelayMs(config, failed))).toEqual([10, 100, 1000, 1000])
+  })
+
+  test("the schedule waits the delays busyDelayMs reports, then exhausts", async () => {
+    const config = { retries: 5, baseDelayMs: 10, maxDelayMs: 1000 }
+    const times: number[] = []
+    const program = Effect.gen(function* () {
+      const fiber = yield* withBusyRetry(
+        Effect.gen(function* () {
+          times.push(yield* Effect.clockWith((clock) => clock.currentTimeMillis))
+          return yield* Effect.fail(busyFailure)
+        }),
+        config,
+      ).pipe(Effect.flip, Effect.forkChild)
+      yield* TestClock.adjust(Duration.seconds(10))
+      return yield* Fiber.join(fiber)
+    }).pipe(Effect.provide(TestClock.layer()))
+
+    const error = await Effect.runPromise(program)
+
+    expect(error).toBeInstanceOf(BusyExhaustedError)
+    const waits = times.slice(1).map((time, index) => time - times[index]!)
+    expect(waits).toEqual([1, 2, 3, 4, 5].map((failed) => busyDelayMs(config, failed)))
+    expect(waits.reduce((total, wait) => total + wait, 0)).toBe(3110)
   })
 
   test("exhausts with a typed BusyExhaustedError carrying attempts and last cause", async () => {

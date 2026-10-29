@@ -2058,6 +2058,50 @@ describe("retirement waits for a confirmed exit", () => {
   })
 })
 
+describe("a detached cancel controller", () => {
+  test("is disposed once its in-flight cancel settles", async () => {
+    const pool = createFakeWorkerPool(1, { onCancel: "ignore" })
+    let subscribed = 0
+    let unsubscribed = 0
+    const dispatcher = createDispatcher({
+      pool,
+      cancellation: {
+        portFor: (worker) => {
+          const port = (worker as FakeSessionWorker).cancelPort
+          return {
+            notify: (frame) => port.notify(frame),
+            onMessage: (handler) => {
+              subscribed += 1
+              const off = port.onMessage(handler)
+              return () => {
+                unsubscribed += 1
+                off()
+              }
+            },
+          }
+        },
+        graceMs: 500,
+        schedule: createTestScheduler().schedule,
+      },
+    })
+    const sessionID = sid("ses_detached_controller")
+    const root = capture(dispatcher.dispatch({ sessionID }))
+    await pollUntil(() => pool.spawned.length === 1, { message: "the run never started" })
+
+    const cancelling = dispatcher.cancelWithGrace(sessionID)
+    await pollUntil(() => subscribed === 1, { message: "the cancel controller was never created" })
+
+    await dispatcher.retireGeneration(sessionID, pool.spawned[0].id)
+    expect(unsubscribed).toBe(0)
+
+    pool.spawned[0].finish(sessionID)
+    await cancelling
+    await root
+    await pollUntil(() => unsubscribed === 1, { message: "the detached controller was never disposed" })
+    await dispatcher.terminateAll()
+  })
+})
+
 describe("retirement exit cannot park the successor", () => {
   test("a terminate that never settles yields to the bounded successor start", async () => {
     const worker = new FakeSessionWorker(1, { mode: "cooperative" })

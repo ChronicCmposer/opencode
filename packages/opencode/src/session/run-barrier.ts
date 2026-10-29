@@ -1,3 +1,10 @@
+// Per-Session run barrier.
+//
+// Delta acknowledgements are deliberately not part of it: deltas are advisory
+// and may be dropped, so they can never be a correctness barrier.
+//
+// Expiry leaves the Session `timed-out`, and the next run is refused until an
+// explicit `reset` or `abandon`; a live worker keeps the refusal.
 
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Context, Deferred, Effect, Layer, Schema } from "effect"

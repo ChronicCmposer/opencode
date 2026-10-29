@@ -347,6 +347,7 @@ function startWorkerThread(data: DbExecutorWorkerData): void {
           try {
             db.close()
           } catch {
+            // The handle may already be unusable.
           }
         }
         transport.postMessage({
@@ -427,6 +428,7 @@ const closeWorkerDatabase = (worker: Worker | undefined, id: number): Effect.Eff
     try {
       worker.postMessage({ type: "close", id } satisfies DbExecutorRequest)
     } catch {
+      // The worker is already gone, so no close reply will come; finish now.
       finish()
     }
     return Effect.sync(() => {

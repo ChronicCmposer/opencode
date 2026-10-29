@@ -230,7 +230,7 @@ export interface SessionExecutorOptions {
   readonly control?: SessionRunControl
   // Answers whether `sessionID` still owns work that must outlive an idle turn (a running process-local background job).
   readonly activeWork?: (sessionID: SessionID) => Promise<boolean>
-  // Run-start seam: called once with the run's `sessionID` (and its dispatch depth, observability only) after the work is resolved and before it runs (e.g.
+  // Run-start seam: called once with the run's `sessionID` (and its dispatch depth, observability only) after the work is resolved and before it runs.
   readonly onRunStart?: (sessionID: SessionID, depth: number) => void
   readonly run?: SessionEffectRunner
 }

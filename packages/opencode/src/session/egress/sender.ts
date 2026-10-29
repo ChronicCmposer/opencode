@@ -1,4 +1,9 @@
 // Worker-side egress sender over the events envelope (spec Q7/Q16).
+//
+// Events-port ack handshake (spec Q16): after a batch that carried durable
+// frames, the sender posts an `ack` frame whose `count` is the number of durable
+// hand-offs in that batch. The hub receiver surfaces it via `onAck`, so durable
+// progress is observable across the port rather than only implied by the events.
 
 import { Effect } from "effect"
 import type { EffectBridge } from "@/effect/bridge"
