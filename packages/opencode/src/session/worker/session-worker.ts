@@ -79,6 +79,7 @@ import {
   llmModelClientLayer,
   reducedLlmLayer,
   reducedModelProviderLayer,
+  snapshotProxyLayer,
   refreshablePluginTools,
   restoreHubProxyError,
   type HubProxyClient,
@@ -1053,6 +1054,7 @@ function directClients(): WorkerClients {
 export function workerGraphReplacements(
   config: WorkerModelConfig,
   reporter?: PidReporterInterface,
+  hubClient?: HubProxyClient,
 ): LayerNode.Replacements {
   // The reporting `AppProcess` replacement is a NODE (not a plain layer), so the
   // graph provides its `CrossSpawnSpawner` dependency; typed as `Replacements`
@@ -1061,7 +1063,7 @@ export function workerGraphReplacements(
     reporter === undefined ? [] : [[AppProcess.node, workerAppProcessNode(reporter)]]
   return [
     [Provider.node, reducedModelProviderLayer(config)],
-    [Snapshot.node, workerSnapshotBoundaryLayer()],
+    [Snapshot.node, hubClient === undefined ? workerSnapshotBoundaryLayer() : snapshotProxyLayer(hubClient)],
     ...appProcess,
   ]
 }
@@ -1552,10 +1554,10 @@ export function bootstrapSessionWorker(
       backgroundJob: backgroundJobLayer,
       // The worker serves exactly one serialized model, so the reduced provider is
       // the graph's provider (the real loop's `LLM` and `SessionPrompt` use it), and
-      // snapshot tracking is a fail-soft no-op (the isolate cannot run `git`). With
+      // snapshot calls run on the hub over hub-proxy. With
       // a control-port reporter, `AppProcess` is replaced by the reporting wrapper
       // so a mid-flight `rg` child's PGID reaches the hub mirror before terminate.
-      replacements: workerGraphReplacements(config, pidReporter),
+      replacements: workerGraphReplacements(config, pidReporter, hubProxies?.sessionStatus),
       // The worker-hosted plugin host reaches the graph's `LLM`/`Plugin` node too,
       // not just the `ModelClient` sealed below, so plugin-set sampling/headers
       // apply identically in both. Absent keeps the graph's no-op pass-through.

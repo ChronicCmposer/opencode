@@ -25,6 +25,8 @@ import { serveHubProxy } from "./hub-proxy-wire"
 import type { PluginToolDescriptor, PluginToolExecuteInput, PluginToolExecuteResult, PluginToolProgress, PluginToolProgressSink } from "./plugin-tool-wire"
 import { PluginToolNotSerializableError } from "./plugin-tool-wire"
 import { Session } from "@/session/session"
+import { MAX_WORKER_FRAME_BYTES } from "./frame"
+import type { Snapshot } from "@/snapshot"
 import { SessionPromptService } from "@/session/prompt-service"
 import { Truncate } from "@/tool/truncate"
 import { pluginToolJsonSchema } from "@/tool/registry"
@@ -83,6 +85,8 @@ export interface HubProxyAuthorities {
   readonly backgroundJob?: WorkerBackgroundJobAuthority
   /** MCP reads, served from the hub's MCP service in the worker's instance context. */
   readonly mcp?: McpHubAuthority
+  /** Hub-owned snapshot authority: git operations stay behind the hub's per-project locks. */
+  readonly snapshot?: Omit<Snapshot.Interface, "init" | "cleanup">
 }
 
 /** The hub-side MCP reads a worker may perform; every value is JSON. */
@@ -164,6 +168,34 @@ const promptAuthority = SessionPromptService.Service
 /** The descriptive rejection an absent plugin-tool authority returns (fail loud). */
 function missingPluginToolAuthority(what: string): Error {
   return new Error(`the hub has no "pluginTool" authority wired; cannot ${what}`)
+}
+
+const DIFF_FRAME_BUDGET = MAX_WORKER_FRAME_BYTES - 512 * 1024
+
+/** A worker reply is one capped frame: keep counts for every file but shed the largest patch bodies until it fits. */
+function fitDiffsToFrame(diffs: Snapshot.FileDiff[]): Snapshot.FileDiff[] {
+  const size = (items: Snapshot.FileDiff[]) => new TextEncoder().encode(JSON.stringify(items)).byteLength
+  if (size(diffs) <= DIFF_FRAME_BUDGET) return diffs
+  const out = [...diffs]
+  const bySize = out
+    .map((item, index) => ({ index, bytes: item.patch?.length ?? 0 }))
+    .sort((a, b) => b.bytes - a.bytes)
+  for (const { index } of bySize) {
+    const { patch: _patch, ...rest } = out[index]
+    out[index] = rest
+    if (size(out) <= DIFF_FRAME_BUDGET) break
+  }
+  return out
+}
+
+function snapshotCall<A>(
+  authorities: HubProxyAuthorities,
+  run: HubProxyRunner,
+  call: (snapshot: NonNullable<HubProxyAuthorities["snapshot"]>) => Effect.Effect<A>,
+): Promise<A> {
+  return authorities.snapshot === undefined
+    ? Promise.reject(new Error('the hub has no "snapshot" authority wired; cannot serve a snapshot call'))
+    : run(call(authorities.snapshot))
 }
 
 /** Build the hub-side handler map for the worker hub-proxy wire. */
@@ -252,6 +284,13 @@ export function buildHubProxyHandlers(authorities: HubProxyAuthorities, run: Hub
       }
       return authorities.discardReverted(request as DiscardRevertedRequest)
     },
+    "snapshot.track": () => snapshotCall(authorities, run, (snapshot) => snapshot.track()),
+    "snapshot.patch": (hash) => snapshotCall(authorities, run, (snapshot) => snapshot.patch(hash as string)),
+    "snapshot.restore": (hash) => snapshotCall(authorities, run, (snapshot) => snapshot.restore(hash as string)),
+    "snapshot.revert": (patches) => snapshotCall(authorities, run, (snapshot) => snapshot.revert(patches as Snapshot.Patch[])),
+    "snapshot.diff": (hash) => snapshotCall(authorities, run, (snapshot) => snapshot.diff(hash as string)),
+    "snapshot.diffFull": (from, to) =>
+      snapshotCall(authorities, run, (snapshot) => snapshot.diffFull(from as string, to as string)).then(fitDiffsToFrame),
   }
   return handlers
 }
@@ -1216,6 +1255,7 @@ export interface HubProxyAuthorityDeps extends SessionScopeAuthorityDeps {
   readonly discardReverted?: NonNullable<HubProxyAuthorities["discardReverted"]>
   readonly backgroundJob?: NonNullable<HubProxyAuthorities["backgroundJob"]>
   readonly mcp?: McpHubAuthority
+  readonly snapshot?: NonNullable<HubProxyAuthorities["snapshot"]>
 }
 
 /** The production authority map for one worker. */
@@ -1242,6 +1282,7 @@ export function hubProxyAuthoritiesFor(deps: HubProxyAuthorityDeps): HubProxyAut
       ? {}
       : { backgroundJob: deps.backgroundJob }),
     ...(deps.mcp === undefined ? {} : { mcp: deps.mcp }),
+    ...(deps.snapshot === undefined ? {} : { snapshot: deps.snapshot }),
     sessionSpawn: sessionSpawnFor(deps.boundSessionID, deps),
     sessionCreate: createSessionFor(deps.boundSessionID, deps.run),
     sessionGet: getSessionFor(deps.boundSessionID, deps.run),

@@ -47,6 +47,7 @@ import type { HubProxyHandlers, HubProxyStreamHandler } from "./hub-proxy-wire"
 import type { SessionWorkerInit } from "./session-worker"
 import { workerLogMessage, WorkerLogging } from "./worker-logging"
 import { Session } from "@/session/session"
+import { Snapshot } from "@/snapshot"
 import { recordAsync } from "@/session/ledger/crash"
 import { ensureProductionSchemaAsync } from "@/session/db/schema"
 
@@ -1109,6 +1110,13 @@ export function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSess
         }),
       )
     }
+  // Snapshot git work stays on the hub so it shares the per-project locks with in-process sessions.
+  const snapshotFor = (
+    context: Context.Context<never> | undefined,
+  ): NonNullable<HubProxyAuthorities["snapshot"]> | undefined => {
+    const snapshot = context === undefined ? Option.none() : Context.getOption(context, Snapshot.Service)
+    return Option.isNone(snapshot) ? undefined : snapshot.value
+  }
   // A worker's permission/question asks are bound to its generation: on retirement the session epoch advances and only the old epoch's asks fail.
   const generationScopedPermission = (
     inner: Permission.Interface,
@@ -1152,6 +1160,7 @@ export function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSess
       pluginToolAbort: (input) => pluginToolAborts.abort(input.sessionID, input.callID),
       discardReverted: discardRevertedFor(context),
       mcp: mcpAuthorityFor(runHubProxyFor(context)),
+      snapshot: snapshotFor(context),
       ...(boundSessionID === undefined
         ? {}
         : { backgroundJob: jobMirrors.authorityFor(runHubProxyFor(context), boundSessionID) }),
