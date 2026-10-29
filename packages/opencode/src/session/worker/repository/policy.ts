@@ -5,7 +5,7 @@
 // express: which tables the durable log owns, which hub tables a worker may
 // read, which carry secrets, and which columns are authority-bearing.
 
-/** Durable log tables written by the Bus/EventV2 path, never by scoped DML. */
+/** Durable log tables written by the DurableLog/EventV2 path, never by scoped DML. */
 export const DURABLE_LOG_TABLES: readonly string[] = Object.freeze(["event", "event_blob", "event_sequence"])
 
 /**

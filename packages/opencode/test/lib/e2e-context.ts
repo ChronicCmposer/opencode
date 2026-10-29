@@ -11,7 +11,7 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { Effect, Layer } from "effect"
+import { Effect, Layer, ManagedRuntime } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
@@ -87,14 +87,11 @@ export interface E2EContextOptions {
 
 /**
  * A fully wired, in-process "production worker" over a REAL per-worker WAL
- * connection. The graph's `Database.Service` is the worker database; a
- * worker-local writer handle exposes the direct query/transaction seam the
- * suites use to observe and pin the same connection.
- *
- * The `SessionProjector` node is included explicitly: `Session.updateMessage` /
- * `updatePart` publish durable events, and only the projector materializes the
- * `session`/`message`/`part` rows the session loop reads back. Without it the
- * loop commits events but cannot find its own messages.
+ * connection. The graph's `Database.Service` is the worker database; the
+ * worker-local writer handle publishes/reads over that same connection. There
+ * is no writer isolate, port, or RPC. It is the shared fixture for the
+ * session-worker / layer-session / prompt-sequential suites; the flag-ON ≡
+ * flag-OFF session parity harness lives in `./parity-session`.
  */
 export interface E2EContext extends AsyncDisposable {
   readonly connection: WorkerDatabase["connection"]
@@ -236,7 +233,14 @@ export function createE2EContext(options: E2EContextOptions): E2EContext {
   bootstrapWorkerDatabase(filename, snapshot.directory, snapshot.projectId ?? "e2e")
   const database = Effect.runSync(openWorkerDatabase({ filename }))
   const connection = database.connection
-  const writer = createWorkerDatabaseWriter({ workerID: 1, filename })
+  const writer = createWorkerDatabaseWriter({
+    workerID: 1,
+    filename: database.filename,
+    connection: database.connection,
+    queryConnection: database.strictConnection,
+    bus: database.bus,
+    eventBinding: database.eventBinding,
+  })
 
   const local = createLocalHubProxies()
   const hubProxies = hubProxiesFor(options.hubProxies, local)
@@ -271,6 +275,7 @@ export function createE2EContext(options: E2EContextOptions): E2EContext {
       writer,
       egress: options.egress ?? { emit: () => {}, emitDurable: () => {} },
       backgroundJob: { wait: async () => null, cancel: async () => {} },
+      database,
     },
     modelClient: llmModelClientLayer(modelConfig).pipe(
       Layer.provide(reducedLlmLayer(snapshot, modelConfig, hubProxies)),
@@ -298,12 +303,19 @@ export function createE2EContext(options: E2EContextOptions): E2EContext {
     project: parityProject("e2e"),
   }
 
+  // Build the graph ONCE and serve its context as a ready layer. A bare
+  // `Effect.provide(built.layer)` would rebuild the worker Database layer per
+  // call, running its close finalizer after each operation. The runtime owns
+  // that scope and is disposed by {@link E2EContext.dispose}.
+  const runtime = ManagedRuntime.make(built.layer)
+  const layer = Layer.succeedContext(Effect.runSync(runtime.contextEffect))
+
   let disposed = false
   const dispose = async (): Promise<void> => {
     if (disposed) return
     disposed = true
     writer.dispose()
-    Effect.runSync(database.close)
+    await runtime.dispose()
     local.dispose()
     fs.rmSync(databaseDirectory, { recursive: true, force: true })
   }
@@ -312,7 +324,7 @@ export function createE2EContext(options: E2EContextOptions): E2EContext {
     connection,
     database,
     writer,
-    layer: built.layer,
+    layer,
     instance,
     statusLog: local.statusLog,
     rows: (table) => {
@@ -354,6 +366,26 @@ export async function withTempDir<T>(
 export interface WorkerE2E {
   readonly context: E2EContext
   readonly directory: string
+}
+
+/** A worker layer whose scope is built once, plus the disposer that closes it. */
+export interface MemoizedWorkerLayer {
+  readonly layer: Layer.Layer<unknown, unknown>
+  dispose(): Promise<void>
+}
+
+/**
+ * Build `layer` once and serve its context as a ready layer, keeping its scope
+ * alive until `dispose()`. Tests that provide a bespoke worker layer more than
+ * once (seed, then run) must not let the per-worker Database finalizer run after
+ * the first `Effect.provide`.
+ */
+export function memoizeWorkerLayer(layer: Layer.Layer<unknown, unknown>): MemoizedWorkerLayer {
+  const runtime = ManagedRuntime.make(layer)
+  return {
+    layer: Layer.succeedContext(Effect.runSync(runtime.contextEffect)),
+    dispose: () => runtime.dispose(),
+  }
 }
 
 /** Options for {@link withWorkerE2E}; `snapshot` is derived from the directory. */

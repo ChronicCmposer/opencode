@@ -32,7 +32,7 @@ import {
   type WorkerSnapshot,
 } from "@/session/worker/layer"
 import { workerGraphReplacements } from "@/session/worker/session-worker"
-import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
+import { createE2EContext, memoizeWorkerLayer, type E2EContext, type MemoizedWorkerLayer } from "../../lib/e2e-context"
 import { pluginPassThroughReplacement } from "../../lib/worker-plugin-routes"
 import { startMockProvider, type MockProviderHandle } from "../../lib/mock-provider"
 import { workerSnapshot } from "../../lib/snapshot"
@@ -90,26 +90,30 @@ function dcpStubHost(): WorkerPluginHost {
   })
 }
 
-/** The full worker graph over the E2E writer, with the stub plugin host. */
+/** The full worker graph over the E2E worker database, with the stub plugin host. */
 function workerLayer(
   snapshot: WorkerSnapshot,
   provider: MockProviderHandle,
+  database: E2EContext["database"],
   writer: WriterClientHandle,
   plugins: WorkerPluginHost,
-): Layer.Layer<unknown, unknown> {
+): MemoizedWorkerLayer {
   const config = modelConfig(provider)
-  return buildSessionWorkerLayer({
-    snapshot,
-    env: { values: {} },
-    clients: {
-      writer,
-      egress: { emit: () => {}, emitDurable: () => {} },
-      backgroundJob: { wait: async () => null, cancel: async () => {} },
-    },
-    modelClient: llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(snapshot, config))),
-    plugins,
-    replacements: [...workerGraphReplacements(config), pluginPassThroughReplacement(plugins)],
-  }).layer
+  return memoizeWorkerLayer(
+    buildSessionWorkerLayer({
+      snapshot,
+      env: { values: {} },
+      clients: {
+        writer,
+        database,
+        egress: { emit: () => {}, emitDurable: () => {} },
+        backgroundJob: { wait: async () => null, cancel: async () => {} },
+      },
+      modelClient: llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(snapshot, config))),
+      plugins,
+      replacements: [...workerGraphReplacements(config), pluginPassThroughReplacement(plugins)],
+    }).layer,
+  )
 }
 
 /**
@@ -216,16 +220,16 @@ describe("DCP sentinel survives a worker prompt turn", () => {
     await withDirectory(async (snapshot) => {
       const provider = startMockProvider({ chunks: ["ok"] })
       const ctx = createE2EContext({ snapshot, modelConfig: modelConfig(provider) })
+      const worker = workerLayer(snapshot, provider, ctx.database, ctx.writer, dcpStubHost())
       try {
-        const layer = workerLayer(snapshot, provider, ctx.writer, dcpStubHost())
-        const sessionID = await Effect.runPromise(seed(layer, ctx.instance, snapshot.directory, provider.model))
+        const sessionID = await Effect.runPromise(seed(worker.layer, ctx.instance, snapshot.directory, provider.model))
         const persisted = await Effect.runPromise(
           Effect.gen(function* () {
             const prompt = yield* SessionPrompt.Service
             yield* prompt.loop({ sessionID })
             const sessions = yield* Session.Service
             return yield* sessions.messages({ sessionID })
-          }).pipe(Effect.provide(layer), Effect.provideService(InstanceRef, ctx.instance)),
+          }).pipe(Effect.provide(worker.layer), Effect.provideService(InstanceRef, ctx.instance)),
         )
 
         const bodies = turnBodies(provider)
@@ -237,6 +241,7 @@ describe("DCP sentinel survives a worker prompt turn", () => {
         // keeps the real tool output.
         expect(JSON.stringify(persisted)).toContain(OLD_OUTPUT)
       } finally {
+        await worker.dispose()
         await ctx.dispose()
         await provider.stop()
       }
@@ -247,9 +252,9 @@ describe("DCP sentinel survives a worker prompt turn", () => {
     await withDirectory(async (snapshot) => {
       const provider = startMockProvider({ chunks: ["summary"] })
       const ctx = createE2EContext({ snapshot, modelConfig: modelConfig(provider) })
+      const worker = workerLayer(snapshot, provider, ctx.database, ctx.writer, dcpStubHost())
       try {
-        const layer = workerLayer(snapshot, provider, ctx.writer, dcpStubHost())
-        const sessionID = await Effect.runPromise(seed(layer, ctx.instance, snapshot.directory, provider.model))
+        const sessionID = await Effect.runPromise(seed(worker.layer, ctx.instance, snapshot.directory, provider.model))
         await Effect.runPromise(
           Effect.gen(function* () {
             const sessions = yield* Session.Service
@@ -258,7 +263,7 @@ describe("DCP sentinel survives a worker prompt turn", () => {
             const parent = messages.findLast((message) => message.info.role === "user")
             if (parent === undefined) throw new Error("seed produced no user message")
             yield* compaction.process({ parentID: parent.info.id, messages, sessionID, auto: false })
-          }).pipe(Effect.provide(layer), Effect.provideService(InstanceRef, ctx.instance)),
+          }).pipe(Effect.provide(worker.layer), Effect.provideService(InstanceRef, ctx.instance)),
         )
 
         const bodies = turnBodies(provider)
@@ -267,6 +272,7 @@ describe("DCP sentinel survives a worker prompt turn", () => {
         expect(serialized).toContain(`[Tool result]: ${SENTINEL}`)
         expect(serialized).not.toContain(OLD_OUTPUT)
       } finally {
+        await worker.dispose()
         await ctx.dispose()
         await provider.stop()
       }

@@ -11,7 +11,6 @@ const MEBIBYTE = 1024 * 1024
 /** SQLite caps the WAL file to this many bytes after a checkpoint resets it. */
 export const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES = 64 * MEBIBYTE
 
-/** Cadence of the writer's idle truncating checkpoint. */
 export const DEFAULT_CHECKPOINT_INTERVAL_MS = 5 * 60 * 1000
 
 /**

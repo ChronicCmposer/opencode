@@ -29,7 +29,9 @@ import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionSummary } from "../../src/session/summary"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { provideTmpdirInstance } from "../fixture/fixture"
+import { InstanceBootstrap } from "@/project/bootstrap-service"
+import { InstanceStore } from "@/project/instance-store"
+import { provideInstance, tmpdirScoped } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -186,6 +188,14 @@ const hangingToolLLM = Layer.succeed(
   }),
 )
 
+// The instance store must resolve `Project` (and therefore the global project
+// row) through the SAME file database the session graph uses. Building it from
+// the shared `Database.node` replacement is what keeps `Project.fromDirectory`'s
+// upsert and the session insert on one connection; a separately compiled
+// fixture store would write the project row to the suite's default `:memory:`
+// database and the session insert would fail its foreign key.
+const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
+
 const root = LayerNode.group([
   SessionProcessor.node,
   Session.node,
@@ -195,12 +205,14 @@ const root = LayerNode.group([
   EventV2Bridge.node,
   SessionStatus.node,
   CrossSpawnSpawner.node,
+  InstanceStore.node,
 ])
 const env = LayerNode.compile(root, [
   [SessionSummary.node, summary],
   [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
   [LLM.node, hangingToolLLM],
   [Database.node, Database.layerFromPath(filename)],
+  [InstanceStore.bootstrapNode, noopBootstrap],
 ])
 
 const it = testEffect(env)
@@ -215,66 +227,76 @@ function runningToolPart(messageID: MessageID) {
   return findingToolPart(messageID).pipe(Effect.map((part) => (part?.state.status === "running" ? part : undefined)))
 }
 
-it.live(
-  "a blocked lifecycle report cannot hold the result transaction open",
-  () =>
-    provideTmpdirInstance(
-      (dir) =>
-        Effect.gen(function* () {
-          const processors = yield* SessionProcessor.Service
-          const session = yield* Session.Service
+it.live("a blocked lifecycle report cannot hold the result transaction open", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped({ config: cfg })
+    return yield* Effect.gen(function* () {
+      const processors = yield* SessionProcessor.Service
+      const session = yield* Session.Service
 
-          const chat = yield* session.create({})
-          const parent = yield* user(chat.id, "settlement deadlock")
-          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
-          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: testModel })
+      // Pin the shared-database wiring: `InstanceStore` already ran
+      // `Project.fromDirectory`, so its global project row must be readable in
+      // the same file the session graph writes to. A fixture store compiled
+      // against `Database.node`'s suite-default `:memory:` database would leave
+      // this file without a project row and the session insert would fail the
+      // `session.project_id -> project.id` foreign key.
+      const probe = openConnection({ filename })
+      try {
+        expect(probe.all<{ id: string }>("SELECT id FROM project WHERE id = ?", ["global"])).toHaveLength(1)
+      } finally {
+        probe.close()
+      }
 
-          const entered = yield* Deferred.make<void>()
-          const release = yield* Deferred.make<void>()
-          const outcomes: Array<"ok" | "error"> = []
+      const chat = yield* session.create({})
+      const parent = yield* user(chat.id, "settlement deadlock")
+      const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+      const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: testModel })
 
-          handle.registerToolSettlement?.(CALL_ID, (outcome, phase) => {
-            if (phase === "commit") return Effect.void
-            return Effect.gen(function* () {
-              outcomes.push(outcome)
-              yield* Deferred.succeed(entered, undefined)
-              yield* Deferred.await(release)
-            })
-          })
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const outcomes: Array<"ok" | "error"> = []
 
-          const process = yield* handle.process(streamInput(chat.id, parent, testModel)).pipe(Effect.forkChild)
-          yield* pollWithTimeout(runningToolPart(msg.id), "timed out waiting for the running tool part")
+      handle.registerToolSettlement?.(CALL_ID, (outcome, phase) => {
+        if (phase === "commit") return Effect.void
+        return Effect.gen(function* () {
+          outcomes.push(outcome)
+          yield* Deferred.succeed(entered, undefined)
+          yield* Deferred.await(release)
+        })
+      })
 
-          const settling = yield* handle
-            .completeToolCall(CALL_ID, { title: "ledger", metadata: {}, output: "done" })
-            .pipe(Effect.forkChild)
+      const process = yield* handle.process(streamInput(chat.id, parent, testModel)).pipe(Effect.forkChild)
+      yield* pollWithTimeout(runningToolPart(msg.id), "timed out waiting for the running tool part")
 
-          // The report is now blocked. Before the fix it is awaited inside
-          // `BEGIN IMMEDIATE`, so the writer lock is still held here.
-          yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"))
+      const settling = yield* handle
+        .completeToolCall(CALL_ID, { title: "ledger", metadata: {}, output: "done" })
+        .pipe(Effect.forkChild)
 
-          // Another writer must be able to take the write lock, which is only
-          // true if the result transaction committed before the report.
-          const other = openConnection({ filename, busyTimeoutMs: 100 })
-          const competing = yield* Effect.try({
-            try: () => {
-              other.exec("BEGIN IMMEDIATE")
-              other.exec("COMMIT")
-              return "committed"
-            },
-            catch: (error) => error,
-          }).pipe(Effect.timeout("2 seconds"), Effect.exit)
-          other.close()
-          expect(Exit.isSuccess(competing)).toBe(true)
+      // The report is now blocked. Before the fix it is awaited inside
+      // `BEGIN IMMEDIATE`, so the writer lock is still held here.
+      yield* Deferred.await(entered).pipe(Effect.timeout("5 seconds"))
 
-          yield* Deferred.succeed(release, undefined)
-          yield* Fiber.join(settling)
-          const part = yield* findingToolPart(msg.id)
-          expect(part?.state.status).toBe("completed")
-          expect(outcomes).toEqual(["ok"])
+      // Another writer must be able to take the write lock, which is only
+      // true if the result transaction committed before the report.
+      const other = openConnection({ filename, busyTimeoutMs: 100 })
+      const competing = yield* Effect.try({
+        try: () => {
+          other.exec("BEGIN IMMEDIATE")
+          other.exec("COMMIT")
+          return "committed"
+        },
+        catch: (error) => error,
+      }).pipe(Effect.timeout("2 seconds"), Effect.exit)
+      other.close()
+      expect(Exit.isSuccess(competing)).toBe(true)
 
-          yield* Fiber.interrupt(process)
-        }),
-      { config: cfg },
-    ),
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(settling)
+      const part = yield* findingToolPart(msg.id)
+      expect(part?.state.status).toBe("completed")
+      expect(outcomes).toEqual(["ok"])
+
+      yield* Fiber.interrupt(process)
+    }).pipe(provideInstance(dir))
+  }),
 )

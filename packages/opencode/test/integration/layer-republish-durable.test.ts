@@ -11,6 +11,7 @@
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
+import { durableLogStub } from "../lib/durable-log-stub"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionV1 } from "@opencode-ai/schema/session-v1"
 import { Latest } from "@/event-manifest"
@@ -19,7 +20,7 @@ import { republishDurableCommit } from "@/session/worker/layer"
 
 /** Publishing live-only never reads `db`, so a stub is enough to build the layer. */
 const databaseStub = Layer.succeed(Database.Service, { db: {} as never })
-const eventLayer = EventV2.layerWith().pipe(Layer.provide(databaseStub))
+const eventLayer = EventV2.layerWith().pipe(Layer.provide(durableLogStub), Layer.provide(databaseStub))
 
 /** A real durable event type: `durable.aggregate === "sessionID"`, version 1. */
 const DURABLE_TYPE = SessionV1.Event.MessageRemoved.type

@@ -9,7 +9,10 @@ import { describe, expect, test } from "bun:test"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { attachMeshWorker, createEgressMesh, type DurableCommit } from "@/session/egress/mesh"
 import { createWorkerEgressClient } from "@/session/worker/egress-client"
-import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
+import { Logger } from "effect"
+import type { EffectBridge } from "@/effect/bridge"
+import { workerLogMessage } from "@/session/worker/worker-logging"
+import { recordingBridge } from "../../lib/recorders"
 import { type EventsFrame, type EventV2Event, eventFrame } from "@/session/worker/frame"
 
 async function pollUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
@@ -254,8 +257,15 @@ interface RecordedLog {
   readonly fields: Record<string, unknown>
 }
 
-function recordingLogger(records: RecordedLog[]): WorkerLogger {
-  return (message, fields) => void records.push({ message, fields })
+function recordingLogger(records: RecordedLog[]): EffectBridge.Shape {
+  const sink = Logger.make<unknown, void>(({ message }) => {
+    const [head, fields] = Array.isArray(message) ? message : [message, undefined]
+    records.push({
+      message: typeof head === "string" ? head : String(head),
+      fields: typeof fields === "object" && fields !== null ? (fields as Record<string, unknown>) : {},
+    })
+  })
+  return recordingBridge(sink)
 }
 
 describe("worker egress client lifecycle logging", () => {
@@ -264,7 +274,7 @@ describe("worker egress client lifecycle logging", () => {
     const records: RecordedLog[] = []
     const client = createWorkerEgressClient(channel.port1, {
       maxBatch: 1,
-      log: recordingLogger(records),
+      bridge: recordingLogger(records),
       workerID: 9,
     })
 
@@ -277,7 +287,7 @@ describe("worker egress client lifecycle logging", () => {
   test("emits an INFO close line on dispose", () => {
     const channel = new MessageChannel()
     const records: RecordedLog[] = []
-    const client = createWorkerEgressClient(channel.port1, { log: recordingLogger(records), workerID: 9 })
+    const client = createWorkerEgressClient(channel.port1, { bridge: recordingLogger(records), workerID: 9 })
     client.dispose()
 
     expect(records.at(-1)).toEqual({
@@ -289,7 +299,7 @@ describe("worker egress client lifecycle logging", () => {
   test("omits workerID when the caller did not supply one", () => {
     const channel = new MessageChannel()
     const records: RecordedLog[] = []
-    const client = createWorkerEgressClient(channel.port1, { log: recordingLogger(records) })
+    const client = createWorkerEgressClient(channel.port1, { bridge: recordingLogger(records) })
 
     expect(records[0]?.fields).toEqual({ peer: "egress", level: "info" })
     client.dispose()
@@ -309,7 +319,7 @@ describe("worker egress client lifecycle logging", () => {
     expect(() =>
       createWorkerEgressClient(channel.port1, {
         controlPort: brokenControl,
-        log: recordingLogger(records),
+        bridge: recordingLogger(records),
         workerID: 9,
       }),
     ).toThrow("control closed")

@@ -4,7 +4,7 @@
 // surface under test: `openWorkerDatabase({ sessionID })` for the typed
 // repository/connection, `EventV2` + `SessionProjector` for the durable-event
 // path, the production hub authority map for the control port, and a real
-// `Bus` over a migrated file for the blob paths. No parser-only assertions and
+// `DurableLog` over a migrated file for the blob paths. No parser-only assertions and
 // no mocks of the exact boundary being verified.
 //
 // Cases covered:
@@ -26,7 +26,7 @@ import os from "node:os"
 import path from "node:path"
 import { afterEach, describe, expect, test } from "bun:test"
 import { Context, Effect, Exit, Layer, Schema, Scope } from "effect"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -709,7 +709,7 @@ function durableBus(
     ...(options.pragmas === undefined ? {} : { pragmas: options.pragmas }),
   })
   cleanups.push(() => connection.close())
-  const bus = Bus.create({
+  const bus = DurableLog.create({
     connection,
     ownerID: "wave3-bus",
     definitions: [Note],
@@ -749,7 +749,7 @@ describe("durable blob reads and rollback", () => {
       ]),
     ).toEqual([{ data: payload, file_path: null }])
 
-    const legacy = Bus.create({ connection, ownerID: "wave3-legacy", definitions: [Note], blobDir })
+    const legacy = DurableLog.create({ connection, ownerID: "wave3-legacy", definitions: [Note], blobDir })
     const events = legacy.read({ aggregateID: SESSION_A })
     expect(events).toHaveLength(1)
     expect(events[0]?.data).toEqual({ sessionID: SESSION_A, text })

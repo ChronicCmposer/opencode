@@ -15,19 +15,13 @@ import {
   UnsupportedFrameVersionError,
   ackFrame,
   assertJsonRepresentable,
-  createFramePrimitives,
   decodeWorkerFrame,
   durableMetaOf,
   encodeWorkerFrame,
   endFrame,
   eventFrame,
-  isRecord,
-  optionalBoolean,
-  optionalString,
   parseEventsFrame,
   parseWorkerFrame,
-  requireInteger,
-  requireString,
   resyncFrame,
   workerFrameByteLength,
   type EventsFrame,
@@ -221,42 +215,6 @@ describe("durableMetaOf", () => {
     expect(durableMetaOf(endFrame())).toBeUndefined()
     expect(durableMetaOf(ackFrame({ count: 1 }))).toBeUndefined()
     expect(durableMetaOf(resyncFrame({ pattern: "p" }))).toBeUndefined()
-  })
-})
-
-describe("shared primitive parsers", () => {
-  test("isRecord excludes null and arrays", () => {
-    expect(isRecord({ a: 1 })).toBe(true)
-    expect(isRecord(null)).toBe(false)
-    expect(isRecord([1, 2])).toBe(false)
-    expect(isRecord("x")).toBe(false)
-  })
-
-  test("requireString/requireInteger fail loud on the wrong shape", () => {
-    expect(requireString({ s: "ok" }, "s")).toBe("ok")
-    expect(() => requireString({ s: 1 }, "s")).toThrow(ProtocolError)
-    expect(requireInteger({ n: 3 }, "n")).toBe(3)
-    expect(() => requireInteger({ n: 3.5 }, "n")).toThrow(ProtocolError)
-    expect(() => requireInteger({ n: "3" }, "n")).toThrow(ProtocolError)
-  })
-
-  test("optionalString/optionalBoolean keep absence as undefined", () => {
-    expect(optionalString({}, "s")).toBeUndefined()
-    expect(optionalString({ s: "v" }, "s")).toBe("v")
-    expect(() => optionalString({ s: 1 }, "s")).toThrow(ProtocolError)
-    expect(optionalBoolean({}, "b")).toBeUndefined()
-    expect(optionalBoolean({ b: false }, "b")).toBe(false)
-    expect(() => optionalBoolean({ b: "true" }, "b")).toThrow(ProtocolError)
-  })
-
-  test("createFramePrimitives binds failures to the caller's own error taxonomy", () => {
-    class CustomError extends Error {}
-    const fail = (message: string): never => {
-      throw new CustomError(message)
-    }
-    const primitives = createFramePrimitives(fail)
-    expect(() => primitives.requireString({ s: 1 }, "s")).toThrow(CustomError)
-    expect(() => primitives.requireInteger({ n: 1.5 }, "n")).toThrow(CustomError)
   })
 })
 

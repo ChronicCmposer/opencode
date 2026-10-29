@@ -17,7 +17,7 @@ import * as Client from "effect/unstable/sql/SqlClient"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { Event } from "@opencode-ai/schema/event"
-import { Bus } from "../src/bus"
+import { DurableLog } from "../src/durable-log"
 import { Database as DatabaseService } from "../src/database/database"
 import { makeSqliteClient, type SqliteNativeRunner } from "../src/database/sqlite-adapter"
 import { EventV2 } from "../src/event"
@@ -91,6 +91,18 @@ function runnerFrom(native: Database): SqliteNativeRunner {
   }
 }
 
+function connectionFrom(native: Database): DurableLog.Connection {
+  return {
+    all: (sql, params = []) => native.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>,
+    run: (sql, params = []) => ({ changes: Number(native.query(sql).run(...(params as never[])).changes) }),
+    exec: (sql) => native.exec(sql),
+  }
+}
+
+function durableLogLayer(native: Database): Layer.Layer<DurableLog.Service> {
+  return DurableLog.layer({ connection: connectionFrom(native), ownerID: "event-v2-async-client-test" })
+}
+
 function databaseLayer(filename: string, client: Client.SqlClient): Layer.Layer<DatabaseService.Service> {
   return Layer.effect(
     DatabaseService.Service,
@@ -135,7 +147,7 @@ afterEach(() => {
 describe("EventV2 async acquisition client", () => {
   test("constructs the layer and offloads/reads an oversized durable payload", async () => {
     const database = open()
-    const text = `async:${"x".repeat(Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES)}`
+    const text = `async:${"x".repeat(DurableLog.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES)}`
     const result = await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
@@ -144,7 +156,9 @@ describe("EventV2 async acquisition client", () => {
             Effect.map((client) => Object.assign(client, { config: { filename: database.filename } })),
           )
           const eventLayer = EventV2.layerWith({ blobDir: database.blobDir }).pipe(
-            Layer.provideMerge(databaseLayer(database.filename, client)),
+            Layer.provideMerge(
+              Layer.merge(databaseLayer(database.filename, client), durableLogLayer(database.native)),
+            ),
           )
           const services = yield* duringAsyncAcquisition(client, Layer.build(eventLayer))
           const events = Context.get(services, EventV2.Service)

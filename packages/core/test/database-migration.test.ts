@@ -684,6 +684,65 @@ describe("DatabaseMigration", () => {
     )
   })
 
+  test("re-reads the journal inside each migration transaction and skips a peer-recorded id", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        let replayed = false
+        // The first migration simulates a peer that recorded a later id while
+        // this process was between its pre-read and the later transaction.
+        const seedsPeer = {
+          id: "tests_seed_peer",
+          up: (tx) => tx.run(sql`INSERT INTO migration (id, time_completed) VALUES ('tests_peer_recorded', 1)`),
+        } satisfies DatabaseMigration.Migration
+        const peerRecorded = {
+          id: "tests_peer_recorded",
+          up: () =>
+            Effect.sync(() => {
+              replayed = true
+            }),
+        } satisfies DatabaseMigration.Migration
+
+        yield* DatabaseMigration.applyOnly(db, [seedsPeer, peerRecorded])
+
+        expect(replayed).toBe(false)
+        expect(yield* db.all(sql`SELECT id FROM migration ORDER BY id`)).toEqual([
+          { id: "tests_peer_recorded" },
+          { id: "tests_seed_peer" },
+        ])
+      }),
+    )
+  })
+
+  test("applyBatched re-reads the journal inside the batch and skips a peer-recorded id", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        // A session table makes applyBatched take the incremental path; the
+        // journal already carries a row another process recorded.
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* db.run(sql`CREATE TABLE migration (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`)
+        yield* db.run(sql`INSERT INTO migration (id, time_completed) VALUES ('tests_peer_recorded', 1)`)
+
+        let replayed = false
+        const peerRecorded = {
+          id: "tests_peer_recorded",
+          up: () =>
+            Effect.sync(() => {
+              replayed = true
+            }),
+        } satisfies DatabaseMigration.Migration
+
+        yield* DatabaseMigration.applyBatched(db, [peerRecorded])
+
+        expect(replayed).toBe(false)
+        expect(yield* db.all(sql`SELECT id FROM migration ORDER BY id`)).toEqual([
+          { id: "tests_peer_recorded" },
+        ])
+      }),
+    )
+  })
+
   test("skips drizzle import when migration table already has state", async () => {
     await run(
       Effect.gen(function* () {

@@ -11,7 +11,7 @@ import { Database } from "bun:sqlite"
 import { Effect, Schema } from "effect"
 import { getTableConfig } from "drizzle-orm/sqlite-core"
 import { Event } from "@opencode-ai/schema/event"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { migrations } from "@opencode-ai/core/database/migration.gen"
 import { DEFAULT_WORKER_CACHE_SIZE_KIB } from "@opencode-ai/core/database/pragmas"
@@ -86,7 +86,7 @@ function workspace(): string {
   return directory
 }
 
-function connectionFrom(native: Database): Bus.Connection {
+function connectionFrom(native: Database): DurableLog.Connection {
   return {
     all: (sql, params = []) => native.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>,
     run: (sql, params = []) => ({ changes: Number(native.query(sql).run(...(params as never[])).changes) }),
@@ -171,8 +171,8 @@ function seedSession(filename: string, sessionID: string): void {
   }
 }
 
-function createBus(input: ReturnType<typeof open>, overrides: Partial<Bus.Options> = {}): Bus.Interface {
-  return Bus.create({
+function createBus(input: ReturnType<typeof open>, overrides: Partial<DurableLog.Options> = {}): DurableLog.Interface {
+  return DurableLog.create({
     connection: input.connection,
     ownerID: "gen-blob",
     definitions: [Note],
@@ -339,7 +339,7 @@ describe("blob-integrity: refcounted dedupe GC", () => {
   })
 })
 
-describe("blob-integrity: aggregate-scoped Bus", () => {
+describe("blob-integrity: aggregate-scoped DurableLog", () => {
   test("collectBlobs runs its retention query under the worker scope guard", async () => {
     const filename = migratedWorkerDatabase()
     seedSession(filename, "session-a")
@@ -403,7 +403,7 @@ describe("blob-integrity: hot path", () => {
   test("one read batches all blob rows into a single query", () => {
     const database = open()
     let blobQueries = 0
-    const counted: Bus.Connection = {
+    const counted: DurableLog.Connection = {
       all: (sql, params) => {
         if (sql.includes("FROM event_blob") && sql.includes("seq IN")) blobQueries += 1
         return database.connection.all(sql, params)
@@ -424,7 +424,7 @@ describe("blob-integrity: hot path", () => {
   test("blob files are staged before BEGIN IMMEDIATE", () => {
     const database = open()
     let stagedBeforeBegin = false
-    const observed: Bus.Connection = {
+    const observed: DurableLog.Connection = {
       all: (sql, params) => database.connection.all(sql, params),
       run: (sql, params) => database.connection.run(sql, params),
       exec: (sql) => {
@@ -446,22 +446,22 @@ describe("blob-integrity: frame-aligned inline bound", () => {
     // The schema bound may reach the cap, but the DEFAULT inline bound must
     // reserve the envelope: an inline row at the cap cannot fit its frame, and
     // would cross as a position reference with no event_blob row to resolve.
-    expect(Bus.DEFAULT_BLOB_LIMIT_BYTES).toBeLessThanOrEqual(MAX_WORKER_FRAME_BYTES)
-    expect(Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES).toBe(MAX_INLINE_EVENT_BYTES)
+    expect(DurableLog.DEFAULT_BLOB_LIMIT_BYTES).toBeLessThanOrEqual(MAX_WORKER_FRAME_BYTES)
+    expect(DurableLog.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES).toBe(MAX_INLINE_EVENT_BYTES)
     expect(MAX_INLINE_EVENT_BYTES).toBe(MAX_WORKER_FRAME_BYTES - ENVELOPE_HEADROOM_BYTES)
   })
 
   test("a payload just under 4 MiB is blob-referenced under the default bound", () => {
     const database = open()
-    const bus = Bus.create({
+    const bus = DurableLog.create({
       connection: database.connection,
       ownerID: "gen-inline-headroom",
       definitions: [Note],
       blobDir: database.blobDir,
     })
     const text = `headroom:${"x".repeat(4 * 1024 * 1024 - 1_024)}`
-    expect(Buffer.byteLength(JSON.stringify(note("s1", text)))).toBeGreaterThan(Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES)
-    expect(Buffer.byteLength(JSON.stringify(note("s1", text)))).toBeLessThanOrEqual(Bus.DEFAULT_BLOB_LIMIT_BYTES)
+    expect(Buffer.byteLength(JSON.stringify(note("s1", text)))).toBeGreaterThan(DurableLog.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES)
+    expect(Buffer.byteLength(JSON.stringify(note("s1", text)))).toBeLessThanOrEqual(DurableLog.DEFAULT_BLOB_LIMIT_BYTES)
 
     bus.publish([{ definition: Note, data: note("s1", text) }])
 
@@ -473,7 +473,7 @@ describe("blob-integrity: frame-aligned inline bound", () => {
 
   test("a 4-16 MiB event is blob-referenced instead of stored inline", () => {
     const database = open()
-    const bus = Bus.create({
+    const bus = DurableLog.create({
       connection: database.connection,
       ownerID: "gen-frame-bound",
       definitions: [Note],
@@ -539,7 +539,7 @@ describe("blob-integrity: blob directory source", () => {
     const second = open()
     const text = oversized("custom-file")
     const busFor = (database: ReturnType<typeof open>) =>
-      Bus.create({
+      DurableLog.create({
         connection: { ...database.connection, filename: database.filename },
         ownerID: "gen-custom-file",
         definitions: [Note],

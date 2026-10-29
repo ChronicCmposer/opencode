@@ -29,7 +29,9 @@ import {
   type SessionExecutorInbound,
   type SessionScheduler,
 } from "@/session/worker/execute"
-import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
+import { Logger } from "effect"
+import { workerLogMessage } from "@/session/worker/worker-logging"
+import { recordingBridge } from "../../lib/recorders"
 import { createWorkerHarness } from "../../lib/worker-harness"
 import { withFaults } from "../../lib/faults"
 import { capture, flush, pollUntil, sid } from "../../lib/async"
@@ -550,11 +552,11 @@ describe("Pending settlement is single-owner", () => {
 
   test("a write barrier that never settles is bounded and finalizes once", async () => {
     const pool = createFakeWorkerPool(1)
-    const { log, lines } = recordingLogger()
+    const { bridge, lines } = recordingLogger()
     const barrierCalls: SessionID[] = []
     const dispatcher = createDispatcher({
       pool,
-      log,
+      bridge,
       writeBarrierTimeoutMs: 25,
       writeBarrier: (sessionID) => {
         barrierCalls.push(sessionID)
@@ -607,12 +609,13 @@ describe("Pending settlement is single-owner", () => {
 
   test("a throwing write barrier timeout logger still resolves the run", async () => {
     const pool = createFakeWorkerPool(1)
-    const log: WorkerLogger = (message) => {
-      if (message === workerLogMessage("session write barrier timed out")) throw new Error("logger exploded")
-    }
+    const sink = Logger.make<unknown, void>(({ message }) => {
+      const [head] = Array.isArray(message) ? message : [message]
+      if (head === workerLogMessage("session write barrier timed out")) throw new Error("logger exploded")
+    })
     const dispatcher = createDispatcher({
       pool,
-      log,
+      bridge: recordingBridge(sink),
       writeBarrierTimeoutMs: 0,
       writeBarrier: () => new Promise<void>(() => {}),
     })
@@ -640,12 +643,13 @@ describe("Pending settlement is single-owner", () => {
     const onUncaught = (error: unknown) => uncaught.push(error)
     process.on("uncaughtException", onUncaught)
     try {
-      const log: WorkerLogger = (message) => {
-        if (message === workerLogMessage("session write barrier timed out")) throw new Error("logger exploded")
-      }
+      const sink = Logger.make<unknown, void>(({ message }) => {
+        const [head] = Array.isArray(message) ? message : [message]
+        if (head === workerLogMessage("session write barrier timed out")) throw new Error("logger exploded")
+      })
       const dispatcher = createDispatcher({
         pool,
-        log,
+        bridge: recordingBridge(sink),
         // Positive deadline: the diagnostic runs from the timer callback, so a
         // throw there must not surface as an uncaught host exception.
         writeBarrierTimeoutMs: 10,
@@ -1023,31 +1027,35 @@ describe("cancelWithGrace and reaping seams", () => {
 interface RecordedLog {
   readonly message: string
   readonly fields: Record<string, unknown>
+  readonly level: string
 }
 
-function recordingLogger(): { log: WorkerLogger; lines: RecordedLog[] } {
+function recordingLogger(): { bridge: ReturnType<typeof recordingBridge>; lines: RecordedLog[] } {
   const lines: RecordedLog[] = []
-  return {
-    log: (message, fields) => {
-      lines.push({ message, fields })
-    },
-    lines,
-  }
+  const sink = Logger.make<unknown, void>(({ logLevel, message }) => {
+    const [head, fields] = Array.isArray(message) ? message : [message, undefined]
+    lines.push({
+      message: typeof head === "string" ? head : String(head),
+      fields: typeof fields === "object" && fields !== null ? (fields as Record<string, unknown>) : {},
+      level: logLevel.toLowerCase(),
+    })
+  })
+  return { bridge: recordingBridge(sink), lines }
 }
 
 describe("dispatch observability logging", () => {
   test("session admitted (INFO) carries worker and depth", async () => {
     const pool = createFakeWorkerPool(1)
-    const { log, lines } = recordingLogger()
-    const dispatcher = createDispatcher({ pool, log })
+    const { bridge, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, bridge })
 
     const run = dispatcher.dispatch({ sessionID: sid("ses_1") })
     await flush()
 
     const admitted = lines.find((line) => line.message === workerLogMessage("session admitted"))
     expect(admitted).toBeDefined()
+    expect(admitted!.level).toBe("info")
     expect(admitted!.fields).toMatchObject({
-      level: "INFO",
       sessionID: "ses_1",
       workerID: pool.spawned[0].id,
       depth: 0,
@@ -1061,8 +1069,8 @@ describe("dispatch observability logging", () => {
 
   test("session completed (INFO) carries the worker and a non-negative duration", async () => {
     const pool = createFakeWorkerPool(1)
-    const { log, lines } = recordingLogger()
-    const dispatcher = createDispatcher({ pool, log })
+    const { bridge, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, bridge })
 
     const run = dispatcher.dispatch({ sessionID: sid("ses_1") })
     await flush()
@@ -1071,15 +1079,16 @@ describe("dispatch observability logging", () => {
 
     const done = lines.find((line) => line.message === workerLogMessage("session completed"))
     expect(done).toBeDefined()
-    expect(done!.fields).toMatchObject({ level: "INFO", sessionID: "ses_1", workerID: pool.spawned[0].id })
+    expect(done!.level).toBe("info")
+    expect(done!.fields).toMatchObject({ sessionID: "ses_1", workerID: pool.spawned[0].id })
     expect(typeof done!.fields.durationMs).toBe("number")
     await dispatcher.terminateAll()
   })
 
   test("waiter promoted (INFO) carries the remaining waiter depth", async () => {
     const pool = createFakeWorkerPool(1)
-    const { log, lines } = recordingLogger()
-    const dispatcher = createDispatcher({ pool, log })
+    const { bridge, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, bridge })
 
     const root = capture(dispatcher.dispatch({ sessionID: sid("ses_1") }))
     const waiter = capture(dispatcher.dispatch({ sessionID: sid("ses_1"), depth: 1 }))
@@ -1091,7 +1100,8 @@ describe("dispatch observability logging", () => {
 
     const promoted = lines.find((line) => line.message === workerLogMessage("waiter promoted"))
     expect(promoted).toBeDefined()
-    expect(promoted!.fields).toMatchObject({ level: "INFO", sessionID: "ses_1" })
+    expect(promoted!.level).toBe("info")
+    expect(promoted!.fields).toMatchObject({ sessionID: "ses_1" })
     expect(typeof promoted!.fields.waiterQueueDepth).toBe("number")
 
     await dispatcher.terminateAll()
@@ -1100,8 +1110,8 @@ describe("dispatch observability logging", () => {
 
   test("worker crashed (WARN) carries the crash", async () => {
     const pool = createFakeWorkerPool(1)
-    const { log, lines } = recordingLogger()
-    const dispatcher = createDispatcher({ pool, log })
+    const { bridge, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, bridge })
 
     const crashed = capture(dispatcher.dispatch({ sessionID: sid("ses_1") }))
     await flush()
@@ -1110,7 +1120,8 @@ describe("dispatch observability logging", () => {
 
     const line = lines.find((entry) => entry.message === workerLogMessage("worker crashed"))
     expect(line).toBeDefined()
-    expect(line!.fields).toMatchObject({ level: "WARN", sessionID: "ses_1" })
+    expect(line!.level).toBe("warn")
+    expect(line!.fields).toMatchObject({ sessionID: "ses_1" })
     expect(typeof line!.fields.workerID).toBe("number")
     await dispatcher.terminateAll()
   })
@@ -1118,8 +1129,8 @@ describe("dispatch observability logging", () => {
   test("session worker reaped (INFO) carries the idle window", async () => {
     const pool = createFakeWorkerPool(1)
     const scheduler = createTestScheduler()
-    const { log, lines } = recordingLogger()
-    const dispatcher = createDispatcher({ pool, log, schedule: scheduler.schedule, reapMs: 60_000 })
+    const { bridge, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, bridge, schedule: scheduler.schedule, reapMs: 60_000 })
 
     const parent = dispatcher.dispatch({ sessionID: sid("ses_parent") })
     await flush()
@@ -1135,7 +1146,8 @@ describe("dispatch observability logging", () => {
 
     const line = lines.find((entry) => entry.message === workerLogMessage("session worker reaped"))
     expect(line).toBeDefined()
-    expect(line!.fields).toMatchObject({ level: "INFO", idleMs: 60_000, sessionID: "ses_parent" })
+    expect(line!.level).toBe("info")
+    expect(line!.fields).toMatchObject({ idleMs: 60_000, sessionID: "ses_parent" })
     expect(typeof line!.fields.workerID).toBe("number")
     await dispatcher.terminateAll()
   })
@@ -1215,8 +1227,8 @@ describe("dispatch observability logging", () => {
 
   test("a plain session failure logs an ERROR 'worker run failed' line", async () => {
     const pool = createFakeWorkerPool(1)
-    const { log, lines } = recordingLogger()
-    const dispatcher = createDispatcher({ pool, log })
+    const { bridge, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, bridge })
 
     const failing = capture(dispatcher.dispatch({ sessionID: sid("ses_1") }))
     await flush()
@@ -1225,8 +1237,8 @@ describe("dispatch observability logging", () => {
 
     const line = lines.find((entry) => entry.message === workerLogMessage("worker run failed"))
     expect(line).toBeDefined()
+    expect(line!.level).toBe("error")
     expect(line!.fields).toMatchObject({
-      level: "ERROR",
       sessionID: "ses_1",
       workerID: pool.spawned[0].id,
     })
@@ -1237,10 +1249,10 @@ describe("dispatch observability logging", () => {
   test("cancelWithGrace emits 'cancel requested' with sessionID, workerID and graceMs", async () => {
     const pool = createFakeWorkerPool(1, { onCancel: "ignore" })
     const scheduler = createTestScheduler()
-    const { log, lines } = recordingLogger()
+    const { bridge, lines } = recordingLogger()
     const dispatcher = createDispatcher({
       pool,
-      log,
+      bridge,
       cancellation: {
         portFor: (worker) => (worker as FakeSessionWorker).cancelPort,
         graceMs: 750,
@@ -1372,8 +1384,8 @@ describe("prompt and shell plumbing", () => {
 describe("cancel claims the gate and drains waiters", () => {
   test("a running cancel reports a cancellation and logs no run failure", async () => {
     const pool = createFakeWorkerPool(1)
-    const { log, lines } = recordingLogger()
-    const dispatcher = createDispatcher({ pool, log })
+    const { bridge, lines } = recordingLogger()
+    const dispatcher = createDispatcher({ pool, bridge })
 
     const running = capture(dispatcher.dispatch({ sessionID: sid("ses_cancel") }))
     await flush()
@@ -1849,7 +1861,7 @@ describe("retirement waits for a confirmed exit", () => {
     const released: SessionID[] = []
     let spawnCount = 0
     const spawned: FakeSessionWorker[] = []
-    const { log, lines } = recordingLogger()
+    const { bridge, lines } = recordingLogger()
     const pool: WorkerPool = {
       spawn: (id) => {
         spawnCount += 1
@@ -1861,7 +1873,7 @@ describe("retirement waits for a confirmed exit", () => {
     }
     const dispatcher = createDispatcher({
       pool,
-      log,
+      bridge,
       terminateTimeoutMs: 1_000,
       onSessionReleased: async (sessionID) => {
         await releaseGate

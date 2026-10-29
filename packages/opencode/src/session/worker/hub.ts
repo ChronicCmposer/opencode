@@ -13,48 +13,61 @@
 // pool-spawning layer node (`makeSessionHubNode`) provides it and tears the pool
 // down with the layer scope.
 
-import { Context, Effect } from "effect"
+import { Context, Effect, Fiber } from "effect"
 import path from "node:path"
-import { InstanceRef } from "@/effect/instance-ref"
-import { SessionStatus } from "@/session/status"
-import { Permission } from "@/permission"
-import { Question } from "@/question"
+import { InstanceRef } from "../../effect/instance-ref"
+import { SessionStatus } from "../status"
+import { Permission } from "../../permission"
+import { Question } from "../../question"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { createEgressReceiver } from "@/session/egress/receiver"
-import { type DurableCommit } from "@/session/egress/mesh"
+import { createEgressPort } from "../egress/receiver"
+import { type DurableCommit } from "../egress/mesh"
 import { durableAggregateMetaOf, isEventBlobReference, type EventBlobPosition, type EventV2Event, type EventsAckPayload } from "./frame"
-import { encodeFrame, resyncWithPositionFrame, type DurableResyncPayload } from "@/session/egress/frame"
-import { type LiveEventPublisher } from "@/event-v2-bridge"
+import { encodeFrame, resyncWithPositionFrame, type DurableResyncPayload } from "../egress/frame"
+import { type LiveEventPublisher } from "../../event-v2-bridge"
 import type { EventV2 } from "@opencode-ai/core/event"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
-import { Bus, StateCache } from "@opencode-ai/core/bus"
-import type { SessionID } from "@/session/schema"
+import { DurableLog, StateCache } from "@opencode-ai/core/durable-log"
+import type { SessionID } from "../schema"
 import { type DbExecutor } from "./db-executor"
-import type { DispatchOrigin } from "@/session/origin"
-import { defined } from "@/util/object"
-import { createDispatcher, type CancellationConfig, type Dispatcher, type DispatcherOptions } from "./dispatch"
-import { createLifecycleTracker, type LifecycleTracker } from "@/session/ledger/lifecycle"
-import { decideAutoResume, type AutoResumeDecision, type IndeterminateCall } from "@/session/ledger/resume"
-import { RUN_BARRIER_TIMEOUT_MS, RunBarrierTimeout, createRunBarrier, type RunBarrier, type RunBarrierPhases, type RunBarrierPromotionOutcome, type RunBarrierRun } from "@/session/run-barrier"
+import type { DispatchOrigin } from "../origin"
+import { defined } from "../../util/object"
+import {
+  createDispatcher,
+  type CancellationConfig,
+  type CommitOutcome,
+  type Dispatcher,
+  type DispatcherOptions,
+} from "./dispatch"
+import { createLifecycleTracker, type LifecycleTracker } from "../ledger/lifecycle"
+import { decideAutoResume, type AutoResumeDecision, type IndeterminateCall } from "../ledger/resume"
+import {
+  RUN_BARRIER_TIMEOUT_MS,
+  RunBarrier,
+  RunBarrierTimeout,
+  type RunBarrierPromotionOutcome,
+  type RunBarrierRun,
+} from "../run-barrier"
 import { createSessionDispatch, type ExecutorWorkerPool, type SessionDispatch, type SessionExecutionResult } from "./execute"
 import { type CancelOutcome } from "./cancel"
 import { type PidRegistry, type PidReport } from "./pid-registry"
 import type { HubProxyHandlers, HubProxyStreamHandler } from "./hub-proxy-wire"
 import { serveHubProxy } from "./hub-proxy-wire"
 import { errorTagOf } from "./port"
-import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
-import { Session } from "@/session/session"
-import type { SessionPrompt } from "@/session/prompt"
-import type { ShellInput } from "@/session/prompt"
-import { isWorkerCrashPhase, recordAsync } from "@/session/ledger/crash"
+import type { EffectBridge } from "@/effect/bridge"
+import { workerLogMessage } from "./worker-logging"
+import { Session } from "../session"
+import type { SessionPrompt } from "../prompt"
+import type { ShellInput } from "../prompt"
+import { isWorkerCrashPhase, recordAsync } from "../ledger/crash"
 import { BuildMismatch, resolveBuildHash } from "./build-hash"
 
 import { createCancelReporter, type CancelReport } from "./cancel-report"
 import {
-  createWorkerPortRegistry,
+  makeAttachments,
+  type Attachments,
   type WorkerPortBackends,
   type WorkerPortBackendsSource,
-  type WorkerPortRegistry,
   type WorkerPorts as WorkerPortsInterface,
   type WorkerTransferredPorts,
 } from "./worker-ports"
@@ -163,7 +176,7 @@ export interface SessionHub {
    */
   readonly lifecycle: LifecycleTracker
   /** The per-session run barrier the next run waits on. */
-  readonly barrier: RunBarrier
+  readonly barrier: RunBarrier.Interface
   /**
    * The advisory hub cache. Never authoritative: the durable database and log
    * remain the only truth (D14). It is empty on construction (a restart starts
@@ -199,6 +212,11 @@ export interface SessionHub {
   releaseGeneration(sessionID: SessionID, workerID?: number): Promise<void>
   /** Dispatch `sessionID` to a worker and resolve with its result (admission-aware). */
   ensureRunning(sessionID: SessionID, origin?: DispatchOrigin): Promise<SessionExecutionResult>
+  /** Effect-native ensureRunning consumed by `SessionRunState`. */
+  ensureRunningEffect(
+    sessionID: SessionID,
+    origin?: DispatchOrigin,
+  ): Effect.Effect<SessionExecutionResult, unknown>
   /**
    * Dispatch a shell turn. `shell` is the serialized `ShellInput` the worker
    * replays through `SessionPrompt.shell`; absent keeps the plain startShell path.
@@ -275,8 +293,24 @@ export interface SessionHubOptions {
    */
   readonly depthOf?: (sessionID: SessionID) => number | undefined
   readonly cancellation?: CancellationSource
-  /** Release hub-side state for one retired generation (crash/reap/cancel/model switch). */
-  readonly onSessionReleased?: (sessionID: SessionID) => void
+  /**
+   * Release one retired generation's hub-owned resources (ports, pending asks
+   * bound to the worker, lease). It must never drop per-session state: a model
+   * switch replaces one generation while the session stays live.
+   */
+  readonly onGenerationReleased?: (sessionID: SessionID, workerID?: number) => unknown
+  /**
+   * Deadline for the retired generation's lease UPDATE only. The successor
+   * barrier never waits on this deadline: the epoch advance and exact-owner
+   * capture must land first, and a late conditional UPDATE can only touch the
+   * captured retired owner, never a successor's live lease.
+   */
+  readonly retiredLeaseReleaseTimeoutMs?: number
+  /**
+   * Release one session's hub-owned state when the session actually leaves the
+   * hub (reap, delete, explicit shutdown). Never called for a generation switch.
+   */
+  readonly onSessionReleased?: (sessionID: SessionID) => unknown
   /**
    * Idle-reap window forwarded to the dispatcher. Absent uses the dispatcher's
    * env/default resolution; tests inject a short window.
@@ -332,13 +366,12 @@ export interface SessionHubOptions {
    * fresh bounded tracker owned by this hub.
    */
   readonly lifecycle?: LifecycleTracker
-  /** The run barrier. Absent creates the production 5 s barrier. */
-  readonly barrier?: RunBarrier
   /**
-   * Caller-supplied barrier phases. A TEST SEAM only: production reports real
-   * observations to the barrier's run handle instead.
+   * The run barrier. Required: the production layer and test graphs supply the
+   * `RunBarrier` service so the hub observes the exact instance the graph owns.
+   * The hub never constructs a private one.
    */
-  readonly barrierPhases?: (sessionID: SessionID) => RunBarrierPhases
+  readonly barrier: RunBarrier.Interface
   /**
    * The background-promotion decision the hub observed for a session at run end.
    * The production layer derives it from its worker-job mirror; a hub with no
@@ -369,7 +402,7 @@ export interface SessionHubOptions {
    */
   readonly bootGate?: () => Promise<void>
   /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
-  readonly log?: WorkerLogger
+  readonly bridge?: EffectBridge.Shape
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +436,7 @@ export interface EventBlobResolverOptions {
    * main thread; tests pass a real connection adapter.
    */
   readonly query: (sql: string, params: ReadonlyArray<unknown>) => Promise<ReadonlyArray<Record<string, unknown>>>
-  /** `dirname(dbFile)/event-blobs`, shared with the worker Bus and EventV2. */
+  /** `dirname(dbFile)/event-blobs`, shared with the worker DurableLog and EventV2. */
   readonly blobDir: string
 }
 
@@ -421,28 +454,28 @@ function inlineEventDataOf(row: Record<string, unknown> | undefined): Record<str
   const decoded = typeof data === "string" ? JSON.parse(data) : data
   if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) return undefined
   const record = decoded as Record<string, unknown>
-  return Bus.isBlobReference(record) ? undefined : record
+  return DurableLog.isBlobReference(record) ? undefined : record
 }
 
 /**
  * Build the production body resolver: first the `event_blob` row by position,
- * decoded and hash/path-validated by the core Bus (the SQL comes from
- * `Bus.blobRowQuery`, the same query `Bus.loadBlobRows` issues). When no blob
+ * decoded and hash/path-validated by the core DurableLog (the SQL comes from
+ * `DurableLog.blobRowQuery`, the same query `DurableLog.loadBlobRows` issues). When no blob
  * row exists, the body was stored inline, so the committed `event.data` row is
  * the authority. A position with neither source is `undefined`.
  */
 export function createEventBlobResolver(options: EventBlobResolverOptions): EventBlobResolver {
-  const blob: Bus.BlobStore = {
+  const blob: DurableLog.BlobStore = {
     dir: options.blobDir,
-    limitBytes: Bus.DEFAULT_BLOB_LIMIT_BYTES,
+    limitBytes: DurableLog.DEFAULT_BLOB_LIMIT_BYTES,
     supportsTable: true,
   }
   return async (position, event) => {
-    const query = Bus.blobRowQuery(position.aggregateID, [position.seq])
+    const query = DurableLog.blobRowQuery(position.aggregateID, [position.seq])
     const rows = await options.query(query.sql, query.params)
-    const row = Bus.blobRowsBySeq(rows).get(position.seq)
+    const row = DurableLog.blobRowsBySeq(rows).get(position.seq)
     if (row !== undefined) {
-      return Bus.resolveBlobRow(
+      return DurableLog.resolveBlobRow(
         { type: event.type, aggregateID: position.aggregateID, seq: position.seq },
         row,
         blob,
@@ -614,12 +647,7 @@ export interface HubEventSink {
   readonly resolveBlob?: EventBlobResolver
 }
 
-/**
- * The live event plus the durable identity that committed in the worker. The
- * shared `LiveEvent` seam gains the field when the event bridge adopts it; the
- * cast keeps the hub half compiling and forwards the metadata instead of
- * dropping it on the floor.
- */
+/** The live event plus the durable identity that committed in the worker. */
 type DurableLiveEvent = Parameters<LiveEventPublisher["publish"]>[0] & {
   readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
 }
@@ -664,7 +692,7 @@ export function createHubEventSink(options: HubEventSinkOptions): HubEventSink {
     if (isEventBlobReference(properties)) {
       return options.resolveBlob?.(properties.__eventBlobPosition, { type: event.type })
     }
-    if (!Bus.isBlobReference(properties)) return properties
+    if (!DurableLog.isBlobReference(properties)) return properties
     return options.resolveBlob?.({ aggregateID, seq }, { type: event.type })
   }
 
@@ -793,7 +821,7 @@ export interface EgressDeliveryBarrier {
 export interface EgressDeliveryBarrierOptions {
   /** Bound on a missing ack; defaults to {@link DEFAULT_EGRESS_BARRIER_TIMEOUT_MS}. */
   readonly timeoutMs?: number
-  readonly log?: WorkerLogger
+  readonly bridge?: EffectBridge.Shape
 }
 
 export const DEFAULT_EGRESS_BARRIER_TIMEOUT_MS = 5_000
@@ -813,7 +841,7 @@ export function createEgressDeliveryBarrier(options: EgressDeliveryBarrierOption
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1) {
     throw new Error(`invalid egress barrier timeout: ${timeoutMs} (expected a positive integer)`)
   }
-  const log = options.log ?? noopWorkerLogger
+  const bridge = options.bridge
   const progress = new Map<SessionID, EgressProgress>()
 
   const progressOf = (sessionID: SessionID): EgressProgress => {
@@ -867,14 +895,15 @@ export function createEgressDeliveryBarrier(options: EgressDeliveryBarrierOption
         state.waiters.add(resolve)
         state.timer ??= setTimeout(() => {
           state.timer = undefined
-          log(workerLogMessage("durable egress ack missing"), {
-            level: "WARN",
-            sessionID,
-            outstanding: state.outstanding,
-            observed: state.observed,
-            acked: state.acked,
-            timeoutMs,
-          })
+          void bridge?.fork(
+            Effect.logWarning(workerLogMessage("durable egress ack missing"), {
+              sessionID,
+              outstanding: state.outstanding,
+              observed: state.observed,
+              acked: state.acked,
+              timeoutMs,
+            }),
+          )
           clear(state)
         }, timeoutMs)
       })
@@ -910,27 +939,9 @@ export function serveEventsPort(
   sink: HubEventSink,
   onError?: (error: Error) => void,
   onDurable?: (commit: DurableCommit) => void,
+  bridge?: EffectBridge.Shape,
 ): () => void {
   let closed = false
-  let tail: Promise<void> | undefined
-  /** Run `task` now when nothing is pending, else append it to the delivery chain. */
-  const ordered = (task: () => void | Promise<void>): void => {
-    if (tail === undefined) {
-      void task()
-      return
-    }
-    enqueue(task)
-  }
-  const enqueue = (task: () => void | Promise<void>): void => {
-    const next = (tail ?? Promise.resolve()).then(task).then(
-      () => undefined,
-      () => undefined,
-    )
-    tail = next
-    void next.then(() => {
-      if (tail === next) tail = undefined
-    })
-  }
   const deliver = (event: EventV2Event, meta: { readonly aggregateID: string; readonly seq: number } | undefined): void => {
     if (closed) return
     sink.event(event, {
@@ -940,33 +951,7 @@ export function serveEventsPort(
     if (meta === undefined || onDurable === undefined) return
     onDurable({ meta, event })
   }
-  const deliverReference = (
-    event: EventV2Event,
-    position: EventBlobPosition,
-    meta: { readonly aggregateID: string; readonly seq: number } | undefined,
-  ): void => {
-    const resolver = sink.resolveBlob
-    if (resolver === undefined) {
-      ordered(() => sink.resync({ aggregateID: position.aggregateID, seq: position.seq }))
-      return
-    }
-    enqueue(async () => {
-      let data: Record<string, unknown> | undefined
-      try {
-        data = await resolver(position, { type: event.type })
-      } catch {
-        // A missing/corrupt row is recoverable from the worker's DB snapshot.
-        data = undefined
-      }
-      if (data === undefined) {
-        sink.resync({ aggregateID: position.aggregateID, seq: position.seq })
-        return
-      }
-      deliver({ ...event, properties: data }, meta)
-    })
-  }
-  const receiver = createEgressReceiver({
-    port,
+  const connection = createEgressPort(port, {
     onFrame: (frame) => {
       if (frame.kind !== "event") return
       // The canonical durability test (present only when BOTH `aggregateID` and
@@ -974,23 +959,54 @@ export function serveEventsPort(
       // drift on exactly which frames are durable.
       const meta = durableAggregateMetaOf(frame)
       const event = frame.payload.event
-      if (isEventBlobReference(event.properties)) {
-        deliverReference(event, event.properties.__eventBlobPosition, meta)
+      if (!isEventBlobReference(event.properties)) {
+        deliver(event, meta)
         return
       }
-      ordered(() => deliver(event, meta))
+      // Resolve the oversized body BEFORE the live publisher or the mesh sees
+      // it. The returned Effect makes `Stream.runForEach` keep every later
+      // frame — including the batch's ack — queued behind the resolution.
+      const position = event.properties.__eventBlobPosition
+      const resolver = sink.resolveBlob
+      if (resolver === undefined) {
+        sink.resync({ aggregateID: position.aggregateID, seq: position.seq })
+        return
+      }
+      return Effect.gen(function* () {
+        const data = yield* Effect.tryPromise({
+          try: () => resolver(position, { type: event.type }),
+          catch: (error) => error,
+        }).pipe(Effect.catch(() => Effect.succeed(undefined)))
+        // A missing/corrupt row is recoverable from the worker's DB snapshot.
+        if (closed) return
+        if (data === undefined) {
+          sink.resync({ aggregateID: position.aggregateID, seq: position.seq })
+          return
+        }
+        deliver({ ...event, properties: data }, meta)
+      })
     },
     // A worker that skipped a durable sequence is healed from the committed log
     // (when the sink has a reader) and asked over the same bidirectional events
-    // port to re-read its own aggregate. Healing is awaited on the delivery chain
-    // so the gapped frame and the frames after it cannot overtake it.
-    onDurableGap: (got, last) => {
-      enqueue(async () => {
+    // port to re-read its own aggregate. Healing is awaited in the ordered
+    // stream so the gapped frame and the frames after it cannot overtake it.
+    onDurableGap: (got, last) =>
+      Effect.gen(function* () {
         if (closed) return
-        if (sink.heal !== undefined) {
-          await sink.heal({ aggregateID: got.aggregateID, seq: got.seq, after: last.seq })
-        } else {
+        const heal = sink.heal
+        if (heal === undefined) {
           sink.resync({ aggregateID: got.aggregateID, seq: got.seq })
+        } else {
+          const healed = yield* Effect.tryPromise({
+            try: () => Promise.resolve(heal({ aggregateID: got.aggregateID, seq: got.seq, after: last.seq })),
+            catch: (error) => error,
+          }).pipe(
+            Effect.as(true),
+            Effect.catch(() => Effect.succeed(false)),
+          )
+          // A failed heal leaves the resync request unsent, exactly as the old
+          // delivery chain did: the sink still records the gap via `heal`.
+          if (!healed) return
         }
         if (closed) return
         try {
@@ -999,17 +1015,48 @@ export function serveEventsPort(
           // The peer may already be gone; the sink counter still records the gap.
           onError?.(error instanceof Error ? error : new Error(String(error)))
         }
-      })
-    },
-    onEnd: () => ordered(() => sink.end()),
-    onResync: (payload) => ordered(() => sink.resync(payload)),
-    onAck: (payload) => ordered(() => sink.ack(payload)),
+      }),
+    onEnd: () => sink.end(),
+    onResync: (payload) => sink.resync(payload),
+    onAck: (payload) => sink.ack(payload),
     ...(onError === undefined ? {} : { onError }),
   })
+  // `createEgressPort` reports every fatal callback throw/defect or failing
+  // handler through `onError` (and `lastError`) exactly once before its program
+  // fails; the terminal catch only ends the hub's fork after that report.
+  const program = connection.program.pipe(Effect.catch(() => Effect.void))
+  // Share the hub's service runtime when it supplies one; direct callers/tests
+  // fork the identical program without an extra runtime per attach site.
+  const forked = forkEventsProgram(program, bridge)
   return () => {
     closed = true
-    receiver.close()
+    connection.close()
+    if (forked.owned) {
+      forked.fiber.interruptUnsafe()
+      return
+    }
+    void bridge?.promise(Fiber.interrupt(forked.fiber))
   }
+}
+
+/**
+ * Fork the long-lived events stream on the hub's bridge when it can host one.
+ * A synchronous-only bridge (the test recorders) throws from `fork`; the same
+ * program then runs on the default runtime so the port still works, which keeps
+ * the bridge seam production-only rather than a second attach-site runtime.
+ */
+function forkEventsProgram(
+  program: Effect.Effect<void, never>,
+  bridge: EffectBridge.Shape | undefined,
+): { readonly fiber: Fiber.Fiber<void, never>; readonly owned: boolean } {
+  if (bridge !== undefined) {
+    try {
+      return { fiber: bridge.fork(program), owned: false }
+    } catch {
+      // Fall through to the default runtime.
+    }
+  }
+  return { fiber: Effect.runFork(program), owned: true }
 }
 
 
@@ -1085,7 +1132,7 @@ export function boundedResumeDecision(
 }
 
 export function createSessionHub(options: SessionHubOptions): SessionHub {
-  const log = options.log ?? noopWorkerLogger
+  const bridge = options.bridge
   const cache = options.cache ?? new StateCache<unknown>()
   const db = options.db
   // Persist every typed crash through the hub's off-loop executor unless the
@@ -1099,40 +1146,43 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     const payload = workerCrashedFrom(error)
     if (payload === undefined) {
       if (errorTagOf(error) === "WorkerCrashedError") {
-        log(workerLogMessage("worker crash payload missing"), {
-          level: "ERROR",
-          sessionID,
-          expected: {
+        void bridge?.fork(
+          Effect.logError(workerLogMessage("worker crash payload missing"), {
             sessionID,
-            workerID: "number",
-            phase: WORKER_CRASH_PHASES.join(" | "),
-            lastCommittedMessageID: "string | null",
-            inFlightCallIDs: "readonly string[]",
-            retryable: false,
-            reason: "string",
-          },
-        })
+            expected: {
+              sessionID,
+              workerID: "number",
+              phase: WORKER_CRASH_PHASES.join(" | "),
+              lastCommittedMessageID: "string | null",
+              inFlightCallIDs: "readonly string[]",
+              retryable: false,
+              reason: "string",
+            },
+          }),
+        )
       }
       return
     }
-    log(workerLogMessage("worker crashed"), {
-      level: "ERROR",
-      sessionID: payload.sessionID,
-      workerID: payload.workerID,
-      phase: payload.phase,
-      retryable: payload.retryable,
-      reason: payload.reason,
-    })
+    void bridge?.fork(
+      Effect.logError(workerLogMessage("worker crashed"), {
+        sessionID: payload.sessionID,
+        workerID: payload.workerID,
+        phase: payload.phase,
+        retryable: payload.retryable,
+        reason: payload.reason,
+      }),
+    )
     if (onWorkerCrashed === undefined) return
     try {
       await onWorkerCrashed(payload)
     } catch (sinkError) {
       // Persistence failure must never replace the crash the caller observes.
-      log(workerLogMessage("worker crash persistence failed"), {
-        level: "ERROR",
-        sessionID: payload.sessionID,
-        error: sinkError instanceof Error ? sinkError.message : String(sinkError),
-      })
+      void bridge?.fork(
+        Effect.logError(workerLogMessage("worker crash persistence failed"), {
+          sessionID: payload.sessionID,
+          error: sinkError instanceof Error ? sinkError.message : String(sinkError),
+        }),
+      )
     }
   }
   // The port authorities are built on the first attach (never at construction):
@@ -1159,7 +1209,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   // Assigned once the pool exists; read lazily by the routing closures below.
   let dispatcher: Dispatcher
   // Assigned once the registry exists (below); read lazily by the attach thunks.
-  let ports: WorkerPortRegistry
+  let ports: Attachments
 
   // A pre-built service owns the port servers, but the hub still owns the
   // per-worker handler seams (they bind reports to the reporting worker's
@@ -1173,32 +1223,30 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     })
   }
 
+  // A pre-built service owns the servers; a direct hub builds the same
+  // attachments from the same implementation. Both are synchronous facades over
+  // the one authority, so no port call site runs an Effect by itself. Resolve
+  // the hub's backend bookkeeping on attach so teardown still disposes the one
+  // backend build the service actually used.
+  const serviceAttachments = portService?.attachments
   ports =
-    portService === undefined
-      ? createWorkerPortRegistry({
-          log,
+    serviceAttachments === undefined
+      ? makeAttachments({
+          ...(bridge === undefined ? {} : { bridge }),
           backends: portBackends,
           hubProxyHandlersFor,
           hubProxyStreamingFor,
           onPidReport: options.onPidReport,
         })
       : {
-          // The synchronous attach surface the pool sinks and SessionHub expose.
-          // Resolve the hub's backend memoization first so one build owns the
-          // backend resources and `terminateAll` still disposes them.
+          ...serviceAttachments,
           attachWorkerPorts: (workerID, transferred) => {
             portBackends()
-            return Effect.runSync(portService.attachWorkerPorts(workerID, transferred))
+            return serviceAttachments.attachWorkerPorts(workerID, transferred)
           },
           attachHubProxyPort: (workerID, port) => {
             portBackends()
-            return Effect.runSync(portService.attachHubProxyPort(workerID, port))
-          },
-          disposeWorker: (workerID) => {
-            Effect.runSync(portService.disposeWorker(workerID))
-          },
-          disposeAll: () => {
-            Effect.runSync(portService.disposeAll())
+            return serviceAttachments.attachHubProxyPort(workerID, port)
           },
         }
 
@@ -1285,7 +1333,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     childrenOf,
     events: options.events,
     ...defined({ eventPublisherFor: options.eventPublisherFor, onCancelRequested: options.onCancelRequested }),
-    log,
+    ...(bridge === undefined ? {} : { bridge }),
   })
   const baseOnCancelled = resolvedCancellation?.onCancelled
   const cancellation: CancellationConfig | undefined =
@@ -1302,15 +1350,18 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   const lifecycle = options.lifecycle ?? createLifecycleTracker()
   const resumeDecisionTimeoutMs = options.resumeDecisionTimeoutMs ?? DEFAULT_RESUME_DECISION_TIMEOUT_MS
   const awaitBootGate = options.bootGate ?? (() => Promise.resolve())
-  const barrier = options.barrier ?? createRunBarrier()
-  // A TEST SEAM only. Production omits it and reports observations to the
-  // per-run handle opened by `barrier.beginRun` below.
-  const barrierPhases = options.barrierPhases
+  const barrier = options.barrier
   const promotionOutcome =
     options.promotionOutcome ?? ((_sessionID: SessionID): RunBarrierPromotionOutcome => "no-job")
   // The report handle for each session's current run. A late report is rejected
   // by the barrier's epoch check, so a superseded run cannot settle its successor.
   const activeRuns = new Map<SessionID, RunBarrierRun>()
+  /**
+   * The authoritative commit outcome of each session's last finished run, set
+   * before its active-run record is deleted. The run's `done` reply and the
+   * barrier both read this one value (F11).
+   */
+  const commitOutcomes = new Map<SessionID, CommitOutcome>()
 
   /**
    * The dispatcher holds a completed run's slot until the barrier observes all
@@ -1320,25 +1371,33 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
    * actually observed. A phase with no report keeps the barrier closed until its
    * typed timeout; cancel still wins.
    */
-  const runBarrier = async (sessionID: SessionID): Promise<void> => {
+  const runBarrier = async (sessionID: SessionID, carried?: CommitOutcome): Promise<void> => {
     await options.writeBarrier?.(sessionID)
     const run = activeRuns.get(sessionID)
+    // The worker's `done` reply carries the commit outcome, so a lost
+    // best-effort control report no longer looks like "nothing committed".
+    let committed: string | null = carried?.committed ?? null
     if (run !== undefined) {
       // A run that observed no tool call is settled explicitly. A started call
       // that never finished is NOT settled: the missing report times the barrier
       // out instead of letting the next run overtake it.
       if (run.missing().includes("tools") && lifecycle.indeterminate(sessionID).length === 0) run.noTools()
-      // A run can end without a durable commit: a shell turn, a loop that exits
-      // before its first model step, or a compaction stop. The commit-side
-      // phases are settled as an explicit `none` (never a fabricated commit), so
-      // the next run is admitted instead of waiting out the 5 s bound and then
-      // refusing every prompt until the idle reaper retires the worker.
-      if (run.missing().includes("commits")) run.noCommit()
+      const observed = run.commitOutcome()
+      if (observed !== undefined) committed = observed.committed
+      // The commit-side phases settle from the carried outcome. Only a run that
+      // truly committed nothing is reported as an explicit `none`; a commit that
+      // arrived in `done` after the events frames still settles as a commit.
+      if (run.missing().includes("commits")) {
+        if (committed === null) run.noCommit()
+        else run.commit(committed)
+      }
       run.promotion(promotionOutcome(sessionID))
     }
+    // Read the authoritative outcome BEFORE deleting the active-run record; the
+    // run `done` reply returns exactly this value.
+    commitOutcomes.set(sessionID, { committed })
     try {
-      if (barrierPhases === undefined) await barrier.wait(sessionID)
-      else await barrier.wait(sessionID, barrierPhases(sessionID))
+      await Effect.runPromise(barrier.wait(sessionID))
     } finally {
       activeRuns.delete(sessionID)
     }
@@ -1371,22 +1430,31 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   /**
    * A retired generation can never run `dispose()` (crash, hard terminate), so
    * its worker lease would otherwise stay live until the 30 s TTL and the
-   * immediate successor's `Bus.reclaim` would fail with `Bus.LeaseConflict`.
+   * immediate successor's `DurableLog.reclaim` would fail with `Bus.LeaseConflict`.
    * Retirement is the authoritative "this generation is dead" signal, so mark
    * its lease expired here. The update is scoped to the retired generation's
    * exact `worker_owner_id`; a successor that already claimed the aggregate must
    * never have its live lease zeroed.
    */
   const retiredLeaseReleases = new Map<SessionID, Promise<void>>()
+  /**
+   * The exact `worker_owner_id` remembered for each session's CURRENT
+   * generation. Captured after a successful dispatch (the isolate has claimed
+   * its lease), so retirement uses the stored identity instead of racing a
+   * successor with a fresh `event_sequence` read.
+   */
+  const leaseOwnerBySession = new Map<SessionID, string>()
+  const retiredLeaseReleaseTimeoutMs = options.retiredLeaseReleaseTimeoutMs ?? 5_000
 
   const queueRetiredLeaseRelease = (sessionID: SessionID, task: () => Promise<void>): Promise<void> => {
     const previous = retiredLeaseReleases.get(sessionID) ?? Promise.resolve()
     const next = previous.then(task).catch((error: unknown) => {
-      log(workerLogMessage("retired lease release failed"), {
-        level: "WARN",
-        sessionID,
-        error: error instanceof Error ? error.message : String(error),
-      })
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("retired lease release failed"), {
+          sessionID,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      )
     })
     retiredLeaseReleases.set(sessionID, next)
     void next.finally(() => {
@@ -1396,20 +1464,55 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   }
 
   /**
-   * Release the retired generation's lease. The `workerID` prefix is its stable
-   * generation identity (`worker-<id>-<pid>-<uuid>`); the exact owner is read
-   * from the row and passed to the scoped update so a successor's lease is
-   * untouched even if it raced the retirement.
+   * Read the EXACT `worker_owner_id` a generation holds for this session. The
+   * successor reuses the same worker slot (`worker-<workerID>-…`), so retirement
+   * prefers the owner remembered at dispatch time; this read is the fallback for
+   * a generation that never completed a tracked dispatch, and still happens
+   * before the successor barrier can open.
    */
-  const releaseRetiredLease = (sessionID: SessionID, workerID?: number): Promise<void> => {
-    if (db === undefined || workerID === undefined) return Promise.resolve()
+  const captureRetiredLeaseOwner = async (
+    sessionID: SessionID,
+    workerID?: number,
+  ): Promise<string | undefined> => {
+    if (db === undefined || workerID === undefined) return undefined
     const generationPrefix = `worker-${workerID}-`
-    return queueRetiredLeaseRelease(sessionID, async () => {
+    try {
       const rows = await db.query("SELECT worker_owner_id FROM event_sequence WHERE aggregate_id = ?", [sessionID])
       const owner = rows[0]?.worker_owner_id
-      if (typeof owner !== "string" || !owner.startsWith(generationPrefix)) return
-      await releaseRetiredWorkerLease(db, sessionID, owner)
+      return typeof owner === "string" && owner.startsWith(generationPrefix) ? owner : undefined
+    } catch (error) {
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("worker lease owner read failed"), {
+          sessionID,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      )
+      return undefined
+    }
+  }
+
+  /**
+   * Zero the retired generation's lease with a conditional update on the exact
+   * owner captured at retirement start. When the row no longer holds that owner,
+   * a successor won the slot and the update leaves it untouched.
+   */
+  const releaseRetiredLease = (sessionID: SessionID, retiredOwnerID: string | undefined): Promise<void> => {
+    if (db === undefined || retiredOwnerID === undefined) return Promise.resolve()
+    return queueRetiredLeaseRelease(sessionID, async () => {
+      await releaseRetiredWorkerLease(db, sessionID, retiredOwnerID)
     })
+  }
+
+  /**
+   * Remember the exact owner the CURRENT generation holds after its successful
+   * dispatch. Retirement then reads this stored value instead of re-reading a
+   * row the successor may already own.
+   */
+  const rememberLeaseOwner = async (sessionID: SessionID): Promise<void> => {
+    const workerID = dispatcher.registry.entry(sessionID)?.workerID
+    if (db === undefined || workerID === undefined) return
+    const owner = await captureRetiredLeaseOwner(sessionID, workerID)
+    if (owner !== undefined) leaseOwnerBySession.set(sessionID, owner)
   }
 
   /** Successor admission waits for the retired generation's release to land. */
@@ -1417,27 +1520,118 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     retiredLeaseReleases.get(sessionID) ?? Promise.resolve()
 
   /**
-   * The one hub-side retirement for a worker generation. Both the dispatcher's
-   * `onSessionReleased` (crash/reap/cancel) and the pool's in-place generation
-   * replacement (a mid-session model switch) funnel through here, so every
-   * retired generation releases the same state exactly once.
+   * Bound ONLY the retired lease UPDATE. The underlying conditional update keeps
+   * running after a timeout, but it is scoped to the exact owner captured before
+   * the successor barrier, so a late completion can never touch the successor's
+   * live lease.
    */
-  const releaseGeneration = async (sessionID: SessionID, workerID?: number): Promise<void> => {
-    // This generation can never settle another phase: the next run must not
-    // inherit its in-flight calls.
-    lostGenerations.add(sessionID)
+  const awaitBoundedRetiredLeaseRelease = (sessionID: SessionID, release: Promise<void>): Promise<void> => {
+    const timeoutMs = retiredLeaseReleaseTimeoutMs
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return release
+    return new Promise<void>((resolve) => {
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        void bridge?.fork(
+          Effect.logWarning(workerLogMessage("retired lease release timed out"), { sessionID, timeoutMs }),
+        )
+        resolve()
+      }, timeoutMs)
+      timer.unref?.()
+      void release.finally(() => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve()
+      })
+    })
+  }
+
+  /**
+   * Release the hub resources owned by ONE worker generation: its ports, the
+   * pending asks bound to that worker, its lost-generation marker and the
+   * retired lease. Per-session state (instance/context/children/job mirrors)
+   * belongs to the session lifetime and is deliberately untouched here: a model
+   * switch replaces the generation while the session and its successor stay
+   * live.
+   *
+   * Ordering is the contract:
+   * 1. the hook is invoked SYNCHRONOUSLY, before any `await`, so its generation
+   *    ask-epoch advance lands at retirement admission (the successor can never
+   *    be tagged with the old epoch);
+   * 2. the exact retired owner is resolved from the dispatch-time record (or a
+   *    pre-barrier read when no record exists) BEFORE the successor is admitted;
+   * 3. only the lease UPDATE is bounded, and it is conditional on that exact
+   *    owner, so a timeout can never zero a successor's lease.
+   *
+   * `lost` marks a generation whose in-flight calls can never settle. A
+   * deliberate replacement (model switch) passes `false`, so the successor
+   * generation is never treated as lost.
+   */
+  const releaseGenerationResources = async (
+    sessionID: SessionID,
+    workerID: number | undefined,
+    releaseOptions: { readonly lost?: boolean },
+    hook: ((sessionID: SessionID, workerID?: number) => unknown) | undefined,
+  ): Promise<void> => {
+    if (releaseOptions.lost !== false) lostGenerations.add(sessionID)
+    // (1) Invoke the hook synchronously. Its synchronous prefix advances the
+    // generation ask epoch; awaiting before it would let the successor register
+    // asks under the still-old epoch.
+    let hookResult: PromiseLike<unknown> | undefined
+    let hookError: unknown
+    let hookThrew = false
+    try {
+      const released = hook?.(sessionID, workerID)
+      if (released !== undefined && typeof (released as PromiseLike<unknown>).then === "function") {
+        hookResult = released as PromiseLike<unknown>
+      }
+    } catch (error) {
+      hookThrew = true
+      hookError = error
+    }
+    // (2) Resolve the exact retired owner before any successor can be admitted.
+    // The dispatch-time record is authoritative; the read is only the fallback
+    // for a generation that never completed a tracked dispatch.
+    const storedOwner = workerID === undefined ? undefined : leaseOwnerBySession.get(sessionID)
+    const generationPrefix = workerID === undefined ? undefined : `worker-${workerID}-`
+    const exactStoredOwner =
+      storedOwner !== undefined && generationPrefix !== undefined && storedOwner.startsWith(generationPrefix)
+        ? storedOwner
+        : undefined
+    if (storedOwner !== undefined) leaseOwnerBySession.delete(sessionID)
+    const retiredOwnerID = exactStoredOwner ?? (await captureRetiredLeaseOwner(sessionID, workerID))
+    // (3) Dispose the old generation's ports and let the hook's async half land,
+    // then bound ONLY the lease UPDATE.
+    let workError: unknown
+    let workFailed = false
     try {
       // Retirement disposes this worker's hub-side port servers immediately,
       // rather than leaving them alive until shutdown.
       if (workerID !== undefined) ports.disposeWorker(workerID)
-      await options.onSessionReleased?.(sessionID)
-    } finally {
-      // The lease release is the retirement's contract, not a best-effort
-      // follow-up: even a throwing port disposer or release hook must not let a
-      // successor boot against the old generation's live lease.
-      await releaseRetiredLease(sessionID, workerID)
+      if (hookResult !== undefined) await hookResult
+    } catch (error) {
+      workFailed = true
+      workError = error
     }
+    await awaitBoundedRetiredLeaseRelease(sessionID, releaseRetiredLease(sessionID, retiredOwnerID))
+    if (workFailed) throw workError
+    if (hookThrew) throw hookError
   }
+
+  /**
+   * The public generation release used by callers that retire a single
+   * generation directly. A hub with no dedicated generation hook keeps the
+   * legacy single-hook behavior by falling back to `onSessionReleased`.
+   */
+  const releaseGeneration = (sessionID: SessionID, workerID?: number): Promise<void> =>
+    releaseGenerationResources(
+      sessionID,
+      workerID,
+      { lost: true },
+      options.onGenerationReleased ?? options.onSessionReleased,
+    )
 
   /**
    * A timed-out barrier refuses the next run while its worker is still alive
@@ -1453,7 +1647,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
         barrier.abandon(sessionID)
         return
       }
-      throw new RunBarrierTimeout(sessionID, RUN_BARRIER_TIMEOUT_MS)
+      throw new RunBarrierTimeout({ sessionID, timeoutMs: RUN_BARRIER_TIMEOUT_MS })
     }
     if (state === "cancelled" || state === "failed") barrier.reset(sessionID)
   }
@@ -1503,11 +1697,12 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
             .catch(() => decide(lifecycle.indeterminate(payload.sessionID))),
         resumeDecisionTimeoutMs,
         () => {
-          log(workerLogMessage("resume decision timed out"), {
-            level: "WARN",
-            sessionID: payload.sessionID,
-            timeoutMs: resumeDecisionTimeoutMs,
-          })
+          void bridge?.fork(
+            Effect.logWarning(workerLogMessage("resume decision timed out"), {
+              sessionID: payload.sessionID,
+              timeoutMs: resumeDecisionTimeoutMs,
+            }),
+          )
           return {
             resume: false,
             sessionID: payload.sessionID,
@@ -1521,10 +1716,9 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       // Cancel always wins: a decision computed before the cancel but resolved
       // after it must never dispatch a successor run.
       if (lifecycle.cancelled(decision.sessionID)) {
-        log(workerLogMessage("auto-resume refused after cancel"), {
-          level: "INFO",
-          sessionID: decision.sessionID,
-        })
+        void bridge?.fork(
+          Effect.logInfo(workerLogMessage("auto-resume refused after cancel"), { sessionID: decision.sessionID }),
+        )
         return
       }
       lifecycle.recordAttempt(decision.sessionID)
@@ -1543,15 +1737,17 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
         .ensureRunning(decision.sessionID as SessionID)
         .then(() => lifecycle.resetAttempts(decision.sessionID))
         .catch((error: unknown) => {
-          log(workerLogMessage("auto-resume failed"), {
-            level: "WARN",
-            sessionID: decision.sessionID,
-            error: error instanceof Error ? error.message : String(error),
-          })
+          void bridge?.fork(
+            Effect.logWarning(workerLogMessage("auto-resume failed"), {
+              sessionID: decision.sessionID,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          )
         })
       return undefined
     },
     writeBarrier: runBarrier,
+    commitOutcome: (sessionID) => commitOutcomes.get(sessionID),
     assertAdmissible: assertBuildAdmissible,
     onRunStart: (sessionID) => {
       // A lost generation's calls can never settle. Release them into the OLD
@@ -1560,6 +1756,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       if (lostGenerations.delete(sessionID)) {
         for (const call of lifecycle.indeterminate(sessionID)) lifecycle.toolFinished(sessionID, call.callID)
       }
+      commitOutcomes.delete(sessionID)
       lifecycle.beginRun(sessionID)
       // A run whose report set cannot be opened still runs; its barrier then
       // fails typed rather than wedging the dispatcher with an unhandled throw.
@@ -1567,28 +1764,42 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
         activeRuns.set(sessionID, barrier.beginRun(sessionID))
       } catch (error) {
         activeRuns.delete(sessionID)
-        log(workerLogMessage("run barrier begin failed"), {
-          level: "WARN",
-          sessionID,
-          error: error instanceof Error ? error.message : String(error),
-        })
+        void bridge?.fork(
+          Effect.logWarning(workerLogMessage("run barrier begin failed"), {
+            sessionID,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        )
       }
     },
+    onGenerationRetired: async (sessionID, workerID) => {
+      // A model switch replaces one generation but keeps the session live, so
+      // only the generation-scoped hook runs (never the session release).
+      await releaseGenerationResources(sessionID, workerID, { lost: false }, options.onGenerationReleased)
+    },
     onSessionReleased: async (sessionID, workerID) => {
-      await releaseGeneration(sessionID, workerID)
+      // Crash/reap/cancel/idle eviction: release the retired generation first,
+      // then the session state that leaves the hub with it.
+      await releaseGenerationResources(sessionID, workerID, { lost: true }, options.onGenerationReleased)
+      leaseOwnerBySession.delete(sessionID)
+      await options.onSessionReleased?.(sessionID)
     },
     ...defined({
       cancellation,
       reapMs: options.reapMs,
       schedule: options.schedule,
-      log,
+      ...(bridge === undefined ? {} : { bridge }),
     }),
   })
   // Depth is carried explicitly on the run (`metadata.depth` -> Session.spawn).
   // The production hub resolves it per session; a plain hub without the seam is a
   // foreground root (0). Clamp so malformed metadata cannot grow the cap's depth
   // map without bound or claim an absurd level.
-  const dispatch: SessionDispatch = createSessionDispatch({ dispatcher, pool })
+  const dispatch: SessionDispatch = createSessionDispatch({
+    dispatcher,
+    pool,
+    commitOutcome: (sessionID) => commitOutcomes.get(sessionID),
+  })
   const onDispatch = options.onDispatch
   const resolveDepth = (sessionID: SessionID): number =>
     options.depthOf === undefined ? 0 : boundedDispatchDepth(options.depthOf(sessionID))
@@ -1603,6 +1814,32 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     releaseGeneration,
     lifecycle,
     barrier,
+    ensureRunningEffect: (sessionID, origin) =>
+      Effect.gen(function* () {
+        // Capture the caller's ambient context synchronously; awaiting first
+        // would resume outside this fiber and lose it.
+        onDispatch?.(sessionID)
+        // The off-loop schema gate must complete before any isolate can spawn.
+        yield* Effect.promise(() => awaitBootGate())
+        yield* Effect.try({ try: () => admitBarrier(sessionID), catch: (error) => error })
+        yield* Effect.try({ try: () => assertBuildAdmissible(sessionID), catch: (error) => error })
+        // A retired generation's release must land before its successor boots and
+        // claims the aggregate; otherwise the successor can be admitted against a
+        // still-live lease.
+        yield* Effect.tryPromise({
+          try: () => awaitRetiredLeaseRelease(sessionID),
+          catch: (error) => error,
+        })
+        const result = yield* dispatch.ensureRunningEffect(sessionID, resolveDepth(sessionID), origin)
+        blockedBuilds.delete(sessionID)
+        lifecycle.resetAttempts(sessionID)
+        // Record the owner this generation claimed, so a later retirement can
+        // release exactly it without re-reading a possibly-successor-owned row.
+        yield* Effect.tryPromise({ try: () => rememberLeaseOwner(sessionID), catch: (error) => error })
+        return result
+      }).pipe(
+        Effect.tapError((error) => Effect.promise(() => surfaceWorkerCrash(error, sessionID))),
+      ),
     ensureRunning: async (sessionID, origin) => {
       // Capture the caller's ambient context synchronously; awaiting first would
       // resume outside this fiber and lose it.
@@ -1619,6 +1856,9 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
         const result = await dispatch.ensureRunning(sessionID, resolveDepth(sessionID), origin)
         blockedBuilds.delete(sessionID)
         lifecycle.resetAttempts(sessionID)
+        // Record the owner this generation claimed, so a later retirement can
+        // release exactly it without re-reading a possibly-successor-owned row.
+        await rememberLeaseOwner(sessionID)
         return result
       } catch (error) {
         await surfaceWorkerCrash(error, sessionID)
@@ -1635,6 +1875,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
         const result = await dispatch.startShell(sessionID, shell, resolveDepth(sessionID))
         blockedBuilds.delete(sessionID)
         lifecycle.resetAttempts(sessionID)
+        await rememberLeaseOwner(sessionID)
         return result
       } catch (error) {
         await surfaceWorkerCrash(error, sessionID)
@@ -1704,7 +1945,6 @@ export {
   DEFAULT_SPAWN_GATE_TIMEOUT_MS,
   DEFAULT_TRANSPORT_BUFFER_CAPACITY,
   type DescribedSessionWorkerEntry,
-  type FromPoolOptions,
   type IdleBoundedExecutorWorkerPool,
   type IdleIsolateCap,
   type IdleIsolateCapOptions,
@@ -1713,6 +1953,12 @@ export {
   type ProductionPoolFactory,
   type ProductionWorkerPoolOptions,
   SESSION_WORKER_ENTRY,
+  type SpawnGateHandle,
+  type SpawnGateOptions,
+  type SpawnOutcome,
+  type SpawnPermit,
+  SpawnGateAbortedError,
+  SpawnGateTimeoutError,
   Service as WorkerPoolsService,
   type SessionBoundSpawner,
   type SessionWorkerEntrySource,
@@ -1725,15 +1971,14 @@ export {
   createBunExecutorTransport,
   createBunExecutorWorkerPool,
   createIdleIsolateCap,
-  createProductionWorkerPool,
   createSessionBoundExecutorWorker,
   createWorkerCap,
   describeSessionWorkerEntry,
-  fromPool,
   layer as WorkerPoolsLayer,
   liveSessionWorkerCount,
   logRunIdleTimeoutWarning,
   makeProduction,
+  makeSpawnGate,
   node as WorkerPoolsNode,
   resolveIdleWorkerCapacity,
   resolveRunIdleTimeoutMs,
@@ -1749,12 +1994,9 @@ export {
   type WorkerPortBackends,
   type WorkerPortBackendsSource,
   WorkerPorts,
-  type WorkerPortRegistry,
-  type WorkerPortRegistryOptions,
   type WorkerPortsDiagnostics,
   type WorkerPortsOptions,
   type WorkerTransferredPorts,
-  createWorkerPortRegistry,
   drainEgressPort,
   isPidReport,
   layer as WorkerPortsLayer,
@@ -1763,4 +2005,4 @@ export {
   servePidReportPort,
 } from "./worker-ports"
 
-export * as SessionHubModule from "./hub"
+export * as SessionHub from "./hub"

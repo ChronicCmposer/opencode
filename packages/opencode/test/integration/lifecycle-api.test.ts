@@ -10,6 +10,7 @@
 
 import { describe, expect, test } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { RunBarrier } from "@/session/run-barrier"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -125,6 +126,7 @@ const authorityLayer = LayerNode.compile(
 )
 
 const baseMocks = Layer.mergeAll(
+  RunBarrier.layer,
   Layer.mock(Config.Service, { get: () => Effect.succeed({ model: "test/model" } as never) }),
   Layer.mock(Auth.Service, {}),
   Layer.mock(ModelsDev.Service, { get: () => Effect.succeed({}) }),

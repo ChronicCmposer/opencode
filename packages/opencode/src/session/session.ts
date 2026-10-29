@@ -13,7 +13,7 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { sessionRow } from "@opencode-ai/core/session/projector"
-import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
+import { SessionExecutionLocal } from "@opencode-ai/core/session/execution/local"
 import { locationServiceMapLayer } from "@opencode-ai/core/location-services"
 
 import { NotFoundError } from "@/storage/storage"
@@ -37,7 +37,7 @@ import { Snapshot } from "@/snapshot"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { SessionID, MessageID, PartID } from "./schema"
-import type { SessionPrompt } from "./prompt"
+import { SessionPromptService } from "./prompt-service"
 import { SessionDepth } from "./depth"
 import type { DispatchOrigin } from "./origin"
 import { SessionSpawnProxyService } from "./worker/subagent"
@@ -300,7 +300,7 @@ export type CreateInput = Types.DeepMutable<Schema.Schema.Type<typeof CreateInpu
 export interface SpawnInput {
   readonly parentID: SessionID
   readonly childID?: SessionID
-  readonly prompt: SessionPrompt.PromptInput
+  readonly prompt: SessionPromptService.PromptInput
   readonly type: string
   readonly title?: string
   readonly agent?: string
@@ -323,12 +323,12 @@ export interface SpawnOutput {
 }
 
 /**
- * The prompt authority's service key, resolved by its string so this module
- * neither imports `prompt.ts` at runtime (an ESM/layer cycle) nor widens the
- * Session layer's requirements. Present in the main process; a worker uses the
- * hub-proxy `SessionSpawnProxyService` instead.
+ * The prompt authority's service key, resolved from the shared declaration so
+ * this module neither imports `prompt.ts` at runtime (an ESM/layer cycle) nor
+ * widens the Session layer's requirements. Present in the main process; a
+ * worker uses the hub-proxy `SessionSpawnProxyService` instead.
  */
-const SessionPromptService = Context.Service<SessionPrompt.Interface>("@opencode/SessionPrompt")
+const promptAuthority = SessionPromptService.Service
 
 export const ForkInput = Schema.Struct({
   sessionID: SessionID,
@@ -701,7 +701,7 @@ const layer: Layer.Layer<
 
         yield* events.publish(SessionV1.Event.Deleted, { sessionID, info: session })
         // The whole durable log (events, blob rows, sequence) and any D16 files
-        // this aggregate alone referenced are removed by one Bus
+        // this aggregate alone referenced are removed by one DurableLog
         // `BEGIN IMMEDIATE`. `EventV2.deleteAggregate` keeps the worker-session
         // fence and is the same path `EventV2.remove` uses.
         yield* EventV2.deleteAggregate(database.db, sessionID)
@@ -835,7 +835,7 @@ const layer: Layer.Layer<
           : yield* stampDepth(input.childID, metadata)
       const prompt = { ...request.prompt, sessionID: child.id }
 
-      const promptService = yield* Effect.serviceOption(SessionPromptService)
+      const promptService = yield* Effect.serviceOption(promptAuthority)
       if (Option.isNone(promptService)) {
         return yield* Effect.die(new Error("Session.spawn requires SessionPrompt or a session-spawn proxy"))
       }

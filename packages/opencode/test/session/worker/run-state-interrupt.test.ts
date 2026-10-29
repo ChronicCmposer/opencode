@@ -9,6 +9,7 @@ import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { createSessionHub, SessionHubService, type SessionHub } from "@/session/worker/hub"
+import { createTestBarrier } from "../../lib/run-barrier-test"
 import { createFakeExecutorPool } from "../../lib/fake-worker-pool"
 import { withTmpdirInstance } from "../../fixture/fixture"
 import { testEffect } from "../../lib/effect"
@@ -32,7 +33,7 @@ const runStateLayer = SessionRunState.layer.pipe(
 describe("hub-hosted run interruption", () => {
   it.live("interrupting the caller cancels through the hub and runs the caller finalizer", () => {
     const sessionID = sid("ses_run_interrupt")
-    const base = createSessionHub({ pool: createFakeExecutorPool(1, { value: withParts(sessionID) }) })
+    const base = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: createFakeExecutorPool(1, { value: withParts(sessionID) }) })
     let cancelCalls = 0
     let started!: () => void
     const startedPromise = new Promise<void>((resolve) => {
@@ -40,11 +41,9 @@ describe("hub-hosted run interruption", () => {
     })
     const hub: SessionHub = {
       ...base,
-      ensureRunning: async () => {
-        started()
+      ensureRunningEffect: () =>
         // The worker run never settles; only the caller's interruption ends it.
-        return new Promise(() => {})
-      },
+        Effect.sync(started).pipe(Effect.andThen(Effect.never)),
       cancelWithReport: async (id) => {
         cancelCalls += 1
         return {

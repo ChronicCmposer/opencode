@@ -48,7 +48,7 @@ import {
 } from "@/session/worker/layer"
 import { workerGraphReplacements } from "@/session/worker/session-worker"
 import { instantRunner, recordingHubAuthorities } from "../../lib/hub-proxy"
-import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
+import { createE2EContext, memoizeWorkerLayer, type E2EContext, type MemoizedWorkerLayer } from "../../lib/e2e-context"
 import { pluginPassThroughReplacement } from "../../lib/worker-plugin-routes"
 import { startMockProvider, type MockProviderHandle } from "../../lib/mock-provider"
 import { workerSnapshot } from "../../lib/snapshot"
@@ -156,26 +156,30 @@ function inProcessHost(): WorkerPluginHost {
   ])
 }
 
-/** The full worker graph over the E2E writer, with a supplied plugin host. */
+/** The full worker graph over the E2E worker database, with a supplied plugin host. */
 function workerLayer(
   snapshot: WorkerSnapshot,
   provider: MockProviderHandle,
+  database: E2EContext["database"],
   writer: WriterClientHandle,
   plugins: WorkerPluginHost,
-): Layer.Layer<unknown, unknown> {
+): MemoizedWorkerLayer {
   const config = modelConfig(provider)
-  return buildSessionWorkerLayer({
-    snapshot,
-    env: { values: {} },
-    clients: {
-      writer,
-      egress: { emit: () => {}, emitDurable: () => {} },
-      backgroundJob: { wait: async () => null, cancel: async () => {} },
-    },
-    modelClient: llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(snapshot, config))),
-    plugins,
-    replacements: [...workerGraphReplacements(config), pluginPassThroughReplacement(plugins)],
-  }).layer
+  return memoizeWorkerLayer(
+    buildSessionWorkerLayer({
+      snapshot,
+      env: { values: {} },
+      clients: {
+        writer,
+        database,
+        egress: { emit: () => {}, emitDurable: () => {} },
+        backgroundJob: { wait: async () => null, cancel: async () => {} },
+      },
+      modelClient: llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(snapshot, config))),
+      plugins,
+      replacements: [...workerGraphReplacements(config), pluginPassThroughReplacement(plugins)],
+    }).layer,
+  )
 }
 
 /**
@@ -275,20 +279,21 @@ async function runPromptWithHost(
   const provider = startMockProvider({ chunks: ["ok"] })
   const ctx = createE2EContext({ snapshot, modelConfig: modelConfig(provider) })
   const built = buildHost()
+  const worker = workerLayer(snapshot, provider, ctx.database, ctx.writer, built.host)
   try {
-    const layer = workerLayer(snapshot, provider, ctx.writer, built.host)
-    const sessionID = await Effect.runPromise(seed(layer, ctx.instance, snapshot.directory, provider.model))
+    const sessionID = await Effect.runPromise(seed(worker.layer, ctx.instance, snapshot.directory, provider.model))
     await Effect.runPromise(
       Effect.gen(function* () {
         const prompt = yield* SessionPrompt.Service
         return yield* prompt.loop({ sessionID })
-      }).pipe(Effect.provide(layer), Effect.provideService(InstanceRef, ctx.instance)),
+      }).pipe(Effect.provide(worker.layer), Effect.provideService(InstanceRef, ctx.instance)),
     )
     // Readiness signal, no sleep: the provider request is recorded before the
     // loop resolves, but wait on it explicitly to make the ordering explicit.
     await provider.wait(1)
     return turnBodies(provider)
   } finally {
+    await worker.dispose()
     built.dispose()
     await ctx.dispose()
     await provider.stop()
@@ -308,9 +313,9 @@ async function runCompaction(
   const provider = startMockProvider({ chunks: ["summary"] })
   const ctx = createE2EContext({ snapshot, modelConfig: modelConfig(provider) })
   const built = buildHost()
+  const worker = workerLayer(snapshot, provider, ctx.database, ctx.writer, built.host)
   try {
-    const layer = workerLayer(snapshot, provider, ctx.writer, built.host)
-    const sessionID = await Effect.runPromise(seed(layer, ctx.instance, snapshot.directory, provider.model))
+    const sessionID = await Effect.runPromise(seed(worker.layer, ctx.instance, snapshot.directory, provider.model))
     await Effect.runPromise(
       Effect.gen(function* () {
         const sessions = yield* Session.Service
@@ -319,11 +324,12 @@ async function runCompaction(
         const parent = messages.findLast((message) => message.info.role === "user")
         if (parent === undefined) throw new Error("seed produced no user message")
         yield* compaction.process({ parentID: parent.info.id, messages, sessionID, auto: false })
-      }).pipe(Effect.provide(layer), Effect.provideService(InstanceRef, ctx.instance)),
+      }).pipe(Effect.provide(worker.layer), Effect.provideService(InstanceRef, ctx.instance)),
     )
     await provider.wait(1)
     return turnBodies(provider)
   } finally {
+    await worker.dispose()
     built.dispose()
     await ctx.dispose()
     await provider.stop()

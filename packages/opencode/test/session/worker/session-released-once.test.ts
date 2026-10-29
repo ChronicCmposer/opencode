@@ -9,6 +9,7 @@
 
 import { describe, expect, test } from "bun:test"
 import { createProductionSessionHub } from "@/session/worker/hub"
+import { createTestBarrier } from "../../lib/run-barrier-test"
 import type { SessionID } from "@/session/schema"
 import { sessionWorkerInit } from "../../lib/session-worker-init"
 import { pollUntil } from "../../lib/poll"
@@ -65,7 +66,7 @@ describe("production hub session release", () => {
     await withFakeWorker(async () => {
       const released: SessionID[] = []
       const releasedAfterExit: boolean[] = []
-      const hub = createProductionSessionHub({
+      const hub = createProductionSessionHub({ ...{ barrier: createTestBarrier() },
         init: () => sessionWorkerInit(),
         count: 1,
         entry: "fake://release-once",
@@ -102,6 +103,43 @@ describe("production hub session release", () => {
 
         expect(released).toEqual([sessionID])
         expect(releasedAfterExit).toEqual([true])
+      } finally {
+        for (const worker of FakeWorker.instances) worker.confirmTerminated()
+        await hub.terminateAll()
+      }
+    })
+  }, 30_000)
+
+  test("a generation switch releases the generation without the session hook", async () => {
+    await withFakeWorker(async () => {
+      const released: SessionID[] = []
+      const hub = createProductionSessionHub({ ...{ barrier: createTestBarrier() },
+        init: () => sessionWorkerInit(),
+        count: 1,
+        entry: "fake://generation-switch",
+        workKind: "instant",
+        onSessionReleased: (sessionID) => {
+          released.push(sessionID)
+        },
+      })
+      try {
+        const sessionID = sid("ses_generation_switch")
+        void hub.ensureRunning(sessionID).catch(() => undefined)
+        await pollUntil(() => FakeWorker.instances.length === 1, {
+          message: "production worker was never materialized",
+        })
+        const entry = hub.dispatcher.registry.entry(sessionID)
+        expect(entry).toBeDefined()
+        const workerID = entry!.workerID
+        const worker = FakeWorker.instances[0]!
+
+        // A model switch retires only the old generation. The session stays
+        // live and its successor reuses the same worker slot.
+        await hub.dispatcher.retireGeneration(sessionID, workerID)
+
+        expect(released).toEqual([])
+        expect(worker.terminated).toBe(false)
+        expect(hub.dispatcher.registry.entry(sessionID)?.workerID).toBe(workerID)
       } finally {
         for (const worker of FakeWorker.instances) worker.confirmTerminated()
         await hub.terminateAll()

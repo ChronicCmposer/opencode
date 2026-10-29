@@ -28,7 +28,7 @@
 // worker keeps the refusal: timed-out is not a free pass.
 
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Context, Effect, Layer } from "effect"
+import { Context, Deferred, Effect, Layer, Schema } from "effect"
 
 /** The hard bound every per-Session barrier is subject to. */
 export const RUN_BARRIER_TIMEOUT_MS = 5000
@@ -61,6 +61,11 @@ export interface RunBarrierPhaseReport {
   readonly observation: RunBarrierObservation
 }
 
+/** The commit-side outcome a run recorded. `null` is the explicit zero-commit settlement. */
+export interface RunBarrierCommitOutcome {
+  readonly committed: string | null
+}
+
 /**
  * The report handle for one run. Reports are only accepted for the run that
  * opened them: a late token cannot settle a successor run.
@@ -85,14 +90,8 @@ export interface RunBarrierRun {
   reported(phase: RunBarrierPhase): boolean
   /** Phases whose report has not arrived yet, in canonical order. */
   missing(): readonly RunBarrierPhase[]
-}
-
-/** Caller-supplied phases. A test seam; production uses reported phases. */
-export interface RunBarrierPhases {
-  readonly commits: Promise<unknown>
-  readonly projectors: Promise<unknown>
-  readonly tools: Promise<unknown>
-  readonly promotion: Promise<unknown>
+  /** The commit outcome recorded by this run, once the commits phase settled. */
+  commitOutcome(): RunBarrierCommitOutcome | undefined
 }
 
 export interface RunBarrierOutcome {
@@ -102,124 +101,70 @@ export interface RunBarrierOutcome {
 
 export type RunBarrierState = "idle" | "draining" | "drained" | "timed-out" | "cancelled" | "failed"
 
-/** Injectable timer seam, so the bound is deterministic in tests. */
-export interface RunBarrierScheduler {
-  schedule(callback: () => void, delayMs: number): unknown
-  cancel(handle: unknown): void
-}
-
-const defaultScheduler: RunBarrierScheduler = {
-  schedule: (callback, delayMs) => setTimeout(callback, delayMs),
-  cancel: (handle) => {
-    if (typeof handle === "number" || (typeof handle === "object" && handle !== null)) {
-      clearTimeout(handle as ReturnType<typeof setTimeout>)
-    }
-  },
-}
-
-export class RunBarrierError extends Error {
-  readonly tag: string = "RunBarrierError"
-  constructor(message: string) {
-    super(message)
-    this.name = "RunBarrierError"
-  }
-}
-
 /** Raised when the commit-side phases did not settle within the 5 s bound. */
-export class RunBarrierTimeout extends RunBarrierError {
-  override readonly tag = "RunBarrierTimeout"
-  constructor(
-    readonly sessionID: string,
-    readonly timeoutMs: number,
-  ) {
-    super(`run barrier for session ${sessionID} timed out after ${timeoutMs}ms`)
-    this.name = "RunBarrierTimeout"
+export class RunBarrierTimeout extends Schema.TaggedErrorClass<RunBarrierTimeout>()("RunBarrier.Timeout", {
+  sessionID: Schema.String,
+  timeoutMs: Schema.Number,
+}) {
+  override get message(): string {
+    return `run barrier for session ${this.sessionID} timed out after ${this.timeoutMs}ms`
   }
 }
 
 /** A second barrier for a Session whose previous barrier is still draining. */
-export class RunBarrierBusyError extends RunBarrierError {
-  override readonly tag = "RunBarrierBusyError"
-  constructor(readonly sessionID: string) {
-    super(`run barrier for session ${sessionID} is still draining`)
-    this.name = "RunBarrierBusyError"
+export class RunBarrierBusyError extends Schema.TaggedErrorClass<RunBarrierBusyError>()("RunBarrier.Busy", {
+  sessionID: Schema.String,
+}) {
+  override get message(): string {
+    return `run barrier for session ${this.sessionID} is still draining`
   }
 }
 
 /** A phase report that cannot belong to the run it names. */
-export class RunBarrierReportError extends RunBarrierError {
-  override readonly tag: string = "RunBarrierReportError"
-  constructor(
-    readonly sessionID: string,
-    message: string,
-  ) {
-    super(message)
-    this.name = "RunBarrierReportError"
-  }
-}
+export class RunBarrierReportError extends Schema.TaggedErrorClass<RunBarrierReportError>()("RunBarrier.Report", {
+  sessionID: Schema.String,
+  message: Schema.String,
+}) {}
 
 /**
  * The barrier was asked to wait for a run that never opened a report set, so no
  * phase can ever settle. This is a typed refusal, not a timeout.
  */
-export class RunBarrierMissingReportError extends RunBarrierReportError {
-  override readonly tag: string = "RunBarrierMissingReportError"
-  constructor(
-    override readonly sessionID: string,
-    readonly missing: readonly RunBarrierPhase[],
-  ) {
-    super(sessionID, `run barrier for session ${sessionID} has no begun run; missing reports: ${missing.join(", ")}`)
-    this.name = "RunBarrierMissingReportError"
+export class RunBarrierMissingReportError extends Schema.TaggedErrorClass<RunBarrierMissingReportError>()(
+  "RunBarrier.MissingReport",
+  {
+    sessionID: Schema.String,
+    missing: Schema.Array(Schema.Literals(RUN_BARRIER_PHASES)),
+  },
+) {
+  override get message(): string {
+    return `run barrier for session ${this.sessionID} has no begun run; missing reports: ${this.missing.join(", ")}`
   }
 }
 
-export interface RunBarrierOptions {
-  /** Barrier bound; defaults to {@link RUN_BARRIER_TIMEOUT_MS}. */
-  readonly timeoutMs?: number
-  readonly scheduler?: RunBarrierScheduler
-  /**
-   * Maximum Session states retained. Terminal sessions evict LRU once the cap is
-   * reached; a draining barrier is never evicted. Defaults to 1024.
-   */
-  readonly maxSessions?: number
+/** The active wait was cancelled; `wait` converts this into a `cancelled` outcome. */
+export class RunBarrierCancelled extends Schema.TaggedErrorClass<RunBarrierCancelled>()("RunBarrier.Cancelled", {
+  sessionID: Schema.String,
+}) {
+  override get message(): string {
+    return `run barrier for session ${this.sessionID} was cancelled`
+  }
 }
 
-export interface RunBarrier {
-  /**
-   * Open a fresh report set for a run. No phase is settled by this call: the
-   * caller must report each phase from the place that observed it.
-   */
-  beginRun(sessionID: string): RunBarrierRun
-  /** Admit the next run only after all four phases were really reported. */
-  wait(sessionID: string): Promise<RunBarrierOutcome>
-  /** Admit after caller-supplied phases settle (test seam, not production). */
-  wait(sessionID: string, phases: RunBarrierPhases): Promise<RunBarrierOutcome>
-  /** Cancel the active barrier (or the next one) for `sessionID`. */
-  cancel(sessionID: string): void
-  state(sessionID: string): RunBarrierState
-  /** Clear a timed-out/cancelled/drained state so a later run may be admitted. */
-  reset(sessionID: string): void
-  /**
-   * Forget a barrier whose owning run can no longer settle (its worker was
-   * retired by a crash or terminate). Refuses a still-draining barrier: a live
-   * run keeps ownership of its drain. Idempotent.
-   */
-  abandon(sessionID: string): void
-  /** Number of retained Session states (bounded). */
-  readonly size: number
-}
-
-interface ActiveBarrier {
-  settleCancelled(): void
-}
+export type RunBarrierWaitError =
+  | RunBarrierTimeout
+  | RunBarrierBusyError
+  | RunBarrierMissingReportError
+  | RunBarrierReportError
 
 interface RunRecord {
   readonly sessionID: string
   readonly epoch: number
   readonly reported: Set<RunBarrierPhase>
   readonly kinds: Map<RunBarrierPhase, RunBarrierObservation["kind"]>
-  readonly waiters: Set<() => void>
+  readonly done: Deferred.Deferred<RunBarrierOutcome, RunBarrierCancelled | RunBarrierReportError>
   invalid: RunBarrierReportError | undefined
+  commitOutcome: RunBarrierCommitOutcome | undefined
 }
 
 const OBSERVATION_KINDS: Record<RunBarrierPhase, readonly RunBarrierObservation["kind"][]> = {
@@ -229,35 +174,47 @@ const OBSERVATION_KINDS: Record<RunBarrierPhase, readonly RunBarrierObservation[
   promotion: ["promotion"],
 }
 
+/** Maximum retained Session states. A draining barrier is never evicted. */
+export const RUN_BARRIER_MAX_SESSIONS = 1024
+
 function requireText(value: unknown, label: string, sessionID: string): string {
   if (typeof value !== "string" || value.length === 0) {
-    throw new RunBarrierReportError(sessionID, `run barrier report ${label} must be a non-empty string`)
+    throw new RunBarrierReportError({
+      sessionID,
+      message: `run barrier report ${label} must be a non-empty string`,
+    })
   }
   return value
 }
 
 function validateReport(sessionID: string, report: RunBarrierPhaseReport): RunBarrierPhaseReport {
   if (report === null || typeof report !== "object") {
-    throw new RunBarrierReportError(sessionID, "run barrier report must be an object")
+    throw new RunBarrierReportError({ sessionID, message: "run barrier report must be an object" })
   }
   if (report.sessionID !== sessionID) {
-    throw new RunBarrierReportError(
+    throw new RunBarrierReportError({
       sessionID,
-      `run barrier report for session ${sessionID} came from ${String(report.sessionID)}`,
-    )
+      message: `run barrier report for session ${sessionID} came from ${String(report.sessionID)}`,
+    })
   }
   if (!RUN_BARRIER_PHASES.includes(report.phase)) {
-    throw new RunBarrierReportError(sessionID, `run barrier report has unknown phase ${String(report.phase)}`)
+    throw new RunBarrierReportError({
+      sessionID,
+      message: `run barrier report has unknown phase ${String(report.phase)}`,
+    })
   }
   const observation = report.observation
   if (observation === null || typeof observation !== "object") {
-    throw new RunBarrierReportError(sessionID, `run barrier ${report.phase} report has no observation`)
+    throw new RunBarrierReportError({
+      sessionID,
+      message: `run barrier ${report.phase} report has no observation`,
+    })
   }
   if (!OBSERVATION_KINDS[report.phase].includes(observation.kind)) {
-    throw new RunBarrierReportError(
+    throw new RunBarrierReportError({
       sessionID,
-      `run barrier ${report.phase} report cannot use observation ${String(observation.kind)}`,
-    )
+      message: `run barrier ${report.phase} report cannot use observation ${String(observation.kind)}`,
+    })
   }
   switch (observation.kind) {
     case "commit":
@@ -279,45 +236,60 @@ function validateReport(sessionID: string, report: RunBarrierPhaseReport): RunBa
         observation.outcome !== "not-promoted" &&
         observation.outcome !== "no-job"
       ) {
-        throw new RunBarrierReportError(
+        throw new RunBarrierReportError({
           sessionID,
-          `run barrier promotion report has unknown outcome ${String(observation.outcome)}`,
-        )
+          message: `run barrier promotion report has unknown outcome ${String(observation.outcome)}`,
+        })
       }
       break
   }
   return report
 }
 
-export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
-  const timeoutMs = options.timeoutMs ?? RUN_BARRIER_TIMEOUT_MS
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 1) {
-    throw new Error(`invalid run barrier timeout: ${timeoutMs} (expected a positive integer)`)
-  }
-  const scheduler = options.scheduler ?? defaultScheduler
-  const maxSessions = options.maxSessions ?? 1024
-  if (!Number.isInteger(maxSessions) || maxSessions < 1) {
-    throw new Error(`invalid run barrier session bound: ${maxSessions}`)
-  }
+/** The barrier surface every consumer uses. Only `wait` performs Effect work. */
+export interface Interface {
+  /**
+   * Open a fresh report set for a run. No phase is settled by this call: the
+   * caller must report each phase from the place that observed it.
+   */
+  readonly beginRun: (sessionID: string) => RunBarrierRun
+  /** Admit the next run only after all four phases were really reported. */
+  readonly wait: (sessionID: string) => Effect.Effect<RunBarrierOutcome, RunBarrierWaitError>
+  /** Cancel the active barrier (or the next one) for `sessionID`. */
+  readonly cancel: (sessionID: string) => void
+  readonly state: (sessionID: string) => RunBarrierState
+  /** Clear a timed-out/cancelled/drained state so a later run may be admitted. */
+  readonly reset: (sessionID: string) => void
+  /**
+   * Forget a barrier whose owning run can no longer settle (its worker was
+   * retired by a crash or terminate). Refuses a still-draining barrier: a live
+   * run keeps ownership of its drain. Idempotent.
+   */
+  readonly abandon: (sessionID: string) => void
+  /** Number of retained Session states (bounded). */
+  readonly size: number
+}
 
+export class Service extends Context.Service<Service, Interface>()("@opencode/RunBarrier") {}
+
+function makeBarrier(): Interface {
   const states = new Map<string, RunBarrierState>()
-  const failures = new Map<string, Error>()
-  const active = new Map<string, ActiveBarrier>()
+  const failures = new Map<string, RunBarrierWaitError>()
+  const active = new Map<string, RunRecord>()
   const runs = new Map<string, RunRecord>()
   let runEpoch = 0
 
   const stateOf = (sessionID: string): RunBarrierState => states.get(sessionID) ?? "idle"
 
-  const notify = (record: RunRecord): void => {
-    if (record.reported.size !== RUN_BARRIER_PHASES.length) return
-    for (const waiter of [...record.waiters]) waiter()
-    record.waiters.clear()
+  const finishRun = (record: RunRecord, outcome: RunBarrierOutcome): void => {
+    Deferred.doneUnsafe(record.done, Effect.succeed(outcome))
   }
 
   const makeRun = (record: RunRecord): RunBarrierRun => {
     const current = (): boolean => runs.get(record.sessionID)?.epoch === record.epoch && record.invalid === undefined
     const invalidate = (error: RunBarrierReportError): never => {
       record.invalid = error
+      Deferred.doneUnsafe(record.done, Effect.fail(error))
       throw error
     }
     const report = (input: RunBarrierPhaseReport): boolean => {
@@ -335,16 +307,23 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
       // claim a real observation and its explicit absence for the same phase.
       if (observed !== undefined && observed !== report.observation.kind) {
         return invalidate(
-          new RunBarrierReportError(
-            record.sessionID,
-            `run barrier tools report conflicts: ${observed} then ${report.observation.kind}`,
-          ),
+          new RunBarrierReportError({
+            sessionID: record.sessionID,
+            message: `run barrier ${report.phase} report conflicts: ${observed} then ${report.observation.kind}`,
+          }),
         )
       }
       record.kinds.set(report.phase, report.observation.kind)
+      if (report.phase === "commits") {
+        record.commitOutcome = {
+          committed: report.observation.kind === "commit" ? report.observation.messageID : null,
+        }
+      }
       if (!record.reported.has(report.phase)) {
         record.reported.add(report.phase)
-        notify(record)
+        if (record.reported.size === RUN_BARRIER_PHASES.length) {
+          finishRun(record, { sessionID: record.sessionID, status: "drained" })
+        }
       }
       return true
     }
@@ -364,6 +343,7 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
         report({ sessionID: record.sessionID, phase: "promotion", observation: { kind: "promotion", outcome } }),
       reported: (phase) => record.reported.has(phase),
       missing: () => RUN_BARRIER_PHASES.filter((phase) => !record.reported.has(phase)),
+      commitOutcome: () => record.commitOutcome,
     }
   }
 
@@ -372,7 +352,7 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
     states.delete(sessionID)
     states.set(sessionID, state)
     if (state !== "failed") failures.delete(sessionID)
-    while (states.size > maxSessions) {
+    while (states.size > RUN_BARRIER_MAX_SESSIONS) {
       let evicted = false
       for (const [key, value] of states) {
         if (key === sessionID || value === "draining") continue
@@ -386,158 +366,120 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
     }
   }
 
-  return {
-    beginRun(sessionID) {
-      if (sessionID.length === 0) throw new RunBarrierError("run barrier requires a non-empty sessionID")
-      if (active.has(sessionID) || stateOf(sessionID) === "draining") throw new RunBarrierBusyError(sessionID)
-      const record: RunRecord = {
-        sessionID,
-        epoch: ++runEpoch,
-        reported: new Set(),
-        kinds: new Map(),
-        waiters: new Set(),
-        invalid: undefined,
-      }
-      runs.set(sessionID, record)
-      return makeRun(record)
-    },
-    wait(sessionID: string, phases?: RunBarrierPhases) {
-      if (sessionID.length === 0) throw new RunBarrierError("run barrier requires a non-empty sessionID")
+  const failureOf = (sessionID: string): RunBarrierWaitError =>
+    failures.get(sessionID) ??
+    new RunBarrierReportError({
+      sessionID,
+      message: `run barrier for session ${sessionID} previously failed`,
+    })
 
-      const state = stateOf(sessionID)
-      if (state === "timed-out") return Promise.reject(new RunBarrierTimeout(sessionID, timeoutMs))
-      if (state === "failed") {
-        return Promise.reject(
-          failures.get(sessionID) ?? new RunBarrierError(`run barrier for session ${sessionID} previously failed`),
-        )
-      }
-      // A cancelled Session does not start a next run either; reset re-admits it.
-      if (state === "cancelled") return Promise.resolve({ sessionID, status: "cancelled" })
-      if (state === "draining") return Promise.reject(new RunBarrierBusyError(sessionID))
+  const beginRun = (sessionID: string): RunBarrierRun => {
+    if (sessionID.length === 0) {
+      throw new RunBarrierReportError({ sessionID, message: "run barrier requires a non-empty sessionID" })
+    }
+    if (active.has(sessionID) || stateOf(sessionID) === "draining") {
+      throw new RunBarrierBusyError({ sessionID })
+    }
+    const record: RunRecord = {
+      sessionID,
+      epoch: ++runEpoch,
+      reported: new Set(),
+      kinds: new Map(),
+      done: Deferred.makeUnsafe(),
+      invalid: undefined,
+      commitOutcome: undefined,
+    }
+    runs.set(sessionID, record)
+    return makeRun(record)
+  }
 
-      let run: RunRecord | undefined
-      if (phases === undefined) {
-        run = runs.get(sessionID)
-        if (run === undefined) {
-          const error = new RunBarrierMissingReportError(sessionID, [...RUN_BARRIER_PHASES])
+  const wait = Effect.fn("RunBarrier.wait")(function* (sessionID: string) {
+    if (sessionID.length === 0) {
+      return yield* new RunBarrierReportError({ sessionID, message: "run barrier requires a non-empty sessionID" })
+    }
+
+    const state = stateOf(sessionID)
+    if (state === "timed-out") {
+      return yield* new RunBarrierTimeout({ sessionID, timeoutMs: RUN_BARRIER_TIMEOUT_MS })
+    }
+    if (state === "failed") return yield* failureOf(sessionID)
+    // A cancelled Session does not start a next run either; reset re-admits it.
+    if (state === "cancelled") return { sessionID, status: "cancelled" as const }
+    if (state === "draining") return yield* new RunBarrierBusyError({ sessionID })
+
+    const record = runs.get(sessionID)
+    if (record === undefined) {
+      const error = new RunBarrierMissingReportError({ sessionID, missing: [...RUN_BARRIER_PHASES] })
+      failures.set(sessionID, error)
+      remember(sessionID, "failed")
+      return yield* Effect.fail(error)
+    }
+    if (record.invalid !== undefined) {
+      failures.set(sessionID, record.invalid)
+      remember(sessionID, "failed")
+      return yield* Effect.fail(record.invalid)
+    }
+
+    remember(sessionID, "draining")
+    active.set(sessionID, record)
+
+    const outcome = yield* Deferred.await(record.done).pipe(
+      Effect.timeoutOrElse({
+        duration: RUN_BARRIER_TIMEOUT_MS,
+        orElse: () =>
+          Effect.suspend(() => {
+            active.delete(sessionID)
+            remember(sessionID, "timed-out")
+            return Effect.fail(new RunBarrierTimeout({ sessionID, timeoutMs: RUN_BARRIER_TIMEOUT_MS }))
+          }),
+      }),
+      Effect.catchTag("RunBarrier.Cancelled", () =>
+        Effect.sync(() => {
+          active.delete(sessionID)
+          remember(sessionID, "cancelled")
+          return { sessionID, status: "cancelled" as const }
+        }),
+      ),
+      Effect.catchTag("RunBarrier.Report", (error) =>
+        Effect.suspend(() => {
+          active.delete(sessionID)
           failures.set(sessionID, error)
           remember(sessionID, "failed")
-          return Promise.reject(error)
-        }
-        if (run.invalid !== undefined) {
-          failures.set(sessionID, run.invalid)
-          remember(sessionID, "failed")
-          return Promise.reject(run.invalid)
-        }
-      }
+          return Effect.fail(error)
+        }),
+      ),
+    )
 
-      remember(sessionID, "draining")
+    active.delete(sessionID)
+    // A cancel that landed while the drain completed still owns the state.
+    if (stateOf(sessionID) !== "cancelled") remember(sessionID, "drained")
+    return outcome
+  })
 
-      return new Promise<RunBarrierOutcome>((resolve, reject) => {
-        let settled = false
-        let timer: unknown
-        // Assigned below; referenced by `detach`/`fail` from callbacks that only
-        // run after the assignment.
-        let check: () => void = () => {}
-
-        const detach = (): void => {
-          if (run !== undefined) run.waiters.delete(check)
-        }
-
-        const finish = (outcome: RunBarrierOutcome): void => {
-          if (settled) return
-          settled = true
-          detach()
-          if (timer !== undefined) scheduler.cancel(timer)
-          timer = undefined
-          active.delete(sessionID)
-          remember(sessionID, outcome.status)
-          resolve(outcome)
-        }
-
-        const fail = (error: Error): void => {
-          if (settled) return
-          settled = true
-          detach()
-          if (timer !== undefined) scheduler.cancel(timer)
-          timer = undefined
-          active.delete(sessionID)
-          const state: RunBarrierState = error instanceof RunBarrierTimeout ? "timed-out" : "failed"
-          if (state === "failed") failures.set(sessionID, error)
-          remember(sessionID, state)
-          reject(error)
-        }
-
-        const settleCancelled = (): void => finish({ sessionID, status: "cancelled" })
-        active.set(sessionID, { settleCancelled })
-
-        timer = scheduler.schedule(() => fail(new RunBarrierTimeout(sessionID, timeoutMs)), timeoutMs)
-
-        check = (): void => {
-          if (settled) return
-          if (stateOf(sessionID) === "cancelled") {
-            settleCancelled()
-            return
-          }
-          if (run === undefined) return
-          if (run.invalid !== undefined) {
-            fail(run.invalid)
-            return
-          }
-          if (run.reported.size === RUN_BARRIER_PHASES.length) finish({ sessionID, status: "drained" })
-        }
-
-        if (phases !== undefined) {
-          Promise.all([phases.commits, phases.projectors, phases.tools, phases.promotion]).then(
-            () => {
-              // Cancellation wins: `cancel` ran before this continuation, so the
-              // active entry is either gone (already cancelled) or this check sees
-              // the cancelled state.
-              if (settled || stateOf(sessionID) === "cancelled") {
-                settleCancelled()
-                return
-              }
-              finish({ sessionID, status: "drained" })
-            },
-            (error: unknown) => {
-              // Phase failures are caller bugs and must not be swallowed; keep the
-              // barrier closed so the next run is not admitted after a broken drain.
-              if (settled) return
-              fail(error instanceof Error ? error : new RunBarrierError(String(error)))
-            },
-          )
-          return
-        }
-
-        // Report path: a run that never reports a phase stays draining until
-        // the bound expires. `check` also handles reports that landed before
-        // `wait` was called.
-        run!.waiters.add(check)
-        check()
-      })
-    },
+  return {
+    beginRun,
+    wait,
     cancel(sessionID) {
-      const current = active.get(sessionID)
-      if (current) {
-        // `settleCancelled` is idempotent via the `settled` flag in `wait`.
-        remember(sessionID, "cancelled")
-        current.settleCancelled()
-        return
-      }
+      const record = active.get(sessionID)
       remember(sessionID, "cancelled")
+      if (record !== undefined) {
+        Deferred.doneUnsafe(record.done, Effect.fail(new RunBarrierCancelled({ sessionID })))
+      }
     },
     state: stateOf,
     reset(sessionID) {
-      if (active.has(sessionID)) throw new RunBarrierBusyError(sessionID)
+      if (active.has(sessionID)) throw new RunBarrierBusyError({ sessionID })
       states.delete(sessionID)
       failures.delete(sessionID)
       runs.delete(sessionID)
     },
     abandon(sessionID) {
-      if (sessionID.length === 0) throw new RunBarrierError("run barrier requires a non-empty sessionID")
+      if (sessionID.length === 0) {
+        throw new RunBarrierReportError({ sessionID, message: "run barrier requires a non-empty sessionID" })
+      }
       // A live drain still owns the phases; abandoning it would let the next run
       // overtake work that is genuinely in flight.
-      if (active.has(sessionID)) throw new RunBarrierBusyError(sessionID)
+      if (active.has(sessionID)) throw new RunBarrierBusyError({ sessionID })
       states.delete(sessionID)
       failures.delete(sessionID)
       runs.delete(sessionID)
@@ -548,80 +490,13 @@ export function createRunBarrier(options: RunBarrierOptions = {}): RunBarrier {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Effect service shape.
-//
-// The `RunBarrier` service is the same barrier behavior expressed as an Effect
-// service. `createRunBarrier` stays the Promise adapter; every service method
-// lifts one operation without changing the report set, timeout, or cancellation
-// semantics. State stays in the adapter's closure.
-// ---------------------------------------------------------------------------
+/** Build the service. `layer` and the synchronous hub compatibility path use it. */
+export const make = Effect.sync(() => makeBarrier())
 
-/** The Effect-facing barrier surface. `barrier` is the Promise adapter. */
-export interface Interface {
-  readonly barrier: RunBarrier
-  readonly beginRun: (sessionID: string) => Effect.Effect<RunBarrierRun>
-  readonly wait: (sessionID: string, phases?: RunBarrierPhases) => Effect.Effect<RunBarrierOutcome>
-  readonly cancel: (sessionID: string) => Effect.Effect<void>
-  readonly state: (sessionID: string) => Effect.Effect<RunBarrierState>
-  readonly reset: (sessionID: string) => Effect.Effect<void>
-  readonly abandon: (sessionID: string) => Effect.Effect<void>
-  readonly size: number
-}
+/** Install the real barrier service; all state lives in this layer's closure. */
+export const layer = Layer.effect(Service, make)
 
-export class Service extends Context.Service<Service, Interface>()("@opencode/RunBarrier") {}
-
-/** Adapt the Promise barrier without owning, reordering, or retrying anything. */
-export function fromBarrier(barrier: RunBarrier): Interface {
-  const beginRun = Effect.fn("RunBarrier.beginRun")(function* (sessionID: string) {
-    return barrier.beginRun(sessionID)
-  })
-  const wait = Effect.fn("RunBarrier.wait")(function* (sessionID: string, phases?: RunBarrierPhases) {
-    return yield* Effect.promise(() =>
-      phases === undefined ? barrier.wait(sessionID) : barrier.wait(sessionID, phases),
-    )
-  })
-  const cancel = Effect.fn("RunBarrier.cancel")(function* (sessionID: string) {
-    barrier.cancel(sessionID)
-  })
-  const state = Effect.fn("RunBarrier.state")(function* (sessionID: string) {
-    return barrier.state(sessionID)
-  })
-  const reset = Effect.fn("RunBarrier.reset")(function* (sessionID: string) {
-    barrier.reset(sessionID)
-  })
-  const abandon = Effect.fn("RunBarrier.abandon")(function* (sessionID: string) {
-    barrier.abandon(sessionID)
-  })
-  return {
-    barrier,
-    beginRun,
-    wait,
-    cancel,
-    state,
-    reset,
-    abandon,
-    get size() {
-      return barrier.size
-    },
-  }
-}
-
-/** Build a barrier; no resource needs a scope. */
-export function make(options: RunBarrierOptions = {}): Effect.Effect<Interface> {
-  return Effect.sync(() => fromBarrier(createRunBarrier(options)))
-}
-
-/** Install a `RunBarrier` implementation into the context. */
-export function layer(options: RunBarrierOptions = {}): Layer.Layer<Service> {
-  return Layer.effect(Service, make(options))
-}
-
-/** The unbound graph node for {@link Service}; this lane does not wire a consumer. */
-export function node(options: RunBarrierOptions = {}): LayerNode.Node<Service, never, undefined> {
-  return LayerNode.make({ service: Service, layer: layer(options), deps: [] })
-}
+/** The unbound graph node for {@link Service}. */
+export const node = LayerNode.make({ service: Service, layer, deps: [] })
 
 export * as RunBarrier from "./run-barrier"
-
-export * as SessionRunBarrier from "./run-barrier"

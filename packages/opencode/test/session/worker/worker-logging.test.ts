@@ -5,8 +5,8 @@
 //
 //   (a) `workerLoggingLayer` attaches the main file sink (unit);
 //   (b) a worker graph built with `logging` captures logs emitted inside it;
-//   (c) `workerBridgeLogger(snapshot, logging)` forwards its `session workers[...]`
-//       lifecycle line to the sink;
+//   (c) `workerLogBridge(snapshot, logging)` routes an `Effect.log*` event to
+//       the sink with the `session workers[...]` prefix;
 //   (d) a `createSessionWork` run that dies logs one Error line with the
 //       sessionID + cause before the original defect is re-raised.
 
@@ -24,8 +24,8 @@ import {
 } from "@/session/worker/layer"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionID } from "@/session/schema"
-import { createSessionWork, workerBridgeLogger } from "@/session/worker/session-worker"
-import { workerLogMessage } from "@/session/worker/log"
+import { createSessionWork, workerLogBridge } from "@/session/worker/session-worker"
+import { workerLogMessage } from "@/session/worker/worker-logging"
 import { workerSnapshot } from "../../lib/snapshot"
 
 const sid = (value: string) => SessionID.make(value)
@@ -114,12 +114,12 @@ describe("worker logging (b): worker graph logging layer", () => {
   })
 })
 
-describe("worker logging (c): workerBridgeLogger forwarding", () => {
+describe("worker logging (c): worker log bridge forwarding", () => {
   test("writes the session workers[...] line to the sink file", async () => {
     const { file, dispose } = await tempLog()
     try {
-      const log = workerBridgeLogger(workerSnapshot(), workerLoggingLayer({ file, id: "worker-bridge" }))
-      log(workerLogMessage("pool resolved"), { sessionID: "ses_abc" })
+      const bridge = workerLogBridge(workerSnapshot(), workerLoggingLayer({ file, id: "worker-bridge" }))
+      bridge.fork(Effect.logInfo(workerLogMessage("pool resolved"), { sessionID: "ses_abc" }))
 
       const text = await readUntil(file, "session workers[abc]: pool resolved")
       expect(text).toContain("session workers[abc]: pool resolved")

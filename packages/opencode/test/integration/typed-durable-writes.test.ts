@@ -1,8 +1,8 @@
 // Typed durable-write primitives.
 //
 // The durable log has exactly one typed write boundary:
-// `Bus.DurableRepository`. EventV2 and Bus must issue every `event`,
-// `event_sequence`, and `event_blob` write through it, and the worker-facing Bus
+// `DurableLog.DurableRepository`. EventV2 and DurableLog must issue every `event`,
+// `event_sequence`, and `event_blob` write through it, and the worker-facing DurableLog
 // capability must expose only typed operations (no connection/transaction
 // handles). These tests drive the real SQLite and worker paths.
 
@@ -15,7 +15,7 @@ import { Effect, Layer, Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import { Session } from "@opencode-ai/schema/session"
 import { SessionV1 } from "@opencode-ai/schema/session-v1"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { Database as DatabaseService } from "@opencode-ai/core/database/database"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -62,6 +62,39 @@ const LEGACY_DDL = `
   );
 `
 
+const WORKER_DDL = `
+  CREATE TABLE event_sequence (
+    aggregate_id text PRIMARY KEY,
+    seq integer NOT NULL,
+    owner_id text,
+    worker_owner_id text,
+    worker_heartbeat_at integer,
+    worker_expires_at integer
+  );
+  CREATE TABLE event (
+    id text PRIMARY KEY,
+    aggregate_id text NOT NULL,
+    seq integer NOT NULL,
+    type text NOT NULL,
+    data text NOT NULL,
+    CONSTRAINT fk_event_aggregate FOREIGN KEY (aggregate_id)
+      REFERENCES event_sequence(aggregate_id) ON DELETE CASCADE
+  );
+  CREATE UNIQUE INDEX event_aggregate_seq_idx ON event(aggregate_id, seq);
+  CREATE TABLE event_blob (
+    aggregate_id text NOT NULL,
+    seq integer NOT NULL,
+    type text NOT NULL,
+    hash text NOT NULL,
+    size integer NOT NULL,
+    data text,
+    file_path text,
+    PRIMARY KEY (aggregate_id, seq),
+    CONSTRAINT fk_event_blob_aggregate FOREIGN KEY (aggregate_id)
+      REFERENCES event_sequence(aggregate_id) ON DELETE CASCADE
+  );
+`
+
 const directories: string[] = []
 const natives: Database[] = []
 const workers: WorkerDatabase[] = []
@@ -72,7 +105,7 @@ function workspace(): string {
   return directory
 }
 
-function connectionFrom(native: Database): Bus.Connection {
+function connectionFrom(native: Database): DurableLog.Connection {
   return {
     all: (sql, params = []) => native.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>,
     run: (sql, params = []) => ({ changes: Number(native.query(sql).run(...(params as never[])).changes) }),
@@ -93,7 +126,23 @@ function openLegacy() {
     blobDir: path.join(directory, "blobs"),
     native,
     connection: { ...connectionFrom(native), filename },
-  } satisfies { directory: string; filename: string; blobDir: string; native: Database; connection: Bus.Connection }
+  } satisfies { directory: string; filename: string; blobDir: string; native: Database; connection: DurableLog.Connection }
+}
+
+function openWorker() {
+  const directory = workspace()
+  const filename = path.join(directory, "durable-worker.db")
+  const native = new Database(filename, { create: true })
+  native.exec(WORKER_DDL)
+  native.exec("PRAGMA foreign_keys = ON")
+  natives.push(native)
+  return {
+    directory,
+    filename,
+    blobDir: path.join(directory, "blobs"),
+    native,
+    connection: { ...connectionFrom(native), filename },
+  } satisfies { directory: string; filename: string; blobDir: string; native: Database; connection: DurableLog.Connection }
 }
 
 function migratedWorkerFile(): string {
@@ -129,7 +178,7 @@ afterEach(async () => {
 describe("typed repository: durable write boundary", () => {
   test("appendSequence/appendEvent/advanceSequence write only through typed methods", () => {
     const database = openLegacy()
-    const repository = Bus.createDurableRepository(database.connection)
+    const repository = DurableLog.createDurableRepository(database.connection)
 
     // No raw statement surface leaks from the boundary.
     expect(repository).not.toHaveProperty("run")
@@ -168,12 +217,12 @@ describe("typed repository: durable write boundary", () => {
     expect(database.connection.all("SELECT seq FROM event_sequence WHERE aggregate_id = ?", ["s1"])).toEqual([{ seq: 2 }])
   })
 
-  test("appendBlob records a content-addressed row that Bus reads back", () => {
+  test("appendBlob records a content-addressed row that DurableLog reads back", () => {
     const database = openLegacy()
-    const repository = Bus.createDurableRepository(database.connection)
+    const repository = DurableLog.createDurableRepository(database.connection)
     const payload = JSON.stringify(note("s1", oversized("typed-blob")))
-    const hash = Bus.digest(payload)
-    Bus.writeBlobFile(database.blobDir, hash, payload)
+    const hash = DurableLog.digest(payload)
+    DurableLog.writeBlobFile(database.blobDir, hash, payload)
 
     repository.appendSequence({ aggregateID: "s1", block: 1 })
     repository.appendBlob({
@@ -192,7 +241,7 @@ describe("typed repository: durable write boundary", () => {
       data: { __eventBlob: hash, size: Buffer.byteLength(payload) },
     })
 
-    const bus = Bus.create({
+    const bus = DurableLog.create({
       repository,
       ownerID: "typed-blob-gen",
       definitions: [Note],
@@ -206,13 +255,13 @@ describe("typed repository: durable write boundary", () => {
 
 describe("typed repository: lease methods fence the write path", () => {
   test("claimLease is owner-exclusive and reclaimLease bumps only at the expected sequence", () => {
-    const database = openLegacy()
-    const first = Bus.createDurableRepository(database.connection)
-    const second = Bus.createDurableRepository({ ...database.connection, filename: database.filename })
+    const database = openWorker()
+    const first = DurableLog.createDurableRepository(database.connection)
+    const second = DurableLog.createDurableRepository({ ...database.connection, filename: database.filename })
 
     first.claimLease({ aggregateID: "s1", ownerID: "gen-1", leaseTimeoutMs: 0 })
     expect(() => second.claimLease({ aggregateID: "s1", ownerID: "gen-2", leaseTimeoutMs: 0 })).toThrow(
-      Bus.StaleOwnerError,
+      DurableLog.StaleOwnerError,
     )
     expect(() =>
       second.reclaimLease({
@@ -222,7 +271,7 @@ describe("typed repository: lease methods fence the write path", () => {
         nextOwnerID: "gen-2",
         leaseTimeoutMs: 0,
       }),
-    ).toThrow(Bus.LeaseConflictError)
+    ).toThrow(DurableLog.LeaseConflictError)
     expect(
       second.reclaimLease({
         aggregateID: "s1",
@@ -232,10 +281,11 @@ describe("typed repository: lease methods fence the write path", () => {
         leaseTimeoutMs: 0,
       }),
     ).toBe(1)
-    expect(first.sequence("s1")?.syncOwnerID).toBe("gen-2")
+    expect(first.sequence("s1")?.workerOwnerID).toBe("gen-2")
+    expect(first.sequence("s1")?.syncOwnerID).toBeUndefined()
   })
 
-  test("the worker Bus exposes only typed operations and fences a stale generation", async () => {
+  test("the worker DurableLog exposes only typed operations and fences a stale generation", async () => {
     const filename = migratedWorkerFile()
     const database = await Effect.runPromise(openWorkerDatabase({ filename, sessionID: "session-typed" }))
     workers.push(database)
@@ -262,7 +312,7 @@ describe("typed repository: lease methods fence the write path", () => {
       definitions: [Note],
       aggregateID: "session-typed",
     })
-    expect(() => successor.claim("session-typed")).toThrow(Bus.StaleOwnerError)
+    expect(() => successor.claim("session-typed")).toThrow(DurableLog.StaleOwnerError)
 
     handle.release("session-typed")
     expect(
@@ -276,12 +326,12 @@ describe("typed repository: lease methods fence the write path", () => {
   })
 })
 
-describe("typed repository: Bus injection and refcounted GC", () => {
-  test("Bus.create accepts the typed repository alone and publishes through it", () => {
+describe("typed repository: DurableLog injection and refcounted GC", () => {
+  test("DurableLog.create accepts the typed repository alone and publishes through it", () => {
     const database = openLegacy()
-    const base = Bus.createDurableRepository(database.connection)
+    const base = DurableLog.createDurableRepository(database.connection)
     const calls = { appendSequence: 0, appendEvent: 0, appendBlob: 0, renewLease: 0 }
-    const spy: Bus.DurableRepository = {
+    const spy: DurableLog.DurableRepository = {
       ...base,
       appendSequence: (input) => {
         calls.appendSequence += 1
@@ -300,7 +350,7 @@ describe("typed repository: Bus injection and refcounted GC", () => {
         return base.renewLease(input)
       },
     }
-    const bus = Bus.create({
+    const bus = DurableLog.create({
       repository: spy,
       ownerID: "gen-typed",
       definitions: [Note],
@@ -324,18 +374,18 @@ describe("typed repository: Bus injection and refcounted GC", () => {
   test("the frame-aligned 4 MiB inline bound is the default and above it offloads by reference", () => {
     // The D16 inline bound must not exceed the worker egress frame cap (4 MiB),
     // or an event that fits SQLite could never cross the events port.
-    expect(Bus.DEFAULT_BLOB_LIMIT_BYTES).toBe(4 * 1024 * 1024)
+    expect(DurableLog.DEFAULT_BLOB_LIMIT_BYTES).toBe(4 * 1024 * 1024)
 
     const database = openLegacy()
-    const bus = Bus.create({
+    const bus = DurableLog.create({
       connection: database.connection,
       ownerID: "gen-4mib",
       definitions: [Note],
       blobDir: database.blobDir,
     })
     expect(bus.read({ aggregateID: "s1" })).toEqual([])
-    expect(Bus.isBlobReference({ __eventBlob: "0".repeat(64), size: 4 * 1024 * 1024 + 1 })).toBe(true)
-    expect(Bus.isBlobReference({ __eventBlob: "0".repeat(64) })).toBe(false)
+    expect(DurableLog.isBlobReference({ __eventBlob: "0".repeat(64), size: 4 * 1024 * 1024 + 1 })).toBe(true)
+    expect(DurableLog.isBlobReference({ __eventBlob: "0".repeat(64) })).toBe(false)
   })
 })
 
@@ -344,7 +394,10 @@ describe("EventV2 uses the typed durable path", () => {
     const filename = migratedWorkerFile()
     const blobDir = path.join(path.dirname(filename), "event-blobs")
     const sessionID = Session.ID.create()
-    const layer = EventV2.layerWith({ blobDir }).pipe(Layer.provide(DatabaseService.layerFromPath(filename)))
+    const layer = EventV2.layerWith({ blobDir }).pipe(
+      Layer.provide(DurableLog.layerFromDatabase),
+      Layer.provide(DatabaseService.layerFromPath(filename)),
+    )
 
     await Effect.runPromise(
       Effect.scoped(

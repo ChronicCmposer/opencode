@@ -1,8 +1,8 @@
 // Shared dependency-free replacements for the production session-hub node.
 //
-// `productionSessionHubNode()` declares nine service deps (Config, Auth,
+// `productionSessionHubNode()` declares ten service deps (Config, Auth,
 // ModelsDev, Provider, RuntimeFlags, SessionStatus, Permission, Question,
-// EventV2Bridge). Suites that only exercise the node's wiring replaced them one
+// EventV2Bridge, RunBarrier). Suites that only exercise the node's wiring replaced them one
 // by one, which drifted between files. This module is the single source: each
 // entry is a dependency-free mock (or, for RuntimeFlags, the real layer) so the
 // node builds without touching the filesystem, network, or a real hub.
@@ -23,6 +23,7 @@ import { Question } from "@/question"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Provider } from "@/provider/provider"
 import { SessionStatus } from "@/session/status"
+import { RunBarrier } from "@/session/run-barrier"
 
 /** Per-service overrides for {@link productionServiceReplacements}. */
 export interface ProductionServiceDepsOptions {
@@ -82,5 +83,6 @@ export function productionServiceReplacements(
       EventV2Bridge.node,
       Layer.mock(EventV2Bridge.Service, { publishLive: () => Effect.void, ...options.eventV2Bridge }),
     ],
+    [RunBarrier.node, RunBarrier.layer],
   ]
 }

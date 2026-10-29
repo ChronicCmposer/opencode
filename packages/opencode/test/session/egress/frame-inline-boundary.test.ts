@@ -9,7 +9,7 @@
 //
 // The two halves of the defense are covered here:
 //   1. the hub resolver recovers an inline body and republishes it exactly once;
-//   2. the Bus default inline bound leaves envelope headroom, so a payload this
+//   2. the DurableLog default inline bound leaves envelope headroom, so a payload this
 //      close to the cap is offloaded by reference before egress.
 
 import fs from "node:fs"
@@ -17,7 +17,7 @@ import os from "node:os"
 import path from "node:path"
 import { afterEach, describe, expect, test } from "bun:test"
 import { Schema } from "effect"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { Event } from "@opencode-ai/schema/event"
 import type { LiveEvent, LiveEventPublisher } from "@/event-v2-bridge"
@@ -128,8 +128,8 @@ describe("inline durable event at the frame boundary", () => {
 
     // The body is inline: under the D16 schema bound but above the headroom-
     // aware default, with no event_blob row.
-    expect(Buffer.byteLength(stored)).toBeGreaterThan(Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES)
-    expect(Buffer.byteLength(stored)).toBeLessThanOrEqual(Bus.DEFAULT_BLOB_LIMIT_BYTES)
+    expect(Buffer.byteLength(stored)).toBeGreaterThan(DurableLog.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES)
+    expect(Buffer.byteLength(stored)).toBeLessThanOrEqual(DurableLog.DEFAULT_BLOB_LIMIT_BYTES)
     db.connection.run("INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)", [
       event.id,
       AGGREGATE,
@@ -171,13 +171,13 @@ describe("inline durable event at the frame boundary", () => {
     expect(live?.durable).toEqual({ aggregateID: AGGREGATE, seq: SEQ, version: 1 })
   })
 
-  test("the Bus default inline bound leaves envelope headroom and offloads by reference", () => {
+  test("the DurableLog default inline bound leaves envelope headroom and offloads by reference", () => {
     // A payload this close to the 4 MiB cap would not fit once framed; the
-    // default Bus bound must therefore reserve headroom and store it as a blob.
-    expect(Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES).toBeLessThan(MAX_WORKER_FRAME_BYTES)
+    // default DurableLog bound must therefore reserve headroom and store it as a blob.
+    expect(DurableLog.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES).toBeLessThan(MAX_WORKER_FRAME_BYTES)
 
     const db = fixture()
-    const bus = Bus.create({
+    const bus = DurableLog.create({
       connection: db.connection,
       ownerID: "gen-inline-boundary",
       definitions: [Note],

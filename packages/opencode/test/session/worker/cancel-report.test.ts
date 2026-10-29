@@ -9,13 +9,11 @@ import { createCancelReporter } from "@/session/worker/cancel-report"
 
 const dispatcher = { cancelWithGrace: async () => undefined } as unknown as Dispatcher
 const noChildren = () => []
-const log = () => {}
 
 function reporter(options: { readonly maxSessions?: number; readonly children?: (id: SessionID) => SessionID[] } = {}) {
   return createCancelReporter({
     dispatcher: () => dispatcher,
     childrenOf: options.children ?? noChildren,
-    log,
     ...(options.maxSessions === undefined ? {} : { maxSessions: options.maxSessions }),
   })
 }
@@ -48,7 +46,6 @@ describe("cancel reporter mode retention", () => {
           },
         }) as unknown as Dispatcher,
       childrenOf: (id) => (id === parent ? [child] : id === child ? [grandchild] : []),
-      log,
     })
 
     state.recordCancelled(parent, "cooperative")

@@ -9,7 +9,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { afterEach, describe, expect, test } from "bun:test"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { encodeFrame, type DurableResyncPayload } from "@/session/egress/frame"
 import type { LiveEvent, LiveEventPublisher } from "@/event-v2-bridge"
@@ -78,8 +78,8 @@ function blobFixture(): BlobFixture {
   }
   const stored = JSON.stringify(big.properties)
   const blobDir = path.join(directory, "event-blobs")
-  const hash = Bus.digest(stored)
-  Bus.writeBlobFile(blobDir, hash, stored)
+  const hash = DurableLog.digest(stored)
+  DurableLog.writeBlobFile(blobDir, hash, stored)
   connection.run(
     "INSERT INTO event_blob (aggregate_id, seq, type, hash, size, data, file_path) VALUES (?, ?, ?, ?, ?, NULL, ?)",
     [AGGREGATE, SEQ, big.type, hash, Buffer.byteLength(stored), hash],
@@ -170,7 +170,7 @@ describe("hub resolves an oversized durable body before republish", () => {
 
   test("a corrupt blob row is healed by a typed resync instead of publishing garbage", async () => {
     const fixture = blobFixture()
-    // The row's filename is its content hash; tamper the bytes so the Bus's
+    // The row's filename is its content hash; tamper the bytes so the DurableLog's
     // re-hash fails before any payload is trusted.
     const [row] = fixture.connection.all<{ hash: string }>("SELECT hash FROM event_blob")
     fs.writeFileSync(path.join(fixture.blobDir, row!.hash), "tampered")

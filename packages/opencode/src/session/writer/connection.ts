@@ -2,7 +2,7 @@
 //
 // Each Session worker opens its own `bun:sqlite` handle through this module;
 // there is no writer isolate and no writer RPC. The implementation lives in
-// `@opencode-ai/core/database/connection` so the Bus, db-core, and the worker
+// `@opencode-ai/core/database/connection` so the DurableLog, db-core, and the worker
 // share one ownership/pragma/close contract. This module keeps the retained
 // names and the writer-specific pragma tuning.
 

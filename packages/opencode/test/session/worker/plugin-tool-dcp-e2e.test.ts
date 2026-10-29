@@ -64,7 +64,7 @@ import {
   type PluginToolExecuteInput,
 } from "@/session/worker/plugin-tool-wire"
 import { recordingHubAuthorities } from "../../lib/hub-proxy"
-import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
+import { createE2EContext, memoizeWorkerLayer, type E2EContext, type MemoizedWorkerLayer } from "../../lib/e2e-context"
 import { pluginPassThroughReplacement } from "../../lib/worker-plugin-routes"
 import { startMockProvider, type MockProviderHandle } from "../../lib/mock-provider"
 import { workerSnapshot } from "../../lib/snapshot"
@@ -219,28 +219,32 @@ const silentClients = (): Parameters<typeof buildSessionWorkerLayer>[0]["clients
   backgroundJob: { wait: async () => null, cancel: async () => {} },
 })
 
-/** The full worker graph over the E2E writer, with the real hub-proxy host. */
+/** The full worker graph over the E2E worker database, with the real hub-proxy host. */
 function workerLayer(
   snapshot: WorkerSnapshot,
   provider: MockProviderHandle,
+  database: E2EContext["database"],
   writer: Parameters<typeof buildSessionWorkerLayer>[0]["clients"]["writer"],
   plugins: ReturnType<typeof createWorkerPluginHost>,
   pluginTools: NonNullable<Parameters<typeof buildSessionWorkerLayer>[0]["pluginTools"]>,
-): Layer.Layer<unknown, unknown> {
+): MemoizedWorkerLayer {
   const config = modelConfig(provider)
-  return buildSessionWorkerLayer({
-    snapshot,
-    env: { values: {} },
-    clients: {
-      writer,
-      egress: { emit: () => {}, emitDurable: () => {} },
-      backgroundJob: { wait: async () => null, cancel: async () => {} },
-    },
-    modelClient: llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(snapshot, config))),
-    plugins,
-    pluginTools,
-    replacements: [...workerGraphReplacements(config), pluginPassThroughReplacement(plugins, pluginTools)],
-  }).layer
+  return memoizeWorkerLayer(
+    buildSessionWorkerLayer({
+      snapshot,
+      env: { values: {} },
+      clients: {
+        writer,
+        database,
+        egress: { emit: () => {}, emitDurable: () => {} },
+        backgroundJob: { wait: async () => null, cancel: async () => {} },
+      },
+      modelClient: llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(snapshot, config))),
+      plugins,
+      pluginTools,
+      replacements: [...workerGraphReplacements(config), pluginPassThroughReplacement(plugins, pluginTools)],
+    }).layer,
+  )
 }
 
 /** A minimal worker graph (no provider) for the registry-level cross-port test. */
@@ -356,25 +360,27 @@ describe("DCP parity: a hub plugin tool and the next transform share hub state",
     const snapshot = workerSnapshot({ directory })
     const ctx = createE2EContext({ snapshot, modelConfig: modelConfig(provider) })
     const proxy = startHubProxy(state)
+    let layer: MemoizedWorkerLayer | undefined
     try {
       const executor = hubProxyPluginTool(proxy.client)
       if (executor === undefined) throw new Error("hub proxy client did not yield a plugin-tool executor")
       const bridge = hubProxyMessagesTransform(proxy.client)
       if (bridge === undefined) throw new Error("hub proxy client did not yield a messages-transform bridge")
 
-      const layer = workerLayer(
+      layer = workerLayer(
         snapshot,
         provider,
+        ctx.database,
         ctx.writer,
         createWorkerPluginHost([], { messagesTransform: bridge }),
         { descriptors: [compressDescriptor], executor },
       )
-      const sessionID = await Effect.runPromise(seed(layer, ctx.instance, directory, provider.model))
+      const sessionID = await Effect.runPromise(seed(layer.layer, ctx.instance, directory, provider.model))
       await Effect.runPromise(
         Effect.gen(function* () {
           const prompt = yield* SessionPrompt.Service
           yield* prompt.loop({ sessionID })
-        }).pipe(Effect.provide(layer), Effect.provideService(InstanceRef, ctx.instance)),
+        }).pipe(Effect.provide(layer.layer), Effect.provideService(InstanceRef, ctx.instance)),
       )
 
       // Wait on the provider's own observation, never a sleep: the turn issues at
@@ -392,6 +398,7 @@ describe("DCP parity: a hub plugin tool and the next transform share hub state",
       const laterBodies = provider.requests.slice(1).map((request) => JSON.stringify(request.body))
       expect(laterBodies.some((body) => body.includes(SENTINEL))).toBe(true)
     } finally {
+      await layer?.dispose()
       proxy.dispose()
       await ctx.dispose()
       await provider.stop()

@@ -10,13 +10,22 @@
 //     reduced provider.
 
 import { describe, expect, test } from "bun:test"
-import { createProductionWorkerPool } from "@/session/worker/hub"
-import { createSessionBoundExecutorWorker } from "@/session/worker/hub"
+import { Effect, Scope } from "effect"
+import { createSessionBoundExecutorWorker, makeProduction } from "@/session/worker/hub"
+import type { ProductionWorkerPoolOptions } from "@/session/worker/hub"
+import type { ExecutorWorkerPool } from "@/session/worker/execute"
 import type { ExecutorWorker } from "@/session/worker/execute"
 import { pollUntil, sid } from "../lib/async"
 import { sessionWorkerInit } from "../lib/session-worker-init"
 
 const EXECUTOR_FIXTURE = new URL("../fixture/session-execute-worker.ts", import.meta.url)
+
+/** The one scoped production pool; `terminateAll` closes the isolate cache. */
+async function createProductionPool(options: ProductionWorkerPoolOptions): Promise<ExecutorWorkerPool> {
+  const scope = Effect.runSync(Scope.make())
+  const pools = await Effect.runPromise(Scope.provide(scope)(makeProduction(options)))
+  return pools.executorPool
+}
 
 const executionOf = (value: unknown): number | undefined =>
   typeof value === "object" && value !== null && "execution" in value
@@ -28,7 +37,7 @@ describe("model switch mid-session", () => {
     const sessionID = sid("ses_model_switch")
     let modelID = "model-a"
     const resolved: string[] = []
-    const pool = createProductionWorkerPool({
+    const pool = await createProductionPool({
       init: (id) => {
         const resolvedModel = String(id) === String(sessionID) ? modelID : `${modelID}-other`
         resolved.push(resolvedModel)
@@ -66,7 +75,7 @@ describe("model switch mid-session", () => {
   test("a switch back to the original model respawns again", async () => {
     const sessionID = sid("ses_model_switch_back")
     let modelID = "model-a"
-    const pool = createProductionWorkerPool({
+    const pool = await createProductionPool({
       init: () => sessionWorkerInit({ model: { providerID: modelID, modelID, apiId: modelID } }),
       entry: EXECUTOR_FIXTURE,
       workKind: "instant",
@@ -98,7 +107,7 @@ describe("production init single-flight", () => {
     const buildGate = new Promise<void>((resolve) => {
       releaseBuild = resolve
     })
-    const pool = createProductionWorkerPool({
+    const pool = await createProductionPool({
       init: async () => {
         builds += 1
         await buildGate
@@ -132,7 +141,7 @@ describe("production init single-flight", () => {
     const buildGate = new Promise<void>((resolve) => {
       releaseBuild = resolve
     })
-    const pool = createProductionWorkerPool({
+    const pool = await createProductionPool({
       init: async () => {
         builds += 1
         await buildGate
@@ -223,7 +232,7 @@ describe("generation changes retire the isolate even within one session", () => 
     const sessionID = sid("ses_production_generation_retire")
     const retired: Array<[string, number | undefined]> = []
     let generation = "model-a"
-    const pool = createProductionWorkerPool({
+    const pool = await createProductionPool({
       init: () =>
         sessionWorkerInit({ model: { providerID: generation, modelID: generation, apiId: generation } }),
       generationOf: () => generation,
@@ -251,7 +260,7 @@ describe("generation changes retire the isolate even within one session", () => 
     // read without the full init build. No requested model is carried.
     let persisted = "model-a"
     const resolved: string[] = []
-    const pool = createProductionWorkerPool({
+    const pool = await createProductionPool({
       init: () => {
         resolved.push(persisted)
         return sessionWorkerInit({ model: { providerID: persisted, modelID: persisted, apiId: persisted } })
@@ -281,7 +290,7 @@ describe("generation changes retire the isolate even within one session", () => 
   test("the requested model keys the generation and the init is built once", async () => {
     const sessionID = sid("ses_requested_model")
     let builds = 0
-    const pool = createProductionWorkerPool({
+    const pool = await createProductionPool({
       init: (_id, requested) => {
         builds += 1
         const selection = requested ?? { providerID: "model-a", modelID: "model-a" }

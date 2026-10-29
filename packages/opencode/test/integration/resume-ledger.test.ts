@@ -17,6 +17,7 @@ import { openConnection } from "@opencode-ai/core/database/connection"
 import { ensureProductionSchema } from "@/session/db/schema"
 import { MessageID } from "@/session/schema"
 import { createProductionSessionHub, type SessionHub, type WorkerCrashed } from "@/session/worker/hub"
+import { createTestBarrier } from "../lib/run-barrier-test"
 import { createDbExecutor } from "@/session/worker/db-executor"
 import { WorkerCrashedError } from "@/session/worker/dispatch"
 import { sessionWorkerInit } from "../lib/session-worker-init"
@@ -132,7 +133,7 @@ function startHub(input: {
   readonly workerData?: Record<string, unknown>
 }): HubFixture {
   const db = createDbExecutor({ filename: input.filename, timeoutMs: REAL_WORKER_TRANSPORT_TIMEOUT_MS })
-  const hub = createProductionSessionHub({
+  const hub = createProductionSessionHub({ ...{ barrier: createTestBarrier() },
     db,
     init: () =>
       ({

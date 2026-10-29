@@ -33,27 +33,23 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { createBunSqliteConnection } from "@/session/writer/connection"
 import { LEDGER_SQL, createToolCallLedger, type ToolCallLedgerHandle } from "@/session/ledger/tool-call"
 import { createLifecycleTracker, type LifecycleTracker } from "@/session/ledger/lifecycle"
-import {
-  RUN_BARRIER_TIMEOUT_MS,
-  RunBarrierTimeout,
-  createRunBarrier,
-  type RunBarrierPhases,
-  type RunBarrierScheduler,
-} from "@/session/run-barrier"
+import { RunBarrier, RunBarrierTimeout } from "@/session/run-barrier"
 import { createProductionSessionHub, type SessionHub } from "@/session/worker/hub"
+import { createTestBarrier } from "../lib/run-barrier-test"
 import { createDbExecutor } from "@/session/worker/db-executor"
 import { WorkerCrashedError } from "@/session/worker/dispatch"
 import { sessionWorkerInit } from "../lib/session-worker-init"
 import { workerSnapshot } from "../lib/snapshot"
 import { TestLLMServer } from "../lib/llm-server"
 import { testEffect } from "../lib/effect"
+import { drainRun, runBarrierLayer } from "../lib/run-barrier-test"
 import { sid } from "../lib/async"
 import {
   REAL_WORKER_IDLE_TIMEOUT_MS,
   REAL_WORKER_TEST_TIMEOUT_MS,
   REAL_WORKER_TRANSPORT_TIMEOUT_MS,
 } from "../lib/worker-timeouts"
-import { Effect, Layer, Schema } from "effect"
+import { Cause, Effect, Exit, Layer, Schema } from "effect"
 
 const callID = "call-p0"
 const sessionID = SessionID.make("ses_tool_p0")
@@ -148,37 +144,6 @@ function tool(execute: RegisteredTool["execute"]): RegisteredTool {
   } satisfies RegisteredTool
 }
 
-interface FakeClock {
-  readonly scheduler: RunBarrierScheduler
-  advance(ms: number): void
-}
-
-/** Deterministic barrier clock: only an explicit `advance` fires the bound. */
-function fakeClock(): FakeClock {
-  let now = 0
-  let nextID = 1
-  const timers = new Map<number, { readonly at: number; readonly run: () => void }>()
-  return {
-    scheduler: {
-      schedule: (run, delayMs) => {
-        const id = nextID++
-        timers.set(id, { at: now + delayMs, run })
-        return id
-      },
-      cancel: (handle) => void timers.delete(handle as number),
-    },
-    advance(ms) {
-      now += ms
-      for (const [id, timer] of [...timers.entries()]) {
-        if (timer.at <= now) {
-          timers.delete(id)
-          timer.run()
-        }
-      }
-    },
-  }
-}
-
 /** Drive the real lifecycle tracker through the promise-shaped reporting seam. */
 function reportingFor(lifecycle: LifecycleTracker) {
   return {
@@ -223,86 +188,87 @@ function run(execute: Awaited<ReturnType<typeof resolveTool>>) {
   return Promise.resolve(execute({}, { toolCallId: callID, abortSignal: new AbortController().signal, messages: [] }))
 }
 
-function settleRunPhases(lifecycle: LifecycleTracker) {
-  lifecycle.settlePhase(String(sessionID), "commits")
-  lifecycle.settlePhase(String(sessionID), "projectors")
-  lifecycle.settlePhase(String(sessionID), "promotion")
-  if (lifecycle.indeterminate(String(sessionID)).length === 0) {
-    lifecycle.settlePhase(String(sessionID), "tools")
-  }
-}
+const barrierIt = testEffect(runBarrierLayer)
 
 /**
- * A finished run waits on the real barrier. The fake clock is advanced only
- * after every phase microtask has had a chance to settle, so a drained barrier
- * cancels its timer instead of racing the timeout.
+ * A finished run reports through the real barrier. This test observed no
+ * durable commit, and an interrupted tool must leave no indeterminate call, so
+ * commit-side phases settle as an explicit `none` and `tools` as `noTools`.
  */
-async function finishRun(barrier: ReturnType<typeof createRunBarrier>, lifecycle: LifecycleTracker, clock: FakeClock) {
-  settleRunPhases(lifecycle)
-  const pending = barrier.wait(String(sessionID), lifecycle.phases(String(sessionID)) as RunBarrierPhases)
-  await new Promise<void>((resolve) => setTimeout(resolve, 0))
-  clock.advance(RUN_BARRIER_TIMEOUT_MS)
-  return pending
+function finishRun(barrier: RunBarrier.Interface, lifecycle: LifecycleTracker) {
+  const inFlight = lifecycle.indeterminate(String(sessionID))
+  return drainRun(barrier, String(sessionID), {
+    commit: null,
+    tools: inFlight.length === 0 ? "none" : inFlight.map((call) => call.callID),
+  })
 }
 
 describe("interrupted tool finishes and releases the run barrier", () => {
-  test("an interrupted side-effecting tool finishes `error` and the next run is admitted", async () => {
-    const { ledger } = ledgerForTest()
-    const lifecycle = createLifecycleTracker()
-    const clock = fakeClock()
-    const barrier = createRunBarrier({ scheduler: clock.scheduler })
-    const execute = await resolveTool(tool(() => Effect.interrupt), ledger, lifecycle)
+  barrierIt.effect("an interrupted side-effecting tool finishes `error` and the next run is admitted", () =>
+    Effect.gen(function* () {
+      const { ledger } = ledgerForTest()
+      const lifecycle = createLifecycleTracker()
+      const barrier = yield* RunBarrier.Service
+      const execute = yield* Effect.promise(() => resolveTool(tool(() => Effect.interrupt), ledger, lifecycle))
 
-    await expect(run(execute)).rejects.toThrow()
+      expect(Exit.isFailure(yield* Effect.exit(Effect.promise(() => run(execute))))).toBe(true)
 
-    // RED (before the fix): the row stays `started` and the call stays in flight.
-    expect(ledger.list(String(sessionID))).toEqual([
-      expect.objectContaining({ callID: ledgerKey, state: "finished", outcome: "error" }),
-    ])
-    expect(ledger.indeterminate(String(sessionID))).toEqual([])
-    expect(lifecycle.indeterminate(String(sessionID))).toEqual([])
+      // RED (before the fix): the row stays `started` and the call stays in flight.
+      expect(ledger.list(String(sessionID))).toEqual([
+        expect.objectContaining({ callID: ledgerKey, state: "finished", outcome: "error" }),
+      ])
+      expect(ledger.indeterminate(String(sessionID))).toEqual([])
+      expect(lifecycle.indeterminate(String(sessionID))).toEqual([])
 
-    await expect(finishRun(barrier, lifecycle, clock)).resolves.toEqual({
-      sessionID: String(sessionID),
-      status: "drained",
-    })
-    expect(barrier.state(String(sessionID))).toBe("drained")
+      expect(yield* finishRun(barrier, lifecycle)).toEqual({
+        sessionID: String(sessionID),
+        status: "drained",
+      })
+      expect(barrier.state(String(sessionID))).toBe("drained")
 
-    // The run after a cancelled tool is admitted; it is not refused forever.
-    await expect(finishRun(barrier, lifecycle, clock)).resolves.toEqual({
-      sessionID: String(sessionID),
-      status: "drained",
-    })
-  })
+      // The run after a cancelled tool is admitted; it is not refused forever.
+      expect(yield* finishRun(barrier, lifecycle)).toEqual({
+        sessionID: String(sessionID),
+        status: "drained",
+      })
+    }),
+  )
 
-  test("a defect also finishes the row instead of leaving it pending", async () => {
-    const { ledger } = ledgerForTest()
-    const lifecycle = createLifecycleTracker()
-    const execute = await resolveTool(tool(() => Effect.die(new Error("simulated tool defect"))), ledger, lifecycle)
+  barrierIt.effect("a defect also finishes the row instead of leaving it pending", () =>
+    Effect.gen(function* () {
+      const { ledger } = ledgerForTest()
+      const lifecycle = createLifecycleTracker()
+      const execute = yield* Effect.promise(() =>
+        resolveTool(tool(() => Effect.die(new Error("simulated tool defect"))), ledger, lifecycle),
+      )
 
-    await expect(run(execute)).rejects.toThrow()
+      expect(Exit.isFailure(yield* Effect.exit(Effect.promise(() => run(execute))))).toBe(true)
 
-    expect(ledger.list(String(sessionID))).toEqual([
-      expect.objectContaining({ callID: ledgerKey, state: "finished", outcome: "error" }),
-    ])
-    expect(lifecycle.indeterminate(String(sessionID))).toEqual([])
-  })
+      expect(ledger.list(String(sessionID))).toEqual([
+        expect.objectContaining({ callID: ledgerKey, state: "finished", outcome: "error" }),
+      ])
+      expect(lifecycle.indeterminate(String(sessionID))).toEqual([])
+    }),
+  )
 
-  test("an interrupted tool cannot leave a timed-out barrier behind", async () => {
-    const { ledger } = ledgerForTest()
-    const lifecycle = createLifecycleTracker()
-    const clock = fakeClock()
-    const barrier = createRunBarrier({ scheduler: clock.scheduler })
-    const execute = await resolveTool(tool(() => Effect.interrupt), ledger, lifecycle)
+  barrierIt.effect("an interrupted tool cannot leave a timed-out barrier behind", () =>
+    Effect.gen(function* () {
+      const { ledger } = ledgerForTest()
+      const lifecycle = createLifecycleTracker()
+      const barrier = yield* RunBarrier.Service
+      const execute = yield* Effect.promise(() => resolveTool(tool(() => Effect.interrupt), ledger, lifecycle))
 
-    await expect(run(execute)).rejects.toThrow()
-    const first = await finishRun(barrier, lifecycle, clock)
-    expect(first.status).toBe("drained")
-    expect(barrier.state(String(sessionID))).not.toBe("timed-out")
+      expect(Exit.isFailure(yield* Effect.exit(Effect.promise(() => run(execute))))).toBe(true)
+      const first = yield* finishRun(barrier, lifecycle)
+      expect(first.status).toBe("drained")
+      expect(barrier.state(String(sessionID))).not.toBe("timed-out")
 
-    const rejected = await finishRun(barrier, lifecycle, clock).catch((error: unknown) => error)
-    expect(rejected).not.toBeInstanceOf(RunBarrierTimeout)
-  })
+      const second = yield* Effect.exit(finishRun(barrier, lifecycle))
+      expect(Exit.isSuccess(second)).toBe(true)
+      if (Exit.isFailure(second)) expect(Cause.squash(second.cause)).not.toBeInstanceOf(RunBarrierTimeout)
+      expect(barrier.state(String(sessionID))).toBe("drained")
+    }),
+  )
 })
 
 describe("same-transaction result + finish", () => {
@@ -463,7 +429,7 @@ function startHub(input: {
   readonly env?: Record<string, string | undefined>
 }): RealHubFixture {
   const db = createDbExecutor({ filename: input.filename, timeoutMs: REAL_WORKER_TRANSPORT_TIMEOUT_MS })
-  const hub = createProductionSessionHub({
+  const hub = createProductionSessionHub({ ...{ barrier: createTestBarrier() },
     db,
     init: () =>
       ({

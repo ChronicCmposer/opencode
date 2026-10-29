@@ -30,6 +30,7 @@ import type { Permission } from "@/permission"
 import type { Question } from "@/question"
 import type { SessionStatus } from "@/session/status"
 import { cancelSessionTree, type SessionPrompt } from "@/session/prompt"
+import { SessionPromptService } from "@/session/prompt-service"
 import { MessageID, SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { markSchemaIdentity } from "@/session/db/schema"
@@ -61,9 +62,7 @@ const PROJECT = "prj_session_hub"
 const DIRECTORIES: string[] = []
 const CLEANUPS: Array<() => void | Promise<void>> = []
 
-/** The prompt authority's string key, exactly as the hub resolver reads it. */
-const SessionPromptService = Context.Service<SessionPrompt.Interface>("@opencode/SessionPrompt")
-
+/** The prompt authority's shared service key, exactly as the hub resolver reads it. */
 function workspace(): string {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-session-hub-"))
   DIRECTORIES.push(directory)
@@ -153,7 +152,7 @@ function recordingPrompt(
   sessions: Session.Interface,
   prompts: SessionPrompt.PromptInput[],
   cancelOrder: SessionID[],
-): SessionPrompt.Interface {
+): SessionPromptService.Interface {
   return {
     prompt: (input: SessionPrompt.PromptInput) =>
       Effect.sync(() => {
@@ -169,13 +168,13 @@ function recordingPrompt(
             return cancelOutcome(id)
           }),
       })(sessionID),
-  } as unknown as SessionPrompt.Interface
+  } as unknown as SessionPromptService.Interface
 }
 
 async function openHub(
   filename: string,
   directory: string,
-  makePrompt: (sessions: Session.Interface) => SessionPrompt.Interface,
+  makePrompt: (sessions: Session.Interface) => SessionPromptService.Interface,
 ): Promise<{ readonly sessions: Session.Interface; readonly run: HubProxyRunner }> {
   const hubLayer = LayerNode.compile(
     LayerNode.group([
@@ -208,7 +207,7 @@ async function openHub(
       effect.pipe(
         Effect.provide(hubContext),
         Effect.provideService(InstanceRef, instance),
-        Effect.provideService(SessionPromptService, prompt),
+        Effect.provideService(SessionPromptService.Service, prompt),
       ),
     )
   return { sessions, run }
@@ -866,13 +865,13 @@ describe("session-hub boundary", () => {
     } as unknown as Session.Interface
     const fakePrompt = {
       cancel: (sessionID: SessionID) => Effect.succeed(cancelOutcome(sessionID)),
-    } as unknown as SessionPrompt.Interface
+    } as unknown as SessionPromptService.Interface
     const boundless = hubProxyAuthoritiesFor({
       run: (effect) =>
         Effect.runPromise(
           effect.pipe(
             Effect.provideService(Session.Service, fakeSessions),
-            Effect.provideService(SessionPromptService, fakePrompt),
+            Effect.provideService(SessionPromptService.Service, fakePrompt),
           ),
         ),
       boundSessionID: undefined,

@@ -22,7 +22,9 @@ import { Effect, Layer, ManagedRuntime, Schema } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { EventV2 } from "@opencode-ai/core/event"
+import { durableLogStub } from "./durable-log-stub"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { EventV2Bridge, createLiveEventPublisher, type LiveEventPublisher } from "@/event-v2-bridge"
@@ -83,7 +85,7 @@ const LiveDelta = EventV2.define({
 })
 
 const databaseStub = Layer.succeed(Database.Service, { db: {} as never })
-const eventLayer = EventV2.layerWith().pipe(Layer.provide(databaseStub))
+const eventLayer = EventV2.layerWith().pipe(Layer.provide(durableLogStub), Layer.provide(databaseStub))
 
 const script: SessionScript = { name: "deterministic-stream", prompt: "hello" }
 
@@ -251,6 +253,7 @@ interface HubBridge {
 async function createHubBridge(context: ParityRunContext): Promise<HubBridge> {
   const layer = AppNodeBuilder.build(LayerNode.group([EventV2.node, EventV2Bridge.node, SessionStatus.node]), [
     [Database.node, databaseStub],
+    [DurableLog.node, durableLogStub],
   ])
   const runtime = ManagedRuntime.make(layer)
   // Pre-warm so the `EventV2` subscription is synchronous (no missed events).

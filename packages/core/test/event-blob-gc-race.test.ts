@@ -1,5 +1,5 @@
 // EventV2 must publish an oversized durable payload through the same D16
-// content-addressed path the Bus uses:
+// content-addressed path the DurableLog uses:
 //
 // * the inline bound is the frame-headroom bound (4 MiB - 64 KiB), not the raw
 //   4 MiB schema bound, so a stored-inline body always fits its egress frame;
@@ -21,7 +21,7 @@ import * as Client from "effect/unstable/sql/SqlClient"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { Event } from "@opencode-ai/schema/event"
-import { Bus } from "../src/bus"
+import { DurableLog } from "../src/durable-log"
 import { Database as DatabaseService } from "../src/database/database"
 import { makeSqliteClient, type SqliteNativeRunner } from "../src/database/sqlite-adapter"
 import { EventV2 } from "../src/event"
@@ -67,7 +67,7 @@ const DDL = `
 const directories: string[] = []
 const natives: Database[] = []
 
-function connectionFrom(native: Database): Bus.Connection {
+function connectionFrom(native: Database): DurableLog.Connection {
   return {
     all: (sql, params = []) => native.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>,
     run: (sql, params = []) => ({ changes: Number(native.query(sql).run(...(params as never[])).changes) }),
@@ -132,6 +132,12 @@ function databaseLayer(filename: string, beforeBegin: () => void): Layer.Layer<D
 
 const textOf = (event: Event.Payload) => (event.data as { text: string }).text
 
+function durableLogLayer(filename: string): Layer.Layer<DurableLog.Service> {
+  const native = new Database(filename, { create: true })
+  natives.push(native)
+  return DurableLog.layer({ connection: connectionFrom(native), ownerID: "event-v2-blob-gc-test" })
+}
+
 afterEach(() => {
   for (const native of natives.splice(0)) native.close()
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
@@ -140,11 +146,11 @@ afterEach(() => {
 describe("EventV2 blob GC race", () => {
   test("publish recreates a staged blob GC unlinked before the commit transaction", async () => {
     const database = open()
-    const text = `race:${"x".repeat(Bus.DEFAULT_BLOB_LIMIT_BYTES + 1)}`
+    const text = `race:${"x".repeat(DurableLog.DEFAULT_BLOB_LIMIT_BYTES + 1)}`
 
     // Seed the same content under the aggregate. GC will delete its only
     // reference and unlink the content-addressed file before EventV2 commits.
-    const seed = Bus.create({
+    const seed = DurableLog.create({
       connection: database.connection,
       ownerID: "seed",
       definitions: [Note],
@@ -155,7 +161,7 @@ describe("EventV2 blob GC race", () => {
     const [file] = fs.readdirSync(database.blobDir)
     expect(file).toBeDefined()
 
-    const gc = Bus.create({
+    const gc = DurableLog.create({
       connection: connectionFrom(database.native),
       ownerID: "gc",
       definitions: [Note],
@@ -167,7 +173,9 @@ describe("EventV2 blob GC race", () => {
       collected = gc.deleteAggregate("s1")
     })
 
-    const eventLayer = EventV2.layerWith({ blobDir: database.blobDir }).pipe(Layer.provide(dbLayer))
+    const eventLayer = EventV2.layerWith({ blobDir: database.blobDir }).pipe(
+      Layer.provide(Layer.merge(dbLayer, durableLogLayer(database.filename))),
+    )
     const published = await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
@@ -188,13 +196,15 @@ describe("EventV2 blob GC race", () => {
     const database = open()
     // Between the frame-headroom bound and the raw 4 MiB schema bound: storing
     // this inline would make its frame unbounded, so it must be offloaded.
-    const text = `aligned:${"x".repeat(Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES + 1)}`
+    const text = `aligned:${"x".repeat(DurableLog.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES + 1)}`
     expect(Buffer.byteLength(JSON.stringify({ sessionID: "s1", text }))).toBeLessThanOrEqual(
-      Bus.DEFAULT_BLOB_LIMIT_BYTES,
+      DurableLog.DEFAULT_BLOB_LIMIT_BYTES,
     )
 
     const eventLayer = EventV2.layerWith({ blobDir: database.blobDir }).pipe(
-      Layer.provide(databaseLayer(database.filename, () => undefined)),
+      Layer.provide(
+        Layer.merge(databaseLayer(database.filename, () => undefined), durableLogLayer(database.filename)),
+      ),
     )
     await Effect.runPromise(
       Effect.scoped(
@@ -207,7 +217,7 @@ describe("EventV2 blob GC race", () => {
 
     expect(database.connection.all("SELECT COUNT(*) AS count FROM event_blob")).toEqual([{ count: 1 }])
     expect(fs.readdirSync(database.blobDir)).toHaveLength(1)
-    const reader = Bus.create({
+    const reader = DurableLog.create({
       connection: database.connection,
       ownerID: "reader",
       definitions: [Note],

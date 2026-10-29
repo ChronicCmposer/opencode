@@ -12,7 +12,7 @@ import os from "node:os"
 import path from "node:path"
 import { Database, type SQLQueryBindings } from "bun:sqlite"
 import { afterEach, describe, expect, test } from "bun:test"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { Event } from "@opencode-ai/schema/event"
 import { ENVELOPE_HEADROOM_BYTES, MAX_INLINE_EVENT_BYTES, decodeFrame, encodeFrameChunks } from "@/session/egress/frame"
 import { createEgressReceiver } from "@/session/egress/receiver"
@@ -80,8 +80,8 @@ describe("frame-aligned durable events", () => {
     // Pinned exactly once: an inline payload must always fit one frame. The bound
     // is the cap MINUS the envelope, not the cap itself, or a body just under
     // 4 MiB would take the reference path with no event_blob row to resolve.
-    expect(MAX_WORKER_FRAME_BYTES).toBeGreaterThan(Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES)
-    expect(Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES).toBe(MAX_INLINE_EVENT_BYTES)
+    expect(MAX_WORKER_FRAME_BYTES).toBeGreaterThan(DurableLog.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES)
+    expect(DurableLog.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES).toBe(MAX_INLINE_EVENT_BYTES)
     expect(MAX_INLINE_EVENT_BYTES).toBe(MAX_WORKER_FRAME_BYTES - ENVELOPE_HEADROOM_BYTES)
   })
 
@@ -154,13 +154,13 @@ describe("frame-aligned durable events", () => {
       "CREATE TABLE event_blob (aggregate_id text NOT NULL, seq integer NOT NULL, type text NOT NULL, hash text NOT NULL, size integer NOT NULL, data text, file_path text)",
     )
     const stored = JSON.stringify(big.properties)
-    const hash = Bus.digest(stored)
-    Bus.writeBlobFile(directory, hash, stored)
+    const hash = DurableLog.digest(stored)
+    DurableLog.writeBlobFile(directory, hash, stored)
     database
       .query("INSERT INTO event_blob (aggregate_id, seq, type, hash, size, data, file_path) VALUES (?, ?, ?, ?, ?, NULL, ?)")
       .run("ses_7", 3, "session.next.prompted", hash, Buffer.byteLength(stored), hash)
 
-    const connection: Bus.Connection = {
+    const connection: DurableLog.Connection = {
       all: (sql, params) =>
         database.query(sql).all(...((params ?? []) as SQLQueryBindings[])) as ReadonlyArray<Record<string, unknown>>,
       run: (sql, params) => ({
@@ -169,11 +169,11 @@ describe("frame-aligned durable events", () => {
       exec: (sql) => database.exec(sql),
     }
     const position = reference.__eventBlobPosition
-    const rows = Bus.loadBlobRows(connection, position.aggregateID, [position.seq])
+    const rows = DurableLog.loadBlobRows(connection, position.aggregateID, [position.seq])
     const row = rows.get(position.seq)
     expect(row).toBeDefined()
 
-    const resolved = Bus.resolveBlobData(
+    const resolved = DurableLog.resolveBlobData(
       {
         id: Event.ID.make(big.id),
         type: big.type,
@@ -182,7 +182,7 @@ describe("frame-aligned durable events", () => {
         data: { __eventBlob: String(row!["hash"]), size: Number(row!["size"]) },
       },
       row,
-      { dir: directory, limitBytes: Bus.DEFAULT_BLOB_LIMIT_BYTES, supportsTable: true },
+      { dir: directory, limitBytes: DurableLog.DEFAULT_BLOB_LIMIT_BYTES, supportsTable: true },
       new Map(),
     )
     expect(resolved).toEqual(JSON.parse(stored))
@@ -190,7 +190,7 @@ describe("frame-aligned durable events", () => {
 
   test("an oversized core blob reference crosses as a position reference without a second body serialisation", () => {
     const position = { aggregateID: "ses_offloaded", seq: 4 }
-    const offloaded = { __eventBlob: Bus.digest("already-offloaded"), size: 5 * MiB }
+    const offloaded = { __eventBlob: DurableLog.digest("already-offloaded"), size: 5 * MiB }
     const frame = eventFrame({
       event: { id: "evt_offloaded", type: "session.next.prompted", properties: offloaded },
       ...position,

@@ -5,7 +5,7 @@ import { Database as BunDatabase } from "bun:sqlite"
 import { afterEach, describe, expect, test } from "bun:test"
 import { Effect, Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { migrationStatements } from "@/session/writer/migration.statements.gen"
 import {
@@ -20,11 +20,62 @@ import {
   markSchemaIdentity,
   openWorkerDatabase,
   schemaIdentity,
+  type WorkerConnection,
   type WorkerDatabase,
+  type WorkerStatement,
 } from "@/session/worker/db"
+import { createWorkerDatabaseWriter } from "@/session/worker/session-worker"
 
 const temporaryDirectories: string[] = []
 const openDatabases: WorkerDatabase[] = []
+const legacyNatives: BunDatabase[] = []
+
+/** A pre-`worker_owner_id` journal: the worker lease has no column to live in. */
+const LEGACY_DDL = `
+  CREATE TABLE event_sequence (
+    aggregate_id text PRIMARY KEY,
+    seq integer NOT NULL,
+    owner_id text
+  );
+  CREATE TABLE event (
+    id text PRIMARY KEY,
+    aggregate_id text NOT NULL,
+    seq integer NOT NULL,
+    type text NOT NULL,
+    data text NOT NULL
+  );
+  CREATE UNIQUE INDEX event_aggregate_seq_idx ON event(aggregate_id, seq);
+`
+
+function legacyConnection(filename: string): WorkerConnection {
+  const native = new BunDatabase(filename, { create: true })
+  legacyNatives.push(native)
+  native.exec("PRAGMA journal_mode = WAL")
+  native.exec(LEGACY_DDL)
+  return {
+    owner: "legacy-worker-test",
+    filename,
+    get closed() {
+      return false
+    },
+    query: <Row>(sql: string) => native.query(sql) as unknown as WorkerStatement<Row>,
+    all: <Row>(sql: string, params = []) =>
+      native.query(sql).all(...(params as never[])) as ReadonlyArray<Row>,
+    values: <Row>(sql: string, params = []) =>
+      native.query(sql).values(...(params as never[])) as unknown as ReadonlyArray<Row>,
+    run: (sql, params = []) => {
+      const result = native.query(sql).run(...(params as never[]))
+      return { changes: Number(result.changes), lastInsertRowid: Number(result.lastInsertRowid) }
+    },
+    exec: (sql) => native.exec(sql),
+    pragma: (name) => {
+      const row = native.query(`PRAGMA ${name}`).get() as Record<string, unknown> | null
+      return row === null ? undefined : Object.values(row)[0]
+    },
+    journalMode: () => "wal",
+    close: () => native.close(),
+  }
+}
 
 function temporaryDatabase(): string {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-worker-db-"))
@@ -62,6 +113,7 @@ async function open(filename: string): Promise<WorkerDatabase> {
 
 afterEach(async () => {
   for (const database of openDatabases.splice(0)) await Effect.runPromise(database.close)
+  for (const native of legacyNatives.splice(0)) native.close()
   for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
 })
 
@@ -227,7 +279,7 @@ describe("worker table ownership (D6)", () => {
     expect(await Effect.runPromise(database.all("SELECT id FROM permission"))).toEqual([{ id: "permission-hub" }])
   })
 
-  test("the worker Bus publishes durable events through the guarded connection", async () => {
+  test("the worker DurableLog publishes durable events through the guarded connection", async () => {
     const filename = temporaryDatabase()
     migrated(filename)
     const database = await open(filename)
@@ -242,14 +294,35 @@ describe("worker table ownership (D6)", () => {
     const published = bus.publish([{ definition: Note, data: { sessionID: "session-a", text: "durable" } }])
     expect(published[0]?.durable?.seq).toBe(0)
     expect(database.connection.all("SELECT aggregate_id, seq, owner_id, worker_owner_id FROM event_sequence")).toEqual([
-      { aggregate_id: "session-a", seq: 0, owner_id: "gen-1", worker_owner_id: "gen-1" },
+      { aggregate_id: "session-a", seq: 0, owner_id: null, worker_owner_id: "gen-1" },
     ])
     expect(database.connection.all<{ count: number }>("SELECT COUNT(*) AS count FROM event")).toEqual([{ count: 1 }])
 
     const stale = database.bus.create({ ownerID: "gen-2", definitions: [Note] })
     expect(() => stale.publish([{ definition: Note, data: { sessionID: "session-a", text: "stolen" } }])).toThrow(
-      Bus.StaleOwnerError,
+      DurableLog.StaleOwnerError,
     )
+  })
+
+  test("a session generation refuses a pre-worker_owner_id journal typed and changes no row", () => {
+    const filename = temporaryDatabase()
+    const connection = legacyConnection(filename)
+    connection.run("INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (?, ?, ?)", [
+      "s1",
+      4,
+      "old-owner",
+    ])
+
+    // The production writer must not read the v1 sync owner as a predecessor
+    // worker lease and must not overwrite it with the new generation.
+    expect(() => createWorkerDatabaseWriter({ connection, filename, sessionID: "s1" })).toThrow(
+      DurableLog.WorkerLeaseUnsupportedError,
+    )
+
+    expect(connection.all("SELECT seq, owner_id FROM event_sequence WHERE aggregate_id = ?", ["s1"])).toEqual([
+      { seq: 4, owner_id: "old-owner" },
+    ])
+    expect(connection.all<{ count: number }>("SELECT COUNT(*) AS count FROM event")).toEqual([{ count: 0 }])
   })
 
   test("a worker may read hub-owned state and write its own session tables", async () => {

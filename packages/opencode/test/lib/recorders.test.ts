@@ -1,36 +1,41 @@
 import { describe, expect, test } from "bun:test"
-import { workerLogMessage } from "@/session/worker/log"
+import { Effect } from "effect"
+import { workerLogMessage } from "@/session/worker/worker-logging"
 import { lineFor, recordingLogger, recordingPublisher } from "./recorders"
 
 describe("recordingLogger", () => {
-  test("captures message and fields, omitting an absent level", () => {
-    const { log, lines } = recordingLogger()
+  test("captures the emitted message, fields and level", () => {
+    const { bridge, lines } = recordingLogger()
 
-    log(workerLogMessage("session admitted"), { workerID: 1 })
+    bridge.fork(Effect.logInfo(workerLogMessage("session admitted"), { workerID: 1 }))
 
-    expect(lines).toEqual([{ message: workerLogMessage("session admitted"), fields: { workerID: 1 } }])
+    expect(lines).toEqual([
+      { message: workerLogMessage("session admitted"), fields: { workerID: 1 }, level: "info" },
+    ])
   })
 
-  test("captures an explicit severity level", () => {
-    const { log, lines } = recordingLogger()
+  test("captures a warning severity", () => {
+    const { bridge, lines } = recordingLogger()
 
-    log(workerLogMessage("worker crashed"), { workerID: 2 }, "error")
+    bridge.fork(Effect.logWarning(workerLogMessage("worker crashed"), { workerID: 2 }))
 
-    expect(lines).toEqual([{ message: workerLogMessage("worker crashed"), fields: { workerID: 2 }, level: "error" }])
+    expect(lines).toEqual([
+      { message: workerLogMessage("worker crashed"), fields: { workerID: 2 }, level: "warn" },
+    ])
   })
 })
 
 describe("lineFor", () => {
   test("returns the recorded line for an event", () => {
-    const { log, lines } = recordingLogger()
-    log(workerLogMessage("pool resolved"), { count: 2 })
+    const { bridge, lines } = recordingLogger()
+    bridge.fork(Effect.logInfo(workerLogMessage("pool resolved"), { count: 2 }))
 
     expect(lineFor(lines, "pool resolved").fields).toEqual({ count: 2 })
   })
 
   test("fails loudly when the event was never logged, naming what was seen", () => {
-    const { log, lines } = recordingLogger()
-    log(workerLogMessage("session admitted"), { workerID: 1 })
+    const { bridge, lines } = recordingLogger()
+    bridge.fork(Effect.logInfo(workerLogMessage("session admitted"), { workerID: 1 }))
 
     expect(() => lineFor(lines, "pool resolved")).toThrow(/no log line for "pool resolved"/)
   })
@@ -40,12 +45,12 @@ describe("recordingPublisher", () => {
   test("records every published event in order", () => {
     const { publisher, published } = recordingPublisher()
 
-    publisher.publish({ type: "session.cancelled", data: { sessionID: "ses_1" } })
-    publisher.publish({ type: "session.error", data: { message: "boom" } })
+    publisher.publish({ type: "one", data: {} } as never)
+    publisher.publishDefinition({ type: "two" } as never, { value: 2 } as never)
 
     expect(published).toEqual([
-      { type: "session.cancelled", data: { sessionID: "ses_1" } },
-      { type: "session.error", data: { message: "boom" } },
+      { type: "one", data: {} },
+      { type: "two", data: { value: 2 } },
     ])
   })
 })

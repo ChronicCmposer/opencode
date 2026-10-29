@@ -3,49 +3,26 @@
 // actually settled.
 //
 // These tests wire the lifecycle ledger (the real tool/commit observation
-// surface) to a per-run reporter and prove:
+// surface) to the real `RunBarrier` service and prove:
 //   - every phase must be reported by its own observation,
 //   - a missing reporter is not fabricated (typed timeout, next run refused),
 //   - a zero-tool run settles `tools` only through an explicit `noTools()`,
 //   - a real tool report settles `tools`,
 //   - cancellation still wins over an incomplete report set.
 
-import { describe, expect, test } from "bun:test"
+import { describe, expect } from "bun:test"
+import { Cause, Effect, Exit, Fiber } from "effect"
 import { createLifecycleTracker } from "@/session/ledger/lifecycle"
 import {
-  RUN_BARRIER_TIMEOUT_MS,
+  RunBarrier,
   RunBarrierReportError,
   RunBarrierTimeout,
-  createRunBarrier,
-  type RunBarrier,
   type RunBarrierPromotionOutcome,
-  type RunBarrierScheduler,
 } from "@/session/run-barrier"
+import { testEffect } from "../lib/effect"
+import { advanceBarrierTimeout, runBarrierLayer } from "../lib/run-barrier-test"
 
-function fakeClock() {
-  let now = 0
-  let nextID = 1
-  const timers = new Map<number, { readonly at: number; readonly run: () => void }>()
-  return {
-    scheduler: {
-      schedule: (run: () => void, delayMs: number) => {
-        const id = nextID++
-        timers.set(id, { at: now + delayMs, run })
-        return id
-      },
-      cancel: (handle: unknown) => void timers.delete(handle as number),
-    } satisfies RunBarrierScheduler,
-    advance(ms: number) {
-      now += ms
-      for (const [id, timer] of [...timers.entries()]) {
-        if (timer.at <= now) {
-          timers.delete(id)
-          timer.run()
-        }
-      }
-    },
-  }
-}
+const it = testEffect(runBarrierLayer)
 
 type Lifecycle = ReturnType<typeof createLifecycleTracker>
 
@@ -54,7 +31,7 @@ type Lifecycle = ReturnType<typeof createLifecycleTracker>
  * observation lands (commit handler, tool finish, projector settle), never from
  * the fact that the run started.
  */
-function createObservedRun(barrier: RunBarrier, lifecycle: Lifecycle, sessionID: string) {
+function createObservedRun(barrier: RunBarrier.Interface, lifecycle: Lifecycle, sessionID: string) {
   const run = barrier.beginRun(sessionID)
   return {
     run,
@@ -84,108 +61,124 @@ function createObservedRun(barrier: RunBarrier, lifecycle: Lifecycle, sessionID:
   }
 }
 
+/** Fork a wait, advance the test clock past the bound, and return its exit. */
+const timeoutWait = (barrier: RunBarrier.Interface, sessionID: string) =>
+  Effect.gen(function* () {
+    const fiber = yield* barrier.wait(sessionID).pipe(Effect.exit, Effect.forkChild)
+    yield* Effect.yieldNow
+    yield* advanceBarrierTimeout()
+    return yield* Fiber.join(fiber)
+  })
+
 describe("run barrier phase reporters", () => {
-  test("a full zero-tool run reports every phase and drains", async () => {
-    const clock = fakeClock()
-    const lifecycle = createLifecycleTracker()
-    const barrier = createRunBarrier({ scheduler: clock.scheduler })
-    const observed = createObservedRun(barrier, lifecycle, "ses_reported")
+  it.effect("a full zero-tool run reports every phase and drains", () =>
+    Effect.gen(function* () {
+      const barrier = yield* RunBarrier.Service
+      const lifecycle = createLifecycleTracker()
+      const observed = createObservedRun(barrier, lifecycle, "ses_reported")
 
-    observed.commit("msg_1")
-    observed.projector()
-    observed.finish()
+      observed.commit("msg_1")
+      observed.projector()
+      observed.finish()
 
-    expect(await barrier.wait("ses_reported")).toEqual({ sessionID: "ses_reported", status: "drained" })
-    expect(barrier.state("ses_reported")).toBe("drained")
-  })
+      expect(yield* barrier.wait("ses_reported")).toEqual({ sessionID: "ses_reported", status: "drained" })
+      expect(barrier.state("ses_reported")).toBe("drained")
+    }),
+  )
 
-  test("a missing projector reporter is not inferred from the commit report", async () => {
-    const clock = fakeClock()
-    const lifecycle = createLifecycleTracker()
-    const barrier = createRunBarrier({ scheduler: clock.scheduler })
-    const observed = createObservedRun(barrier, lifecycle, "ses_no_projector")
+  it.effect("a missing projector reporter is not inferred from the commit report", () =>
+    Effect.gen(function* () {
+      const barrier = yield* RunBarrier.Service
+      const lifecycle = createLifecycleTracker()
+      const observed = createObservedRun(barrier, lifecycle, "ses_no_projector")
 
-    observed.commit("msg_1")
-    observed.finish()
+      observed.commit("msg_1")
+      observed.finish()
 
-    const pending = barrier.wait("ses_no_projector")
-    clock.advance(RUN_BARRIER_TIMEOUT_MS)
+      const exit = yield* timeoutWait(barrier, "ses_no_projector")
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(RunBarrierTimeout)
+      expect(barrier.state("ses_no_projector")).toBe("timed-out")
+      // No next run after a fabricated drain: the barrier stays refused.
+      const refused = yield* barrier.wait("ses_no_projector").pipe(Effect.flip)
+      expect(refused).toBeInstanceOf(RunBarrierTimeout)
+    }),
+  )
 
-    await expect(pending).rejects.toBeInstanceOf(RunBarrierTimeout)
-    expect(barrier.state("ses_no_projector")).toBe("timed-out")
-    // No next run after a fabricated drain: the barrier stays refused.
-    await expect(barrier.wait("ses_no_projector")).rejects.toBeInstanceOf(RunBarrierTimeout)
-  })
+  it.effect("a started tool with no settle report holds the barrier", () =>
+    Effect.gen(function* () {
+      const barrier = yield* RunBarrier.Service
+      const lifecycle = createLifecycleTracker()
+      const observed = createObservedRun(barrier, lifecycle, "ses_tool_stuck")
 
-  test("a started tool with no settle report holds the barrier", async () => {
-    const clock = fakeClock()
-    const lifecycle = createLifecycleTracker()
-    const barrier = createRunBarrier({ scheduler: clock.scheduler })
-    const observed = createObservedRun(barrier, lifecycle, "ses_tool_stuck")
+      observed.toolStarted("call_write")
+      observed.commit("msg_1")
+      observed.projector()
+      observed.finish()
 
-    observed.toolStarted("call_write")
-    observed.commit("msg_1")
-    observed.projector()
-    observed.finish()
+      const exit = yield* timeoutWait(barrier, "ses_tool_stuck")
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(RunBarrierTimeout)
+      expect(barrier.state("ses_tool_stuck")).toBe("timed-out")
+    }),
+  )
 
-    const pending = barrier.wait("ses_tool_stuck")
-    clock.advance(RUN_BARRIER_TIMEOUT_MS)
-    await expect(pending).rejects.toBeInstanceOf(RunBarrierTimeout)
-    expect(barrier.state("ses_tool_stuck")).toBe("timed-out")
-  })
+  it.effect("a real tool settlement report drains a run with tools", () =>
+    Effect.gen(function* () {
+      const barrier = yield* RunBarrier.Service
+      const lifecycle = createLifecycleTracker()
+      const observed = createObservedRun(barrier, lifecycle, "ses_tool_real")
 
-  test("a real tool settlement report drains a run with tools", async () => {
-    const clock = fakeClock()
-    const lifecycle = createLifecycleTracker()
-    const barrier = createRunBarrier({ scheduler: clock.scheduler })
-    const observed = createObservedRun(barrier, lifecycle, "ses_tool_real")
+      observed.toolStarted("call_write")
+      observed.commit("msg_1")
+      observed.projector()
+      observed.toolFinished("call_write")
+      observed.finish()
 
-    observed.toolStarted("call_write")
-    observed.commit("msg_1")
-    observed.projector()
-    observed.toolFinished("call_write")
-    observed.finish()
+      expect(yield* barrier.wait("ses_tool_real")).toEqual({ sessionID: "ses_tool_real", status: "drained" })
+      expect(observed.run.reported("tools")).toBe(true)
+    }),
+  )
 
-    expect(await barrier.wait("ses_tool_real")).toEqual({ sessionID: "ses_tool_real", status: "drained" })
-    expect(observed.run.reported("tools")).toBe(true)
-  })
+  it.effect("a report for the wrong observation cannot stand in for a projector", () =>
+    Effect.gen(function* () {
+      const barrier = yield* RunBarrier.Service
+      const lifecycle = createLifecycleTracker()
+      const observed = createObservedRun(barrier, lifecycle, "ses_wrong_kind")
 
-  test("a report for the wrong observation cannot stand in for a projector", async () => {
-    const clock = fakeClock()
-    const lifecycle = createLifecycleTracker()
-    const barrier = createRunBarrier({ scheduler: clock.scheduler })
-    const observed = createObservedRun(barrier, lifecycle, "ses_wrong_kind")
+      observed.commit("msg_1")
+      expect(() =>
+        observed.run.report({
+          sessionID: "ses_wrong_kind",
+          phase: "projectors",
+          observation: { kind: "commit", messageID: "msg_1" },
+        }),
+      ).toThrow(RunBarrierReportError)
 
-    observed.commit("msg_1")
-    expect(() =>
-      observed.run.report({
-        sessionID: "ses_wrong_kind",
-        phase: "projectors",
-        observation: { kind: "commit", messageID: "msg_1" },
-      }),
-    ).toThrow(RunBarrierReportError)
+      const error = yield* barrier.wait("ses_wrong_kind").pipe(Effect.flip)
+      expect(error).toBeInstanceOf(RunBarrierReportError)
+      expect(barrier.state("ses_wrong_kind")).toBe("failed")
+    }),
+  )
 
-    const pending = barrier.wait("ses_wrong_kind")
-    clock.advance(RUN_BARRIER_TIMEOUT_MS)
-    await expect(pending).rejects.toBeInstanceOf(RunBarrierReportError)
-    expect(barrier.state("ses_wrong_kind")).toBe("failed")
-  })
+  it.effect("cancellation wins while a reporter is still missing", () =>
+    Effect.gen(function* () {
+      const barrier = yield* RunBarrier.Service
+      const lifecycle = createLifecycleTracker()
+      const observed = createObservedRun(barrier, lifecycle, "ses_cancel_missing")
 
-  test("cancellation wins while a reporter is still missing", async () => {
-    const clock = fakeClock()
-    const lifecycle = createLifecycleTracker()
-    const barrier = createRunBarrier({ scheduler: clock.scheduler })
-    const observed = createObservedRun(barrier, lifecycle, "ses_cancel_missing")
+      observed.commit("msg_1")
+      // The projector was never reported, so the run is still open.
+      observed.finish()
 
-    observed.commit("msg_1")
-    observed.finish()
+      const pending = yield* barrier.wait("ses_cancel_missing").pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      barrier.cancel("ses_cancel_missing")
 
-    const pending = barrier.wait("ses_cancel_missing")
-    barrier.cancel("ses_cancel_missing")
-
-    expect(await pending).toEqual({ sessionID: "ses_cancel_missing", status: "cancelled" })
-    expect(barrier.state("ses_cancel_missing")).toBe("cancelled")
-    clock.advance(RUN_BARRIER_TIMEOUT_MS)
-    expect(barrier.state("ses_cancel_missing")).toBe("cancelled")
-  })
+      expect(yield* Fiber.join(pending)).toEqual({ sessionID: "ses_cancel_missing", status: "cancelled" })
+      expect(barrier.state("ses_cancel_missing")).toBe("cancelled")
+      yield* advanceBarrierTimeout()
+      expect(barrier.state("ses_cancel_missing")).toBe("cancelled")
+    }),
+  )
 })

@@ -4,7 +4,7 @@
 // the reclaim instead of being dropped. The v1 sync owner is never rewritten.
 //
 // This drives the production `createWorkerDatabaseWriter` over two real
-// per-worker WAL connections to the same file, not a Bus double.
+// per-worker WAL connections to the same file, not a DurableLog double.
 
 import fs from "node:fs"
 import os from "node:os"
@@ -13,7 +13,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { DateTime, Effect } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import { SessionEvent } from "@opencode-ai/schema/session-event"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { migrationStatements } from "@/session/writer/migration.statements.gen"
 import { markSchemaIdentity, openWorkerDatabase, type WorkerDatabase } from "@/session/worker/db"
@@ -79,7 +79,7 @@ describe("worker generation owner lease", () => {
     // Gen-1 is alive: the lease has not expired, so gen-2 must not steal it.
     expect(() =>
       createWorkerDatabaseWriter({ connection: second.connection, workerID: 2, sessionID: "session-lease" }),
-    ).toThrow(Bus.LeaseConflictError)
+    ).toThrow(DurableLog.LeaseConflictError)
 
     gen1.dispose()
 
@@ -95,14 +95,14 @@ describe("worker generation owner lease", () => {
     const rows = second.connection.all<{
       aggregate_id: string
       seq: number
-      owner_id: string
+      owner_id: string | null
       worker_owner_id: string
     }>("SELECT aggregate_id, seq, owner_id, worker_owner_id FROM event_sequence")
     expect(rows).toEqual([
       {
         aggregate_id: "session-lease",
         seq: 1,
-        owner_id: expect.any(String),
+        owner_id: null,
         worker_owner_id: expect.any(String),
       },
     ])
@@ -123,7 +123,7 @@ describe("worker generation owner lease", () => {
     const secondPublish = await gen2.publish(durable("gen-2"))
     expect(secondPublish.seq).toBe(1)
 
-    await expect(gen1.publish(durable("late"))).rejects.toThrow(Bus.StaleOwnerError)
+    await expect(gen1.publish(durable("late"))).rejects.toThrow(DurableLog.StaleOwnerError)
     expect(first.connection.all<{ seq: number }>("SELECT seq FROM event_sequence")).toEqual([{ seq: 1 }])
     gen1.dispose()
     gen2.dispose()
@@ -139,8 +139,12 @@ describe("worker generation owner lease", () => {
 
     // The generation is still alive but its TTL elapsed (e.g. a long model turn
     // between writes). The same writer must renew on its next write rather than
-    // self-fence.
-    first.connection.run("UPDATE event_sequence SET worker_expires_at = 0 WHERE aggregate_id = ?", ["session-lease"])
+    // self-fence. F8 reserves `worker_expires_at = 0` for a released lease, so
+    // an elapsed TTL is a past positive timestamp.
+    first.connection.run("UPDATE event_sequence SET worker_expires_at = ? WHERE aggregate_id = ?", [
+      Date.now() - 1,
+      "session-lease",
+    ])
     expect((await gen1.publish(durable("gen-1-after-ttl"))).seq).toBe(1)
 
     const renewed = first.connection.all<{ worker_expires_at: number }>(
@@ -152,7 +156,7 @@ describe("worker generation owner lease", () => {
     // The renewed lease is live, so the successor cannot steal it.
     expect(() =>
       createWorkerDatabaseWriter({ connection: second.connection, workerID: 2, sessionID: "session-lease" }),
-    ).toThrow(Bus.LeaseConflictError)
+    ).toThrow(DurableLog.LeaseConflictError)
 
     gen1.dispose()
   })

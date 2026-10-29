@@ -17,8 +17,10 @@ import type { Latch } from "effect"
 import { Runner } from "@/effect/runner"
 import type { SessionID } from "@/session/schema"
 import type { PromptInput, ShellInput } from "@/session/prompt"
+import type { EffectBridge } from "@/effect/bridge"
 import type { BootCancelResult, CancelFrame, CancelPort } from "./cancel"
-import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
+import { workerLogMessage } from "./worker-logging"
+import { committedMessage, resetCommitted } from "@/session/ledger/lifecycle"
 import { errorTagOf, messageOf } from "./port"
 import { readyFrame, type ReadyBuildFrame } from "./build-hash"
 import type { DispatchOrigin } from "@/session/origin"
@@ -33,6 +35,12 @@ import {
 export interface SessionExecutionResult {
   readonly sessionID: string
   readonly value?: unknown
+  /**
+   * The assistant message this run committed, or `null` when it committed none.
+   * Carried in the worker's `done` reply so the hub barrier settles from one
+   * authoritative message (F11) instead of a separate best-effort report.
+   */
+  readonly committed?: string | null
 }
 
 /**
@@ -306,7 +314,14 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
       // folds into a structured error frame instead of rejecting the handler.
       Effect.matchCause({
         onFailure: (cause): SessionExecutorOutbound => failed(id, Cause.squash(cause)),
-        onSuccess: (result): SessionExecutorOutbound => ({ type: "done", id, result }),
+        onSuccess: (result): SessionExecutorOutbound => {
+          const committed = committedMessage(result.sessionID)
+          return {
+            type: "done",
+            id,
+            result: committed === undefined ? result : { ...result, committed },
+          }
+        },
       }),
     )
 
@@ -319,6 +334,7 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
     prompt?: PromptInput,
     shell?: ShellInput,
   ): Promise<SessionExecutorOutbound> => {
+    resetCommitted(sessionID)
     let work: SessionWork
     try {
       work = options.work(kind)
@@ -558,8 +574,8 @@ export interface ExecutorWorker extends ExecutorSessionWorker {
 
 export interface ExecutorCancelPortOptions {
   readonly cancel: (sessionID: SessionID) => Promise<void>
-  /** Optional structured logger seam; absent defaults to a no-op. */
-  readonly log?: WorkerLogger
+  /** Optional re-entry bridge for the cancel outcome line. */
+  readonly bridge?: EffectBridge.Shape
 }
 
 /**
@@ -578,13 +594,13 @@ export type ExecutorCancelMode = (typeof EXECUTOR_CANCEL_MODES)[number]
  * echoed back as a `cancel-ack` (accepted on success, rejected otherwise).
  */
 export function createExecutorCancelPort(options: ExecutorCancelPortOptions): CancelPort {
-  const log = options.log ?? noopWorkerLogger
+  const bridge = options.bridge
   const handlers = new Set<(frame: CancelFrame) => void>()
   const emit = (frame: CancelFrame): void => {
     for (const handler of [...handlers]) handler(frame)
   }
   const outcome = (sessionID: string, mode: ExecutorCancelMode, accepted: boolean): void =>
-    log(workerLogMessage("cancel outcome"), { sessionID, mode, accepted })
+    void bridge?.fork(Effect.logInfo(workerLogMessage("cancel outcome"), { sessionID, mode, accepted }))
   return {
     notify(frame) {
       if (frame.type !== "cancel") return
@@ -632,8 +648,8 @@ export interface ExecutorWorkerOptions {
    * hand the worker its next run early. Absent leaves the reply path unchanged.
    */
   readonly egressBarrier?: (sessionID: SessionID) => Promise<void> | undefined
-  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
-  readonly log?: WorkerLogger
+  /** Optional re-entry bridge for the worker spawn line. */
+  readonly bridge?: EffectBridge.Shape
 }
 
 /**
@@ -677,52 +693,63 @@ export async function awaitReplyWithLiveness(
   intervalMs: number,
   nextId: () => number,
 ): Promise<SessionExecutorOutbound> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  let stopped = false
   // Abort the in-flight probe's `waitFor` when the run settles, so the ping
   // waiter is removed immediately instead of lingering until its own deadline.
   const probes = new AbortController()
-  const wedged = new Promise<never>((_resolve, reject) => {
-    const probe = (): void => {
-      if (stopped) return
-      const pingId = nextId()
-      try {
-        transport.post({ type: "ping", id: pingId })
-        transport
-          .waitFor((message) => message.type === "pong" && message.id === pingId, {
-            timeoutMs: intervalMs,
-            signal: probes.signal,
-          })
-          .then(
-            () => {
-              if (!stopped) timer = setTimeout(probe, intervalMs)
-            },
-            () => {
-              if (!stopped) reject(new SessionWorkerReplyTimeoutError(intervalMs))
-            },
-          )
-      } catch (error) {
-        // `post` throws once the isolate is gone; surface it the same way a
-        // dead worker is surfaced rather than escaping the timer callback.
-        if (!stopped) reject(error instanceof Error ? error : new Error(String(error)))
-      }
+
+  const probeOnce = (): Promise<void> => {
+    const pingId = nextId()
+    try {
+      transport.post({ type: "ping", id: pingId })
+    } catch (error) {
+      // `post` throws once the isolate is gone; surface it the same way a dead
+      // worker is surfaced rather than letting it escape the probe fiber.
+      return Promise.reject(error instanceof Error ? error : new Error(String(error)))
     }
-    timer = setTimeout(probe, intervalMs)
-  })
+    return transport
+      .waitFor((message) => message.type === "pong" && message.id === pingId, {
+        timeoutMs: intervalMs,
+        signal: probes.signal,
+      })
+      .then(() => undefined)
+  }
+
+  // One probe per interval: sleep first (a run that settles inside the interval
+  // never pings), then require the matching pong within the same window. The
+  // sleep is Effect's clock, so `raceFirst` interrupts it the moment the run
+  // settles instead of leaving a raw timer behind.
+  const probeLoop = Effect.gen(function* () {
+    while (true) {
+      yield* Effect.sleep(intervalMs)
+      yield* Effect.tryPromise({
+        try: probeOnce,
+        catch: (error) =>
+          error instanceof SessionWorkerReplyTimeoutError
+            ? error
+            : new Error(messageOf(error)),
+      })
+    }
+  }).pipe(Effect.andThen(Effect.never))
+
   try {
-    return await Promise.race([reply, wedged])
+    // Bridge the interruptible probe at the one Promise-shaped edge: the run
+    // reply and the probe race, and the loser's fiber is interrupted.
+    return await Effect.runPromise(
+      Effect.raceFirst(
+        Effect.tryPromise({ try: () => reply, catch: (error) => error }),
+        probeLoop,
+      ),
+    )
   } finally {
-    // Settle the watchdog the moment the run does, so no timer outlives it and
-    // no probe waiter is left registered on the transport.
-    stopped = true
+    // The race interrupts the probe fiber; abort the transport waiter too so a
+    // settled run never leaves a ping waiter registered until its deadline.
     probes.abort()
-    if (timer !== undefined) clearTimeout(timer)
   }
 }
 
 export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWorker {
   const { transport } = options
-  const log = options.log ?? noopWorkerLogger
+  const bridge = options.bridge
   const workKind = options.workKind ?? DEFAULT_WORK_KIND
   const waitOptions = options.timeoutMs === undefined ? undefined : { timeoutMs: options.timeoutMs }
   const runIdleTimeoutMs = options.runIdleTimeoutMs ?? 0
@@ -737,12 +764,14 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     lastResult = result
   }
 
-  log(workerLogMessage("worker spawning"), {
-    workerID: options.id,
-    kind: workKind,
-    ...(options.sessionID === undefined ? {} : { sessionID: options.sessionID }),
-    reason: options.reason ?? "initial",
-  })
+  void bridge?.fork(
+    Effect.logInfo(workerLogMessage("worker spawning"), {
+      workerID: options.id,
+      kind: workKind,
+      ...(options.sessionID === undefined ? {} : { sessionID: options.sessionID }),
+      reason: options.reason ?? "initial",
+    }),
+  )
 
   const request = (
     build: (id: number) => SessionExecutorInbound,
@@ -825,7 +854,7 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     return active
   }
 
-  const cancelPort = createExecutorCancelPort({ cancel, log })
+  const cancelPort = createExecutorCancelPort({ cancel, ...(bridge === undefined ? {} : { bridge }) })
 
   return {
     id: options.id,
@@ -858,8 +887,6 @@ export interface ExecutorWorkerPoolOptions {
   readonly spawn: (id: number) => ExecutorWorker
   /** Pool-side cleanup when a session's worker is retired (e.g. init cache). */
   readonly onSessionReleased?: (sessionID: SessionID) => void
-  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
-  readonly log?: WorkerLogger
 }
 
 /** Structural mirror of dispatch's `WorkerPool` plus result/worker lookup. */
@@ -937,6 +964,13 @@ export interface SessionScheduler {
     readonly mode?: SessionRunMode
     readonly shell?: ShellInput
   }): Promise<void>
+  /** Effect-native admission; the Promise form remains for external callers. */
+  dispatchEffect?(request: {
+    readonly sessionID: SessionID
+    readonly depth?: number
+    readonly mode?: SessionRunMode
+    readonly shell?: ShellInput
+  }): Effect.Effect<void, unknown>
   cancel(sessionID: SessionID): Promise<void>
   terminateAll(): Promise<void>
   readonly registry: { get(sessionID: SessionID): { readonly workerID: number | undefined } | undefined }
@@ -950,6 +984,12 @@ export interface SessionDispatch {
    * session.
    */
   ensureRunning(sessionID: SessionID, depth?: number, origin?: DispatchOrigin): Promise<SessionExecutionResult>
+  /** Effect-native ensureRunning used by `SessionRunState`. */
+  ensureRunningEffect(
+    sessionID: SessionID,
+    depth?: number,
+    origin?: DispatchOrigin,
+  ): Effect.Effect<SessionExecutionResult, unknown>
   /**
    * Dispatch `sessionID` on the shell-start path, carrying `shell` to the worker
    * so it resolves the real shell work, at `depth` (default 0).
@@ -975,6 +1015,12 @@ export interface SessionDispatchOptions {
    * Defaults to 0 (a foreground root).
    */
   readonly depthOf?: (sessionID: SessionID) => number
+  /**
+   * The hub's authoritative commit outcome for a finished run, read before its
+   * active-run record is deleted. The run's `done` reply carries it so the
+   * barrier settles from one message (F11).
+   */
+  readonly commitOutcome?: (sessionID: SessionID) => { readonly committed: string | null } | undefined
   /** Per-session crash policy; defaults to a fresh in-process policy. */
   readonly supervision?: Supervision
 }
@@ -1046,13 +1092,61 @@ export function createSessionDispatch(options: SessionDispatchOptions): SessionD
     supervision.recordHealthy(sessionID)
   }
 
+  /** Attach the hub's authoritative commit outcome to a finished run. */
+  const withCommitOutcome = (result: SessionExecutionResult): SessionExecutionResult => {
+    const outcome = options.commitOutcome?.(result.sessionID as SessionID)
+    return outcome === undefined ? result : { ...result, committed: outcome.committed }
+  }
+
+  const admitEffect = (
+    sessionID: SessionID,
+    depth: number | undefined,
+    mode: SessionRunMode,
+    shell?: ShellInput,
+    origin: DispatchOrigin = "user",
+  ): Effect.Effect<void, unknown> =>
+    Effect.suspend(() => {
+      try {
+        requireAdmission(sessionID, origin)
+      } catch (error) {
+        return Effect.fail(error)
+      }
+      const request = {
+        sessionID,
+        depth: depth ?? options.depthOf?.(sessionID) ?? 0,
+        mode,
+        ...(shell === undefined ? {} : { shell }),
+      }
+      const admitted =
+        options.dispatcher.dispatchEffect === undefined
+          ? Effect.tryPromise({ try: () => options.dispatcher.dispatch(request), catch: (error) => error })
+          : options.dispatcher.dispatchEffect(request)
+      return admitted.pipe(
+        Effect.tap(() => Effect.sync(() => supervision.recordHealthy(sessionID))),
+        Effect.tapError((error) =>
+          Effect.sync(() => {
+            if (errorTagOf(error) === "WorkerCrashedError") recordCrashOnce(sessionID, error)
+          }),
+        ),
+      )
+    })
+
+  const ensureRunningEffect = (
+    sessionID: SessionID,
+    depth?: number,
+    origin: DispatchOrigin = "user",
+  ): Effect.Effect<SessionExecutionResult, unknown> =>
+    admitEffect(sessionID, depth, "run", undefined, origin).pipe(
+      Effect.andThen(Effect.sync(() => withCommitOutcome(requireResult(sessionID)))),
+    )
+
   const ensureRunning = async (
     sessionID: SessionID,
     depth?: number,
     origin: DispatchOrigin = "user",
   ): Promise<SessionExecutionResult> => {
     await admit(sessionID, depth, "run", undefined, origin)
-    return requireResult(sessionID)
+    return withCommitOutcome(requireResult(sessionID))
   }
 
   const assertNotBusy = async (sessionID: SessionID): Promise<boolean> => {
@@ -1072,11 +1166,12 @@ export function createSessionDispatch(options: SessionDispatchOptions): SessionD
   ): Promise<SessionExecutionResult> => {
     if (await assertNotBusy(sessionID)) throw new SessionBusyError({ sessionID })
     await admit(sessionID, depth, "startShell", shell, origin)
-    return requireResult(sessionID)
+    return withCommitOutcome(requireResult(sessionID))
   }
 
   return {
     ensureRunning,
+    ensureRunningEffect,
     startShell,
     assertNotBusy,
     cancel: (sessionID) => options.dispatcher.cancel(sessionID),

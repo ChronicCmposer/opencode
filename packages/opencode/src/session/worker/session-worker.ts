@@ -41,15 +41,15 @@ import { EffectBridge } from "@/effect/bridge"
 import { setThreadName } from "@/util/thread-name"
 import type { InstanceContext } from "@/project/instance-context"
 import { Provider } from "@/provider/provider"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { EventV2 } from "@opencode-ai/core/event"
-import * as Database from "@opencode-ai/core/database/database"
+import { Database } from "@opencode-ai/core/database/database"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
 import { openWriterConnection } from "@/session/writer/connection"
 import { createWorkerEgressClient, type WorkerEgressClient } from "./egress-client"
 import { openWorkerDatabase, type WorkerBus, type WorkerConnection, type WorkerDatabase } from "./db"
 import { createProxyReporting, installReporting } from "@/session/ledger/lifecycle"
-import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
+import { workerLogMessage } from "./worker-logging"
 import { workerLoggingLayer } from "./worker-logging"
 import { messageOf } from "./port"
 import { createThreadNamer, type ThreadNamer } from "./thread-naming"
@@ -285,20 +285,15 @@ export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
 
 /**
  * The worker-local writer over its own SQLite WAL connection (D5). It replaces
- * the deleted writer RPC: every primitive below runs in this isolate.
+ * the deleted writer RPC: it publishes durable events, reads rows, and disposes
+ * the generation lease/handle. Transaction control belongs to the worker's
+ * `WorkerDatabase`, never to this seam.
  */
 export interface WorkerWriterClient extends WriterClientHandle {
-  begin(): Promise<string>
-  txQuery(handle: string, method: string, sql: string, params?: readonly unknown[]): Promise<unknown>
-  commit(handle: string): Promise<void>
-  rollback(handle: string): Promise<void>
   dispose(): void
 }
 
 type WriterQueryConnection = Pick<WorkerConnection, "all" | "values" | "run" | "exec">
-
-const WRITER_TX_WRITE_REJECTED =
-  "writer txQuery is read-only; use the typed repository or durable Bus for writes"
 
 /** One third of the 30s worker lease TTL: two missed beats still leave headroom. */
 const WORKER_LEASE_HEARTBEAT_MS = 10_000
@@ -338,13 +333,13 @@ export function createWorkerDatabaseWriter(
      * Transaction-capable scoped handle. Production passes
      * `WorkerDatabase.connection` (repository-backed, never a raw main handle);
      * standalone tests may pass a trusted unbound connection. Ad-hoc raw SQL is
-     * read-only: the typed repository/Bus owns every write.
+     * read-only: the typed repository/DurableLog owns every write.
      */
     connection?: WorkerConnection
     /** Read-only query connection for raw writer SQL; defaults to `connection`. */
     queryConnection?: WorkerConnection
     /**
-     * Narrow Bus/EventV2 capability owned by the worker DB. Production passes
+     * Narrow DurableLog/EventV2 capability owned by the worker DB. Production passes
      * this instead of a raw connection; the returned handle has no `connection`
      * or transaction surface.
      */
@@ -368,16 +363,14 @@ export function createWorkerDatabaseWriter(
   const databaseFilename = options.filename ?? options.connection?.filename ?? Database.path()
   const ownedConnection =
     options.connection ?? (options.bus === undefined ? openWriterConnection(databaseFilename) : undefined)
-  // Transaction control (BEGIN/COMMIT/ROLLBACK) must use the scoped transaction
-  // handle; ad-hoc statements may use the stricter read-only handle. Conflating
-  // the two made `begin()` on a bound worker fail as "query connection is
-  // read-only". Raw writes are rejected below on either handle: durable writes
-  // belong to the typed repository/Bus, never to the writer seam.
-  const writeConnection = options.connection ?? ownedConnection ?? openWriterConnection(databaseFilename)
-  const readConnection = options.queryConnection ?? writeConnection
+  // Transaction control (BEGIN/COMMIT/ROLLBACK) belongs to the worker's own
+  // `WorkerDatabase`; the writer seam only reads and publishes. Raw writes are
+  // repository/DurableLog-only.
+  const readConnection =
+    options.queryConnection ?? options.connection ?? ownedConnection ?? openWriterConnection(databaseFilename)
   const ownerID = `worker-${options.workerID ?? threadId}-${process.pid}-${randomUUID()}`
-  if (options.eventBinding !== undefined) options.eventBinding.leaseOwner = ownerID
-  // A session worker's Bus is scoped to its one session aggregate: publishing,
+  if (options.eventBinding !== undefined) Effect.runSync(options.eventBinding.setLeaseOwner(ownerID))
+  // A session worker's DurableLog is scoped to its one session aggregate: publishing,
   // claiming, reading, or releasing another session's log is refused.
   const blobDir = options.blobDir ?? path.join(path.dirname(databaseFilename), "event-blobs")
   const bus =
@@ -390,22 +383,29 @@ export function createWorkerDatabaseWriter(
           // caller named a directory explicitly.
           ...(options.blobDir === undefined ? {} : { blobDir: options.blobDir }),
         })
-      : Bus.create({
+      : DurableLog.create({
           connection: ownedConnection!,
           ownerID,
           leaseTimeoutMs: 30_000,
           ...(options.sessionID === undefined ? {} : { aggregateID: options.sessionID }),
           blobDir,
         })
-  const transactions = new Set<string>()
-  let nextTransaction = 1
-
   // Claim only the worker-generation lease. The v1 sync owner
   // (`event_sequence.owner_id`) belongs to sync replication and is never
   // rewritten here. A lease held by a live generation is refused; a dead
   // generation is reclaimed only at the observed sequence inside one
   // `BEGIN IMMEDIATE`, so a raced commit fences the reclaim instead of losing it.
   const claimWorkerLease = (aggregateID: string): void => {
+    // Refuse a non-worker schema before `ownerOf`: on a pre-`worker_owner_id`
+    // journal `ownerOf` reports v1 sync state, which is not a reclaimable worker
+    // lease. Surface the same typed refusal the DurableLog uses instead of silently
+    // treating the sync owner as a predecessor generation.
+    if (!bus.workerLease) {
+      throw new DurableLog.WorkerLeaseUnsupportedError({
+        type: "event_sequence",
+        message: `Aggregate ${aggregateID} requires a worker lease but this schema has no worker_owner_id column`,
+      })
+    }
     const owner = bus.ownerOf(aggregateID)
     if (owner === undefined) {
       bus.claim(aggregateID)
@@ -421,8 +421,8 @@ export function createWorkerDatabaseWriter(
   }
   if (options.sessionID !== undefined) claimWorkerLease(options.sessionID)
 
-  // Keep the generation's lease live while it is idle. The Bus and EventV2 share
-  // the same `event_sequence` lease columns, so renewing through the Bus also
+  // Keep the generation's lease live while it is idle. The DurableLog and EventV2 share
+  // the same `event_sequence` lease columns, so renewing through the DurableLog also
   // renews the durable-event lease. A stale owner is ignored here: the next write
   // fences it through the normal owner check.
   const heartbeatIntervalMs = options.heartbeatIntervalMs ?? WORKER_LEASE_HEARTBEAT_MS
@@ -439,50 +439,22 @@ export function createWorkerDatabaseWriter(
       : undefined
   heartbeat?.unref?.()
 
-  const requireTransaction = (handle: string): void => {
-    if (!transactions.has(handle)) throw new Error(`unknown or spent transaction handle "${handle}"`)
-  }
-
   return {
     query: async (method, sql, params) => writerQuery(readConnection, method, sql, params),
     publish: async (event) => {
       const definition =
         Durable.get(event.type) ?? [...Durable.values()].find((candidate) => candidate.type === event.type)
       if (definition === undefined) throw new Error(`unknown durable event type "${event.type}"`)
-      // Non-blocking busy backoff: the async Bus path yields between retries so
+      // Non-blocking busy backoff: the async DurableLog path yields between retries so
       // cancellation and streaming progress keep running while SQLite is busy.
       const published = await bus.publishAsync([{ definition, data: event.data as never, id: event.id as never }])
       const last = published[published.length - 1]
       return { seq: last?.durable?.seq ?? null, committed: true }
     },
-    begin: async () => {
-      const handle = `tx-${nextTransaction++}`
-      writeConnection.exec("BEGIN IMMEDIATE")
-      transactions.add(handle)
-      return handle
-    },
-    txQuery: async (handle, method, sql, params) => {
-      requireTransaction(handle)
-      // `run` is the raw write method; durable writes belong to the typed
-      // repository/Bus. The trusted Drizzle graph's writer path issues its
-      // statements through `all`, so only the write method is refused here.
-      if (method === "run") throw new Error(WRITER_TX_WRITE_REJECTED)
-      return writerQuery(readConnection, method, sql, params)
-    },
-    commit: async (handle) => {
-      requireTransaction(handle)
-      writeConnection.exec("COMMIT")
-      transactions.delete(handle)
-    },
-    rollback: async (handle) => {
-      requireTransaction(handle)
-      writeConnection.exec("ROLLBACK")
-      transactions.delete(handle)
-    },
     dispose: () => {
       if (heartbeat !== undefined) clearInterval(heartbeat)
       if (options.sessionID !== undefined) bus.release(options.sessionID)
-      if (options.eventBinding !== undefined) options.eventBinding.leaseOwner = undefined
+      if (options.eventBinding !== undefined) Effect.runSync(options.eventBinding.clear())
       ownedConnection?.close()
     },
   }
@@ -515,9 +487,9 @@ function requirePort(port: MessagePort | undefined, field: string): MessagePort 
 const transferable = (port: MessagePort): Transferable => port as unknown as Transferable
 
 /**
- * The client handles the reduced session layer installs. The writer is the full
- * `WorkerWriterClient`, so the production worker can build a real DB-backed
- * `Database` (statements AND `begin`/`txQuery`/`commit`/`rollback`). The
+ * The client handles the reduced session layer installs. The writer publishes
+ * durable events, reads rows, and disposes its generation lease/handle; the
+ * worker's own `WorkerDatabase` owns transaction control. The
  * background-job handle is process-local (the hub no longer serves a job port).
  */
 export interface WorkerClients {
@@ -536,21 +508,21 @@ export interface WorkerClients {
  * log lines carry the worker's owner id. It is omitted (never fabricated) when
  * the caller does not know it.
  *
- * `log`, when supplied, is threaded into the egress client so the peer
- * lifecycle lines actually fire in the isolate. Absent keeps the no-op default.
+ * `bridge`, when supplied, is threaded into the egress client so the peer
+ * lifecycle lines actually fire in the isolate. Absent keeps logging inert.
  */
 export function buildWorkerClients(
   ports: WorkerClientPorts,
   options: {
     workerID?: number
-    log?: WorkerLogger
+    bridge?: EffectBridge.Shape
     database?: WorkerDatabase
     sessionID?: string
   } = {},
 ): WorkerClients {
   const egress = requirePort(ports.egress, "egress")
   const workerID = options.workerID
-  const withLog = options.log === undefined ? {} : { log: options.log }
+  const withBridge = options.bridge === undefined ? {} : { bridge: options.bridge }
   return {
     writer: createWorkerDatabaseWriter({
       ...(workerID === undefined ? {} : { workerID }),
@@ -568,7 +540,7 @@ export function buildWorkerClients(
     egress: createWorkerEgressClient(egress, {
       ...(ports.egressControl === undefined ? {} : { controlPort: ports.egressControl }),
       ...(workerID === undefined ? {} : { workerID }),
-      ...withLog,
+      ...withBridge,
     }),
   }
 }
@@ -612,8 +584,8 @@ export function reportedWorkerID(init: Pick<SessionWorkerInit, "workerID">, thre
  * dropped report is observable.
  */
 export interface ControlPidReporterOptions {
-  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
-  readonly log?: WorkerLogger
+  /** Optional re-entry bridge for the failure line; absent keeps logging inert. */
+  readonly bridge?: EffectBridge.Shape
 }
 
 /**
@@ -623,14 +595,18 @@ export interface ControlPidReporterOptions {
  * `pid report failed` path (and the forwarded `log`) is observable without a
  * real closed port.
  */
-export type ControlPidReporterFactory = (port: MessagePort, workerID: number, log: WorkerLogger) => PidReporterInterface
+export type ControlPidReporterFactory = (
+  port: MessagePort,
+  workerID: number,
+  bridge: EffectBridge.Shape,
+) => PidReporterInterface
 
 export function createControlPidReporter(
   port: MessagePort,
   workerID: number,
   options: ControlPidReporterOptions = {},
 ): PidReporterInterface {
-  const log = options.log ?? noopWorkerLogger
+  const bridge = options.bridge
   return {
     report(entry) {
       const frame: PidReport = {
@@ -643,7 +619,9 @@ export function createControlPidReporter(
       } catch (error) {
         // The port is closed. Emit the WARN before rethrowing so the report
         // is never silently dropped AND the reason is observable.
-        log(workerLogMessage("pid report failed"), { level: "warn", workerID, reason: messageOf(error) })
+        void bridge?.fork(
+          Effect.logWarning(workerLogMessage("pid report failed"), { workerID, reason: messageOf(error) }),
+        )
         throw error
       }
     },
@@ -876,7 +854,10 @@ export function createSessionWork(options: SessionWorkOptions): SessionWork {
     ).pipe(Effect.orDie)
     // The layer build (and any fiber it forks) must see the worker's ambient
     // instance context, so `InstanceState`-backed services resolve a directory.
-    return options.instance === undefined ? run : Effect.provideService(run, InstanceRef, options.instance)
+    const provided = options.instance === undefined ? run : Effect.provideService(run, InstanceRef, options.instance)
+    // One annotation at the per-session run boundary: every Effect log the run
+    // emits is forwarded with the session id in its user-visible prefix.
+    return provided.pipe(Effect.annotateLogs({ sessionID }))
   }
 }
 
@@ -1022,19 +1003,10 @@ export function productionWorkRegistry(session: SessionWork): SessionWorkFactory
  * fallback reports a non-committed publish and emits nothing.
  */
 function directClients(): WorkerClients {
-  // Degraded boot: there is no writer authority, so every write/transaction
-  // primitive fails loud instead of silently returning `undefined`.
-  const unavailable = (method: string) => async (): Promise<never> => {
-    throw new Error(`session worker has no writer authority for "${method}" (degraded boot)`)
-  }
   return {
     writer: {
       query: async () => [],
       publish: async () => ({ seq: null, committed: false }),
-      begin: unavailable("begin"),
-      txQuery: unavailable("txQuery"),
-      commit: unavailable("commit"),
-      rollback: unavailable("rollback"),
       dispose: () => {},
     },
     // Degraded boot: the hub serves no egress port, so events are dropped and
@@ -1088,19 +1060,19 @@ export function workerGraphReplacements(
  * on the default Effect runtime, so the peer lifecycle lines reach the worker's
  * output instead of being dropped by the no-op default.
  */
-export function workerBridgeLogger(snapshot: WorkerSnapshot, logging?: Layer.Layer<never>): WorkerLogger {
+export function workerLogBridge(snapshot: WorkerSnapshot, logging?: Layer.Layer<never>): EffectBridge.Shape {
   const bridge = Effect.runSync(
     EffectBridge.make().pipe(Effect.provideService(InstanceRef, workerInstanceContext(snapshot))),
   )
-  if (logging === undefined) return workerLoggerFromBridge(bridge)
+  if (logging === undefined) return bridge
   // The file sink opens asynchronously, so `Effect.runSync` cannot build it into
   // the bridge context. Provide the logging layer per emitted line instead — the
   // bridge logger only emits a handful of lifecycle lines.
-  return workerLoggerFromBridge({
+  return {
     ...bridge,
     fork: <A, E, R>(effect: Effect.Effect<A, E, R>): Fiber.Fiber<A, E> =>
       Effect.runFork(effect.pipe(Effect.provide(logging)) as Effect.Effect<A, E, never>),
-  })
+  }
 }
 
 /**
@@ -1209,11 +1181,11 @@ export function hubProxyPluginToolList(
 /** Options for {@link bootstrapSessionWorker}; every field is additive. */
 export interface BootstrapSessionWorkerOptions {
   /**
-   * Override the worker-side logger. Production omits it (a bridge logger is
+   * Override the worker-side log bridge. Production omits it (a bridge is
    * derived from the snapshot); a test may inject a recorder to observe the
    * lines the client construction emits.
    */
-  readonly log?: WorkerLogger
+  readonly bridge?: EffectBridge.Shape
   /**
    * Worker logging layer (see `worker-logging.ts`). Production omits it: the
    * worker derives a file-sink layer scoped to its slot id so its `Effect.log*`
@@ -1222,8 +1194,8 @@ export interface BootstrapSessionWorkerOptions {
   readonly logging?: Layer.Layer<never>
   /**
    * Test seam: build the control-port PID reporter. Defaults to
-   * `createControlPidReporter(port, workerID, { log })`, so the worker's forwarded
-   * `log` reaches the reporter's `pid report failed` line.
+   * `createControlPidReporter(port, workerID, { bridge })`, so the worker's
+   * forwarded bridge reaches the reporter's `pid report failed` line.
    */
   readonly pidReporterFactory?: ControlPidReporterFactory
   /**
@@ -1240,8 +1212,8 @@ export interface BootstrapSessionWorkerOptions {
    */
   readonly observeHubProxy?: (client: HubProxyClient) => void
   /**
-   * Test seam: observe the worker's own writer handle. Lets a shutdown test pin
-   * a real write transaction on the same connection the orderly close owns.
+   * Test seam: observe the worker's own writer handle. Lets a shutdown test
+   * probe the same connection the orderly close owns.
    */
   readonly observeWriter?: (writer: WorkerWriterClient) => void
   /**
@@ -1288,13 +1260,14 @@ export function bootstrapSessionWorker(
   options: BootstrapSessionWorkerOptions = {},
 ): SessionWorkerBootstrap {
   const logging = options.logging ?? workerLoggingLayer({ id: `worker-${init.workerID ?? threadId}` })
-  const log = options.log ?? workerBridgeLogger(init.snapshot, logging)
-  // The control-port PID reporter's log is the worker's forwarded `log` (the same
-  // seam the client lifecycles use). A test may swap the factory to observe the failure.
+  const bridge = options.bridge ?? workerLogBridge(init.snapshot, logging)
+  // The control-port PID reporter's log is the worker's forwarded bridge (the
+  // same seam the client lifecycles use). A test may swap the factory to observe
+  // the failure.
   const createPidReporter =
     options.pidReporterFactory ??
-    ((port: MessagePort, workerID: number, forwarded: WorkerLogger) =>
-      createControlPidReporter(port, workerID, { log: forwarded }))
+    ((port: MessagePort, workerID: number, forwarded: EffectBridge.Shape) =>
+      createControlPidReporter(port, workerID, { bridge: forwarded }))
   // Thread-naming lifecycle seam (N slice): bind at boot when the hub shipped
   // the session, then toggle running/idle per run and clear on dispose.
   const namer = options.threadNamer ?? createThreadNamer({ setName: setThreadName })
@@ -1318,7 +1291,7 @@ export function bootstrapSessionWorker(
   // while the worker is still booting must not be lost, otherwise the isolate's
   // native WAL handle outlives `Worker.terminate()` and keeps the write lock
   // until the process exits. It must run while the realm still exists so the
-  // handle closes and the Bus releases its lease.
+  // handle closes and the DurableLog releases its lease.
   let resourcesClosed = false
   let shutdownRequested = false
   /** Run one best-effort disposal: a broken handle must never skip the rest. */
@@ -1446,7 +1419,7 @@ export function bootstrapSessionWorker(
         },
         {
           workerID: reportedWorkerID(init, threadId),
-          log,
+          bridge,
           database,
           ...(init.sessionID === undefined ? {} : { sessionID: init.sessionID }),
         },
@@ -1470,7 +1443,7 @@ export function bootstrapSessionWorker(
       // The shell tool's detached children are reaped by the hub, so the same
       // control port carries their `pid-report` frames (the hub distinguishes the
       // two frame shapes). Only the full-port boot owns children.
-      pidReporter = createPidReporter(hubProxyChannel.port1, reportedWorkerID(init, threadId), log)
+      pidReporter = createPidReporter(hubProxyChannel.port1, reportedWorkerID(init, threadId), bridge)
     } else {
       clients = directClients()
     }

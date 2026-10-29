@@ -12,7 +12,7 @@ import { isBusySqlError } from "./busy"
 
 /**
  * The transaction helpers only ever call `exec`; taking this structural slice
- * (rather than the full native `Connection`) also lets the core Bus run over a
+ * (rather than the full native `Connection`) also lets the core DurableLog run over a
  * test double without pretending to own a real handle.
  */
 export interface TransactionConnection {
@@ -168,7 +168,7 @@ async function retryBusyLater<T>(work: () => T, config: BusyRetryConfig): Promis
 }
 
 /**
- * Retry a synchronous call (for example the Bus `publish`) whenever it fails
+ * Retry a synchronous call (for example the DurableLog `publish`) whenever it fails
  * with a busy error. The whole call is retried; non-busy failures pass through
  * unchanged and exhaustion is typed.
  */
@@ -182,9 +182,12 @@ function commit(connection: TransactionConnection, config: BusyRetryConfig): voi
   retryBusyNow(() => connection.exec("COMMIT"), config)
 }
 
-function rollback(connection: TransactionConnection, cause: unknown): void {
+function rollback(connection: TransactionConnection, cause: unknown, config: BusyRetryConfig): void {
+  // A busy ROLLBACK did not roll back; the transaction is still open and
+  // recoverable, so re-issue ROLLBACK in place with the same bounded budget as
+  // COMMIT. Only an exhausted/failed rollback poisons the connection.
   try {
-    connection.exec("ROLLBACK")
+    retryBusyNow(() => connection.exec("ROLLBACK"), config)
   } catch (rollbackCause) {
     poison(connection)
     throw new TransactionRollbackError(cause, rollbackCause)
@@ -205,7 +208,7 @@ function transactionBody<T, C extends TransactionConnection>(
       commit(connection, config)
       return result
     } catch (error) {
-      if (begun) rollback(connection, error)
+      if (begun) rollback(connection, error, config)
       throw error
     }
   }
@@ -230,7 +233,7 @@ export function inImmediateTransaction<T, C extends TransactionConnection = Conn
 /**
  * Async twin of {@link retryBusySync}: the body is still synchronous (so a
  * transaction cannot interleave), but the backoff between attempts yields to
- * the event loop. This is the path a worker Bus uses so cancellation and
+ * the event loop. This is the path a worker DurableLog uses so cancellation and
  * streaming progress keep running while SQLite is busy.
  */
 export function retryBusyAsync<T>(work: () => T, options: Partial<BusyRetryConfig> = {}): Promise<T> {
@@ -251,7 +254,7 @@ export async function inImmediateTransactionAsync<T, C extends TransactionConnec
   return retryBusyLater(transactionBody(connection, work, config), config)
 }
 
-/** Readable alias used by the Bus/db-core contract. */
+/** Readable alias used by the DurableLog/db-core contract. */
 export function transaction<T, C extends TransactionConnection = Connection>(
   connection: C,
   work: (tx: C) => T,

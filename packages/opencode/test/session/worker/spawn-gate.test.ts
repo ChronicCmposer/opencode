@@ -5,7 +5,8 @@
 // of the session.
 
 import { describe, expect, test } from "bun:test"
-import { createSpawnGate } from "@/session/worker/spawn-gate"
+import { makeSpawnGate } from "@/session/worker/worker-pools"
+import { pollUntil } from "../../lib/async"
 
 /** Track settlement without leaving an unhandled rejection behind. */
 function observe<T>(promise: Promise<T>) {
@@ -23,17 +24,15 @@ function observe<T>(promise: Promise<T>) {
   return state
 }
 
-const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 10))
-
-describe("createSpawnGate", () => {
+describe("makeSpawnGate", () => {
   test("grants one permit at a time", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000, capacity: 1 })
 
     const first = await gate.acquire()
     const second = gate.acquire()
     const secondState = observe(second)
 
-    await tick()
+    await pollUntil(() => gate.waiting === 1, { message: "the second acquisition never queued" })
     expect(secondState.settled).toBe(false)
 
     first.release()
@@ -43,12 +42,12 @@ describe("createSpawnGate", () => {
   })
 
   test("releases are not on acquire or construction", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000, capacity: 1 })
     const first = await gate.acquire()
     const second = gate.acquire()
     const secondState = observe(second)
 
-    await tick()
+    await pollUntil(() => gate.waiting === 1, { message: "the second acquisition never queued" })
     expect(secondState.settled).toBe(false)
     expect(secondState.error).toBeUndefined()
 
@@ -61,7 +60,7 @@ describe("createSpawnGate", () => {
   })
 
   test("queues concurrent acquisitions FIFO", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000, capacity: 1 })
     const first = await gate.acquire()
     const order: string[] = []
 
@@ -76,7 +75,10 @@ describe("createSpawnGate", () => {
 
     first.release()
     const secondPermit = await second
-    await tick()
+    // The third stays queued behind the one permit: it must not have run yet.
+    await pollUntil(() => gate.waiting === 1 && gate.active === 1, {
+      message: "the third acquisition left the queue before the second released",
+    })
     expect(order).toEqual(["second"])
 
     secondPermit.release()
@@ -86,12 +88,12 @@ describe("createSpawnGate", () => {
   })
 
   test("a waiter is not rejected while it waits", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000, capacity: 1 })
     const first = await gate.acquire()
     const second = gate.acquire()
     const secondState = observe(second)
 
-    await tick()
+    await pollUntil(() => gate.waiting === 1, { message: "the second acquisition never queued" })
     expect(secondState.error).toBeUndefined()
 
     first.release()
@@ -101,7 +103,7 @@ describe("createSpawnGate", () => {
   })
 
   test("a failed release frees the permit for the next waiter", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000, capacity: 1 })
     const first = await gate.acquire()
     const second = gate.acquire()
 
@@ -112,7 +114,7 @@ describe("createSpawnGate", () => {
   })
 
   test("release is idempotent", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000, capacity: 1 })
     const first = await gate.acquire()
     first.release()
     first.release()
@@ -122,7 +124,9 @@ describe("createSpawnGate", () => {
     const third = gate.acquire()
     const thirdState = observe(third)
 
-    await tick()
+    await pollUntil(() => gate.waiting === 1 && gate.active === 1, {
+      message: "the third acquisition never queued behind the second",
+    })
     expect(thirdState.settled).toBe(false)
 
     second.release()
@@ -131,7 +135,7 @@ describe("createSpawnGate", () => {
   })
 
   test("release with different outcomes still releases once", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000, capacity: 1 })
     const first = await gate.acquire()
     first.release("failed", new Error("worker boot failed"))
     first.release()
@@ -139,7 +143,9 @@ describe("createSpawnGate", () => {
     const second = await gate.acquire()
     const third = gate.acquire()
     const thirdState = observe(third)
-    await tick()
+    await pollUntil(() => gate.waiting === 1 && gate.active === 1, {
+      message: "the third acquisition never queued behind the second",
+    })
     expect(thirdState.settled).toBe(false)
 
     second.release()
@@ -147,7 +153,7 @@ describe("createSpawnGate", () => {
   })
 
   test("times out a waiting acquisition with a descriptive error", async () => {
-    const gate = createSpawnGate({ timeoutMs: 20, capacity: 1 })
+    const gate = makeSpawnGate({ timeoutMs: 20, capacity: 1 })
     const first = await gate.acquire()
 
     const timeout = gate.acquire()
@@ -166,7 +172,7 @@ describe("createSpawnGate", () => {
   })
 
   test("release accepts an optional outcome and the permit has no fail method", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000, capacity: 1 })
 
     const first = await gate.acquire()
     expect("fail" in first).toBe(false)
@@ -185,19 +191,19 @@ describe("createSpawnGate", () => {
   })
 
   test("rejects an invalid timeout at construction", () => {
-    expect(() => createSpawnGate({ timeoutMs: 0 })).toThrow(/timeoutMs/)
-    expect(() => createSpawnGate({ timeoutMs: Number.NaN })).toThrow(/timeoutMs/)
+    expect(() => makeSpawnGate({ timeoutMs: 0 })).toThrow(/timeoutMs/)
+    expect(() => makeSpawnGate({ timeoutMs: Number.NaN })).toThrow(/timeoutMs/)
   })
 
   test("rejects an invalid capacity at construction", () => {
-    expect(() => createSpawnGate({ timeoutMs: 1_000, capacity: 0 })).toThrow(/capacity/)
-    expect(() => createSpawnGate({ timeoutMs: 1_000, capacity: 1.5 })).toThrow(/capacity/)
+    expect(() => makeSpawnGate({ timeoutMs: 1_000, capacity: 0 })).toThrow(/capacity/)
+    expect(() => makeSpawnGate({ timeoutMs: 1_000, capacity: 1.5 })).toThrow(/capacity/)
   })
 })
 
 describe("cap-bounded parallel boots", () => {
   test("admits capacity boots concurrently and queues the rest FIFO", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 2 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000, capacity: 2 })
     expect(gate.capacity).toBe(2)
 
     const first = await gate.acquire()
@@ -207,7 +213,7 @@ describe("cap-bounded parallel boots", () => {
 
     const third = gate.acquire()
     const thirdState = observe(third)
-    await tick()
+    await pollUntil(() => gate.waiting === 1, { message: "the third acquisition never queued" })
     expect(thirdState.settled).toBe(false)
     expect(gate.waiting).toBe(1)
 
@@ -225,7 +231,7 @@ describe("cap-bounded parallel boots", () => {
   })
 
   test("defaults to a bounded parallel capacity, not a single permit", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000 })
     expect(gate.capacity).toBeGreaterThan(1)
     const permits = await Promise.all([gate.acquire(), gate.acquire()])
     expect(gate.active).toBe(2)
@@ -233,7 +239,7 @@ describe("cap-bounded parallel boots", () => {
   })
 
   test("a stalled boot does not block an unrelated boot", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 2 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000, capacity: 2 })
     const stalled = await gate.acquire()
     const other = await gate.acquire()
     // The stalled holder never releases; the other boot still completes.
@@ -245,16 +251,16 @@ describe("cap-bounded parallel boots", () => {
 
 describe("abortable acquisitions", () => {
   test("aborting a queued acquisition removes its waiter without consuming a permit", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000, capacity: 1 })
     const first = await gate.acquire()
     const controller = new AbortController()
     const queued = gate.acquire(controller.signal)
     const state = observe(queued)
-    await tick()
+    await pollUntil(() => gate.waiting === 1, { message: "the queued acquisition never queued" })
     expect(gate.waiting).toBe(1)
 
     controller.abort()
-    await tick()
+    await pollUntil(() => state.settled, { message: "the aborted acquisition never settled" })
     expect(state.settled).toBe(true)
     expect(state.error).toBeInstanceOf(Error)
     expect((state.error as Error).message).toContain("aborted")
@@ -265,7 +271,7 @@ describe("abortable acquisitions", () => {
     // by the single release, and the permit accounting stays exact.
     const next = gate.acquire()
     const nextState = observe(next)
-    await tick()
+    await pollUntil(() => gate.waiting === 1, { message: "the next acquisition never queued" })
     expect(nextState.settled).toBe(false)
     first.release()
     const permit = await next
@@ -275,7 +281,7 @@ describe("abortable acquisitions", () => {
   })
 
   test("an already-aborted signal rejects without queueing", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000, capacity: 1 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000, capacity: 1 })
     const controller = new AbortController()
     controller.abort()
     await expect(gate.acquire(controller.signal)).rejects.toThrow(/aborted/)
@@ -288,7 +294,7 @@ describe("abortable acquisitions", () => {
 
 describe("abort listener lifecycle", () => {
   test("a timed-out acquisition removes its abort listener", async () => {
-    const gate = createSpawnGate({ timeoutMs: 20, capacity: 1 })
+    const gate = makeSpawnGate({ timeoutMs: 20, capacity: 1 })
     const first = await gate.acquire()
     let added = 0
     let removed = 0

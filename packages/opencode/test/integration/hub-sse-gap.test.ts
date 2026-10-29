@@ -15,6 +15,7 @@ import { Effect, Layer, ManagedRuntime } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { EventV2 } from "@opencode-ai/core/event"
+import { durableLogStub } from "../lib/durable-log-stub"
 import { createLiveEventPublisher } from "@/event-v2-bridge"
 import { encodeFrame } from "@/session/egress/frame"
 import { buildProductionPortBackends, createDurableHealReader } from "@/session/worker/hub"
@@ -65,7 +66,9 @@ function eventLog(): {
 /** The real EventV2 subscriber seam the SSE handler uses, over a DB-free live path. */
 function sseRuntime() {
   const databaseStub = Layer.succeed(Database.Service, { db: {} as never })
-  return ManagedRuntime.make(EventV2.layerWith().pipe(Layer.provide(databaseStub)))
+  return ManagedRuntime.make(
+    EventV2.layerWith().pipe(Layer.provide(durableLogStub), Layer.provide(databaseStub)),
+  )
 }
 
 describe("hub SSE gap healing", () => {

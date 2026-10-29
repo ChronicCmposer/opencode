@@ -10,6 +10,7 @@
 import { describe, expect } from "bun:test"
 import { Effect, Layer, Schema } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
+import { durableLogStub } from "../../lib/durable-log-stub"
 import { Database } from "@opencode-ai/core/database/database"
 import {
   DURABLE_WAKEUP_METADATA_KEY,
@@ -25,7 +26,7 @@ import { testEffect } from "../../lib/effect"
 
 /** Non-durable publishes never read `db`, so a stub is enough to build the layer. */
 const databaseStub = Layer.succeed(Database.Service, { db: {} as never })
-const eventLayer = EventV2.layerWith().pipe(Layer.provide(databaseStub))
+const eventLayer = EventV2.layerWith().pipe(Layer.provide(durableLogStub), Layer.provide(databaseStub))
 const it = testEffect(eventLayer)
 
 // A session-scoped event (has sessionID), worker-local telemetry (no sessionID),

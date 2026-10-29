@@ -23,6 +23,7 @@ import type { SessionID } from "@/session/schema"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { createSessionHub, SessionHubService } from "@/session/worker/hub"
+import { createTestBarrier } from "../../lib/run-barrier-test"
 import type {
   ExecutorRun,
   ExecutorSessionWorker,
@@ -162,7 +163,7 @@ describe("14.1 the pool is gated by the flag (a present hub is ignored when OFF)
   for (const testCase of delegationMatrix) {
     it.live(testCase.name, () => {
       const pool = new SpyPool(1, withParts(testCase.sessionID))
-      const hub = createSessionHub({ pool })
+      const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool })
       const run = Effect.gen(function* () {
         const state = yield* SessionRunState.Service
         let workRan = false

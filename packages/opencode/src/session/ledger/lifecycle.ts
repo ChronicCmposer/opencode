@@ -260,6 +260,26 @@ export interface LifecycleReporting {
 
 let installed: LifecycleReporting | undefined
 
+/** The worker-local last committed assistant message per session in this isolate. */
+const committedBySession = new Map<string, string>()
+
+/** Start a fresh worker-local commit record for one run. */
+export function resetCommitted(sessionID: string): void {
+  committedBySession.delete(sessionID)
+}
+
+/**
+ * The committed message this isolate observed for its current run. The run's
+ * `done` reply carries this value, so the hub barrier never depends on the
+ * best-effort `lifecycle.commit` RPC landing in time (F11).
+ */
+export function committedMessage(sessionID: string): string | null | undefined {
+  // No reporting seam means this is not a real worker run (unit tests, pipeline
+  // reductions): leave the historical result shape untouched.
+  if (installed === undefined) return undefined
+  return committedBySession.get(sessionID) ?? null
+}
+
 /** Install the current isolate's reporting seam (`session-worker` boot). */
 export function installReporting(reporting: LifecycleReporting | undefined): void {
   installed = reporting
@@ -336,7 +356,14 @@ export function createProxyReporting(
       () => undefined,
     )
   return {
-    commit: (sessionID, messageID) => bestEffort("lifecycle.commit", [sessionID, messageID]),
+    // The commit outcome rides the run's `done` reply (from the worker-local
+    // record); this RPC is demoted to a crash-ledger hint and never gates the
+    // barrier with a 5 s best-effort deadline.
+    commit: (sessionID, messageID) => {
+      if (typeof messageID === "string" && messageID.length > 0) committedBySession.set(sessionID, messageID)
+      void call("lifecycle.commit", [sessionID, messageID]).catch(() => undefined)
+      return Promise.resolve()
+    },
     toolStarted: (sessionID, callID, sideEffecting = true) =>
       send("lifecycle.toolStarted", [sessionID, callID, sideEffecting]),
     toolFinished: (sessionID, callID) => bestEffort("lifecycle.toolFinished", [sessionID, callID]),

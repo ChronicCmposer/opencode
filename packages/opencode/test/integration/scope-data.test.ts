@@ -1,5 +1,5 @@
 // Scope/data contracts: every worker surface is bound to one session, EventV2
-// enforces the same aggregate/blob bounds as the Bus, the zero-live gate counts
+// enforces the same aggregate/blob bounds as the DurableLog, the zero-live gate counts
 // real isolates, migrations run once per process on a genuinely legacy file,
 // the retry timer never pins a worker process, and the page-cache budget stays
 // bounded for eight workers.
@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url"
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test"
 import { layer as sqliteLayer } from "@opencode-ai/core/database/sqlite.bun"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
-import { Effect, Exit, Schema } from "effect"
+import { Effect, Exit, Layer, Schema } from "effect"
 import { sql } from "drizzle-orm"
 import { Database as DatabaseService } from "@opencode-ai/core/database/database"
 import { openConnection } from "@opencode-ai/core/database/connection"
@@ -24,7 +24,7 @@ import {
   walPragmas,
 } from "@opencode-ai/core/database/pragmas"
 import { EventV2 } from "@opencode-ai/core/event"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { Event } from "@opencode-ai/schema/event"
 import { SCHEMA_VERSION } from "@/session/db/allowlist.gen"
 import { SessionID } from "@/session/schema"
@@ -51,6 +51,7 @@ import {
   type WorkerDatabase,
 } from "@/session/worker/db"
 import { createBunExecutorTransport, createProductionSessionHub, liveSessionWorkerCount } from "@/session/worker/hub"
+import { createTestBarrier } from "../lib/run-barrier-test"
 import { migrationStatements } from "@/session/writer/migration.statements.gen"
 import { sessionWorkerInit } from "../lib/session-worker-init"
 import { REAL_WORKER_TEST_TIMEOUT_MS } from "../lib/worker-timeouts"
@@ -306,7 +307,7 @@ describe("bound-session scope on every surface", () => {
     ])
   })
 
-  test("the Bus capability exposes operations, never a raw connection", async () => {
+  test("the DurableLog capability exposes operations, never a raw connection", async () => {
     const filename = migratedDatabase()
     seedSessions(filename)
     const database = await openBound(filename, "session-a")
@@ -398,7 +399,12 @@ describe("EventV2 durable path", () => {
             manifest: NoteManifest,
           })
           return { published, read }
-        }).pipe(Effect.provide(EventV2.layerWith()), Effect.provide(DatabaseService.layerFromPath(filename))),
+        }).pipe(Effect.provide(
+            EventV2.layerWith().pipe(
+              Layer.provide(DurableLog.layerFromDatabase),
+              Layer.provideMerge(DatabaseService.layerFromPath(filename)),
+            ),
+          )),
       ),
     )
 
@@ -464,7 +470,7 @@ describe("real zero-live-worker gate", () => {
     expect(liveSessionWorkerCount(filename)).toBe(1)
     // Schema-ensure is lazy by design (it must not run sync SQL on the hub
     // loop), so the refusal happens before the first dispatch can spawn.
-    const hub = createProductionSessionHub({
+    const hub = createProductionSessionHub({ ...{ barrier: createTestBarrier() },
       init: sessionWorkerInit(),
       databasePath: filename,
     })
@@ -483,7 +489,7 @@ describe("real zero-live-worker gate", () => {
         return true
       },
     }
-    const hub = createProductionSessionHub({
+    const hub = createProductionSessionHub({ ...{ barrier: createTestBarrier() },
       init: sessionWorkerInit(),
       databasePath: filename,
       spawnGate: gate,
@@ -649,18 +655,18 @@ describe("worker retry timer and cache budget", () => {
   })
 })
 
-describe("aggregate deletion through Bus.deleteAggregate", () => {
+describe("aggregate deletion through DurableLog.deleteAggregate", () => {
   test("an oversized blob is collected atomically and a shared file survives until its last aggregate", async () => {
     const directory = workspace()
     const filename = path.join(directory, "hub.db")
     const blobDir = path.join(directory, "event-blobs")
 
-    // Build the hub schema once, then publish through the same unguarded Bus
+    // Build the hub schema once, then publish through the same unguarded DurableLog
     // the worker/hub writer uses (EventV2 shares the same D16 blob path).
     await Effect.runPromise(Effect.scoped(Effect.void.pipe(Effect.provide(DatabaseService.layerFromPath(filename)))))
     const raw = openConnection({ filename })
     cleanups.push(() => raw.close())
-    const bus = Bus.create({
+    const bus = DurableLog.create({
       connection: raw,
       ownerID: "scope-data-delete",
       definitions: [Note],
@@ -702,8 +708,12 @@ describe("aggregate deletion through Bus.deleteAggregate", () => {
             const events = yield* EventV2.Service
             yield* events.remove(aggregateID)
           }).pipe(
-            Effect.provide(EventV2.layerWith({ blobDir })),
-            Effect.provide(DatabaseService.layerFromPath(filename)),
+            Effect.provide(
+              EventV2.layerWith({ blobDir }).pipe(
+                Layer.provide(DurableLog.layerFromDatabase),
+                Layer.provideMerge(DatabaseService.layerFromPath(filename)),
+              ),
+            ),
           ),
         ),
       )
@@ -1018,7 +1028,7 @@ describe("EventV2 blob directory follows the connection file", () => {
       [rawA, dirA],
       [rawB, dirB],
     ] as const) {
-      const bus = Bus.create({
+      const bus = DurableLog.create({
         connection: raw,
         ownerID: "blob-dir-source",
         definitions: [Note],
@@ -1039,7 +1049,12 @@ describe("EventV2 blob directory follows the connection file", () => {
           Effect.gen(function* () {
             const events = yield* EventV2.Service
             yield* events.remove("session-a")
-          }).pipe(Effect.provide(EventV2.layerWith()), Effect.provide(DatabaseService.layerFromPath(filename))),
+          }).pipe(Effect.provide(
+            EventV2.layerWith().pipe(
+              Layer.provide(DurableLog.layerFromDatabase),
+              Layer.provideMerge(DatabaseService.layerFromPath(filename)),
+            ),
+          )),
         ),
       )
 
@@ -1454,7 +1469,7 @@ describe("authoritative bound scope (adversarial fail-closed)", () => {
     ])
   })
 
-  test("bound worker and Bus authorizers refuse secret-bearing hub reads", async () => {
+  test("bound worker and DurableLog authorizers refuse secret-bearing hub reads", async () => {
     const filename = migratedDatabase()
     seedSessions(filename)
     const database = await openBound(filename, "session-a")

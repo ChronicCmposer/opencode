@@ -1,4 +1,5 @@
 import type { EventV2Event } from "./frame"
+import { Option, Schema } from "effect"
 
 /** One committed position in an aggregate's durable log. */
 export interface AggregatePosition {
@@ -228,9 +229,13 @@ const SNAPSHOT_SQL =
 const SNAPSHOT_RANGE_SQL =
   "SELECT id, type, data FROM event WHERE aggregate_id = ? AND seq > ? AND seq <= ? ORDER BY seq ASC"
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-}
+const SnapshotRowSchema = Schema.Struct({
+  id: Schema.String,
+  type: Schema.String,
+  data: Schema.Unknown,
+})
+
+const decodeSnapshotRow = Schema.decodeUnknownOption(SnapshotRowSchema)
 
 /** Decode a stored payload; SQLite stores `data` as JSON text, tests may use objects. */
 function decodeData(value: unknown): unknown {
@@ -269,11 +274,9 @@ export function createEventLogSnapshotReader(query: SnapshotQuery): SnapshotRead
         : await query("all", SNAPSHOT_RANGE_SQL, [aggregate, after, seq])
     if (!Array.isArray(rows)) throw new Error("snapshot query returned a non-array result")
     return rows.map((row, index) => {
-      if (!isRecord(row)) throw new Error(`invalid event row ${index}: expected an object`)
-      if (typeof row.id !== "string") throw new Error(`invalid event row ${index}: id must be a string`)
-      if (typeof row.type !== "string") throw new Error(`invalid event row ${index}: type must be a string`)
-      if (!("data" in row)) throw new Error(`invalid event row ${index}: data is missing`)
-      return { id: row.id, type: row.type, properties: decodeData(row.data) }
+      const decoded = decodeSnapshotRow(row)
+      if (Option.isNone(decoded)) throw new Error(`invalid event row ${index}: expected { id, type, data }`)
+      return { id: decoded.value.id, type: decoded.value.type, properties: decodeData(decoded.value.data) }
     })
   }
 }

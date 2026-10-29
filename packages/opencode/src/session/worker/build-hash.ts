@@ -13,7 +13,7 @@
 
 import { createHash } from "node:crypto"
 
-import { Schema } from "effect"
+import { Option, Schema } from "effect"
 
 import { WORKER_PROTOCOL_SCHEMA_VERSION } from "./frame"
 
@@ -244,21 +244,18 @@ export function readyFrame(
   return { type: "ready", threadId, buildHash: resolved.hash }
 }
 
-/** True for a plain object; `null` and arrays are excluded. */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-}
+const ReadyBuildSchema = Schema.Struct({ buildHash: Schema.NonEmptyString })
+const decodeReadyBuild = Schema.decodeUnknownOption(ReadyBuildSchema)
 
 /**
  * Check a ready frame's build hash. Missing, empty, or different hashes are a
  * typed `BuildMismatch`; a matching hash returns the trusted value.
  */
 export function verifyReadyBuild(input: unknown, expected: string = resolveBuildHash().hash): string {
-  if (!isRecord(input)) throw new BuildMismatch({ expected, actual: "<not-an-object>" })
-  const actual = input["buildHash"]
-  if (typeof actual !== "string" || actual.length === 0) {
-    throw new BuildMismatch({ expected, actual: "<missing>" })
-  }
+  if (typeof input !== "object" || input === null) throw new BuildMismatch({ expected, actual: "<not-an-object>" })
+  const decoded = decodeReadyBuild(input)
+  if (Option.isNone(decoded)) throw new BuildMismatch({ expected, actual: "<missing>" })
+  const actual = decoded.value.buildHash
   if (actual !== expected) throw new BuildMismatch({ expected, actual })
   return actual
 }

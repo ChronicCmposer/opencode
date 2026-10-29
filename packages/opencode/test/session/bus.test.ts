@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
 import { Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 
 const Note = Event.define({
   type: "test.bus.note",
@@ -47,7 +47,7 @@ const open = () => {
   return { native, connection: connectionFrom(native) }
 }
 
-function connectionFrom(native: Database): Bus.Connection {
+function connectionFrom(native: Database): DurableLog.Connection {
   return {
     all: (sql, params = []) => native.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>,
     run: (sql, params = []) => ({ changes: Number(native.query(sql).run(...(params as never[])).changes) }),
@@ -60,11 +60,11 @@ afterEach(() => {
   for (const native of databases.splice(0)) native.close()
 })
 
-describe("Bus", () => {
+describe("DurableLog", () => {
   test("publishes a batch with contiguous durable sequences", () => {
     const { native, connection } = open()
     databases.push(native)
-    const bus = Bus.create({ connection, ownerID: "worker-1", definitions: [Note] })
+    const bus = DurableLog.create({ connection, ownerID: "worker-1", definitions: [Note] })
 
     const first = bus.publish([
       { definition: Note, data: note("s1", "a") },
@@ -80,7 +80,7 @@ describe("Bus", () => {
   test("runs registered projectors inside the committing transaction", () => {
     const { native, connection } = open()
     databases.push(native)
-    const bus = Bus.create({ connection, ownerID: "worker-1", definitions: [Note] })
+    const bus = DurableLog.create({ connection, ownerID: "worker-1", definitions: [Note] })
     bus.project(Note, (event) => {
       connection.run("INSERT INTO projection (session_id, seq, body) VALUES (?, ?, ?)", [
         event.data.sessionID,
@@ -97,7 +97,7 @@ describe("Bus", () => {
   test("rolls back the event, sequence block, and projector when a projector fails", () => {
     const { native, connection } = open()
     databases.push(native)
-    const bus = Bus.create({ connection, ownerID: "worker-1", definitions: [Note] })
+    const bus = DurableLog.create({ connection, ownerID: "worker-1", definitions: [Note] })
     let fail = true
     bus.project(Note, (event) => {
       if (fail) throw new Error("projector failed")
@@ -121,12 +121,12 @@ describe("Bus", () => {
   })
 })
 
-describe("Bus cache contract", () => {
+describe("DurableLog cache contract", () => {
   test("is event-invalidated, state-version fenced, and restart-safe", () => {
     const { native, connection } = open()
     databases.push(native)
-    const cache = new Bus.StateCache<string>()
-    const bus = Bus.create({ connection, ownerID: "worker-1", definitions: [Note], cache })
+    const cache = new DurableLog.StateCache<string>()
+    const bus = DurableLog.create({ connection, ownerID: "worker-1", definitions: [Note], cache })
 
     bus.publish([{ definition: Note, data: note("s1", "a") }])
     const version = cache.version
@@ -136,9 +136,9 @@ describe("Bus cache contract", () => {
     bus.publish([{ definition: Note, data: note("s1", "b") }])
     expect(cache.get("s1", 0)).toBeUndefined()
     expect(cache.version).toBe(version + 1)
-    expect(() => cache.set("s1", 1, "stale", version)).toThrow(Bus.StaleStateVersionError)
+    expect(() => cache.set("s1", 1, "stale", version)).toThrow(DurableLog.StaleStateVersionError)
 
-    const restarted = new Bus.StateCache<string>()
+    const restarted = new DurableLog.StateCache<string>()
     expect(restarted.get("s1", 0)).toBeUndefined()
     for (const event of bus.read({ aggregateID: "s1" })) {
       restarted.set("s1", event.durable?.seq ?? -1, textOf(event))

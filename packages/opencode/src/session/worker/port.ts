@@ -14,14 +14,15 @@
 // it never drags in a protocol or creates an import cycle. The lifecycle helpers
 // additionally use the structured logger, which is a leaf module.
 
-import { workerLogMessage, type WorkerLogger } from "./log"
+import { Deferred, Effect, Schema } from "effect"
+import type { EffectBridge } from "@/effect/bridge"
+import { workerLogMessage } from "./worker-logging"
 import {
   ProtocolError,
   WORKER_FRAME_VERSION,
   assertWorkerFrameSize,
   decodeWorkerFrame,
   encodeWorkerFrame,
-  isRecord,
   type WorkerFramePort,
 } from "./frame"
 
@@ -117,6 +118,11 @@ export interface WorkerFrameChannelOptions<Frame = unknown> {
    */
   readonly onProtocolError?: (error: unknown) => void
   /**
+   * Decode the family payload once at the port boundary. A throw is contained by
+   * the same host boundary as a malformed envelope.
+   */
+  readonly decodePayload?: (payload: unknown) => Frame
+  /**
    * Validate an outbound frame before it is encoded. Left unset on the egress
    * hot path, where the encoder's plain fast path is deliberate. An untrusted
    * control boundary (hub-proxy) supplies `assertJsonRepresentable` so a
@@ -153,10 +159,13 @@ export function workerFrameChannel<Frame extends WorkerFrameCarrier>(
             throw new ProtocolError(`expected worker port "${portName}" (got ${JSON.stringify(envelope.port)})`)
           }
           const payload = envelope.payload
-          if (!isRecord(payload) || payload["kind"] !== envelope.kind) {
+          if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
             throw new ProtocolError(`frame "${envelope.kind}" is missing a matching payload`)
           }
-          handler(payload as Frame)
+          if ((payload as { readonly kind?: unknown }).kind !== envelope.kind) {
+            throw new ProtocolError(`frame "${envelope.kind}" is missing a matching payload`)
+          }
+          handler(options.decodePayload === undefined ? (payload as Frame) : options.decodePayload(payload))
         } catch (error) {
           if (options.onProtocolError === undefined) throw error
           unsubscribe()
@@ -172,12 +181,20 @@ export function workerFrameChannel<Frame extends WorkerFrameCarrier>(
 // Request/response correlation
 // ---------------------------------------------------------------------------
 
-/** One in-flight request: how to settle it and how to cancel its timeout. */
-interface PendingRequest<Reply> {
-  readonly resolve: (reply: Reply) => void
-  readonly reject: (error: unknown) => void
-  /** Cancel the unref'd timeout armed for this request, when one was armed. */
-  readonly cancelTimeout: (() => void) | undefined
+/**
+ * A reply deadline fired before the peer answered. The request id identifies the
+ * frame still outstanding, so a caller can correlate the timeout with the wire.
+ */
+export class WorkerReplyTimeout extends Schema.TaggedErrorClass<WorkerReplyTimeout>()(
+  "WorkerPort.ReplyTimeout",
+  {
+    id: Schema.Number,
+    timeoutMs: Schema.Number,
+  },
+) {
+  override get message() {
+    return `worker request ${this.id} timed out after ${this.timeoutMs}ms`
+  }
 }
 
 export interface RequestChannelOptions<Frame, Reply extends Frame, Id> {
@@ -189,14 +206,12 @@ export interface RequestChannelOptions<Frame, Reply extends Frame, Id> {
   readonly nextId: () => Id
   /** Default per-request timeout; `undefined` disables timeouts. */
   readonly timeoutMs?: number
-  /** Build the rejection used once the channel is disposed. */
+  /** Build the failure used once the channel is disposed. */
   readonly disposedError: () => unknown
-  /** Build the rejection used when a request times out. */
+  /** Build the failure used when a request times out. */
   readonly timeoutError: (id: Id, timeoutMs: number) => unknown
-  /** Map a `post` failure before rejecting; defaults to the raw thrown error. */
+  /** Map a `post` failure before failing the request; defaults to the raw thrown error. */
   readonly mapPostError?: (error: unknown) => unknown
-  /** Timer seam; defaults to the unref'd {@link defaultSchedule}. */
-  readonly schedule?: PortScheduler
   /**
    * Reject a request whose id is already in flight, instead of silently
    * overwriting its waiter. Omitted callers keep the historical overwrite
@@ -204,10 +219,10 @@ export interface RequestChannelOptions<Frame, Reply extends Frame, Id> {
    */
   readonly duplicateError?: (id: Id) => unknown
   /**
-   * Gate the actual `post` behind a transport becoming ready, so the timeout
-   * armed at `request` time also covers the wait for the transport. The frame is
-   * built and registered immediately; `post` runs once this resolves, or the
-   * request rejects with the transport's failure. Omitted callers post inline.
+   * Gate the actual `post` behind a transport becoming ready, so the deadline
+   * also covers the wait for the transport. The frame is built and registered
+   * immediately; `post` runs once this resolves, or the request fails with the
+   * transport's failure. Omitted callers post inline.
    */
   readonly awaitPost?: () => Promise<void>
 }
@@ -215,30 +230,28 @@ export interface RequestChannelOptions<Frame, Reply extends Frame, Id> {
 /**
  * A framed request/response channel: `request` correlates a reply by id,
  * `onFrame` observes every inbound frame (for unsolicited pushes), `fail`
- * rejects every in-flight request without tearing the channel down, and
- * `dispose` rejects every in-flight request permanently. Timers are armed
- * through `PortScheduler`, so the default is unref'd and never keeps the
- * process alive.
+ * completes every in-flight `Deferred` with one failure without tearing the
+ * channel down, and `dispose` fails every in-flight request permanently.
  */
 export interface RequestChannel<Frame, Reply extends Frame, Id> {
-  request(build: (id: Id) => Frame, timeoutMs?: number, id?: Id): Promise<Reply>
+  request(build: (id: Id) => Frame, timeoutMs?: number, id?: Id): Effect.Effect<Reply, unknown>
   onFrame(handler: (frame: Frame) => void): () => void
-  /** Reject every in-flight request with `error`, leaving the channel usable. */
+  /** Fail every in-flight request with `error`, leaving the channel usable. */
   fail(error: unknown): void
   dispose(): void
 }
 
 /**
- * Build a request/response channel over `channel`. The reply shape and id are
- * supplied by the caller, so each protocol keeps its own frame codec while the
- * pending-map, timeout and dispose plumbing lives here.
+ * Build a request/response channel over `channel`. Each in-flight request is a
+ * `Deferred`: the message handler completes the matching one, a deadline is
+ * `Effect.timeoutOrElse`, and a disconnect fails every pending `Deferred` in one
+ * place. The frame codec stays with the caller.
  */
 export function createRequestChannel<Frame, Reply extends Frame, Id>(
   channel: FrameChannel<Frame>,
   options: RequestChannelOptions<Frame, Reply, Id>,
 ): RequestChannel<Frame, Reply, Id> {
-  const schedule = options.schedule ?? defaultSchedule
-  const pending = new Map<Id, PendingRequest<Reply>>()
+  const pending = new Map<Id, Deferred.Deferred<Reply, unknown>>()
   const observers = new Set<(frame: Frame) => void>()
   let disposed = false
 
@@ -251,89 +264,74 @@ export function createRequestChannel<Frame, Reply extends Frame, Id>(
     const waiter = pending.get(id)
     if (waiter === undefined) return
     pending.delete(id)
-    waiter.cancelTimeout?.()
-    waiter.resolve(frame)
+    Deferred.doneUnsafe(waiter, Effect.succeed(frame))
   })
 
   const mapPostError = options.mapPostError ?? ((error: unknown) => error)
 
-  /** Reject `id`'s waiter (if still registered) after cancelling its timer. */
-  const rejectWaiter = (id: Id, error: unknown): void => {
-    const waiter = pending.get(id)
-    if (waiter === undefined) return
-    pending.delete(id)
-    waiter.cancelTimeout?.()
-    waiter.reject(error)
+  /** Complete every pending waiter with `error`; the map is the one place. */
+  const failPending = (error: unknown): void => {
+    const waiters = Array.from(pending.values())
+    pending.clear()
+    for (const waiter of waiters) Deferred.doneUnsafe(waiter, Effect.fail(error))
   }
 
-  return {
-    request(build, timeoutMs = options.timeoutMs, id = options.nextId()) {
-      if (disposed) return Promise.reject(options.disposedError())
+  const request = (
+    build: (id: Id) => Frame,
+    timeoutMs = options.timeoutMs,
+    id = options.nextId(),
+  ): Effect.Effect<Reply, unknown> =>
+    Effect.suspend(() => {
+      if (disposed) return Effect.fail(options.disposedError())
       if (options.duplicateError !== undefined && pending.has(id)) {
-        return Promise.reject(options.duplicateError(id))
+        return Effect.fail(options.duplicateError(id))
       }
-      return new Promise<Reply>((resolve, reject) => {
-        const cancelTimeout =
-          timeoutMs === undefined
-            ? undefined
-            : schedule(timeoutMs, () => {
-                pending.delete(id)
-                reject(options.timeoutError(id, timeoutMs))
-              })
-        pending.set(id, { resolve, reject, cancelTimeout })
-        let frame: Frame
-        try {
-          frame = build(id)
-        } catch (error) {
-          pending.delete(id)
-          cancelTimeout?.()
-          reject(mapPostError(error))
-          return
-        }
-        // A send only fires while this request is still registered: a timeout
-        // (or dispose) that won the race must not post a frame no one waits on.
-        const send = () => {
+      const waiter = Deferred.makeUnsafe<Reply, unknown>()
+      pending.set(id, waiter)
+      const fail = (error: unknown): void => {
+        pending.delete(id)
+        Deferred.doneUnsafe(waiter, Effect.fail(error))
+      }
+      const post = Effect.try({
+        try: () => {
           if (!pending.has(id)) return
-          try {
-            channel.post(frame)
-          } catch (error) {
-            pending.delete(id)
-            cancelTimeout?.()
-            reject(mapPostError(error))
-          }
-        }
-        // Without a transport gate the frame posts inline; with one, the post is
-        // deferred until the transport is live, so the timeout above covers it.
-        if (options.awaitPost === undefined) {
-          send()
-          return
-        }
-        Promise.resolve()
-          .then(options.awaitPost)
-          .then(send, (error) => rejectWaiter(id, mapPostError(error)))
-      })
-    },
+          channel.post(build(id))
+        },
+        catch: mapPostError,
+      }).pipe(Effect.tapError((error) => Effect.sync(() => fail(error))), Effect.ignore)
+      const send = options.awaitPost === undefined
+        ? post
+        : Effect.tryPromise({ try: () => options.awaitPost!(), catch: mapPostError }).pipe(
+            Effect.tapError((error) => Effect.sync(() => fail(error))),
+            Effect.ignore,
+            Effect.andThen(post),
+          )
+      const awaited = send.pipe(Effect.andThen(Deferred.await(waiter)))
+      const timed =
+        timeoutMs === undefined
+          ? awaited
+          : awaited.pipe(
+              Effect.timeoutOrElse({
+                duration: timeoutMs,
+                orElse: () => Effect.fail(options.timeoutError(id, timeoutMs)),
+              }),
+            )
+      return timed.pipe(Effect.ensuring(Effect.sync(() => pending.delete(id))))
+    })
+
+  return {
+    request,
     onFrame(handler) {
       if (disposed) return () => {}
       observers.add(handler)
       return () => observers.delete(handler)
     },
-    fail(error) {
-      for (const waiter of pending.values()) {
-        waiter.cancelTimeout?.()
-        waiter.reject(error)
-      }
-      pending.clear()
-    },
+    fail: failPending,
     dispose() {
       if (disposed) return
       disposed = true
       unsubscribe()
-      for (const waiter of pending.values()) {
-        waiter.cancelTimeout?.()
-        waiter.reject(options.disposedError())
-      }
-      pending.clear()
+      failPending(options.disposedError())
       observers.clear()
     },
   }
@@ -406,14 +404,21 @@ export function peerLifecycle(
  * (with the error `reason`) before rethrowing. `build` is where the port is
  * started, so a start failure surfaces here.
  */
-export function connectPeer<T>(log: WorkerLogger, peer: string, workerID: number | undefined, build: () => T): T {
+export function connectPeer<T>(
+  bridge: EffectBridge.Shape | undefined,
+  peer: string,
+  workerID: number | undefined,
+  build: () => T,
+): T {
   const lifecycle = peerLifecycle(peer, workerID)
   try {
     const client = build()
-    log(workerLogMessage(`${peer} connected`), lifecycle("info"))
+    void bridge?.fork(Effect.logInfo(workerLogMessage(`${peer} connected`), lifecycle("info")))
     return client
   } catch (error) {
-    log(workerLogMessage(`${peer} connect failed`), { ...lifecycle("warn"), reason: messageOf(error) })
+    void bridge?.fork(
+      Effect.logWarning(workerLogMessage(`${peer} connect failed`), { ...lifecycle("warn"), reason: messageOf(error) }),
+    )
     throw error
   }
 }

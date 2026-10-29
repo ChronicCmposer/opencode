@@ -6,6 +6,7 @@ import { Session } from "@opencode-ai/schema/session"
 import { SessionEvent } from "@opencode-ai/schema/session-event"
 import { SessionV1 } from "@opencode-ai/schema/session-v1"
 import { Database } from "@opencode-ai/core/database/database"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { Node } from "@opencode-ai/core/effect/app-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -466,7 +467,10 @@ describe("EventV2", () => {
           pause
             ? Deferred.succeed(readStarted, undefined).pipe(Effect.andThen(Deferred.await(continueRead)))
             : Effect.void,
-      }).pipe(Layer.provide(LayerNode.compile(Database.node)))
+      }).pipe(
+        Layer.provide(DurableLog.layerFromDatabase),
+        Layer.provide(LayerNode.compile(Database.node)),
+      )
 
       yield* Effect.gen(function* () {
         const events = yield* EventV2.Service
@@ -524,7 +528,10 @@ describe("EventV2", () => {
       const reads = yield* Queue.unbounded<string>()
       const eventLayer = EventV2.layerWith({
         beforeAggregateRead: (aggregateID) => Queue.offer(reads, aggregateID),
-      }).pipe(Layer.provide(LayerNode.compile(Database.node)))
+      }).pipe(
+        Layer.provide(DurableLog.layerFromDatabase),
+        Layer.provide(LayerNode.compile(Database.node)),
+      )
 
       yield* Effect.gen(function* () {
         const events = yield* EventV2.Service
@@ -1157,7 +1164,7 @@ describe("EventV2 service idiom", () => {
     expect(EventV2.node.name).toBe("@opencode/Event")
     expect(EventV2.node.service).toBe(EventV2.Service)
     expect(EventV2.node.tag).toBe(Node.tags.values.global)
-    expect(EventV2.node.dependencies).toEqual([Database.node])
+    expect(EventV2.node.dependencies).toEqual([Database.node, DurableLog.node])
   })
 
   it.effect("the exported layer provides the same Service as the node", () =>
@@ -1165,6 +1172,9 @@ describe("EventV2 service idiom", () => {
       const events = yield* EventV2.Service
       expect(typeof events.publish).toBe("function")
       expect(typeof events.publishLive).toBe("function")
-    }).pipe(Effect.provide(EventV2.layer.pipe(Layer.provide(LayerNode.compile(Database.node))))),
+    }).pipe(Effect.provide(EventV2.layer.pipe(
+        Layer.provide(DurableLog.layerFromDatabase),
+        Layer.provide(LayerNode.compile(Database.node)),
+      ))),
   )
 })

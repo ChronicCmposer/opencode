@@ -8,6 +8,7 @@ import type {
   SessionExecutionResult,
 } from "@/session/worker/execute"
 import { createSessionHub, isWorkerCrashed, workerCrashedFrom, type WorkerCrashed } from "@/session/worker/hub"
+import { createTestBarrier } from "../../lib/run-barrier-test"
 
 const payload = (sessionID: string): WorkerCrashed => ({
   sessionID,
@@ -60,7 +61,7 @@ describe("D8 hub crash payload", () => {
       workerCrashed: expected,
     })
     const persisted: WorkerCrashed[] = []
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool: crashPool(crash),
       onWorkerCrashed: (value) => void persisted.push(value),
     })

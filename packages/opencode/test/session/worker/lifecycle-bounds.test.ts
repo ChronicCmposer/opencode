@@ -2,27 +2,39 @@
 // the process maps forever. Terminal sessions evict LRU once the cap is reached.
 
 import { describe, expect, test } from "bun:test"
-import { createRunBarrier } from "@/session/run-barrier"
+import { Effect } from "effect"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+
+import { RUN_BARRIER_MAX_SESSIONS, RunBarrier } from "@/session/run-barrier"
 import { createAutoResumeController } from "@/session/ledger/resume"
 import { createLifecycleTracker } from "@/session/ledger/lifecycle"
+import { testEffect } from "../../lib/effect"
 
-const settled = Promise.resolve()
+const barrierIt = testEffect(LayerNode.compile(LayerNode.group([RunBarrier.node])))
+
+function drain(barrier: RunBarrier.Interface, sessionID: string) {
+  return Effect.suspend(() => {
+    const run = barrier.beginRun(sessionID)
+    run.commit(`msg_${sessionID}`)
+    run.projector("session-row")
+    run.noTools()
+    run.promotion("no-job")
+    return barrier.wait(sessionID)
+  })
+}
 
 describe("bounded lifecycle maps (MINOR)", () => {
-  test("run-barrier keeps at most the configured number of session states", async () => {
-    const barrier = createRunBarrier({ maxSessions: 2 })
-    for (const sessionID of ["s1", "s2", "s3"]) {
-      await barrier.wait(sessionID, {
-        commits: settled,
-        projectors: settled,
-        tools: settled,
-        promotion: settled,
-      })
-    }
-    expect(barrier.size).toBe(2)
-    expect(barrier.state("s1")).toBe("idle")
-    expect(barrier.state("s3")).toBe("drained")
-  })
+  barrierIt.effect("run-barrier keeps at most the LRU number of session states", () =>
+    Effect.gen(function* () {
+      const barrier = yield* RunBarrier.Service
+      for (let index = 0; index < RUN_BARRIER_MAX_SESSIONS + 1; index++) {
+        yield* drain(barrier, `s${index}`)
+      }
+      expect(barrier.size).toBe(RUN_BARRIER_MAX_SESSIONS)
+      expect(barrier.state("s0")).toBe("idle")
+      expect(barrier.state(`s${RUN_BARRIER_MAX_SESSIONS}`)).toBe("drained")
+    }),
+  )
 
   test("resume attempts are bounded per session", () => {
     const resume = createAutoResumeController({ maxSessions: 2 })

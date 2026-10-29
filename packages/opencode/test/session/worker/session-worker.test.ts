@@ -19,6 +19,7 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { RipgrepBinary } from "@opencode-ai/core/ripgrep/binary"
 import { workerAppProcessLayer } from "@/session/worker/app-process-report"
 import { ShellTool } from "@/tool/shell"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Event } from "@opencode-ai/schema/event"
 import { SessionEvent } from "@opencode-ai/schema/session-event"
@@ -73,7 +74,7 @@ import {
   type SessionWorkerModel,
   type WorkerWriterClient,
 } from "@/session/worker/session-worker"
-import { workerLogMessage } from "@/session/worker/log"
+import { workerLogMessage } from "@/session/worker/worker-logging"
 import {
   createPidRegistry,
   registerReported,
@@ -321,8 +322,10 @@ describe("bootstrapSessionWorker control-port transfer", () => {
     })
     try {
       expect(writer).toBeDefined()
-      // Pin a real write transaction on the worker's own WAL connection.
-      await writer!.begin()
+      // Pin a real write transaction on the worker's own WAL connection. The
+      // writer seam reads through the worker's scoped connection; transaction
+      // control belongs to the connection, not a deleted writer API.
+      await writer!.query("exec", "BEGIN IMMEDIATE")
       listener?.({ data: { type: "shutdown", id: 21 } })
       expect(frameTypes(frames)).toContain("shutdown-ack")
       expect(frames.find((frame) => (frame.data as { type?: string }).type === "shutdown-ack")?.data).toEqual({
@@ -427,7 +430,7 @@ describe("bootstrapSessionWorker control-port transfer", () => {
     const recorder = recordingLogger()
     let client: import("@/session/worker/hub-proxy-wire").HubProxyClient | undefined
     const handle = bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope, {
-      log: recorder.log,
+      bridge: recorder.bridge,
       observeHubProxy: (observed) => {
         client = observed
       },
@@ -457,7 +460,7 @@ describe("bootstrapSessionWorker control-port transfer", () => {
   test("wires a real logger into the client lifecycles (not the noop default)", () => {
     const { scope } = fakeScope()
     const recorder = recordingLogger()
-    bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope, { log: recorder.log })
+    bootstrapSessionWorker(init({ sessionWorkerPorts: true }), scope, { bridge: recorder.bridge })
     const messages = recorder.lines.map((entry) => entry.message)
     // Each port-backed peer emits its connected line at construction; without
     // a real logger these were dormant in production.
@@ -553,8 +556,13 @@ describe("buildWorkerClients", () => {
       expect("backgroundJob" in clients).toBe(false)
       expect(typeof clients.writer.publish).toBe("function")
       expect(typeof clients.writer.query).toBe("function")
-      expect(typeof clients.writer.begin).toBe("function")
       expect(typeof clients.writer.dispose).toBe("function")
+      // D5/S4: the legacy writer transaction API is deleted; the worker database
+      // owns transaction control and the writer only publishes/reads/disposes.
+      expect("begin" in clients.writer).toBe(false)
+      expect("txQuery" in clients.writer).toBe(false)
+      expect("commit" in clients.writer).toBe(false)
+      expect("rollback" in clients.writer).toBe(false)
     } finally {
       clients.writer.dispose()
     }
@@ -591,7 +599,7 @@ describe("buildWorkerClients", () => {
     const recorder = recordingLogger()
     const clients = buildWorkerClients(
       { egress: channels.egress.port1 },
-      { workerID: 4, log: recorder.log },
+      { workerID: 4, bridge: recorder.bridge },
     )
     try {
       const connected = recorder.lines.filter((entry) => entry.message.endsWith("connected"))
@@ -650,7 +658,14 @@ describe("worker database writer blob directory (D16)", () => {
           Effect.gen(function* () {
             const events = yield* EventV2.Service
             yield* events.remove(aggregateID)
-          }).pipe(Effect.provide(EventV2.layerWith()), Effect.provide(DatabaseService.layerFromPath(filename))),
+          }).pipe(
+            Effect.provide(
+              EventV2.layerWith().pipe(
+                Layer.provide(DurableLog.layerFromDatabase),
+                Layer.provide(DatabaseService.layerFromPath(filename)),
+              ),
+            ),
+          ),
         ),
       )
       expect(entries(ownBlobDir)).toEqual([])
@@ -773,12 +788,13 @@ describe("worker→hub PID reporting", () => {
       },
     } as unknown as MessagePort
 
-    const reporter = createControlPidReporter(brokenPort, 5, { log: recorder.log })
+    const reporter = createControlPidReporter(brokenPort, 5, { bridge: recorder.bridge })
     expect(() => reporter.report({ pid: 101, pgid: 101, label: "shell:echo hi" })).toThrow("port closed")
     expect(recorder.lines).toEqual([
       {
         message: workerLogMessage("pid report failed"),
-        fields: { level: "warn", workerID: 5, reason: "port closed" },
+        fields: { workerID: 5, reason: "port closed" },
+        level: "warn",
       },
     ])
   })
@@ -818,10 +834,10 @@ describe("worker→hub PID reporting", () => {
     let reporter: PidReporterInterface | undefined
     let reportedID: number | undefined
     bootstrapSessionWorker(init, scope, {
-      log: recorder.log,
+      bridge: recorder.bridge,
       pidReporterFactory: (_port, workerID, forwarded) => {
         reportedID = workerID
-        reporter = createControlPidReporter(brokenPort, workerID, { log: forwarded })
+        reporter = createControlPidReporter(brokenPort, workerID, { bridge: forwarded })
         return reporter
       },
     })
@@ -832,12 +848,9 @@ describe("worker→hub PID reporting", () => {
     expect(reporter).toBeDefined()
     expect(() => reporter!.report({ pid: 101, pgid: 101, label: "shell:echo hi" })).toThrow("port closed")
     const failed = recorder.lines.filter((entry) => entry.message === workerLogMessage("pid report failed"))
-    expect(failed).toEqual([
-      {
-        message: workerLogMessage("pid report failed"),
-        fields: { level: "warn", workerID: reportedID, reason: "port closed" },
-      },
-    ])
+    expect(failed).toHaveLength(1)
+    expect(failed[0].level).toBe("warn")
+    expect(failed[0].fields).toEqual({ workerID: reportedID, reason: "port closed" })
   })
 
   test("a missing reporter (degraded boot) is a no-op; win32 reports nothing", () => {

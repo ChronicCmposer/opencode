@@ -18,7 +18,6 @@ import path from "node:path"
 import { Cause, Effect, Exit, Fiber } from "effect"
 import { sql } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
-import { withBusyRetry } from "@opencode-ai/core/database/busy"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
 import { openWriterConnection } from "@/session/writer/connection"
@@ -74,8 +73,8 @@ const runInContext = <A, E, R>(ctx: E2EContext, effect: Effect.Effect<A, E, R>):
  * fails loud when a transaction is still pinned, then `ROLLBACK` releases it.
  */
 const probeWorkerConnection = async (ctx: E2EContext): Promise<void> => {
-  const handle = await ctx.writer.begin()
-  await ctx.writer.rollback(handle)
+  ctx.connection.exec("BEGIN IMMEDIATE")
+  ctx.connection.exec("ROLLBACK")
 }
 
 /** Create a session and its first user message through the worker's own services. */
@@ -279,9 +278,10 @@ describe("Gate 7 — sequential prompts in one session over the writer-backed wo
 //
 // While the worker's `BEGIN IMMEDIATE` is pinned, the main transaction's own
 // `BEGIN IMMEDIATE` hits `SQLITE_BUSY` -> `database is locked` /
-// `LockTimeoutError`. The commit owner (`EventV2.commitDurableEvent`) wraps the
-// whole transaction in `withBusyRetry`; this test mirrors that ownership so the
-// bounded retry rides out the contention until the worker releases.
+// `LockTimeoutError`. The retry now lives at the transaction boundary inside the
+// SQLite adapter: `BEGIN IMMEDIATE`, `COMMIT`, and `ROLLBACK` are retried with
+// bounded backoff, while the transaction body is never replayed per statement.
+// This test asserts that ownership end to end instead of wrapping the call site.
 //
 // `PRAGMA busy_timeout = 0` is applied to the main connection so the lock
 // surfaces immediately (rather than after the production 5s wait) — the same
@@ -310,30 +310,28 @@ describe("Main-process durable write vs the session-worker write lock", () => {
           writerConnection.exec("BEGIN IMMEDIATE")
 
           // 2. Concurrent main-process durable write.
-          const write = db
-            .transaction(
-              () =>
-                Effect.gen(function* () {
-                  yield* db
-                    .insert(EventSequenceTable)
-                    .values([{ aggregate_id: "b-regression", seq: 0 }])
-                    .run()
-                  yield* db
-                    .insert(EventTable)
-                    .values([
-                      {
-                        id: EventV2.ID.create(),
-                        aggregate_id: "b-regression",
-                        seq: 0,
-                        type: "regression",
-                        data: {},
-                      },
-                    ])
-                    .run()
-                }),
-              { behavior: "immediate" },
-            )
-            .pipe(withBusyRetry)
+          const write = db.transaction(
+            () =>
+              Effect.gen(function* () {
+                yield* db
+                  .insert(EventSequenceTable)
+                  .values([{ aggregate_id: "b-regression", seq: 0 }])
+                  .run()
+                yield* db
+                  .insert(EventTable)
+                  .values([
+                    {
+                      id: EventV2.ID.create(),
+                      aggregate_id: "b-regression",
+                      seq: 0,
+                      type: "regression",
+                      data: {},
+                    },
+                  ])
+                  .run()
+              }),
+            { behavior: "immediate" },
+          )
           const fiber = yield* write.pipe(Effect.forkScoped({ startImmediately: true }))
 
           // 3. Hold the lock while the main write contends, then release it.

@@ -20,6 +20,7 @@ import {
   createSessionHub,
   type WorkerCrashed,
 } from "@/session/worker/hub"
+import { createTestBarrier } from "../lib/run-barrier-test"
 import type { DbExecutor } from "@/session/worker/db-executor"
 import type { SessionID } from "@/session/schema"
 import { sid } from "../lib/async"
@@ -123,7 +124,7 @@ describe("boundedResumeDecision", () => {
 describe("a crashed run settles inside the resume deadline", () => {
   test("a stalled ledger read refuses auto-resume and rejects the run", async () => {
     const pool = poolWith(() => Promise.reject(crashError(SESSION)))
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       // The retired-lease release reads `event_sequence`; only the crash-truth
       // read stalls, which is exactly the unresolved decision under test.
@@ -153,7 +154,7 @@ describe("a resume decision that resolves after cancel cannot dispatch", () => {
     const ledger = deferred<ReadonlyArray<Record<string, unknown>>>()
     const execute = deferred<never>()
     const pool = poolWith(() => execute.promise)
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       db: fakeDb((sql) => (sql.includes("tool_call") ? ledger.promise : Promise.resolve([]))),
       resumeDecisionTimeoutMs: 1_000,
@@ -186,7 +187,7 @@ describe("retirement awaits the scoped lease release", () => {
   test("a successor cannot boot before the retired generation's release lands", async () => {
     const release = deferred<ReadonlyArray<Record<string, unknown>>>()
     const pool = poolWith(() => new Promise<void>(() => {}))
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       db: fakeDb((sql) => (sql.includes("event_sequence") ? release.promise : Promise.resolve([]))),
       onWorkerCrashed: () => {},
@@ -219,7 +220,7 @@ describe("retirement awaits the scoped lease release", () => {
     const sessionID = sid("ses_release_finally_ports")
     const pool = poolWith(async () => {})
     let disposed = false
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       db: {
         threadId: 0,
@@ -254,7 +255,7 @@ describe("retirement awaits the scoped lease release", () => {
     const zeroed: Array<ReadonlyArray<unknown> | Record<string, unknown>> = []
     const sessionID = sid("ses_release_finally_hook")
     const pool = poolWith(async () => {})
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       db: {
         threadId: 0,
@@ -308,7 +309,7 @@ describe("a typed build mismatch is returned as-is and blocks respawn", () => {
       byID: (id) => (id === worker.id ? worker : undefined),
       resultFor: () => undefined,
     }
-    const hub = createSessionHub({ pool, onWorkerCrashed: () => {} })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool, onWorkerCrashed: () => {} })
     try {
       await expect(hub.ensureRunning(sid(sessionID))).rejects.toBeInstanceOf(BuildMismatch)
       expect(executed).toBe(1)
@@ -354,7 +355,7 @@ describe("a build mismatch rejects a parked waiter instead of respawning", () =>
       byID: (id) => (id === worker.id ? worker : undefined),
       resultFor: () => undefined,
     }
-    const hub = createSessionHub({ pool, onWorkerCrashed: () => {} })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool, onWorkerCrashed: () => {} })
     try {
       const first = hub.dispatcher.dispatch({ sessionID: sid(sessionID), depth: 0 }).catch((error) => error)
       // A different run identity parks behind the first.
@@ -387,7 +388,7 @@ describe("a failing auto-resume settles the original caller with that failure", 
       reason: "isolate exited",
     })
     const pool = poolWith(() => Promise.reject(crash))
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       resumeRun: () => Promise.reject(error),
       onWorkerCrashed: () => {},
@@ -413,7 +414,7 @@ describe("same-session generation retirement", () => {
     const sessionID = sid("ses_generation_release")
     const released: SessionID[] = []
     const pool = poolWith(async () => {})
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       onSessionReleased: (id) => released.push(id),
       onWorkerCrashed: () => {},

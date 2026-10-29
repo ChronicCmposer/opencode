@@ -11,7 +11,7 @@
 //   12.4 HTTP ingress + SSE stay functional while K sessions run.
 
 import { beforeEach, describe, expect, test } from "bun:test"
-import { Context, Effect, Exit, Fiber, Layer, Logger, ManagedRuntime, Option } from "effect"
+import { Context, Effect, Exit, Fiber, Layer, Logger, ManagedRuntime, Option, Scope } from "effect"
 import type { EffectBridge } from "@/effect/bridge"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import type { SessionID } from "@/session/schema"
@@ -22,7 +22,6 @@ import {
   createEgressDeliveryBarrier,
   createHubEventSink,
   createProductionSessionHub,
-  createProductionWorkerPool,
   createSessionBoundExecutorWorker,
   createSessionHub,
   createSessionHubLayer,
@@ -31,6 +30,7 @@ import {
   describeSessionWorkerEntry,
   DEFAULT_RUN_IDLE_TIMEOUT_MS,
   fallbackInstanceContext,
+  makeProduction,
   makeSessionHubNode,
   productionSessionHubLayer,
   productionSessionHubNode,
@@ -43,10 +43,13 @@ import {
   SESSION_CANCELLED_TYPE,
   SessionHubService,
   type ProductionPoolFactory,
+  type ProductionWorkerPoolOptions,
   type SessionHub,
   type WorkerPortBackends,
   type WorkerTransferredPorts,
 } from "@/session/worker/hub"
+import { RunBarrier } from "@/session/run-barrier"
+import { createTestBarrier } from "../../lib/run-barrier-test"
 import { createLazyExecutorWorker, createLazyExecutorWorkerPool } from "../../lib/lazy-worker-pool"
 import {
   ackFrame,
@@ -62,6 +65,8 @@ import { encodeFrame } from "@/session/egress/frame"
 import { createMeshWorkerClient, type DurableCommit } from "@/session/egress/mesh"
 import { createLiveEventPublisher, EventV2Bridge, type LiveEvent, type LiveEventPublisher } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
+import { DurableLog } from "@opencode-ai/core/durable-log"
+import { durableLogStub } from "../../lib/durable-log-stub"
 import { Database } from "@opencode-ai/core/database/database"
 import { GlobalBus } from "@/bus/global"
 import { SessionCancelledError, WorkerCrashedError } from "@/session/worker/dispatch"
@@ -79,7 +84,7 @@ import { SessionWorkerReplyTimeoutError } from "@/session/worker/execute"
 import type { CancelFrame, CancelPort, CancelScheduler } from "@/session/worker/cancel"
 import type { SessionWorkerInit } from "@/session/worker/session-worker"
 import { createPidRegistry, registerReported } from "@/session/worker/pid-registry"
-import { workerLoggerFromBridge, workerLogMessage, type WorkerLogger } from "@/session/worker/log"
+import { forwardingLogger, workerLogMessage } from "@/session/worker/worker-logging"
 import { createWorkerPluginHost } from "@/session/worker/plugin-host"
 import { sessionWorkerInit, assertStructuredCloneable } from "../../lib/session-worker-init"
 import { Session } from "@/session/session"
@@ -87,7 +92,7 @@ import type { ShellInput } from "@/session/prompt"
 import { testEffect } from "../../lib/effect"
 import { TestLLMServer } from "../../lib/llm-server"
 import { settleOf, sid } from "../../lib/async"
-import { lineFor, recordingLogger } from "../../lib/recorders"
+import { lineFor, recordingBridge, recordingBridgeFrom, recordingLogger } from "../../lib/recorders"
 import { pollUntil } from "../../lib/poll"
 import { createHubProxyClient } from "@/session/worker/hub-proxy-wire"
 import { createFakeExecutorPool } from "../../lib/fake-worker-pool"
@@ -122,6 +127,16 @@ const EXECUTOR_FIXTURE = new URL("../../fixture/session-execute-worker.ts", impo
 /** The production worker entry (reduced layer as the work factory). */
 const SESSION_WORKER = new URL("../../../src/session/worker/session-worker.ts", import.meta.url)
 
+/**
+ * Build the one scoped production pool for a test. `pool.terminateAll()` closes
+ * the isolate cache scope, so callers keep using the structural pool surface.
+ */
+async function createProductionPool(options: ProductionWorkerPoolOptions): Promise<ExecutorWorkerPool> {
+  const scope = Effect.runSync(Scope.make())
+  const pools = await Effect.runPromise(Scope.provide(scope)(makeProduction(options)))
+  return pools.executorPool
+}
+
 
 describe("12.1 the hub executes zero sessions", () => {
   it.live("work runs in the reduced-layer worker, never on the hub", () =>
@@ -139,7 +154,7 @@ describe("12.1 the hub executes zero sessions", () => {
           model: { baseUrl: llm.url, apiKey: "test-key" },
         }),
       })
-      const hub = createSessionHub({ pool })
+      const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool })
       try {
         const result = yield* Effect.promise(() => hub.ensureRunning(sid("ses_1")))
         const value = result.value as { text: string; threadId: number }
@@ -158,7 +173,7 @@ describe("12.1 the hub executes zero sessions", () => {
 describe("12.2 per-session admission", () => {
   test("parent, sibling and depth-1 child run concurrently on distinct workers", async () => {
     const pool = createBunExecutorWorkerPool({ entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
-    const hub = createSessionHub({ pool })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool })
     try {
       const parent = hub.dispatcher.dispatch({ sessionID: sid("ses_parent"), depth: 0 })
       const sibling = hub.dispatcher.dispatch({ sessionID: sid("ses_sib"), depth: 0 })
@@ -185,7 +200,7 @@ describe("12.3 the hub loop is I/O-only", () => {
     // main-thread timer a real window; the 200ms "slow" kind could finish before
     // the timer got a turn under host load.
     const pool = createBunExecutorWorkerPool({ entry: EXECUTOR_FIXTURE, workKind: "verySlow", timeoutMs: 15_000 })
-    const hub = createSessionHub({ pool })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool })
     try {
       let ticks = 0
       const timer = setInterval(() => {
@@ -206,7 +221,7 @@ describe("12.3 the hub loop is I/O-only", () => {
 describe("12.4 HTTP ingress + SSE stay functional", () => {
   test("health + SSE respond while K sessions run", async () => {
     const pool = createBunExecutorWorkerPool({ entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
-    const hub = createSessionHub({ pool })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool })
     const server = Bun.serve({
       port: 0,
       fetch(request) {
@@ -314,13 +329,13 @@ async function withGlobalFakeWorker(run: () => Promise<void>): Promise<void> {
 
 async function withFakeWorker(
   run: (fake: FakeWorker, transport: ExecutorTransport) => Promise<void>,
-  options: { readonly bufferCapacity?: number; readonly log?: WorkerLogger; readonly workerID?: number } = {},
+  options: { readonly bufferCapacity?: number; readonly bridge?: EffectBridge.Shape; readonly workerID?: number } = {},
 ): Promise<void> {
   await withGlobalFakeWorker(async () => {
     const transport = createBunExecutorTransport({
       entry: "fake://session-worker",
       ...(options.bufferCapacity === undefined ? {} : { bufferCapacity: options.bufferCapacity }),
-      ...(options.log === undefined ? {} : { log: options.log }),
+      ...(options.bridge === undefined ? {} : { bridge: options.bridge }),
       ...(options.workerID === undefined ? {} : { workerID: options.workerID }),
     })
     const fake = FakeWorker.last
@@ -412,7 +427,7 @@ describe("12.x executor transport buffering", () => {
   })
 
   test("a worker boot/import failure is logged as an error with its workerID", async () => {
-    const { log, lines } = recordingLog()
+    const { bridge, lines } = recordingLog()
     await withFakeWorker(
       async (fake, transport) => {
         const pending = transport.waitFor(() => true)
@@ -421,10 +436,10 @@ describe("12.x executor transport buffering", () => {
         await expect(pending).rejects.toThrow("session worker error")
         const line = lineFor(lines, "worker boot failed")
         expect(line.fields.workerID).toBe(11)
-        expect(line.fields.level).toBe("ERROR")
+        expect(line.level).toBe("error")
         expect(String(line.fields.message)).toContain("Cannot find module")
       },
-      { log, workerID: 11 },
+      { bridge, workerID: 11 },
     )
   })
 })
@@ -591,7 +606,7 @@ const recordingSchedule = () => {
 describe("12 lazy pool", () => {
   test("constructing the hub spawns no workers until the first dispatch", async () => {
     const created: ImmediateWorker[] = []
-    const hub = createSessionHub({ pool: trackedLazyPool(created) })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: trackedLazyPool(created) })
 
     expect(created).toHaveLength(0)
 
@@ -640,7 +655,7 @@ const recordingExecutorPool = (runs: ExecutorRun[]): ExecutorWorkerPool => {
 describe("hub startShell payload forwarding", () => {
   test("forwards the ShellInput payload and the startShell mode to the worker", async () => {
     const runs: ExecutorRun[] = []
-    const hub = createSessionHub({ pool: recordingExecutorPool(runs) })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: recordingExecutorPool(runs) })
     const sessionID = sid("ses_shell_fwd")
     const shell: ShellInput = { sessionID, agent: "build", command: "echo hi" }
     try {
@@ -656,7 +671,7 @@ describe("hub startShell payload forwarding", () => {
 
   test("an absent shell keeps the plain startShell path (no shell on the run)", async () => {
     const runs: ExecutorRun[] = []
-    const hub = createSessionHub({ pool: recordingExecutorPool(runs) })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: recordingExecutorPool(runs) })
     const sessionID = sid("ses_shell_plain")
     try {
       await hub.startShell(sessionID)
@@ -671,7 +686,7 @@ describe("hub startShell payload forwarding", () => {
 describe("13 cooperative cancel within grace", () => {
   test("cancelWithGrace stops a running session on a real worker", async () => {
     const pool = createBunExecutorWorkerPool({ entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
-    const hub = createSessionHub({ pool, cancellation: (p) => createWorkerCancellation(p, { graceMs: 5_000 }) })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool, cancellation: (p) => createWorkerCancellation(p, { graceMs: 5_000 }) })
     try {
       const running = hub.dispatcher.dispatch({ sessionID: sid("ses_cancel"), depth: 0 })
       await pollUntil(() => hub.dispatcher.registry.get(sid("ses_cancel"))?.state === "running", {
@@ -697,7 +712,7 @@ describe("production depth plumbing", () => {
   test("a depth ≥ 1 child admitted through the hub materializes its own worker", async () => {
     const childID = sid("ses_w11_depth_child")
     const created: ImmediateWorker[] = []
-    const hub = createSessionHub({ pool: trackedLazyPool(created) })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: trackedLazyPool(created) })
     try {
       const result = await hub.ensureRunning(childID)
 
@@ -712,7 +727,7 @@ describe("production depth plumbing", () => {
   test("a depth 0 root also materializes its own worker", async () => {
     const sessionID = sid("ses_w11_root")
     const created: ImmediateWorker[] = []
-    const hub = createSessionHub({ pool: trackedLazyPool(created) })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: trackedLazyPool(created) })
     try {
       const result = await hub.ensureRunning(sessionID)
 
@@ -906,7 +921,7 @@ describe("egress ack correlation", () => {
 describe("14 makeSessionHubNode", () => {
   test("provides SessionHubService and terminates the pool on scope close", async () => {
     const created: ImmediateWorker[] = []
-    const node = makeSessionHubNode({ pool: trackedLazyPool(created) })
+    const node = makeSessionHubNode({ pool: trackedLazyPool(created), barrier: createTestBarrier() })
 
     await Effect.runPromise(
       Effect.scoped(
@@ -932,7 +947,9 @@ describe("15 layer lifecycle / leak", () => {
     await Effect.runPromise(
       Effect.scoped(
         Effect.gen(function* () {
-          const context = yield* Layer.build(createSessionHubLayer({ pool: trackedLazyPool(created) }))
+          const context = yield* Layer.build(
+            createSessionHubLayer({ pool: trackedLazyPool(created), barrier: createTestBarrier() }).pipe(Layer.provide(RunBarrier.layer)),
+          )
           const hub = Context.get(context, SessionHubService)
           yield* Effect.promise(() =>
             Promise.all([hub.ensureRunning(sid("ses_life_1")), hub.ensureRunning(sid("ses_life_2"))]),
@@ -950,7 +967,7 @@ describe("35a worker port serving", () => {
 
 
   test("serves the hub-proxy authorities over a worker control port", async () => {
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool: trackedLazyPool([]),
       ports: { hubProxy: { "sessionStatus.get": () => "pong" } },
     })
@@ -973,7 +990,7 @@ describe("35a worker port serving", () => {
   })
 
   test("returns idempotent disposers and is a no-op without backends", () => {
-    const hub = createSessionHub({ pool: trackedLazyPool([]) })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: trackedLazyPool([]) })
     const proxyChannel = new MessageChannel()
     const disposePorts = hub.attachWorkerPorts(1, {})
     const disposeProxy = hub.attachHubProxyPort(1, proxyChannel.port1)
@@ -989,7 +1006,7 @@ describe("35a worker port serving", () => {
 describe("42 crash/respawn end-to-end", () => {
   test("killing a worker mid-dispatch respawns it and completes the next session", async () => {
     const pool = createBunExecutorWorkerPool({ entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
-    const hub = createSessionHub({ pool })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool })
     try {
       const first = hub.dispatcher.dispatch({ sessionID: sid("ses_crash"), depth: 0 })
       await pollUntil(() => hub.dispatcher.registry.get(sid("ses_crash"))?.state === "running", {
@@ -1411,7 +1428,9 @@ describe("Q22 hub event sink", () => {
 
   test("a worker event reaches hub EventV2 live-only through the port", async () => {
     const databaseStub = Layer.succeed(Database.Service, { db: {} as never })
-    const runtime = ManagedRuntime.make(EventV2.layerWith().pipe(Layer.provide(databaseStub)))
+    const runtime = ManagedRuntime.make(
+      EventV2.layerWith().pipe(Layer.provide(durableLogStub), Layer.provide(databaseStub)),
+    )
     const channel = new MessageChannel()
     try {
       const events = runtime.runSync(EventV2.Service)
@@ -1459,7 +1478,9 @@ describe("Q22 hub event sink", () => {
         },
       ) as never,
     })
-    const runtime = ManagedRuntime.make(EventV2.layerWith().pipe(Layer.provide(commitGuard)))
+    const runtime = ManagedRuntime.make(
+      EventV2.layerWith().pipe(Layer.provide(durableLogStub), Layer.provide(commitGuard)),
+    )
     const channel = new MessageChannel()
     try {
       const events = runtime.runSync(EventV2.Service)
@@ -1494,6 +1515,7 @@ describe("Q22 hub event sink", () => {
     const databaseStub = Layer.succeed(Database.Service, { db: {} as never })
     const bridgeLayer = AppNodeBuilder.build(LayerNode.group([EventV2.node, EventV2Bridge.node]), [
       [Database.node, databaseStub],
+      [DurableLog.node, durableLogStub],
     ])
     const runtime = ManagedRuntime.make(bridgeLayer)
     const channel = new MessageChannel()
@@ -1556,7 +1578,7 @@ describe("Q9/Q23 session.cancelled", () => {
   test("the hub publishes session.cancelled with the CancelOutcome fields", async () => {
     const { publisher, published } = recordingPublisher()
     const pool = createBunExecutorWorkerPool({ entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       events: publisher,
       cancellation: (p) => createWorkerCancellation(p, { graceMs: 5_000 }),
@@ -1592,7 +1614,7 @@ describe("Q9/Q23 session.cancelled", () => {
     const { publisher, published } = recordingPublisher()
     // The run resolves on cancel without acking: completion wins the race.
     const pool = new ControllablePool(1, "resolve")
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       events: publisher,
       cancellation: {
@@ -1626,7 +1648,7 @@ describe("Q9/Q23 session.cancelled", () => {
     const scheduler = recordingSchedule()
     // The run ignores the cancel: the grace window expires and the hub terminates.
     const pool = new ControllablePool(1, "ignore", true)
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       events: publisher,
       cancellation: {
@@ -1686,7 +1708,7 @@ describe("cancellation authorities", () => {
     const childID = sid("ses_child")
     const cancelled: string[] = []
     const pool = new ControllablePool(1, "resolve")
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       cancellation: {
         childrenOf: (id) => (id === parentID ? [childID] : []),
@@ -1729,6 +1751,7 @@ describe("session model threading", () => {
         })
 
       const deps = Layer.mergeAll(
+        RunBarrier.layer,
         Layer.mock(Config.Service, {
           get: () => Effect.succeed({ model: "config/default" } as ConfigV1.Info),
           directories: () => Effect.succeed(["/cfg/opencode"]),
@@ -1797,7 +1820,7 @@ describe("session model threading", () => {
 describe("per-session worker model", () => {
   test("one worker rebinds for a second session and resolves that session's model", async () => {
     const resolvedSessions: string[] = []
-    const pool = createProductionWorkerPool({
+    const pool = await createProductionPool({
       init: (sessionID) => {
         resolvedSessions.push(String(sessionID))
         return sessionWorkerInit({ model: { modelID: `model-${sessionID}` } })
@@ -1860,6 +1883,7 @@ describe("Fix 1 per-session working directory", () => {
     }
 
   const deps = Layer.mergeAll(
+        RunBarrier.layer,
     Layer.mock(Config.Service, {
       get: () => Effect.succeed({ model: "config/default" } as ConfigV1.Info),
       directories: () => Effect.succeed(["/cfg/opencode"]),
@@ -1984,6 +2008,7 @@ describe("plugin effect shipping", () => {
         })
 
       const deps = Layer.mergeAll(
+        RunBarrier.layer,
         Layer.mock(Config.Service, {
           get: () => Effect.succeed({ model: "config/default" } as ConfigV1.Info),
           directories: () => Effect.succeed(["/cfg/opencode"]),
@@ -2061,7 +2086,7 @@ describe("pid-report receive", () => {
   test("a pid-report frame populates the registry and reap uses it", async () => {
     const killed: number[] = []
     const registry = createPidRegistry({ reaper: { killGroup: (pgid) => killed.push(pgid) } })
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool: new ControllablePool(1, "resolve"),
       onPidReport: (workerID, report) => registerReported(registry, report, workerID),
     })
@@ -2183,7 +2208,7 @@ describe("fallbackInstanceContext", () => {
 describe("Fix 1 workerID threading", () => {
   test("the production pool ships the pool slot id as workerData.workerID", async () => {
     await withGlobalFakeWorker(async () => {
-      const pool = createProductionWorkerPool({
+      const pool = await createProductionPool({
         init: () => sessionWorkerInit(),
         entry: "fake://workerid",
         workKind: "instant",
@@ -2246,6 +2271,7 @@ describe("Fix 2 real plugin hook input", () => {
         })
 
       const deps = Layer.mergeAll(
+        RunBarrier.layer,
         Layer.mock(Config.Service, {
           get: () => Effect.succeed({ model: "config/default" } as ConfigV1.Info),
           directories: () => Effect.succeed(["/cfg/opencode"]),
@@ -2345,7 +2371,7 @@ describe("cancelWithReport", () => {
     const childID = sid("ses_rep_child")
     // Two per-session workers: the parent and the child each own one.
     const pool = new ControllablePool(2, "resolve", true)
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       cancellation: {
         childrenOf: (id) => (id === parentID ? [childID] : []),
@@ -2379,7 +2405,7 @@ describe("cancelWithReport", () => {
     const parentID = sid("ses_unset_parent")
     const childID = sid("ses_unset_child")
     const pool = new ControllablePool(1, "resolve", true)
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       cancellation: {
         childrenOf: (id) => (id === parentID ? [childID] : []),
@@ -2408,11 +2434,11 @@ describe("cancelWithReport", () => {
   test("D3 logs the cancel cascade with descendant and fallback-idle counts", async () => {
     const parentID = sid("ses_cascade_parent")
     const childID = sid("ses_cascade_child")
-    const { log, lines } = recordingLog()
+    const { bridge, lines } = recordingLog()
     const pool = new ControllablePool(1, "resolve", true)
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
-      log,
+      bridge,
       cancellation: {
         childrenOf: (id) => (id === parentID ? [childID] : []),
         portFor: (worker) => (worker as ControllableWorker).cancelPort,
@@ -2430,7 +2456,8 @@ describe("cancelWithReport", () => {
       await hub.cancelWithReport(parentID)
 
       const line = lineFor(lines, "cancel cascade")
-      expect(line.fields).toEqual({ level: "INFO", sessionID: parentID, descendants: 1, needsFallbackIdle: 1 })
+      expect(line.level).toBe("info")
+      expect(line.fields).toEqual({ sessionID: parentID, descendants: 1, needsFallbackIdle: 1 })
       expect(await parent).toBeInstanceOf(SessionCancelledError)
     } finally {
       await hub.terminateAll()
@@ -2444,15 +2471,14 @@ describe("cancelWithReport", () => {
 
 describe("rebind and ports", () => {
   test("logs a rebound worker's session transition", async () => {
-    const { log, lines } = recordingLog()
-    const worker = createSessionBoundExecutorWorker(5, async (id) => new ImmediateWorker(id), log)
+    const { bridge, lines } = recordingLog()
+    const worker = createSessionBoundExecutorWorker(5, async (id) => new ImmediateWorker(id), bridge)
     try {
       await worker.execute({ sessionID: sid("ses_a"), depth: 0 })
       await worker.execute({ sessionID: sid("ses_b"), depth: 0 })
 
       const rebound = lineFor(lines, "worker rebound").fields
       expect(rebound).toEqual({
-        level: "INFO",
         workerID: 5,
         fromSession: "ses_a",
         toSession: "ses_b",
@@ -2466,35 +2492,18 @@ describe("rebind and ports", () => {
     }
   })
 
-  test("renders the rebound line through workerLoggerFromBridge with the bare ULID prefix", async () => {
+  test("renders the rebound line through the forwarding logger with the bare ULID prefix", async () => {
     const rendered: Array<{ readonly logLevel: string; readonly message: unknown }> = []
-    // A bridge whose `fork` runs the logging effect synchronously under a
-    // capturing logger, so this test observes what `workerLoggerFromBridge`
-    // emits in production: both concurrent edits composed end-to-end.
-    const capturingBridge: EffectBridge.Shape = {
-      promise: () => Promise.reject(new Error("capturing bridge: promise is unused")),
-      fork: <A, E, R>(effect: Effect.Effect<A, E, R>): Fiber.Fiber<A, E> => {
-        Effect.runSync(
-          (effect as unknown as Effect.Effect<A, E, never>).pipe(
-            Effect.provide(
-              Logger.layer([
-                Logger.make<unknown, void>(({ logLevel, message }) => {
-                  rendered.push({ logLevel, message })
-                }),
-              ]),
-            ),
-          ),
-        )
-        return undefined as unknown as Fiber.Fiber<A, E>
-      },
-      run: <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E> =>
-        effect as unknown as Effect.Effect<A, E>,
-      bind: <Args extends readonly unknown[], Result>(fn: (...args: Args) => Result) => fn,
-    }
+    // A bridge whose `fork` runs the logging effect synchronously under the
+    // forwarding logger, so this test observes the production rendering: the
+    // logger turns the emitted event + session annotation into the visible line.
+    const sink = Logger.make<unknown, void>(({ logLevel, message }) => {
+      rendered.push({ logLevel, message })
+    })
     const worker = createSessionBoundExecutorWorker(
       7,
       async (id) => new ImmediateWorker(id),
-      workerLoggerFromBridge(capturingBridge),
+      recordingBridge(forwardingLogger(sink)),
     )
     try {
       await worker.execute({ sessionID: sid("ses_a"), depth: 0 })
@@ -2516,8 +2525,8 @@ describe("rebind and ports", () => {
   })
 
   test("does not log a rebind when the same session is reused", async () => {
-    const { log, lines } = recordingLog()
-    const worker = createSessionBoundExecutorWorker(6, async (id) => new ImmediateWorker(id), log)
+    const { bridge, lines } = recordingLog()
+    const worker = createSessionBoundExecutorWorker(6, async (id) => new ImmediateWorker(id), bridge)
     try {
       await worker.execute({ sessionID: sid("ses_same"), depth: 0 })
       await worker.execute({ sessionID: sid("ses_same"), depth: 0 })
@@ -2529,8 +2538,8 @@ describe("rebind and ports", () => {
   })
 
   test("logs each connected hub port under its worker id", async () => {
-    const { log, lines } = recordingLog()
-    const hub = createSessionHub({ pool: trackedLazyPool([]), log })
+    const { bridge, lines } = recordingLog()
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: trackedLazyPool([]), bridge })
     const egress = new MessageChannel()
     const hubProxy = new MessageChannel()
     try {
@@ -2562,8 +2571,8 @@ describe("rebind and ports", () => {
 describe("hub wiring — forward log through production paths", () => {
   test("spawnBunExecutorWorker forwards log into createExecutorWorker", async () => {
     await withGlobalFakeWorker(async () => {
-      const { log, lines } = recordingLog()
-      const worker = spawnBunExecutorWorker(7, { entry: "fake://spawn", workKind: "slow", log })
+      const { bridge, lines } = recordingLog()
+      const worker = spawnBunExecutorWorker(7, { entry: "fake://spawn", workKind: "slow", bridge })
       try {
         expect(lineFor(lines, "worker spawning").fields).toEqual({ workerID: 7, kind: "slow", reason: "initial" })
       } finally {
@@ -2573,8 +2582,8 @@ describe("hub wiring — forward log through production paths", () => {
   })
 
   test("D2 createSessionBoundExecutorWorker forwards log into its cancel port", async () => {
-    const { log, lines } = recordingLog()
-    const worker = createSessionBoundExecutorWorker(5, async (id) => new ImmediateWorker(id), log)
+    const { bridge, lines } = recordingLog()
+    const worker = createSessionBoundExecutorWorker(5, async (id) => new ImmediateWorker(id), bridge)
     try {
       await worker.execute({ sessionID: sid("ses_d2"), depth: 0 })
       await worker.cancelPort!.notify({ type: "cancel", sessionID: sid("ses_d2") })
@@ -2592,8 +2601,8 @@ describe("hub wiring — forward log through production paths", () => {
   })
 
   test("D2 createLazyExecutorWorker forwards log into its cancel port", async () => {
-    const { log, lines } = recordingLog()
-    const worker = createLazyExecutorWorker(9, async () => new ImmediateWorker(9), log)
+    const { bridge, lines } = recordingLog()
+    const worker = createLazyExecutorWorker(9, async () => new ImmediateWorker(9), bridge)
     try {
       await worker.cancelPort!.notify({ type: "cancel", sessionID: sid("ses_lazy_d2") })
       await pollUntil(() => lines.some((entry) => entry.message === workerLogMessage("cancel outcome")), {
@@ -2685,9 +2694,9 @@ describe("liveness watchdog wiring", () => {
     })
   })
 
-  test("createProductionWorkerPool threads runIdleTimeoutMs into the spawned worker", async () => {
+  test("the production pool threads runIdleTimeoutMs into the spawned worker", async () => {
     await withGlobalFakeWorker(async () => {
-      const pool = createProductionWorkerPool({
+      const pool = await createProductionPool({
         init: () => sessionWorkerInit(),
         entry: "fake://idle-timeout",
         workKind: "instant",
@@ -2708,7 +2717,7 @@ describe("liveness watchdog wiring", () => {
 
   test("createProductionSessionHub resolves the env override and reaches the worker", async () => {
     await withGlobalFakeWorker(async () => {
-      const hub = createProductionSessionHub({
+      const hub = createProductionSessionHub({ ...{ barrier: createTestBarrier() },
         init: () => sessionWorkerInit(),
         count: 1,
         entry: "fake://idle-env",
@@ -2736,7 +2745,7 @@ describe("liveness watchdog wiring", () => {
 
 describe("lifecycle reports are bound to the reporting worker's session", () => {
   test("a bound worker may report its own session; a foreign session is rejected", async () => {
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool: createFakeExecutorPool(1),
       ports: { hubProxy: { "sessionStatus.get": () => "pong" } },
     })
@@ -2893,6 +2902,10 @@ describe("idle isolate cap", () => {
         await worker.execute({ sessionID: sid(`ses_idle_cap_${index}`), depth: 0 })
       }
 
+      // Enforcement is one asynchronous queue consumer; wait for its pass.
+      await pollUntil(() => pool.idleWorkers === 2 && terminated.length === 3, {
+        message: "the idle cap never drained to capacity",
+      })
       expect(pool.idleCapacity).toBe(2)
       expect(pool.idleWorkers).toBe(2)
       expect(terminated).toEqual([1, 2, 3])
@@ -2922,6 +2935,7 @@ describe("idle isolate cap", () => {
       await third.execute({ sessionID: sid("ses_idle_third"), depth: 0 })
 
       // The oldest IDLE worker is evicted; the still-running one is untouched.
+      await pollUntil(() => terminated.length === 1, { message: "the idle worker was never evicted" })
       expect(terminated).toEqual([2])
       expect(pool.idleWorkers).toBe(1)
       expect(terminated).not.toContain(1)
@@ -2929,6 +2943,7 @@ describe("idle isolate cap", () => {
       release()
       await running
       // Once it becomes idle the LRU applies again, still keeping one isolate.
+      await pollUntil(() => terminated.length === 2, { message: "the freed worker was never evicted" })
       expect(terminated).toEqual([2, 3])
       expect(pool.idleWorkers).toBe(1)
       expect(terminated).not.toContain(1)
@@ -3002,9 +3017,10 @@ describe("startup dead-lease sweep", () => {
       )
 
       const logs: Array<{ message: string; fields: Record<string, unknown> }> = []
-      const released = sweepDeadLeasesAtStartup(filename, (message, fields) => {
-        logs.push({ message, fields })
-      })
+      const released = sweepDeadLeasesAtStartup(
+        filename,
+        recordingBridgeFrom((line) => void logs.push({ message: line.message, fields: line.fields })),
+      )
 
       expect(released).toBe(1)
       const rows = connection.all<{ aggregate_id: string; worker_expires_at: number }>(
@@ -3027,7 +3043,12 @@ describe("startup dead-lease sweep", () => {
     const { filename, directory } = scratch()
     try {
       const logs: string[] = []
-      expect(sweepDeadLeasesAtStartup(filename, (message) => logs.push(message))).toBe(0)
+      expect(
+        sweepDeadLeasesAtStartup(
+          filename,
+          recordingBridgeFrom((line) => void logs.push(line.message)),
+        ),
+      ).toBe(0)
       expect(logs).toEqual([expect.stringContaining("startup lease sweep failed")])
     } finally {
       fs.rmSync(directory, { recursive: true, force: true })

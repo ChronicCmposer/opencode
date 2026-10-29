@@ -20,6 +20,7 @@ import type { ExecutorWorker, ExecutorWorkerPool } from "@/session/worker/execut
 import type { ShellInput } from "@/session/prompt"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { createSessionHub, SessionHubService, type SessionHub } from "@/session/worker/hub"
+import { createTestBarrier } from "../lib/run-barrier-test"
 import { withTmpdirInstance } from "../fixture/fixture"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 import { sid } from "../lib/async"
@@ -45,7 +46,7 @@ const runStateLayer = SessionRunState.layer.pipe(
 
 /** A hub that records the `startShell` arguments it receives, then delegates. */
 const recordingShellHub = (sessionID: SessionID, forwarded: Array<{ sessionID: SessionID; shell?: ShellInput }>) => {
-  const base = createSessionHub({ pool: createFakeExecutorPool(1, { value: withParts(sessionID) }) })
+  const base = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: createFakeExecutorPool(1, { value: withParts(sessionID) }) })
   return {
     ...base,
     startShell: async (id: SessionID, shell?: ShellInput) => {
@@ -173,12 +174,12 @@ const recordingEnsureHub = (
   sessionID: SessionID,
   forwarded: Array<{ sessionID: SessionID; origin?: DispatchOrigin }>,
 ) => {
-  const base = createSessionHub({ pool: createFakeExecutorPool(1, { value: withParts(sessionID) }) })
+  const base = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: createFakeExecutorPool(1, { value: withParts(sessionID) }) })
   return {
     ...base,
-    ensureRunning: async (id: SessionID, origin?: DispatchOrigin) => {
+    ensureRunningEffect: (id: SessionID, origin?: DispatchOrigin) => {
       forwarded.push({ sessionID: id, origin })
-      return base.ensureRunning(id, origin)
+      return base.ensureRunningEffect(id, origin)
     },
   } satisfies SessionHub
 }
@@ -218,7 +219,7 @@ describe("SessionRunState.ensureRunning — dispatch origin seam", () => {
 describe("SessionRunState — hub rejections are typed", () => {
   const failingHub = (overrides: Partial<SessionHub>): SessionHub => {
     const sessionID = sid("ses_typed")
-    const base = createSessionHub({ pool: createFakeExecutorPool(1, { value: withParts(sessionID) }) })
+    const base = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: createFakeExecutorPool(1, { value: withParts(sessionID) }) })
     return { ...base, ...overrides } satisfies SessionHub
   }
 
@@ -226,9 +227,7 @@ describe("SessionRunState — hub rejections are typed", () => {
     const sessionID = sid("ses_cancel_typed")
     const interrupted = withParts(sessionID)
     const hub = failingHub({
-      ensureRunning: async () => {
-        throw new SessionCancelledError({ message: "cancelled", sessionID })
-      },
+      ensureRunningEffect: () => Effect.fail(new SessionCancelledError({ message: "cancelled", sessionID })),
     })
 
     return withTmpdirInstance()(
@@ -275,9 +274,7 @@ describe("SessionRunState — hub rejections are typed", () => {
   it.live("ensureRunning surfaces a hub crash as a typed failure, not a defect", () => {
     const sessionID = sid("ses_crash_typed")
     const hub = failingHub({
-      ensureRunning: async () => {
-        throw new WorkerCrashedError({ message: "worker crashed", workerID: 7, sessionID })
-      },
+      ensureRunningEffect: () => Effect.fail(new WorkerCrashedError({ message: "worker crashed", workerID: 7, sessionID })),
     })
 
     return withTmpdirInstance()(
@@ -406,7 +403,7 @@ describe("SessionRunState — hub rejections are typed", () => {
       byID: (id) => (dead !== undefined && id === dead.id ? dead : pool.byID(id)),
       resultFor: (id) => pool.resultFor(id),
     }
-    const hub = createSessionHub({ pool: guardedPool })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: guardedPool })
 
     return withTmpdirInstance()(
       Effect.gen(function* () {

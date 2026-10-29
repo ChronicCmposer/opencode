@@ -8,6 +8,7 @@
 import { describe, expect, it } from "bun:test"
 import { Effect, Layer, ManagedRuntime, Schema } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
+import { durableLogStub } from "./durable-log-stub"
 import { Database } from "@opencode-ai/core/database/database"
 import { GlobalBus } from "@/bus/global"
 import { createEventSink } from "./event-sink"
@@ -24,7 +25,7 @@ const LiveCount = EventV2.define({
 
 /** Non-durable publishes never read `db`, so a stub is enough to build the layer. */
 const databaseStub = Layer.succeed(Database.Service, { db: {} as never })
-const eventLayer = EventV2.layerWith().pipe(Layer.provide(databaseStub))
+const eventLayer = EventV2.layerWith().pipe(Layer.provide(durableLogStub), Layer.provide(databaseStub))
 
 function makeRuntime() {
   return ManagedRuntime.make(eventLayer)

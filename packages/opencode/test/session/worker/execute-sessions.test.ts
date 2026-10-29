@@ -199,7 +199,7 @@ describe("per-session workers integration", () => {
           timeoutMs: 15_000,
         }),
     })
-    const hub = createSessionHub({ pool })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool })
     try {
       const [a, b] = await Promise.all([
         hub.ensureRunning(sid("ses_real_a")),
@@ -351,3 +351,5 @@ describe("createSessionDispatch honors the dispatch origin", () => {
     await dispatcher.terminateAll()
   })
 })
+
+import { createTestBarrier } from "../../lib/run-barrier-test"

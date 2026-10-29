@@ -14,9 +14,10 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { afterEach, describe, expect, test } from "bun:test"
-import { Effect, Schema } from "effect"
+import { Effect, Layer, Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import { Database as DatabaseService } from "@opencode-ai/core/database/database"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { EventV2 } from "@opencode-ai/core/event"
 
 const Note = Event.define({
@@ -65,7 +66,14 @@ describe("durable metadata on republish", () => {
           yield* events.publishLive(original)
 
           return { seen, original }
-        }).pipe(Effect.provide(EventV2.layerWith()), Effect.provide(DatabaseService.layerFromPath(filename))),
+        }).pipe(
+          Effect.provide(
+            EventV2.layerWith().pipe(
+              Layer.provide(DurableLog.layerFromDatabase),
+              Layer.provideMerge(DatabaseService.layerFromPath(filename)),
+            ),
+          ),
+        ),
       ),
     )
 

@@ -8,9 +8,10 @@
 // `hub → layer → run-state → hub` import cycle and the duplicated hub-side
 // `serveHubProxy` workaround.
 
+import { Effect, Option, Schema } from "effect"
 import { createRequestChannel, errorTagOf, messageOf, workerFrameChannel } from "./port"
 import { ProtocolError, assertJsonRepresentable } from "./frame"
-import { parseJson as parseSafeJson } from "@/util/safe-json"
+import { parseJson } from "@/util/safe-json"
 import type { SessionSpawnRequest, SessionSpawnResult } from "./subagent"
 
 export type HubProxyRequest = {
@@ -51,6 +52,44 @@ export type HubProxyEventFrame = {
 }
 
 export type HubProxyFrame = HubProxyRequest | HubProxyReply | HubProxyEventFrame
+
+/**
+ * The wire shape, decoded once at the port. Fields whose *value* is forwarded to
+ * a hub authority stay `Unknown` so a bad argument still gets a correlated error
+ * reply; the correlation id and discriminant are structural and fail the port.
+ */
+const HubProxyFrameSchema = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("request"),
+    id: Schema.Int,
+    method: Schema.Unknown,
+    args: Schema.Unknown,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("reply"),
+    id: Schema.Int,
+    ok: Schema.Boolean,
+    value: Schema.optional(Schema.Unknown),
+    message: Schema.optional(Schema.String),
+    tag: Schema.optional(Schema.String),
+    data: Schema.optional(Schema.Unknown),
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("event"),
+    id: Schema.Int,
+    method: Schema.String,
+    payload: Schema.Unknown,
+  }),
+])
+
+const decodeHubProxyFrameOption = Schema.decodeUnknownOption(HubProxyFrameSchema)
+
+/** Decode one hub-proxy payload, failing the port on a structurally invalid frame. */
+export function decodeHubProxyFrame(input: unknown): HubProxyFrame {
+  const decoded = decodeHubProxyFrameOption(input)
+  if (Option.isNone(decoded)) throw new ProtocolError("hub-proxy frame does not match the wire schema")
+  return decoded.value as HubProxyFrame
+}
 
 /**
  * The namespaced hub-proxy methods. One worker control port multiplexes the
@@ -153,6 +192,7 @@ export function createHubProxyClient(port: MessagePort, options: HubProxyClientO
   // boundary validates explicitly: a function/symbol that JSON would silently
   // drop rejects the call with a typed `ProtocolError` before any frame posts.
   const channel = workerFrameChannel<HubProxyFrame>(port, "hub-proxy", {
+    decodePayload: decodeHubProxyFrame,
     validateOutbound: assertJsonRepresentable,
   })
   let nextId = 1
@@ -184,11 +224,13 @@ export function createHubProxyClient(port: MessagePort, options: HubProxyClientO
     // settles — before the request is even posted, so no event can slip past it.
     let id: number | undefined
     try {
-      const reply = await requests.request((requestId) => {
-        id = requestId
-        if (onEvent !== undefined) eventHandlers.set(requestId, onEvent)
-        return { kind: "request", id: requestId, method, args }
-      })
+      const reply = await Effect.runPromise(
+        requests.request((requestId) => {
+          id = requestId
+          if (onEvent !== undefined) eventHandlers.set(requestId, onEvent)
+          return { kind: "request", id: requestId, method, args }
+        }),
+      )
       if (reply.ok) return reply.value
       throw new HubProxyRemoteError(reply.message, { tag: reply.tag, data: reply.data })
     } finally {
@@ -235,7 +277,7 @@ function errorDataOf(error: unknown): unknown {
     const fields = Object.entries(error).filter(([key]) => !UNSERIALISED_ERROR_FIELDS.has(key))
     if (fields.length === 0) return undefined
     const text = JSON.stringify(Object.fromEntries(fields))
-    return text === undefined ? undefined : parseSafeJson(text)
+    return text === undefined ? undefined : parseJson(text)
   } catch {
     return undefined
   }
@@ -278,6 +320,7 @@ export function serveHubProxy(
   options: ServeHubProxyOptions = {},
 ): () => void {
   const channel = workerFrameChannel<HubProxyFrame>(port, "hub-proxy", {
+    decodePayload: decodeHubProxyFrame,
     ...(options.onProtocolError === undefined ? {} : { onProtocolError: options.onProtocolError }),
   })
   return channel.onMessage((frame) => {

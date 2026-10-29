@@ -35,10 +35,20 @@
 // translation. `generation` / `ordinal` are frame metadata (payload siblings of
 // `event`), never fields on the event itself.
 
-import { Schema } from "effect"
+import { Option, Schema } from "effect"
 import { decodeEventsFrameBody, type EventsFrameBody } from "@/util/events-frame-schema"
 import { PrototypePollutionError, parseJson as parseSafeJson } from "@/util/safe-json"
 import type { WriterOrdinal } from "@/session/egress/ordinal"
+
+/** Branded wire identifiers; mixing a session id and a worker id becomes a type error. */
+export const WorkerID = Schema.Int.pipe(Schema.brand("WorkerID"))
+export type WorkerID = typeof WorkerID.Type
+export const Generation = Schema.Int.pipe(Schema.brand("Generation"))
+export type Generation = typeof Generation.Type
+export const AggregateID = Schema.NonEmptyString.pipe(Schema.brand("AggregateID"))
+export type AggregateID = typeof AggregateID.Type
+export const CallID = Schema.NonEmptyString.pipe(Schema.brand("CallID"))
+export type CallID = typeof CallID.Type
 
 /** The only envelope version understood by this build. */
 export const WORKER_FRAME_VERSION = 1
@@ -128,13 +138,19 @@ export interface EventBlobReference {
   readonly frameBytes: number
 }
 
+const EventBlobReferenceSchema = Schema.Struct({
+  [EVENT_BLOB_POSITION_KEY]: Schema.Struct({
+    aggregateID: Schema.String,
+    seq: Schema.Number,
+  }),
+  frameBytes: Schema.Number,
+})
+
+const decodeEventBlobReference = Schema.decodeUnknownOption(EventBlobReferenceSchema)
+
 /** True when an event payload is a resolvable blob-position reference. */
 export function isEventBlobReference(value: unknown): value is EventBlobReference {
-  if (!isRecord(value)) return false
-  if (typeof value["frameBytes"] !== "number") return false
-  const position = value[EVENT_BLOB_POSITION_KEY]
-  if (!isRecord(position)) return false
-  return typeof position["aggregateID"] === "string" && typeof position["seq"] === "number"
+  return Option.isSome(decodeEventBlobReference(value))
 }
 
 /**
@@ -234,99 +250,6 @@ export class FrameTooLargeError extends ProtocolError {
 // ---------------------------------------------------------------------------
 // Shared primitive parsers
 // ---------------------------------------------------------------------------
-
-/**
- * A protocol's failure factory: build and throw that module's own protocol error.
- * Binding the shared parsers to it lets every framed protocol (writer,
- * events) keep its own error taxonomy while sharing one implementation.
- */
-export type ParseFail = (message: string) => never
-
-/** The failure factory used by the default parser exports: this module's `ProtocolError`. */
-const frameFail: ParseFail = (message) => {
-  throw new ProtocolError(message)
-}
-
-/** True for a plain object; `null` and arrays are excluded. */
-export function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-}
-
-/** Parse a required string field; fails loud through `fail` (frame `ProtocolError` by default). */
-export function requireString(record: Record<string, unknown>, field: string, fail: ParseFail = frameFail): string {
-  const value = record[field]
-  if (typeof value !== "string") fail(`field "${field}" must be a string (got ${JSON.stringify(value)})`)
-  return value
-}
-
-/** Parse a required finite-number field. */
-export function requireNumber(record: Record<string, unknown>, field: string, fail: ParseFail = frameFail): number {
-  const value = record[field]
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    fail(`field "${field}" must be a finite number (got ${JSON.stringify(value)})`)
-  }
-  return value
-}
-
-/** Parse a required integer field. */
-export function requireInteger(record: Record<string, unknown>, field: string, fail: ParseFail = frameFail): number {
-  const value = record[field]
-  if (typeof value !== "number" || !Number.isInteger(value)) {
-    fail(`field "${field}" must be an integer (got ${JSON.stringify(value)})`)
-  }
-  return value
-}
-
-/** Parse an optional string field; `undefined` stays absent. */
-export function optionalString(
-  record: Record<string, unknown>,
-  field: string,
-  fail: ParseFail = frameFail,
-): string | undefined {
-  const value = record[field]
-  if (value === undefined) return undefined
-  if (typeof value !== "string") fail(`field "${field}" must be a string (got ${JSON.stringify(value)})`)
-  return value
-}
-
-/** Parse an optional boolean field; `undefined` stays absent. */
-export function optionalBoolean(
-  record: Record<string, unknown>,
-  field: string,
-  fail: ParseFail = frameFail,
-): boolean | undefined {
-  const value = record[field]
-  if (value === undefined) return undefined
-  if (typeof value !== "boolean") fail(`field "${field}" must be a boolean (got ${JSON.stringify(value)})`)
-  return value
-}
-
-/** The total primitive parsers shared by every framed protocol. */
-export interface FramePrimitives {
-  /** True for a plain object; `null` and arrays are excluded. */
-  isRecord(value: unknown): value is Record<string, unknown>
-  requireString(record: Record<string, unknown>, field: string): string
-  requireNumber(record: Record<string, unknown>, field: string): number
-  requireInteger(record: Record<string, unknown>, field: string): number
-  optionalString(record: Record<string, unknown>, field: string): string | undefined
-  optionalBoolean(record: Record<string, unknown>, field: string): boolean | undefined
-}
-
-/**
- * Bind the shared primitive parsers to a protocol's own failure type, so a
- * module can parse with its own error while reusing the
- * implementation. Once bound, each parser takes only `(record, field)`.
- */
-export function createFramePrimitives(fail: ParseFail): FramePrimitives {
-  return {
-    isRecord,
-    requireString: (record, field) => requireString(record, field, fail),
-    requireNumber: (record, field) => requireNumber(record, field, fail),
-    requireInteger: (record, field) => requireInteger(record, field, fail),
-    optionalString: (record, field) => optionalString(record, field, fail),
-    optionalBoolean: (record, field) => optionalBoolean(record, field, fail),
-  }
-}
 
 /** Coerce a thrown JSON-parse error to a message for a protocol error. */
 export function jsonErrorOf(error: unknown): string {
@@ -430,8 +353,11 @@ const decodeWorkerFrameEnvelope = Schema.decodeUnknownSync(WorkerFrameSchema)
  * trusted, and `payload` is left for the family parser.
  */
 export function parseWorkerFrame(input: unknown): WorkerFrameEnvelope {
-  if (!isRecord(input)) throw new ProtocolError(`frame must be an object (got ${JSON.stringify(input)})`)
-  if (input["v"] !== WORKER_FRAME_VERSION) throw new UnsupportedFrameVersionError(input["v"])
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw new ProtocolError(`frame must be an object (got ${JSON.stringify(input)})`)
+  }
+  const record = input as Record<string, unknown>
+  if (record["v"] !== WORKER_FRAME_VERSION) throw new UnsupportedFrameVersionError(record["v"])
 
   let parsed: typeof WorkerFrameSchema.Type
   try {
@@ -566,9 +492,10 @@ function correlation(id: number | undefined): { id?: number } {
  * frame "almost durable", so it is rejected rather than dropped.
  */
 function durableAggregateFieldsOf(value: unknown): { aggregateID?: string; seq?: number } {
-  if (!isRecord(value)) return {}
-  const aggregateID = parseOptionalAggregateID(value["aggregateID"])
-  const seq = parseOptionalSeq(value["seq"])
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return {}
+  const record = value as Record<string, unknown>
+  const aggregateID = parseOptionalAggregateID(record["aggregateID"])
+  const seq = parseOptionalSeq(record["seq"])
   if ((aggregateID === undefined) !== (seq === undefined)) {
     throw new ProtocolError("durable event must carry both aggregateID and seq, or neither")
   }
@@ -580,10 +507,11 @@ function durableAggregateFieldsOf(value: unknown): { aggregateID?: string; seq?:
 
 function parseOptionalAggregateID(value: unknown): string | undefined {
   if (value === undefined) return undefined
-  if (typeof value !== "string" || value.length === 0) {
+  const decoded = Schema.decodeUnknownOption(AggregateID)(value)
+  if (Option.isNone(decoded)) {
     throw new ProtocolError(`field "aggregateID" must be a non-empty string (got ${JSON.stringify(value)})`)
   }
-  return value
+  return decoded.value
 }
 
 function parseOptionalSeq(value: unknown): number | undefined {

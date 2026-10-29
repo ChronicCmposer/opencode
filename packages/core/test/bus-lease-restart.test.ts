@@ -13,7 +13,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
 import { Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
-import { Bus } from "../src/bus"
+import { DurableLog } from "../src/durable-log"
 
 const Note = Event.define({
   type: "test.bus-lease-restart.note",
@@ -62,7 +62,7 @@ function open() {
   native.exec("PRAGMA journal_mode = WAL")
   native.exec(DDL)
   natives.push(native)
-  const connection: Bus.Connection = {
+  const connection: DurableLog.Connection = {
     all: (sql, params = []) => native.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>,
     run: (sql, params = []) => ({ changes: Number(native.query(sql).run(...(params as never[])).changes) }),
     exec: (sql) => native.exec(sql),
@@ -71,7 +71,7 @@ function open() {
 }
 
 function bus(database: ReturnType<typeof open>, ownerID: string) {
-  return Bus.create({
+  return DurableLog.create({
     connection: database.connection,
     ownerID,
     definitions: [Note],
@@ -93,7 +93,7 @@ afterEach(() => {
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
 })
 
-describe("Bus lease after a hub restart", () => {
+describe("DurableLog lease after a hub restart", () => {
   test("an unexpired lease from a dead process generation is reclaimable", () => {
     const database = open()
     const previousOwner = owner(1, DEAD_PID)
@@ -143,6 +143,6 @@ describe("Bus lease after a hub restart", () => {
         expectedSeq: -1,
         nextOwnerID: successorOwner,
       }),
-    ).toThrow(Bus.LeaseConflictError)
+    ).toThrow(DurableLog.LeaseConflictError)
   })
 })

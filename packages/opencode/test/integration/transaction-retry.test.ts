@@ -1,11 +1,12 @@
-// Whole-transaction busy retry.
+// Busy retry at the transaction boundary.
 //
 // A worker writes with `BEGIN IMMEDIATE`; a concurrent writer makes SQLite
-// report busy. Retrying one statement would leave a half-applied transaction, so
-// the retry boundary must be the whole body (begin, statements, commit). These
-// tests drive the real transaction helper against a real SQLite file for the
-// begin-busy case, and a fault-injected connection for a busy failure in the
-// middle of the body, proving the body replays and no partial row survives.
+// report busy. Retrying a body statement inside the failed transaction would
+// keep the stale snapshot, so the adapter retries only the control statement at
+// its own boundary: `BEGIN IMMEDIATE` before anything ran, `COMMIT` after the
+// body ran exactly once, and `ROLLBACK` in place. These tests drive the real
+// adapter and transaction helper against a real SQLite file, including a
+// fault-injected busy COMMIT.
 
 import fs from "node:fs"
 import os from "node:os"
@@ -251,7 +252,7 @@ describe("adapter transaction retry boundary", () => {
     }
   })
 
-  test("a transaction takes BEGIN IMMEDIATE and does not replay a busy begin", async () => {
+  test("a busy BEGIN IMMEDIATE is retried at the transaction boundary", async () => {
     const { filename } = workspace()
     const holder = new BunDatabase(filename)
     const writer = new BunDatabase(filename)
@@ -262,8 +263,22 @@ describe("adapter transaction retry boundary", () => {
       holder.exec("BEGIN IMMEDIATE")
 
       const statements: string[] = []
+      let begins = 0
+      let signalBusy!: () => void
+      // Published readiness signal: the first `BEGIN IMMEDIATE` has actually
+      // returned busy. No sleep is used to guess when the lock matters.
+      const firstBusy = new Promise<void>((resolve) => {
+        signalBusy = resolve
+      })
       const client = await Effect.runPromise(
-        makeSqliteClient({}, adapterRunner(writer, statements)).pipe(Effect.provide(Reactivity.layer)),
+        makeSqliteClient(
+          {},
+          adapterRunner(writer, statements, (sql) => {
+            if (sql !== "BEGIN IMMEDIATE") return
+            begins += 1
+            if (begins === 1) signalBusy()
+          }),
+        ).pipe(Effect.provide(Reactivity.layer)),
       )
       // Reserve the transaction-scoped connection directly: the adapter rewrites
       // its `BEGIN` to `BEGIN IMMEDIATE`, which is where the busy result arrives.
@@ -275,17 +290,59 @@ describe("adapter transaction retry boundary", () => {
         }),
       )
 
-      const error = await Effect.runPromise(begin.pipe(Effect.flip))
-      expect(isBusySqlError(error)).toBe(true)
-      expect(statements).toEqual(["BEGIN IMMEDIATE"])
-      expect(writer.query("SELECT COUNT(*) AS count FROM item").get()).toEqual({ count: 0 })
-
+      const pending = Effect.runPromise(begin)
+      await firstBusy
+      // The retry is bounded and interruptible; release the lock inside its
+      // budget so the second attempt can take the write lock.
       holder.exec("COMMIT")
-      await Effect.runPromise(begin)
-      expect(statements).toEqual(["BEGIN IMMEDIATE", "BEGIN IMMEDIATE", "ROLLBACK"])
+      await pending
+
+      expect(begins).toBeGreaterThan(1)
+      expect(statements.filter((sql) => sql === "BEGIN IMMEDIATE")).toHaveLength(begins)
+      expect(writer.query("SELECT COUNT(*) AS count FROM item").get()).toEqual({ count: 0 })
     } finally {
       writer.close()
       holder.close()
+    }
+  })
+})
+
+describe("adapter busy COMMIT recovery", () => {
+  test("a busy COMMIT is retried in place; the body inserts exactly one row", async () => {
+    const { filename } = workspace()
+    const native = new BunDatabase(filename)
+    native.exec("PRAGMA journal_mode = WAL")
+    native.exec("PRAGMA busy_timeout = 0")
+    native.exec("CREATE TABLE item (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)")
+    const statements: string[] = []
+    let inserts = 0
+    let commits = 0
+    const client = await Effect.runPromise(
+      makeSqliteClient(
+        {},
+        adapterRunner(native, statements, (sql) => {
+          if (sql.trim().toUpperCase().startsWith("INSERT")) inserts += 1
+          if (sql !== "COMMIT") return
+          commits += 1
+          // A busy COMMIT did not commit: the adapter must re-issue only
+          // COMMIT, never replay the body.
+          if (commits === 1) throw busy()
+        }),
+      ).pipe(Effect.provide(Reactivity.layer)),
+    )
+
+    try {
+      await Effect.runPromise(
+        client.withTransaction(
+          client.unsafe("INSERT INTO item (name) VALUES (?)", ["row"]).withoutTransform.pipe(Effect.asVoid),
+        ),
+      )
+
+      expect(inserts).toBe(1)
+      expect(commits).toBe(2)
+      expect(native.query("SELECT COUNT(*) AS count FROM item").get()).toEqual({ count: 1 })
+    } finally {
+      native.close()
     }
   })
 })

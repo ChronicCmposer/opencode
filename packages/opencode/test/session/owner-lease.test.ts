@@ -5,7 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 
 const Note = Event.define({
   type: "test.bus.lease.note",
@@ -23,7 +23,10 @@ const DDL = `
   CREATE TABLE event_sequence (
     aggregate_id text PRIMARY KEY,
     seq integer NOT NULL,
-    owner_id text
+    owner_id text,
+    worker_owner_id text,
+    worker_heartbeat_at integer,
+    worker_expires_at integer
   );
   CREATE TABLE event (
     id text PRIMARY KEY,
@@ -37,7 +40,7 @@ const DDL = `
   CREATE UNIQUE INDEX event_aggregate_seq_idx ON event(aggregate_id, seq);
 `
 
-function connectionFrom(native: Database): Bus.Connection {
+function connectionFrom(native: Database): DurableLog.Connection {
   return {
     all: (sql, params = []) => native.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>,
     run: (sql, params = []) => ({ changes: Number(native.query(sql).run(...(params as never[])).changes) }),
@@ -48,8 +51,8 @@ function connectionFrom(native: Database): Bus.Connection {
 let directory = ""
 let nativeA: Database
 let nativeB: Database
-let busA: Bus.Interface
-let busB: Bus.Interface
+let busA: DurableLog.Interface
+let busB: DurableLog.Interface
 
 beforeEach(() => {
   directory = mkdtempSync(join(tmpdir(), "opencode-bus-lease-"))
@@ -62,8 +65,8 @@ beforeEach(() => {
   nativeB.exec("PRAGMA journal_mode = WAL")
   nativeB.exec("PRAGMA foreign_keys = ON")
   nativeB.exec("PRAGMA busy_timeout = 10")
-  busA = Bus.create({ connection: connectionFrom(nativeA), ownerID: "worker-1/gen-1", definitions: [Note] })
-  busB = Bus.create({ connection: connectionFrom(nativeB), ownerID: "worker-1/gen-2", definitions: [Note] })
+  busA = DurableLog.create({ connection: connectionFrom(nativeA), ownerID: "worker-1/gen-1", definitions: [Note] })
+  busB = DurableLog.create({ connection: connectionFrom(nativeB), ownerID: "worker-1/gen-2", definitions: [Note] })
 })
 
 afterEach(() => {
@@ -72,11 +75,11 @@ afterEach(() => {
   rmSync(directory, { recursive: true, force: true })
 })
 
-describe("Bus owner lease", () => {
+describe("DurableLog owner lease", () => {
   test("claim is exclusive and a stale owner cannot write", () => {
     expect(busA.claim("s1")).toEqual({ aggregateID: "s1", ownerID: "worker-1/gen-1", seq: -1 })
-    expect(() => busB.claim("s1")).toThrow(Bus.StaleOwnerError)
-    expect(() => busB.publish([{ definition: Note, data: note("s1", "stolen") }])).toThrow(Bus.StaleOwnerError)
+    expect(() => busB.claim("s1")).toThrow(DurableLog.StaleOwnerError)
+    expect(() => busB.publish([{ definition: Note, data: note("s1", "stolen") }])).toThrow(DurableLog.StaleOwnerError)
 
     expect(busA.publish([{ definition: Note, data: note("s1", "owned") }])[0]?.durable?.seq).toBe(0)
     expect(busA.read({ aggregateID: "s1" }).map((event) => textOf(event))).toEqual(["owned"])
@@ -101,7 +104,7 @@ describe("Bus owner lease", () => {
         nextOwnerID: "worker-1/gen-2",
       }),
     ).not.toThrow()
-    expect(() => busA.publish([{ definition: Note, data: note("s1", "late") }])).toThrow(Bus.StaleOwnerError)
+    expect(() => busA.publish([{ definition: Note, data: note("s1", "late") }])).toThrow(DurableLog.StaleOwnerError)
     expect(busB.publish([{ definition: Note, data: note("s1", "b") }])[0]?.durable?.seq).toBe(1)
   })
 
@@ -116,7 +119,7 @@ describe("Bus owner lease", () => {
         expectedSeq: -1,
         nextOwnerID: "worker-1/gen-2",
       }),
-    ).toThrow(Bus.LeaseConflictError)
+    ).toThrow(DurableLog.LeaseConflictError)
     expect(busA.publish([{ definition: Note, data: note("s1", "b") }])[0]?.durable?.seq).toBe(1)
   })
 
@@ -143,7 +146,7 @@ describe("Bus owner lease", () => {
         expectedSeq: 0,
         nextOwnerID: "worker-1/gen-2",
       }),
-    ).toThrow(Bus.LeaseConflictError)
+    ).toThrow(DurableLog.LeaseConflictError)
     expect(
       busB.reclaim({
         aggregateID: "s1",
@@ -157,11 +160,11 @@ describe("Bus owner lease", () => {
 
   test("two writers cannot both own the aggregate", () => {
     busA.claim("s1")
-    expect(() => busB.claim("s1")).toThrow(Bus.StaleOwnerError)
-    expect(() => busB.publish([{ definition: Note, data: note("s1", "b") }])).toThrow(Bus.StaleOwnerError)
+    expect(() => busB.claim("s1")).toThrow(DurableLog.StaleOwnerError)
+    expect(() => busB.publish([{ definition: Note, data: note("s1", "b") }])).toThrow(DurableLog.StaleOwnerError)
     busA.publish([{ definition: Note, data: note("s1", "a") }])
     expect(nativeA.query("SELECT aggregate_id, seq, owner_id FROM event_sequence").all()).toEqual([
-      { aggregate_id: "s1", seq: 0, owner_id: "worker-1/gen-1" },
+      { aggregate_id: "s1", seq: 0, owner_id: null },
     ])
     expect(nativeA.query("SELECT aggregate_id, seq FROM event").all()).toEqual([{ aggregate_id: "s1", seq: 0 }])
   })

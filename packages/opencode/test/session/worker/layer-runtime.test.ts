@@ -1,22 +1,28 @@
 // Reduced session layer runtime tests.
 //
-//   * 23 writer-backed Drizzle Database
+//   * 23 worker-owned Drizzle Database
 //   * 24 hub-proxy authorities (SessionStatus / Permission / Question)
 //   * 25 reduced in-worker Provider (real call against the mock provider)
 //   * 26 LLM.stream-backed ModelClient
 
-import { Database as BunDatabase } from "bun:sqlite"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer, Stream } from "effect"
-import { eq, sql } from "drizzle-orm"
-import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core"
+import { eq } from "drizzle-orm"
+import { openConnection } from "@opencode-ai/core/database/connection"
 import { Database } from "@opencode-ai/core/database/database"
+import { ProjectV2 } from "@opencode-ai/core/project"
+import { SessionTable } from "@opencode-ai/core/session/sql"
 import { streamText } from "ai"
 import type { LLMEvent } from "@opencode-ai/llm"
 import { SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
 import { Permission } from "@/permission"
 import { Question } from "@/question"
+import { migrationStatements } from "@/session/writer/migration.statements.gen"
+import { markSchemaIdentity, openWorkerDatabase } from "@/session/worker/db"
 import {
   ModelClient,
   boundaryReplacements,
@@ -30,11 +36,10 @@ import {
   reducedModelProviderLayer,
   serveHubProxy,
   sessionStatusProxyLayer,
-  writerDatabaseLayer,
+  workerDatabaseLayer,
   type HubProxyClient,
   type HubProxyClients,
   type WorkerModelConfig,
-  type WriterClientHandle,
 } from "@/session/worker/layer"
 import type { HubProxyMethod } from "@/session/worker/hub-proxy-wire"
 import { Provider } from "@/provider/provider"
@@ -46,80 +51,82 @@ import { workerSnapshot } from "../../lib/snapshot"
 const sid = (value: string) => SessionID.make(value)
 
 // ---------------------------------------------------------------------------
-// Writer-backed Drizzle Database.
+// Worker-owned Drizzle Database (D5).
 //
-// `writerDatabaseLayer(writer)` yields a real Drizzle `Database` whose
-// `select` / `insert` / `update` / `delete` return Effects. The writer handle
-// here is backed by a real in-memory SQLite connection so the round-trip runs
-// against genuine storage rather than a mock.
+// `workerDatabaseLayer(database)` yields a real Drizzle `Database` over the
+// worker's own WAL connection. The file is migrated first so the production
+// schema gate opens it exactly as a worker does.
 // ---------------------------------------------------------------------------
 
-const widget = sqliteTable("widget", {
-  id: integer("id").primaryKey(),
-  name: text("name").notNull(),
-})
-
-/**
- * A writer handle backed by an in-memory SQLite connection. The stateless
- * `query` path serves ordinary statements; `begin` / `txQuery` / `commit` /
- * `rollback` mirror the production writer so the reserved-connection path is
- * real too.
- */
-function writerOverSqlite(native: BunDatabase): WriterClientHandle {
-  let nextTxId = 1
-  const run = (method: string, statement: string, params: readonly unknown[] = []) => {
-    const query = native.query(statement)
-    return method === "values" ? query.values(...(params as never[])) : query.all(...(params as never[]))
-  }
-  return {
-    query: async (method, statement, params) => run(method, statement, params),
-    publish: async () => ({ seq: null, committed: false }),
-    begin: async () => {
-      native.run("BEGIN IMMEDIATE")
-      return `tx-${nextTxId++}`
-    },
-    txQuery: async (_handle, method, statement, params) => run(method, statement, params),
-    commit: async () => {
-      native.run("COMMIT")
-    },
-    rollback: async () => {
-      native.run("ROLLBACK")
-    },
-  }
+function temporaryWorkerFile(): string {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-runtime-db-"))
+  return path.join(directory, "opencode.db")
 }
 
-describe("writerDatabaseLayer", () => {
-  test("yields a real Drizzle Database that round-trips CRUD through the writer", async () => {
-    const native = new BunDatabase(":memory:")
+function migrateWorkerFile(): string {
+  const filename = temporaryWorkerFile()
+  const connection = openConnection({ filename })
+  try {
+    for (const statement of migrationStatements) connection.exec(statement)
+    markSchemaIdentity(connection)
+    connection.run(
+      "INSERT INTO project (id, worktree, sandboxes, time_created, time_updated) VALUES (?, ?, ?, ?, ?)",
+      ["prj_worker", "/tmp/project-a", "[]", 1, 1],
+    )
+  } finally {
+    connection.close()
+  }
+  return filename
+}
+
+function removeWorkerFile(filename: string): void {
+  fs.rmSync(path.dirname(filename), { recursive: true, force: true })
+}
+
+const sessionRow = (id: string, title: string) => ({
+  id: SessionID.make(id),
+  project_id: ProjectV2.ID.make("prj_worker"),
+  slug: id,
+  directory: "/tmp/project-a",
+  title,
+  version: "1",
+})
+
+describe("workerDatabaseLayer", () => {
+  test("yields a real Drizzle Database that round-trips CRUD through the worker connection", async () => {
+    const filename = migrateWorkerFile()
+    const worker = await Effect.runPromise(openWorkerDatabase({ filename }))
     try {
       const rows = await Effect.runPromise(
         Effect.gen(function* () {
           const database = yield* Database.Service
           const db = database.db
-          yield* db.run(sql`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`)
           yield* db
-            .insert(widget)
-            .values([
-              { id: 1, name: "alpha" },
-              { id: 2, name: "beta" },
-            ])
+            .insert(SessionTable)
+            .values([sessionRow("ses_1", "alpha"), sessionRow("ses_2", "beta")])
             .run()
-          yield* db.update(widget).set({ name: "ALPHA" }).where(eq(widget.id, 1)).run()
-          yield* db.delete(widget).where(eq(widget.id, 2)).run()
-          return yield* db.select().from(widget).all()
-        }).pipe(Effect.provide(writerDatabaseLayer(writerOverSqlite(native)))),
+          yield* db
+            .update(SessionTable)
+            .set({ title: "ALPHA" })
+            .where(eq(SessionTable.id, SessionID.make("ses_1")))
+            .run()
+          yield* db.delete(SessionTable).where(eq(SessionTable.id, SessionID.make("ses_2"))).run()
+          return yield* db.select({ id: SessionTable.id, title: SessionTable.title }).from(SessionTable).all()
+        }).pipe(Effect.provide(workerDatabaseLayer(worker))),
       )
 
-      expect(rows).toEqual([{ id: 1, name: "ALPHA" }])
+      expect(rows).toEqual([{ id: SessionID.make("ses_1"), title: "ALPHA" }])
     } finally {
-      native.close()
+      await Effect.runPromise(worker.close)
+      removeWorkerFile(filename)
     }
   })
 
-  test("boundaryReplacements installs the writer proxy, not the throwing stub", async () => {
-    const native = new BunDatabase(":memory:")
+  test("boundaryReplacements installs the worker Database, not the throwing stub", async () => {
+    const filename = migrateWorkerFile()
+    const worker = await Effect.runPromise(openWorkerDatabase({ filename }))
     try {
-      const entry = boundaryReplacements(workerSnapshot(), writerOverSqlite(native)).find(
+      const entry = boundaryReplacements(workerSnapshot(), worker).find(
         ([node]) => node.name === Database.node.name,
       )
       expect(entry).toBeDefined()
@@ -127,15 +134,15 @@ describe("writerDatabaseLayer", () => {
       const rows = await Effect.runPromise(
         Effect.gen(function* () {
           const database = yield* Database.Service
-          yield* database.db.run(sql`CREATE TABLE widget (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`)
-          yield* database.db.insert(widget).values({ id: 7, name: "seven" }).run()
-          return yield* database.db.select().from(widget).all()
+          yield* database.db.insert(SessionTable).values(sessionRow("ses_boundary", "boundary")).run()
+          return yield* database.db.select({ id: SessionTable.id }).from(SessionTable).all()
         }).pipe(Effect.provide(entry![1] as Layer.Layer<Database.Service>)),
       )
 
-      expect(rows).toEqual([{ id: 7, name: "seven" }])
+      expect(rows).toEqual([{ id: SessionID.make("ses_boundary") }])
     } finally {
-      native.close()
+      await Effect.runPromise(worker.close)
+      removeWorkerFile(filename)
     }
   })
 })

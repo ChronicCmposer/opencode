@@ -181,17 +181,21 @@ export const layer = Layer.effect(
     ) {
       const hub = yield* hubIfEnabled
       if (hub !== undefined) {
-        // A hub-hosted run reports cancel/crash/control failures through its
-        // promise rejection. Map them into the typed `RunError` channel so the
-        // caller can branch on them; never let a rejection become a defect.
-        // A clean cancel is the exception: the caller's `onInterrupt` is the run's
-        // intended result (flag-off parity), not a failure, so a cancelled prompt
-        // handler returns the interrupted message instead of `BadRequest`.
-        const run = Effect.tryPromise({
-          try: () => hub.ensureRunning(sessionID, origin),
-          catch: asRunError,
-        })
-        return yield* settleHubRun(interruptibleHubRun(run, hub, sessionID, onInterrupt), onInterrupt)
+        // The hub exposes the run as an Effect, so its cancel/crash/control
+        // failures arrive in the typed `RunError` channel directly (never as a
+        // squashed Promise rejection). A clean cancel is the exception: the
+        // caller's `onInterrupt` is the run's intended result (flag-off parity),
+        // not a failure, so a cancelled prompt handler returns the interrupted
+        // message instead of `BadRequest`.
+        const run = hub.ensureRunningEffect(sessionID, origin).pipe(Effect.mapError(asRunError))
+        const outcome = yield* interruptibleHubRun(run, hub, sessionID, onInterrupt).pipe(
+          Effect.map(Option.some),
+          Effect.catchTag("SessionCancelledError", () => Effect.succeed(Option.none<SessionExecutionResult>())),
+        )
+        // Flag-off parity: a clean cancel yields the caller's interrupt result;
+        // every other typed failure propagates.
+        if (Option.isNone(outcome)) return yield* onInterrupt
+        return yield* parseSessionResult(outcome.value)
       }
       const runners = yield* InstanceState.get(state)
       return yield* runners.ensureRunning(sessionID, work, onInterrupt)
@@ -344,9 +348,8 @@ function interruptibleHubRun<A, E>(
 }
 
 /**
- * Fold a hub-hosted run's outcome: a clean cancel yields the caller's
- * `onInterrupt` result (the interrupted assistant message), exactly as the
- * flag-off runner does, while every other typed failure still propagates.
+ * Fold a hub-hosted shell run's outcome: a clean cancel yields the caller's
+ * `onInterrupt` result, exactly as the flag-off runner does.
  */
 function settleHubRun(
   run: Effect.Effect<SessionExecutionResult, RunError>,

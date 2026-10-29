@@ -7,16 +7,44 @@
 // support from `node:sqlite` for the per-session scoped handle (live bound
 // views plus a repository-only write path). Foreign keys stay ON there so a
 // cross-session parent reference cannot be inserted. The exported surface
-// deliberately matches the Bus `Connection` contract (`all`/`run`/`exec`) and
+// deliberately matches the DurableLog `Connection` contract (`all`/`run`/`exec`) and
 // the retained `session/writer/connection.ts` helper.
 
 import { randomUUID } from "node:crypto"
 import { Database, type SQLQueryBindings } from "bun:sqlite"
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue, type StatementSync } from "node:sqlite"
+import { isBusySqlError } from "./busy"
 import { resolveWorkerCacheSizeKib, walPragmas } from "./pragmas"
 
 /** SQLite stays locked for this long before the sync driver reports busy. */
 export const WORKER_BUSY_TIMEOUT_MS = 250
+
+/**
+ * Open-time busy budget. Switching a fresh handle to WAL needs a brief write
+ * lock; a process that starts while a peer is checkpointing or migrating must
+ * wait it out instead of failing boot with `SQLITE_BUSY`. The driver's own
+ * `busy_timeout` covers most of the window, and this bounded replay covers the
+ * cases SQLite reports busy without waiting.
+ */
+const OPEN_BUSY_RETRIES = 8
+const OPEN_BUSY_BASE_DELAY_MS = 20
+const OPEN_BUSY_MAX_DELAY_MS = 400
+
+/** Blocking pause shared by the boot paths that cannot yield to the event loop. */
+export function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+function retryOpenWhileBusy<T>(open: () => T): T {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return open()
+    } catch (error) {
+      if (!isBusySqlError(error) || attempt >= OPEN_BUSY_RETRIES) throw error
+      sleepSync(Math.min(OPEN_BUSY_BASE_DELAY_MS * 2 ** attempt, OPEN_BUSY_MAX_DELAY_MS))
+    }
+  }
+}
 
 /**
  * Upper bound on prepared statements kept per `node:sqlite` connection. The
@@ -181,13 +209,16 @@ export function openConnection(options: ConnectionOptions): Connection {
       cacheSizeKib: options.cacheSizeKib ?? resolveWorkerCacheSizeKib(),
     })
 
-  const native = new Database(options.filename, { create: options.create ?? true })
-  try {
-    for (const pragma of pragmas) native.exec(pragma)
-  } catch (error) {
-    native.close()
-    throw error
-  }
+  const native = retryOpenWhileBusy(() => {
+    const handle = new Database(options.filename, { create: options.create ?? true })
+    try {
+      for (const pragma of pragmas) handle.exec(pragma)
+      return handle
+    } catch (error) {
+      handle.close()
+      throw error
+    }
+  })
 
   const owner = nextOwnerID()
   let closed = false
@@ -255,20 +286,23 @@ export function openNodeConnection(options: NodeConnectionOptions): NodeConnecti
       cacheSizeKib: options.cacheSizeKib ?? resolveWorkerCacheSizeKib(),
     })
 
-  const native = new DatabaseSync(options.filename, {
-    open: true,
-    enableForeignKeyConstraints: options.foreignKeys ?? true,
+  const native = retryOpenWhileBusy(() => {
+    const handle = new DatabaseSync(options.filename, {
+      open: true,
+      enableForeignKeyConstraints: options.foreignKeys ?? true,
+    })
+    try {
+      for (const pragma of pragmas) handle.exec(pragma)
+      // The shared WAL tuning enables foreign keys. Callers may explicitly opt out
+      // for a private test handle, but the worker's scoped handle keeps them ON so
+      // a child row cannot reference another session's parent.
+      if (options.foreignKeys === false) handle.exec("PRAGMA foreign_keys = OFF")
+      return handle
+    } catch (error) {
+      handle.close()
+      throw error
+    }
   })
-  try {
-    for (const pragma of pragmas) native.exec(pragma)
-    // The shared WAL tuning enables foreign keys. Callers may explicitly opt out
-    // for a private test handle, but the worker's scoped handle keeps them ON so
-    // a child row cannot reference another session's parent.
-    if (options.foreignKeys === false) native.exec("PRAGMA foreign_keys = OFF")
-  } catch (error) {
-    native.close()
-    throw error
-  }
 
   const owner = nextOwnerID()
   let closed = false

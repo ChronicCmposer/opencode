@@ -10,6 +10,7 @@
 import { describe, expect, test } from "bun:test"
 import { Effect, Layer, ManagedRuntime } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
+import { durableLogStub } from "../../lib/durable-log-stub"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionV1 } from "@opencode-ai/schema/session-v1"
 import { attachMeshWorker, createEgressMesh, type DurableCommit, type MeshWorkerClient } from "@/session/egress/mesh"
@@ -24,7 +25,7 @@ import { pollUntil } from "../../lib/poll"
 
 /** Publishing live-only never reads `db`, so a stub is enough to build the layer. */
 const databaseStub = Layer.succeed(Database.Service, { db: {} as never })
-const eventLayer = EventV2.layerWith().pipe(Layer.provide(databaseStub))
+const eventLayer = EventV2.layerWith().pipe(Layer.provide(durableLogStub), Layer.provide(databaseStub))
 
 /** A real durable event type: `durable.aggregate === "sessionID"`. */
 const DURABLE_TYPE = SessionV1.Event.MessageRemoved.type

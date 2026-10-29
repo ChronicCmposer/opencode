@@ -1,5 +1,5 @@
 // Production hub layer/node/resolver wiring.
-import { Context, Effect, Fiber, Layer, Option, Scope } from "effect"
+import { Context, Deferred, Effect, Fiber, Layer, Logger, Option, Scope } from "effect"
 import os from "node:os"
 import path from "node:path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -15,31 +15,38 @@ import { EffectBridge } from "@/effect/bridge"
 import { SessionStatus } from "@/session/status"
 import { Permission } from "@/permission"
 import { Question } from "@/question"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import type { InstanceContext } from "@/project/instance-context"
 import { Project } from "@opencode-ai/schema/project"
 import { attachMeshWorker, createEgressMesh, type EgressMesh } from "@/session/egress/mesh"
 import { createLiveEventPublisher, instanceLocation, EventV2Bridge, type LiveEventPublisher } from "@/event-v2-bridge"
 import type { EventV2 } from "@opencode-ai/core/event"
-import { Bus, StateCache } from "@opencode-ai/core/bus"
+import { DurableLog, StateCache } from "@opencode-ai/core/durable-log"
 import type { SessionID } from "@/session/schema"
-import { createDbExecutor, type DbExecutor } from "./db-executor"
+import { DbExecutor } from "./db-executor"
 import { spawnDepth } from "@/session/depth"
 import { defined } from "@/util/object"
 import { setThreadName } from "@/util/thread-name"
 import { type CancellationConfig, type DispatcherOptions, type SessionWorker } from "./dispatch"
 import { createLifecycleTracker } from "@/session/ledger/lifecycle"
-import { type RunBarrierPhases, type RunBarrierPromotionOutcome } from "@/session/run-barrier"
+import { RunBarrier, type RunBarrierPromotionOutcome } from "@/session/run-barrier"
 import { type ExecutorWorkerPool } from "./execute"
 import { resolveCancelGraceMs, type BootTelemetry } from "./cancel"
-import { createSpawnGate, type SpawnGateHandle } from "./spawn-gate"
+
 import { createEpochSequence, makeInstanceContext, type EpochSequence } from "./snapshot"
-import { buildSessionWorkerInit, resolveWorkerPlugins, type BuildSessionWorkerInitOptions, type WorkerModelSelection, type WorkerPluginSource } from "./init"
+import {
+  buildSessionWorkerInit,
+  resolveWorkerPlugins,
+  type BuildSessionWorkerInitOptions,
+  type WorkerModelSelection,
+  type WorkerPluginSource,
+} from "./init"
 import { createPidRegistry, reapSupport, registerReported, type PidRegistry, type PidReport } from "./pid-registry"
 import { Plugin } from "@/plugin"
 import type { WorkerPluginHooks } from "./plugin-host"
 import type { HubProxyHandlers, HubProxyStreamHandler } from "./hub-proxy-wire"
 import type { SessionWorkerInit } from "./session-worker"
-import { noopWorkerLogger, workerLogMessage, workerLoggerFromBridge, type WorkerLogger } from "./log"
+import { workerLogMessage, WorkerLogging } from "./worker-logging"
 import { Session } from "@/session/session"
 import { recordAsync } from "@/session/ledger/crash"
 import { ensureProductionSchemaAsync } from "@/session/db/schema"
@@ -78,18 +85,19 @@ import {
 } from "./hub-proxy-authorities"
 import {
   DEFAULT_SPAWN_GATE_TIMEOUT_MS,
-  createProductionWorkerPool,
   describeSessionWorkerEntry,
   liveSessionWorkerCount,
   logRunIdleTimeoutWarning,
+  makeProduction,
+  makeSpawnGate,
   resolveRunIdleTimeoutMs,
   withSessionWorkerPorts,
-  WorkerPools as WorkerPoolsModule,
   type DescribedSessionWorkerEntry,
   type Interface as WorkerPoolsInterface,
   type ProductionPoolFactory,
   type ProductionWorkerPoolOptions,
   type SessionWorkerInitSource,
+  type SpawnGateHandle,
   type WorkerPoolSinks,
 } from "./worker-pools"
 import {
@@ -215,9 +223,7 @@ async function loadDispatchedSession(
     userModel !== undefined
       ? {
           providerID: userModel.providerID,
-          modelID: String(
-            "modelID" in userModel ? userModel.modelID : (userModel as { readonly id?: string }).id,
-          ),
+          modelID: String("modelID" in userModel ? userModel.modelID : (userModel as { readonly id?: string }).id),
         }
       : info?.model === undefined
         ? undefined
@@ -311,6 +317,13 @@ export interface ProductionPortBackendsOptions {
    * Takes precedence over {@link events} for the worker's events port.
    */
   readonly eventsForWorker?: (workerID: number) => LiveEventPublisher | undefined
+  /**
+   * Observe egress receiver failures. A rejected events frame (invalid JSON, a
+   * non-string message, an oversized frame, or a durable ordering violation)
+   * closes the port; the receiver must never stop delivery silently, so it is
+   * logged here with the worker/session context.
+   */
+  readonly bridge?: EffectBridge.Shape
   /** Advisory hub cache invalidated by each durable event (never authoritative). */
   readonly cache?: HubCacheInvalidation
   /**
@@ -377,6 +390,7 @@ export interface ProductionPortBackends extends WorkerPortBackends {
  * mesh/port state down; it is safe to call when nothing was attached.
  */
 export function buildProductionPortBackends(options: ProductionPortBackendsOptions = {}): ProductionPortBackends {
+  const bridge = options.bridge
   // ONE mesh per hub: every worker's transferred `egressControl` port attaches
   // here, and the durable commit path publishes to it.
   const egressMesh = createEgressMesh(options.egressMeshBound === undefined ? {} : { bound: options.egressMeshBound })
@@ -441,7 +455,27 @@ export function buildProductionPortBackends(options: ProductionPortBackendsOptio
             return sink.acks
           },
         }
-        const disposeReceiver = serveEventsPort(port, observedSink, undefined, (commit) => egressMesh.publish(commit))
+        // A rejected frame closes the receiver's port, so the failure MUST be
+        // observed here: a silent stop would leave the hub believing egress is
+        // healthy while no further event ever arrives.
+        const onEgressError = (error: Error): void => {
+          const bound = boundSession()
+          void bridge?.fork(
+            Effect.logError(workerLogMessage("egress frame rejected"), {
+              workerID,
+              ...(bound === undefined ? {} : { sessionID: bound }),
+              error: error.message,
+              errorName: error.name,
+            }),
+          )
+        }
+        const disposeReceiver = serveEventsPort(
+          port,
+          observedSink,
+          onEgressError,
+          (commit) => egressMesh.publish(commit),
+          bridge,
+        )
         return () => {
           disposeReceiver()
           attachment?.dispose()
@@ -469,8 +503,10 @@ export interface ProductionSessionHubOptions {
   readonly cancellation?: WorkerCancellationOptions
   /** Upper bound on the dispatcher's async resume decision (see `SessionHubOptions`). */
   readonly resumeDecisionTimeoutMs?: number
-  /** Hub-side cleanup when a session's worker is retired (per-session maps). */
-  readonly onSessionReleased?: (sessionID: SessionID) => void
+  /** Generation-scoped release for an in-place replacement (see `SessionHubOptions`). */
+  readonly onGenerationReleased?: (sessionID: SessionID, workerID?: number) => unknown
+  /** Session-scoped release when a session leaves the hub (reap/delete/shutdown). */
+  readonly onSessionReleased?: (sessionID: SessionID) => unknown
   /**
    * Cheap generation probe (the dispatching session's requested model), so an
    * unchanged generation reuses the cached worker init instead of rebuilding it.
@@ -481,6 +517,11 @@ export interface ProductionSessionHubOptions {
    * dispatcher: a completed run's slot is held until it resolves.
    */
   readonly writeBarrier?: DispatcherOptions["writeBarrier"]
+  /**
+   * The run barrier. Required: the production layer yields `RunBarrier.Service`
+   * and passes it through, so the hub never builds a private instance.
+   */
+  readonly barrier: RunBarrier.Interface
   /**
    * Per-session durable-egress barrier forwarded to every
    * spawned worker's executor.
@@ -545,16 +586,11 @@ export interface ProductionSessionHubOptions {
   /** Boot-ready deadline handed to every spawned worker; defaults to `timeoutMs`. */
   readonly bootTimeoutMs?: number
   /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
-  readonly log?: WorkerLogger
+  readonly bridge?: EffectBridge.Shape
   /** Boot-cancellation telemetry: a cancel win or a death during abort. */
   readonly onBootTelemetry?: (event: BootTelemetry) => void
   /** The background-promotion decision the hub observed (see `SessionHubOptions`). */
   readonly promotionOutcome?: (sessionID: SessionID) => RunBarrierPromotionOutcome
-  /**
-   * Test seam for a scripted pool that reports no commit/projector phases. The
-   * production pool omits it, so every run drains through its own reports.
-   */
-  readonly barrierPhases?: (sessionID: SessionID) => RunBarrierPhases
   /**
    * The layer scope that owns the Wave-6 `WorkerPorts` / `WorkerPools` services
    * this hub creates internally. `productionSessionHubLayer` supplies it so those
@@ -598,20 +634,21 @@ function ignoreReapFailure(reap: () => void): void {
  * connection. A failure is logged and swallowed: the successor reclaim path
  * still fences correctly, so this is defense-in-depth, never a boot blocker.
  */
-export function sweepDeadLeasesAtStartup(filename: string, log: WorkerLogger = noopWorkerLogger): number {
+export function sweepDeadLeasesAtStartup(filename: string, bridge?: EffectBridge.Shape): number {
   let connection: ReturnType<typeof openConnection> | undefined
   try {
     connection = openConnection({ filename, create: false, busyTimeoutMs: 250 })
-    const released = Bus.create({ connection, ownerID: "hub-startup-lease-sweep" }).releaseDeadLeases()
+    const released = DurableLog.create({ connection, ownerID: "hub-startup-lease-sweep" }).releaseDeadLeases()
     if (released > 0) {
-      log(workerLogMessage("startup lease sweep"), { level: "INFO", released })
+      void bridge?.fork(Effect.logInfo(workerLogMessage("startup lease sweep"), { released }))
     }
     return released
   } catch (error) {
-    log(workerLogMessage("startup lease sweep failed"), {
-      level: "WARN",
-      error: error instanceof Error ? error.message : String(error),
-    })
+    void bridge?.fork(
+      Effect.logWarning(workerLogMessage("startup lease sweep failed"), {
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    )
     return 0
   } finally {
     connection?.close()
@@ -628,7 +665,7 @@ function resolveSessionInstance(
   sessionID: SessionID | undefined,
   dispatched: DispatchedSession | undefined,
   instanceOfSession: (id: SessionID | undefined) => InstanceContext | undefined,
-  log: WorkerLogger,
+  bridge: EffectBridge.Shape | undefined,
 ): InstanceContext {
   const resolved =
     instanceOfSession(sessionID) ??
@@ -636,11 +673,12 @@ function resolveSessionInstance(
     captureInstanceRef()
   if (resolved !== undefined) return resolved
   const fallback = fallbackInstanceContext()
-  log(workerLogMessage("instance fallback"), {
-    level: "WARN",
-    sessionID,
-    directory: fallback.directory,
-  })
+  void bridge?.fork(
+    Effect.logWarning(workerLogMessage("instance fallback"), {
+      sessionID,
+      directory: fallback.directory,
+    }),
+  )
   return fallback
 }
 
@@ -653,9 +691,13 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   // graph contributes no hub node — see `sessionWorkerNodes`), so this only names
   // the real hub process; no worker's `ocs<slot>` name can be clobbered.
   setThreadName("och")
-  const log = options.log ?? noopWorkerLogger
+  const bridge = options.bridge
   const scope = options.scope
-  const runScoped = <A>(effect: Effect.Effect<A, never, Scope.Scope>): A => Effect.runSync(Scope.provide(scope!)(effect))
+  // A direct caller without a layer scope still gets the single scoped pool:
+  // its `terminateAll` closes the pool's own cache scope on shutdown.
+  const poolScope = scope ?? Effect.runSync(Scope.make())
+  const runScoped = <A>(effect: Effect.Effect<A, never, Scope.Scope>): A =>
+    Effect.runSync(Scope.provide(poolScope)(effect))
   // One backend build for both the hub's dispose bookkeeping and the port
   // service: a function source is memoized here, so neither owner can construct
   // a second egress mesh. The resolved flag is set only AFTER the source
@@ -673,32 +715,33 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
           return portBackendsValue
         }
       : portSource
-  // One permit serializes every cold isolate spawn for this hub (and every
+  // One Effect semaphore bounds every cold isolate spawn for this hub (and every
   // crash respawn, because the pool retains the same handle).
   const spawnGate =
-    options.spawnGate ?? createSpawnGate({ timeoutMs: options.spawnTimeoutMs ?? DEFAULT_SPAWN_GATE_TIMEOUT_MS })
+    options.spawnGate ?? makeSpawnGate({ timeoutMs: options.spawnTimeoutMs ?? DEFAULT_SPAWN_GATE_TIMEOUT_MS })
   // Schema-ensure runs off the hub's main thread and before any spawn. The gate
   // is lazy so construction stays sync (the layer body) while the actual migrate/
   // verify/mark work runs on the DbExecutor thread; the first dispatch awaits it.
-  // Its live count is the process-wide registry of constructed isolates, plus a
-  // spawn that has acquired the one permit but not constructed its isolate yet.
-  // A booted (permit-released) worker is exactly the case `spawnGate.held` alone
-  // missed. `BEGIN IMMEDIATE` serializes concurrent hubs.
+  // Its live count is the process-wide registry of constructed isolates plus
+  // the exact pre-construction reservations held by an acquired permit.
+  // `BEGIN IMMEDIATE` serializes concurrent hubs.
   let bootGate: Promise<void> | undefined
   const awaitBootGate = (): Promise<void> => {
     const databasePath = options.databasePath
     if (databasePath === undefined) return Promise.resolve()
+    // A caller-supplied gate without an exact `active` count (a test fake) keeps
+    // the legacy "held" hint; the real semaphore gate never reads it.
+    const heldHint = spawnGate.active === undefined && spawnGate.held === true ? 1 : 0
     bootGate ??= ensureProductionSchemaAsync({
       filename: databasePath,
-      liveWorkers:
-        options.liveWorkers?.() ?? liveSessionWorkerCount(databasePath) + (spawnGate.held === true ? 1 : 0),
+      liveWorkers: options.liveWorkers?.() ?? liveSessionWorkerCount(databasePath) + heldHint,
       ...(options.db === undefined ? {} : { executor: options.db }),
     }).then(
       () => {
         // The schema gate has migrated/verified the file, so the lease table is
         // safe to sweep. Schedule after this promise resolves and never await:
         // a slow or failing sweep must not delay the first worker admission.
-        setTimeout(() => sweepDeadLeasesAtStartup(databasePath, log), 0)
+        setTimeout(() => sweepDeadLeasesAtStartup(databasePath, bridge), 0)
         return undefined
       },
       (error: unknown) => {
@@ -716,23 +759,25 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   // Resolve the run-reply liveness budget once, at the hub boundary: an explicit
   // option wins, else the env override, else the default-on watchdog budget.
   const runIdleTimeoutMs = resolveRunIdleTimeoutMs(options)
-  logRunIdleTimeoutWarning(log, options)
+  logRunIdleTimeoutWarning(bridge, options)
   // Resolve the entry the pool will actually spawn (an explicit entry wins, then
   // the env override, then the build-time define, then the source-relative URL).
   const describedEntry: DescribedSessionWorkerEntry =
     options.entry !== undefined
       ? { entry: options.entry, source: "definedPath" }
       : describeSessionWorkerEntry({ env: options.env })
-  log(workerLogMessage("pool resolved"), {
-    level: "INFO",
-    workerCount,
-    availableParallelism: os.availableParallelism(),
-  })
-  log(workerLogMessage("worker entry resolved"), {
-    level: "INFO",
-    entry: String(describedEntry.entry),
-    source: describedEntry.source,
-  })
+  void bridge?.fork(
+    Effect.logInfo(workerLogMessage("pool resolved"), {
+      workerCount,
+      availableParallelism: os.availableParallelism(),
+    }),
+  )
+  void bridge?.fork(
+    Effect.logInfo(workerLogMessage("worker entry resolved"), {
+      entry: String(describedEntry.entry),
+      source: describedEntry.source,
+    }),
+  )
   // The hub is assigned after the pool is built; port transfers arrive only on
   // dispatch (post-assignment), so the deferred reference is safe.
   // One lifecycle tracker owned by this hub: the pool reports boot/materialize,
@@ -762,7 +807,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   const maxRunning = options.maxRunningWorkers ?? os.availableParallelism()
   const poolOptions: ProductionWorkerPoolOptions = {
     init: resolveInit,
-    log,
+    ...(bridge === undefined ? {} : { bridge }),
     onPhase: (sessionID, phase) => lifecycle.phase(sessionID, phase),
     // An idle-cap eviction is a full generation retirement: drop the
     // dispatcher entry, terminate, and run the hub release (ports, asks,
@@ -787,10 +832,11 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
       ...(options.generationOf === undefined ? {} : { generationOf: options.generationOf }),
       beforeSpawn: awaitBootGate,
     }),
-    // A same-session model switch replaces the isolate in place, so the
-    // dispatcher never retires it. Route it through the hub's full
-    // generation retirement (lost calls, ports, pending asks, lease).
-    onGenerationRetired: (sessionID, workerID) => hub?.releaseGeneration(sessionID, workerID),
+    // A same-session model switch replaces the isolate in place. Route the old
+    // generation through the dispatcher's retirement gate (never `retireWorker`:
+    // the successor reuses the same slot) so it gets the same release ordering,
+    // port disposal and retired-lease release as crash/reap/cancel.
+    onGenerationRetired: (sessionID, workerID) => hub?.dispatcher.retireGeneration(sessionID, workerID),
     ...sinks,
   }
   // Scope ownership: only services this hub creates internally are attached to
@@ -800,20 +846,41 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   // finalizers dispose ports before terminating the pool; in production the
   // layer's hub finalizer is the single owner of that ordering.
   let workerPortSeams: WorkerPortSeams | undefined
+  // The test pool seam adapts a caller-built structural pool; production always
+  // uses the one scoped `makeProduction` layer.
+  const adaptPool = (pool: ExecutorWorkerPool): WorkerPoolsInterface => ({
+    executorPool: pool,
+    spawn: (id) => Effect.sync(() => pool.spawn(id)),
+    releaseSession: (sessionID, workerID) =>
+      Effect.sync(() => {
+        pool.releaseSession?.(sessionID, workerID)
+      }),
+    byID: (id) => Effect.sync(() => pool.byID(id)),
+    resultFor: (sessionID) => Effect.sync(() => pool.resultFor(sessionID)),
+    workers: Effect.sync(() => pool.workers),
+    terminateAll: () => Effect.promise(() => pool.terminateAll()),
+    stats: Effect.sync(() => {
+      const bounded = pool as Partial<{ idleWorkers: number; idleCapacity: number; idleEvictions: number }>
+      return {
+        workers: pool.workers.length,
+        idleWorkers: bounded.idleWorkers ?? 0,
+        idleCapacity: bounded.idleCapacity ?? 0,
+        idleEvictions: bounded.idleEvictions ?? 0,
+      }
+    }),
+  })
   const workerPools: WorkerPoolsInterface =
     options.workerPools ??
     (options.poolFactory !== undefined
-      ? WorkerPoolsModule.fromPool(options.poolFactory(resolveInit, sinks, { maxRunning }))
-      : scope === undefined
-        ? WorkerPoolsModule.fromPool(createProductionWorkerPool(poolOptions))
-        : runScoped(WorkerPoolsModule.makeProduction(poolOptions)))
+      ? adaptPool(options.poolFactory(resolveInit, sinks, { maxRunning }))
+      : runScoped(makeProduction(poolOptions)))
   const workerPorts: WorkerPortsInterface | undefined =
     options.workerPorts ??
     (scope === undefined
       ? undefined
       : runScoped(
           WorkerPortsModule.make({
-            log,
+            ...(bridge === undefined ? {} : { bridge }),
             backends: sharedPortSource,
             hubProxyHandlersFor: (workerID) => workerPortSeams?.hubProxyHandlersFor(workerID),
             hubProxyStreamingFor: (workerID) => workerPortSeams?.hubProxyStreamingFor(workerID),
@@ -827,9 +894,13 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   // report for an already-mirrored group only advances its generation.
   const pids = createPidRegistry()
   const support = reapSupport()
-  log(workerLogMessage("reap support"), { level: "INFO", supported: support.supported, reason: support.reason })
+  void bridge?.fork(
+    Effect.logInfo(workerLogMessage("reap support"), { supported: support.supported, reason: support.reason }),
+  )
   const onPidReport = (workerID: number, report: PidReport): void => {
-    log(workerLogMessage("pid report"), { level: "INFO", workerID, entries: report.entries.length })
+    void bridge?.fork(
+      Effect.logInfo(workerLogMessage("pid report"), { workerID, entries: report.entries.length }),
+    )
     try {
       // `workerID` is the hub's slot association (authoritative); the registry
       // refuses a PGID reassignment to a different owner.
@@ -841,8 +912,9 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   options.onServices?.({ ...(workerPorts === undefined ? {} : { workerPorts }), workerPools })
   hub = createSessionHub({
     pool,
-    log,
+    ...(bridge === undefined ? {} : { bridge }),
     lifecycle,
+    barrier: options.barrier,
     ...defined({
       ports: sharedPortSource,
       db: options.db,
@@ -856,9 +928,9 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
       writeBarrier: options.writeBarrier,
       resumeDecisionTimeoutMs: options.resumeDecisionTimeoutMs,
       bootGate: awaitBootGate,
+      onGenerationReleased: options.onGenerationReleased,
       onSessionReleased: options.onSessionReleased,
       promotionOutcome: options.promotionOutcome,
-      barrierPhases: options.barrierPhases,
       onPidReport,
     }),
     ...(workerPorts === undefined
@@ -975,7 +1047,8 @@ interface PerSessionResolverDeps {
    * init resolver must not invoke them a second time to build a boot diff.
    */
   readonly requestHooksViaHub: boolean
-  readonly log: WorkerLogger
+  /** Re-entry bridge for lines emitted from the resolver's foreign callbacks. */
+  readonly logBridge: EffectBridge.Shape | undefined
   /** The hub-resolved `subagent_depth` its `session.spawn` authority enforces. */
   readonly subagentDepth: number
   /** The session a worker is currently bound to, if known. */
@@ -1007,6 +1080,18 @@ interface PerSessionResolvers {
    * retired.
    */
   readonly cancelPendingRequests: (sessionID: SessionID) => void
+  /**
+   * Release the pending hub-side requests bound to ONE retired worker
+   * generation. Each ask is tagged with the session generation epoch it began
+   * in; this advances the epoch and synchronously fails only the older epoch's
+   * asks, so a successor's own asks can never be caught by the old generation's
+   * retirement — even if this bounded release lands after the successor boots.
+   */
+  readonly releaseGeneration: (sessionID: SessionID, workerID?: number) => Promise<void>
+  /** Diagnostic/test seam: the session's current generation-ask epoch. */
+  readonly generationEpochOf: (sessionID: SessionID) => number
+  /** Diagnostic/test seam: sessions that still hold a generation epoch record. */
+  readonly generationSessionCount: () => number
   readonly instanceOfSession: (sessionID: SessionID | undefined) => InstanceContext | undefined
   readonly resolveInit: (sessionID?: SessionID) => Promise<SessionWorkerInit>
   readonly generationOfSession: (sessionID: SessionID) => Promise<string>
@@ -1091,8 +1176,125 @@ export function createSessionChildrenIndex(): SessionChildrenIndex {
   return { childrenOf, register, release, clear }
 }
 
-function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionResolvers {
-  const { services, bridge, authorities, log, subagentDepth } = deps
+/** One in-flight hub-proxy ask tagged with the session generation that began it. */
+interface PendingGenerationAsk {
+  readonly epoch: number
+  readonly cancel: () => void
+}
+
+/**
+ * The per-session generation-ask registry. Every hub-proxy ask records the
+ * epoch current when its wrapper was INVOKED, not when its effect later runs:
+ * an old generation's ask whose effect starts after retirement has already
+ * advanced the epoch must still be tagged with the old epoch and fail.
+ */
+export interface GenerationAskTracker {
+  /** The session's current epoch (0 before its first retirement). */
+  current(sessionID: SessionID): number
+  /**
+   * Register and run one ask under an explicit epoch. The post-registration
+   * check covers a retirement that advanced the epoch while this effect was
+   * starting, before its entry joined the pending set.
+   */
+  track<A, E>(sessionID: SessionID, epoch: number, work: Effect.Effect<A, E>, rejected: () => E): Effect.Effect<A, E>
+  /** Advance the epoch and synchronously fail every ask of an older epoch. */
+  retire(sessionID: SessionID): void
+  /** Drop the session's epoch record (session release; no unbounded growth). */
+  forget(sessionID: SessionID): void
+  /** Drop every epoch and pending ask (hub teardown). */
+  clear(): void
+  /** Diagnostic: asks currently registered for the session. */
+  pending(sessionID: SessionID): number
+  /** Diagnostic: sessions that still have an epoch record. */
+  sessionCount(): number
+}
+
+export function createGenerationAskTracker(): GenerationAskTracker {
+  const epochBySession = new Map<SessionID, number>()
+  const pendingBySession = new Map<SessionID, Set<PendingGenerationAsk>>()
+  const current = (sessionID: SessionID): number => epochBySession.get(sessionID) ?? 0
+  const pendingSet = (sessionID: SessionID): Set<PendingGenerationAsk> | undefined => pendingBySession.get(sessionID)
+  const track = <A, E>(
+    sessionID: SessionID,
+    epoch: number,
+    work: Effect.Effect<A, E>,
+    rejected: () => E,
+  ): Effect.Effect<A, E> =>
+    Effect.gen(function* () {
+      const cancelled = yield* Deferred.make<never, E>()
+      const entry: PendingGenerationAsk = {
+        epoch,
+        cancel: () => {
+          Deferred.doneUnsafe(cancelled, Effect.fail(rejected()))
+        },
+      }
+      let pending = pendingBySession.get(sessionID)
+      if (pending === undefined) {
+        pending = new Set()
+        pendingBySession.set(sessionID, pending)
+      }
+      pending.add(entry)
+      // A retirement that raced the registration already advanced the epoch.
+      if (current(sessionID) > epoch) entry.cancel()
+      return yield* Effect.raceFirst(work, Deferred.await(cancelled)).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            const live = pendingBySession.get(sessionID)
+            if (live === undefined) return
+            live.delete(entry)
+            if (live.size === 0) pendingBySession.delete(sessionID)
+          }),
+        ),
+      )
+    })
+  const retire = (sessionID: SessionID): void => {
+    const epoch = current(sessionID) + 1
+    epochBySession.set(sessionID, epoch)
+    const pending = pendingSet(sessionID)
+    if (pending === undefined) return
+    for (const entry of [...pending]) {
+      if (entry.epoch >= epoch) continue
+      pending.delete(entry)
+      entry.cancel()
+    }
+    if (pending.size === 0) pendingBySession.delete(sessionID)
+  }
+  const forget = (sessionID: SessionID): void => {
+    epochBySession.delete(sessionID)
+  }
+  const clear = (): void => {
+    for (const sessionID of pendingBySession.keys()) retire(sessionID)
+    epochBySession.clear()
+    pendingBySession.clear()
+  }
+  return {
+    current,
+    track,
+    retire,
+    forget,
+    clear,
+    pending: (sessionID) => pendingSet(sessionID)?.size ?? 0,
+    sessionCount: () => epochBySession.size,
+  }
+}
+
+/**
+ * Tag an ask with the epoch current at the wrapper's call site. Reading the
+ * epoch here — never inside the returned effect — is what lets a retirement
+ * cancel an old generation's ask whose effect starts afterwards.
+ */
+export function askInGeneration<A, E>(
+  tracker: GenerationAskTracker,
+  sessionID: SessionID,
+  work: Effect.Effect<A, E>,
+  rejected: () => E,
+): Effect.Effect<A, E> {
+  const epoch = tracker.current(sessionID)
+  return tracker.track(sessionID, epoch, work, rejected)
+}
+
+export function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionResolvers {
+  const { services, bridge, authorities, logBridge, subagentDepth } = deps
   // The synchronous parent → children mirror the dispatcher's crash/timeout
   // cascade reads. Registered at the two hub-observable boundaries below and
   // pruned when a session's worker is released.
@@ -1131,12 +1333,19 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
     contextBySession.delete(sessionID)
     children.release(sessionID)
     jobMirrors.releaseSession(sessionID)
+    // A session's pending asks belong to its live generation; a rebind or
+    // terminal release must not leave them blocked. The epoch record itself is
+    // dropped afterwards: a re-dispatch starts at 0 and no old ask survives, so
+    // keeping one entry per session would grow without bound.
+    generationAsks.retire(sessionID)
+    generationAsks.forget(sessionID)
   }
   const clearSessions = (): void => {
     instanceBySession.clear()
     contextBySession.clear()
     children.clear()
     sessionDepths.clear()
+    generationAsks.clear()
   }
   // The session currently being dispatched. Updated on every dispatch; used only
   // as the fallback when a pool resolves an init without a session id.
@@ -1174,6 +1383,15 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
     (context: Context.Context<never> | undefined): HubProxyRunner =>
     (effect) =>
       Effect.runPromise(context === undefined ? effect : Effect.provide(effect, context))
+  // Every hub-proxy permission/question ask is tagged with the generation epoch
+  // of the session it belongs to. Retiring a generation advances that session's
+  // epoch and synchronously fails only asks tagged with an older epoch, so a
+  // successor's asks — tagged with the advanced epoch — can never be cancelled
+  // by the old generation's retirement, even if its cleanup lands after the
+  // successor is admitted. The tracker owns both maps so the epoch and its
+  // pending set are always released together.
+  const generationAsks = createGenerationAskTracker()
+
   // The worker cannot run `experimental.chat.system.transform` itself: the hub
   // owns plugin loading (decision 70). Read `Plugin` from the worker's session
   // context and run the trigger under it, so the per-directory `InstanceState`
@@ -1218,15 +1436,37 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
     })
   // Revert is hub-owned: the worker's `Session.clearRevert` forwards here, where
   // the hub clears its own row under the dispatching session's context.
-  const clearRevertFor = (
-    context: Context.Context<never> | undefined,
-  ): NonNullable<HubProxyAuthorities["clearRevert"]> => async (sessionID) => {
-    const sessions = context === undefined ? Option.none() : Context.getOption(context, Session.Service)
-    if (Option.isNone(sessions)) {
-      throw new Error("the hub has no Session authority in the dispatched context; cannot clear a session revert")
+  const clearRevertFor =
+    (context: Context.Context<never> | undefined): NonNullable<HubProxyAuthorities["clearRevert"]> =>
+    async (sessionID) => {
+      const sessions = context === undefined ? Option.none() : Context.getOption(context, Session.Service)
+      if (Option.isNone(sessions)) {
+        throw new Error("the hub has no Session authority in the dispatched context; cannot clear a session revert")
+      }
+      await runHubProxyFor(context)(sessions.value.clearRevert(sessionID as SessionID))
     }
-    await runHubProxyFor(context)(sessions.value.clearRevert(sessionID as SessionID))
-  }
+  // A worker's permission/question asks are bound to its generation: on
+  // retirement the session epoch advances and only the old epoch's asks fail.
+  // Unbound workers keep the raw authority (they cannot ask anyway).
+  const generationScopedPermission = (
+    inner: Permission.Interface,
+    sessionID: SessionID | undefined,
+  ): Permission.Interface =>
+    sessionID === undefined
+      ? inner
+      : {
+          ...inner,
+          ask: (input) =>
+            askInGeneration(generationAsks, sessionID, inner.ask(input), () => new PermissionV1.RejectedError()),
+        }
+  const generationScopedQuestion = (inner: Question.Interface, sessionID: SessionID | undefined): Question.Interface =>
+    sessionID === undefined
+      ? inner
+      : {
+          ...inner,
+          ask: (input) =>
+            askInGeneration(generationAsks, sessionID, inner.ask(input), () => new Question.RejectedError()),
+        }
   // Build the authority map per worker under THAT worker's session context. A
   // worker is bound to exactly one session, so its control port reaches the
   // right `SessionStatus`/`Permission`/`Question`/`systemTransform`/
@@ -1242,8 +1482,8 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
       recordDepth,
       registerChild: children.register,
       sessionStatus: authorities.sessionStatus,
-      permission: authorities.permission,
-      question: authorities.question,
+      permission: generationScopedPermission(authorities.permission, boundSessionID),
+      question: generationScopedQuestion(authorities.question, boundSessionID),
       systemTransform: systemTransformFor(context),
       messagesTransform: messagesTransformFor(context),
       pluginTrigger: pluginTriggerFor(context),
@@ -1300,7 +1540,7 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
     // Mirror the persisted depth so a re-dispatched child keeps its cap level
     // even when the in-memory spawn record is gone (restart/custom pool).
     if (session !== undefined && dispatched?.depth !== undefined) recordDepth(session, dispatched.depth)
-    const instance = resolveSessionInstance(session, dispatched, instanceOfSession, log)
+    const instance = resolveSessionInstance(session, dispatched, instanceOfSession, logBridge)
     const model = dispatched?.model
     const request = dispatched?.request
     const pluginSources = deps.plugins !== undefined ? await deps.plugins() : await resolveContextPluginSources(context)
@@ -1346,7 +1586,7 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
   }
   /**
    * Cheap generation probe: read the dispatching session's requested model
-   * without building the full worker init. `createProductionWorkerPool` caches
+   * without building the full worker init. The scoped production pool caches
    * the init per `(session, generation)`, so an unchanged model never rebuilds
    * the graph/plugin bootstrap on every turn.
    */
@@ -1364,6 +1604,52 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
     if (context !== undefined) contextBySession.set(sessionID, context)
     dispatchedSession = sessionID
   }
+  const cancelPendingRequests = (sessionID: SessionID): Promise<void> => {
+    // Capture the session's own context before any asynchronous run so a
+    // concurrent release cannot drop it out from under the authority effects.
+    const context = contextOfSession(sessionID)
+    const run = runHubProxyFor(context)
+    const cancels: Array<Promise<void>> = []
+    if (authorities.permission.cancelSession !== undefined) {
+      cancels.push(run(authorities.permission.cancelSession(sessionID)))
+    }
+    if (authorities.question.cancelSession !== undefined) {
+      cancels.push(run(authorities.question.cancelSession(sessionID)))
+    }
+    if (cancels.length === 0) return Promise.resolve()
+    return Promise.all(cancels).then(
+      () => undefined,
+      (error: unknown) => {
+        void logBridge?.fork(
+          Effect.logWarning(workerLogMessage("pending request cancel failed"), {
+            sessionID,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        )
+      },
+    )
+  }
+  // A retired generation's pending asks can never be answered by its successor.
+  // Asks are tagged with the session generation epoch captured when their proxy
+  // wrapper was invoked; retiring advances the epoch and synchronously fails only
+  // the older epoch's asks, so a successor's asks are never caught — even if this
+  // hook's cleanup lands after the successor is admitted. The binding guard
+  // refuses a worker id already reassigned to another session.
+  //
+  // Precondition: every ask that can outlive a generation crossed this tracked
+  // proxy (`permission.ask` / `question.ask`). That is why a known worker id
+  // deliberately skips the session-wide `cancelPendingRequests`: an untracked
+  // ask path would have no generation tag and could only be reached by that
+  // session-wide cancel.
+  const releaseGeneration = (sessionID: SessionID, workerID?: number): Promise<void> => {
+    const bound = workerID === undefined ? undefined : deps.sessionOfWorker(workerID)
+    if (bound !== undefined && bound !== sessionID) return Promise.resolve()
+    // Synchronous: the successor is admitted only after this epoch advance lands.
+    generationAsks.retire(sessionID)
+    // With no worker id there is no generation to scope; fall back to the
+    // session-wide cancel for asks that never crossed the tracked proxy.
+    return workerID === undefined ? cancelPendingRequests(sessionID) : Promise.resolve()
+  }
   return {
     events,
     eventsForSession,
@@ -1372,26 +1658,11 @@ function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionReso
     hubProxyStreamingFor,
     abortPluginTools: (sessionID) => pluginToolAborts.abortSession(sessionID),
     cancelPendingRequests: (sessionID) => {
-      // Capture the session's own context before any asynchronous run so a
-      // concurrent release cannot drop it out from under the authority effects.
-      const context = contextOfSession(sessionID)
-      const run = runHubProxyFor(context)
-      const cancels: Array<Promise<void>> = []
-      if (authorities.permission.cancelSession !== undefined) {
-        cancels.push(run(authorities.permission.cancelSession(sessionID)))
-      }
-      if (authorities.question.cancelSession !== undefined) {
-        cancels.push(run(authorities.question.cancelSession(sessionID)))
-      }
-      if (cancels.length === 0) return
-      void Promise.all(cancels).catch((error: unknown) => {
-        log(workerLogMessage("pending request cancel failed"), {
-          level: "WARN",
-          sessionID,
-          error: error instanceof Error ? error.message : String(error),
-        })
-      })
+      void cancelPendingRequests(sessionID)
     },
+    releaseGeneration,
+    generationEpochOf: (sessionID) => generationAsks.current(sessionID),
+    generationSessionCount: () => generationAsks.sessionCount(),
     instanceOfSession,
     resolveInit,
     generationOfSession,
@@ -1425,12 +1696,14 @@ export function productionSessionHubLayer(
   | Permission.Service
   | Question.Service
   | EventV2Bridge.Service
+  | RunBarrier.Service
 > {
   return Layer.effect(
     SessionHubService,
     Effect.gen(function* () {
       // The layer scope owns the Wave-6 port/pool services created below.
       const scope = yield* Scope.Scope
+      const barrier = yield* RunBarrier.Service
       const config = yield* Config.Service
       const auth = yield* Auth.Service
       const modelsDev = yield* ModelsDev.Service
@@ -1466,8 +1739,10 @@ export function productionSessionHubLayer(
       // test-only `createSessionHubLayer`. Without this the production graph passed
       // no `log`, so worker, cancel, and lifecycle log lines and everything forwarded through
       // dispatch/execute/cancel were dormant. `bridge` names the EventV2Bridge above.
-      const effectBridge = yield* EffectBridge.make()
-      const log = workerLoggerFromBridge(effectBridge)
+      const loggers = yield* Logger.CurrentLoggers
+      const effectBridge = yield* EffectBridge.make().pipe(
+        Effect.provide(WorkerLogging.forwardingLayer(loggers)),
+      )
       // One advisory cache for the hub, its durable-event sink, and shutdown. It
       // starts cold (no persisted prompt state) and is never authoritative.
       const cache = options.cache ?? new StateCache<unknown>()
@@ -1478,19 +1753,23 @@ export function productionSessionHubLayer(
       // The schema gate above has already created/migrated this file, so the
       // executor probes it with `create: false`: a missing or unmigrated
       // database is refused without leaving a stray file behind.
-      const db =
-        options.db ??
-        createDbExecutor({
+      // TEMPORARY EDGE: `SessionHubOptions.db` and the hub internals are still
+      // Promise-shaped. The service owns the worker and its scope; this facade
+      // only lets those Promise internals call the Effect methods. Remove it
+      // when the hub itself is effectified.
+      let db = options.db
+      if (db === undefined) {
+        const service = yield* DbExecutor.make({
           filename: databasePath,
           create: false,
-          ...(options.checkpointIntervalMs === undefined
-            ? {}
-            : { checkpointIntervalMs: options.checkpointIntervalMs }),
+          ...(options.checkpointIntervalMs === undefined ? {} : { checkpointIntervalMs: options.checkpointIntervalMs }),
         })
+        db = DbExecutor.toPromiseExecutor(service)
+      }
       // Oversized durable events reach the hub as a committed position. Resolve
       // them off-loop through the same executor that owns hub SQL: no core
       // `Database.Service` dependency is added, so the hub node graph is unchanged.
-      const blobDir = Bus.blobDirectoryFor(databasePath)
+      const blobDir = DurableLog.blobDirectoryFor(databasePath)
       const resolveBlob =
         options.backends?.resolveBlob ??
         (blobDir === undefined
@@ -1498,8 +1777,7 @@ export function productionSessionHubLayer(
           : createEventBlobResolver({ query: (sql, params) => db.query(sql, params), blobDir }))
       // A worker gap is healed by reading the missed committed range off-loop.
       const readDurable =
-        options.backends?.readDurable ??
-        createDurableHealReader({ query: (sql, params) => db.query(sql, params) })
+        options.backends?.readDurable ?? createDurableHealReader({ query: (sql, params) => db.query(sql, params) })
       // The hub is assigned after the pool is built; the resolver's per-worker
       // lookups run lazily on the first port attach (post-assignment), so the
       // deferred reference is safe.
@@ -1528,7 +1806,7 @@ export function productionSessionHubLayer(
         // A bridged worker runs `chat.params` / `chat.headers` once per request;
         // resolving them during init as well would double every invocation.
         requestHooksViaHub,
-        log,
+        logBridge: effectBridge,
         subagentDepth,
         sessionOfWorker: (workerID) => hubRef?.sessionOfWorker(workerID),
       })
@@ -1536,7 +1814,7 @@ export function productionSessionHubLayer(
       // durable frame and its ack, and `execute` awaits the ack after the run
       // reply. Supplying it keeps the run from being recorded before its durable
       // egress write reached the hub.
-      const egressDelivery = createEgressDeliveryBarrier({ log })
+      const egressDelivery = createEgressDeliveryBarrier({ bridge: effectBridge })
       // The production port authorities: supplied ready, or built on the first
       // dispatch (the source is only invoked when a worker attaches a port).
       const ports: WorkerPortBackendsSource =
@@ -1544,6 +1822,7 @@ export function productionSessionHubLayer(
         (() =>
           buildProductionPortBackends({
             ...options.backends,
+            bridge: effectBridge,
             ...(resolveBlob === undefined ? {} : { resolveBlob }),
             readDurable,
             hubProxy: options.backends?.hubProxy,
@@ -1559,6 +1838,7 @@ export function productionSessionHubLayer(
         ...options,
         scope,
         count,
+        barrier,
         databasePath,
         init: resolvers.resolveInit,
         generationOf: resolvers.generationOfSession,
@@ -1569,7 +1849,7 @@ export function productionSessionHubLayer(
         eventPublisherFor: resolvers.eventsForSession,
         egressBarrier: options.egressBarrier ?? egressDelivery.wait,
         promotionOutcome: options.promotionOutcome ?? resolvers.promotionOutcome,
-        log,
+        bridge: effectBridge,
         // The dispatcher's crash/timeout cascade needs the synchronous index the
         // resolvers build as they observe spawns and dispatches. Without this,
         // production falls back to `() => []` and a parent crash leaves its
@@ -1584,12 +1864,11 @@ export function productionSessionHubLayer(
           resolvers.releaseSession(sessionID)
           options.onSessionRebound?.(sessionID)
         },
+        onGenerationReleased: (sessionID, workerID) => resolvers.releaseGeneration(sessionID, workerID),
         onSessionReleased: (sessionID) => {
-          // A retired generation can never answer a hub-side permission/question
-          // request; fail and remove it before dropping the session's context.
-          resolvers.cancelPendingRequests(sessionID)
-          // Per-session workers never rebind: release state when the worker is
-          // reaped/cancelled so the per-session maps stay bounded.
+          // A session leaving the hub (reap/delete/shutdown) drops its
+          // per-session maps. The retired generation was already released before
+          // this hook, so pending asks/ports/lease are gone.
           resolvers.releaseSession(sessionID)
           options.onSessionReleased?.(sessionID)
         },
@@ -1641,6 +1920,7 @@ export function productionSessionHubNode(
       Permission.node,
       Question.node,
       EventV2Bridge.node,
+      RunBarrier.node,
     ],
   })
 }
@@ -1650,13 +1930,16 @@ export function productionSessionHubNode(
 // ---------------------------------------------------------------------------
 
 /** Provide `SessionHubService`, terminating the pool when the layer scope closes. */
-export function createSessionHubLayer(options: SessionHubOptions): Layer.Layer<SessionHubService> {
+export function createSessionHubLayer(
+  options: SessionHubOptions,
+): Layer.Layer<SessionHubService, never, RunBarrier.Service> {
   return Layer.effect(
     SessionHubService,
     Effect.gen(function* () {
-      const bridge = yield* EffectBridge.make()
-      const log = workerLoggerFromBridge(bridge)
-      const hub = createSessionHub({ ...options, log })
+      const loggers = yield* Logger.CurrentLoggers
+      const log = yield* EffectBridge.make().pipe(Effect.provide(WorkerLogging.forwardingLayer(loggers)))
+      const barrier = yield* RunBarrier.Service
+      const hub = createSessionHub({ ...options, bridge: log, barrier })
       yield* Effect.addFinalizer(() => Effect.promise(() => hub.terminateAll().catch(() => undefined)))
       return SessionHubService.of(hub)
     }),
@@ -1668,5 +1951,9 @@ export function createSessionHubLayer(options: SessionHubOptions): Layer.Layer<S
  * app graphs include this node; flag-off graphs never reference it.
  */
 export function makeSessionHubNode(options: SessionHubOptions): LayerNode.Node<SessionHubService, never, undefined> {
-  return LayerNode.make({ service: SessionHubService, layer: createSessionHubLayer(options), deps: [] })
+  return LayerNode.make({
+    service: SessionHubService,
+    layer: createSessionHubLayer(options),
+    deps: [RunBarrier.node],
+  })
 }

@@ -2,9 +2,11 @@
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { type LiveEventPublisher } from "@/event-v2-bridge"
 import type { SessionID } from "@/session/schema"
+import { Effect } from "effect"
+import type { EffectBridge } from "@/effect/bridge"
 import { type CancelledMode, type Dispatcher } from "./dispatch"
 import { type CancelOutcome } from "./cancel"
-import { workerLogMessage, type WorkerLogger } from "./log"
+import { workerLogMessage } from "./worker-logging"
 
 /** A descendant cancelled by the subagent cascade, and whether it needs a fallback idle. */
 export interface CancelledDescendant {
@@ -44,7 +46,7 @@ interface CancelReporterOptions {
    * instead of only after the grace window has elapsed.
    */
   readonly onCancelRequested?: (sessionID: SessionID) => void
-  readonly log: WorkerLogger
+  readonly bridge?: EffectBridge.Shape
   /**
    * Bound on recorded modes retained between cancels. Entries are also dropped
    * as soon as their session (or descendant) is reported, so this is only the
@@ -151,12 +153,13 @@ export function createCancelReporter(options: CancelReporterOptions): CancelRepo
     // cancels instead of by the process lifetime.
     cancelledModes.delete(sessionID)
     for (const descendant of descendants) cancelledModes.delete(descendant)
-    options.log(workerLogMessage("cancel cascade"), {
-      level: "INFO",
-      sessionID,
-      descendants: reportDescendants.length,
-      needsFallbackIdle: reportDescendants.filter((descendant) => descendant.needsFallbackIdle).length,
-    })
+    void options.bridge?.fork(
+      Effect.logInfo(workerLogMessage("cancel cascade"), {
+        sessionID,
+        descendants: reportDescendants.length,
+        needsFallbackIdle: reportDescendants.filter((descendant) => descendant.needsFallbackIdle).length,
+      }),
+    )
     return { outcome, descendants: reportDescendants }
   }
 

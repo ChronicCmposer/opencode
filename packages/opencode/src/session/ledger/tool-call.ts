@@ -1,9 +1,12 @@
 import { readFileSync } from "node:fs"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Effect, Layer, Option, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Database } from "@opencode-ai/core/database/database"
+import { withBusyRetry } from "@opencode-ai/core/database/busy"
 import type { Connection, WriteOutcome } from "@opencode-ai/core/database/connection"
 import type { RepositoryValues, WorkerRepository } from "@/session/worker/repository/types"
 import { connectedRepository } from "@/session/worker/repository/write"
+import { WorkerDb } from "@/session/worker/db"
 import { LEDGER_SQL_FALLBACK } from "./sql/fallback.gen"
 
 export const TOOL_CALL_STATES = ["started", "finished", "indeterminate"] as const
@@ -124,6 +127,11 @@ export interface ToolCallLedgerOptions {
   readonly fence?: ToolCallFence
 }
 
+/** The lease-generation identity of the ledger's writer. */
+export interface ToolCallFence {
+  readonly ownerID: string
+}
+
 export class ToolCallLedgerError extends Error {
   readonly tag = "TOOL_CALL_LEDGER"
   constructor(message: string) {
@@ -161,8 +169,8 @@ export class StaleWorkerGenerationError extends ToolCallLedgerError {
 /**
  * The service-level failure for a ledger operation. Every tagged class wraps the
  * exact legacy throw in `cause` (so callers can still recover with `instanceof`)
- * and carries the legacy error's stable `tag` (`TOOL_CALL_LEDGER`). Only
- * `fromHandle` maps to these; the synchronous adapter keeps throwing the legacy
+ * and carries the legacy error's stable `tag` (`TOOL_CALL_LEDGER`). Only the
+ * Effect service raises these; the synchronous adapter keeps throwing the legacy
  * classes unchanged.
  */
 const serviceErrorFields = {
@@ -203,9 +211,49 @@ export type ServiceError =
   | ToolCallNotStartedServiceError
   | ToolCallStaleGenerationServiceError
 
-/** The lease-generation identity of the ledger's writer. */
-export interface ToolCallFence {
-  readonly ownerID: string
+/**
+ * A synchronous outcome with no thrown control flow. The transaction callbacks
+ * return one of these so the service can raise a typed error in its generator;
+ * the legacy handle unwraps it into the exact class direct callers expect.
+ */
+type LedgerFailure =
+  | { readonly kind: "invalid"; readonly message: string }
+  | { readonly kind: "alreadyStarted"; readonly callID: string; readonly sessionID: string }
+  | { readonly kind: "notStarted"; readonly callID: string; readonly sessionID: string }
+  | { readonly kind: "stale"; readonly sessionID: string; readonly expected: string; readonly actual: string | undefined }
+
+type LedgerResult<A> = { readonly ok: true; readonly value: A } | { readonly ok: false; readonly error: LedgerFailure }
+
+const OK = <A>(value: A): LedgerResult<A> => ({ ok: true, value })
+const FAIL = (error: LedgerFailure): LedgerResult<never> => ({ ok: false, error })
+
+function failureError(failure: LedgerFailure): ToolCallLedgerError {
+  switch (failure.kind) {
+    case "invalid":
+      return new ToolCallLedgerError(failure.message)
+    case "alreadyStarted":
+      return new ToolCallAlreadyStartedError(failure.callID, failure.sessionID)
+    case "notStarted":
+      return new ToolCallNotStartedError(failure.callID, failure.sessionID)
+    case "stale":
+      return new StaleWorkerGenerationError(failure.sessionID, failure.expected, failure.actual)
+  }
+}
+
+/** Map a synchronous failure to its tagged service error. */
+function failureServiceError(operation: string, failure: LedgerFailure): ServiceError {
+  const cause = failureError(failure)
+  const fields = { operation, message: cause.message, legacyTag: cause.tag, cause }
+  switch (failure.kind) {
+    case "alreadyStarted":
+      return new ToolCallAlreadyStartedServiceError(fields)
+    case "notStarted":
+      return new ToolCallNotStartedServiceError(fields)
+    case "stale":
+      return new ToolCallStaleGenerationServiceError(fields)
+    case "invalid":
+      return new ToolCallLedgerServiceError(fields)
+  }
 }
 
 /**
@@ -239,6 +287,24 @@ function requireText(value: string, field: string): string {
     throw new ToolCallLedgerError(`${field} must be a non-empty string`)
   }
   return value
+}
+
+function textFailure(value: string, field: string): LedgerFailure | undefined {
+  return typeof value === "string" && value.length > 0
+    ? undefined
+    : { kind: "invalid", message: `${field} must be a non-empty string` }
+}
+
+function validateStart(input: StartInput): LedgerFailure | undefined {
+  return textFailure(input.callID, "callID") ?? textFailure(input.sessionID, "sessionID") ?? textFailure(input.tool, "tool")
+}
+
+function validateFinish(input: FinishInput): LedgerFailure | undefined {
+  return (
+    textFailure(input.callID, "callID") ??
+    textFailure(input.sessionID, "sessionID") ??
+    textFailure(input.outcome, "outcome")
+  )
 }
 
 function rowFromRecord(record: Record<string, unknown>): ToolCallRow {
@@ -279,74 +345,140 @@ function stored(repository: WorkerRepository, callID: string, sessionID: string)
   return row as Record<string, unknown>
 }
 
-/** The event-sequence lease owner, the authoritative worker generation. */
-function currentLeaseOwner(repository: WorkerRepository, sessionID: string): string | undefined {
-  const row = repository.select("event_sequence", { aggregate_id: sessionID })[0]
-  const owner = row?.worker_owner_id
-  return typeof owner === "string" && owner.length > 0 ? owner : undefined
-}
-
-function assertCurrentGeneration(
+/**
+ * The lease-generation fence. A released lease has `worker_owner_id = NULL` and
+ * `worker_expires_at = 0`; either state means this generation may no longer
+ * write. An absent `event_sequence` row is fenced the same way: no lease exists,
+ * so no generation may record a call.
+ */
+function currentGenerationFailure(
   repository: WorkerRepository,
   sessionID: string,
   fence: ToolCallFence | undefined,
-): void {
-  if (fence === undefined) return
-  const owner = currentLeaseOwner(repository, sessionID)
-  if (owner !== undefined && owner !== fence.ownerID) {
-    throw new StaleWorkerGenerationError(sessionID, fence.ownerID, owner)
+): LedgerFailure | undefined {
+  if (fence === undefined) return undefined
+  const row = repository.select("event_sequence", { aggregate_id: sessionID })[0]
+  const rawOwner = row?.worker_owner_id
+  const owner = typeof rawOwner === "string" && rawOwner.length > 0 ? rawOwner : undefined
+  const expires = typeof row?.worker_expires_at === "number" ? row.worker_expires_at : undefined
+  if (row === undefined || owner === undefined || expires === 0 || owner !== fence.ownerID) {
+    return { kind: "stale", sessionID, expected: fence.ownerID, actual: owner }
   }
+  return undefined
 }
 
-function startWith(repository: WorkerRepository, input: StartInput, fence?: ToolCallFence): ToolCallRow {
-  const callID = requireText(input.callID, "callID")
-  const sessionID = requireText(input.sessionID, "sessionID")
-  const tool = requireText(input.tool, "tool")
+function attemptStart(repository: WorkerRepository, input: StartInput, fence?: ToolCallFence): LedgerResult<ToolCallRow> {
+  const invalid = validateStart(input)
+  if (invalid !== undefined) return FAIL(invalid)
   // The generation check, duplicate check and insert share one transaction so a
   // successor's claim cannot interleave between the fence read and the write.
   return repository.atomic(() => {
-    assertCurrentGeneration(repository, sessionID, fence)
-    const where: RepositoryValues<"tool_call"> = { call_id: callID, session_id: sessionID }
-    if (repository.select("tool_call", where).length > 0) throw new ToolCallAlreadyStartedError(callID, sessionID)
+    const fenced = currentGenerationFailure(repository, input.sessionID, fence)
+    if (fenced !== undefined) return FAIL(fenced)
+    const where: RepositoryValues<"tool_call"> = { call_id: input.callID, session_id: input.sessionID }
+    if (repository.select("tool_call", where).length > 0) {
+      return FAIL({ kind: "alreadyStarted", callID: input.callID, sessionID: input.sessionID })
+    }
     repository.insert("tool_call", {
-      call_id: callID,
-      session_id: sessionID,
-      tool,
+      call_id: input.callID,
+      session_id: input.sessionID,
+      tool: input.tool,
       side_effecting: input.sideEffecting === false ? 0 : 1,
       state: "started",
       outcome: null,
       time_started: input.timeStarted ?? Date.now(),
       ...(fence === undefined ? {} : { worker_owner_id: fence.ownerID }),
     })
-    return rowFromRecord(stored(repository, callID, sessionID))
+    return OK(rowFromRecord(stored(repository, input.callID, input.sessionID)))
   })
 }
 
-function finishWith(repository: WorkerRepository, input: FinishInput, fence?: ToolCallFence): ToolCallRow {
-  const callID = requireText(input.callID, "callID")
-  const sessionID = requireText(input.sessionID, "sessionID")
-  const outcome = requireText(input.outcome, "outcome")
+function attemptFinish(
+  repository: WorkerRepository,
+  input: FinishInput,
+  fence?: ToolCallFence,
+): LedgerResult<ToolCallRow> {
   return repository.atomic(() => {
-    assertCurrentGeneration(repository, sessionID, fence)
+    const fenced = currentGenerationFailure(repository, input.sessionID, fence)
+    if (fenced !== undefined) return FAIL(fenced)
     const where: RepositoryValues<"tool_call"> = {
-      call_id: callID,
-      session_id: sessionID,
+      call_id: input.callID,
+      session_id: input.sessionID,
       state: "started",
       ...(fence === undefined ? {} : { worker_owner_id: fence.ownerID }),
     }
     const changed: WriteOutcome = repository.update(
       "tool_call",
-      { state: "finished", outcome, time_finished: input.timeFinished ?? Date.now() },
+      { state: "finished", outcome: input.outcome, time_finished: input.timeFinished ?? Date.now() },
       where,
     )
-    if (changed.changes !== 1) throw new ToolCallNotStartedError(callID, sessionID)
-    return rowFromRecord(stored(repository, callID, sessionID))
+    if (changed.changes !== 1) {
+      return FAIL({ kind: "notStarted", callID: input.callID, sessionID: input.sessionID })
+    }
+    return OK(rowFromRecord(stored(repository, input.callID, input.sessionID)))
   })
+}
+
+function attemptFinishWithResult<T>(
+  repository: WorkerRepository,
+  input: FinishInput,
+  result: () => T,
+  fence?: ToolCallFence,
+): LedgerResult<T> {
+  return repository.atomic(() => {
+    const finished = attemptFinish(repository, input, fence)
+    if (!finished.ok) return finished
+    return OK(result())
+  })
+}
+
+function attemptIndeterminate(
+  repository: WorkerRepository,
+  sessionID: string,
+): LedgerResult<readonly ToolCallRow[]> {
+  const invalid = textFailure(sessionID, "sessionID")
+  if (invalid !== undefined) return FAIL(invalid)
+  const rows = repository
+    .select("tool_call", { session_id: sessionID, state: "started" })
+    .map((record) => ({ ...rowFromRecord(record as Record<string, unknown>), state: "indeterminate" as const }))
+  return OK(rows.sort((left, right) => left.timeStarted - right.timeStarted || left.callID.localeCompare(right.callID)))
+}
+
+function attemptList(repository: WorkerRepository, sessionID: string): LedgerResult<readonly ToolCallRow[]> {
+  const invalid = textFailure(sessionID, "sessionID")
+  if (invalid !== undefined) return FAIL(invalid)
+  const rows = repository
+    .select("tool_call", { session_id: sessionID })
+    .map((record) => rowFromRecord(record as Record<string, unknown>))
+  return OK(rows.sort((left, right) => left.timeStarted - right.timeStarted || left.callID.localeCompare(right.callID)))
+}
+
+function attemptHasSideEffectingStarted(repository: WorkerRepository, sessionID: string): LedgerResult<boolean> {
+  const invalid = textFailure(sessionID, "sessionID")
+  if (invalid !== undefined) return FAIL(invalid)
+  return OK(
+    repository.select("tool_call", { session_id: sessionID, state: "started", side_effecting: 1 }).length > 0,
+  )
+}
+
+function unwrap<A>(result: LedgerResult<A>): A {
+  if (result.ok) return result.value
+  throw failureError(result.error)
+}
+
+function startWith(repository: WorkerRepository, input: StartInput, fence?: ToolCallFence): ToolCallRow {
+  return unwrap(attemptStart(repository, input, fence))
+}
+
+function finishWith(repository: WorkerRepository, input: FinishInput, fence?: ToolCallFence): ToolCallRow {
+  const invalid = validateFinish(input)
+  if (invalid !== undefined) throw failureError(invalid)
+  return unwrap(attemptFinish(repository, input, fence))
 }
 
 /**
  * Mark a call started. Direct callers run outside a result transaction; the
- * production tool path uses {@link startStandaloneWith} so a parallel tool
+ * production tool path uses the service's `startStandalone` so a parallel tool
  * cannot record its start inside another tool's result transaction.
  */
 export function start(source: ToolCallLedgerSource, input: StartInput, fence?: ToolCallFence): ToolCallRow {
@@ -360,7 +492,7 @@ function startStandaloneWith(
   fence?: ToolCallFence,
 ): Effect.Effect<ToolCallRow> {
   const write = () => startWith(repository, input, fence)
-  return exclusive === undefined ? Effect.sync(write) : exclusive(write)
+  return exclusive === undefined ? Effect.sync(write) : Effect.suspend(() => exclusive(write))
 }
 
 /**
@@ -379,7 +511,7 @@ function finishStandaloneWith(
   fence?: ToolCallFence,
 ): Effect.Effect<ToolCallRow> {
   const write = () => finishWith(repository, input, fence)
-  return exclusive === undefined ? Effect.sync(write) : exclusive(write)
+  return exclusive === undefined ? Effect.sync(write) : Effect.suspend(() => exclusive(write))
 }
 
 /**
@@ -398,10 +530,9 @@ function finishWithResultWith<T>(
   result: () => T,
   fence?: ToolCallFence,
 ): T {
-  return repository.atomic(() => {
-    finishWith(repository, input, fence)
-    return result()
-  })
+  const invalid = validateFinish(input)
+  if (invalid !== undefined) throw failureError(invalid)
+  return unwrap(attemptFinishWithResult(repository, input, result, fence))
 }
 
 export function finishWithResult<T>(
@@ -414,42 +545,16 @@ export function finishWithResult<T>(
 }
 
 /** Calls still in `started`: indeterminate work that is never auto-retried. */
-function indeterminateWith(repository: WorkerRepository, sessionID: string): readonly ToolCallRow[] {
-  const required = requireText(sessionID, "sessionID")
-  const rows = repository
-    .select("tool_call", { session_id: required, state: "started" })
-    .map((record) => ({ ...rowFromRecord(record as Record<string, unknown>), state: "indeterminate" as const }))
-  return rows.sort((left, right) => left.timeStarted - right.timeStarted || left.callID.localeCompare(right.callID))
-}
-
 export function indeterminate(source: ToolCallLedgerSource, sessionID: string): readonly ToolCallRow[] {
-  return indeterminateWith(repositoryFor(source), sessionID)
-}
-
-function listWith(repository: WorkerRepository, sessionID: string): readonly ToolCallRow[] {
-  const required = requireText(sessionID, "sessionID")
-  const rows = repository
-    .select("tool_call", { session_id: required })
-    .map((record) => rowFromRecord(record as Record<string, unknown>))
-  return rows.sort((left, right) => left.timeStarted - right.timeStarted || left.callID.localeCompare(right.callID))
+  return unwrap(attemptIndeterminate(repositoryFor(source), sessionID))
 }
 
 export function list(source: ToolCallLedgerSource, sessionID: string): readonly ToolCallRow[] {
-  return listWith(repositoryFor(source), sessionID)
-}
-
-function hasSideEffectingStartedWith(repository: WorkerRepository, sessionID: string): boolean {
-  return (
-    repository.select("tool_call", {
-      session_id: requireText(sessionID, "sessionID"),
-      state: "started",
-      side_effecting: 1,
-    }).length > 0
-  )
+  return unwrap(attemptList(repositoryFor(source), sessionID))
 }
 
 export function hasSideEffectingStarted(source: ToolCallLedgerSource, sessionID: string): boolean {
-  return hasSideEffectingStartedWith(repositoryFor(source), sessionID)
+  return unwrap(attemptHasSideEffectingStarted(repositoryFor(source), sessionID))
 }
 
 export interface ToolCallLedgerHandle {
@@ -467,6 +572,11 @@ export interface ToolCallLedgerHandle {
   readonly hasSideEffectingStarted: (sessionID: string) => boolean
 }
 
+/**
+ * The synchronous adapter. New code calls the Effect service; this remains for
+ * direct callers that cannot yet compose effects (the ledger's unit tests and
+ * the legacy hub seam). Production `src` callers use {@link Service}.
+ */
 export function createToolCallLedger(
   source: ToolCallLedgerSource,
   options: ToolCallLedgerOptions = {},
@@ -479,23 +589,26 @@ export function createToolCallLedger(
     finish: (input) => finishWith(repository, input, fence),
     finishStandalone: (input) => finishStandaloneWith(repository, options.exclusive, input, fence),
     finishWithResult: (input, result) => finishWithResultWith(repository, input, result, fence),
-    indeterminate: (sessionID) => indeterminateWith(repository, sessionID),
-    list: (sessionID) => listWith(repository, sessionID),
-    hasSideEffectingStarted: (sessionID) => hasSideEffectingStartedWith(repository, sessionID),
+    indeterminate: (sessionID) => unwrap(attemptIndeterminate(repository, sessionID)),
+    list: (sessionID) => unwrap(attemptList(repository, sessionID)),
+    hasSideEffectingStarted: (sessionID) => unwrap(attemptHasSideEffectingStarted(repository, sessionID)),
   }
 }
 
 // ---------------------------------------------------------------------------
 // Effect service shape.
 //
-// The `ToolCallLedger` service is the same ledger behavior expressed as an
-// Effect service. `createToolCallLedger` stays the synchronous adapter; every
-// service method lifts one handle operation without changing the repository,
-// fence, or savepoint semantics. State stays in the adapter's closure.
+// The `ToolCallLedger` service owns the ledger behavior. Its methods run the
+// repository write and the generation fence in one savepoint and raise a typed
+// failure with `yield*`; nothing is thrown through the service boundary. The
+// synchronous handle above is a shim over the same primitives.
 // ---------------------------------------------------------------------------
 
-/** The Effect-facing ledger surface. `ledger` is the synchronous adapter. */
+/** The Effect-facing ledger surface. */
 export interface Interface {
+  /** False when a reduced graph supplied no usable `WorkerDb`; callers skip the ledger. */
+  readonly available: boolean
+  /** The synchronous adapter for direct callers (tests and the legacy seam). */
   readonly ledger: ToolCallLedgerHandle
   readonly startStandalone: (input: StartInput) => Effect.Effect<ToolCallRow, ServiceError>
   readonly start: (input: StartInput) => Effect.Effect<ToolCallRow, ServiceError>
@@ -509,7 +622,48 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ToolCallLedger") {}
 
-/** Adapt the synchronous handle without owning, reordering, or retrying anything. */
+function makeService(
+  repository: WorkerRepository,
+  options: ToolCallLedgerOptions,
+  currentFence?: () => ToolCallFence | undefined,
+): Interface {
+  const fenceFor = (): ToolCallFence | undefined => (currentFence ?? (() => options.fence))()
+  const run = <A>(
+    operation: string,
+    write: () => LedgerResult<A>,
+    standalone: boolean,
+  ): Effect.Effect<A, ServiceError> =>
+    Effect.fn(`ToolCallLedger.${operation}`)(function* () {
+      const attempt =
+        standalone && options.exclusive !== undefined
+          ? Effect.suspend(() => options.exclusive!(write))
+          : Effect.sync(write)
+      const result = yield* attempt.pipe(
+        Effect.catchDefect((defect) => {
+          const failure = serviceError(operation, defect)
+          return failure === undefined ? Effect.die(defect) : Effect.fail(failure)
+        }),
+      )
+      if (result.ok) return result.value
+      return yield* failureServiceError(operation, result.error)
+    })()
+  return {
+    available: true,
+    ledger: createToolCallLedger(repository, options),
+    startStandalone: (input) => run("startStandalone", () => attemptStart(repository, input, fenceFor()), true),
+    start: (input) => run("start", () => attemptStart(repository, input, fenceFor()), false),
+    finish: (input) => run("finish", () => attemptFinish(repository, input, fenceFor()), false),
+    finishStandalone: (input) => run("finishStandalone", () => attemptFinish(repository, input, fenceFor()), true),
+    finishWithResult: (input, result) =>
+      run("finishWithResult", () => attemptFinishWithResult(repository, input, result, fenceFor()), false),
+    indeterminate: (sessionID) => run("indeterminate", () => attemptIndeterminate(repository, sessionID), false),
+    list: (sessionID) => run("list", () => attemptList(repository, sessionID), false),
+    hasSideEffectingStarted: (sessionID) =>
+      run("hasSideEffectingStarted", () => attemptHasSideEffectingStarted(repository, sessionID), false),
+  }
+}
+
+/** Adapt a synchronous handle to the Effect surface (compatibility seam). */
 export function fromHandle(ledger: ToolCallLedgerHandle): Interface {
   const startStandalone = Effect.fn("ToolCallLedger.startStandalone")(function* (input: StartInput) {
     // `suspend` defers handle construction into the Effect so a synchronous throw
@@ -561,6 +715,7 @@ export function fromHandle(ledger: ToolCallLedgerHandle): Interface {
     )
   })
   return {
+    available: true,
     ledger,
     startStandalone,
     start,
@@ -575,7 +730,29 @@ export function fromHandle(ledger: ToolCallLedgerHandle): Interface {
 
 /** Build a ledger over the given source; no resource needs a scope. */
 export function make(source: ToolCallLedgerSource, options: ToolCallLedgerOptions = {}): Effect.Effect<Interface> {
-  return Effect.sync(() => fromHandle(createToolCallLedger(source, options)))
+  return Effect.sync(() => makeService(repositoryFor(source), options))
+}
+
+/** The worker-database portion the ledger needs; the live lease owner is read per write. */
+export interface WorkerLedgerSource {
+  readonly repository: WorkerRepository
+  readonly eventBinding: { leaseOwner?: string }
+}
+
+/**
+ * Build the ledger service from a worker database. The fence follows the
+ * worker scope's lease owner on every write, so a lease claimed after the graph
+ * is built is still enforced.
+ */
+export function makeFromWorker(
+  workerDb: WorkerLedgerSource,
+  options: Omit<ToolCallLedgerOptions, "fence"> = {},
+): Effect.Effect<Interface> {
+  const fence = (): ToolCallFence | undefined => {
+    const ownerID = workerDb.eventBinding.leaseOwner
+    return ownerID === undefined ? undefined : { ownerID }
+  }
+  return Effect.sync(() => makeService(workerDb.repository, options, fence))
 }
 
 /** Install a `ToolCallLedger` implementation into the context. */
@@ -583,12 +760,110 @@ export function layer(source: ToolCallLedgerSource, options: ToolCallLedgerOptio
   return Layer.effect(Service, make(source, options))
 }
 
-/** The unbound graph node for {@link Service}; this lane does not wire a consumer. */
+/** The unbound graph node for {@link Service} over an explicit test source. */
 export function node(
   source: ToolCallLedgerSource,
   options: ToolCallLedgerOptions = {},
 ): LayerNode.Node<Service, never, undefined> {
   return LayerNode.make({ service: Service, layer: layer(source, options), deps: [] })
 }
+
+function isWorkerDatabase(value: object): value is {
+  readonly filename: string
+  readonly repository: WorkerRepository
+  readonly eventBinding: { leaseOwner?: string }
+} {
+  const candidate = value as {
+    readonly filename?: unknown
+    readonly repository?: Partial<WorkerRepository>
+    readonly eventBinding?: { leaseOwner?: string }
+  }
+  return (
+    typeof candidate.filename === "string" &&
+    typeof candidate.repository?.insert === "function" &&
+    typeof candidate.repository?.select === "function"
+  )
+}
+
+function unavailableService(): Interface {
+  const cause = new ToolCallLedgerError("tool-call ledger is unavailable without a worker database")
+  const fail = (operation: string): Effect.Effect<never, ServiceError> =>
+    Effect.fail(
+      new ToolCallLedgerServiceError({
+        operation,
+        message: cause.message,
+        legacyTag: cause.tag,
+        cause,
+      }),
+    )
+  const throwIt = (): never => {
+    throw cause
+  }
+  return {
+    available: false,
+    ledger: {
+      startStandalone: () => Effect.die(cause),
+      start: throwIt,
+      finish: throwIt,
+      finishStandalone: () => Effect.die(cause),
+      finishWithResult: throwIt,
+      indeterminate: throwIt,
+      list: throwIt,
+      hasSideEffectingStarted: throwIt,
+    },
+    startStandalone: () => fail("startStandalone"),
+    start: () => fail("start"),
+    finish: () => fail("finish"),
+    finishStandalone: () => fail("finishStandalone"),
+    finishWithResult: () => fail("finishWithResult"),
+    indeterminate: () => fail("indeterminate"),
+    list: () => fail("list"),
+    hasSideEffectingStarted: () => fail("hasSideEffectingStarted"),
+  }
+}
+
+/**
+ * The production layer. The repository and the generation fence come from
+ * `WorkerDb.Service`; the connection's exclusive transaction comes from the
+ * optional `Database.Service`. A reduced graph with no usable worker database
+ * yields an unavailable service so callers keep their no-ledger behavior.
+ */
+export const workerLayer: Layer.Layer<Service> = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const workerDb = yield* Effect.serviceOption(WorkerDb)
+    if (Option.isNone(workerDb) || !isWorkerDatabase(workerDb.value)) return unavailableService()
+    const database = yield* Effect.serviceOption(Database.Service)
+    const exclusive: LedgerExclusive | undefined = Option.isSome(database)
+      ? <A>(operation: () => A) =>
+          database.value.db
+            .transaction(() => Effect.sync(operation), { behavior: "immediate" })
+            // A busy ledger write owns no outer transaction, so the whole
+            // exclusive transaction replays instead of a single statement.
+            .pipe(withBusyRetry, Effect.orDie)
+      : undefined
+    // The lease owner is read per operation: a worker claims its lease after the
+    // graph is built, so capturing it here would miss the first write.
+    const fenceFor = (): ToolCallFence | undefined => {
+      const ownerID = workerDb.value.eventBinding.leaseOwner
+      return ownerID === undefined ? undefined : { ownerID }
+    }
+    return makeService(
+      workerDb.value.repository,
+      exclusive === undefined ? {} : { exclusive },
+      fenceFor,
+    )
+  }),
+)
+
+/**
+ * The production graph node. `WorkerDb` is read through `serviceOption` so the
+ * node adds no hard dependency and a reduced graph still builds.
+ */
+export const workerNode: LayerNode.Node<Service, never, undefined> = LayerNode.make({
+  service: Service,
+  layer: workerLayer,
+  deps: [],
+})
 
 export * as ToolCallLedger from "./tool-call"

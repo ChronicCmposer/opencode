@@ -1,10 +1,10 @@
 // Typed durable-log primitives (interface for `typed-durable`).
 //
-// The Bus/EventV2 path owns these operations today. This interface is the typed
+// The DurableLog/EventV2 path owns these operations today. This interface is the typed
 // seam that replaces its raw SQL: `event`, `event_sequence`, and `event_blob`
 // are scoped by `aggregate_id` and may only be written for the bound session.
 // The repository core deliberately does not implement `core/src/event.ts` or
-// `core/src/bus.ts`.
+// `core/src/durable-log.ts`.
 
 import type { WriteOutcome } from "@opencode-ai/core/database/connection"
 import type { RepositoryValues } from "./types"

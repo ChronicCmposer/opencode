@@ -6,6 +6,8 @@
 // stays free while a worker runs a session.
 
 import { describe, expect, test } from "bun:test"
+import { Logger } from "effect"
+import { recordingBridge } from "../../lib/recorders"
 import { createDispatcher, SessionCancelledError } from "@/session/worker/dispatch"
 import {
   createExecutorWorker,
@@ -106,7 +108,11 @@ describe("5.5 different sessions run concurrently on different per-session worke
     const [ra, rb] = await Promise.all([a, b])
     expect(ra.sessionID).toBe("ses_a")
     expect(rb.sessionID).toBe("ses_b")
-  })
+    // Spawning two real worker threads is genuinely CPU/IO-bound: under the
+    // full worker suite the host is oversubscribed by every other test file, so
+    // 30 s is not enough headroom for both isolates to boot and finish. The
+    // assertion is unchanged; only the per-test deadline is widened.
+  }, 60_000)
 })
 
 describe("5.4 hub forwards cancellation", () => {
@@ -138,6 +144,13 @@ describe("5.4 hub forwards cancellation", () => {
 describe("worker spawn logging", () => {
   test("a spawn bound to a session logs it with the given reason", () => {
     const entries: Array<{ message: string; fields: Record<string, unknown> }> = []
+    const sink = Logger.make<unknown, void>(({ message }) => {
+      const [head, fields] = Array.isArray(message) ? message : [message, undefined]
+      entries.push({
+        message: typeof head === "string" ? head : String(head),
+        fields: typeof fields === "object" && fields !== null ? (fields as Record<string, unknown>) : {},
+      })
+    })
     const transport: ExecutorTransport = {
       post: () => {},
       waitFor: async () => {
@@ -152,7 +165,7 @@ describe("worker spawn logging", () => {
       workKind: "session",
       sessionID: sid("ses_spawn"),
       reason: "rebind",
-      log: (message, fields) => entries.push({ message, fields }),
+      bridge: recordingBridge(sink),
     })
 
     expect(entries).toEqual([

@@ -16,7 +16,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
 import { Effect, Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 
 const Note = Event.define({
   type: "test.blob-gc-race.note",
@@ -60,7 +60,7 @@ const DDL = `
 const directories: string[] = []
 const natives: Database[] = []
 
-function connectionFrom(native: Database): Bus.Connection {
+function connectionFrom(native: Database): DurableLog.Connection {
   return {
     all: (sql, params = []) => native.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>,
     run: (sql, params = []) => ({ changes: Number(native.query(sql).run(...(params as never[])).changes) }),
@@ -95,7 +95,7 @@ describe("blob GC race", () => {
 
     // Seed the same aggregate with the same content: its only reference is the
     // row the GC will delete, and the concurrent publisher re-uses that hash.
-    const seedBus = Bus.create({
+    const seedBus = DurableLog.create({
       connection: database.connection,
       ownerID: "gen-seed",
       definitions: [Note],
@@ -107,9 +107,9 @@ describe("blob GC race", () => {
     expect(file).toBeDefined()
     expect(database.connection.all("SELECT COUNT(*) AS count FROM event_blob")).toEqual([{ count: 1 }])
 
-    // A separate, uninstrumented Bus performs the GC so the hook below cannot
+    // A separate, uninstrumented DurableLog performs the GC so the hook below cannot
     // recurse into its own `BEGIN IMMEDIATE`.
-    const gcBus = Bus.create({
+    const gcBus = DurableLog.create({
       connection: database.connection,
       ownerID: "gen-gc",
       definitions: [Note],
@@ -119,7 +119,7 @@ describe("blob GC race", () => {
 
     let armed = true
     let collected = 0
-    const publisherConnection: Bus.Connection = {
+    const publisherConnection: DurableLog.Connection = {
       ...database.connection,
       exec: (sql) => {
         if (armed && sql === "BEGIN IMMEDIATE") {
@@ -131,7 +131,7 @@ describe("blob GC race", () => {
         database.connection.exec(sql)
       },
     }
-    const publisher = Bus.create({
+    const publisher = DurableLog.create({
       connection: publisherConnection,
       ownerID: "gen-publisher",
       definitions: [Note],
@@ -157,7 +157,7 @@ describe("blob GC race", () => {
     const text = oversized("retention-race")
     const blobDir = database.blobDir
 
-    const seedBus = Bus.create({
+    const seedBus = DurableLog.create({
       connection: database.connection,
       ownerID: "gen-seed",
       definitions: [Note],
@@ -166,7 +166,7 @@ describe("blob GC race", () => {
     })
     seedBus.publish([{ definition: Note, data: { sessionID: "s1", text } }])
 
-    const gcBus = Bus.create({
+    const gcBus = DurableLog.create({
       connection: database.connection,
       ownerID: "gen-gc",
       definitions: [Note],
@@ -176,7 +176,7 @@ describe("blob GC race", () => {
 
     let armed = true
     let collected = 0
-    const publisherConnection: Bus.Connection = {
+    const publisherConnection: DurableLog.Connection = {
       ...database.connection,
       exec: (sql) => {
         if (armed && sql === "BEGIN IMMEDIATE") {
@@ -186,7 +186,7 @@ describe("blob GC race", () => {
         database.connection.exec(sql)
       },
     }
-    const publisher = Bus.create({
+    const publisher = DurableLog.create({
       connection: publisherConnection,
       ownerID: "gen-seed",
       definitions: [Note],

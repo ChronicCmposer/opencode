@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Effect, Exit, Layer, Scope } from "effect"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -16,7 +16,9 @@ import {
   resolveWorkerModel,
 } from "@/session/worker/init"
 import { DEFAULT_REAP_MS, REAP_MS_ENV, reapMsWarning, resolveReapMs } from "@/session/worker/pool"
-import { createProductionWorkerPool, createSessionBoundExecutorWorker, createSessionHub } from "@/session/worker/hub"
+import { createSessionBoundExecutorWorker, createSessionHub, makeProduction } from "@/session/worker/hub"
+import type { IdleBoundedExecutorWorkerPool, ProductionWorkerPoolOptions } from "@/session/worker/hub"
+import { createTestBarrier } from "../../lib/run-barrier-test"
 import type { DbExecutor } from "@/session/worker/db-executor"
 import { createDispatcher } from "@/session/worker/dispatch"
 import type { ExecutorWorker } from "@/session/worker/execute"
@@ -28,6 +30,16 @@ import { flush, pollUntil, sid } from "../../lib/async"
 
 /** The dependency-light executor fixture (speaks the executor protocol). */
 const EXECUTOR_FIXTURE = new URL("../../fixture/session-execute-worker.ts", import.meta.url)
+
+/** Build the one scoped production pool for a test and dispose it afterwards. */
+async function createProductionPool(options: ProductionWorkerPoolOptions) {
+  const scope = Effect.runSync(Scope.make())
+  const pools = await Effect.runPromise(Scope.provide(scope)(makeProduction(options)))
+  return {
+    pool: pools.executorPool as IdleBoundedExecutorWorkerPool,
+    dispose: () => Effect.runPromise(Scope.close(scope, Exit.void)).then(() => undefined),
+  }
+}
 
 describe("pool sizing removal", () => {
   test("no longer exports a machine-derived pool size", async () => {
@@ -397,28 +409,32 @@ describe("buildSessionWorkerInit", () => {
 // Production pool wrapper.
 // ---------------------------------------------------------------------------
 
-describe("createProductionWorkerPool", () => {
+describe("makeProduction pool", () => {
   test("wraps the production entry with a pool that becomes ready on use", async () => {
-    const pool = createProductionWorkerPool({
+    const { pool, dispose } = await createProductionPool({
       init: sessionWorkerInit(),
       entry: EXECUTOR_FIXTURE,
       workKind: "instant",
       timeoutMs: 15_000,
     })
 
-    // No prewarm: each worker materializes lazily under the dispatcher's id.
-    expect(pool.workers).toHaveLength(0)
-    const workers = Array.from({ length: 4 }, () => pool.spawn())
+    try {
+      // No prewarm: each worker materializes lazily under the dispatcher's id.
+      expect(pool.workers).toHaveLength(0)
+      const workers = Array.from({ length: 4 }, () => pool.spawn())
 
-    await Promise.all(workers.map((worker, index) => worker.execute({ sessionID: sid(`ses_${index}`), depth: 0 })))
+      await Promise.all(workers.map((worker, index) => worker.execute({ sessionID: sid(`ses_${index}`), depth: 0 })))
 
-    expect(pool.workers).toHaveLength(4)
-    expect(pool.workers.every((worker) => worker.alive)).toBe(true)
-    for (const index of pool.workers.keys()) {
-      expect(pool.resultFor(sid(`ses_${index}`))?.sessionID).toBe(sid(`ses_${index}`))
+      expect(pool.workers).toHaveLength(4)
+      expect(pool.workers.every((worker) => worker.alive)).toBe(true)
+      for (const index of pool.workers.keys()) {
+        expect(pool.resultFor(sid(`ses_${index}`))?.sessionID).toBe(sid(`ses_${index}`))
+      }
+
+      await pool.terminateAll()
+    } finally {
+      await dispose()
     }
-
-    await pool.terminateAll()
   }, 30_000)
 })
 
@@ -440,7 +456,7 @@ describe("idle eviction retirement", () => {
       transaction: async () => [],
       close: async () => {},
     }
-    const pool = createProductionWorkerPool({
+    const scoped = await createProductionPool({
       init: sessionWorkerInit(),
       entry: EXECUTOR_FIXTURE,
       workKind: "instant",
@@ -451,7 +467,8 @@ describe("idle eviction retirement", () => {
       // pool's local `releaseSession`.
       onIdleEvicted: (sessionID) => hub?.dispatcher.retire(sessionID) ?? Promise.resolve(),
     })
-    hub = createSessionHub({
+    const pool = scoped.pool
+    hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       db,
       ports: {
@@ -486,6 +503,7 @@ describe("idle eviction retirement", () => {
       expect(pool.idleEvictions).toBe(1)
     } finally {
       await sessionHub.terminateAll()
+      await scoped.dispose()
     }
   }, 30_000)
 })
@@ -500,11 +518,13 @@ describe("dispatch pool constants", () => {
 })
 
 describe("one production pool", () => {
-  test("test-only lazy factories are gone while the production factory remains", async () => {
+  test("test-only lazy factories and the duplicate production factory are gone", async () => {
     const workerPools = await import("@/session/worker/worker-pools")
     expect(workerPools).not.toHaveProperty("createLazyExecutorWorker")
     expect(workerPools).not.toHaveProperty("createLazyExecutorWorkerPool")
-    expect(typeof workerPools.createProductionWorkerPool).toBe("function")
+    expect(workerPools).not.toHaveProperty("createProductionWorkerPool")
+    expect(workerPools).not.toHaveProperty("fromPool")
+    expect(typeof workerPools.makeProduction).toBe("function")
   })
 })
 

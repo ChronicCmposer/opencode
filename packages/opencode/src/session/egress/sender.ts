@@ -11,8 +11,10 @@
 // hand-offs in that batch. The hub receiver surfaces it via `onAck`, so durable
 // progress is observable across the port rather than only implied by the events.
 
+import { Effect } from "effect"
+import type { EffectBridge } from "@/effect/bridge"
 import { ackFrame, type EventsFrame, type EventV2Event } from "@/session/worker/frame"
-import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "@/session/worker/log"
+import { workerLogMessage } from "@/session/worker/worker-logging"
 
 import { createCoalescer, type Coalescer, type CoalescerScheduler } from "./coalesce"
 import { durableMetaOf, encodeFrame, encodeFrameChunks, type DurableMeta } from "./frame"
@@ -22,8 +24,8 @@ export interface EgressSenderOptions {
   readonly windowMs?: number
   readonly maxBatch?: number
   readonly scheduler?: CoalescerScheduler
-  /** Structured logger; an oversized advisory frame is dropped with a warning. */
-  readonly log?: WorkerLogger
+  /** Re-entry bridge; an oversized advisory frame is dropped with a warning. */
+  readonly bridge?: EffectBridge.Shape
 }
 
 export interface EgressSender {
@@ -40,7 +42,6 @@ export interface EgressSender {
 }
 
 export function createEgressSender(options: EgressSenderOptions): EgressSender {
-  const log = options.log ?? noopWorkerLogger
   const coalescer: Coalescer = createCoalescer({
     windowMs: options.windowMs,
     maxBatch: options.maxBatch,
@@ -54,14 +55,12 @@ export function createEgressSender(options: EgressSenderOptions): EgressSender {
       // warning so it cannot take the rest of the batch and its ack with it.
       const chunks = encodeFrameChunks(frames, {
         onDrop: (frame, error) => {
-          log(
-            workerLogMessage("dropped oversized non-durable egress frame"),
-            {
+          void options.bridge?.fork(
+            Effect.logWarning(workerLogMessage("dropped oversized non-durable egress frame"), {
               kind: frame.kind,
               byteLength: error.byteLength,
               limit: error.limit,
-            },
-            "warn",
+            }),
           )
         },
       })
@@ -107,4 +106,4 @@ function requireDurableMeta(meta: DurableMeta | undefined): DurableMeta {
   return meta
 }
 
-export * as EgressSenderModule from "./sender"
+export * as EgressSender from "./sender"

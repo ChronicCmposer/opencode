@@ -10,6 +10,8 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { Database as BunDatabase } from "bun:sqlite"
 import { afterEach, describe, expect, test } from "bun:test"
+import { Effect, Layer } from "effect"
+import { Database as CoreDatabase } from "@opencode-ai/core/database/database"
 import { openConnection, type Connection } from "@opencode-ai/core/database/connection"
 import { migrationStatements } from "@/session/writer/migration.statements.gen"
 import { hashStatements } from "@/session/db/identity"
@@ -18,6 +20,7 @@ import {
   SchemaMismatch,
   assertSchemaIdentity,
   currentSchemaIdentity,
+  ensureProductionSchema,
   ensureProductionSchemaAsync,
   markSchemaIdentity,
   migrate,
@@ -262,13 +265,13 @@ describe("cross-process schema gate", () => {
   }, 60_000)
 
   test("two processes starting together still produce one complete schema", async () => {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-schema-gate-"))
-    directories.push(directory)
-    const filename = path.join(directory, "processes.db")
     const modulePath = fileURLToPath(new URL("../../../src/session/db/schema.ts", import.meta.url))
+    // Both children block on a barrier file the parent creates after spawning
+    // them, so the race starts together without a startup sleep.
     const script = `
+      import { existsSync } from "node:fs"
       import { ensureProductionSchemaAsync } from ${JSON.stringify(modulePath)}
-      await Bun.sleep(50)
+      while (!existsSync(process.env.BARRIER)) await Bun.sleep(5)
       try {
         await ensureProductionSchemaAsync({ filename: process.env.DB_FILE, liveWorkers: 0 })
         console.log("ok")
@@ -278,32 +281,121 @@ describe("cross-process schema gate", () => {
       }
     `
     const cwd = path.resolve(import.meta.dir, "../../..")
-    const children = [0, 1].map(() =>
-      Bun.spawn([process.execPath, "-e", script], {
-        cwd,
-        env: { ...process.env, DB_FILE: filename },
+
+    for (let iteration = 0; iteration < 3; iteration += 1) {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-schema-gate-"))
+      directories.push(directory)
+      const filename = path.join(directory, `processes-${iteration}.db`)
+      const barrier = path.join(directory, "barrier")
+      const children = [0, 1].map(() =>
+        Bun.spawn([process.execPath, "-e", script], {
+          cwd,
+          env: { ...process.env, DB_FILE: filename, BARRIER: barrier },
+          stdout: "pipe",
+          stderr: "pipe",
+        }),
+      )
+      await Bun.write(barrier, "go")
+      const results = await Promise.all(
+        children.map(async (child) => {
+          const [out, err] = await Promise.all([
+            new Response(child.stdout).text(),
+            new Response(child.stderr).text(),
+          ])
+          return { exitCode: await child.exited, out: out.trim(), err: err.trim() }
+        }),
+      )
+      expect(results.map((result) => ({ exitCode: result.exitCode, out: result.out, err: result.err }))).toEqual([
+        { exitCode: 0, out: "ok", err: "" },
+        { exitCode: 0, out: "ok", err: "" },
+      ])
+
+      const raw = openConnection({ filename })
+      connections.push(raw)
+      expect(schemaIdentity(raw)).toEqual(currentSchemaIdentity())
+      const journal = raw.all<{ id: string }>("SELECT id FROM migration ORDER BY id").map((row) => row.id)
+      expect(new Set(journal).size).toBe(journal.length)
+    }
+  }, 180_000)
+
+  test("sync ensure retries a contended legacy file with a blocking budget", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-schema-sync-"))
+    directories.push(directory)
+    const filename = path.join(directory, "legacy.db")
+    const ready = path.join(directory, "lock-ready")
+    const busy = path.join(directory, "begin-busy")
+
+    // Seed core's migration journal without the hub-owned ledger/marker, then
+    // contend the write lock in a separate process (a blocking retry cannot let
+    // a same-thread timer release it).
+    await Effect.runPromise(Effect.scoped(Layer.build(CoreDatabase.layerFromPath(filename))))
+
+    // Deterministic handshake: the holder keeps the write lock until the ensure
+    // process publishes that it actually observed a busy BEGIN, so the retry is
+    // exercised regardless of host speed (no fixed hold duration).
+    const holder = Bun.spawn(
+      [
+        process.execPath,
+        "-e",
+        `
+          import { Database } from "bun:sqlite"
+          import { existsSync, writeFileSync } from "node:fs"
+          const db = new Database(process.env.DB_FILE)
+          db.exec("PRAGMA journal_mode = WAL")
+          db.exec("PRAGMA busy_timeout = 0")
+          db.exec("BEGIN IMMEDIATE")
+          writeFileSync(process.env.READY, "ready")
+          const deadline = Date.now() + 30000
+          while (!existsSync(process.env.BUSY) && Date.now() < deadline) await Bun.sleep(5)
+          db.exec("COMMIT")
+          db.close()
+        `,
+      ],
+      { env: { ...process.env, DB_FILE: filename, READY: ready, BUSY: busy }, stdout: "pipe", stderr: "pipe" },
+    )
+
+    const modulePath = fileURLToPath(new URL("../../../src/session/db/schema.ts", import.meta.url))
+    const ensure = Bun.spawn(
+      [
+        process.execPath,
+        "-e",
+        `
+          import { writeFileSync } from "node:fs"
+          import { ensureProductionSchema } from ${JSON.stringify(modulePath)}
+          try {
+            ensureProductionSchema({
+              filename: process.env.DB_FILE,
+              liveWorkers: 0,
+              onMigrationBusy: () => writeFileSync(process.env.BUSY, "busy"),
+            })
+            console.log("ok")
+          } catch (error) {
+            console.error(error)
+            process.exit(1)
+          }
+        `,
+      ],
+      {
+        cwd: path.resolve(import.meta.dir, "../../.."),
+        env: { ...process.env, DB_FILE: filename, BUSY: busy },
         stdout: "pipe",
         stderr: "pipe",
-      }),
+      },
     )
-    const results = await Promise.all(
-      children.map(async (child) => {
-        const [out, err] = await Promise.all([
-          new Response(child.stdout).text(),
-          new Response(child.stderr).text(),
-        ])
-        return { exitCode: await child.exited, out: out.trim(), err: err.trim() }
-      }),
-    )
-    expect(results.map((result) => ({ exitCode: result.exitCode, out: result.out }))).toEqual([
-      { exitCode: 0, out: "ok" },
-      { exitCode: 0, out: "ok" },
-    ])
+
+    try {
+      while (!fs.existsSync(ready)) await Bun.sleep(5)
+      const [out, err] = await Promise.all([new Response(ensure.stdout).text(), new Response(ensure.stderr).text()])
+      const exitCode = await ensure.exited
+      expect({ exitCode, out: out.trim(), err: err.trim() }).toEqual({ exitCode: 0, out: "ok", err: "" })
+    } finally {
+      await holder.exited
+    }
 
     const raw = openConnection({ filename })
     connections.push(raw)
     expect(schemaIdentity(raw)).toEqual(currentSchemaIdentity())
     const journal = raw.all<{ id: string }>("SELECT id FROM migration ORDER BY id").map((row) => row.id)
     expect(new Set(journal).size).toBe(journal.length)
-  }, 90_000)
+  }, 120_000)
 })

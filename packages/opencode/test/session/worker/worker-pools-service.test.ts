@@ -1,14 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
-import { createExecutorWorkerPool, type ExecutorWorker, type ExecutorWorkerPool } from "@/session/worker/execute"
+import type { ExecutorWorker } from "@/session/worker/execute"
 import {
   createBunExecutorTransport,
   createBunExecutorWorkerPool,
   createIdleIsolateCap,
-  createProductionWorkerPool,
   createSessionBoundExecutorWorker,
   createWorkerCap,
-  fromPool,
   layer,
   liveSessionWorkerCount,
   makeProduction,
@@ -17,7 +15,6 @@ import {
   spawnBunExecutorWorker,
 } from "@/session/worker/worker-pools"
 import { pollUntil, sid } from "../../lib/async"
-import { FakeExecutorWorker } from "../../lib/fake-worker-pool"
 import { it } from "../../lib/effect"
 import { sessionWorkerInit } from "../../lib/session-worker-init"
 
@@ -49,56 +46,54 @@ describe("WorkerPools service surface", () => {
     expect(poolsNode.dependencies).toEqual([])
   })
 
-  it.live("fromPool adapts a structural pool through the Effect methods", () =>
-    Effect.gen(function* () {
-      const pool = createExecutorWorkerPool({ spawn: (id) => new FakeExecutorWorker(id, { value: "ok" }) })
-      const pools = fromPool(pool)
-      const sessionID = sid("ses_worker_pools_service_fake")
+  it.live(
+    "makeProduction exposes the structural pool through the Effect methods",
+    () =>
+      Effect.gen(function* () {
+        const pools = yield* makeProduction({
+          init: sessionWorkerInit(),
+          entry: EXECUTOR_FIXTURE,
+          workKind: "instant",
+          timeoutMs: 15_000,
+        })
+        const sessionID = sid("ses_worker_pools_service_fake")
 
-      const worker = yield* pools.spawn()
-      expect(yield* pools.workers).toHaveLength(1)
-      expect((yield* pools.byID(worker.id))?.id).toBe(worker.id)
-      expect(yield* pools.resultFor(sessionID)).toBeUndefined()
+        const worker = yield* pools.spawn()
+        expect(yield* pools.workers).toHaveLength(1)
+        expect((yield* pools.byID(worker.id))?.id).toBe(worker.id)
+        expect(yield* pools.resultFor(sessionID)).toBeUndefined()
 
-      yield* Effect.promise(() => worker.execute({ sessionID, depth: 0 }))
-      expect(yield* pools.resultFor(sessionID)).toEqual({ sessionID, value: "ok" })
+        yield* Effect.promise(() => worker.execute({ sessionID, depth: 0 }))
+        expect(yield* pools.resultFor(sessionID)).toMatchObject({ sessionID, value: { execution: 1 } })
 
-      yield* pools.releaseSession(sessionID, worker.id)
-      expect(yield* pools.byID(worker.id)).toBeUndefined()
-      expect((yield* pools.stats).workers).toBe(0)
+        yield* pools.releaseSession(sessionID, worker.id)
+        expect(yield* pools.byID(worker.id)).toBeUndefined()
+        expect((yield* pools.stats).workers).toBe(0)
 
-      yield* pools.terminateAll()
-    }),
+        yield* pools.terminateAll()
+      }),
+    30_000,
   )
 
-  it.live("terminateAll joins concurrent calls and is idempotent", () =>
-    Effect.gen(function* () {
-      let calls = 0
-      let finished = 0
-      const gate = new Promise<void>((resolve) => setTimeout(resolve, 10))
-      const pool: ExecutorWorkerPool = {
-        workers: [],
-        spawn: () => {
-          throw new Error("spawn is unused by the terminateAll test")
-        },
-        terminateAll: async () => {
-          calls += 1
-          await gate
-          finished += 1
-        },
-        byID: () => undefined,
-        resultFor: () => undefined,
-      }
-      const pools = fromPool(pool)
+  it.live(
+    "terminateAll joins concurrent calls and is idempotent",
+    () =>
+      Effect.gen(function* () {
+        const pools = yield* makeProduction({
+          init: sessionWorkerInit(),
+          entry: EXECUTOR_FIXTURE,
+          workKind: "instant",
+          timeoutMs: 15_000,
+        })
+        yield* pools.spawn()
 
-      yield* Effect.all([pools.terminateAll(), pools.terminateAll()], { concurrency: "unbounded" })
-      expect(calls).toBe(1)
-      expect(finished).toBe(1)
+        yield* Effect.all([pools.terminateAll(), pools.terminateAll()], { concurrency: "unbounded" })
+        expect(yield* pools.stats).toMatchObject({ workers: 0 })
 
-      yield* pools.terminateAll()
-      expect(calls).toBe(1)
-      expect(finished).toBe(1)
-    }),
+        yield* pools.terminateAll()
+        expect(yield* pools.stats).toMatchObject({ workers: 0 })
+      }),
+    30_000,
   )
 
   it.live(
@@ -259,34 +254,24 @@ describe("WorkerPools service surface", () => {
     expect(evicted).toEqual([1])
   })
 
-  test("a recheck set after the final drain still causes another enforcement", async () => {
+  test("a burst of enforcement requests coalesces into one queue drain", async () => {
     const evicted: number[] = []
-    let cap!: ReturnType<typeof createIdleIsolateCap>
-    let injected = false
-    let releaseThird!: () => void
-    const thirdGate = new Promise<void>((resolve) => {
-      releaseThird = resolve
+    let releaseEviction!: () => void
+    const evictionGate = new Promise<void>((resolve) => {
+      releaseEviction = resolve
     })
-    cap = createIdleIsolateCap({
+    const cap = createIdleIsolateCap({
       capacity: 1,
-      onEvict: (entry) => {
+      onEvict: async (entry) => {
         evicted.push(entry.worker.id)
-      },
-      // Runs after the owner's last drain and before the single-flight is
-      // released: exactly the window where a concurrent recheck used to vanish.
-      onBeforeRelease: async () => {
-        if (injected) return
-        injected = true
-        releaseThird()
-        await thirdRun
-        cap.requestEnforce()
+        if (entry.worker.id === 1) await evictionGate
       },
     })
-    const workers = [1, 2, 3].map((id) => {
+    const workers = [1, 2, 3, 4, 5].map((id) => {
       const inner: ExecutorWorker = {
         id,
         alive: true,
-        execute: id === 3 ? () => thirdGate : async () => {},
+        execute: async () => {},
         cancel: async () => {},
         assertNotBusy: async () => false,
         resultFor: () => undefined,
@@ -294,18 +279,21 @@ describe("WorkerPools service surface", () => {
       }
       return cap.track(inner)
     })
-    const thirdRun = workers[2]!.execute({ sessionID: sid("ses_idle_cap_recheck_third"), depth: 0 })
 
-    await Promise.all([
-      workers[0]!.execute({ sessionID: sid("ses_idle_cap_recheck_first"), depth: 0 }),
-      workers[1]!.execute({ sessionID: sid("ses_idle_cap_recheck_second"), depth: 0 }),
-    ])
+    // Five settlements land while the first eviction is still running. The
+    // single consumer must collapse the queued requests to the passes needed to
+    // reach capacity (four evictions), not one pass per settlement.
+    await Promise.all(
+      workers.map((worker, index) => worker.execute({ sessionID: sid(`ses_idle_cap_burst_${index}`), depth: 0 })),
+    )
+    await pollUntil(() => evicted.length === 1, { message: "the first eviction never started" })
+    releaseEviction()
 
-    await pollUntil(() => injected && cap.idle === 1 && cap.evictions === 2, {
-      message: "the post-drain recheck was lost",
+    await pollUntil(() => cap.idle === 1 && cap.evictions === 4, {
+      message: "the queued enforcement requests did not drain to capacity",
       timeoutMs: 2_000,
     })
-    expect(evicted).toEqual([1, 2])
+    expect(evicted).toEqual([1, 2, 3, 4])
   })
 
   test("a throwing eviction hook still terminates and counts the eviction", async () => {
@@ -381,26 +369,26 @@ describe("WorkerPools service surface", () => {
     expect(terminated.sort()).toEqual([1, 2])
   })
 
-  test("every existing production factory stays exported as an adapter", async () => {
+  test("the single production pool is the scoped layer, not a duplicate factory", async () => {
     const module = await import("@/session/worker/worker-pools")
 
     for (const name of [
-      "createProductionWorkerPool",
       "createBunExecutorWorkerPool",
       "createBunExecutorTransport",
       "spawnBunExecutorWorker",
       "createWorkerCap",
       "createIdleIsolateCap",
       "createSessionBoundExecutorWorker",
+      "makeProduction",
+      "makeSpawnGate",
     ]) {
       expect(typeof (module as Record<string, unknown>)[name]).toBe("function")
     }
-    expect(typeof module.WorkerPools.fromPool).toBe("function")
-    expect(typeof module.WorkerPools.makeProduction).toBe("function")
+    expect("createProductionWorkerPool" in module).toBe(false)
+    expect("fromPool" in module).toBe(false)
   })
 
   test("the adapter factories are the same functions the module exports directly", () => {
-    expect(typeof createProductionWorkerPool).toBe("function")
     expect(typeof createBunExecutorWorkerPool).toBe("function")
     expect(typeof createBunExecutorTransport).toBe("function")
     expect(typeof spawnBunExecutorWorker).toBe("function")

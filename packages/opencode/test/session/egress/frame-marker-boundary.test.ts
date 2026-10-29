@@ -10,7 +10,7 @@
 // size; a non-durable marker keeps its legacy pass-through.
 
 import { describe, expect, test } from "bun:test"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import {
   MAX_FRAME_BYTES,
   MAX_INLINE_EVENT_BYTES,
@@ -20,7 +20,7 @@ import {
 import { eventFrame, type EventV2Event } from "@/session/worker/frame"
 
 function coreMarker(size: number): { readonly __eventBlob: string; readonly size: number } {
-  return { __eventBlob: Bus.digest(`durable-body-${size}`), size }
+  return { __eventBlob: DurableLog.digest(`durable-body-${size}`), size }
 }
 
 function durableEvent(size: number): EventV2Event {

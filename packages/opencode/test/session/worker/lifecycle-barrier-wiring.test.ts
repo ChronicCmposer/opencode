@@ -1,216 +1,233 @@
 // The run barrier must be drained by the production hub: the next run waits for
 // the prior run's commits/projectors/tools/promotion, is bounded at 5 s, and a
 // cancel wins over a still-draining barrier.
+//
+// The bound is driven by `TestClock.adjust` through `clockedRunBarrierLayer`, so
+// expiry is deterministic and instant; no case waits 5 s of wall-clock time.
 
-import { describe, expect, test } from "bun:test"
+import { describe, expect } from "bun:test"
+import { Effect, Fiber } from "effect"
+
 import { createLifecycleTracker } from "@/session/ledger/lifecycle"
-import { createFakeExecutorPool } from "../../lib/fake-worker-pool"
-import { flush } from "../../lib/async"
-import { sid } from "../../lib/async"
-import {
-  RUN_BARRIER_TIMEOUT_MS,
-  RunBarrierTimeout,
-  createRunBarrier,
-  type RunBarrierScheduler,
-} from "@/session/run-barrier"
+import { RunBarrier, RunBarrierTimeout } from "@/session/run-barrier"
 import { createSessionHub } from "@/session/worker/hub"
+import { createFakeExecutorPool } from "../../lib/fake-worker-pool"
+import { flush, pollUntil, sid } from "../../lib/async"
+import { testEffect } from "../../lib/effect"
+import { advanceBarrierTimeout, clockedRunBarrierLayer } from "../../lib/run-barrier-test"
 
-function fakeScheduler() {
-  let now = 0
-  let nextID = 1
-  const timers = new Map<number, { readonly at: number; readonly run: () => void }>()
-  return {
-    scheduler: {
-      schedule: (run: () => void, delayMs: number) => {
-        const id = nextID++
-        timers.set(id, { at: now + delayMs, run })
-        return id
-      },
-      cancel: (handle: unknown) => void timers.delete(handle as number),
-    } satisfies RunBarrierScheduler,
-    advance(ms: number) {
-      now += ms
-      for (const [id, timer] of [...timers.entries()]) {
-        if (timer.at <= now) {
-          timers.delete(id)
-          timer.run()
-        }
-      }
-    },
-  }
+const it = testEffect(clockedRunBarrierLayer)
+
+interface ObservableBarrier {
+  readonly barrier: RunBarrier.Interface
+  run(sessionID: string): RunBarrier.RunBarrierRun | undefined
+  suppressPromotion(sessionID: string): void
 }
 
 /**
- * The explicit legacy-observer seam: these cases drive the barrier with caller
- * phases because the fake run never reports commit/projector phases itself.
+ * A delegating spy over the real service: the hub drives the real reports, while
+ * these cases capture the per-run handle (to settle an in-flight tool) or omit
+ * the promotion report (to prove a missing phase is never fabricated).
  */
-const settled = Promise.resolve()
-
-function deferred() {
-  let resolve!: () => void
-  const promise = new Promise<void>((done) => {
-    resolve = done
-  })
-  return { promise, resolve }
+function observableBarrier(service: RunBarrier.Interface): ObservableBarrier {
+  const runs = new Map<string, RunBarrier.RunBarrierRun>()
+  const suppressPromotion = new Set<string>()
+  return {
+    barrier: {
+      beginRun(sessionID) {
+        const run = service.beginRun(sessionID)
+        const captured = suppressPromotion.has(sessionID) ? { ...run, promotion: () => false } : run
+        runs.set(sessionID, captured)
+        return captured
+      },
+      wait: (sessionID) => service.wait(sessionID),
+      cancel: (sessionID) => service.cancel(sessionID),
+      state: (sessionID) => service.state(sessionID),
+      reset: (sessionID) => service.reset(sessionID),
+      abandon: (sessionID) => service.abandon(sessionID),
+      get size() {
+        return service.size
+      },
+    },
+    run: (sessionID) => runs.get(sessionID),
+    suppressPromotion: (sessionID) => suppressPromotion.add(sessionID),
+  }
 }
 
-const phasesWithTools = (tools: Promise<unknown>) => ({
-  commits: settled,
-  projectors: settled,
-  tools,
-  promotion: settled,
-})
+/** Wait for the hub to publish the state the case is about to act on. */
+const waitForState = (hub: ReturnType<typeof createSessionHub>, sessionID: string, state: RunBarrier.RunBarrierState) =>
+  Effect.promise(() =>
+    pollUntil(() => hub.barrier.state(sessionID) === state, {
+      message: `barrier never reached ${state}`,
+    }),
+  )
 
 describe("hub run-barrier wiring (D18)", () => {
-  test("the next run waits until an in-flight tool settles", async () => {
-    const lifecycle = createLifecycleTracker()
-    const clock = fakeScheduler()
-    const barrier = createRunBarrier({ scheduler: clock.scheduler })
-    const tools = deferred()
-    const hub = createSessionHub({
-      pool: createFakeExecutorPool(1),
-      lifecycle,
-      barrier,
-      barrierPhases: () => phasesWithTools(tools.promise),
-    })
-    const sessionID = sid("ses_barrier_wait")
-    lifecycle.toolStarted(sessionID, "call_write")
+  it.effect("the next run waits until an in-flight tool settles", () =>
+    Effect.gen(function* () {
+      const service = yield* RunBarrier.Service
+      const lifecycle = createLifecycleTracker()
+      const control = observableBarrier(service)
+      const hub = createSessionHub({
+        pool: createFakeExecutorPool(1),
+        lifecycle,
+        barrier: control.barrier,
+      })
+      const sessionID = sid("ses_barrier_wait")
+      lifecycle.toolStarted(sessionID, "call_write")
 
-    try {
-      const first = hub.ensureRunning(sessionID)
-      await flush()
-      const second = hub.ensureRunning(sessionID)
-      await flush()
-      expect(hub.dispatcher.busySlotCount).toBe(1)
-      expect(hub.barrier.state(sessionID)).toBe("draining")
+      try {
+        const first = yield* Effect.promise(() => hub.ensureRunning(sessionID)).pipe(Effect.forkChild)
+        yield* Effect.promise(flush)
+        yield* waitForState(hub, sessionID, "draining")
+        const second = yield* Effect.promise(() => hub.ensureRunning(sessionID)).pipe(Effect.forkChild)
+        yield* Effect.promise(flush)
+        expect(hub.dispatcher.busySlotCount).toBe(1)
+        expect(hub.barrier.state(sessionID)).toBe("draining")
 
-      lifecycle.toolFinished(sessionID, "call_write")
-      tools.resolve()
-      await first
-      await second
-      expect(hub.barrier.state(sessionID)).toBe("drained")
-    } finally {
-      await hub.terminateAll()
-    }
-  })
+        lifecycle.toolFinished(sessionID, "call_write")
+        control.run(sessionID)?.tool("call_write")
+        yield* Fiber.join(first)
+        yield* Fiber.join(second)
+        expect(hub.barrier.state(sessionID)).toBe("drained")
+      } finally {
+        yield* Effect.promise(() => hub.terminateAll())
+      }
+    }),
+  )
 
-  test("expiry is a typed RunBarrierTimeout that refuses the next run", async () => {
-    const lifecycle = createLifecycleTracker()
-    const clock = fakeScheduler()
-    const barrier = createRunBarrier({ scheduler: clock.scheduler })
-    const stuck = new Promise<never>(() => {})
-    const hub = createSessionHub({
-      pool: createFakeExecutorPool(1),
-      lifecycle,
-      barrier,
-      barrierPhases: () => phasesWithTools(stuck),
-    })
-    const sessionID = sid("ses_barrier_timeout")
-    lifecycle.toolStarted(sessionID, "call_stuck")
+  it.effect("expiry is a typed RunBarrierTimeout that refuses the next run", () =>
+    Effect.gen(function* () {
+      const service = yield* RunBarrier.Service
+      const lifecycle = createLifecycleTracker()
+      const control = observableBarrier(service)
+      const hub = createSessionHub({
+        pool: createFakeExecutorPool(1),
+        lifecycle,
+        barrier: control.barrier,
+      })
+      const sessionID = sid("ses_barrier_timeout")
+      lifecycle.toolStarted(sessionID, "call_stuck")
 
-    try {
-      const first = hub.ensureRunning(sessionID)
-      await flush()
-      expect(hub.barrier.state(sessionID)).toBe("draining")
-      clock.advance(RUN_BARRIER_TIMEOUT_MS)
-      await first
-      await flush()
+      try {
+        const first = yield* Effect.promise(() => hub.ensureRunning(sessionID).catch(() => undefined)).pipe(
+          Effect.forkChild,
+        )
+        yield* Effect.promise(flush)
+        yield* waitForState(hub, sessionID, "draining")
+        // The in-flight tool is never reported: advance the barrier's clock to
+        // its real 5 s bound instead of sleeping for it.
+        yield* advanceBarrierTimeout()
+        yield* Fiber.join(first)
+        yield* Effect.promise(flush)
 
-      await expect(hub.ensureRunning(sessionID)).rejects.toBeInstanceOf(RunBarrierTimeout)
-      expect(hub.barrier.state(sessionID)).toBe("timed-out")
-    } finally {
-      await hub.terminateAll()
-    }
-  })
+        const refused = yield* Effect.tryPromise({
+          try: () => hub.ensureRunning(sessionID),
+          catch: (error) => error,
+        }).pipe(Effect.flip)
+        expect(refused).toBeInstanceOf(RunBarrierTimeout)
+        expect(hub.barrier.state(sessionID)).toBe("timed-out")
+      } finally {
+        yield* Effect.promise(() => hub.terminateAll())
+      }
+    }),
+  )
 
-  test("cancel wins while the barrier is draining", async () => {
-    const lifecycle = createLifecycleTracker()
-    const clock = fakeScheduler()
-    const barrier = createRunBarrier({ scheduler: clock.scheduler })
-    const stuck = new Promise<never>(() => {})
-    const hub = createSessionHub({
-      pool: createFakeExecutorPool(1),
-      lifecycle,
-      barrier,
-      barrierPhases: () => phasesWithTools(stuck),
-    })
-    const sessionID = sid("ses_barrier_cancel")
-    lifecycle.toolStarted(sessionID, "call_slow")
+  it.effect("cancel wins while the barrier is draining", () =>
+    Effect.gen(function* () {
+      const service = yield* RunBarrier.Service
+      const lifecycle = createLifecycleTracker()
+      const control = observableBarrier(service)
+      const hub = createSessionHub({
+        pool: createFakeExecutorPool(1),
+        lifecycle,
+        barrier: control.barrier,
+      })
+      const sessionID = sid("ses_barrier_cancel")
+      lifecycle.toolStarted(sessionID, "call_slow")
 
-    try {
-      const first = hub.ensureRunning(sessionID).catch(() => undefined)
-      await flush()
-      expect(hub.barrier.state(sessionID)).toBe("draining")
-      await hub.cancel(sessionID)
-      await first
-      await flush()
-      expect(hub.barrier.state(sessionID)).toBe("cancelled")
-      expect(barrier.state(sessionID)).not.toBe("draining")
-    } finally {
-      await hub.terminateAll()
-    }
-  })
+      try {
+        const first = yield* Effect.promise(() => hub.ensureRunning(sessionID).catch(() => undefined)).pipe(
+          Effect.forkChild,
+        )
+        yield* Effect.promise(flush)
+        yield* waitForState(hub, sessionID, "draining")
+        yield* Effect.promise(() => hub.cancel(sessionID))
+        yield* Fiber.join(first)
+        yield* Effect.promise(flush)
+        expect(hub.barrier.state(sessionID)).toBe("cancelled")
+      } finally {
+        yield* Effect.promise(() => hub.terminateAll())
+      }
+    }),
+  )
 })
 
 // The barrier must await all FOUR commit-side phases. A phase that never reports
 // (here `promotion`) is not treated as settled merely because the others are:
 // the barrier stays open, expires typed, and cancel still wins.
 describe("hub run-barrier four-phase coverage", () => {
-  const partialPhases = () => ({
-    commits: Promise.resolve(),
-    projectors: Promise.resolve(),
-    tools: Promise.resolve(),
-    promotion: new Promise<never>(() => {}),
-  })
+  it.effect("a missing promotion phase is not fabricated as settled", () =>
+    Effect.gen(function* () {
+      const service = yield* RunBarrier.Service
+      const lifecycle = createLifecycleTracker()
+      const control = observableBarrier(service)
+      const sessionID = sid("ses_barrier_missing_promotion")
+      control.suppressPromotion(sessionID)
+      const hub = createSessionHub({
+        pool: createFakeExecutorPool(1),
+        lifecycle,
+        barrier: control.barrier,
+      })
 
-  test("a missing promotion phase is not fabricated as settled", async () => {
-    const lifecycle = createLifecycleTracker()
-    const clock = fakeScheduler()
-    const barrier = createRunBarrier({ scheduler: clock.scheduler })
-    const hub = createSessionHub({
-      pool: createFakeExecutorPool(1),
-      lifecycle,
-      barrier,
-      barrierPhases: partialPhases,
-    })
-    const sessionID = sid("ses_barrier_missing_promotion")
+      try {
+        const first = yield* Effect.promise(() => hub.ensureRunning(sessionID).catch(() => undefined)).pipe(
+          Effect.forkChild,
+        )
+        yield* Effect.promise(flush)
+        yield* waitForState(hub, sessionID, "draining")
+        yield* advanceBarrierTimeout()
+        yield* Fiber.join(first)
+        yield* Effect.promise(flush)
 
-    try {
-      const first = hub.ensureRunning(sessionID).catch(() => undefined)
-      await flush()
-      expect(hub.barrier.state(sessionID)).toBe("draining")
-      clock.advance(RUN_BARRIER_TIMEOUT_MS)
-      await first
-      await flush()
+        expect(hub.barrier.state(sessionID)).toBe("timed-out")
+        const refused = yield* Effect.tryPromise({
+          try: () => hub.ensureRunning(sessionID),
+          catch: (error) => error,
+        }).pipe(Effect.flip)
+        expect(refused).toBeInstanceOf(RunBarrierTimeout)
+      } finally {
+        yield* Effect.promise(() => hub.terminateAll())
+      }
+    }),
+  )
 
-      expect(hub.barrier.state(sessionID)).toBe("timed-out")
-      await expect(hub.ensureRunning(sessionID)).rejects.toBeInstanceOf(RunBarrierTimeout)
-    } finally {
-      await hub.terminateAll()
-    }
-  })
+  it.effect("cancel wins while promotion is missing", () =>
+    Effect.gen(function* () {
+      const service = yield* RunBarrier.Service
+      const lifecycle = createLifecycleTracker()
+      const control = observableBarrier(service)
+      const sessionID = sid("ses_barrier_missing_cancel")
+      control.suppressPromotion(sessionID)
+      const hub = createSessionHub({
+        pool: createFakeExecutorPool(1),
+        lifecycle,
+        barrier: control.barrier,
+      })
 
-  test("cancel wins while promotion is missing", async () => {
-    const lifecycle = createLifecycleTracker()
-    const barrier = createRunBarrier()
-    const hub = createSessionHub({
-      pool: createFakeExecutorPool(1),
-      lifecycle,
-      barrier,
-      barrierPhases: partialPhases,
-    })
-    const sessionID = sid("ses_barrier_missing_cancel")
-
-    try {
-      const first = hub.ensureRunning(sessionID).catch(() => undefined)
-      await flush()
-      expect(hub.barrier.state(sessionID)).toBe("draining")
-      await hub.cancel(sessionID)
-      await first
-      await flush()
-      expect(hub.barrier.state(sessionID)).toBe("cancelled")
-    } finally {
-      await hub.terminateAll()
-    }
-  })
+      try {
+        const first = yield* Effect.promise(() => hub.ensureRunning(sessionID).catch(() => undefined)).pipe(
+          Effect.forkChild,
+        )
+        yield* Effect.promise(flush)
+        yield* waitForState(hub, sessionID, "draining")
+        yield* Effect.promise(() => hub.cancel(sessionID))
+        yield* Fiber.join(first)
+        yield* Effect.promise(flush)
+        expect(hub.barrier.state(sessionID)).toBe("cancelled")
+      } finally {
+        yield* Effect.promise(() => hub.terminateAll())
+      }
+    }),
+  )
 })

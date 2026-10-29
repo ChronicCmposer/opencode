@@ -10,6 +10,7 @@ import type { SessionID } from "@/session/schema"
 import type { ExecutorRun, ExecutorWorker, ExecutorWorkerPool, SessionExecutionResult } from "@/session/worker/execute"
 import { WorkerCrashedError } from "@/session/worker/dispatch"
 import { createSessionHub, type WorkerCrashed } from "@/session/worker/hub"
+import { createTestBarrier } from "../../lib/run-barrier-test"
 import { WORKER_CRASH_PHASES, type WorkerCrashPhase } from "@/session/ledger/crash"
 import { createLifecycleTracker, type LifecycleTracker } from "@/session/ledger/lifecycle"
 import { sid } from "../../lib/async"
@@ -64,7 +65,7 @@ describe("hub lifecycle wiring (D8)", () => {
       const lifecycle = createLifecycleTracker()
       const pool = crashPool({ lifecycle, phase })
       const persisted: WorkerCrashed[] = []
-      const hub = createSessionHub({
+      const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
         pool,
         lifecycle,
         onWorkerCrashed: (payload) => void persisted.push(payload),
@@ -95,7 +96,7 @@ describe("hub lifecycle wiring (D8)", () => {
   test("a crash after commit carries the committed id and the in-flight tool call", async () => {
     const lifecycle = createLifecycleTracker()
     const pool = crashPool({ lifecycle, phase: "tool", inFlight: ["call_write"] })
-    const hub = createSessionHub({ pool, lifecycle })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool, lifecycle })
     const sessionID = sid("ses_after_commit")
     lifecycle.commit(sessionID, "msg_9")
 

@@ -32,6 +32,7 @@ import {
   SessionHubService,
   type ProductionPoolFactory,
 } from "@/session/worker/hub"
+import { RunBarrier } from "@/session/run-barrier"
 import { createLazyExecutorWorkerPool } from "../../lib/lazy-worker-pool"
 import type { SessionWorkerInit } from "@/session/worker/session-worker"
 import { sid } from "../../lib/async"
@@ -71,6 +72,7 @@ const providerModel = {
 
 const deps = () =>
   Layer.mergeAll(
+    RunBarrier.layer,
     Layer.mock(Config.Service, {
       get: () => Effect.succeed({ model: "config/default" } as ConfigV1.Info),
       directories: () => Effect.succeed(["/cfg/opencode"]),

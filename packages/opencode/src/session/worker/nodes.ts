@@ -9,7 +9,7 @@
 // today (an empty spread).
 //
 // It is intentionally decoupled from `hub.ts`: the caller supplies the hub node
-// (e.g. `SessionHubModule.productionSessionHubNode()`), so this module has no
+// (e.g. `SessionHub.productionSessionHubNode()`), so this module has no
 // dependency on the production pool factory. Nothing here acquires resources or
 // spawns workers — it only decides graph membership.
 //
@@ -31,12 +31,12 @@
 // // packages/opencode/src/effect/app-runtime.ts — inside AppLayer's group, after
 // // SessionRunState.node:
 // import { SessionWorkerNodes } from "@/session/worker/nodes"
-// import { SessionHubModule } from "@/session/worker/hub"
+// import { SessionHub } from "@/session/worker/hub"
 // ...
 // LayerNode.group([
 //   ...,
 //   SessionRunState.node,
-//   ...SessionWorkerNodes.sessionWorkerNodes({ hubNode: SessionHubModule.productionSessionHubNode() }),
+//   ...SessionWorkerNodes.sessionWorkerNodes({ hubNode: SessionHub.productionSessionHubNode() }),
 //   ...,
 // ])
 // ```

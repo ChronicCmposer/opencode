@@ -6,6 +6,7 @@
 // `(generation, ordinal)` when no writer meta is supplied.
 
 import { describe, expect, test } from "bun:test"
+import { recordingBridgeFrom } from "../../lib/recorders"
 import { decodeFrame } from "@/session/egress/frame"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { createEgressSender } from "@/session/egress/sender"
@@ -176,7 +177,7 @@ describe("egress sender", () => {
     const sender = createEgressSender({
       port: channel.port1,
       maxBatch: 2,
-      log: (message, _fields, level) => void warnings.push({ message, level }),
+      bridge: recordingBridgeFrom((line) => void warnings.push({ message: line.message, level: line.level })),
     })
     try {
       const huge: EventV2Event = {

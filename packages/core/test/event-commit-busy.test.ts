@@ -1,12 +1,12 @@
 // EventV2's durable commit is one whole transaction: `BEGIN IMMEDIATE`, the
 // sequence/lease writes, the projectors, and the event row. When another
-// connection holds the write lock, the adapter must not replay a single
-// statement inside that transaction — the commit owner must replay the entire
-// body with a fresh snapshot.
+// connection holds the write lock, the SQLite adapter retries the `BEGIN
+// IMMEDIATE` at the transaction boundary and never replays a single statement
+// inside the body (which would keep the stale snapshot).
 //
 // These tests drive the real EventV2 layer over a real SQLite file and pin the
 // write lock from a second native connection. The pre-fix path had no
-// whole-transaction retry, so the commit died with `database is locked`.
+// transaction-boundary retry, so the commit died with `database is locked`.
 
 import fs from "node:fs"
 import os from "node:os"
@@ -17,6 +17,7 @@ import { Effect, Layer, Schema } from "effect"
 import * as Client from "effect/unstable/sql/SqlClient"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
+import { DurableLog } from "../src/durable-log"
 import { Database as DatabaseService } from "../src/database/database"
 import { makeSqliteClient, type SqliteNativeRunner } from "../src/database/sqlite-adapter"
 import { EventV2 } from "../src/event"
@@ -104,13 +105,26 @@ function databaseLayer(filename: string, queries: string[]): Layer.Layer<Databas
   ).pipe(Layer.provide(Reactivity.layer))
 }
 
+function durableLogLayer(filename: string): Layer.Layer<DurableLog.Service> {
+  const native = new Database(filename, { create: true })
+  natives.push(native)
+  return DurableLog.layer({
+    connection: {
+      all: (sql, params = []) => native.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>,
+      run: (sql, params = []) => ({ changes: Number(native.query(sql).run(...(params as never[])).changes) }),
+      exec: (sql) => native.exec(sql),
+    },
+    ownerID: "event-v2-commit-busy-test",
+  })
+}
+
 afterEach(() => {
   for (const native of natives.splice(0)) native.close()
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
 })
 
 describe("EventV2 durable commit busy retry", () => {
-  test("replays the whole commit when another connection holds the write lock", async () => {
+  test("retries the busy BEGIN at the boundary when another connection holds the write lock", async () => {
     const database = open()
     const queries: string[] = []
     const holder = new Database(database.filename)
@@ -122,7 +136,7 @@ describe("EventV2 durable commit busy retry", () => {
       const release = setTimeout(() => holder.exec("COMMIT"), 150)
       try {
         const eventLayer = EventV2.layerWith({ blobDir: database.blobDir }).pipe(
-          Layer.provide(databaseLayer(database.filename, queries)),
+          Layer.provide(Layer.merge(databaseLayer(database.filename, queries), durableLogLayer(database.filename))),
         )
         const published = await Effect.runPromise(
           Effect.scoped(
@@ -134,10 +148,14 @@ describe("EventV2 durable commit busy retry", () => {
         )
 
         expect(published.durable?.seq).toBe(0)
-        // A busy begin is retried by replaying the transaction, never by
-        // re-issuing one statement inside the failed transaction.
+        // The adapter re-issues `BEGIN IMMEDIATE` at the transaction boundary;
+        // the body itself is never replayed inside the failed transaction.
         expect(queries.filter((query) => query === "BEGIN IMMEDIATE").length).toBeGreaterThan(1)
         expect(holder.query("SELECT seq FROM event_sequence WHERE aggregate_id = 's1'").get()).toEqual({ seq: 0 })
+        // The body itself ran exactly once: a replay would insert a second row.
+        expect(holder.query("SELECT COUNT(*) AS count FROM event WHERE aggregate_id = 's1'").get()).toEqual({
+          count: 1,
+        })
       } finally {
         clearTimeout(release)
       }

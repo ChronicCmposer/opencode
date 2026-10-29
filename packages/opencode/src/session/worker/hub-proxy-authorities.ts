@@ -2,9 +2,9 @@
 import { Context, Deferred, Effect, Option } from "effect"
 import { z } from "zod"
 import path from "node:path"
-import type { Hooks, ToolContext as PluginToolContext, ToolDefinition } from "@opencode-ai/plugin"
+import type { Hooks, ToolContext, ToolDefinition } from "@opencode-ai/plugin"
 import { BackgroundJob } from "@opencode-ai/core/background-job"
-import type { Info as BackgroundJobInfo, Status as BackgroundJobStatus } from "@opencode-ai/core/background-job"
+import type { Info, Status } from "@opencode-ai/core/background-job"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceRef } from "@/effect/instance-ref"
 import { EffectBridge } from "@/effect/bridge"
@@ -25,7 +25,7 @@ import { serveHubProxy } from "./hub-proxy-wire"
 import type { PluginToolDescriptor, PluginToolExecuteInput, PluginToolExecuteResult, PluginToolProgress, PluginToolProgressSink } from "./plugin-tool-wire"
 import { PluginToolNotSerializableError } from "./plugin-tool-wire"
 import { Session } from "@/session/session"
-import type { SessionPrompt } from "@/session/prompt"
+import { SessionPromptService } from "@/session/prompt-service"
 import { Truncate } from "@/tool/truncate"
 import { pluginToolJsonSchema } from "@/tool/registry"
 import { MCP } from "@/mcp"
@@ -33,7 +33,7 @@ import { McpCatalog } from "@/mcp/catalog"
 import { LspTool, Parameters as LspParameters } from "@/tool/lsp"
 import DESCRIPTION_LSP from "@/tool/lsp.txt"
 import { ToolJsonSchema } from "@/tool/json-schema"
-import type { Tool as ToolDef } from "@/tool/tool"
+import type { Tool } from "@/tool/tool"
 import { LSP } from "@/lsp/lsp"
 import { Agent } from "@/agent/agent"
 
@@ -145,14 +145,14 @@ export interface HubProxyAuthorities {
 /** One worker-reported terminal job state, settled into the hub mirror. */
 export interface WorkerBackgroundJobSettle {
   readonly id: string
-  readonly status: Exclude<BackgroundJobStatus, "running">
+  readonly status: Exclude<Status, "running">
   readonly output?: string
   readonly error?: string
 }
 
 /** The worker-job mirror surface exposed over the hub-proxy control port. */
 export interface WorkerBackgroundJobAuthority {
-  register(info: BackgroundJobInfo): Promise<void>
+  register(info: Info): Promise<void>
   settle(input: WorkerBackgroundJobSettle): Promise<void>
   /** Resolves `true` on promotion, `false` once the job settles or disappears. */
   awaitPromotion(id: string): Promise<boolean>
@@ -166,11 +166,12 @@ export interface WorkerBackgroundJobAuthority {
 export type HubProxyRunner = <A, E>(effect: Effect.Effect<A, E>) => Promise<A>
 
 /**
- * The prompt authority's string-keyed service. Resolving it by key lets the hub
- * run the authoritative children-first cancel without importing `prompt.ts`
- * (hub → prompt → run-state → hub would cycle).
+ * The prompt authority's shared service key. Resolving it from
+ * `prompt-service.ts` lets the hub run the authoritative children-first cancel
+ * without importing `prompt.ts` (hub → prompt → run-state → hub would cycle) and
+ * without declaring a second `@opencode/SessionPrompt` key.
  */
-const SessionPromptService = Context.Service<SessionPrompt.Interface>("@opencode/SessionPrompt")
+const promptAuthority = SessionPromptService.Service
 
 /** The descriptive rejection an absent plugin-tool authority returns (fail loud). */
 function missingPluginToolAuthority(what: string): Error {
@@ -243,7 +244,7 @@ export function buildHubProxyHandlers(authorities: HubProxyAuthorities, run: Hub
     // reports them. Absent an authority (a plain test hub) registration and
     // settlement are no-ops, but promotion never fabricates a `true`.
     "backgroundJob.register": (info) =>
-      authorities.backgroundJob?.register(info as BackgroundJobInfo) ?? Promise.resolve(),
+      authorities.backgroundJob?.register(info as Info) ?? Promise.resolve(),
     "backgroundJob.settle": (input) =>
       authorities.backgroundJob?.settle(input as WorkerBackgroundJobSettle) ?? Promise.resolve(),
     "backgroundJob.awaitPromotion": (id) =>
@@ -617,7 +618,7 @@ const executeHubTool = (
       if (Option.isNone(lsp)) return yield* Effect.fail(new UnknownPluginToolError(input.toolID))
       const abort = beginAbort()
       return yield* Effect.gen(function* () {
-        const ctx: ToolDef.Context = {
+        const ctx: Tool.Context = {
           sessionID: input.sessionID as SessionID,
           messageID: input.messageID as never,
           agent: input.agent,
@@ -664,7 +665,7 @@ const executeHubTool = (
 
 /**
  * Run one plugin tool on the hub: locate its definition, validate the forwarded
- * args, reconstruct the `PluginToolContext` the plugin expects, execute, then
+ * args, reconstruct the `ToolContext` the plugin expects, execute, then
  * normalize, bound (once) and sanitize the result exactly like the registry's
  * local `fromPlugin` path.
  */
@@ -699,7 +700,7 @@ function pluginToolExecute(
       signal: new AbortController().signal,
       dispose: () => {},
     }
-    const pluginCtx: PluginToolContext = {
+    const pluginCtx: ToolContext = {
       sessionID: input.sessionID,
       messageID: input.messageID,
       agent: input.agent,
@@ -1060,7 +1061,7 @@ export function cancelSessionFor(
       Effect.gen(function* () {
         const sessions = yield* Effect.serviceOption(Session.Service)
         if (Option.isNone(sessions)) return yield* Effect.die(missingSessionService())
-        const prompt = yield* Effect.serviceOption(SessionPromptService)
+        const prompt = yield* Effect.serviceOption(promptAuthority)
         if (Option.isNone(prompt)) return yield* Effect.die(missingPromptService())
         return yield* cancelSessionOnHub(sessions.value, boundSessionID, request, (sessionID) =>
           prompt.value.cancel(sessionID),

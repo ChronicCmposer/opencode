@@ -9,9 +9,22 @@
 //
 // The scheduler depends on the `WorkerPool` seam (not on Bun workers directly),
 // so scheduling stays deterministic in tests. The production adapter lives in
-// `hub.ts` (`createProductionWorkerPool`).
+// `hub.ts` (the scoped production pool).
 
-import { Cause, Deferred, Effect, Exit, Fiber, Ref, Schema, SynchronizedRef } from "effect"
+import {
+  Cause,
+  Context,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  FiberMap,
+  FiberSet,
+  Layer,
+  ManagedRuntime,
+  Schema,
+} from "effect"
 import type { SessionID } from "@/session/schema"
 import { isWorkerCrashPhase, workerCrashed, type WorkerCrashPhase, type WorkerCrashed } from "@/session/ledger/crash"
 import type { AutoResumeDecision } from "@/session/ledger/resume"
@@ -20,9 +33,10 @@ import { defined } from "@/util/object"
 import { createSessionWorkerRegistry, type SessionWorkerRegistry } from "./session-registry"
 import { defaultSchedule, errorTagOf, messageOf } from "./port"
 import { resolveReapMs } from "./pool"
-import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
+import type { EffectBridge } from "@/effect/bridge"
+import { workerLogMessage } from "./worker-logging"
 import { SessionWorkerReplyTimeoutError } from "./execute"
-import type { ExecutorRun, ExecutorSessionWorker, SessionRunMode } from "./execute"
+import type { ExecutorRun, ExecutorSessionWorker, SessionExecutionResult, SessionRunMode } from "./execute"
 import {
   createCancelController,
   createOutcomeGate,
@@ -62,6 +76,8 @@ export interface WorkerPool {
    * and any per-session pool state. Called once per retirement (reap/cancel/crash).
    */
   releaseSession?(sessionID: SessionID, workerID?: number): void
+  /** The worker's last `done` reply, when the pool retains it. */
+  resultFor?(sessionID: SessionID): SessionExecutionResult | undefined
   terminateAll(): Promise<void>
 }
 
@@ -103,6 +119,17 @@ export class WorkerCrashedError extends Schema.TaggedErrorClass<WorkerCrashedErr
 function describeFailure(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
+
+/**
+ * The classification of a run whose fiber exited because it was interrupted.
+ * Derived from `Cause.hasInterruptsOnly` (never from an error string or exit
+ * code), mirroring `Runner.Cancelled`.
+ */
+export class Cancelled extends Schema.TaggedErrorClass<Cancelled>()("SessionDispatchCancelled", {}) {}
+
+/** Classify a run exit cause as a clean cancellation, or `undefined` otherwise. */
+export const cancelledFromCause = (cause: Cause.Cause<unknown>): Cancelled | undefined =>
+  Cause.hasInterruptsOnly(cause) ? new Cancelled() : undefined
 
 /** Raised to the caller when a session is cancelled. */
 export class SessionCancelledError extends Schema.TaggedErrorClass<SessionCancelledError>()("SessionCancelledError", {
@@ -172,6 +199,11 @@ export interface CancellationConfig {
 
 export type Scheduler = (delayMs: number, run: () => void) => () => void
 
+/** The one commit outcome a run's `done` reply and the barrier agree on (F11). */
+export interface CommitOutcome {
+  readonly committed: string | null
+}
+
 export interface DispatchRequest {
   readonly sessionID: SessionID
   /** 0 = root; ≥1 = subagent child. Carried on the run; no scheduling split. */
@@ -193,13 +225,13 @@ export interface DispatcherOptions {
   /** Idle-reap window; defaults to `OPENCODE_SESSION_WORKER_REAP_MS` (300000). */
   readonly reapMs?: number
   readonly cancellation?: CancellationConfig
-  readonly log?: WorkerLogger
+  readonly bridge?: EffectBridge.Shape
   /**
    * Per-session write barrier: a completed run's worker is not released for its
    * next run until the barrier resolves, so the next run never overtakes the
    * prior run's durable egress write.
    */
-  readonly writeBarrier?: (sessionID: SessionID) => Promise<void> | undefined
+  readonly writeBarrier?: (sessionID: SessionID, outcome?: CommitOutcome) => Promise<void> | undefined
   /**
    * How long a completed run waits for its write barrier before releasing the
    * worker as if the barrier failed. Defaults to 5s; `0` or less fires the
@@ -214,6 +246,13 @@ export interface DispatcherOptions {
   readonly assertAdmissible?: (sessionID: SessionID) => void
   /** Hub-side cleanup when a session's worker is retired (reap/cancel/crash). */
   readonly onSessionReleased?: (sessionID: SessionID, workerID?: number) => unknown
+  /**
+   * Worker/generation-scoped cleanup for an in-place generation replacement
+   * (a mid-session model switch). It runs INSTEAD OF `onSessionReleased`, so the
+   * session's own hub state survives while the old generation's ports, pending
+   * asks and lease are released.
+   */
+  readonly onGenerationRetired?: (sessionID: SessionID, workerID?: number) => unknown
   /** Invoked synchronously when a run actually starts (not when it parks). */
   readonly onRunStart?: (sessionID: SessionID) => void
   /** Persist the D8 payload before the crash is returned to the caller. */
@@ -255,6 +294,12 @@ export interface DispatcherOptions {
     decision: Extract<AutoResumeDecision, { resume: true }>,
     payload: WorkerCrashed,
   ) => unknown
+  /**
+   * The hub's authoritative commit outcome for a completed run, read before the
+   * hub deletes its active-run record. Carried into the barrier and the run's
+   * `done` reply (F11).
+   */
+  readonly commitOutcome?: (sessionID: SessionID) => CommitOutcome | undefined
 }
 
 export interface Dispatcher extends AsyncDisposable {
@@ -266,6 +311,8 @@ export interface Dispatcher extends AsyncDisposable {
   /** The worker currently hosting `sessionID`'s active run, or `undefined` when idle. */
   workerForSession(sessionID: SessionID): number | undefined
   dispatch(request: DispatchRequest): Promise<void>
+  /** Effect-native admission used by the hub-side dispatcher adapter. */
+  dispatchEffect(request: DispatchRequest): Effect.Effect<void, unknown>
   cancel(sessionID: SessionID): Promise<void>
   cancelWithGrace(sessionID: SessionID): Promise<CascadeReport | undefined>
   /**
@@ -274,6 +321,13 @@ export interface Dispatcher extends AsyncDisposable {
    * cap, which evicts a worker the dispatcher would otherwise keep idle.
    */
   retire(sessionID: SessionID): Promise<void>
+  /**
+   * Retire one generation of a session's worker that the pool replaced in place
+   * (a mid-session model switch). Runs the same release gate and confirmed-exit
+   * barrier as `retire` but never terminates or drops the successor isolate: the
+   * pool reuses the same worker slot for the new generation.
+   */
+  retireGeneration(sessionID: SessionID, workerID?: number): Promise<void>
   /**
    * Release barrier: resolves once this session's in-flight retirement has
    * confirmed the isolate exit and finished its `onSessionReleased` callback
@@ -311,76 +365,51 @@ interface Pending {
   readonly model: { readonly providerID: string; readonly modelID: string } | undefined
   /** The caller's settlement cell; completed exactly once. */
   readonly done: Deferred.Deferred<void, unknown>
-  /** Synchronous Promise adapter for `done`, settled by the same call. */
-  readonly doneBridge: SettlementBridge<void>
   /** The cancellation controller's "the run completed" probe. */
   readonly completion: Deferred.Deferred<void>
-  /** Synchronous Promise adapter for `completion`, settled by the same call. */
-  readonly completionBridge: SettlementBridge<void>
-  /** The caller's promise, bridged from `done` at admission. */
-  readonly promise: Promise<void>
-  /** The completion probe, bridged from `completion` at admission. */
-  readonly completionPromise: Promise<void>
   /** Resolved by the barrier's finish path once `completionBarrierInFlight` clears. */
   readonly barrierDone: Deferred.Deferred<void>
-  /** Synchronous Promise adapter for `barrierDone`, settled by the same call. */
-  readonly barrierDoneBridge: SettlementBridge<void>
-  readonly phase: Ref.Ref<PendingPhase>
+  /** The caller's promise, derived from `done` at admission. */
+  readonly promise: Promise<void>
+  /** The completion probe, derived from `completion` at admission. */
+  readonly completionPromise: Promise<void>
+  /** The barrier probe, derived from `barrierDone` at admission. */
+  readonly barrierDonePromise: Promise<void>
+  phase: PendingPhase
   readonly gate: OutcomeGate
 }
 
 /**
- * A Promise viewer over a `Deferred`. `settle` runs only after the Deferred is
- * completed, and resolves/rejects the Promise in that same synchronous turn.
+ * The dispatcher's scoped Effect engine. `fork` owns every background fiber;
+ * `reaping`/`retiring` are session-keyed so a replacement timer or retirement
+ * interrupts the one it supersedes. A plain Map holds run ownership because JS
+ * transitions are synchronous inside one Effect step.
  */
-interface SettlementBridge<A> {
-  readonly promise: Promise<A>
-  readonly settle: () => void
+interface Engine {
+  readonly fork: <A, E>(effect: Effect.Effect<A, E>) => Fiber.Fiber<A, E>
+  readonly background: FiberSet.FiberSet<void>
+  readonly reaping: FiberMap.FiberMap<SessionID, void>
+  readonly runReap: (key: SessionID, effect: Effect.Effect<void>) => Fiber.Fiber<void>
+  readonly retiring: FiberMap.FiberMap<SessionID, void>
+  readonly runRetire: (key: SessionID, effect: Effect.Effect<void>) => Fiber.Fiber<void>
 }
 
-/**
- * The session ownership table. `runs` is the admitted run per session (the old
- * `byKey`), `waiters` is the unbounded parked-run list per session (the old
- * `waitersByKey`), and `terminated` is the shutdown latch. Every transition is
- * serialized through one `SynchronizedRef`, so a check and the state write it
- * guards can never be split by another ownership transition.
- */
-interface OwnershipState {
-  readonly runs: ReadonlyMap<SessionID, Pending>
-  readonly waiters: ReadonlyMap<SessionID, ReadonlyArray<Pending>>
-  readonly terminated: boolean
-}
+class DispatchEngine extends Context.Service<DispatchEngine, Engine>()("@opencode/SessionDispatchEngine") {}
 
-/** A new state with `pending` as the session's admitted run. */
-const withRun = (state: OwnershipState, sessionID: SessionID, pending: Pending): OwnershipState => {
-  const runs = new Map(state.runs)
-  runs.set(sessionID, pending)
-  return { ...state, runs }
-}
-
-/** A new state with no admitted run for the session (an absent run is a no-op). */
-const withoutRun = (state: OwnershipState, sessionID: SessionID): OwnershipState => {
-  if (!state.runs.has(sessionID)) return state
-  const runs = new Map(state.runs)
-  runs.delete(sessionID)
-  return { ...state, runs }
-}
-
-/** A new state with exactly `waiters` parked for the session (empty removes it). */
-const withWaiters = (state: OwnershipState, sessionID: SessionID, waiters: ReadonlyArray<Pending>): OwnershipState => {
-  const next = new Map(state.waiters)
-  if (waiters.length === 0) next.delete(sessionID)
-  else next.set(sessionID, waiters)
-  return { ...state, waiters: next }
-}
-
-/** A new state with the session's parked waiters removed. */
-const withoutWaiters = (state: OwnershipState, sessionID: SessionID): OwnershipState => {
-  if (!state.waiters.has(sessionID)) return state
-  const next = new Map(state.waiters)
-  next.delete(sessionID)
-  return { ...state, waiters: next }
-}
+const engineLayer = Layer.effect(
+  DispatchEngine,
+  Effect.gen(function* () {
+    const background = yield* FiberSet.make<void>()
+    const fork = (yield* FiberSet.runtime(background)()) as <A, E>(
+      effect: Effect.Effect<A, E>,
+    ) => Fiber.Fiber<A, E>
+    const reaping = yield* FiberMap.make<SessionID, void>()
+    const runReap = yield* FiberMap.runtime(reaping)()
+    const retiring = yield* FiberMap.make<SessionID, void>()
+    const runRetire = yield* FiberMap.runtime(retiring)()
+    return DispatchEngine.of({ fork, background, reaping, runReap, retiring, runRetire })
+  }),
+)
 
 /** How an admitted run may begin after its build/shutdown preflight. */
 type StartAdmission =
@@ -388,7 +417,7 @@ type StartAdmission =
   | { readonly kind: "blocked"; readonly error: unknown }
   | { readonly kind: "open" }
 
-/** What `nextWaiter` must do after atomically inspecting the session slot. */
+/** What `nextWaiter` must do after inspecting the session slot. */
 type NextWaiterDecision =
   | { readonly kind: "owned" }
   | { readonly kind: "idle" }
@@ -408,42 +437,26 @@ type FailOwnershipDecision =
   | { readonly kind: "gate-cancel" }
   | { readonly kind: "owned" }
 
-const phaseOf = (pending: Pending): PendingPhase => Ref.getUnsafe(pending.phase)
-
-const updatePhase = (pending: Pending, update: (phase: PendingPhase) => PendingPhase): void => {
-  Effect.runSync(Ref.update(pending.phase, update))
-}
-
-/** Bridge a `Deferred` to the synchronous Promise façade at the adapter boundary. */
-const bridgeDeferred = <A, E>(deferred: Deferred.Deferred<A, E>): SettlementBridge<A> => {
-  let deliver!: () => void
-  const promise = new Promise<A>((resolve, reject) => {
-    deliver = () => {
-      const exit = Effect.runSyncExit(Deferred.await(deferred))
-      if (Exit.isSuccess(exit)) resolve(exit.value)
-      else reject(Cause.squash(exit.cause))
-    }
-  })
-  return { promise, settle: deliver }
-}
+const phaseOf = (pending: Pending): PendingPhase => pending.phase
 
 /** Complete the caller's run exactly once; a later settlement is ignored. */
 const resolveRun = (pending: Pending): void => {
-  if (Deferred.doneUnsafe(pending.done, Effect.void)) pending.doneBridge.settle()
+  Deferred.doneUnsafe(pending.done, Effect.void)
 }
 
 /** Fail the caller's run exactly once; a later settlement is ignored. */
 const rejectRun = (pending: Pending, error: unknown): void => {
-  if (Deferred.doneUnsafe(pending.done, Effect.fail(error))) pending.doneBridge.settle()
+  Deferred.doneUnsafe(pending.done, Effect.fail(error))
 }
 
 /** Record the terminal observation once and wake the cancellation controller. */
 const markSettled = (pending: Pending): void => {
-  updatePhase(pending, (phase) => (phase.settled ? phase : { ...phase, settled: true }))
-  if (Deferred.doneUnsafe(pending.completion, Effect.void)) pending.completionBridge.settle()
+  if (!pending.phase.settled) pending.phase = { ...pending.phase, settled: true }
+  Deferred.doneUnsafe(pending.completion, Effect.void)
 }
 
 function createPending(
+  promiseOf: <A, E>(deferred: Deferred.Deferred<A, E>) => Promise<A>,
   sessionID: SessionID,
   depth: number,
   mode: SessionRunMode,
@@ -452,11 +465,8 @@ function createPending(
   model: { readonly providerID: string; readonly modelID: string } | undefined,
 ): Pending {
   const done = Deferred.makeUnsafe<void, unknown>()
-  const doneBridge = bridgeDeferred(done)
   const completion = Deferred.makeUnsafe<void>()
-  const completionBridge = bridgeDeferred(completion)
   const barrierDone = Deferred.makeUnsafe<void>()
-  const barrierDoneBridge = bridgeDeferred(barrierDone)
   return {
     sessionID,
     depth,
@@ -465,21 +475,21 @@ function createPending(
     shell,
     model,
     done,
-    doneBridge,
     completion,
-    completionBridge,
-    promise: doneBridge.promise,
-    completionPromise: completionBridge.promise,
     barrierDone,
-    barrierDoneBridge,
-    phase: Ref.makeUnsafe<PendingPhase>({
+    promise: promiseOf(done),
+    // The completion and barrier probes are internal; a runtime shutdown may
+    // interrupt a pending await, so they never surface an unhandled rejection.
+    completionPromise: promiseOf(completion).catch(() => undefined),
+    barrierDonePromise: promiseOf(barrierDone).catch(() => undefined),
+    phase: {
       settled: false,
       completed: false,
       startedAt: undefined,
       workerID: undefined,
       cancelPending: false,
       completionBarrierInFlight: false,
-    }),
+    },
     gate: createOutcomeGate(),
   }
 }
@@ -487,7 +497,7 @@ function createPending(
 export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const pool = options.pool
   const cancellation = options.cancellation
-  const log = options.log ?? noopWorkerLogger
+  const bridge = options.bridge
   const writeBarrier = options.writeBarrier
   const schedule = options.schedule ?? defaultSchedule
   const reapMs = options.reapMs ?? resolveReapMs()
@@ -495,75 +505,38 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const terminateTimeoutMs = options.terminateTimeoutMs ?? DEFAULT_TERMINATE_TIMEOUT_MS
   const writeBarrierTimeoutMs = options.writeBarrierTimeoutMs ?? DEFAULT_WRITE_BARRIER_TIMEOUT_MS
 
+  // The Effect engine owns every background fiber and timer. The promise-facing
+  // public methods cross this one managed-runtime boundary; the engine itself is
+  // pure Effect (FiberSet for supervision, FiberMap for session-keyed timers).
+  const runtime = ManagedRuntime.make(engineLayer)
+  const engine = runtime.runSync(DispatchEngine.use(Effect.succeed))
+  const promiseOf = <A, E>(deferred: Deferred.Deferred<A, E>): Promise<A> => runtime.runPromise(Deferred.await(deferred))
+
+  // Plain single-owner state. Every transition below is synchronous, so a
+  // check and the write it guards cannot interleave in JS's run-to-completion.
+  const runs = new Map<SessionID, Pending>()
+  const waiters = new Map<SessionID, Pending[]>()
+  let terminated = false
   // The session→worker map. Workers outlive runs (reuse across turns) until
   // idle-reap or terminal cancel disposes them.
   const workers = createSessionWorkerRegistry<SessionWorker>()
-  // Run ownership, parked waiters, and the shutdown latch are one atomic state.
-  const ownership = SynchronizedRef.makeUnsafe<OwnershipState>({
-    runs: new Map(),
-    waiters: new Map(),
-    terminated: false,
-  })
-  /**
-   * One armed reap timer per idle session. The token is installed BEFORE the
-   * fiber is forked, so a scheduler callback that resumes synchronously cannot
-   * fire before the identity fence exists. The fiber owns the delay and the
-   * probe, so clearing it interrupts both instead of relying on the host timer
-   * cancel to withdraw an already-queued callback.
-   */
-  interface IdleTimer {
-    readonly token: object
-    fiber: Fiber.Fiber<void> | undefined
-  }
-  const idleTimers = new Map<SessionID, IdleTimer>()
-  /** Forked fibers that outlive the synchronous call site, drained on shutdown. */
-  const backgroundFibers = new Set<Fiber.Fiber<void>>()
-  /**
-   * The bounded release+finish work for a live retirement. The exit Deferred is
-   * only signalled after this settles, so shutdown can join a watchdog-detached
-   * release instead of tearing the pool down underneath it.
-   */
-  const retirementReleases = new Map<SessionID, () => Promise<void>>()
-  /** Retirement fibers, stopped after their release settles so shutdown is bounded. */
-  const retirementFibers = new Set<Fiber.Fiber<void>>()
   const controllers = new Map<number, CancelController>()
   /**
-   * The confirmed-exit signal for a retiring generation. A successor must not
-   * start until the old isolate is gone and its lease release has landed.
+   * The retired-run signal for a session. Completed ONLY by the retirement
+   * fiber's `onExit` after its release settles; a successor awaits it.
    */
-  const terminating = new Map<SessionID, Deferred.Deferred<void>>()
+  const retiringDone = new Map<SessionID, Deferred.Deferred<void>>()
+  let disposed = false
 
-  /** The current ownership state, read without acquiring the transition lock. */
-  const stateOf = (): OwnershipState => SynchronizedRef.getUnsafe(ownership)
-
-  /**
-   * Apply one pure check-then-act transition atomically. The transition body must
-   * be synchronous and must never transition ownership again, so the effect can
-   * be run to completion inside the SynchronizedRef permit.
-   */
-  const ownershipTransition = Effect.fnUntraced(function* <A>(
-    update: (state: OwnershipState) => readonly [A, OwnershipState],
-  ) {
-    return yield* SynchronizedRef.modifyEffect(ownership, (state) => Effect.sync(() => update(state)))
-  })
-
-  /**
-   * Run one pure ownership transition to completion from a Promise-facing call
-   * site. The transition body never suspends and never re-enters ownership, so
-   * `runSync` is safe here; fiber-internal code should prefer `yield*` when it
-   * can. This is the documented Promise/Effect boundary.
-   */
-  const atomically = <A>(update: (state: OwnershipState) => readonly [A, OwnershipState]): A =>
-    Effect.runSync(ownershipTransition(update))
-
-  /** Track a forked fiber so shutdown can drain it; completed fibers self-remove. */
-  const trackFiber = (fiber: Fiber.Fiber<void>): void => {
-    backgroundFibers.add(fiber)
-    fiber.addObserver(() => backgroundFibers.delete(fiber))
-    // A synchronously completed fiber may never notify an observer added after
-    // completion, so drop it explicitly.
-    if (fiber.pollUnsafe() !== undefined) backgroundFibers.delete(fiber)
-  }
+  /** Create one run's settlement cells and Promise facade. */
+  const create = (
+    sessionID: SessionID,
+    depth: number,
+    mode: SessionRunMode,
+    prompt: PromptInput | undefined,
+    shell: ShellInput | undefined,
+    model: { readonly providerID: string; readonly modelID: string } | undefined,
+  ): Pending => createPending(promiseOf, sessionID, depth, mode, prompt, shell, model)
 
   /**
    * Bound a Promise with a deadline. A promise that settles is forwarded as-is;
@@ -571,6 +544,9 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
    * once and yields `undefined`, so the caller always resumes. When the deadline
    * has already elapsed the source is still observed, so its rejection can never
    * surface unhandled.
+   *
+   * The deadline is Effect's interruptible clock, not a raw host timer: the
+   * timeout fiber is interrupted the moment the source settles.
    */
   const boundedPromise = <A>(
     promise: Promise<A>,
@@ -578,20 +554,19 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     onTimeout: () => void,
   ): Promise<A | undefined> => {
     /**
-     * Run the deadline diagnostic without letting it escape. From a timer
-     * callback a throw would be an uncaught host exception; the deadline must
-     * still resolve the caller. The failure itself is reported as one more
-     * diagnostic, guarded because the logger is the seam that may have failed.
+     * Run the deadline diagnostic without letting it escape. From an Effect
+     * timeout callback a throw would be a defect that still resolves the caller
+     * wrong; the failure itself is reported as one more diagnostic, guarded
+     * because the logger is the seam that may have failed.
      */
     const reportTimeout = (): void => {
       try {
         onTimeout()
       } catch (error) {
         try {
-          log(workerLogMessage("timeout diagnostic failed"), {
-            level: "WARN",
-            reason: messageOf(error),
-          })
+          void bridge?.fork(
+            Effect.logWarning(workerLogMessage("timeout diagnostic failed"), { reason: messageOf(error) }),
+          )
         } catch {
           // No reporter left: settling the deadline is the only safe outcome.
         }
@@ -604,36 +579,34 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       reportTimeout()
       return Promise.resolve(undefined)
     }
-    let timer: ReturnType<typeof setTimeout> | undefined
-    return Promise.race([
-      promise,
-      new Promise<undefined>((resolve) => {
-        timer = setTimeout(() => {
-          reportTimeout()
-          resolve(undefined)
-        }, timeoutMs)
-        timer.unref?.()
-      }),
-    ]).finally(() => {
-      if (timer !== undefined) clearTimeout(timer)
-    })
+    return runtime.runPromise(
+      Effect.tryPromise({ try: () => promise, catch: (error) => error }).pipe(
+        Effect.timeoutOrElse({
+          duration: Duration.millis(timeoutMs),
+          orElse: () =>
+            Effect.sync(() => {
+              reportTimeout()
+              return undefined
+            }),
+        }),
+      ),
+    )
   }
 
   const cancelled = (sessionID: SessionID): SessionCancelledError =>
     new SessionCancelledError({ message: `session ${sessionID} was cancelled`, sessionID })
 
+  /**
+   * A new turn under a session key interrupts any pending reap timer: the
+   * FiberMap replacement is the identity fence, so no token bookkeeping remains.
+   */
   const clearIdle = (sessionID: SessionID): void => {
-    const timer = idleTimers.get(sessionID)
-    if (timer === undefined) return
-    idleTimers.delete(sessionID)
-    // Interrupting the fiber also runs the scheduler cancel through the
-    // callback's cleanup, so a callback the host already queued cannot reap.
-    if (timer.fiber !== undefined) trackFiber(Effect.runFork(Fiber.interrupt(timer.fiber)))
+    engine.runReap(sessionID, Effect.void)
   }
 
-  const hasWaiters = (sessionID: SessionID): boolean => (stateOf().waiters.get(sessionID)?.length ?? 0) > 0
+  const hasWaiters = (sessionID: SessionID): boolean => (waiters.get(sessionID)?.length ?? 0) > 0
 
-  const hasRun = (sessionID: SessionID): boolean => stateOf().runs.has(sessionID)
+  const hasRun = (sessionID: SessionID): boolean => runs.has(sessionID)
 
   /**
    * The typed refusal when the session's build is no longer admissible (or
@@ -661,12 +634,13 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     try {
       return await worker.hasActiveWork(sessionID)
     } catch (error) {
-      log(workerLogMessage("background probe failed"), {
-        level: "warn",
-        sessionID,
-        workerID: worker.id,
-        reason: messageOf(error),
-      })
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("background probe failed"), {
+          sessionID,
+          workerID: worker.id,
+          reason: messageOf(error),
+        }),
+      )
       return false
     }
   }
@@ -677,63 +651,51 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
    * or parked waiter must win, and a retired/replaced worker must not be touched
    * by a stale timer.
    */
-  const reapIfIdle = (sessionID: SessionID, token: object): Effect.Effect<void> =>
+  const reapIfIdle = (sessionID: SessionID): Effect.Effect<void> =>
     Effect.gen(function* () {
-      // A callback the host queued before `clearIdle` interrupted its fiber must
-      // be inert: only the timer still installed for this session may reap.
-      if (idleTimers.get(sessionID)?.token !== token) return
-      idleTimers.delete(sessionID)
-      if (stateOf().terminated || hasRun(sessionID) || hasWaiters(sessionID)) return
+      if (terminated || hasRun(sessionID) || hasWaiters(sessionID)) return
       const worker = workers.worker(sessionID)
       if (worker === undefined) return
-      const active = yield* Effect.promise(() => hasActiveWork(worker, sessionID))
+      const active = yield* Effect.tryPromise({
+        try: () => hasActiveWork(worker, sessionID),
+        catch: (error) => error,
+      }).pipe(Effect.orElseSucceed(() => false))
       // Re-check after the await: a new run or parked waiter must win, and a
       // retired/replaced worker must not be touched by this stale timer.
-      if (stateOf().terminated || hasRun(sessionID) || hasWaiters(sessionID)) return
+      if (terminated || hasRun(sessionID) || hasWaiters(sessionID)) return
       if (workers.worker(sessionID) !== worker) return
-      // A newer idle window may have been armed while the probe was pending.
-      const newerTimer = idleTimers.get(sessionID)
-      if (newerTimer !== undefined && newerTimer.token !== token) return
       if (active) {
-        // A running background job still owns this isolate; arm a fresh window
-        // instead of retiring it. Its own completion is observed by the next probe.
+        // A running background job still owns this isolate; replace this timer
+        // with a fresh window under the same key.
         scheduleReap(sessionID)
         return
       }
       retireWorker(sessionID)
-      log(workerLogMessage("session worker reaped"), {
-        level: "INFO",
-        sessionID,
-        workerID: worker.id,
-        idleMs: reapMs,
-      })
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("session worker reaped"), {
+          sessionID,
+          workerID: worker.id,
+          idleMs: reapMs,
+        }),
+      )
     })
 
   /**
-   * The fenced delay for one reap. The scheduler seam stays callback-based, but
-   * its cancel runs as the callback's cleanup when the fiber is interrupted.
+   * The delay for one reap. The scheduler seam stays callback-based, but its
+   * cancel runs as the callback's cleanup when the fiber is interrupted.
    */
-  const reapAfterDelay = (sessionID: SessionID, token: object): Effect.Effect<void> =>
+  const reapAfterDelay = (sessionID: SessionID): Effect.Effect<void> =>
     Effect.gen(function* () {
       yield* Effect.callback<void>((resume) => {
         const cancel = schedule(reapMs, () => resume(Effect.void))
         return Effect.sync(cancel)
       })
-      yield* reapIfIdle(sessionID, token)
+      yield* reapIfIdle(sessionID)
     })
 
   const scheduleReap = (sessionID: SessionID): void => {
-    clearIdle(sessionID)
-    if (stateOf().terminated || workers.worker(sessionID) === undefined) return
-    // Install the identity fence before forking: a scheduler seam may invoke the
-    // callback synchronously during registration.
-    const timer: IdleTimer = { token: {}, fiber: undefined }
-    idleTimers.set(sessionID, timer)
-    const fiber = Effect.runFork(reapAfterDelay(sessionID, timer.token))
-    if (idleTimers.get(sessionID) === timer) timer.fiber = fiber
-    // The probe crosses the worker protocol and may never answer. Track the
-    // reap fiber so shutdown can drain (then interrupt) it instead of leaking it.
-    trackFiber(fiber)
+    if (terminated || workers.worker(sessionID) === undefined) return
+    engine.runReap(sessionID, reapAfterDelay(sessionID))
   }
 
   const disposeController = (workerID: number): void => {
@@ -741,6 +703,136 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     if (controller === undefined) return
     controller.dispose()
     controllers.delete(workerID)
+  }
+
+  /**
+   * The shared retirement release gate. `scope` selects which lifetime the hook
+   * releases: a terminal retirement ("session": crash/reap/cancel/idle eviction)
+   * also runs the pool's session cleanup and the session-release hook, while an
+   * in-place generation replacement ("generation": a mid-session model switch)
+   * runs only the generation-scoped hook. Both signal the same confirmed-exit
+   * barrier AFTER the release lands, so a successor never starts against a live
+   * old generation.
+   */
+  const beginRetirement = (
+    sessionID: SessionID,
+    worker: SessionWorker,
+    scope: "session" | "generation",
+  ): Promise<void> => {
+    // Retirement is reported only after the isolate has actually exited. A
+    // still-live old generation could otherwise write after its lease was
+    // zeroed and re-stamp the expiry, starving the successor. The callback may
+    // be async (the hub's lease release is an executor round-trip); await it in
+    // the same fiber so a successor waits for the release too.
+    const exit = Deferred.makeUnsafe<void>()
+    retiringDone.set(sessionID, exit)
+    let releasing: Promise<void> | undefined
+    /** Run the release hook exactly once, even if the terminate watchdog races. */
+    const release = (): Promise<void> => {
+      if (releasing !== undefined) return releasing
+      releasing = (async () => {
+        // The pool's session state (init cache, idle-cap bookkeeping) belongs to
+        // the session, not the generation. Only a terminal retirement drops it;
+        // a generation switch leaves it for the successor on the same slot.
+        if (scope === "session") {
+          try {
+            pool.releaseSession?.(sessionID, worker.id)
+          } catch (error) {
+            void bridge?.fork(
+              Effect.logWarning(workerLogMessage("session release callback failed"), {
+                sessionID,
+                workerID: worker.id,
+                reason: messageOf(error),
+              }),
+            )
+          }
+        }
+        const hook = scope === "generation" ? options.onGenerationRetired : options.onSessionReleased
+        try {
+          // The callback may be async (the hub's lease release is an executor
+          // round-trip); await it before signalling the successor.
+          const released = hook?.(sessionID, worker.id) as PromiseLike<unknown> | undefined
+          if (released !== undefined && typeof released.then === "function") {
+            // A generation release must complete its synchronous epoch advance
+            // and exact-owner capture BEFORE the successor is admitted, so the
+            // whole hook is awaited unbounded. Only the lease UPDATE inside the
+            // hub is bounded; a terminal session release keeps the old deadline.
+            if (scope === "generation") await released
+            else
+              await boundedPromise(Promise.resolve(released), terminateTimeoutMs, () =>
+                void bridge?.fork(
+                  Effect.logWarning(workerLogMessage("release callback timed out"), {
+                    sessionID,
+                    workerID: worker.id,
+                    timeoutMs: terminateTimeoutMs,
+                  }),
+                ),
+              )
+          }
+        } catch (error) {
+          // A callback that throws must not leave the exit signal failed (a
+          // successor may be waiting) nor park it: log and treat it as settled.
+          void bridge?.fork(
+            Effect.logWarning(workerLogMessage("release callback failed"), {
+              sessionID,
+              workerID: worker.id,
+              reason: messageOf(error),
+            }),
+          )
+        }
+      })()
+      return releasing
+    }
+    /**
+     * Complete the retired Deferred exactly once, and only from the retirement
+     * fiber's `onExit` after the idempotent release has settled (or failed).
+     */
+    const completeRetired = (): void => {
+      if (retiringDone.get(sessionID) === exit) retiringDone.delete(sessionID)
+      Deferred.doneUnsafe(exit, Effect.void)
+    }
+    const releaseEffect: Effect.Effect<void> = Effect.promise(() => release()).pipe(Effect.ignoreCause)
+    // The pool terminated the old isolate before it reported the generation
+    // change, so there is nothing left to watch: run the release directly (the
+    // pool awaits the retired Deferred before spawning the successor).
+    const body =
+      scope === "generation"
+        ? releaseEffect
+        : Effect.tryPromise({ try: () => worker.terminate().catch(() => undefined), catch: (error) => error }).pipe(
+            Effect.timeoutOrElse({
+              duration: terminateTimeoutMs,
+              orElse: () =>
+                Effect.sync(() => {
+                  void bridge?.fork(
+                    Effect.logWarning(workerLogMessage("retirement terminate timed out"), {
+                      sessionID,
+                      workerID: worker.id,
+                      timeoutMs: terminateTimeoutMs,
+                    }),
+                  )
+                }),
+            }),
+            Effect.ignore,
+            Effect.andThen(releaseEffect),
+          )
+    // A terminal retirement exposes its bounded barrier through `retire`/
+    // `awaitRelease`; the generation path awaits the same completed Deferred so
+    // the pool can gate the successor on the release.
+    engine.runRetire(
+      sessionID,
+      body.pipe(
+        // One annotation at the per-session/per-worker fiber boundary, so every
+        // Effect log inside the retirement carries the ids the forwarding logger
+        // renders into the user-visible prefix.
+        Effect.annotateLogs({ sessionID, workerID: worker.id }),
+        Effect.onExit(() =>
+          Effect.uninterruptible(
+            releaseEffect.pipe(Effect.andThen(Effect.sync(completeRetired))),
+          ),
+        ),
+      ),
+    )
+    return scope === "generation" ? runtime.runPromise(Deferred.await(exit)) : Promise.resolve()
   }
 
   /**
@@ -756,122 +848,62 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const worker = workers.dispose(sessionID)
     if (worker === undefined) return undefined
     if (retireOptions.keepController !== true) disposeController(worker.id)
-    // Retirement is reported only after the isolate has actually exited. A
-    // still-live old generation could otherwise write after its lease was
-    // zeroed and re-stamp the expiry, starving the successor. The callback may
-    // be async (the hub's lease release is an executor round-trip); await it in
-    // the same chain so a successor waits for the release too.
-    const exit = Deferred.makeUnsafe<void>()
-    terminating.set(sessionID, exit)
-    let finished = false
-    let releasing: Promise<void> | undefined
-    /** Run the release hook exactly once, even if the terminate watchdog races. */
-    const release = (): Promise<void> => {
-      if (releasing !== undefined) return releasing
-      releasing = (async () => {
-        // The callback may be async (the hub's lease release is an executor
-        // round-trip); await it before signalling the successor. A throwing
-        // pool clean-up must not skip the lease-sensitive hook below.
-        try {
-          pool.releaseSession?.(sessionID, worker.id)
-        } catch (error) {
-          log(workerLogMessage("session release callback failed"), {
-            level: "WARN",
-            sessionID,
-            workerID: worker.id,
-            reason: messageOf(error),
-          })
-        }
-        try {
-          const released = options.onSessionReleased?.(sessionID, worker.id) as PromiseLike<unknown> | undefined
-          // A synchronous hook resumes without paying the deadline; only a
-          // thenable that never settles does.
-          if (released !== undefined && typeof released.then === "function") {
-            await boundedPromise(Promise.resolve(released), terminateTimeoutMs, () =>
-              log(workerLogMessage("session release callback timed out"), {
-                level: "WARN",
-                sessionID,
-                workerID: worker.id,
-                timeoutMs: terminateTimeoutMs,
-              }),
-            )
-          }
-        } catch (error) {
-          // A callback that throws must not leave the exit signal failed (a
-          // successor may be waiting) nor park it: log and treat it as settled.
-          log(workerLogMessage("session release callback failed"), {
-            level: "WARN",
-            sessionID,
-            workerID: worker.id,
-            reason: messageOf(error),
-          })
-        }
-      })()
-      return releasing
-    }
-    /** Signal the successor exactly once (normal exit or the terminate deadline). */
-    const finish = (): void => {
-      if (finished) return
-      finished = true
-      if (terminating.get(sessionID) === exit) {
-        terminating.delete(sessionID)
-        retirementReleases.delete(sessionID)
-      }
-      Deferred.doneUnsafe(exit, Effect.void)
-    }
-    /**
-     * Run the release hook and only then signal the exit. The exit Deferred is
-     * the successor's confirmation, so resolving it before an asynchronous lease
-     * release lands would admit the successor against a still-live generation.
-     */
-    const releaseThenFinish = (): Promise<void> => release().then(finish, finish)
-    retirementReleases.set(sessionID, releaseThenFinish)
-    // A wedged terminate must not leak the fiber, pin the barrier, or wedge
-    // idle-cap eviction. At the deadline, run the release hook and confirm the
-    // exit ourselves; a late terminate only joins the same idempotent release.
-    // The fiber is interrupted only after that release settles, so its `ensuring`
-    // cannot signal the exit while the async release hook is still pending.
-    let retirementFiber: Fiber.Fiber<void> | undefined
-    const watchdog = setTimeout(() => {
-      if (finished) return
-      log(workerLogMessage("retirement terminate timed out"), {
-        level: "WARN",
-        sessionID,
-        workerID: worker.id,
-        timeoutMs: terminateTimeoutMs,
-      })
-      void releaseThenFinish().then(() => {
-        if (retirementFiber === undefined) return
-        backgroundFibers.delete(retirementFiber)
-        retirementFibers.delete(retirementFiber)
-        retirementFiber.interruptUnsafe()
-      })
-    }, Math.max(0, terminateTimeoutMs))
-    watchdog.unref?.()
-    const fiber = Effect.runFork(
-      Effect.promise(async () => {
-        // Retirement is reported only after the isolate exits. The watchdog
-        // above bounds the observable wait; this fiber is interrupted during
-        // shutdown if the isolate never settles.
-        await worker.terminate().catch(() => undefined)
-        await releaseThenFinish()
-      }).pipe(
-        Effect.ensuring(
-          Effect.sync(() => {
-            clearTimeout(watchdog)
-            // An interrupted terminate may never reach the release, so start it
-            // here. It still signals the exit (through `finish`) only after the
-            // lease release lands; shutdown joins the same promise.
-            void releaseThenFinish()
-          }),
-        ),
-      ),
-    )
-    retirementFiber = fiber
-    retirementFibers.add(fiber)
-    fiber.addObserver(() => retirementFibers.delete(fiber))
-    trackFiber(fiber)
+    beginRetirement(sessionID, worker, "session")
     return worker
+  }
+
+  /**
+   * Retire one generation the pool replaced in place. The session→worker entry
+   * and the successor isolate are untouched: the same slot serves the new
+   * generation, so only the old generation's controller, ports, pending asks and
+   * lease are released.
+   */
+  const retireGeneration = (sessionID: SessionID, workerID?: number): Promise<void> => {
+    const worker = workers.worker(sessionID)
+    if (worker === undefined) {
+      // The registry entry can already be gone when a concurrent terminal reap
+      // drops it before the pool reports the in-place generation change. The
+      // pool has terminated the old isolate by then, so run the generation
+      // release directly: skipping it would leave the retired lease live and
+      // the old epoch unadvanced. This runs synchronously, before any successor
+      // dispatch can create a new entry.
+      if (workerID === undefined) return Promise.resolve()
+      clearIdle(sessionID)
+      disposeController(workerID)
+      return invokeGenerationRelease(sessionID, workerID)
+    }
+    if (workerID !== undefined && worker.id !== workerID) {
+      // A different live worker already owns the session: the old generation
+      // was retired when its registry entry was replaced. Running the
+      // generation hook now would advance the CURRENT generation's ask epoch
+      // and cancel the successor's asks, so this stale report is a no-op.
+      return Promise.resolve()
+    }
+    // A terminal retirement already owns this session's release gate; join its
+    // release rather than starting a second, competing one.
+    const retiring = retiringDone.get(sessionID)
+    if (retiring !== undefined) return runtime.runPromise(Deferred.await(retiring))
+    clearIdle(sessionID)
+    disposeController(worker.id)
+    return beginRetirement(sessionID, worker, "generation")
+  }
+
+  /** Run the generation-scoped release with no dispatcher record to gate it. */
+  const invokeGenerationRelease = (sessionID: SessionID, workerID: number): Promise<void> => {
+    const hook = options.onGenerationRetired
+    if (hook === undefined) return Promise.resolve()
+    try {
+      return Promise.resolve(hook(sessionID, workerID)).then(() => undefined)
+    } catch (error) {
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("generation release callback failed"), {
+          sessionID,
+          workerID,
+          reason: messageOf(error),
+        }),
+      )
+      return Promise.resolve()
+    }
   }
 
   const controllerFor = (config: CancellationConfig, worker: SessionWorker, port: CancelPort): CancelController => {
@@ -882,7 +914,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       terminate: () => worker.terminate().then(() => undefined),
       ...defined({ graceMs: config.graceMs, schedule: config.schedule }),
       reap: () => config.reap?.(worker),
-      log,
+      ...(bridge === undefined ? {} : { bridge }),
       workerID: worker.id,
     })
     controllers.set(worker.id, controller)
@@ -898,11 +930,9 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const replaceDeadIdleWorker = (sessionID: SessionID): void => {
     const entry = workers.entry(sessionID)
     if (entry === undefined || entry.state !== "idle" || entry.worker.alive) return
-    log(workerLogMessage("dead idle worker replaced"), {
-      level: "WARN",
-      sessionID,
-      workerID: entry.id,
-    })
+    void bridge?.fork(
+      Effect.logWarning(workerLogMessage("dead idle worker replaced"), { sessionID, workerID: entry.id }),
+    )
     retireWorker(sessionID)
   }
 
@@ -917,11 +947,12 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       Effect.map(() => true),
       Effect.catchCause((cause) =>
         Effect.sync(() => {
-          log(workerLogMessage("retirement exit failed"), {
-            level: "WARN",
-            sessionID,
-            reason: messageOf(Cause.squash(cause)),
-          })
+          void bridge?.fork(
+            Effect.logWarning(workerLogMessage("retirement exit failed"), {
+              sessionID,
+              reason: messageOf(Cause.squash(cause)),
+            }),
+          )
           return true
         }),
       ),
@@ -929,12 +960,13 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
         duration: terminateTimeoutMs,
         orElse: () =>
           Effect.sync(() => {
-            log(workerLogMessage("retirement exit timed out"), {
-              level: "WARN",
-              sessionID,
-              timeoutMs: terminateTimeoutMs,
-              reason: "the retiring generation never confirmed its exit; starting the successor",
-            })
+            void bridge?.fork(
+              Effect.logWarning(workerLogMessage("retirement exit timed out"), {
+                sessionID,
+                timeoutMs: terminateTimeoutMs,
+                reason: "the retiring generation never confirmed its exit; starting the successor",
+              }),
+            )
             return false
           }),
       }),
@@ -947,27 +979,25 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
    * can never materialize against a live old isolate.
    */
   const deferUntilRetired = (pending: Pending, exit: Deferred.Deferred<void>): void => {
-    trackFiber(
-      Effect.runFork(
-        Effect.gen(function* () {
-          // A successor must re-observe ownership after this turn, never re-enter
-          // the caller's stack synchronously when the exit signal is already set.
-          yield* Effect.yieldNow
-          const settled = yield* awaitTerminating(pending.sessionID, exit)
-          // A timed-out retirement is still live. Keep it in `terminating` so
-          // `retiringCount`/`awaitRelease` remain accurate; the successor still
-          // starts (bounded), but through the explicit bypass below instead of
-          // deleting evidence of the live generation.
-          if (settled && terminating.get(pending.sessionID) === exit) terminating.delete(pending.sessionID)
-          if (stateOf().runs.get(pending.sessionID) !== pending) return
-          if (stateOf().terminated) {
-            pending.gate.claim("cancel")
-            rejectRun(pending, cancelled(pending.sessionID))
-            return
-          }
-          start(pending, { permitLiveRetirement: !settled })
-        }),
-      ),
+    engine.fork(
+      Effect.gen(function* () {
+        // A successor must re-observe ownership after this turn, never re-enter
+        // the caller's stack synchronously when the exit signal is already set.
+        yield* Effect.yieldNow
+        const settled = yield* awaitTerminating(pending.sessionID, exit)
+        // A timed-out retirement is still live. Keep it in `retiringDone` so
+        // `retiringCount`/`awaitRelease` remain accurate; the successor still
+        // starts (bounded), but through the explicit bypass below instead of
+        // deleting evidence of the live generation.
+        if (settled && retiringDone.get(pending.sessionID) === exit) retiringDone.delete(pending.sessionID)
+        if (runs.get(pending.sessionID) !== pending) return
+        if (terminated) {
+          pending.gate.claim("cancel")
+          rejectRun(pending, cancelled(pending.sessionID))
+          return
+        }
+        start(pending, { permitLiveRetirement: !settled })
+      }),
     )
   }
 
@@ -977,19 +1007,20 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
    * must not pin `retire`/`awaitRelease` (and therefore idle-cap eviction) forever.
    */
   const retirementBarrier = (sessionID: SessionID): Promise<void> => {
-    const exit = terminating.get(sessionID)
+    const exit = retiringDone.get(sessionID)
     if (exit === undefined) return Promise.resolve()
-    return Effect.runPromise(
+    return runtime.runPromise(
       Deferred.await(exit).pipe(
         Effect.timeoutOrElse({
           duration: terminateTimeoutMs,
           orElse: () =>
             Effect.sync(() =>
-              log(workerLogMessage("retirement barrier timed out"), {
-                level: "WARN",
-                sessionID,
-                timeoutMs: terminateTimeoutMs,
-              }),
+              void bridge?.fork(
+                Effect.logWarning(workerLogMessage("retirement barrier timed out"), {
+                  sessionID,
+                  timeoutMs: terminateTimeoutMs,
+                }),
+              ),
             ),
         }),
       ),
@@ -1004,33 +1035,38 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   /** The explicit release barrier for a retirement that is already in flight. */
   const awaitRelease = (sessionID: SessionID): Promise<void> => retirementBarrier(sessionID)
 
+  /** Settle a run whose supervised fiber was interrupted as a clean cancel. */
+  const cancelInterrupted = (pending: Pending): void => {
+    pending.gate.claim("cancel")
+    rejectRun(pending, cancelled(pending.sessionID))
+  }
+
   const start = (
     pending: Pending,
     startOptions: { readonly permitLiveRetirement?: boolean } = {},
   ): void => {
-    // The build guard is user code: run it before taking the ownership permit,
-    // so a guard that re-enters dispatch/terminateAll cannot find the lock held.
-    // Shutdown still wins because the transition below re-checks the latch.
-    const blocked = stateOf().terminated ? undefined : inadmissible(pending.sessionID)
-    const admission = atomically<StartAdmission>((state) => {
-      if (state.terminated) return [{ kind: "terminated" }, state]
-      // A build that became inadmissible while this run waited (a crash blocked
-      // the bundle) must reject here too, before any isolate is materialized.
-      if (blocked === undefined) return [{ kind: "open" }, state]
-      const owns = state.runs.get(pending.sessionID) === pending
-      return [{ kind: "blocked", error: blocked }, owns ? withoutRun(state, pending.sessionID) : state]
-    })
+    // The build guard is user code: run it before mutating ownership, so a guard
+    // that re-enters dispatch/terminateAll cannot observe a half-written state.
+    const blocked = terminated ? undefined : inadmissible(pending.sessionID)
+    const admission: StartAdmission = terminated
+      ? { kind: "terminated" }
+      : blocked === undefined
+        ? { kind: "open" }
+        : { kind: "blocked", error: blocked }
     if (admission.kind === "terminated") {
       pending.gate.claim("cancel")
       rejectRun(pending, cancelled(pending.sessionID))
       return
     }
     if (admission.kind === "blocked") {
+      // A build that became inadmissible while this run waited (a crash blocked
+      // the bundle) must reject here too, before any isolate is materialized.
+      if (runs.get(pending.sessionID) === pending) runs.delete(pending.sessionID)
       if (pending.gate.claim("cancel")) rejectRun(pending, admission.error)
       nextWaiter(pending.sessionID)
       return
     }
-    const exiting = startOptions.permitLiveRetirement === true ? undefined : terminating.get(pending.sessionID)
+    const exiting = startOptions.permitLiveRetirement === true ? undefined : retiringDone.get(pending.sessionID)
     if (exiting !== undefined) {
       deferUntilRetired(pending, exiting)
       return
@@ -1042,22 +1078,23 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     // successor must wait for the old close and lease release. A retirement that
     // already timed out is bypassed explicitly (it stays visible for diagnostics).
     const replaced =
-      startOptions.permitLiveRetirement === true ? undefined : terminating.get(pending.sessionID)
+      startOptions.permitLiveRetirement === true ? undefined : retiringDone.get(pending.sessionID)
     if (replaced !== undefined) {
       deferUntilRetired(pending, replaced)
       return
     }
     options.onRunStart?.(pending.sessionID)
     const worker = workers.getOrCreate(pending.sessionID, (id) => pool.spawn(id))
-    updatePhase(pending, (phase) => ({ ...phase, startedAt: Date.now(), workerID: worker.id }))
+    pending.phase = { ...pending.phase, startedAt: Date.now(), workerID: worker.id }
     workers.markRunning(pending.sessionID)
-    log(workerLogMessage("session admitted"), {
-      level: "INFO",
-      sessionID: pending.sessionID,
-      workerID: worker.id,
-      depth: pending.depth,
-      queueDepth: stateOf().waiters.get(pending.sessionID)?.length ?? 0,
-    })
+    void bridge?.fork(
+      Effect.logInfo(workerLogMessage("session admitted"), {
+        sessionID: pending.sessionID,
+        workerID: worker.id,
+        depth: pending.depth,
+        queueDepth: waiters.get(pending.sessionID)?.length ?? 0,
+      }),
+    )
     const run: SessionRun = {
       sessionID: pending.sessionID,
       depth: pending.depth,
@@ -1066,21 +1103,24 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       ...(pending.shell === undefined ? {} : { shell: pending.shell }),
       ...(pending.model === undefined ? {} : { model: pending.model }),
     }
-    let execution: Promise<void>
-    try {
-      execution = worker.execute(run)
-    } catch (error) {
-      execution = Promise.reject(error)
-    }
-    execution.then(
-      () => complete(pending),
-      (error) => fail(pending, error),
+    const execution = Effect.tryPromise({
+      try: () => worker.execute(run),
+      catch: (error) => error,
+    }).pipe(
+      Effect.exit,
+      Effect.flatMap((exit) => {
+        if (Exit.isSuccess(exit)) return Effect.sync(() => complete(pending))
+        const cause = exit.cause
+        if (cancelledFromCause(cause) !== undefined) return Effect.sync(() => cancelInterrupted(pending))
+        return Effect.sync(() => fail(pending, Cause.squash(cause)))
+      }),
     )
+    engine.fork(execution)
   }
 
   /** Release a completed run once the per-session write barrier (if any) resolves. */
   const complete = (pending: Pending): void => {
-    updatePhase(pending, (phase) => ({ ...phase, completed: true }))
+    pending.phase = { ...pending.phase, completed: true }
     markSettled(pending)
     // A cancel that already claimed the run owns the terminal decision; a run
     // whose session a successor now owns must not touch its write barrier.
@@ -1094,29 +1134,32 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     // Mark ownership BEFORE invoking the barrier: a cancel settlement observes
     // the flag and must leave release/promotion to this barrier's single
     // completion. Every path below clears the flag exactly once.
-    updatePhase(pending, (phase) => ({ ...phase, completionBarrierInFlight: true }))
+    pending.phase = { ...pending.phase, completionBarrierInFlight: true }
     let finalized = false
     const finish = (): void => {
       if (finalized) return
       finalized = true
-      updatePhase(pending, (phase) => ({ ...phase, completionBarrierInFlight: false }))
+      pending.phase = { ...pending.phase, completionBarrierInFlight: false }
       // A cancel that already claimed this run owns release/retire/promotion
       // once the barrier resolves, so it must not be finalized as a completion.
       // A completion still owns its own finalization here.
       if (pending.gate.winner !== "cancel") finalizeCompletion(pending)
-      if (Deferred.doneUnsafe(pending.barrierDone, Effect.void)) pending.barrierDoneBridge.settle()
+      Deferred.doneUnsafe(pending.barrierDone, Effect.void)
     }
+    const reported = pool.resultFor?.(pending.sessionID)?.committed
+    const carried = options.commitOutcome?.(pending.sessionID) ?? (reported === undefined ? undefined : { committed: reported })
     let barrier: Promise<void> | undefined
     try {
-      barrier = writeBarrier?.(pending.sessionID)
+      barrier = writeBarrier?.(pending.sessionID, carried)
     } catch (error) {
       // A throwing seam is treated as a resolved barrier so the run can never
       // park its worker forever.
-      log(workerLogMessage("session write barrier failed"), {
-        level: "WARN",
-        sessionID: pending.sessionID,
-        reason: messageOf(error),
-      })
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("session write barrier failed"), {
+          sessionID: pending.sessionID,
+          reason: messageOf(error),
+        }),
+      )
       finish()
       return
     }
@@ -1125,11 +1168,12 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       return
     }
     void boundedPromise(barrier, writeBarrierTimeoutMs, () =>
-      log(workerLogMessage("session write barrier timed out"), {
-        level: "WARN",
-        sessionID: pending.sessionID,
-        timeoutMs: writeBarrierTimeoutMs,
-      }),
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("session write barrier timed out"), {
+          sessionID: pending.sessionID,
+          timeoutMs: writeBarrierTimeoutMs,
+        }),
+      ),
     ).then(finish, finish)
   }
 
@@ -1138,18 +1182,18 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
    * settle its worker protocol arbitrarily late; only the run `runs` points at
    * may mutate the session maps, reservations, waiters, or worker.
    */
-  const ownsSession = (pending: Pending): boolean => stateOf().runs.get(pending.sessionID) === pending
+  const ownsSession = (pending: Pending): boolean => runs.get(pending.sessionID) === pending
 
   /**
    * Atomically drop `pending` from run ownership. Returns false when a different
    * run (or no run) owns the session, so a stale settlement can never delete a
    * successor's entry.
    */
-  const removeOwnedRun = (pending: Pending): boolean =>
-    atomically((state) => {
-      if (state.runs.get(pending.sessionID) !== pending) return [false, state] as const
-      return [true, withoutRun(state, pending.sessionID)] as const
-    })
+  const removeOwnedRun = (pending: Pending): boolean => {
+    if (runs.get(pending.sessionID) !== pending) return false
+    runs.delete(pending.sessionID)
+    return true
+  }
 
   /**
    * Settle a superseded run's own promise without touching shared session state.
@@ -1175,12 +1219,13 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     }
     workers.release(pending.sessionID)
     const { startedAt, workerID } = phaseOf(pending)
-    log(workerLogMessage("session completed"), {
-      level: "INFO",
-      sessionID: pending.sessionID,
-      workerID,
-      durationMs: startedAt === undefined ? 0 : Date.now() - startedAt,
-    })
+    void bridge?.fork(
+      Effect.logInfo(workerLogMessage("session completed"), {
+        sessionID: pending.sessionID,
+        workerID,
+        durationMs: startedAt === undefined ? 0 : Date.now() - startedAt,
+      }),
+    )
     if (pending.gate.claim("completion")) resolveRun(pending)
     else rejectRun(pending, cancelled(pending.sessionID))
     nextWaiter(pending.sessionID)
@@ -1222,11 +1267,8 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       if (seen.has(childSessionID)) continue
       const failure = new ParentCrashedError(parentSessionID, childSessionID)
       rejectWaiters(childSessionID, failure)
-      const owned = atomically((state) => {
-        const run = state.runs.get(childSessionID)
-        if (run === undefined) return [undefined, state] as const
-        return [run, withoutRun(state, childSessionID)] as const
-      })
+      const owned = runs.get(childSessionID)
+      if (owned !== undefined) runs.delete(childSessionID)
       const worker = workers.worker(childSessionID)
       if (owned !== undefined) {
         owned.gate.claim("cancel")
@@ -1320,13 +1362,13 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     // A late rejection from a cancelled/superseded run must not settle the
     // successor that now owns this session. The ownership read, gate check, and
     // run removal are one atomic transition.
-    const outcome = atomically<FailOwnershipDecision>((state) => {
-      if (state.runs.get(pending.sessionID) !== pending) return [{ kind: "superseded" }, state]
-      if (pending.gate.winner === "cancel") {
-        return [{ kind: "gate-cancel" }, withoutRun(state, pending.sessionID)]
-      }
-      return [{ kind: "owned" }, state]
-    })
+    const outcome: FailOwnershipDecision =
+      runs.get(pending.sessionID) !== pending
+        ? { kind: "superseded" }
+        : pending.gate.winner === "cancel"
+          ? { kind: "gate-cancel" }
+          : { kind: "owned" }
+    if (outcome.kind === "gate-cancel") runs.delete(pending.sessionID)
     if (outcome.kind === "superseded") {
       settleSuperseded(pending)
       return
@@ -1350,13 +1392,14 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       retireWorker(pending.sessionID)
     } else if (crashed) {
       const payload = crashPayloadFor(pending, error)
-      log(workerLogMessage("worker crashed"), {
-        level: "WARN",
-        sessionID: pending.sessionID,
-        workerID: payload.workerID,
-        phase: payload.phase,
-        reason: payload.reason,
-      })
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("worker crashed"), {
+          sessionID: pending.sessionID,
+          workerID: payload.workerID,
+          phase: payload.phase,
+          reason: payload.reason,
+        }),
+      )
       options.recordCrash?.(payload)
       options.onCrash?.(payload)
       const cause = error instanceof WorkerCrashedError ? (error.cause ?? error) : error
@@ -1390,23 +1433,23 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
         const settleOnce = (resolved: AutoResumeDecision | undefined): void => {
           if (settled) return
           settled = true
-          if (timer !== undefined) clearTimeout(timer)
           settleCrash(pending, failure, payload, resolved)
         }
-        const timer =
+        // `0` disables the deadline (wait for the decision); otherwise the
+        // Effect clock bounds it and a late answer cannot settle twice.
+        const decisionWindow =
           resumeDecisionTimeoutMs > 0
-            ? setTimeout(() => {
-                log(workerLogMessage("resume decision timed out"), {
-                  level: "WARN",
-                  sessionID: pending.sessionID,
-                  workerID: payload.workerID,
-                  timeoutMs: resumeDecisionTimeoutMs,
-                })
-                settleOnce(undefined)
-              }, resumeDecisionTimeoutMs)
-            : undefined
-        timer?.unref?.()
-        void decision.then(
+            ? boundedPromise(decision, resumeDecisionTimeoutMs, () =>
+                void bridge?.fork(
+                  Effect.logWarning(workerLogMessage("resume decision timed out"), {
+                    sessionID: pending.sessionID,
+                    workerID: payload.workerID,
+                    timeoutMs: resumeDecisionTimeoutMs,
+                  }),
+                ),
+              )
+            : decision
+        void decisionWindow.then(
           (resolved) => settleOnce(resolved),
           () => settleOnce(undefined),
         )
@@ -1415,13 +1458,14 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       settleCrash(pending, failure, payload, decision)
       return
     } else {
-      log(workerLogMessage("worker run failed"), {
-        level: "ERROR",
-        sessionID: pending.sessionID,
-        workerID: phaseOf(pending).workerID,
-        error: describeFailure(error),
-        cause: error,
-      })
+      void bridge?.fork(
+        Effect.logError(workerLogMessage("worker run failed"), {
+          sessionID: pending.sessionID,
+          workerID: phaseOf(pending).workerID,
+          error: describeFailure(error),
+          cause: error,
+        }),
+      )
       workers.release(pending.sessionID)
       removeOwnedRun(pending)
       rejectRun(pending, error)
@@ -1432,31 +1476,28 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   /** Start the next parked run for a session, or arm the idle-reap timer. */
   const nextWaiter = (sessionID: SessionID): void => {
     // The admission guard is user code and must run outside the ownership
-    // permit. Snapshot first so an owned session or an empty queue short-
+    // transition. Snapshot first so an owned session or an empty queue short-
     // circuits without invoking it.
-    const snapshot = stateOf()
-    const willAdmit = !snapshot.runs.has(sessionID) && (snapshot.waiters.get(sessionID)?.length ?? 0) > 0
+    const willAdmit = !runs.has(sessionID) && (waiters.get(sessionID)?.length ?? 0) > 0
     const blocked = willAdmit ? inadmissible(sessionID) : undefined
-    // The live-owner guard, the admission check, the waiter list drain, and the
-    // promotion are one atomic transition. A settlement can admit a successor as
-    // a side effect (auto-resume dispatches synchronously), so a parked waiter
-    // must never overwrite that live owner.
-    const decision = atomically<NextWaiterDecision>((state) => {
-      if (state.runs.has(sessionID)) return [{ kind: "owned" }, state]
-      const waiters = state.waiters.get(sessionID)
-      if (waiters === undefined || waiters.length === 0) return [{ kind: "idle" }, state]
-      // A waiter promoted after a crash must not respawn a bundle that is no
-      // longer admissible. The typed refusal is the caller's outcome, not a run.
-      if (blocked !== undefined) {
-        return [{ kind: "blocked", error: blocked, waiters }, withoutWaiters(state, sessionID)]
-      }
-      const next = waiters[0]
-      const remaining = waiters.slice(1)
-      return [
-        { kind: "promote", next, remaining: remaining.length },
-        withWaiters(withRun(state, sessionID, next), sessionID, remaining),
-      ]
-    })
+    // A settlement can admit a successor as a side effect (auto-resume dispatches
+    // synchronously), so a parked waiter must never overwrite a live owner.
+    const parked = runs.has(sessionID) ? undefined : waiters.get(sessionID)
+    const decision: NextWaiterDecision =
+      runs.has(sessionID)
+        ? { kind: "owned" }
+        : parked === undefined || parked.length === 0
+          ? { kind: "idle" }
+          : blocked !== undefined
+            ? { kind: "blocked", error: blocked, waiters: parked }
+            : { kind: "promote", next: parked[0], remaining: parked.length - 1 }
+    if (decision.kind === "blocked") waiters.delete(sessionID)
+    if (decision.kind === "promote") {
+      const remaining = parked!.slice(1)
+      if (remaining.length === 0) waiters.delete(sessionID)
+      else waiters.set(sessionID, remaining)
+      runs.set(sessionID, decision.next)
+    }
     switch (decision.kind) {
       case "owned":
         return
@@ -1470,24 +1511,22 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
         scheduleReap(sessionID)
         return
       case "promote":
-        log(workerLogMessage("waiter promoted"), {
-          level: "INFO",
-          sessionID,
-          waiterQueueDepth: decision.remaining,
-        })
+        void bridge?.fork(
+          Effect.logInfo(workerLogMessage("waiter promoted"), {
+            sessionID,
+            waiterQueueDepth: decision.remaining,
+          }),
+        )
         start(decision.next)
         return
     }
   }
 
   const rejectWaiters = (sessionID: SessionID, error: unknown): void => {
-    const waiters = atomically((state) => {
-      const current = state.waiters.get(sessionID)
-      if (current === undefined) return [undefined, state] as const
-      return [current, withoutWaiters(state, sessionID)] as const
-    })
-    if (waiters === undefined) return
-    for (const waiter of waiters) {
+    const parked = waiters.get(sessionID)
+    if (parked === undefined) return
+    waiters.delete(sessionID)
+    for (const waiter of parked) {
       waiter.gate.claim("cancel")
       rejectRun(waiter, error)
     }
@@ -1534,12 +1573,13 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     }
 
     if (barrierInFlight && owned !== undefined) {
-      await boundedPromise(owned.barrierDoneBridge.promise, writeBarrierTimeoutMs, () =>
-        log(workerLogMessage("session write barrier timed out"), {
-          level: "WARN",
-          sessionID,
-          timeoutMs: writeBarrierTimeoutMs,
-        }),
+      await boundedPromise(owned.barrierDonePromise, writeBarrierTimeoutMs, () =>
+        void bridge?.fork(
+          Effect.logWarning(workerLogMessage("session write barrier timed out"), {
+            sessionID,
+            timeoutMs: writeBarrierTimeoutMs,
+          }),
+        ),
       )
     }
 
@@ -1549,13 +1589,8 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const barrierOwnsFinalization = winner === "completion" && barrierInFlight
     // The ownership check and the run-slot removal are one transition: a cancel
     // can never delete a successor's entry or release its worker.
-    const owns =
-      owned !== undefined &&
-      !barrierOwnsFinalization &&
-      atomically((state) => {
-        if (state.runs.get(sessionID) !== owned) return [false, state] as const
-        return [true, withoutRun(state, sessionID)] as const
-      })
+    const owns = owned !== undefined && !barrierOwnsFinalization && runs.get(sessionID) === owned
+    if (owns) runs.delete(sessionID)
 
     if (owns) {
       if (workers.has(sessionID)) {
@@ -1595,7 +1630,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     // Shutdown owns the terminal state: a prompt racing `terminateAll`/`dispose`
     // must never construct an isolate after the pool and backends are gone. The
     // atomic transition re-checks the latch, so the fast path cannot race it.
-    if (stateOf().terminated) return Promise.reject(cancelled(request.sessionID))
+    if (terminated) return Promise.reject(cancelled(request.sessionID))
     const depth = request.depth ?? 0
     if (!Number.isInteger(depth) || depth < 0) {
       return Promise.reject(new Error(`invalid dispatch depth: ${depth} (expected a non-negative integer)`))
@@ -1607,21 +1642,20 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const model = request.model ?? request.prompt?.model
 
     // Join vs park vs admit is decided together with the ownership write.
-    const decision = atomically<DispatchDecision>((state) => {
-      if (state.terminated) return [{ kind: "reject" }, state]
-      const admitted = state.runs.get(sessionID)
-      if (admitted !== undefined) {
-        if (isSameRun(admitted, depth, mode, prompt, shell, model)) {
-          return [{ kind: "join", promise: admitted.promise }, state]
-        }
-        // Different run identity: park behind the in-flight run. Unbounded.
-        const pending = createPending(sessionID, depth, mode, prompt, shell, model)
-        const waiters = state.waiters.get(sessionID) ?? []
-        return [{ kind: "park", pending }, withWaiters(state, sessionID, [...waiters, pending])]
-      }
-      const pending = createPending(sessionID, depth, mode, prompt, shell, model)
-      return [{ kind: "admit", pending }, withRun(state, sessionID, pending)]
-    })
+    const admitted = terminated ? undefined : runs.get(sessionID)
+    const decision: DispatchDecision = terminated
+      ? { kind: "reject" }
+      : admitted !== undefined
+        ? isSameRun(admitted, depth, mode, prompt, shell, model)
+          ? { kind: "join", promise: admitted.promise }
+          : { kind: "park", pending: create(sessionID, depth, mode, prompt, shell, model) }
+        : { kind: "admit", pending: create(sessionID, depth, mode, prompt, shell, model) }
+    if (decision.kind === "park") {
+      const parked = waiters.get(sessionID) ?? []
+      parked.push(decision.pending)
+      waiters.set(sessionID, parked)
+    }
+    if (decision.kind === "admit") runs.set(sessionID, decision.pending)
     if (decision.kind === "reject") return Promise.reject(cancelled(sessionID))
     if (decision.kind === "join") return decision.promise
     if (decision.kind === "park") {
@@ -1633,7 +1667,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   }
 
   const cancel = async (sessionID: SessionID): Promise<void> => {
-    const owned = stateOf().runs.get(sessionID)
+    const owned = runs.get(sessionID)
     // Parked waiters belong to this session's terminal decision: drain them once,
     // before the admitted run's worker settles.
     rejectWaiters(sessionID, cancelled(sessionID))
@@ -1686,7 +1720,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     // be admitted while children unwind or the grace window is open. The
     // `Pending` identity is the generation; only this run may be cancelled,
     // released, or have its worker retired.
-    const owned = stateOf().runs.get(sessionID)
+    const owned = runs.get(sessionID)
 
     for (const child of config.childrenOf?.(sessionID) ?? []) {
       if (cascade.seen.has(child)) continue
@@ -1698,14 +1732,10 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
 
     // The run we meant to cancel already settled and something else owns the
     // session now: never cancel the newcomer. The owner check and the waiter
-    // drain are one atomic transition, so a waiter cannot be left behind.
-    const drained = atomically((state) => {
-      if (state.runs.get(sessionID) !== owned) return [undefined, state] as const
-      const waiters = state.waiters.get(sessionID)
-      if (waiters === undefined) return [[] as ReadonlyArray<Pending>, state] as const
-      return [waiters, withoutWaiters(state, sessionID)] as const
-    })
-    if (drained === undefined) return undefined
+    // drain are one synchronous transition, so a waiter cannot be left behind.
+    if (runs.get(sessionID) !== owned) return undefined
+    const drained = waiters.get(sessionID) ?? []
+    waiters.delete(sessionID)
 
     // Drain waiters that existed at request time exactly once. A prompt that
     // parks during the grace window is NOT drained here; `settleCancelled`
@@ -1752,7 +1782,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       return { sessionID, mode: "terminated", winner: "cancel", acknowledged: false, durationMs: 0 }
     }
 
-    updatePhase(owned, (phase) => ({ ...phase, cancelPending: true }))
+    owned.phase = { ...owned.phase, cancelPending: true }
     let resolved: CancelOutcome = {
       sessionID,
       mode: "terminated",
@@ -1770,7 +1800,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
           : outcome
       return resolved
     } finally {
-      updatePhase(owned, (phase) => ({ ...phase, cancelPending: false }))
+      owned.phase = { ...owned.phase, cancelPending: false }
       // The controller terminates/reaps on the forced path; a cooperative or
       // completed outcome keeps the worker. Only the captured run is released.
       await settleCancelled(sessionID, owned, {
@@ -1796,103 +1826,91 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   }
 
   const terminateAll = async (): Promise<void> => {
+    if (disposed) return
     // The shutdown latch, the run table, and the waiter table flip together:
     // a dispatch can either observe the pre-shutdown state or the latch, never a
     // cleared table that still admits work.
-    const shutdown = atomically((state) => {
-      if (state.terminated) return [undefined, state] as const
-      const runs = [...state.runs.values()]
-      const waiters = [...state.waiters.values()].flat()
-      return [
-        { runs, waiters },
-        {
-          runs: new Map<SessionID, Pending>(),
-          waiters: new Map<SessionID, ReadonlyArray<Pending>>(),
-          terminated: true,
-        },
-      ] as const
-    })
-    if (shutdown === undefined) return
-    for (const sessionID of [...idleTimers.keys()]) clearIdle(sessionID)
-    for (const pending of shutdown.runs) rejectRun(pending, cancelled(pending.sessionID))
-    for (const pending of shutdown.waiters) rejectRun(pending, cancelled(pending.sessionID))
+    if (terminated) {
+      disposed = true
+      await runtime.dispose()
+      return
+    }
+    terminated = true
+    const pendingRuns = [...runs.values()]
+    const pendingWaiters = [...waiters.values()].flat()
+    runs.clear()
+    waiters.clear()
+    const reaping = [...engine.reaping].map(([sessionID]) => sessionID)
+    for (const sessionID of reaping) clearIdle(sessionID)
+    for (const pending of pendingRuns) rejectRun(pending, cancelled(pending.sessionID))
+    for (const pending of pendingWaiters) rejectRun(pending, cancelled(pending.sessionID))
     for (const controller of controllers.values()) controller.dispose()
     controllers.clear()
     const workersToTerminate = workers.entries().map((entry) => entry.worker)
     workers.clear()
     // Every direct terminate stays bounded; a wedged isolate must not hang
     // shutdown, because the pool and backends are torn down after this.
-    await Promise.all(
-      workersToTerminate.map((worker) =>
-        Effect.runPromise(
-          Effect.promise(() => worker.terminate().catch(() => undefined)).pipe(
-            Effect.timeoutOrElse({
-              duration: terminateTimeoutMs,
-              orElse: () => Effect.void,
-            }),
+    await runtime.runPromise(
+      Effect.forEach(
+        workersToTerminate,
+        (worker) =>
+          Effect.tryPromise({ try: () => worker.terminate().catch(() => undefined), catch: (error) => error }).pipe(
+            Effect.timeoutOrElse({ duration: terminateTimeoutMs, orElse: () => Effect.void }),
           ),
-        ).catch(() => undefined),
+        { concurrency: "unbounded", discard: true },
       ),
     )
-    // Settle every live retirement's bounded release before signalling its exit.
-    // The exit is the successor's confirmation, so it must not resolve while an
-    // async release hook is pending. This also joins a release the watchdog
-    // detached (or one an interrupted fiber started) before the pool is torn down.
-    const releases = [...retirementReleases.values()]
-    await Promise.all(releases.map((releaseThenFinish) => releaseThenFinish().catch(() => undefined)))
-    // Deferred-start fibers are parked on these exits. Resolve them before the
-    // drain so shutdown does not charge each one another full terminate deadline.
-    const exits = [...terminating.values()]
-    terminating.clear()
-    retirementReleases.clear()
-    for (const exit of exits) Deferred.doneUnsafe(exit, Effect.void)
-    // A retirement fiber may still be parked on a terminate promise that never
-    // settles. Its release already ran above, so stop it instead of paying the
-    // drain deadline a second time.
-    for (const fiber of retirementFibers) {
-      backgroundFibers.delete(fiber)
-      retirementFibers.delete(fiber)
-      fiber.interruptUnsafe()
-    }
-    // Drain the retirement/reap/deferred-start fibers we forked so none can run
-    // `pool.releaseSession`/`onSessionReleased` after the pool is torn down. A
-    // fiber still wedged after the deadline is interrupted rather than awaited.
-    const background = [...backgroundFibers]
-    await Promise.all(
-      background.map((fiber) =>
-        Effect.runPromise(
-          Fiber.await(fiber).pipe(
-            Effect.timeoutOrElse({
-              duration: terminateTimeoutMs,
-              orElse: () => Effect.sync(() => fiber.interruptUnsafe()),
-            }),
+    // A retirement's Deferred completes ONLY in its fiber's `onExit`. Interrupt
+    // the fiber first so a wedged terminate stops waiting, then let the
+    // idempotent release settle; the same owner completes the Deferred.
+    for (const [, fiber] of engine.retiring) fiber.interruptUnsafe()
+    const exits = [...retiringDone.values()]
+    await runtime.runPromise(
+      Effect.forEach(
+        exits,
+        (exit) =>
+          Deferred.await(exit).pipe(
+            Effect.timeoutOrElse({ duration: terminateTimeoutMs, orElse: () => Effect.void }),
           ),
-        ).catch(() => undefined),
+        { concurrency: "unbounded", discard: true },
       ),
     )
-    for (const fiber of background) fiber.interruptUnsafe()
+    retiringDone.clear()
+    // Release timers and standby fibers; a wedged release is interrupted rather
+    // than awaited forever.
+    await runtime.runPromise(
+      Effect.all(
+        [FiberMap.clear(engine.reaping), FiberSet.clear(engine.background)],
+        { concurrency: "unbounded", discard: true },
+      ).pipe(Effect.timeoutOrElse({ duration: terminateTimeoutMs, orElse: () => Effect.void })),
+    )
     await pool.terminateAll().catch(() => undefined)
     cancellation?.reapAll?.()
+    disposed = true
+    await runtime.dispose()
   }
 
   return {
     get busySlotCount() {
-      return stateOf().runs.size
+      return runs.size
     },
     get queuedCount() {
       let count = 0
-      for (const waiters of stateOf().waiters.values()) count += waiters.length
+      for (const parked of waiters.values()) count += parked.length
       return count
     },
     get retiringCount() {
-      return terminating.size
+      return retiringDone.size
     },
     registry: workers,
     workerForSession: (sessionID) => workers.get(sessionID)?.workerID,
     dispatch,
+    dispatchEffect: (request) =>
+      Effect.tryPromise({ try: () => dispatch(request), catch: (error) => error }),
     cancel,
     cancelWithGrace,
     retire,
+    retireGeneration,
     awaitRelease,
     terminateAll,
     dispose: terminateAll,

@@ -12,6 +12,7 @@ import type {
   SessionExecutionResult,
 } from "@/session/worker/execute"
 import { createSessionHub, workerCrashedFrom, type WorkerCrashed } from "@/session/worker/hub"
+import { createTestBarrier } from "../../lib/run-barrier-test"
 import { createDbExecutor, type DbExecutor } from "@/session/worker/db-executor"
 import { createBunSqliteConnection } from "@/session/writer/connection"
 import { LEDGER_SQL } from "@/session/ledger/tool-call"
@@ -79,7 +80,7 @@ describe("hub crash persistence through the DB executor", () => {
     let hub: ReturnType<typeof createSessionHub> | undefined
     try {
       executor = createDbExecutor({ filename, timeoutMs: 10_000 })
-      hub = createSessionHub({ pool: crashPool(expected), db: executor })
+      hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: crashPool(expected), db: executor })
 
       const settled = hub.ensureRunning(sessionID as SessionID).then(
         () => ({ rejected: false as const }),

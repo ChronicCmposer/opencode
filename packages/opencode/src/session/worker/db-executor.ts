@@ -5,13 +5,21 @@
 // ordering, cache, migration, schema, or lease policy: callers pass SQL and
 // params, and the executor returns the driver result. The hub uses it only as a
 // measured fallback; workers keep their own WAL connection.
+//
+// The Effect service in this file is the implementation. There is no Promise
+// executor underneath it: every operation is an `Effect`, and the worker
+// handshake is an `Effect.callback`. The exported `makePromiseExecutor` is the
+// single temporary edge for callers that are not Effect yet (the async schema
+// gate); the production hub consumes the service directly and adapts only at
+// its Promise-shaped `SessionHubOptions.db` boundary.
 
 import { Database, type SQLQueryBindings } from "bun:sqlite"
 import { isMainThread, parentPort, threadId, workerData } from "node:worker_threads"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { executorPragmas, resolveWalConfig } from "@opencode-ai/core/database/pragmas"
-import { EXECUTOR_BUSY_RETRY_CONFIG, isBusyError, retryBusySync } from "@opencode-ai/core/database/transaction"
-import { Context, Effect, Layer, type Scope } from "effect"
+import { EXECUTOR_BUSY_RETRY_CONFIG, retryBusySync } from "@opencode-ai/core/database/transaction"
+import { withBusyRetry, type BusyRetriesExhaustedError } from "@opencode-ai/core/database/busy"
+import { Context, Deferred, Duration, Effect, Exit, Layer, Schedule, Schema, Scope, Semaphore } from "effect"
 import { resolveWorkerEntry } from "./port"
 
 export type DbParams = ReadonlyArray<unknown> | Record<string, unknown>
@@ -36,6 +44,13 @@ export interface DbExecutor {
   run(sql: string, params?: DbParams): Promise<DbRunResult>
   query(sql: string, params?: DbParams): Promise<ReadonlyArray<Record<string, unknown>>>
   transaction(statements: ReadonlyArray<DbStatement>): Promise<ReadonlyArray<DbTransactionResult>>
+  /**
+   * Same as {@link query} but a busy failure is returned to the caller instead
+   * of replaying the statement. The migration path opens one `BEGIN IMMEDIATE`
+   * transaction and must fail the whole batch, never re-issue a statement
+   * inside a still-open transaction.
+   */
+  queryInTransaction?(sql: string, params?: DbParams): Promise<ReadonlyArray<Record<string, unknown>>>
   close(): Promise<void>
   /** The isolate's real thread id; `0` until the ready frame arrives. */
   readonly threadId: number
@@ -73,45 +88,38 @@ type DbExecutorResponse =
   | { readonly type: "failure"; readonly id: number; readonly error: DbExecutorFailure }
   | { readonly type: "closed"; readonly id: number }
 
-export class DbExecutorCrashedError extends Error {
-  readonly tag = "DB_EXECUTOR_CRASHED"
-  constructor(message: string) {
-    super(message)
-    this.name = "DbExecutorCrashedError"
-  }
-}
+export class DbExecutorCrashedError extends Schema.TaggedErrorClass<DbExecutorCrashedError>()(
+  "DbExecutorCrashedError",
+  {
+    message: Schema.String,
+  },
+) {}
 
-export class DbExecutorClosedError extends Error {
-  readonly tag = "DB_EXECUTOR_CLOSED"
-  constructor() {
-    super("database executor is closed")
-    this.name = "DbExecutorClosedError"
-  }
-}
+export class DbExecutorClosedError extends Schema.TaggedErrorClass<DbExecutorClosedError>()("DbExecutorClosedError", {
+  message: Schema.String,
+}) {}
 
-export class DbExecutorRemoteError extends Error {
-  readonly tag = "DB_EXECUTOR_REMOTE"
-  readonly code: string | number | undefined
-  readonly sqliteCode: string | undefined
-  constructor(failure: DbExecutorFailure) {
-    super(failure.message)
-    this.name = failure.name
-    this.code = failure.code
-    this.sqliteCode = failure.sqliteCode
-  }
-}
+export class DbExecutorRemoteError extends Schema.TaggedErrorClass<DbExecutorRemoteError>()("DbExecutorRemoteError", {
+  message: Schema.String,
+  /** The original driver error name (for example `SQLiteError`). */
+  errorName: Schema.optional(Schema.String),
+  code: Schema.optional(Schema.Union([Schema.String, Schema.Number])),
+  sqliteCode: Schema.optional(Schema.String),
+}) {}
 
 /**
  * A request deadline elapsed. The transaction may have committed before the
  * response was lost, so the result is indeterminate: the thread is retired and
  * the caller must not blindly retry a non-idempotent body.
  */
-export class DbExecutorTimeoutError extends Error {
-  readonly tag = "DB_EXECUTOR_TIMEOUT"
-  readonly indeterminate = true
-  constructor(message: string) {
-    super(message)
-    this.name = "DbExecutorTimeoutError"
+export class DbExecutorTimeoutError extends Schema.TaggedErrorClass<DbExecutorTimeoutError>()(
+  "DbExecutorTimeoutError",
+  {
+    message: Schema.String,
+  },
+) {
+  get indeterminate(): true {
+    return true
   }
 }
 
@@ -121,26 +129,33 @@ export class DbExecutorTimeoutError extends Error {
  * `rollbackCause`; the executor is poisoned because the transaction state is
  * unknown.
  */
-export class DbExecutorRollbackError extends Error {
-  readonly tag = "DB_EXECUTOR_ROLLBACK_FAILED"
-  override readonly cause: Error
-  readonly rollbackCause: DbExecutorRemoteError
-  constructor(original: DbExecutorFailure, rollback: DbExecutorFailure) {
-    super(original.message)
-    this.name = "DbExecutorRollbackError"
-    this.cause = new DbExecutorRemoteError(original)
-    this.rollbackCause = new DbExecutorRemoteError(rollback)
-  }
-}
+export class DbExecutorRollbackError extends Schema.TaggedErrorClass<DbExecutorRollbackError>()(
+  "DbExecutorRollbackError",
+  {
+    message: Schema.String,
+    cause: DbExecutorRemoteError,
+    rollbackCause: DbExecutorRemoteError,
+  },
+) {}
 
 /** A prior failed rollback left the connection unusable; no work may follow. */
-export class DbExecutorPoisonedError extends Error {
-  readonly tag = "DB_EXECUTOR_POISONED"
-  constructor() {
-    super("database executor is poisoned by a failed rollback")
-    this.name = "DbExecutorPoisonedError"
-  }
-}
+export class DbExecutorPoisonedError extends Schema.TaggedErrorClass<DbExecutorPoisonedError>()(
+  "DbExecutorPoisonedError",
+  {
+    message: Schema.String,
+  },
+) {}
+
+export type DbExecutorError =
+  | DbExecutorCrashedError
+  | DbExecutorClosedError
+  | DbExecutorRemoteError
+  | DbExecutorTimeoutError
+  | DbExecutorRollbackError
+  | DbExecutorPoisonedError
+
+/** A service failure: executor errors plus the shared busy-retry terminal error. */
+export type DbExecutorFailureError = DbExecutorError | BusyRetriesExhaustedError
 
 export interface DbExecutorOptions {
   /** SQLite filename opened inside the executor thread. */
@@ -151,8 +166,9 @@ export interface DbExecutorOptions {
   readonly timeoutMs?: number
   /**
    * Idle WAL checkpoint cadence. `0` disables it; defaults to
-   * `resolveWalConfig().checkpointIntervalMs`. The checkpoint runs inside the
-   * executor thread, so a truncating checkpoint never blocks the hub loop.
+   * `resolveWalConfig().checkpointIntervalMs`. The checkpoint is issued through
+   * the executor so the truncating checkpoint runs on the executor thread and
+   * never blocks the hub loop.
    */
   readonly checkpointIntervalMs?: number
   /** Worker entry override (tests / packaged builds). */
@@ -171,7 +187,6 @@ export interface DbExecutorWorkerData {
   readonly filename: string
   readonly pragmas?: ReadonlyArray<string>
   readonly create?: boolean
-  readonly checkpointIntervalMs?: number
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000
@@ -217,11 +232,36 @@ function failureOf(error: unknown): DbExecutorFailure {
   }
 }
 
-function remoteErrorOf(failure: DbExecutorFailure): Error {
-  if (failure.cause !== undefined && failure.rollbackCause !== undefined) {
-    return new DbExecutorRollbackError(failure.cause, failure.rollbackCause)
+function remoteErrorOf(
+  failure: DbExecutorFailure,
+): DbExecutorRemoteError | DbExecutorRollbackError | DbExecutorPoisonedError {
+  // The isolate reports poisoning as its own failure kind; keep the typed
+  // surface instead of folding it into a generic remote error.
+  if (failure.name === "DbExecutorPoisonedError") {
+    return new DbExecutorPoisonedError({ message: failure.message })
   }
-  return new DbExecutorRemoteError(failure)
+  if (failure.cause !== undefined && failure.rollbackCause !== undefined) {
+    return new DbExecutorRollbackError({
+      message: failure.cause.message,
+      cause: new DbExecutorRemoteError(remoteFields(failure.cause)),
+      rollbackCause: new DbExecutorRemoteError(remoteFields(failure.rollbackCause)),
+    })
+  }
+  return new DbExecutorRemoteError(remoteFields(failure))
+}
+
+function remoteFields(failure: DbExecutorFailure): {
+  message: string
+  errorName: string
+  code?: string | number
+  sqliteCode?: string
+} {
+  return {
+    message: failure.message,
+    errorName: failure.name,
+    ...(failure.code === undefined ? {} : { code: failure.code }),
+    ...(failure.sqliteCode === undefined ? {} : { sqliteCode: failure.sqliteCode }),
+  }
 }
 
 function runStatement(db: Database, statement: DbStatement): DbRunResult {
@@ -233,6 +273,9 @@ function runStatement(db: Database, statement: DbStatement): DbRunResult {
  * Run `work` inside one `BEGIN IMMEDIATE` transaction. A busy failure at any
  * point rolls back and retries the whole body, never a single statement: a
  * half-applied transaction is not observable to the caller.
+ *
+ * This is the synchronous caller on the executor thread; it reuses the shared
+ * busy-retry primitive rather than owning a second backoff loop.
  */
 function runTransaction(db: Database, statements: ReadonlyArray<DbStatement>): ReadonlyArray<DbTransactionResult> {
   return retryBusySync(() => {
@@ -245,7 +288,9 @@ function runTransaction(db: Database, statements: ReadonlyArray<DbStatement>): R
       return results
     } catch (error) {
       try {
-        db.exec("ROLLBACK")
+        // A busy ROLLBACK did not roll back; re-issue it in place on the same
+        // bounded budget before treating the transaction state as unknown.
+        retryBusySync(() => db.exec("ROLLBACK"), EXECUTOR_BUSY_RETRY_CONFIG)
       } catch (rollbackError) {
         // The original failure is the cause; the failed rollback is attached so
         // neither is lost. The message handler poisons the thread afterwards.
@@ -275,21 +320,30 @@ export interface CheckpointTarget {
 }
 
 /**
- * Start a periodic passive WAL checkpoint on the executor thread. Returns a stop
- * function. A checkpoint failure is swallowed: the next interval retries, and a
- * busy database must not crash the executor.
+ * Start a periodic passive WAL checkpoint. Returns a stop function.
+ *
+ * The loop is an Effect fiber in its own scope, not `setInterval`: `stop()`
+ * closes the scope, which interrupts and joins the fiber. A checkpoint failure
+ * is swallowed: the next interval retries, and a busy database must not crash
+ * the executor.
  */
 export function scheduleCheckpoint(target: CheckpointTarget, intervalMs: number): () => void {
   if (!Number.isFinite(intervalMs) || intervalMs <= 0) return () => {}
-  const timer = setInterval(() => {
+  const scope = Effect.runSync(Scope.make())
+  const tick = Effect.sync(() => {
     try {
       target.exec("PRAGMA wal_checkpoint(PASSIVE)")
     } catch {
       // A concurrently held write lock is expected; the next tick retries.
     }
-  }, intervalMs)
-  timer.unref?.()
-  return () => clearInterval(timer)
+  })
+  Effect.runSync(tick.pipe(Effect.repeat(Schedule.spaced(Duration.millis(intervalMs))), Effect.forkIn(scope)))
+  let stopped = false
+  return () => {
+    if (stopped) return
+    stopped = true
+    Effect.runSync(Scope.close(scope, Exit.void))
+  }
 }
 
 function startWorkerThread(data: DbExecutorWorkerData): void {
@@ -298,14 +352,12 @@ function startWorkerThread(data: DbExecutorWorkerData): void {
   const db = new Database(data.filename, { create: data.create ?? true })
   try {
     for (const pragma of data.pragmas ?? []) db.exec(pragma)
-    const stopCheckpoint = scheduleCheckpoint(db, data.checkpointIntervalMs ?? 0)
     let poisoned = false
     transport.postMessage({ type: "ready", threadId } satisfies DbExecutorResponse)
     transport.on("message", (message: DbExecutorRequest) => {
       // A close is honoured even by a poisoned handle: releasing the native
       // handle is the whole point, and it must never be answered with a retry.
       if (message.type === "close") {
-        stopCheckpoint()
         try {
           db.close()
         } catch {
@@ -318,7 +370,9 @@ function startWorkerThread(data: DbExecutorWorkerData): void {
         transport.postMessage({
           type: "failure",
           id: message.id,
-          error: failureOf(new DbExecutorPoisonedError()),
+          error: failureOf(
+            new DbExecutorPoisonedError({ message: "database executor is poisoned by a failed rollback" }),
+          ),
         } satisfies DbExecutorResponse)
         return
       }
@@ -333,7 +387,6 @@ function startWorkerThread(data: DbExecutorWorkerData): void {
         if (error instanceof RollbackFailure) {
           // The transaction state is unknown; never reuse this handle.
           poisoned = true
-          stopCheckpoint()
           try {
             db.close()
           } catch {
@@ -381,17 +434,17 @@ declare global {
 
 interface PendingRequest {
   readonly resolve: (value: unknown) => void
-  readonly reject: (error: unknown) => void
-  readonly timer: ReturnType<typeof setTimeout> | undefined
+  readonly reject: (error: DbExecutorError) => void
 }
 
-const terminateWorker = async (worker: Worker | undefined): Promise<void> => {
-  if (worker === undefined) return
-  try {
-    await worker.terminate()
-  } catch {
-    // The thread is already gone; there is nothing left to release.
-  }
+const terminateWorker = (worker: Worker | undefined): Effect.Effect<void> => {
+  if (worker === undefined) return Effect.void
+  return Effect.tryPromise({
+    try: async () => {
+      await worker.terminate()
+    },
+    catch: () => undefined,
+  }).pipe(Effect.ignore)
 }
 
 /** How long a closing executor may take to acknowledge its native-handle close. */
@@ -402,20 +455,21 @@ const CLOSE_ACK_TIMEOUT_MS = 1_000
  * acknowledgement before terminating the thread. Without this the native handle
  * outlives the JS realm and its WAL lock survives until the process exits.
  */
-const closeWorkerDatabase = async (worker: Worker | undefined, id: number): Promise<void> => {
-  if (worker === undefined) return
-  await new Promise<void>((resolve) => {
+const closeWorkerDatabase = (worker: Worker | undefined, id: number): Effect.Effect<void> => {
+  if (worker === undefined) return Effect.void
+  return Effect.callback<void>((resume) => {
     let settled = false
-    let timer: ReturnType<typeof setTimeout>
-    const onMessage = (event: MessageEvent<DbExecutorResponse>): void => {
-      if (event.data?.type === "closed" && event.data.id === id) finish()
-    }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let onMessage: (event: MessageEvent<DbExecutorResponse>) => void
     const finish = (): void => {
       if (settled) return
       settled = true
-      clearTimeout(timer)
+      if (timer !== undefined) clearTimeout(timer)
       worker.removeEventListener?.("message", onMessage)
-      resolve()
+      resume(Effect.void)
+    }
+    onMessage = (event: MessageEvent<DbExecutorResponse>): void => {
+      if (event.data?.type === "closed" && event.data.id === id) finish()
     }
     timer = setTimeout(finish, CLOSE_ACK_TIMEOUT_MS)
     timer.unref?.()
@@ -425,10 +479,45 @@ const closeWorkerDatabase = async (worker: Worker | undefined, id: number): Prom
     } catch {
       finish()
     }
+    return Effect.sync(() => {
+      if (settled) return
+      settled = true
+      if (timer !== undefined) clearTimeout(timer)
+      worker.removeEventListener?.("message", onMessage)
+    })
   })
 }
 
-export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
+interface ExecutorState {
+  worker: Worker | undefined
+  /** A crashed/exited worker that still needs `terminate()` before a respawn. */
+  staleWorker: Worker | undefined
+  ready: Deferred.Deferred<void, DbExecutorError> | undefined
+  closed: boolean
+  nextId: number
+  executorThreadId: number
+  readonly pending: Map<number, PendingRequest>
+}
+
+interface ExecutorCore extends Interface {
+  readonly checkpoint: () => Effect.Effect<void>
+  readonly checkpointIntervalMs: number
+}
+
+function closedError(): DbExecutorClosedError {
+  return new DbExecutorClosedError({ message: "database executor is closed" })
+}
+
+function crashedError(message: string): DbExecutorCrashedError {
+  return new DbExecutorCrashedError({ message })
+}
+
+/**
+ * Build the Effect-native executor state. Construction is synchronous and
+ * spawns nothing; the worker starts lazily on the first operation (or the first
+ * checkpoint after a request has started the worker).
+ */
+function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): ExecutorCore {
   const entry = options.entry ?? resolveDbExecutorEntry({ env: options.env })
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const resolvedWal = resolveWalConfig(options.env)
@@ -439,238 +528,294 @@ export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
   // surfacing SQLITE_BUSY immediately, and the executor does not duplicate the
   // hub's 64 MiB cache.
   const pragmas = options.pragmas ?? executorPragmas(options.env)
-  let worker: Worker | undefined
-  let ready: Promise<void> | undefined
-  // Settles the in-flight boot handshake when a close/crash retires the worker
-  // before its `ready` frame. Without it a caller awaiting `ensureReady` hangs.
-  let bootReject: ((error: unknown) => void) | undefined
-  let closed = false
-  let nextId = 1
-  let executorThreadId = 0
-  // Serializes teardown with the next spawn. A timeout retires the old thread
+  // Serializes spawn with teardown. A timeout retires the old thread
   // asynchronously; the replacement must await that retirement or two SQLite
   // handles (and their WAL locks) would overlap during the handover.
-  let retirement: Promise<void> = Promise.resolve()
-  const pending = new Map<number, PendingRequest>()
-
-  const failPending = (error: unknown): void => {
-    for (const request of pending.values()) {
-      if (request.timer !== undefined) clearTimeout(request.timer)
-      request.reject(error)
-    }
-    pending.clear()
+  const workerGate = Semaphore.makeUnsafe(1)
+  const state: ExecutorState = {
+    worker: undefined,
+    staleWorker: undefined,
+    ready: undefined,
+    closed: false,
+    nextId: 1,
+    executorThreadId: 0,
+    pending: new Map(),
   }
 
-  const settleBoot = (error: unknown): void => {
-    const reject = bootReject
-    bootReject = undefined
-    reject?.(error)
+  const failPending = (error: DbExecutorError): void => {
+    for (const request of [...state.pending.values()]) request.reject(error)
+    state.pending.clear()
   }
 
-  const retire = (error: Error, orderly = false): Promise<void> => {
-    const current = worker
-    worker = undefined
-    ready = undefined
-    settleBoot(error)
-    failPending(error)
-    if (current === undefined) return retirement
-    // A timeout may have left the thread mid-transaction: ask it to close the
-    // native handle (bounded) before terminating, so the WAL lock is released
-    // even when the request itself will never answer.
-    const closing = orderly
-      ? closeWorkerDatabase(current, nextId++).then(() => terminateWorker(current))
-      : terminateWorker(current)
-    retirement = retirement.then(() => closing)
-    return retirement
+  const failBoot = (error: DbExecutorError): void => {
+    const ready = state.ready
+    state.ready = undefined
+    if (ready !== undefined) Deferred.doneUnsafe(ready, Effect.fail(error))
   }
 
-  const ensureReady = (): Promise<void> => {
-    if (closed) return Promise.reject(new DbExecutorClosedError())
-    if (ready !== undefined) return ready
-    ready = (async () => {
-      // A previous thread may still be closing. Spawning now would overlap two
-      // handles against the same file; wait for the orderly retirement instead.
-      await retirement
-      if (closed) throw new DbExecutorClosedError()
-      await new Promise<void>((resolve, reject) => {
-        bootReject = reject
-        const workerOptions = {
-          ...(options.name === undefined ? {} : { name: options.name }),
-          workerData: {
-            kind: "db-executor",
-            filename: options.filename,
-            pragmas,
-            checkpointIntervalMs,
-            ...(options.create === undefined ? {} : { create: options.create }),
-          } satisfies DbExecutorWorkerData,
-        } as unknown as WorkerOptions
-        const spawned = new Worker(entry, workerOptions)
-        worker = spawned
-        spawned.onmessage = (event: MessageEvent<DbExecutorResponse>) => {
-          // A retired worker's late frames must never settle a request for, or
-          // resolve, a replacement thread.
-          if (worker !== spawned) return
-          const message = event.data
-          if (message.type === "ready") {
-            executorThreadId = message.threadId
-            bootReject = undefined
-            resolve()
-            return
+  const retire = (error: DbExecutorError, orderly: boolean): Effect.Effect<void> =>
+    workerGate.withPermits(1)(
+      Effect.suspend(() => {
+        const live = state.worker
+        const stale = state.staleWorker
+        state.worker = undefined
+        state.staleWorker = undefined
+        failBoot(error)
+        failPending(error)
+        return Effect.gen(function* () {
+          if (live !== undefined) {
+            if (orderly) yield* closeWorkerDatabase(live, state.nextId++)
+            yield* terminateWorker(live)
           }
-          // A close acknowledgement has no request to settle; `close()` waits
-          // for it through its own listener.
-          if (message.type === "closed") return
-          const request = pending.get(message.id)
-          if (request === undefined) return
-          pending.delete(message.id)
-          if (request.timer !== undefined) clearTimeout(request.timer)
-          if (message.type === "result") request.resolve(message.value)
-          else request.reject(remoteErrorOf(message.error))
-        }
-        spawned.onerror = (event) => {
-          if (worker !== spawned) return
-          const error = new DbExecutorCrashedError(
-            `db executor worker failed: ${event.message || "unknown worker error"}`,
-          )
-          bootReject = undefined
-          void retire(error)
-          reject(error)
-        }
-        spawned.addEventListener("close", () => {
-          if (closed || worker !== spawned) return
-          const error = new DbExecutorCrashedError("db executor worker exited")
-          bootReject = undefined
-          void retire(error)
-          reject(error)
+          if (stale !== undefined) yield* terminateWorker(stale)
         })
-      })
-    })()
-    return ready
-  }
-
-  const requestOnce = async (build: (id: number) => DbExecutorRequest): Promise<unknown> => {
-    await ensureReady()
-    if (closed) throw new DbExecutorClosedError()
-    const id = nextId++
-    const current = worker
-    if (current === undefined) throw new DbExecutorCrashedError("db executor worker is not running")
-    return new Promise<unknown>((resolve, reject) => {
-      const timer =
-        timeoutMs > 0
-          ? setTimeout(() => {
-              // A deadline is indeterminate: the transaction may have committed
-              // before the response was lost. Retire the whole thread so a retry
-              // starts on a fresh connection and no half-open transaction is
-              // reused. Unlike a crash, callers can tell this apart by type.
-              retire(
-                new DbExecutorTimeoutError(
-                  `db executor request ${id} timed out after ${timeoutMs}ms; the transaction may have committed`,
-                ),
-                true,
-              )
-            }, timeoutMs)
-          : undefined
-      pending.set(id, { resolve, reject, timer })
-      try {
-        current.postMessage(build(id))
-      } catch (error) {
-        pending.delete(id)
-        if (timer !== undefined) clearTimeout(timer)
-        reject(error)
-      }
-    })
-  }
-
-  const backoff = (attempt: number): number =>
-    Math.min(EXECUTOR_BUSY_RETRY_CONFIG.baseDelayMs * 2 ** (attempt - 1), EXECUTOR_BUSY_RETRY_CONFIG.maxDelayMs)
-
-  const sleep = (ms: number): Promise<void> =>
-    new Promise((resolve) => {
-      const timer = setTimeout(resolve, ms)
-      timer.unref?.()
-    })
+      }),
+    )
 
   /**
-   * A standalone `run`/`query` is one atomic SQLite statement. A busy failure
-   * means SQLite did not take the lock, so re-issuing the statement is safe;
-   * retry it within the shared executor budget instead of surfacing a transient
-   * lock. Transactions keep their own whole-body retry inside the worker.
+   * Wait for a prior retirement to finish, then spawn the isolate. The boot is
+   * forked into the service scope, so interrupting one caller does not abandon
+   * the shared handshake.
    */
-  const request = async (build: (id: number) => DbExecutorRequest, retryBusy: boolean): Promise<unknown> => {
-    let attempts = 0
-    for (;;) {
-      attempts += 1
-      try {
-        return await requestOnce(build)
-      } catch (error) {
-        if (!retryBusy || !isBusyError(error) || attempts > EXECUTOR_BUSY_RETRY_CONFIG.retries) throw error
-        await sleep(backoff(attempts))
-      }
-    }
+  const bootWorker = (ready: Deferred.Deferred<void, DbExecutorError>): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      yield* workerGate
+        .withPermits(1)(
+          Effect.gen(function* () {
+            if (state.closed) return yield* closedError()
+            const stale = state.staleWorker
+            state.staleWorker = undefined
+            if (stale !== undefined) yield* terminateWorker(stale)
+            const spawned = yield* Effect.try({
+              try: () => {
+                const workerOptions = {
+                  ...(options.name === undefined ? {} : { name: options.name }),
+                  workerData: {
+                    kind: "db-executor",
+                    filename: options.filename,
+                    pragmas,
+                    ...(options.create === undefined ? {} : { create: options.create }),
+                  } satisfies DbExecutorWorkerData,
+                } as unknown as WorkerOptions
+                return new Worker(entry, workerOptions)
+              },
+              catch: (error) => crashedError(`db executor worker failed to start: ${errorMessage(error)}`),
+            })
+            state.worker = spawned
+            spawned.onmessage = (event: MessageEvent<DbExecutorResponse>) => {
+              // A retired worker's late frames must never settle a request for, or
+              // resolve, a replacement thread.
+              if (state.worker !== spawned) return
+              const message = event.data
+              if (message.type === "ready") {
+                state.executorThreadId = message.threadId
+                Deferred.doneUnsafe(ready, Effect.void)
+                return
+              }
+              // A close acknowledgement has no request to settle; `close()` waits
+              // for it through its own listener.
+              if (message.type === "closed") return
+              const request = state.pending.get(message.id)
+              if (request === undefined) return
+              if (message.type === "result") request.resolve(message.value)
+              else request.reject(remoteErrorOf(message.error))
+            }
+            spawned.onerror = (event) => {
+              if (state.worker !== spawned) return
+              crash(spawned, crashedError(`db executor worker failed: ${event.message || "unknown worker error"}`))
+            }
+            spawned.addEventListener("close", () => {
+              if (state.closed || state.worker !== spawned) return
+              crash(spawned, crashedError("db executor worker exited"))
+            })
+          }),
+        )
+        .pipe(
+          Effect.catch((error) =>
+            Effect.sync(() => {
+              Deferred.doneUnsafe(ready, Effect.fail(error))
+            }),
+          ),
+        )
+      // The deferred carries success or failure to every waiter; the boot fiber
+      // itself has nothing left to report.
+      yield* Deferred.await(ready).pipe(Effect.ignore)
+    })
+
+  const crash = (spawned: Worker, error: DbExecutorCrashedError): void => {
+    if (state.worker !== spawned) return
+    state.worker = undefined
+    state.staleWorker = spawned
+    failBoot(error)
+    failPending(error)
   }
+
+  const ensureReady = (): Effect.Effect<void, DbExecutorError> =>
+    Effect.suspend(() => {
+      if (state.closed) return Effect.fail(closedError())
+      if (state.ready !== undefined) return Deferred.await(state.ready)
+      const ready = Deferred.makeUnsafe<void, DbExecutorError>()
+      state.ready = ready
+      return Effect.forkIn(bootWorker(ready), scope).pipe(Effect.flatMap(() => Deferred.await(ready)))
+    })
+
+  const requestOnce = (build: (id: number) => DbExecutorRequest): Effect.Effect<unknown, DbExecutorError> =>
+    Effect.gen(function* () {
+      yield* ensureReady()
+      if (state.closed) return yield* closedError()
+      const current = state.worker
+      if (current === undefined) return yield* crashedError("db executor worker is not running")
+      const id = state.nextId++
+      return yield* Effect.callback<unknown, DbExecutorError>((resume) => {
+        let done = false
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const clearTimer = (): void => {
+          if (timer !== undefined) clearTimeout(timer)
+        }
+        const finish = (effect: Effect.Effect<unknown, DbExecutorError>): void => {
+          if (done) return
+          done = true
+          clearTimer()
+          state.pending.delete(id)
+          resume(effect)
+        }
+        if (timeoutMs > 0) {
+          timer = setTimeout(() => {
+            if (done) return
+            done = true
+            clearTimer()
+            state.pending.delete(id)
+            // A deadline is indeterminate: the transaction may have committed
+            // before the response was lost. Retire the whole thread so a retry
+            // starts on a fresh connection and no half-open transaction is
+            // reused. Unlike a crash, callers can tell this apart by type.
+            const error = new DbExecutorTimeoutError({
+              message: `db executor request ${id} timed out after ${timeoutMs}ms; the transaction may have committed`,
+            })
+            resume(
+              Effect.gen(function* () {
+                yield* retire(error, true)
+                return yield* Effect.fail(error)
+              }),
+            )
+          }, timeoutMs)
+        }
+        state.pending.set(id, {
+          resolve: (value) => finish(Effect.succeed(value)),
+          reject: (error) => finish(Effect.fail(error)),
+        })
+        try {
+          current.postMessage(build(id))
+        } catch (error) {
+          finish(Effect.fail(crashedError(`db executor request failed: ${errorMessage(error)}`)))
+        }
+        // Interruption removes the pending entry; the statement itself may still
+        // finish on the executor thread, and its late result is ignored.
+        return Effect.sync(() => {
+          if (done) return
+          done = true
+          clearTimer()
+          state.pending.delete(id)
+        })
+      })
+    })
+
+  const busy = <A>(effect: Effect.Effect<A, DbExecutorError>): Effect.Effect<A, DbExecutorFailureError> =>
+    withBusyRetry(effect, EXECUTOR_BUSY_RETRY_CONFIG)
 
   return {
     run: (sql, params) =>
-      request(
-        (id) => ({
+      busy(
+        requestOnce((id) => ({
           type: "run",
           id,
           sql,
           ...(params === undefined ? {} : { params }),
-        }),
-        true,
-      ) as Promise<DbRunResult>,
+        })) as Effect.Effect<DbRunResult, DbExecutorError>,
+      ),
     query: (sql, params) =>
-      request(
-        (id) => ({
+      busy(
+        requestOnce((id) => ({
           type: "query",
           id,
           sql,
           ...(params === undefined ? {} : { params }),
-        }),
-        true,
-      ) as Promise<ReadonlyArray<Record<string, unknown>>>,
+        })) as Effect.Effect<ReadonlyArray<Record<string, unknown>>, DbExecutorError>,
+      ),
+    queryInTransaction: (sql, params) =>
+      requestOnce((id) => ({
+        type: "query",
+        id,
+        sql,
+        ...(params === undefined ? {} : { params }),
+      })) as Effect.Effect<ReadonlyArray<Record<string, unknown>>, DbExecutorError>,
     transaction: (statements) =>
-      request((id) => ({ type: "transaction", id, statements }), false) as Promise<ReadonlyArray<DbTransactionResult>>,
+      requestOnce((id) => ({ type: "transaction", id, statements })) as Effect.Effect<
+        ReadonlyArray<DbTransactionResult>,
+        DbExecutorError
+      >,
+    close: () =>
+      Effect.suspend(() => {
+        if (state.closed) return Effect.void
+        state.closed = true
+        const error = closedError()
+        failBoot(error)
+        failPending(error)
+        return workerGate.withPermits(1)(
+          Effect.gen(function* () {
+            // Read the current handles after acquiring the gate: a boot that was
+            // between its closed check and its spawn cannot be missed.
+            const live = state.worker
+            const stale = state.staleWorker
+            state.worker = undefined
+            state.staleWorker = undefined
+            // The isolate must close its own native handle while its realm still
+            // exists; `terminate()` alone would strand the WAL lock.
+            if (live !== undefined) {
+              yield* closeWorkerDatabase(live, state.nextId++)
+              yield* terminateWorker(live)
+            }
+            if (stale !== undefined) yield* terminateWorker(stale)
+          }),
+        )
+      }),
     get threadId() {
-      return executorThreadId
+      return state.executorThreadId
     },
-    async close() {
-      if (closed) return
-      closed = true
-      const current = worker
-      worker = undefined
-      ready = undefined
-      settleBoot(new DbExecutorClosedError())
-      failPending(new DbExecutorClosedError())
-      // The isolate must close its own native handle while its realm still
-      // exists; `terminate()` alone would strand the WAL lock.
-      await closeWorkerDatabase(current, nextId++)
-      await terminateWorker(current)
-      // A retirement started before close may still be running.
-      await retirement
-    },
+    checkpoint: () =>
+      Effect.suspend(() => {
+        if (state.closed || state.worker === undefined) return Effect.void
+        return requestOnce((id) => ({ type: "query", id, sql: "PRAGMA wal_checkpoint(PASSIVE)" })).pipe(
+          Effect.asVoid,
+          Effect.catchCause(() => Effect.logWarning("db executor passive checkpoint failed")),
+        )
+      }),
+    checkpointIntervalMs,
   }
 }
 
 // ---------------------------------------------------------------------------
 // Effect service shape.
-//
-// The `DbExecutor` service is the same executor behavior expressed as an Effect
-// service. The Promise executor stays the adapter (`createDbExecutor`); every
-// service method lifts one of its operations without changing ordering,
-// deadlines, retries, or teardown. State stays in the adapter's closure.
 // ---------------------------------------------------------------------------
 
 /**
- * The Effect-facing executor surface. `executor` is the raw Promise adapter the
- * service delegates to; the remaining members lift each operation.
+ * The Effect-facing executor surface. Every method is the implementation: it
+ * owns the worker handshake, deadline, retirement, and detach semantics.
  */
 export interface Interface {
-  readonly executor: DbExecutor
-  readonly run: (sql: string, params?: DbParams) => Effect.Effect<DbRunResult>
-  readonly query: (sql: string, params?: DbParams) => Effect.Effect<ReadonlyArray<Record<string, unknown>>>
-  readonly transaction: (statements: ReadonlyArray<DbStatement>) => Effect.Effect<ReadonlyArray<DbTransactionResult>>
+  readonly run: (sql: string, params?: DbParams) => Effect.Effect<DbRunResult, DbExecutorFailureError>
+  readonly query: (
+    sql: string,
+    params?: DbParams,
+  ) => Effect.Effect<ReadonlyArray<Record<string, unknown>>, DbExecutorFailureError>
+  /** Query without busy replay; the migration batch owns its transaction. */
+  readonly queryInTransaction: (
+    sql: string,
+    params?: DbParams,
+  ) => Effect.Effect<ReadonlyArray<Record<string, unknown>>, DbExecutorError>
+  readonly transaction: (
+    statements: ReadonlyArray<DbStatement>,
+  ) => Effect.Effect<ReadonlyArray<DbTransactionResult>, DbExecutorError>
   readonly close: () => Effect.Effect<void>
   /** The isolate's real thread id; `0` until the ready frame arrives. */
   readonly threadId: number
@@ -678,38 +823,25 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/DbExecutor") {}
 
-/** Adapt the Promise executor without owning, reordering, or retrying anything. */
-export function fromExecutor(executor: DbExecutor): Interface {
-  const run = Effect.fn("DbExecutor.run")(function* (sql: string, params?: DbParams) {
-    return yield* Effect.promise(() => executor.run(sql, params))
-  })
-  const query = Effect.fn("DbExecutor.query")(function* (sql: string, params?: DbParams) {
-    return yield* Effect.promise(() => executor.query(sql, params))
-  })
-  const transaction = Effect.fn("DbExecutor.transaction")(function* (statements: ReadonlyArray<DbStatement>) {
-    return yield* Effect.promise(() => executor.transaction(statements))
-  })
-  const close = Effect.fn("DbExecutor.close")(function* () {
-    yield* Effect.promise(() => executor.close())
-  })
-  return {
-    executor,
-    run,
-    query,
-    transaction,
-    close,
-    get threadId() {
-      return executor.threadId
-    },
-  }
-}
-
-/** Build the executor on demand; the scope owns its native-handle close. */
+/**
+ * Acquire the executor and fork its passive-checkpoint loop into the current
+ * scope. Closing the scope interrupts and joins the checkpoint before the
+ * service's release finalizer closes the worker.
+ */
 export function make(options: DbExecutorOptions): Effect.Effect<Interface, never, Scope.Scope> {
-  return Effect.acquireRelease(
-    Effect.sync(() => fromExecutor(createDbExecutor(options))),
-    (service) => service.close(),
-  )
+  return Effect.gen(function* () {
+    const scope = yield* Scope.Scope
+    const core = yield* Effect.acquireRelease(
+      Effect.sync(() => createExecutorCore(options, scope)),
+      (executor) => executor.close(),
+    )
+    if (core.checkpointIntervalMs > 0) {
+      yield* core
+        .checkpoint()
+        .pipe(Effect.repeat(Schedule.spaced(Duration.millis(core.checkpointIntervalMs))), Effect.forkScoped)
+    }
+    return core
+  })
 }
 
 /** Install a `DbExecutor` implementation into the context. */
@@ -722,6 +854,48 @@ export function node(options: DbExecutorOptions): LayerNode.Node<Service, never,
   return LayerNode.make({ service: Service, layer: layer(options), deps: [] })
 }
 
-export * as DbExecutor from "./db-executor"
+// ---------------------------------------------------------------------------
+// Temporary Promise edge.
+//
+// The async schema gate and some legacy tests are not Effect yet. These helpers
+// acquire the same service and expose its methods as Promises. The production
+// hub uses the service directly; it only adapts at `SessionHubOptions.db`.
+// ---------------------------------------------------------------------------
 
-export * as DbExecutorModule from "./db-executor"
+function promiseFacade(service: Interface, close: () => Promise<void>): DbExecutor {
+  return {
+    run: (sql, params) => Effect.runPromise(service.run(sql, params)),
+    query: (sql, params) => Effect.runPromise(service.query(sql, params)),
+    queryInTransaction: (sql, params) => Effect.runPromise(service.queryInTransaction(sql, params)),
+    transaction: (statements) => Effect.runPromise(service.transaction(statements)),
+    close,
+    get threadId() {
+      return service.threadId
+    },
+  }
+}
+
+/** Adapt a live service to the legacy Promise surface (hub internals only). */
+export function toPromiseExecutor(service: Interface): DbExecutor {
+  return promiseFacade(service, () => Effect.runPromise(service.close()))
+}
+
+/**
+ * Acquire the service on a private scope and return its Promise facade.
+ *
+ * This is the single temporary edge for non-Effect callers. The returned
+ * handle must be closed; that closes the service scope (worker + checkpoint).
+ */
+export function makePromiseExecutor(options: DbExecutorOptions): DbExecutor {
+  const scope = Effect.runSync(Scope.make())
+  const service = Effect.runSync(Scope.provide(scope)(make(options)))
+  let closing: Promise<void> | undefined
+  return promiseFacade(service, () => (closing ??= Effect.runPromise(Scope.close(scope, Exit.void))))
+}
+
+/** @deprecated Use {@link Service} / {@link make} in production; kept for legacy tests. */
+export function createDbExecutor(options: DbExecutorOptions): DbExecutor {
+  return makePromiseExecutor(options)
+}
+
+export * as DbExecutor from "./db-executor"

@@ -1,13 +1,12 @@
-// The worker-ports service is the Effect-idiomatic surface over the hub-side
-// port registry. These tests pin the added `Interface` / `make` / `layer` /
-// `node` shape and the adapter equivalence with the synchronous
-// `createWorkerPortRegistry`, without exercising the hub wiring.
+// The worker-ports service is the one authority for hub-side port attachment.
+// These tests pin the `Interface` / `make` / `layer` / `node` shape and the
+// synchronous attachments facade the Promise-shaped hub composes.
 
 import { describe, expect, test } from "bun:test"
 import { Effect, Tracer } from "effect"
 import { createHubProxyClient } from "@/session/worker/hub-proxy-wire"
 import type { PidReport } from "@/session/worker/pid-registry"
-import { Service, createWorkerPortRegistry, layer, make, node, type WorkerPorts } from "@/session/worker/worker-ports"
+import { Service, layer, make, makeAttachments, node, type WorkerPorts } from "@/session/worker/worker-ports"
 import { it } from "../../lib/effect"
 
 const pidReport = (workerID: number, pgid: number): PidReport => ({
@@ -248,7 +247,7 @@ describe("worker-ports service", () => {
     )
   })
 
-  it.live("matches the synchronous registry adapter", () =>
+  it.live("matches the attachments facade", () =>
     Effect.gen(function* () {
       const makeOptions = () => {
         let resolutions = 0
@@ -257,7 +256,6 @@ describe("worker-ports service", () => {
           resolutions: () => resolutions,
           disposals: () => disposals,
           options: {
-            log: () => {},
             backends: () => {
               resolutions++
               return { egress: () => () => void disposals++ }
@@ -279,28 +277,28 @@ describe("worker-ports service", () => {
       expect(serviceBase.resolutions()).toBe(1)
       expect(serviceBase.disposals()).toBe(2)
 
-      const registryBase = makeOptions()
-      const registry = createWorkerPortRegistry(registryBase.options)
-      const registryChannel = messageChannel()
-      const registryNext = messageChannel()
-      const registryFirst = registry.attachWorkerPorts(1, { egress: registryChannel.port1 })
-      const registrySecond = registry.attachWorkerPorts(1, { egress: registryNext.port1 })
-      registrySecond()
-      registryFirst()
-      expect(registryBase.resolutions()).toBe(1)
-      expect(registryBase.disposals()).toBe(2)
+      const facadeBase = makeOptions()
+      const facade = makeAttachments(facadeBase.options)
+      const facadeChannel = messageChannel()
+      const facadeNext = messageChannel()
+      const facadeFirst = facade.attachWorkerPorts(1, { egress: facadeChannel.port1 })
+      const facadeSecond = facade.attachWorkerPorts(1, { egress: facadeNext.port1 })
+      facadeSecond()
+      facadeFirst()
+      expect(facadeBase.resolutions()).toBe(1)
+      expect(facadeBase.disposals()).toBe(2)
 
       yield* service.disposeAll()
-      registry.disposeAll()
+      facade.disposeAll()
 
       serviceChannel.port1.close()
       serviceChannel.port2.close()
       serviceNext.port1.close()
       serviceNext.port2.close()
-      registryChannel.port1.close()
-      registryChannel.port2.close()
-      registryNext.port1.close()
-      registryNext.port2.close()
+      facadeChannel.port1.close()
+      facadeChannel.port2.close()
+      facadeNext.port1.close()
+      facadeNext.port2.close()
     }),
   )
 })

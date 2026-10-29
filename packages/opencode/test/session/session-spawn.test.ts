@@ -12,6 +12,7 @@ import { InstanceBootstrap } from "@/project/bootstrap"
 import { Session } from "@/session/session"
 import { SessionDepth } from "@/session/depth"
 import { SessionPrompt } from "@/session/prompt"
+import { SessionPromptService } from "@/session/prompt-service"
 import { spawnChildOnHub } from "@/session/worker/hub"
 import type { SessionSpawnRequest } from "@/session/worker/subagent"
 import { MessageID, PartID } from "@/session/schema"
@@ -43,7 +44,7 @@ function reply(input: SessionPrompt.PromptInput, text: string): SessionV1.WithPa
   }
 }
 
-const promptLayer = Layer.mock(SessionPrompt.Service, {
+const promptLayer = Layer.mock(SessionPromptService.Service, {
   prompt: (input) =>
     Effect.sync(() => {
       promptCalls.push(input)

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import type { LiveEventPublisher } from "@/event-v2-bridge"
 import {
   aggregateIDOfEvent,
@@ -7,6 +7,7 @@ import {
   createSessionHub,
   type HubTruthCache,
 } from "@/session/worker/hub"
+import { createTestBarrier } from "../../lib/run-barrier-test"
 import type { ExecutorWorkerPool } from "@/session/worker/execute"
 
 const publisher: LiveEventPublisher = {
@@ -31,7 +32,7 @@ const cacheOf = (cache: HubTruthCache | undefined): HubTruthCache => {
 
 describe("hub truth cache", () => {
   test("is keyed by (aggregate_id, seq) and never authoritative across a restart", async () => {
-    const hub = createSessionHub({ pool: emptyPool() })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: emptyPool() })
     const cache = cacheOf(hub.cache)
     expect(cache.get("ses_one", 0)).toBeUndefined()
 
@@ -45,13 +46,13 @@ describe("hub truth cache", () => {
     await hub.terminateAll()
     expect(cache.get("ses_one", 0)).toBeUndefined()
 
-    const restarted = createSessionHub({ pool: emptyPool() })
+    const restarted = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: emptyPool() })
     expect(restarted.cache?.get("ses_one", 0)).toBeUndefined()
     await restarted.terminateAll()
   })
 
   test("a durable hub event invalidates its aggregate and fences the old state version", async () => {
-    const cache = new Bus.StateCache<string>()
+    const cache = new DurableLog.StateCache<string>()
     const sink = createHubEventSink({ publisher, cache })
     const event = { id: "evt_1", type: "session.updated", properties: { sessionID: "ses_one" } }
     const before = cache.version
@@ -68,7 +69,7 @@ describe("hub truth cache", () => {
     try {
       cache.set("ses_one", 0, "old-version", before)
     } catch (error) {
-      rejected = error instanceof Bus.StaleStateVersionError
+      rejected = error instanceof DurableLog.StaleStateVersionError
     }
     expect(rejected).toBe(true)
 

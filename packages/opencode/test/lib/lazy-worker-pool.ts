@@ -1,6 +1,6 @@
 // Test-only lazy executor pool.
 //
-// The product only builds workers through `createProductionWorkerPool`; the
+// The product only builds workers through the scoped production pool; the
 // lazy `create(callback)` variants were test seams that never ran in a hub. They
 // live here so tests keep an in-memory worker factory while production carries
 // only the live pool. The materialization and idle-cap mechanics below are the
@@ -14,7 +14,7 @@ import {
   type ExecutorWorker,
   type ExecutorWorkerPool,
 } from "@/session/worker/execute"
-import { noopWorkerLogger, type WorkerLogger } from "@/session/worker/log"
+import type { EffectBridge } from "@/effect/bridge"
 import {
   createIdleIsolateCap,
   createWorkerCap,
@@ -33,7 +33,7 @@ interface MaterializingWorkerState {
 function createMaterializingExecutorWorker(
   id: number,
   materialize: (run: ExecutorRun, state: MaterializingWorkerState) => Promise<ExecutorWorker>,
-  log: WorkerLogger = noopWorkerLogger,
+  bridge: EffectBridge.Shape | undefined,
   cap?: WorkerCap,
 ): ExecutorWorker {
   const state: MaterializingWorkerState = { inner: undefined, terminated: false, materializing: undefined }
@@ -55,7 +55,7 @@ function createMaterializingExecutorWorker(
     assertNotBusy: (sessionID) =>
       state.inner === undefined ? Promise.resolve(false) : state.inner.assertNotBusy(sessionID),
     resultFor: (sessionID) => state.inner?.resultFor(sessionID),
-    cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID), log }),
+    cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID), ...(bridge === undefined ? {} : { bridge }) }),
     terminate: async () => {
       state.terminated = true
       const materializing = state.materializing
@@ -78,7 +78,7 @@ export type LazyExecutorWorkerFactory = () => ExecutorWorker | Promise<ExecutorW
 
 export interface LazyExecutorWorkerPoolOptions {
   readonly create: (id: number) => ExecutorWorker | Promise<ExecutorWorker>
-  readonly log?: WorkerLogger
+  readonly bridge?: EffectBridge.Shape
   readonly maxRunning?: number
   readonly maxIdleWorkers?: number
 }
@@ -86,7 +86,7 @@ export interface LazyExecutorWorkerPoolOptions {
 export function createLazyExecutorWorker(
   id: number,
   create: LazyExecutorWorkerFactory,
-  log: WorkerLogger = noopWorkerLogger,
+  bridge: EffectBridge.Shape | undefined,
   cap?: WorkerCap,
 ): ExecutorWorker {
   return createMaterializingExecutorWorker(
@@ -106,7 +106,7 @@ export function createLazyExecutorWorker(
         })
       return state.materializing
     },
-    log,
+    bridge,
     cap,
   )
 }
@@ -147,11 +147,11 @@ export function createLazyExecutorWorkerPool(options: LazyExecutorWorkerPoolOpti
   let pool: ExecutorWorkerPool | undefined
   const idleCap = createIdleIsolateCap({
     capacity: options.maxIdleWorkers ?? resolveIdleWorkerCapacity(),
-    ...(options.log === undefined ? {} : { log: options.log }),
+    ...(options.bridge === undefined ? {} : { bridge: options.bridge }),
     onEvict: (entry) => pool?.releaseSession?.(entry.sessionID, entry.worker.id),
   })
   pool = createExecutorWorkerPool({
-    spawn: (id) => idleCap.track(createLazyExecutorWorker(id, () => options.create(id), options.log, cap)),
+    spawn: (id) => idleCap.track(createLazyExecutorWorker(id, () => options.create(id), options.bridge, cap)),
   })
   return withIdleIsolateCap(pool, idleCap)
 }

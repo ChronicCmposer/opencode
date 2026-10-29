@@ -7,6 +7,7 @@ import { Global } from "../global"
 import { Flag } from "../flag/flag"
 import { isAbsolute, join } from "path"
 import { DatabaseMigration } from "./migration"
+import { SchemaGate } from "./schema-gate"
 import { resolveWalConfig, walPragmas } from "./pragmas"
 import { InstallationChannel } from "../installation/version"
 import { makeGlobalNode } from "../effect/app-node"
@@ -20,25 +21,39 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/storage/Database") {}
 
-const layer = Layer.effect(
-  Service,
-  Effect.gen(function* () {
-    const db = yield* makeDatabase
+export interface DatabaseLayerOptions {
+  /**
+   * `false` only for a caller that already holds the cross-process gate (the
+   * session hub's synchronous ensure). Every other construction takes the gate
+   * inside this layer, before any migration statement runs.
+   */
+  readonly gate?: boolean
+}
 
-    // One resolved config feeds both the pragma list applied here (journal size
-    // limit + busy timeout) and the hub executor's periodic checkpoint cadence
-    // (`checkpointIntervalMs`, consumed by `session/worker/db-executor.ts`);
-    // neither setting is dropped between the two connections.
-    for (const pragma of walPragmas(resolveWalConfig())) yield* db.run(pragma)
-    yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
-    yield* DatabaseMigration.apply(db)
+export function layer(filename: string, options: DatabaseLayerOptions = {}) {
+  return Layer.effect(
+    Service,
+    Effect.gen(function* () {
+      const db = yield* makeDatabase
 
-    return { db }
-  }).pipe(Effect.orDie),
-)
+      // One resolved config feeds both the pragma list applied here (journal size
+      // limit + busy timeout) and the hub executor's periodic checkpoint cadence
+      // (`checkpointIntervalMs`, consumed by `session/worker/db-executor.ts`);
+      // neither setting is dropped between the two connections.
+      for (const pragma of walPragmas(resolveWalConfig())) yield* db.run(pragma)
+      yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
 
-export function layerFromPath(filename: string) {
-  return layer.pipe(Layer.provide(sqliteLayer({ filename })))
+      const migrate = () => DatabaseMigration.apply(db)
+      if (options.gate === false) yield* migrate()
+      else yield* SchemaGate.withSchemaGate(filename, migrate)
+
+      return { db }
+    }).pipe(Effect.orDie),
+  )
+}
+
+export function layerFromPath(filename: string, options: DatabaseLayerOptions = {}) {
+  return layer(filename, options).pipe(Layer.provide(sqliteLayer({ filename })))
 }
 
 export function path() {

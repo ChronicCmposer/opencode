@@ -1,13 +1,13 @@
 // Typed-repository durable/event/blob/lease acceptance.
 //
 // Real migrated SQLite file + real bound worker. The durable log has exactly one
-// write boundary (`Bus.DurableRepository`) reached through the narrow
+// write boundary (`DurableLog.DurableRepository`) reached through the narrow
 // `WorkerDatabase.bus` capability:
 //
-//   * the Bus handles expose typed publish/read/claim/reclaim/release only — no
+//   * the DurableLog handles expose typed publish/read/claim/reclaim/release only — no
 //     `connection`, `transaction`, `transactionAsync`, `run`, `exec`, or `all`;
 //   * events, sequences, and oversized blob rows are written and read back;
-//   * a Bus handle is scoped to the worker's one aggregate;
+//   * a DurableLog handle is scoped to the worker's one aggregate;
 //   * the worker lease fences a stale generation: it cannot claim, publish,
 //     heartbeat, or reclaim a live successor, and only the released generation
 //     can be reclaimed;
@@ -20,7 +20,7 @@ import path from "node:path"
 import { afterEach, describe, expect, test } from "bun:test"
 import { Effect, Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { markSchemaIdentity } from "@/session/db/schema"
 import { openWorkerDatabase, type WorkerDatabase } from "@/session/worker/db"
@@ -123,7 +123,7 @@ afterEach(async () => {
 })
 
 describe("durable log has one typed boundary and no raw handle", () => {
-  test("Bus handles expose only typed operations, and event sequence/blob writes work end to end", async () => {
+  test("DurableLog handles expose only typed operations, and event sequence/blob writes work end to end", async () => {
     const filename = migratedWorkerFile()
     const database = await openBound(filename)
     const blobDir = path.join(path.dirname(filename), "event-blobs")
@@ -236,7 +236,7 @@ describe("the worker lease fences a stale generation", () => {
     expect(seq).toBe(0)
 
     const second = database.bus.create({ ...options, ownerID: "final-gen-2" })
-    expect(() => second.claim(SESSION)).toThrow(Bus.StaleOwnerError)
+    expect(() => second.claim(SESSION)).toThrow(DurableLog.StaleOwnerError)
     // The predecessor's lease is still live, so a reclaim is refused.
     expect(() =>
       second.reclaim({
@@ -245,7 +245,7 @@ describe("the worker lease fences a stale generation", () => {
         expectedSeq: seq,
         nextOwnerID: "final-gen-2",
       }),
-    ).toThrow(Bus.LeaseConflictError)
+    ).toThrow(DurableLog.LeaseConflictError)
     expect(second.ownerOf(SESSION)).toBe("final-gen-1")
 
     first.release(SESSION)
@@ -262,8 +262,8 @@ describe("the worker lease fences a stale generation", () => {
     second.heartbeat(SESSION)
     const next = second.publish([{ definition: Note, data: note("generation two") }])
     expect(next[0]?.durable?.seq).toBe(1)
-    expect(() => first.publish([{ definition: Note, data: note("stale write") }])).toThrow(Bus.StaleOwnerError)
-    expect(() => first.heartbeat(SESSION)).toThrow(Bus.StaleOwnerError)
+    expect(() => first.publish([{ definition: Note, data: note("stale write") }])).toThrow(DurableLog.StaleOwnerError)
+    expect(() => first.heartbeat(SESSION)).toThrow(DurableLog.StaleOwnerError)
 
     expect(first.read({ aggregateID: SESSION }).map(textOf)).toEqual(["generation one", "generation two"])
   }, 60_000)

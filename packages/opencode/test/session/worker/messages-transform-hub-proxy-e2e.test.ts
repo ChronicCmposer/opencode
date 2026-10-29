@@ -50,7 +50,7 @@ import {
 } from "@/session/worker/layer"
 import { workerGraphReplacements } from "@/session/worker/session-worker"
 import { instantRunner, recordingHubAuthorities, type HubAuthorityCall } from "../../lib/hub-proxy"
-import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
+import { createE2EContext, memoizeWorkerLayer, type E2EContext, type MemoizedWorkerLayer } from "../../lib/e2e-context"
 import { pluginPassThroughReplacement } from "../../lib/worker-plugin-routes"
 import { startMockProvider, type MockProviderHandle } from "../../lib/mock-provider"
 import { workerSnapshot } from "../../lib/snapshot"
@@ -149,26 +149,30 @@ function realHubProxyHost(): RealHubProxyHost {
   }
 }
 
-/** The full worker graph over the E2E writer, with the real hub-proxy host. */
+/** The full worker graph over the E2E worker database, with the real hub-proxy host. */
 function workerLayer(
   snapshot: WorkerSnapshot,
   provider: MockProviderHandle,
+  database: E2EContext["database"],
   writer: WriterClientHandle,
   plugins: WorkerPluginHost,
-): Layer.Layer<unknown, unknown> {
+): MemoizedWorkerLayer {
   const config = modelConfig(provider)
-  return buildSessionWorkerLayer({
-    snapshot,
-    env: { values: {} },
-    clients: {
-      writer,
-      egress: { emit: () => {}, emitDurable: () => {} },
-      backgroundJob: { wait: async () => null, cancel: async () => {} },
-    },
-    modelClient: llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(snapshot, config))),
-    plugins,
-    replacements: [...workerGraphReplacements(config), pluginPassThroughReplacement(plugins)],
-  }).layer
+  return memoizeWorkerLayer(
+    buildSessionWorkerLayer({
+      snapshot,
+      env: { values: {} },
+      clients: {
+        writer,
+        database,
+        egress: { emit: () => {}, emitDurable: () => {} },
+        backgroundJob: { wait: async () => null, cancel: async () => {} },
+      },
+      modelClient: llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(snapshot, config))),
+      plugins,
+      replacements: [...workerGraphReplacements(config), pluginPassThroughReplacement(plugins)],
+    }).layer,
+  )
 }
 
 /**
@@ -277,10 +281,10 @@ describe("messages.transform crosses the REAL hub-proxy boundary", () => {
     const snapshot = workerSnapshot({ directory })
     const ctx = createE2EContext({ snapshot, modelConfig: modelConfig(provider) })
     const proxy = realHubProxyHost()
+    const worker = workerLayer(snapshot, provider, ctx.database, ctx.writer, proxy.host)
     try {
-      const layer = workerLayer(snapshot, provider, ctx.writer, proxy.host)
-      const sessionID = await Effect.runPromise(seed(layer, ctx.instance, directory, provider.model))
-      const persisted = await Effect.runPromise(runTurn(layer, ctx.instance, sessionID))
+      const sessionID = await Effect.runPromise(seed(worker.layer, ctx.instance, directory, provider.model))
+      const persisted = await Effect.runPromise(runTurn(worker.layer, ctx.instance, sessionID))
 
       // Readiness signal: the provider only records after it answers, and the
       // loop only resolves after that reply — no sleep, wait on the request.
@@ -299,6 +303,7 @@ describe("messages.transform crosses the REAL hub-proxy boundary", () => {
       // keeps the real tool output.
       expect(JSON.stringify(persisted)).toContain(OLD_OUTPUT)
     } finally {
+      await worker.dispose()
       proxy.dispose()
       await ctx.dispose()
       await provider.stop()

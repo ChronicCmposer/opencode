@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
 import { Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 
 const Note = Event.define({
   type: "test.bus.seq.note",
@@ -40,7 +40,7 @@ const open = () => {
   return { native, connection: connectionFrom(native) }
 }
 
-function connectionFrom(native: Database): Bus.Connection {
+function connectionFrom(native: Database): DurableLog.Connection {
   return {
     all: (sql, params = []) => native.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>,
     run: (sql, params = []) => ({ changes: Number(native.query(sql).run(...(params as never[])).changes) }),
@@ -53,11 +53,11 @@ afterEach(() => {
   for (const native of databases.splice(0)) native.close()
 })
 
-describe("Bus sequence allocation", () => {
+describe("DurableLog sequence allocation", () => {
   test("keeps contiguous per-aggregate sequences across interleaved batches", () => {
     const { native, connection } = open()
     databases.push(native)
-    const bus = Bus.create({ connection, ownerID: "worker-1", definitions: [Note] })
+    const bus = DurableLog.create({ connection, ownerID: "worker-1", definitions: [Note] })
 
     bus.publish([{ definition: Note, data: note("a", "a0") }])
     bus.publish([
@@ -80,7 +80,7 @@ describe("Bus sequence allocation", () => {
   test("enforces unique (aggregate_id, seq) at the database boundary", () => {
     const { native, connection } = open()
     databases.push(native)
-    const bus = Bus.create({ connection, ownerID: "worker-1", definitions: [Note] })
+    const bus = DurableLog.create({ connection, ownerID: "worker-1", definitions: [Note] })
     bus.publish([{ definition: Note, data: note("s1", "a") }])
 
     expect(() =>
@@ -98,7 +98,7 @@ describe("Bus sequence allocation", () => {
     const { native, connection } = open()
     databases.push(native)
     const statements = new Array<string>()
-    const tracked: Bus.Connection = {
+    const tracked: DurableLog.Connection = {
       all: (sql, params = []) => {
         statements.push(sql)
         return connection.all(sql, params)
@@ -106,7 +106,7 @@ describe("Bus sequence allocation", () => {
       run: (sql, params = []) => connection.run(sql, params),
       exec: (sql) => connection.exec(sql),
     }
-    const bus = Bus.create({ connection: tracked, ownerID: "worker-1", definitions: [Note] })
+    const bus = DurableLog.create({ connection: tracked, ownerID: "worker-1", definitions: [Note] })
 
     bus.publish([
       { definition: Note, data: note("s1", "a") },
@@ -122,7 +122,7 @@ describe("Bus sequence allocation", () => {
   test("does not advance the sequence when an uncommitted block is rolled back", () => {
     const { native, connection } = open()
     databases.push(native)
-    const bus = Bus.create({ connection, ownerID: "worker-1", definitions: [Note] })
+    const bus = DurableLog.create({ connection, ownerID: "worker-1", definitions: [Note] })
     let fail = true
     bus.project(Note, () => {
       if (fail) throw new Error("rollback")

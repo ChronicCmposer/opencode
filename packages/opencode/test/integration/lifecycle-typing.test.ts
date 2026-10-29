@@ -12,6 +12,7 @@ import { Permission } from "@/permission"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Question } from "@/question"
 import { buildHubProxyHandlers, createProductionSessionHub, DEFAULT_RUN_IDLE_TIMEOUT_MS, resolveRunIdleTimeoutMs } from "@/session/worker/hub"
+import { createTestBarrier } from "../lib/run-barrier-test"
 import { createHubProxyClient, HubProxyRemoteError, serveHubProxy } from "@/session/worker/hub-proxy-wire"
 import { SessionWorkerReplyTimeoutError } from "@/session/worker/execute"
 import { SESSION_WORKER_IDLE_TIMEOUT_ENV } from "@/session/worker/pool"
@@ -195,7 +196,7 @@ describe("run-reply watchdog", () => {
   test("a non-responsive worker fails typed within the configured budget", async () => {
     const original = (globalThis as { Worker?: unknown }).Worker
     ;(globalThis as { Worker?: unknown }).Worker = NonResponsiveWorker
-    const hub = createProductionSessionHub({
+    const hub = createProductionSessionHub({ ...{ barrier: createTestBarrier() },
       init: () => sessionWorkerInit(),
       entry: "fake://non-responsive",
       workKind: "instant",

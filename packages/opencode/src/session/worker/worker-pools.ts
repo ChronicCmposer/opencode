@@ -2,8 +2,24 @@
 import os from "node:os"
 import path from "node:path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Context, Deferred, Effect, Layer, Scope, SynchronizedRef } from "effect"
+import {
+  Context,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Queue,
+  Ref,
+  Scope,
+  ScopedCache,
+  Semaphore,
+  SynchronizedRef,
+} from "effect"
 import type { SessionID } from "@/session/schema"
+import type { EffectBridge } from "@/effect/bridge"
 import { defined } from "@/util/object"
 import {
   createExecutorCancelPort,
@@ -26,15 +42,202 @@ import {
   type BootLifecycle,
   type BootTelemetry,
 } from "./cancel"
-import { type SpawnGateHandle, type SpawnPermit } from "./spawn-gate"
 import { SESSION_WORKER_IDLE_TIMEOUT_ENV } from "./pool"
 import { mergeEnv, type WorkerModelSelection } from "./init"
 import { BuildMismatch, verifyReadyBuild } from "./build-hash"
 import type { SessionWorkerInit } from "./session-worker"
-import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
+import { workerLogMessage } from "./worker-logging"
 import { sessionThreadName } from "@/session/worker/thread-name"
 
 import type { WorkerTransferredPorts } from "./worker-ports"
+
+// ---------------------------------------------------------------------------
+// Spawn admission (one Effect `Semaphore`, not a hand-built Promise queue).
+// ---------------------------------------------------------------------------
+
+/** Why a permit was released. Diagnostic only; both outcomes free the slot. */
+export type SpawnOutcome = "ready" | "failed"
+
+/** A boot slot held by one in-flight spawn. */
+export interface SpawnPermit {
+  /** Release the permit exactly once; repeated releases are a no-op. */
+  release(outcome?: SpawnOutcome, error?: unknown): void
+}
+
+export interface SpawnGateOptions {
+  /** How long an acquisition may wait for a slot before the spawn fails. */
+  readonly timeoutMs: number
+  /** How many boots may run concurrently; defaults to 4. */
+  readonly capacity?: number
+}
+
+export interface SpawnGateHandle {
+  acquire(signal?: AbortSignal): Promise<SpawnPermit>
+  /** Whether at least one boot slot is currently held. */
+  readonly held?: boolean
+  /** Exact count of currently held boot slots. */
+  readonly active?: number
+  /** The maximum number of concurrent boots. */
+  readonly capacity?: number
+  /** Number of acquisitions still queued for a slot. */
+  readonly waiting?: number
+}
+
+/** A spawn could not obtain a boot slot within the configured timeout. */
+export class SpawnGateTimeoutError extends Error {
+  readonly timeoutMs: number
+
+  constructor(timeoutMs: number) {
+    super(`spawn gate: no worker spawn permit became available within ${timeoutMs}ms`)
+    this.name = "SpawnGateTimeoutError"
+    this.timeoutMs = timeoutMs
+  }
+}
+
+/** A boot slot acquisition was aborted before it was granted. */
+export class SpawnGateAbortedError extends Error {
+  constructor() {
+    super("spawn gate: acquisition aborted before a worker spawn permit was granted")
+    this.name = "SpawnGateAbortedError"
+  }
+}
+
+const DEFAULT_SPAWN_CAPACITY = 4
+
+function requirePositive(name: string, value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`spawn gate: ${name} must be a positive finite number, received ${value}`)
+  }
+  return value
+}
+
+function requirePositiveInteger(name: string, value: number): number {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`spawn gate: ${name} must be a positive integer, received ${value}`)
+  }
+  return value
+}
+
+/**
+ * The one global spawn admission. A `Semaphore` owns the permits (capacity 4 by
+ * default); `withPermits(1)` is the acquisition primitive, so an interrupted
+ * waiter leaves the queue without consuming a permit and every failed or
+ * abandoned spawn releases exactly once.
+ */
+export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
+  const timeoutMs = requirePositive("timeoutMs", options.timeoutMs)
+  const capacity = requirePositiveInteger("capacity", options.capacity ?? DEFAULT_SPAWN_CAPACITY)
+  const semaphore = Semaphore.makeUnsafe(capacity)
+  const active = Ref.makeUnsafe(0)
+  const waiting = Ref.makeUnsafe(0)
+
+  const activeCount = (): number => Ref.getUnsafe(active)
+  const waitingCount = (): number => Ref.getUnsafe(waiting)
+
+  const acquire = (signal?: AbortSignal): Promise<SpawnPermit> => {
+    if (signal?.aborted === true) return Promise.reject(new SpawnGateAbortedError())
+
+    const granted = Deferred.makeUnsafe<void>()
+    const released = Deferred.makeUnsafe<void>()
+    const aborted = Deferred.makeUnsafe<void>()
+    let waitingCounted = false
+    let holding = false
+
+    const onAbort = (): void => {
+      Deferred.doneUnsafe(aborted, Effect.void)
+    }
+    signal?.addEventListener("abort", onAbort, { once: true })
+    const detach = (): void => {
+      signal?.removeEventListener("abort", onAbort)
+    }
+
+    const hold = semaphore.withPermits(1)(
+      Effect.gen(function* () {
+        yield* Ref.update(waiting, (count) => (count === 0 ? 0 : count - 1))
+        waitingCounted = false
+        yield* Ref.update(active, (count) => count + 1)
+        holding = true
+        yield* Deferred.succeed(granted, undefined)
+        yield* Deferred.await(released)
+      }),
+    )
+
+    // Count the waiter before the fiber can run, so `waiting` is observable the
+    // moment `acquire` is called (and never double-counted on abort).
+    waitingCounted = true
+    Effect.runSync(Ref.update(waiting, (count) => count + 1))
+
+    const fiber = Effect.runFork(
+      Effect.raceFirst(
+        hold,
+        Deferred.await(aborted).pipe(Effect.andThen(Effect.interrupt)),
+      ).pipe(
+        Effect.catchCause(() => Effect.void),
+        Effect.ensuring(
+          Effect.sync(() => {
+            detach()
+            if (waitingCounted) {
+              waitingCounted = false
+              Effect.runSync(Ref.update(waiting, (count) => (count === 0 ? 0 : count - 1)))
+            }
+            if (holding) {
+              holding = false
+              Effect.runSync(Ref.update(active, (count) => (count === 0 ? 0 : count - 1)))
+            }
+          }),
+        ),
+      ),
+    )
+
+    const permit = (): SpawnPermit => {
+      let releasedOnce = false
+      return {
+        release: () => {
+          if (releasedOnce) return
+          releasedOnce = true
+          Deferred.doneUnsafe(released, Effect.void)
+        },
+      }
+    }
+
+    return Effect.runPromise(
+      Effect.raceFirst(
+        Deferred.await(granted).pipe(Effect.map(permit)),
+        Deferred.await(aborted).pipe(Effect.andThen(Effect.fail(new SpawnGateAbortedError()))),
+      ).pipe(
+        Effect.timeoutOrElse({
+          duration: timeoutMs,
+          orElse: () => Effect.fail(new SpawnGateTimeoutError(timeoutMs)),
+        }),
+      ),
+    ).then(
+      (value) => value,
+      (error: unknown) => {
+        // A failed acquisition must leave the queue: interrupt the pending
+        // `withPermits` scope so it can never construct afterwards.
+        Effect.runFork(Fiber.interrupt(fiber))
+        throw error
+      },
+    )
+  }
+
+  return {
+    acquire,
+    get held() {
+      return activeCount() > 0
+    },
+    get active() {
+      return activeCount()
+    },
+    get capacity() {
+      return capacity
+    },
+    get waiting() {
+      return waitingCount()
+    },
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Bun executor transport + pool (production adapters over `execute.ts` frames).
 // ---------------------------------------------------------------------------
@@ -58,8 +261,8 @@ export interface BunExecutorTransportOptions {
   readonly onWorkerPorts?: (ports: WorkerTransferredPorts) => void
   /** Called with the worker's transferred hub-proxy control port. */
   readonly onHubProxyPort?: (port: MessagePort) => void
-  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
-  readonly log?: WorkerLogger
+  /** Optional re-entry bridge for the worker lifecycle lines. */
+  readonly bridge?: EffectBridge.Shape
   /** Boot-cancellation telemetry: a cancel win or a death during abort. */
   readonly onBootTelemetry?: (event: BootTelemetry) => void
   /**
@@ -105,6 +308,14 @@ export const DEFAULT_TRANSPORT_BUFFER_CAPACITY = 1024
  */
 const SHUTDOWN_ACK_TIMEOUT_MS = 1_000
 
+/**
+ * How long a slot terminate waits for an in-flight boot/init before detaching.
+ * A wedged init resolver must not make `pool.terminateAll()` hang: the join is
+ * abandoned at the deadline and the cache key is invalidated, so a late boot
+ * result is discarded instead of published.
+ */
+const MATERIALIZE_JOIN_TIMEOUT_MS = 1_000
+
 /** Raw terminates (an isolate that never acknowledged the shutdown frame). */
 let rawTerminateCount = 0
 
@@ -117,7 +328,7 @@ export function workerShutdownStats(): { readonly rawTerminates: number } {
 const shutdownRequested = new WeakSet<object>()
 
 interface WorkerShutdownOptions {
-  readonly log?: WorkerLogger
+  readonly bridge?: EffectBridge.Shape
   readonly workerID?: number
 }
 
@@ -145,11 +356,11 @@ async function requestWorkerShutdown(worker: Worker, options: WorkerShutdownOpti
   let acknowledged = false
   await new Promise<void>((resolve) => {
     let settled = false
-    let timer: ReturnType<typeof setTimeout>
+    let cancelTimer: (() => void) | undefined
     const finish = (): void => {
       if (settled) return
       settled = true
-      clearTimeout(timer)
+      cancelTimer?.()
       worker.removeEventListener?.("message", onMessage)
       resolve()
     }
@@ -159,8 +370,7 @@ async function requestWorkerShutdown(worker: Worker, options: WorkerShutdownOpti
       acknowledged = true
       finish()
     }
-    timer = setTimeout(finish, SHUTDOWN_ACK_TIMEOUT_MS)
-    timer.unref?.()
+    cancelTimer = scheduleTimeout(SHUTDOWN_ACK_TIMEOUT_MS, finish)
     worker.addEventListener?.("message", onMessage)
     try {
       worker.postMessage({ type: "shutdown", id: 0 })
@@ -170,12 +380,13 @@ async function requestWorkerShutdown(worker: Worker, options: WorkerShutdownOpti
   })
   if (acknowledged) return
   rawTerminateCount += 1
-  options.log?.(workerLogMessage("worker shutdown ack timed out"), {
-    level: "WARN",
-    ...(options.workerID === undefined ? {} : { workerID: options.workerID }),
-    timeoutMs: SHUTDOWN_ACK_TIMEOUT_MS,
-    reason: "the isolate reached no safepoint within the shutdown budget; terminating it raw",
-  })
+  void options.bridge?.fork(
+    Effect.logWarning(workerLogMessage("worker shutdown ack timed out"), {
+      ...(options.workerID === undefined ? {} : { workerID: options.workerID }),
+      timeoutMs: SHUTDOWN_ACK_TIMEOUT_MS,
+      reason: "the isolate reached no safepoint within the shutdown budget; terminating it raw",
+    }),
+  )
 }
 
 /** A validated boot/port frame; `invalid` fails the spawn loud. */
@@ -185,11 +396,10 @@ type BootFrame =
   | { readonly kind: "hub-proxy"; readonly port: MessagePort }
   /**
    * `error` preserves a typed failure (e.g. `BuildMismatch`) for the caller.
-   * `booted` marks a `ready` frame that the worker actually emitted: the isolate
-   * completed its DB/WAL boot, so its teardown must be orderly even though the
-   * hub rejected it. A malformed frame before `ready` is not booted.
+   * Every invalid frame's teardown is orderly, because even a pre-ready isolate
+   * may already have opened SQLite.
    */
-  | { readonly kind: "invalid"; readonly reason: string; readonly error?: Error; readonly booted?: boolean }
+  | { readonly kind: "invalid"; readonly reason: string; readonly error?: Error }
 
 const asMessagePort = (value: unknown): MessagePort | undefined =>
   typeof MessagePort !== "undefined" && value instanceof MessagePort ? value : undefined
@@ -216,13 +426,13 @@ function parseBootFrame(data: unknown): BootFrame | undefined {
     // Any `ready` frame proves the isolate opened its DB/WAL: even a rejected
     // one must close through the orderly shutdown path, never terminate-only.
     if (typeof frame.threadId !== "number") {
-      return { kind: "invalid", reason: "boot-ready frame without a numeric threadId", booted: true }
+      return { kind: "invalid", reason: "boot-ready frame without a numeric threadId" }
     }
     try {
       verifyReadyBuild(frame)
     } catch (error) {
-      if (error instanceof BuildMismatch) return { kind: "invalid", reason: error.message, error, booted: true }
-      return { kind: "invalid", reason: "boot-ready frame failed build-hash verification", booted: true }
+      if (error instanceof BuildMismatch) return { kind: "invalid", reason: error.message, error }
+      return { kind: "invalid", reason: "boot-ready frame failed build-hash verification" }
     }
     return { kind: "ready" }
   }
@@ -255,8 +465,8 @@ interface PendingWaiter {
   readonly predicate: (message: SessionExecutorOutbound) => boolean
   readonly resolve: (message: SessionExecutorOutbound) => void
   readonly reject: (error: Error) => void
-  /** Absent when the wait has no deadline (`timeoutMs <= 0`). */
-  readonly timer: ReturnType<typeof setTimeout> | undefined
+  /** Cancels the deadline; absent when the wait has no deadline (`timeoutMs <= 0`). */
+  readonly cancelTimeout: (() => void) | undefined
 }
 
 /**
@@ -273,15 +483,51 @@ interface PendingWaiter {
  */
 const liveExecutorWorkers = new Map<object, string | undefined>()
 
+/**
+ * Spawns that hold a global permit but have not constructed their isolate yet.
+ * The schema gate must refuse a migration for a database that an in-flight
+ * spawn is about to open; the constructed-worker registry cannot see that
+ * window. The token is removed the moment `new Worker` runs.
+ */
+const pendingSpawns = new Map<object, string | undefined>()
+
+function beginPendingSpawn(databasePath: string | undefined): object {
+  const token = {}
+  pendingSpawns.set(token, databasePath)
+  return token
+}
+
+function endPendingSpawn(token: object | undefined): void {
+  if (token === undefined) return
+  pendingSpawns.delete(token)
+}
+
 /** How many session-worker isolates live on `databasePath` (all files when omitted). */
 export function liveSessionWorkerCount(databasePath?: string): number {
-  if (databasePath === undefined) return liveExecutorWorkers.size
-  const target = path.resolve(databasePath)
+  const matches = (workerPath: string | undefined): boolean =>
+    databasePath === undefined || (workerPath !== undefined && path.resolve(workerPath) === path.resolve(databasePath))
   let count = 0
-  for (const workerPath of liveExecutorWorkers.values()) {
-    if (workerPath !== undefined && path.resolve(workerPath) === target) count += 1
-  }
+  for (const workerPath of liveExecutorWorkers.values()) if (matches(workerPath)) count += 1
+  for (const workerPath of pendingSpawns.values()) if (matches(workerPath)) count += 1
   return count
+}
+
+/**
+ * Schedule a callback with Effect's clock instead of a raw timer. The
+ * returned cancel function interrupts the sleep fiber, so a settled watchdog
+ * never keeps the process alive. Used only for the native-worker boundaries
+ * (promise APIs) that still need a deadline; Effect paths use `timeoutOrElse`.
+ */
+function scheduleTimeout(ms: number, fire: () => void): () => void {
+  const fiber = Effect.runFork(
+    Effect.sleep(Duration.millis(ms)).pipe(Effect.andThen(Effect.sync(fire))),
+  )
+  let cancelled = false
+  return () => {
+    if (cancelled) return
+    cancelled = true
+    fiber.interruptUnsafe()
+  }
 }
 
 /**
@@ -290,7 +536,7 @@ export function liveSessionWorkerCount(databasePath?: string): number {
  * loud on timeout or isolate error.
  */
 export function createBunExecutorTransport(options: BunExecutorTransportOptions): ExecutorTransport {
-  const log = options.log ?? noopWorkerLogger
+  const bridge = options.bridge
   const timeoutMs = options.timeoutMs ?? DEFAULT_TRANSPORT_TIMEOUT_MS
   const bufferCapacity = options.bufferCapacity ?? DEFAULT_TRANSPORT_BUFFER_CAPACITY
   const gate = options.spawnGate
@@ -303,15 +549,18 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
   let closing = false
   let worker: Worker | undefined
   let booting: Promise<void> | undefined
+  /** The schema-gate reservation for a permit held before construction. */
+  let reservedSpawn: object | undefined
   // Aborts the pending spawn-permit acquisition when the boot is cancelled or
   // terminated, so a cancelled spawn never waits out the gate deadline.
   let bootAcquisition: AbortController | undefined
-  let bootTimer: ReturnType<typeof setTimeout> | undefined
+  let bootTimer: (() => void) | undefined
   let bootLifecycle: BootLifecycle<Worker> | undefined
-  // A boot that failed on its own (protocol error, deadline, isolate death) never
-  // completed the handshake, so its teardown is terminate-only: a wedged isolate
-  // cannot ack the orderly-shutdown frame. An explicit boot cancel stays orderly.
-  let bootFailed = false
+  // The one raw thread-destroy gate. Every teardown path (boot failure, boot
+  // cancel, normal retire) closes the isolate orderly first and then destroys
+  // the thread through this flag, so a second authority calls no second
+  // `Worker.terminate()` for the same isolate.
+  let threadDestroyed = false
   // A cancel that arrives while the boot is still waiting for the global permit.
   // The cancel resolves immediately; the flag tells the pending acquisition to
   // release its eventual permit without constructing the isolate.
@@ -330,13 +579,17 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
   const failWaiters = (error: Error): void => {
     terminal = error
     for (const waiter of waiters) {
-      if (waiter.timer !== undefined) clearTimeout(waiter.timer)
+      waiter.cancelTimeout?.()
       waiters.delete(waiter)
       waiter.reject(error)
     }
   }
 
   const constructWorker = (): Worker => {
+    // The isolate is about to exist: the registry (below) takes over the
+    // schema-gate count, so the pre-construction reservation ends here.
+    endPendingSpawn(reservedSpawn)
+    reservedSpawn = undefined
     const created = new Worker(options.entry, {
       env: mergeEnv(options.env),
       // `smol` keeps each isolate's heap small; a per-session worker does not
@@ -350,7 +603,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
   }
 
   const clearBootTimer = (): void => {
-    if (bootTimer !== undefined) clearTimeout(bootTimer)
+    bootTimer?.()
     bootTimer = undefined
   }
 
@@ -394,9 +647,22 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
   }
 
   /**
-   * Tear down the isolate that owns the active boot interval. A booting/ready
-   * lifecycle terminates the partial isolate itself (releasing the permit once);
-   * a started worker is terminated directly.
+   * Destroy the raw thread exactly once, whichever teardown path reaches it.
+   * The orderly shutdown frame is attempted by each caller before this; the
+   * flag is what keeps a persisted cache release from terminating an isolate a
+   * failed-boot teardown already destroyed.
+   */
+  const destroyThread = (target: Worker): Promise<number | void> => {
+    if (threadDestroyed) return Promise.resolve(0)
+    threadDestroyed = true
+    return Promise.resolve(target.terminate())
+  }
+
+  /**
+   * Tear down the isolate that owns the active boot interval. Every path is an
+   * orderly close: a booting/ready lifecycle owns the permit and its terminate
+   * callback releases it once, while a started worker is closed here. A worker
+   * that was never constructed (`partial === undefined`) has nothing to close.
    */
   const teardownBooted = (created: Worker): void => {
     liveExecutorWorkers.delete(created)
@@ -404,29 +670,30 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       void bootLifecycle.cancel().catch(() => undefined)
       return
     }
-    void created.terminate()
+    void requestWorkerShutdown(created, { ...(bridge === undefined ? {} : { bridge }), workerID: options.workerID })
+      .then(() => destroyThread(created))
+      .catch(() => undefined)
   }
 
   const connect = (created: Worker): void => {
     /**
      * Fail one spawn loud on a malformed boot/port frame, then tear the isolate
      * down. A typed cause (a `BuildMismatch` from a stale bundle) is preserved so
-     * the dispatcher can refuse to retry it instead of crash-looping.
-     * `booted` distinguishes a rejected `ready` (the isolate opened its DB/WAL,
-     * so it needs the orderly close) from a frame before ready (never usable;
-     * terminate-only).
+     * the dispatcher can refuse to retry it instead of crash-looping. The
+     * teardown is always orderly: a rejected `ready` isolate already opened its
+     * DB/WAL, and even a pre-ready frame may have opened SQLite before `ports`.
      */
-    const failProtocol = (reason: string, cause?: Error, booted = false): void => {
+    const failProtocol = (reason: string, cause?: Error): void => {
       const error = cause ?? new Error(`session worker protocol error: ${reason}`)
-      bootFailed = !booted
       alive = false
       created.onmessage = null
       created.onerror = null
-      log(workerLogMessage("worker boot failed"), {
-        level: "ERROR",
-        workerID: options.workerID,
-        message: error.message,
-      })
+      void bridge?.fork(
+        Effect.logError(workerLogMessage("worker boot failed"), {
+          workerID: options.workerID,
+          message: error.message,
+        }),
+      )
       failWaiters(error)
       teardownBooted(created)
     }
@@ -438,7 +705,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       // serializes the expensive cold boot; the boot timer stays armed until then.
       const bootFrame = parseBootFrame(event.data)
       if (bootFrame?.kind === "invalid") {
-        failProtocol(bootFrame.reason, bootFrame.error, bootFrame.booted === true)
+        failProtocol(bootFrame.reason, bootFrame.error)
         return
       }
       if (bootFrame?.kind === "worker-ports") {
@@ -462,7 +729,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       // ever drops oldest frames that no waiter has claimed).
       for (const waiter of [...waiters]) {
         if (!waiter.predicate(message)) continue
-        if (waiter.timer !== undefined) clearTimeout(waiter.timer)
+        waiter.cancelTimeout?.()
         waiters.delete(waiter)
         waiter.resolve(message)
         return
@@ -472,7 +739,6 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     }
 
     created.onerror = (event: ErrorEvent) => {
-      bootFailed = true
       alive = false
       // Detach so a terminating worker cannot re-enter this handler, then fail
       // every waiter and tear the isolate down.
@@ -487,11 +753,12 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       const message = `session worker error: ${event.message}${detail}`
       // A boot/import failure is the loudest signal a worker could not start;
       // report it before the waiters fail so the operator sees why.
-      log(workerLogMessage("worker boot failed"), {
-        level: "ERROR",
-        workerID: options.workerID,
-        message,
-      })
+      void bridge?.fork(
+        Effect.logError(workerLogMessage("worker boot failed"), {
+          workerID: options.workerID,
+          message,
+        }),
+      )
       failWaiters(new Error(message, cause === undefined ? undefined : { cause }))
       teardownBooted(created)
     }
@@ -501,7 +768,6 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     // noticed when the run reply times out, losing the crash phase truth.
     created.addEventListener?.("close", (event: Event) => {
       if (!alive) return
-      bootFailed = true
       alive = false
       created.onmessage = null
       created.onerror = null
@@ -525,16 +791,14 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
         if (signal.aborted) throw new Error("session worker boot aborted")
         // Arm the deadline before construction so a synchronous `new Worker`
         // throw still releases the global permit (the rejection path below).
-        bootTimer = setTimeout(() => {
+        bootTimer = scheduleTimeout(bootTimeoutMs, () => {
           bootTimer = undefined
           const error = new Error(`session worker boot timeout after ${bootTimeoutMs}ms`)
-          bootFailed = true
           alive = false
           queued.length = 0
           failWaiters(error)
           void lifecycle.cancel().catch(() => undefined)
-        }, bootTimeoutMs)
-        bootTimer.unref?.()
+        })
         options.onPhase?.("boot")
         created = constructWorker()
         worker = created
@@ -546,20 +810,13 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
         worker = undefined
         if (partial === undefined) return
         liveExecutorWorkers.delete(partial)
-        // A failed boot has no acknowledged generation to drain, and the isolate
-        // that missed its deadline or sent a malformed frame cannot answer the
-        // shutdown frame; waiting the full ack budget would stall the released
-        // permit for a worker that never became usable. Terminate it directly.
-        if (bootFailed) {
-          await partial.terminate()
-          return
-        }
-        // A cancelled boot is still an orderly close: let the isolate release its
-        // native WAL handle/lease through the shutdown frame before the thread is
-        // destroyed. Terminate-only would strand the lock; `requestWorkerShutdown`
-        // is the shared close primitive (owned by the cap/close section).
-        await requestWorkerShutdown(partial, { log, workerID: options.workerID })
-        await partial.terminate()
+        // Every boot teardown is an orderly close. The worker opens SQLite
+        // before it sends `ports`, so even a pre-ready deadline or malformed
+        // frame can hold the WAL lock: always attempt the bounded shutdown ack
+        // before the thread is destroyed. A wedged isolate still falls back to
+        // the raw terminate after the ack budget, logged and counted.
+        await requestWorkerShutdown(partial, { ...(bridge === undefined ? {} : { bridge }), workerID: options.workerID })
+        await destroyThread(partial)
       },
       onRun: () => {
         // The validated ready handshake is the one boot-ready permit release.
@@ -582,6 +839,8 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       (error: unknown) => {
         const failure = error instanceof Error ? error : new Error(String(error))
         clearBootTimer()
+        endPendingSpawn(reservedSpawn)
+        reservedSpawn = undefined
         alive = false
         queued.length = 0
         failWaiters(failure)
@@ -604,6 +863,8 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       // landed while waiting takes the same path without a cancel outcome.
       bootAcquisition = undefined
       if (!alive || waitingCancelled) {
+        endPendingSpawn(reservedSpawn)
+        reservedSpawn = undefined
         const cancelled = waitingCancelled
         acquired.release("failed", cancelled ? undefined : new Error("session worker terminated before boot"))
         alive = false
@@ -617,9 +878,14 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
         }
         return
       }
+      // Hold the schema-gate reservation across the pre-construction window
+      // (permit granted, `new Worker` not yet run).
+      reservedSpawn = beginPendingSpawn(options.databasePath ?? options.env?.OPENCODE_DB)
       startBoot(acquired)
     })().catch((error) => {
       bootAcquisition = undefined
+      endPendingSpawn(reservedSpawn)
+      reservedSpawn = undefined
       const failure = error instanceof Error ? error : new Error(String(error))
       // A cancelled waiter must settle even when the permit acquisition failed.
       if (waitingCancel !== undefined) {
@@ -664,14 +930,14 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
         // `timeoutMs <= 0` means "no deadline": a run/startShell reply is a whole
         // LLM turn that can outlast any fixed budget, so it never gets a timer.
         // The configured deadline applies only to the short control frames.
-        const timer =
+        const cancelTimeout =
           waitMs > 0
-            ? setTimeout(() => {
+            ? scheduleTimeout(waitMs, () => {
                 waiters.delete(waiter)
                 reject(new SessionWorkerReplyTimeoutError(waitMs))
-              }, waitMs)
+              })
             : undefined
-        const waiter: PendingWaiter = { predicate, resolve, reject, timer }
+        const waiter: PendingWaiter = { predicate, resolve, reject, cancelTimeout }
         waiters.add(waiter)
         // A caller that abandons the wait (the liveness probe on a resolved run)
         // aborts, so the waiter does not linger until its own deadline.
@@ -679,7 +945,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
           "abort",
           () => {
             if (!waiters.delete(waiter)) return
-            if (timer !== undefined) clearTimeout(timer)
+            cancelTimeout?.()
             reject(new Error("session worker wait aborted"))
           },
           { once: true },
@@ -706,12 +972,13 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       failWaiters(new Error("session worker terminated"))
       const current = worker
       if (current === undefined) return
-      await requestWorkerShutdown(current, { log, workerID: options.workerID })
+      await requestWorkerShutdown(current, { ...(bridge === undefined ? {} : { bridge }), workerID: options.workerID })
     },
     async terminate(code = 0): Promise<number> {
       // A `close()` already marked the isolate dead; the thread still exists and
-      // must be destroyed, so only a repeated terminate (no close) short-circuits.
-      if (!alive && !closing) return code
+      // must be destroyed, so only an isolate already destroyed (or one that
+      // died without a close) short-circuits.
+      if (threadDestroyed || (!alive && !closing)) return code
       closing = true
       alive = false
       queued.length = 0
@@ -739,8 +1006,8 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       // this applies to an in-flight run too: a forced cancel mid-tool must not
       // keep the write lock until process exit. The wait is bounded, so a wedged
       // worker is still terminated.
-      await requestWorkerShutdown(current, { log, workerID: options.workerID })
-      const result = await current.terminate()
+      await requestWorkerShutdown(current, { ...(bridge === undefined ? {} : { bridge }), workerID: options.workerID })
+      const result = await destroyThread(current)
       return typeof result === "number" ? result : code
     },
   }
@@ -770,8 +1037,8 @@ export interface BunExecutorWorkerPoolOptions {
   readonly sessionID?: SessionID
   /** Why this isolate is spawning; defaults to `"initial"`. */
   readonly reason?: WorkerSpawnReason
-  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
-  readonly log?: WorkerLogger
+  /** Optional re-entry bridge for the worker lifecycle lines. */
+  readonly bridge?: EffectBridge.Shape
   /** Boot-cancellation telemetry: a cancel win or a death during abort. */
   readonly onBootTelemetry?: (event: BootTelemetry) => void
   /** Boot-stage phase reporting for the isolate. */
@@ -796,7 +1063,7 @@ export function spawnBunExecutorWorker(id: number, options: BunExecutorWorkerPoo
   // pool factories resolve once and pass a concrete value, so this is a no-op
   // for them (and never double-warns).
   const runIdleTimeoutMs = resolveRunIdleTimeoutMs(options)
-  logRunIdleTimeoutWarning(options.log ?? noopWorkerLogger, options)
+  logRunIdleTimeoutWarning(options.bridge, options)
   const transport = createBunExecutorTransport({
     entry: options.entry,
     ...defined({
@@ -808,7 +1075,7 @@ export function spawnBunExecutorWorker(id: number, options: BunExecutorWorkerPoo
       // TODO(N-slice): route through thread-naming.ts once its seam lands.
       name: sessionThreadName(options.sessionID ?? String(id)),
       timeoutMs: options.timeoutMs,
-      log: options.log,
+      ...(options.bridge === undefined ? {} : { bridge: options.bridge }),
       workerID: id,
       spawnGate: options.spawnGate,
       bootTimeoutMs: options.bootTimeoutMs,
@@ -829,10 +1096,10 @@ export function spawnBunExecutorWorker(id: number, options: BunExecutorWorkerPoo
       sessionID: options.sessionID,
       reason: options.reason,
       egressBarrier: options.egressBarrier,
-      // Forward the resolved logger so the `worker spawning` line fires in
-      // production, where this helper (not a test's direct `createExecutorWorker`)
-      // builds the executor.
-      log: options.log,
+      // Forward the bridge so the `worker spawning` line fires in production,
+      // where this helper (not a test's direct `createExecutorWorker`) builds
+      // the executor.
+      ...(options.bridge === undefined ? {} : { bridge: options.bridge }),
     }),
   })
 }
@@ -843,16 +1110,15 @@ export function createBunExecutorWorkerPool(options: BunExecutorWorkerPoolOption
   // point, so an absent option must still arm the budget (an explicit `0`
   // disables it) rather than silently reaching the executor as `undefined`.
   const runIdleTimeoutMs = resolveRunIdleTimeoutMs(options)
-  if (options.log !== undefined) logRunIdleTimeoutWarning(options.log, options)
+  logRunIdleTimeoutWarning(options.bridge, options)
   let pool: ExecutorWorkerPool | undefined
   const idleCap = createIdleIsolateCap({
     capacity: options.maxIdleWorkers ?? resolveIdleWorkerCapacity(),
-    ...(options.log === undefined ? {} : { log: options.log }),
+    ...(options.bridge === undefined ? {} : { bridge: options.bridge }),
     onEvict: (entry) => pool?.releaseSession?.(entry.sessionID, entry.worker.id),
   })
   pool = createExecutorWorkerPool({
     spawn: (id) => idleCap.track(spawnBunExecutorWorker(id, { ...options, runIdleTimeoutMs })),
-    ...(options.log === undefined ? {} : { log: options.log }),
   })
   return withIdleIsolateCap(pool, idleCap)
 }
@@ -1074,13 +1340,7 @@ export interface IdleIsolateCapOptions {
   readonly onEvict: (entry: IdleWorkerEntry) => unknown
   /** Deadline for one eviction step; defaults to 5s. */
   readonly evictTimeoutMs?: number
-  /**
-   * Diagnostic seam: runs after the owner's final `recheck` drain and before the
-   * single-flight is released. Production does not set it; the idle-cap race
-   * test uses it to land a request in the exact handoff window.
-   */
-  readonly onBeforeRelease?: () => void | Promise<void>
-  readonly log?: WorkerLogger
+  readonly bridge?: EffectBridge.Shape
 }
 
 /**
@@ -1123,18 +1383,12 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
     readonly idle: ReadonlyMap<number, Tracked>
     readonly active: ReadonlySet<number>
     readonly evictions: number
-    /** The in-flight enforce, or `undefined` when none is running. */
-    readonly enforcing: Deferred.Deferred<void> | undefined
-    /** An enforce request arrived while the flight was busy. */
-    readonly recheck: boolean
   }
   const state = SynchronizedRef.makeUnsafe<IdleCapState>({
     tracked: new Map(),
     idle: new Map(),
     active: new Set(),
     evictions: 0,
-    enforcing: undefined,
-    recheck: false,
   })
 
   /**
@@ -1153,12 +1407,13 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
         duration: evictTimeoutMs,
         orElse: () =>
           Effect.sync(() => {
-            options.log?.(workerLogMessage(message), {
-              level: "WARN",
-              workerID: entry.worker.id,
-              sessionID: entry.sessionID,
-              timeoutMs: evictTimeoutMs,
-            })
+            void options.bridge?.fork(
+              Effect.logWarning(workerLogMessage(message), {
+                workerID: entry.worker.id,
+                sessionID: entry.sessionID,
+                timeoutMs: evictTimeoutMs,
+              }),
+            )
           }),
       }),
       Effect.catchCause(() => Effect.void),
@@ -1186,12 +1441,13 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
         entry,
       )
     }
-    options.log?.(workerLogMessage("idle worker evicted"), {
-      level: "INFO",
-      workerID: entry.worker.id,
-      sessionID,
-      capacity,
-    })
+    void options.bridge?.fork(
+      Effect.logInfo(workerLogMessage("idle worker evicted"), {
+        workerID: entry.worker.id,
+        sessionID,
+        capacity,
+      }),
+    )
     // Await the same in-flight close a later retire will join: eviction is not
     // complete until the isolate has exited (or the deadline elapses).
     yield* boundedEvict(
@@ -1202,93 +1458,82 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
   })
 
   /**
-   * One enforce flight at a time. A request that arrives mid-flight sets
-   * `recheck` and joins the same flight, so concurrent settlements can never
-   * run two eviction passes against one idle snapshot.
+   * One eviction pass down to capacity. Guarded so a wedged probe/hook never
+   * pins the loop: every awaited eviction step is bounded, and the caller
+   * (`runEnforcement`) catches any defect and keeps serving the queue.
    */
-  const enforce = Effect.fn("WorkerPools.enforce")(function* () {
-    const [flight, owner] = yield* SynchronizedRef.modify(state, (current) => {
-      if (current.enforcing !== undefined) {
-        return [[current.enforcing, false as boolean] as const, { ...current, recheck: true }] as const
-      }
-      const flight = Deferred.makeUnsafe<void>()
-      return [[flight, true as boolean] as const, { ...current, enforcing: flight, recheck: false }] as const
-    })
-    if (!owner) {
-      yield* Deferred.await(flight)
-      return
-    }
-    try {
-      while (true) {
-        yield* SynchronizedRef.modify(state, (current) => [undefined, { ...current, recheck: false }] as const)
-        while (true) {
-          const next = yield* SynchronizedRef.modify(state, (current) => {
-            if (current.idle.size <= capacity) return [undefined, current] as const
-            const oldest = current.idle.entries().next()
-            if (oldest.done) return [undefined, current] as const
-            const [workerID, entry] = oldest.value
-            const idle = new Map(current.idle)
-            idle.delete(workerID)
-            return [[workerID, entry] as const, { ...current, idle }] as const
-          })
-          if (next === undefined) break
-          const [workerID, entry] = next
-          if (entry.terminated || mutate((current) => [current.active.has(workerID), current])) continue
-          // Background work must outlive an idle turn; keep one worker alive even
-          // above the cap rather than killing a running job. Its next settlement
-          // (or the dispatcher's idle reap) revisits the cap.
-          const sessionID = entry.sessionID
-          if (sessionID !== undefined && entry.worker.hasActiveWork !== undefined) {
-            const hasActiveWork = entry.worker.hasActiveWork
-            const background = yield* Effect.tryPromise(() => hasActiveWork(sessionID)).pipe(
-              Effect.catchCause(() => Effect.succeed(false)),
-            )
-            if (background) {
-              yield* SynchronizedRef.modify(state, (current) => {
-                if (entry.terminated || current.active.has(workerID)) return [undefined, current] as const
-                const idle = new Map(current.idle)
-                idle.set(workerID, entry)
-                return [undefined, { ...current, idle }] as const
-              })
-              break
-            }
-            // A new run may have started while the probe was in flight.
-            if (entry.terminated || mutate((current) => [current.active.has(workerID), current])) continue
-          }
-          yield* evict(entry)
-        }
-        const again = yield* SynchronizedRef.modify(state, (current) => [current.recheck, current] as const)
-        if (!again) break
-      }
-    } finally {
-      // The diagnostic seam must never be able to break the flight.
-      if (options.onBeforeRelease !== undefined) {
-        yield* Effect.tryPromise(() => Promise.resolve(options.onBeforeRelease!())).pipe(
-          Effect.catchCause(() => Effect.void),
+  const enforceOnce = Effect.fnUntraced(function* () {
+    while (true) {
+      const next = yield* SynchronizedRef.modify(state, (current) => {
+        if (current.idle.size <= capacity) return [undefined, current] as const
+        const oldest = current.idle.entries().next()
+        if (oldest.done) return [undefined, current] as const
+        const [workerID, entry] = oldest.value
+        const idle = new Map(current.idle)
+        idle.delete(workerID)
+        return [[workerID, entry] as const, { ...current, idle }] as const
+      })
+      if (next === undefined) return
+      const [workerID, entry] = next
+      if (entry.terminated || mutate((current) => [current.active.has(workerID), current])) continue
+      // Background work must outlive an idle turn; keep one worker alive even
+      // above the cap rather than killing a running job. Its next settlement
+      // (or the dispatcher's idle reap) revisits the cap.
+      const sessionID = entry.sessionID
+      if (sessionID !== undefined && entry.worker.hasActiveWork !== undefined) {
+        const hasActiveWork = entry.worker.hasActiveWork
+        const background = yield* Effect.tryPromise(() => hasActiveWork(sessionID)).pipe(
+          Effect.catchCause(() => Effect.succeed(false)),
         )
+        if (background) {
+          yield* SynchronizedRef.modify(state, (current) => {
+            if (entry.terminated || current.active.has(workerID)) return [undefined, current] as const
+            const idle = new Map(current.idle)
+            idle.set(workerID, entry)
+            return [undefined, { ...current, idle }] as const
+          })
+          return
+        }
+        // A new run may have started while the probe was in flight.
+        if (entry.terminated || mutate((current) => [current.active.has(workerID), current])) continue
       }
-      // Take-and-clear `recheck` together with `enforcing`: a request that lands
-      // after the final drain is either seen here (and starts another pass) or
-      // sees no flight and starts one itself. It can never be dropped.
-      const again = yield* SynchronizedRef.modify(state, (current) => [
-        current.recheck,
-        { ...current, enforcing: undefined, recheck: false },
-      ] as const)
-      yield* Deferred.succeed(flight, undefined)
-      if (again) requestEnforce()
+      yield* evict(entry)
     }
   })
 
+  /**
+   * The single scoped consumer. Requests coalesce in the queue: a burst of
+   * settlements wakes the loop once, and the non-blocking drain collapses every
+   * request that arrived during the previous pass into one more pass. A failed
+   * pass is logged and the loop continues; closing the scope interrupts it.
+   */
+  const requests = Effect.runSync(Queue.unbounded<void>())
+  const scope = Effect.runSync(Scope.make())
+  Effect.runSync(
+    Effect.forkIn(
+      Effect.gen(function* () {
+        while (true) {
+          yield* Queue.take(requests)
+          // Drain every request that coalesced while the last pass ran. `poll`
+          // is non-blocking (unlike `takeAll`, which waits for another item).
+          while (Option.isSome(yield* Queue.poll(requests))) {}
+          yield* enforceOnce().pipe(
+            Effect.catchCause((cause) =>
+              Effect.sync(() => {
+                void options.bridge?.fork(
+                  Effect.logWarning(workerLogMessage("idle worker enforcement failed"), { reason: String(cause) }),
+                )
+              }),
+            ),
+          )
+        }
+      }),
+      scope,
+    ),
+  )
+
   const requestEnforce = (): void => {
-    // Atomic with the flight lifecycle: set `recheck` synchronously when a
-    // flight exists, otherwise start one. Reading then writing non-atomically
-    // would recreate the lost-request window this function exists to close.
-    const active = mutate((current) => {
-      if (current.enforcing === undefined) return [false, current] as const
-      if (current.recheck) return [true, current] as const
-      return [true, { ...current, recheck: true }] as const
-    })
-    if (!active) void Effect.runPromise(enforce()).catch(() => undefined)
+    Queue.offerUnsafe(requests, undefined)
   }
 
   const track = (worker: ExecutorWorker): ExecutorWorker => {
@@ -1383,6 +1628,8 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
     },
     clear: () => {
       mutate((current) => [undefined, { ...current, tracked: new Map(), idle: new Map(), active: new Set() }] as const)
+      // Closing the scope interrupts and joins the one enforcement consumer.
+      Effect.runSync(Scope.close(scope, Exit.void))
     },
   }
 }
@@ -1453,7 +1700,7 @@ interface MaterializingWorkerState {
 function createMaterializingExecutorWorker(
   id: number,
   materialize: (run: import("./execute").ExecutorRun, state: MaterializingWorkerState) => Promise<ExecutorWorker>,
-  log: WorkerLogger = noopWorkerLogger,
+  bridge: EffectBridge.Shape | undefined,
   cap?: WorkerCap,
 ): ExecutorWorker {
   const state: MaterializingWorkerState = { inner: undefined, terminated: false, materializing: undefined }
@@ -1488,7 +1735,7 @@ function createMaterializingExecutorWorker(
     // inner) the safe defaults are "no work" and "nothing to await".
     hasActiveWork: (sessionID) => state.inner?.hasActiveWork?.(sessionID) ?? Promise.resolve(false),
     awaitEgress: (sessionID) => state.inner?.awaitEgress?.(sessionID) ?? Promise.resolve(),
-    cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID), log }),
+    cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID), ...(bridge === undefined ? {} : { bridge }) }),
     terminate: () => {
       if (termination !== undefined) return termination
       state.terminated = true
@@ -1623,7 +1870,7 @@ function parseRunIdleTimeoutEnv(raw: string | undefined): ParsedRunIdleTimeout {
 
 /** Emit the malformed-watchdog warning once per resolved pool/hub. */
 export function logRunIdleTimeoutWarning(
-  log: WorkerLogger,
+  bridge: EffectBridge.Shape | undefined,
   options: {
     readonly runIdleTimeoutMs?: number
     readonly env?: Record<string, string | undefined>
@@ -1631,7 +1878,7 @@ export function logRunIdleTimeoutWarning(
 ): void {
   const warning = runIdleTimeoutWarning(options)
   if (warning === undefined) return
-  log(workerLogMessage("run idle timeout invalid"), { level: "WARN", reason: warning })
+  void bridge?.fork(Effect.logWarning(workerLogMessage("run idle timeout invalid"), { reason: warning }))
 }
 
 /**
@@ -1686,8 +1933,8 @@ export interface ProductionWorkerPoolOptions {
   readonly spawnGate?: SpawnGateHandle
   /** Boot-ready deadline; see {@link BunExecutorTransportOptions.bootTimeoutMs}. */
   readonly bootTimeoutMs?: number
-  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
-  readonly log?: WorkerLogger
+  /** Optional re-entry bridge for the worker lifecycle lines. */
+  readonly bridge?: EffectBridge.Shape
   /** Boot-cancellation telemetry: a cancel win or a death during abort. */
   readonly onBootTelemetry?: (event: BootTelemetry) => void
   /** Boot-stage phase reporting for the session this isolate is bound to. */
@@ -1744,7 +1991,7 @@ export type SessionBoundSpawner = (
 export function createSessionBoundExecutorWorker(
   id: number,
   spawnFor: SessionBoundSpawner,
-  log: WorkerLogger = noopWorkerLogger,
+  bridge?: EffectBridge.Shape,
   /**
    * Runs when this isolate rebinds to a different session. The old session's
    * hub-side state is no longer reachable from this worker.
@@ -1789,14 +2036,15 @@ export function createSessionBoundExecutorWorker(
       // path (the dispatcher never sees an in-place replacement).
       if (previousSession !== undefined && previous !== undefined) {
         const rebound = previousSession !== sessionID
-        log(workerLogMessage(rebound ? "worker rebound" : "worker generation changed"), {
-          level: "INFO",
-          workerID: id,
-          ...(rebound
-            ? { fromSession: previousSession, toSession: sessionID }
-            : { fromGeneration: previousGeneration, toGeneration: generation }),
-          sessionID,
-        })
+        void bridge?.fork(
+          Effect.logInfo(workerLogMessage(rebound ? "worker rebound" : "worker generation changed"), {
+            workerID: id,
+            ...(rebound
+              ? { fromSession: previousSession, toSession: sessionID }
+              : { fromGeneration: previousGeneration, toGeneration: generation }),
+            sessionID,
+          }),
+        )
       }
       const retiredSession = previousSession
       const retiredIsRebind = retiredSession !== undefined && retiredSession !== sessionID
@@ -1810,12 +2058,13 @@ export function createSessionBoundExecutorWorker(
             else await onGenerationRetired?.(retiredSession, id)
           } catch (error) {
             // Cleanup must never fail the new run; the successor still boots.
-            log(workerLogMessage("worker retirement callback failed"), {
-              level: "WARN",
-              workerID: id,
-              sessionID: retiredSession,
-              error: error instanceof Error ? error.message : String(error),
-            })
+            void bridge?.fork(
+              Effect.logWarning(workerLogMessage("worker retirement callback failed"), {
+                workerID: id,
+                sessionID: retiredSession,
+                error: error instanceof Error ? error.message : String(error),
+              }),
+            )
           }
         })
         .then(() => spawnFor(id, sessionID, resolved.init))
@@ -1829,7 +2078,7 @@ export function createSessionBoundExecutorWorker(
         })
       return state.materializing
     },
-    log,
+    bridge,
     cap,
   )
 }
@@ -1841,9 +2090,8 @@ interface InitFlight {
 }
 
 /**
- * The production pool's init bookkeeping. The Wave-6 `makeProduction` service
- * keeps this state in a `SynchronizedRef`; the direct factory keeps the same
- * operations over plain maps, so both paths resolve in exactly the same order.
+ * The production pool's init bookkeeping. `makeProduction` keeps this state in
+ * a `SynchronizedRef` so the scoped cache and the init cache observe one order.
  */
 interface ProductionInitState {
   inFlight(key: string): InitFlight | undefined
@@ -1853,189 +2101,6 @@ interface ProductionInitState {
   cached(sessionID: SessionID): WorkerGeneration | undefined
   cache(sessionID: SessionID, generation: WorkerGeneration): void
   forget(sessionID: SessionID): void
-}
-
-function mapProductionInitState(): ProductionInitState {
-  const inFlight = new Map<string, InitFlight>()
-  const cache = new Map<SessionID, WorkerGeneration>()
-  return {
-    inFlight: (key) => inFlight.get(key),
-    startInFlight: (key, flight) => {
-      inFlight.set(key, flight)
-    },
-    finishInFlight: (key, flight) => {
-      // Only the flight that still owns the key may remove it: a cleared
-      // session may already have started a newer build under the same key.
-      if (inFlight.get(key) === flight) inFlight.delete(key)
-    },
-    clearInFlight: (sessionID) => {
-      for (const key of inFlight.keys()) if (key.startsWith(`${sessionID}:`)) inFlight.delete(key)
-    },
-    cached: (sessionID) => cache.get(sessionID),
-    cache: (sessionID, generation) => {
-      cache.set(sessionID, generation)
-    },
-    forget: (sessionID) => {
-      cache.delete(sessionID)
-    },
-  }
-}
-
-/**
- * Production `ExecutorWorkerPool` over the session-worker entry. Lazy: building
- * the pool spawns no isolates. Each worker resolves its init for the session it
- * is asked to run (and rebinds when that session changes), so multiple sessions
- * with distinct models share a generation without a `WorkerModelMismatchError`.
- */
-export function createProductionWorkerPool(options: ProductionWorkerPoolOptions): IdleBoundedExecutorWorkerPool {
-  return createProductionWorkerPoolWithState(options, mapProductionInitState())
-}
-
-function createProductionWorkerPoolWithState(
-  options: ProductionWorkerPoolOptions,
-  state: ProductionInitState,
-): IdleBoundedExecutorWorkerPool {
-  const log = options.log ?? noopWorkerLogger
-  // Default the liveness watchdog ON unless the caller or env explicitly opts out.
-  const runIdleTimeoutMs = resolveRunIdleTimeoutMs(options)
-  logRunIdleTimeoutWarning(log, options)
-  const resolveSource: (
-    sessionID?: SessionID,
-    model?: WorkerModelSelection,
-  ) => SessionWorkerInit | Promise<SessionWorkerInit> =
-    typeof options.init === "function" ? options.init : () => options.init as SessionWorkerInit
-  const modelKey = (model: WorkerModelSelection): string => `${model.providerID}/${model.modelID}`
-  // In-flight dedup is keyed by the exact generation request, so two concurrent
-  // first turns for one model share one build while a model switch never joins
-  // the old build.
-  const resolveInit = (sessionID: SessionID, model?: WorkerModelSelection): Promise<SessionWorkerInit> => {
-    const key = `${sessionID}:${model === undefined ? "" : modelKey(model)}`
-    const existing = state.inFlight(key)
-    if (existing !== undefined) return existing.promise
-    const deferred = Deferred.makeUnsafe<SessionWorkerInit, unknown>()
-    const flight: InitFlight = { deferred, promise: Effect.runPromise(Deferred.await(deferred)) }
-    state.startInFlight(key, flight)
-    Promise.resolve()
-      .then(() => resolveSource(sessionID, model))
-      .then(
-        (init) => {
-          Deferred.doneUnsafe(deferred, Effect.succeed(init))
-          state.finishInFlight(key, flight)
-        },
-        (error) => {
-          // Remove the failed flight so the next turn retries instead of
-          // observing a poisoned cache entry.
-          Deferred.doneUnsafe(deferred, Effect.fail(error))
-          state.finishInFlight(key, flight)
-        },
-      )
-    return flight.promise
-  }
-  // `(sessionID, generation)` is the init cache: a repeated turn on the same
-  // generation never rebuilds the graph/plugin/model bootstrap.
-  const generationOf = async (
-    sessionID: SessionID,
-    requested?: import("./execute").WorkerRunModel,
-  ): Promise<WorkerGeneration> => {
-    const cached = state.cached(sessionID)
-    const requestedKey = requested === undefined ? undefined : modelKey(requested)
-    // The requested model is the authoritative generation key: it is the model
-    // this run will actually use, even before the session row catches up.
-    if (requestedKey !== undefined) {
-      if (cached?.generation === requestedKey && cached.init !== undefined) return cached
-      const init = await resolveInit(sessionID, requested)
-      const entry: WorkerGeneration = { generation: requestedKey, init }
-      state.cache(sessionID, entry)
-      return entry
-    }
-    // No requested model: use the cheap probe when supplied (production). It
-    // returns the persisted/current model identity without rebuilding the init.
-    if (options.generationOf !== undefined) {
-      const generation = await options.generationOf(sessionID)
-      if (cached?.generation === generation && cached.init !== undefined) return cached
-      // The probe proved this is a NEW generation, so the previous init is
-      // stale by definition. Always rebuild it (production resolves the last
-      // user message's model, never the lagging `session.model` row).
-      const init = await resolveInit(sessionID)
-      const entry: WorkerGeneration = { generation, init }
-      state.cache(sessionID, entry)
-      return entry
-    }
-    // Last resort for a caller that supplies neither: resolve the init and key
-    // on its resolved model (correct, but one build per dispatch).
-    const init = await resolveInit(sessionID)
-    const generation = modelKey(init.model)
-    if (cached?.generation === generation) return cached
-    const entry: WorkerGeneration = { generation, init }
-    state.cache(sessionID, entry)
-    return entry
-  }
-  const spawnFor: SessionBoundSpawner = async (id, sessionID, resolvedInit) => {
-    await options.beforeSpawn?.()
-    const init = resolvedInit ?? (await resolveInit(sessionID))
-    return spawnBunExecutorWorker(id, {
-      entry: options.entry ?? SESSION_WORKER_ENTRY,
-      // Ship the pool id so the worker's `pid-report` frames are keyed to this
-      // slot out of the box (the hub still treats its port association as authoritative).
-      // The pool only spawns session workers, so the role is pinned `session`.
-      workerData: { ...init, workerID: id, role: "session", sessionID },
-      ...defined({
-        env: options.env,
-        databasePath: options.databasePath,
-        timeoutMs: options.timeoutMs,
-        runIdleTimeoutMs,
-        workKind: options.workKind,
-        egressBarrier: options.egressBarrier,
-        log,
-        // The session this isolate is bound to, so the `worker spawning`
-        // line names it (the init was already resolved for the same session).
-        sessionID,
-        spawnGate: options.spawnGate,
-        bootTimeoutMs: options.bootTimeoutMs,
-        onBootTelemetry: options.onBootTelemetry,
-        ...(options.onPhase === undefined
-          ? {}
-          : { onPhase: (phase: "boot" | "materialize") => options.onPhase?.(sessionID, phase) }),
-        onWorkerPorts: options.onWorkerPorts,
-        onHubProxyPort: options.onHubProxyPort,
-      }),
-    })
-  }
-  const cap = createWorkerCap(options.maxRunning ?? os.availableParallelism())
-  let pool: ExecutorWorkerPool | undefined
-  const idleCap = createIdleIsolateCap({
-    capacity: options.maxIdleWorkers ?? resolveIdleWorkerCapacity(),
-    log,
-    // An eviction is a generation retirement, not a pool-local cache drop. When
-    // the hub supplies the hook it owns the whole retirement (including the
-    // dispatcher's registry entry and the retired lease); otherwise keep the
-    // local release for a standalone pool.
-    onEvict: (entry) =>
-      options.onIdleEvicted === undefined
-        ? pool?.releaseSession?.(entry.sessionID, entry.worker.id)
-        : options.onIdleEvicted(entry.sessionID, entry.worker.id),
-  })
-  pool = createExecutorWorkerPool({
-    spawn: (id) =>
-      idleCap.track(
-        createSessionBoundExecutorWorker(
-          id,
-          spawnFor,
-          log,
-          options.onSessionRebound,
-          cap,
-          generationOf,
-          options.onGenerationRetired,
-        ),
-      ),
-    onSessionReleased: (sessionID) => {
-      state.clearInFlight(sessionID)
-      state.forget(sessionID)
-      options.onSessionReleased?.(sessionID)
-    },
-    log,
-  })
-  return withIdleIsolateCap(pool, idleCap)
 }
 
 /** The port-transfer sinks a production pool routes worker messages to. */
@@ -2073,15 +2138,10 @@ export interface WorkerPoolsStats {
   readonly idleEvictions: number
 }
 
-/** Optional counters for a pool that is not an {@link IdleBoundedExecutorWorkerPool}. */
-export interface FromPoolOptions {
-  readonly idle?: () => Pick<WorkerPoolsStats, "idleWorkers" | "idleCapacity" | "idleEvictions">
-}
-
 /**
  * The Effect-facing pool surface. `executorPool` stays the structural Promise
- * pool the dispatcher and hub already consume; every other member lifts one of
- * its operations into the service idiom without changing the adapter.
+ * pool the dispatcher and hub already consume; the scoped cache owns every
+ * isolate and `terminateAll` is the one shutdown wave.
  */
 export interface Interface {
   readonly executorPool: ExecutorWorkerPool
@@ -2095,43 +2155,6 @@ export interface Interface {
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/WorkerPools") {}
-
-function idleStats(pool: ExecutorWorkerPool): Pick<WorkerPoolsStats, "idleWorkers" | "idleCapacity" | "idleEvictions"> {
-  const bounded = pool as Partial<IdleBoundedExecutorWorkerPool>
-  return {
-    idleWorkers: bounded.idleWorkers ?? 0,
-    idleCapacity: bounded.idleCapacity ?? 0,
-    idleEvictions: bounded.idleEvictions ?? 0,
-  }
-}
-
-/** Adapt an existing structural pool (the production pool or a test fake). */
-export function fromPool(pool: ExecutorWorkerPool, options: FromPoolOptions = {}): Interface {
-  // One termination per adapter: a second concurrent call joins the first
-  // instead of posting a second shutdown wave.
-  let terminating: Promise<void> | undefined
-  const stats = (): WorkerPoolsStats => ({
-    workers: pool.workers.length,
-    ...(options.idle?.() ?? idleStats(pool)),
-  })
-  return {
-    executorPool: pool,
-    spawn: (id) => Effect.sync(() => pool.spawn(id)),
-    releaseSession: (sessionID, workerID) =>
-      Effect.sync(() => {
-        pool.releaseSession?.(sessionID, workerID)
-      }),
-    byID: (id) => Effect.sync(() => pool.byID(id)),
-    resultFor: (sessionID) => Effect.sync(() => pool.resultFor(sessionID)),
-    workers: Effect.sync(() => pool.workers),
-    terminateAll: () =>
-      Effect.suspend(() => {
-        const joined = (terminating ??= Promise.resolve(pool.terminateAll()))
-        return Effect.promise(() => joined)
-      }),
-    stats: Effect.sync(stats),
-  }
-}
 
 type ProductionInitMaps = {
   readonly inFlight: ReadonlyMap<string, InitFlight>
@@ -2179,18 +2202,409 @@ function synchronizedProductionInitState(
   }
 }
 
+/** The cache key: one isolate per `(sessionID, generation)`. */
+function generationKey(sessionID: SessionID, generation: string): string {
+  return `${sessionID}\u0000${generation}`
+}
+
+interface GenerationLookup {
+  readonly sessionID: SessionID
+  readonly workerID: number
+  readonly init?: SessionWorkerInit
+}
+
+const promiseEffect = <A>(run: () => Promise<A>): Effect.Effect<A> =>
+  Effect.tryPromise({ try: run, catch: (error) => error }).pipe(Effect.orDie)
+
 /**
- * Build the production {@link Interface}. Lazy like the factory it composes: no
- * isolate exists until `spawn`/`execute`; the returned scope terminates the pool.
+ * Join an in-flight promise for at most `timeoutMs`, then detach. Effect's
+ * interruptible clock bounds the wait; a rejected or wedged source is reported
+ * as a settled join because the caller is tearing the resource down anyway.
+ */
+const joinWithin = (promise: Promise<unknown>, timeoutMs: number): Promise<void> =>
+  Effect.runPromise(
+    Effect.tryPromise({ try: () => promise, catch: (error) => error }).pipe(
+      Effect.timeoutOrElse({
+        duration: Duration.millis(timeoutMs),
+        orElse: () => Effect.void,
+      }),
+      Effect.asVoid,
+    ),
+  ).catch(() => undefined)
+
+/**
+ * Build the production {@link Interface}. The isolate is an
+ * `Effect.acquireRelease` resource in a `ScopedCache` keyed by
+ * `(sessionID, generation)`; acquiring boots the isolate and the release is the
+ * ONLY isolate-terminate authority. Retirement (crash, cancel, reap, model
+ * switch, idle eviction, shutdown) is `ScopedCache.invalidate`, so every path
+ * runs the same orderly DB/WAL close exactly once.
  */
 export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Effect<Interface, never, Scope.Scope> {
   return Effect.gen(function* () {
-    const state = yield* SynchronizedRef.make<ProductionInitMaps>({
+    const bridge = options.bridge
+    const runIdleTimeoutMs = resolveRunIdleTimeoutMs(options)
+    logRunIdleTimeoutWarning(bridge, options)
+    const initRef = yield* SynchronizedRef.make<ProductionInitMaps>({
       inFlight: new Map(),
       cache: new Map(),
     })
-    const pools = fromPool(createProductionWorkerPoolWithState(options, synchronizedProductionInitState(state)))
-    yield* Effect.addFinalizer(() => pools.terminateAll())
+    const state = synchronizedProductionInitState(initRef)
+    const resolveSource: (
+      sessionID?: SessionID,
+      model?: WorkerModelSelection,
+    ) => SessionWorkerInit | Promise<SessionWorkerInit> =
+      typeof options.init === "function" ? options.init : () => options.init as SessionWorkerInit
+    const modelKey = (model: WorkerModelSelection): string => `${model.providerID}/${model.modelID}`
+    // In-flight dedup is keyed by the exact generation request, so two concurrent
+    // first turns for one model share one build while a model switch never joins
+    // the old build.
+    const resolveInit = (sessionID: SessionID, model?: WorkerModelSelection): Promise<SessionWorkerInit> => {
+      const key = `${sessionID}:${model === undefined ? "" : modelKey(model)}`
+      const existing = state.inFlight(key)
+      if (existing !== undefined) return existing.promise
+      const deferred = Deferred.makeUnsafe<SessionWorkerInit, unknown>()
+      const flight: InitFlight = { deferred, promise: Effect.runPromise(Deferred.await(deferred)) }
+      state.startInFlight(key, flight)
+      Promise.resolve()
+        .then(() => resolveSource(sessionID, model))
+        .then(
+          (init) => {
+            Deferred.doneUnsafe(deferred, Effect.succeed(init))
+            state.finishInFlight(key, flight)
+          },
+          (error) => {
+            // Remove the failed flight so the next turn retries instead of
+            // observing a poisoned cache entry.
+            Deferred.doneUnsafe(deferred, Effect.fail(error))
+            state.finishInFlight(key, flight)
+          },
+        )
+      return flight.promise
+    }
+    // `(sessionID, generation)` is the init cache: a repeated turn on the same
+    // generation never rebuilds the graph/plugin/model bootstrap.
+    const generationOf = async (
+      sessionID: SessionID,
+      requested?: import("./execute").WorkerRunModel,
+    ): Promise<WorkerGeneration> => {
+      const cached = state.cached(sessionID)
+      const requestedKey = requested === undefined ? undefined : modelKey(requested)
+      // The requested model is the authoritative generation key: it is the model
+      // this run will actually use, even before the session row catches up.
+      if (requestedKey !== undefined) {
+        if (cached?.generation === requestedKey && cached.init !== undefined) return cached
+        const init = await resolveInit(sessionID, requested)
+        const entry: WorkerGeneration = { generation: requestedKey, init }
+        state.cache(sessionID, entry)
+        return entry
+      }
+      // No requested model: use the cheap probe when supplied (production). It
+      // returns the persisted/current model identity without rebuilding the init.
+      if (options.generationOf !== undefined) {
+        const generation = await options.generationOf(sessionID)
+        if (cached?.generation === generation && cached.init !== undefined) return cached
+        const init = await resolveInit(sessionID)
+        const entry: WorkerGeneration = { generation, init }
+        state.cache(sessionID, entry)
+        return entry
+      }
+      // Last resort for a caller that supplies neither: resolve the init and key
+      // on its resolved model (correct, but one build per dispatch).
+      const init = await resolveInit(sessionID)
+      const generation = modelKey(init.model)
+      if (cached?.generation === generation) return cached
+      const entry: WorkerGeneration = { generation, init }
+      state.cache(sessionID, entry)
+      return entry
+    }
+    const spawnFor: SessionBoundSpawner = async (id, sessionID, resolvedInit) => {
+      const init = resolvedInit ?? (await resolveInit(sessionID))
+      return spawnBunExecutorWorker(id, {
+        entry: options.entry ?? SESSION_WORKER_ENTRY,
+        // Ship the pool id so the worker's `pid-report` frames are keyed to this
+        // slot out of the box (the hub still treats its port association as authoritative).
+        // The pool only spawns session workers, so the role is pinned `session`.
+        workerData: { ...init, workerID: id, role: "session", sessionID },
+        ...defined({
+          env: options.env,
+          databasePath: options.databasePath,
+          timeoutMs: options.timeoutMs,
+          runIdleTimeoutMs,
+          workKind: options.workKind,
+          egressBarrier: options.egressBarrier,
+          ...(bridge === undefined ? {} : { bridge }),
+          // The session this isolate is bound to, so the `worker spawning`
+          // line names it (the init was already resolved for the same session).
+          sessionID,
+          spawnGate: options.spawnGate,
+          bootTimeoutMs: options.bootTimeoutMs,
+          onBootTelemetry: options.onBootTelemetry,
+          ...(options.onPhase === undefined
+            ? {}
+            : { onPhase: (phase: "boot" | "materialize") => options.onPhase?.(sessionID, phase) }),
+          onWorkerPorts: options.onWorkerPorts,
+          onHubProxyPort: options.onHubProxyPort,
+        }),
+      })
+    }
+    const cap = createWorkerCap(options.maxRunning ?? os.availableParallelism())
+    // The scope that owns the isolate cache; closing it invalidates every entry
+    // through the same release. Kept separate so `terminateAll` can close it
+    // exactly once even while the outer layer scope lives on.
+    const cacheScope = yield* Scope.make()
+    const lookups = new Map<string, GenerationLookup>()
+    const cache = yield* Scope.provide(cacheScope)(
+      ScopedCache.make<string, ExecutorWorker>({
+        // The idle cap, not the cache capacity, bounds retention.
+        capacity: Number.MAX_SAFE_INTEGER,
+        lookup: (key) =>
+          Effect.acquireRelease(
+            Effect.gen(function* () {
+              const lookup = lookups.get(key)
+              if (lookup === undefined) throw new Error(`session worker generation ${key} disappeared before boot`)
+              // The schema gate must run before the isolate opens SQLite.
+              yield* Effect.tryPromise({
+                try: () => Promise.resolve(options.beforeSpawn?.()),
+                catch: (error) => error,
+              }).pipe(Effect.orDie)
+              const init = lookup.init ?? (yield* promiseEffect(() => resolveInit(lookup.sessionID)))
+              return yield* promiseEffect(() => spawnFor(lookup.workerID, lookup.sessionID, init))
+            }),
+            (worker) =>
+              Effect.tryPromise({
+                try: () => worker.terminate(),
+                catch: (error) => error,
+              }).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.sync(() => {
+                    void bridge?.fork(
+                      Effect.logWarning(workerLogMessage("worker release failed"), {
+                        workerID: worker.id,
+                        reason: String(cause),
+                      }),
+                    )
+                  }),
+                ),
+              ),
+          ),
+      }),
+    )
+    const invalidate = (key: string): Promise<void> => {
+      lookups.delete(key)
+      return Effect.runPromise(ScopedCache.invalidate(cache, key)).catch(() => undefined)
+    }
+    const idleCap = createIdleIsolateCap({
+      capacity: options.maxIdleWorkers ?? resolveIdleWorkerCapacity(),
+      ...(bridge === undefined ? {} : { bridge }),
+      // An eviction is a generation retirement, not a pool-local cache drop. When
+      // the hub supplies the hook it owns the whole retirement (including the
+      // dispatcher's registry entry and the retired lease); otherwise keep the
+      // local release for a standalone pool.
+      onEvict: (entry) =>
+        options.onIdleEvicted === undefined
+          ? basePool?.releaseSession?.(entry.sessionID, entry.worker.id)
+          : options.onIdleEvicted(entry.sessionID, entry.worker.id),
+    })
+    const slots = new Map<number, ExecutorWorker>()
+    let nextId = 1
+    let basePool: ExecutorWorkerPool | undefined
+    let terminationAll: Promise<void> | undefined
+
+    const createSlot = (id: number): ExecutorWorker => {
+      let boundSession: SessionID | undefined
+      let boundKey: string | undefined
+      let current: ExecutorWorker | undefined
+      let terminated = false
+      // A slot whose isolate died is observably dead even after the bound key is
+      // invalidated and `current` cleared. Dispatch classifies a raw transport
+      // exit as a crash from this flag; a fresh isolate clears it.
+      let isolateDead = false
+      let termination: Promise<void> | undefined
+      let materializing: Promise<void> | undefined
+
+      const invalidateBound = async (deadIsolate = false): Promise<void> => {
+        if (deadIsolate) isolateDead = true
+        const key = boundKey
+        boundKey = undefined
+        boundSession = undefined
+        current = undefined
+        if (key !== undefined) await invalidate(key)
+      }
+
+      const worker: ExecutorWorker = {
+        id,
+        get alive() {
+          return !terminated && !isolateDead && (current === undefined || current.alive)
+        },
+        execute: async (run) => {
+          const release = await cap.acquire(run.depth)
+          try {
+            if (terminated) throw new Error(`executor worker ${id} is terminated`)
+            const materialized = (async () => {
+              const generation = await generationOf(run.sessionID, run.model)
+              const key = generationKey(run.sessionID, generation.generation)
+              if (boundKey !== undefined && boundKey !== key) {
+                const previousSession = boundSession
+                await invalidateBound()
+                try {
+                  if (previousSession !== undefined && previousSession !== run.sessionID) {
+                    await options.onSessionRebound?.(previousSession)
+                  } else if (previousSession !== undefined) {
+                    await options.onGenerationRetired?.(previousSession, id)
+                  }
+                } catch (error) {
+                  // Cleanup must never fail the new run; the successor still boots.
+                  void bridge?.fork(
+                    Effect.logWarning(workerLogMessage("worker retirement callback failed"), {
+                      workerID: id,
+                      sessionID: previousSession,
+                      error: error instanceof Error ? error.message : String(error),
+                    }),
+                  )
+                }
+              }
+              boundSession = run.sessionID
+              boundKey = key
+              lookups.set(key, { sessionID: run.sessionID, workerID: id, init: generation.init })
+              if (current === undefined) {
+                try {
+                  current = await Effect.runPromise(ScopedCache.get(cache, key))
+                } catch (error) {
+                  // A failed lookup is cached by the cache's TTL; drop it so the
+                  // next turn retries the init/spawn instead of replaying it.
+                  await invalidate(key)
+                  throw error
+                }
+              }
+              const isolate = current
+              if (isolate === undefined) throw new Error(`executor worker ${id} did not materialize`)
+              isolateDead = false
+              return { key, worker: isolate }
+            })()
+            materializing = materialized.then(
+              () => undefined,
+              () => undefined,
+            )
+            const { key, worker: isolate } = await materialized
+            if (terminated) {
+              await invalidate(key)
+              throw new Error(`executor worker ${id} is terminated`)
+            }
+            try {
+              return await isolate.execute(run)
+            } catch (error) {
+              // A first-run boot failure surfaces here, not in `ScopedCache.get`
+              // (the transport constructs on the first post). A dead isolate must
+              // stay observably dead (so dispatch classifies the crash) AND have
+              // its key dropped so the release runs and the next turn boots a
+              // fresh isolate instead of replaying the dead cached entry.
+              if (!isolate.alive && boundKey === key) await invalidateBound(true)
+              throw error
+            }
+          } finally {
+            release?.()
+          }
+        },
+        cancel: (sessionID) => (current === undefined ? Promise.resolve() : current.cancel(sessionID)),
+        cancelBoot: () => current?.cancelBoot?.() ?? Promise.resolve(undefined),
+        assertNotBusy: (sessionID) =>
+          current === undefined ? Promise.resolve(false) : current.assertNotBusy(sessionID),
+        resultFor: (sessionID) => current?.resultFor(sessionID),
+        hasActiveWork: (sessionID) => current?.hasActiveWork?.(sessionID) ?? Promise.resolve(false),
+        awaitEgress: (sessionID) => current?.awaitEgress?.(sessionID) ?? Promise.resolve(),
+        cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID), ...(bridge === undefined ? {} : { bridge }) }),
+        terminate: () => {
+          if (termination !== undefined) return termination
+          terminated = true
+          const pending = materializing
+          termination = (async () => {
+            // A terminate during the first materialization joins that same
+            // close: the fresh isolate is discarded, never published. A wedged
+            // boot/init resolution is bounded so shutdown cannot park on it.
+            if (pending !== undefined) await joinWithin(pending, MATERIALIZE_JOIN_TIMEOUT_MS)
+            await invalidateBound()
+          })()
+          return termination
+        },
+      }
+      return worker
+    }
+
+    const spawn = (id?: number): ExecutorSessionWorker => {
+      // Honour a dispatcher-supplied id (the registry owns the monotonic source
+      // there); a direct caller keeps the pool's own counter.
+      const workerID = id === undefined || slots.has(id) ? nextId : id
+      nextId = Math.max(nextId, workerID + 1)
+      const slot = idleCap.track(createSlot(workerID))
+      slots.set(workerID, slot)
+      return slot
+    }
+
+    const terminateAll = (): Promise<void> => {
+      if (terminationAll !== undefined) return terminationAll
+      const workers = [...slots.values()]
+      slots.clear()
+      terminationAll = (async () => {
+        await Promise.all(workers.map((worker) => worker.terminate().catch(() => undefined)))
+        // Every slot join above is bounded; the cache scope close is bounded too
+        // so a lingering lookup cannot park shutdown after its deadline.
+        await Effect.runPromise(
+          Scope.close(cacheScope, Exit.void).pipe(
+            Effect.timeoutOrElse({
+              duration: Duration.millis(MATERIALIZE_JOIN_TIMEOUT_MS),
+              orElse: () => Effect.void,
+            }),
+          ),
+        ).catch(() => undefined)
+      })()
+      return terminationAll
+    }
+
+    const poolBase: ExecutorWorkerPool = {
+      get workers() {
+        return [...slots.values()]
+      },
+      spawn,
+      releaseSession: (sessionID, workerID) => {
+        if (workerID !== undefined) slots.delete(workerID)
+        state.clearInFlight(sessionID)
+        state.forget(sessionID)
+        options.onSessionReleased?.(sessionID)
+      },
+      terminateAll,
+      byID: (id) => slots.get(id),
+      resultFor: (sessionID) => {
+        for (const worker of slots.values()) {
+          const result = worker.resultFor(sessionID)
+          if (result !== undefined) return result
+        }
+        return undefined
+      },
+    }
+    basePool = poolBase
+    const pool = withIdleIsolateCap(poolBase, idleCap)
+
+    const stats = (): WorkerPoolsStats => ({
+      workers: pool.workers.length,
+      idleWorkers: pool.idleWorkers,
+      idleCapacity: pool.idleCapacity,
+      idleEvictions: pool.idleEvictions,
+    })
+    const pools: Interface = {
+      executorPool: pool,
+      spawn: (id) => Effect.sync(() => pool.spawn(id)),
+      releaseSession: (sessionID, workerID) =>
+        Effect.sync(() => {
+          pool.releaseSession?.(sessionID, workerID)
+        }),
+      byID: (id) => Effect.sync(() => pool.byID(id)),
+      resultFor: (sessionID) => Effect.sync(() => pool.resultFor(sessionID)),
+      workers: Effect.sync(() => pool.workers),
+      terminateAll: () => Effect.promise(() => terminateAll()),
+      stats: Effect.sync(stats),
+    }
+    yield* Effect.addFinalizer(() => Effect.promise(() => terminateAll()))
     return pools
   })
 }

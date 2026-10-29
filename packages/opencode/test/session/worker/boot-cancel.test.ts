@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { flush } from "../../lib/async"
-import { createSpawnGate } from "@/session/worker/spawn-gate"
+import { makeSpawnGate } from "@/session/worker/worker-pools"
 import { BOOT_CANCELLED, createBootLifecycle, type BootTelemetry } from "@/session/worker/cancel"
 
 function countingPermit() {
@@ -135,7 +135,7 @@ describe("boot cancellation (D11)", () => {
   })
 
   test("the spawn permit count is unchanged across boot cancel", async () => {
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000 })
     const permit = await gate.acquire()
     expect(gate.held).toBe(true)
 

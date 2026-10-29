@@ -33,15 +33,23 @@ import { capture, flush, sid } from "../../lib/async"
 import { createFakeWorkerPool, type FakeSessionWorker } from "../../lib/fake-worker-pool"
 import { createListenerPair } from "../../lib/port-pair"
 import { createRecordingScheduler } from "../../lib/scheduler"
-import type { WorkerLogger } from "@/session/worker/log"
+import { Logger } from "effect"
+import { recordingBridge } from "../../lib/recorders"
 
-/** A recording logger: captures every `(message, fields)` pair in call order. */
+/** A recording bridge: captures every `(message, fields)` pair in call order. */
 function recordingLog(): {
-  readonly log: WorkerLogger
+  readonly bridge: ReturnType<typeof recordingBridge>
   readonly entries: Array<{ message: string; fields: Record<string, unknown> }>
 } {
   const entries: Array<{ message: string; fields: Record<string, unknown> }> = []
-  return { log: (message, fields) => entries.push({ message, fields }), entries }
+  const sink = Logger.make<unknown, void>(({ message }) => {
+    const [head, fields] = Array.isArray(message) ? message : [message, undefined]
+    entries.push({
+      message: typeof head === "string" ? head : String(head),
+      fields: typeof fields === "object" && fields !== null ? (fields as Record<string, unknown>) : {},
+    })
+  })
+  return { bridge: recordingBridge(sink), entries }
 }
 
 /** An in-process pair of cancel ports; `hub.notify` reaches the worker side. */
@@ -574,14 +582,14 @@ describe("12 D1 cancel requested logging", () => {
   test("createCancelController emits 'cancel requested' once with sessionID, workerID and graceMs", () => {
     const pair = createPortPair()
     const scheduler = createRecordingScheduler<CancelScheduler>()
-    const { log, entries } = recordingLog()
+    const { bridge, entries } = recordingLog()
     const controller = createCancelController({
       port: pair.hub,
       terminate: () => {},
       graceMs: 250,
       workerID: 5,
       schedule: scheduler.schedule,
-      log,
+      bridge,
     })
 
     const never = new Promise<void>(() => {})

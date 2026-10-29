@@ -2,8 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Deferred, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
-import * as Stream from "effect/Stream"
+import { Cause, Deferred, Effect, Exit, Layer, Context, Scope, Stream, Schema } from "effect"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
 import { Permission } from "@/permission"
@@ -24,7 +23,6 @@ import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
-import { withBusyRetry } from "@opencode-ai/core/database/busy"
 import { LLMError, UnknownProviderReason, Usage, type LLMEvent } from "@opencode-ai/llm"
 import { Faults } from "@/testing/faults"
 
@@ -302,9 +300,10 @@ const layer = Layer.effect(
                   }),
                 { behavior: "immediate" },
               )
-              // Busy retry owns the whole result/failure transaction; replaying a
-              // single statement inside it would keep the stale snapshot.
-              .pipe(withBusyRetry, Effect.orDie)
+              // The adapter retries a busy transaction boundary (`BEGIN
+              // IMMEDIATE`/`COMMIT`); a statement inside the body is never
+              // replayed on its own.
+              .pipe(Effect.orDie)
             yield* settleRegistered(toolCallID, "ok", "afterCommit")
             yield* settleToolCall(toolCallID)
           }),
@@ -340,9 +339,10 @@ const layer = Layer.effect(
                   }),
                 { behavior: "immediate" },
               )
-              // Busy retry owns the whole result/failure transaction; replaying a
-              // single statement inside it would keep the stale snapshot.
-              .pipe(withBusyRetry, Effect.orDie)
+              // The adapter retries a busy transaction boundary (`BEGIN
+              // IMMEDIATE`/`COMMIT`); a statement inside the body is never
+              // replayed on its own.
+              .pipe(Effect.orDie)
             yield* settleRegistered(toolCallID, "error", "afterCommit")
             if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
               ctx.blocked = ctx.shouldBreak

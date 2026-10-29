@@ -14,6 +14,7 @@ import type { DbExecutor } from "@/session/worker/db-executor"
 import { WorkerCrashedError } from "@/session/worker/dispatch"
 import type { ExecutorRun, ExecutorWorker, ExecutorWorkerPool, SessionExecutionResult } from "@/session/worker/execute"
 import { createSessionHub } from "@/session/worker/hub"
+import { createTestBarrier } from "../../lib/run-barrier-test"
 import { sid } from "../../lib/async"
 
 type RunHook = (sessionID: SessionID, lifecycle: LifecycleTracker) => void
@@ -74,7 +75,7 @@ async function runCrash(
   const lifecycle = createLifecycleTracker()
   const sessionID = sid("ses_resume")
   prepare(lifecycle, sessionID)
-  const hub = createSessionHub({
+  const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
     pool: crashPool(lifecycle, hook),
     lifecycle,
     resumeRun: (decision) => resume(decision),
@@ -135,7 +136,7 @@ describe("hub auto-resume wiring (D9)", () => {
     const sessionID = sid("ses_cap")
     lifecycle.commit(sessionID, "msg_committed")
     for (let attempt = 0; attempt < AUTO_RESUME_CAP; attempt++) lifecycle.recordAttempt(sessionID)
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool: crashPool(lifecycle, phaseStream),
       lifecycle,
       resumeRun: (decision) => {
@@ -259,7 +260,7 @@ describe("async resume ownership (D9)", () => {
       resultFor: () => undefined,
     }
 
-    const hub = createSessionHub({ pool, lifecycle, resumeRun: () => {}, db })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool, lifecycle, resumeRun: () => {}, db })
     try {
       const crashed = hub.ensureRunning(sessionID).catch((error: unknown) => error)
       await started

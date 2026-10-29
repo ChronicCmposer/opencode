@@ -16,18 +16,20 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { afterEach, describe, expect, test } from "bun:test"
-import { Effect } from "effect"
+import { afterEach, describe, expect } from "bun:test"
+import { Effect, Fiber } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { MessageID } from "@/session/schema"
 import { createLifecycleTracker } from "@/session/ledger/lifecycle"
-import { createRunBarrier, type RunBarrierScheduler } from "@/session/run-barrier"
+import { RunBarrier } from "@/session/run-barrier"
 import { createProductionSessionHub, createSessionHub, type SessionHub } from "@/session/worker/hub"
+import { createTestBarrier } from "../lib/run-barrier-test"
 import { createDbExecutor } from "@/session/worker/db-executor"
 import { createFakeExecutorPool } from "../lib/fake-worker-pool"
 import { flush, sid } from "../lib/async"
 import { testEffect } from "../lib/effect"
+import { clockedRunBarrierLayer } from "../lib/run-barrier-test"
 import { TestLLMServer } from "../lib/llm-server"
 import { sessionWorkerInit } from "../lib/session-worker-init"
 import { workerSnapshot } from "../lib/snapshot"
@@ -37,62 +39,58 @@ import {
   REAL_WORKER_TRANSPORT_TIMEOUT_MS,
 } from "../lib/worker-timeouts"
 
-/**
- * A scheduler that never advances: a regression is caught as `draining` instead
- * of hiding behind the real 5 s bound.
- */
-function frozenScheduler(): RunBarrierScheduler {
-  let nextID = 1
-  return {
-    schedule: () => nextID++,
-    cancel: () => {},
-  }
-}
-
 function shellInput(sessionID: ReturnType<typeof sid>) {
   return { sessionID, agent: "build", command: "true" }
 }
 
+const it = testEffect(clockedRunBarrierLayer)
+
 describe("run admission after a run that commits nothing (P0)", () => {
-  test("a shell run drains and admits the next prompt", async () => {
-    const barrier = createRunBarrier({ scheduler: frozenScheduler() })
-    const pool = createFakeExecutorPool(1)
-    const hub = createSessionHub({ pool, lifecycle: createLifecycleTracker(), barrier })
-    const sessionID = sid("ses_admission_shell")
+  it.effect("a shell run drains and admits the next prompt", () =>
+    Effect.gen(function* () {
+      const barrier = yield* RunBarrier.Service
+      const pool = createFakeExecutorPool(1)
+      const hub = createSessionHub({ pool, lifecycle: createLifecycleTracker(), barrier })
+      const sessionID = sid("ses_admission_shell")
 
-    try {
-      const shellRun = hub.startShell(sessionID, shellInput(sessionID))
-      await flush()
-      expect(hub.barrier.state(sessionID)).toBe("drained")
-      await shellRun
+      try {
+        const shellRun = yield* Effect.promise(() => hub.startShell(sessionID, shellInput(sessionID))).pipe(
+          Effect.forkChild,
+        )
+        yield* Effect.promise(flush)
+        expect(hub.barrier.state(sessionID)).toBe("drained")
+        yield* Fiber.join(shellRun)
 
-      await hub.ensureRunning(sessionID)
-      expect(hub.barrier.state(sessionID)).toBe("drained")
-      expect(hub.barrier.state(sessionID)).not.toBe("timed-out")
-    } finally {
-      await hub.terminateAll()
-    }
-  })
+        yield* Effect.promise(() => hub.ensureRunning(sessionID))
+        expect(hub.barrier.state(sessionID)).toBe("drained")
+        expect(hub.barrier.state(sessionID)).not.toBe("timed-out")
+      } finally {
+        yield* Effect.promise(() => hub.terminateAll())
+      }
+    }),
+  )
 
-  test("a prompt run that commits nothing drains and admits the next prompt", async () => {
-    const barrier = createRunBarrier({ scheduler: frozenScheduler() })
-    const pool = createFakeExecutorPool(1)
-    const hub = createSessionHub({ pool, lifecycle: createLifecycleTracker(), barrier })
-    const sessionID = sid("ses_admission_no_commit")
+  it.effect("a prompt run that commits nothing drains and admits the next prompt", () =>
+    Effect.gen(function* () {
+      const barrier = yield* RunBarrier.Service
+      const pool = createFakeExecutorPool(1)
+      const hub = createSessionHub({ pool, lifecycle: createLifecycleTracker(), barrier })
+      const sessionID = sid("ses_admission_no_commit")
 
-    try {
-      const first = hub.ensureRunning(sessionID)
-      await flush()
-      expect(hub.barrier.state(sessionID)).toBe("drained")
-      await first
+      try {
+        const first = yield* Effect.promise(() => hub.ensureRunning(sessionID)).pipe(Effect.forkChild)
+        yield* Effect.promise(flush)
+        expect(hub.barrier.state(sessionID)).toBe("drained")
+        yield* Fiber.join(first)
 
-      await hub.ensureRunning(sessionID)
-      expect(hub.barrier.state(sessionID)).toBe("drained")
-      expect(hub.barrier.state(sessionID)).not.toBe("timed-out")
-    } finally {
-      await hub.terminateAll()
-    }
-  })
+        yield* Effect.promise(() => hub.ensureRunning(sessionID))
+        expect(hub.barrier.state(sessionID)).toBe("drained")
+        expect(hub.barrier.state(sessionID)).not.toBe("timed-out")
+      } finally {
+        yield* Effect.promise(() => hub.terminateAll())
+      }
+    }),
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -178,7 +176,7 @@ function startProductionHub(input: {
   readonly sessionID: string
 }): ProductionFixture {
   const db = createDbExecutor({ filename: input.filename, timeoutMs: REAL_WORKER_TRANSPORT_TIMEOUT_MS })
-  const hub = createProductionSessionHub({
+  const hub = createProductionSessionHub({ ...{ barrier: createTestBarrier() },
     db,
     init: () =>
       sessionWorkerInit({

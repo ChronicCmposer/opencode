@@ -1,10 +1,8 @@
 // Durable/blob settlement cases:
 // 1. a legacy inline `event_blob` row (`file_path IS NULL`, `data` present) must resolve
-//    through a repository-only Bus, not `String(undefined)`;
+//    through a repository-only DurableLog, not `String(undefined)`;
 // 2. blob GC must commit row deletion before it unlinks files, so a rolled-back
-//    transaction can never leave a live row pointing at a removed file;
-// 3. the bound writer's `txQuery` must reject raw writes loudly instead of relying on
-//    the connection guard to reject them incidentally.
+//    transaction can never leave a live row pointing at a removed file.
 
 import fs from "node:fs"
 import os from "node:os"
@@ -13,7 +11,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
 import { Effect, Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { markSchemaIdentity } from "@/session/db/schema"
 import { openWorkerDatabase, type WorkerDatabase } from "@/session/worker/db"
@@ -71,7 +69,7 @@ function workspace(): string {
   return directory
 }
 
-function connectionFrom(native: Database): Bus.Connection {
+function connectionFrom(native: Database): DurableLog.Connection {
   return {
     all: (sql, params = []) => native.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>,
     run: (sql, params = []) => ({ changes: Number(native.query(sql).run(...(params as never[])).changes) }),
@@ -131,7 +129,7 @@ interface TransactionHooks {
 }
 
 /** Wrap a real repository transaction so the test can force a rollback or observe commit. */
-function withTransactionHooks(base: Bus.DurableRepository, hooks: TransactionHooks): Bus.DurableRepository {
+function withTransactionHooks(base: DurableLog.DurableRepository, hooks: TransactionHooks): DurableLog.DurableRepository {
   return {
     ...base,
     transaction: <T>(work: () => T): T => {
@@ -153,11 +151,11 @@ afterEach(async () => {
 })
 
 describe("durable settlement: legacy inline blob rows", () => {
-  test("a repository-only Bus resolves a legacy inline event_blob row", () => {
+  test("a repository-only DurableLog resolves a legacy inline event_blob row", () => {
     const database = openLegacy()
     const payload = JSON.stringify(note("s1", oversized("legacy-inline")))
-    const hash = Bus.digest(payload)
-    const repository = Bus.createDurableRepository(database.connection)
+    const hash = DurableLog.digest(payload)
+    const repository = DurableLog.createDurableRepository(database.connection)
 
     repository.appendSequence({ aggregateID: "s1", block: 1 })
     repository.appendEvent({
@@ -173,7 +171,7 @@ describe("durable settlement: legacy inline blob rows", () => {
       ["s1", STORED_TYPE, hash, Buffer.byteLength(payload), payload],
     )
 
-    const bus = Bus.create({
+    const bus = DurableLog.create({
       repository,
       ownerID: "gen-legacy-inline",
       definitions: [Note],
@@ -187,8 +185,8 @@ describe("durable settlement: legacy inline blob rows", () => {
 describe("durable settlement: blob GC ordering", () => {
   test("a rolled-back collect keeps both the rows and the file", () => {
     const database = openLegacy()
-    const base = Bus.createDurableRepository(database.connection)
-    const publishBus = Bus.create({
+    const base = DurableLog.createDurableRepository(database.connection)
+    const publishBus = DurableLog.create({
       repository: base,
       ownerID: "gen-gc-rollback",
       definitions: [Note],
@@ -199,7 +197,7 @@ describe("durable settlement: blob GC ordering", () => {
     const [file] = fs.readdirSync(database.blobDir)
     expect(file).toBeDefined()
 
-    const gcBus = Bus.create({
+    const gcBus = DurableLog.create({
       repository: withTransactionHooks(base, { rollbackAfterWork: true }),
       ownerID: "gen-gc-rollback",
       definitions: [Note],
@@ -218,8 +216,8 @@ describe("durable settlement: blob GC ordering", () => {
 
   test("a missing blob directory fails before deleting any row", () => {
     const database = openLegacy()
-    const base = Bus.createDurableRepository(database.connection)
-    const publishBus = Bus.create({
+    const base = DurableLog.createDurableRepository(database.connection)
+    const publishBus = DurableLog.create({
       repository: base,
       ownerID: "gen-gc-no-dir",
       definitions: [Note],
@@ -230,9 +228,9 @@ describe("durable settlement: blob GC ordering", () => {
     const [file] = fs.readdirSync(database.blobDir)
     expect(file).toBeDefined()
 
-    // A repository without a filename cannot derive a blob directory; the Bus
+    // A repository without a filename cannot derive a blob directory; the DurableLog
     // must refuse the collection while the rows are still intact.
-    const gcBus = Bus.create({
+    const gcBus = DurableLog.create({
       repository: { ...base, filename: undefined },
       ownerID: "gen-gc-no-dir",
       definitions: [Note],
@@ -247,8 +245,8 @@ describe("durable settlement: blob GC ordering", () => {
 
   test("deleteAggregate unlinks only after the row deletion commits", () => {
     const database = openLegacy()
-    const base = Bus.createDurableRepository(database.connection)
-    const publishBus = Bus.create({
+    const base = DurableLog.createDurableRepository(database.connection)
+    const publishBus = DurableLog.create({
       repository: base,
       ownerID: "gen-gc-order",
       definitions: [Note],
@@ -260,7 +258,7 @@ describe("durable settlement: blob GC ordering", () => {
     expect(file).toBeDefined()
 
     let fileAtCommit: boolean | undefined
-    const gcBus = Bus.create({
+    const gcBus = DurableLog.create({
       repository: withTransactionHooks(base, {
         afterCommit: () => {
           // The row-deletion commit must still see the file: unlink happens in a
@@ -283,8 +281,8 @@ describe("durable settlement: blob GC ordering", () => {
   })
 })
 
-describe("durable settlement: bound writer transaction writes", () => {
-  test("txQuery rejects raw writes loudly while begin/commit and reads still work", async () => {
+describe("durable settlement: bound writer surface (S4)", () => {
+  test("the bound writer keeps publish/query/dispose and has no transaction API", async () => {
     const sessionID = "session-settlement-tx"
     const filename = migratedWorkerFile(sessionID)
     const database = await Effect.runPromise(openWorkerDatabase({ filename, sessionID }))
@@ -299,22 +297,17 @@ describe("durable settlement: bound writer transaction writes", () => {
     })
 
     try {
-      const handle = await writer.begin()
-      try {
-        const rows = await writer.txQuery(handle, "all", "SELECT COUNT(*) AS count FROM event")
-        expect(rows).toEqual([{ count: 0 }])
-        await expect(
-          writer.txQuery(
-            handle,
-            "run",
-            "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)",
-            ["event-settlement-tx", sessionID, 0, STORED_TYPE, "{}"],
-          ),
-        ).rejects.toThrow(/writer txQuery is read-only/)
-      } finally {
-        await writer.commit(handle)
-      }
-      expect(database.connection.all("SELECT COUNT(*) AS count FROM event")).toEqual([{ count: 0 }])
+      // Characterization: D5 makes the worker Database the transaction owner.
+      // The writer seam must not grow back `begin`/`txQuery`/`commit`/`rollback`.
+      expect("begin" in writer).toBe(false)
+      expect("txQuery" in writer).toBe(false)
+      expect("commit" in writer).toBe(false)
+      expect("rollback" in writer).toBe(false)
+      expect(typeof writer.publish).toBe("function")
+      expect(typeof writer.dispose).toBe("function")
+
+      const rows = await writer.query("all", "SELECT COUNT(*) AS count FROM event")
+      expect(rows).toEqual([{ count: 0 }])
     } finally {
       writer.dispose()
     }

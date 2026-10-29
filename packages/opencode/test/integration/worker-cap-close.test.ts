@@ -12,6 +12,7 @@
 // file, then terminates it through the production transport.
 
 import { describe, expect, setDefaultTimeout, test } from "bun:test"
+import { recordingBridgeFrom } from "../lib/recorders"
 import { Database } from "bun:sqlite"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -34,6 +35,7 @@ import {
   createWorkerCap,
   workerShutdownStats,
 } from "@/session/worker/hub"
+import { createTestBarrier } from "../lib/run-barrier-test"
 import { createLazyExecutorWorkerPool } from "../lib/lazy-worker-pool"
 import { sessionWorkerInit } from "../lib/session-worker-init"
 import { flush, pollUntil, settleOf, sid, withDeadline } from "../lib/async"
@@ -50,10 +52,6 @@ function deferred(): { readonly promise: Promise<void>; readonly resolve: () => 
   })
   return { promise, resolve }
 }
-
-/** A settled phase set: the scripted pools report no commit/projector phases. */
-const settled = Promise.resolve()
-const settledPhases = () => ({ commits: settled, projectors: settled, tools: settled, promotion: settled })
 
 /** A scripted `ExecutorWorker`: the cap wraps it exactly as production does. */
 function scriptedWorker(id: number, execute: (run: ExecutorRun) => Promise<void>): ExecutorWorker {
@@ -181,11 +179,10 @@ describe("production dispatch depth (metadata.depth -> cap headroom)", () => {
       [childID, { depth: 1 }],
     ])
     const results = new Map<string, SessionExecutionResult>()
-    const hub = createProductionSessionHub({
+    const hub = createProductionSessionHub({ ...{ barrier: createTestBarrier() },
       init: sessionWorkerInit(),
       count: 1,
       maxRunningWorkers: 1,
-      barrierPhases: settledPhases,
       depthOf: (sessionID) => spawnDepth(metadata.get(sessionID)),
       poolFactory: (_resolveInit, _sinks, runtime) =>
         createLazyExecutorWorkerPool({
@@ -233,11 +230,10 @@ describe("production dispatch depth (metadata.depth -> cap headroom)", () => {
     const parentID = sid("ses_busy_parent")
     const queuedID = sid("ses_busy_queued")
     const results = new Map<string, SessionExecutionResult>()
-    const hub = createProductionSessionHub({
+    const hub = createProductionSessionHub({ ...{ barrier: createTestBarrier() },
       init: sessionWorkerInit(),
       count: 1,
       maxRunningWorkers: 1,
-      barrierPhases: settledPhases,
       depthOf: () => 0,
       poolFactory: (_resolveInit, _sinks, runtime) =>
         createLazyExecutorWorkerPool({
@@ -560,7 +556,7 @@ describe("forced close observability and ordering", () => {
       const before = workerShutdownStats().rawTerminates
       const transport = createBunExecutorTransport({
         entry: "fake://silent-close",
-        log: (message, fields) => lines.push({ message, fields }),
+        bridge: recordingBridgeFrom((line) => lines.push({ message: line.message, fields: line.fields })),
       })
       await transport.terminate()
       expect(workerShutdownStats().rawTerminates).toBe(before + 1)

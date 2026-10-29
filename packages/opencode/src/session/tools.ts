@@ -15,8 +15,10 @@ import type { TaskPromptOps } from "@/tool/task"
 import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
 import { Cause, Effect, Exit, Option } from "effect"
 import {
-  createToolCallLedger,
+  ToolCallLedger,
   ToolCallNotStartedError,
+  ToolCallNotStartedServiceError,
+  fromHandle,
   type LedgerExclusive,
   type ToolCallLedgerHandle,
 } from "./ledger/tool-call"
@@ -63,9 +65,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
   /**
-   * The durable tool-call ledger. A worker boot passes a handle over its own WAL
-   * connection; absent, the per-worker `WorkerDb` connection is used when the
-   * graph provides one. A hub process (no worker connection) records nothing.
+   * A synchronous ledger handle for direct/test callers. Production passes no
+   * handle: the per-worker `ToolCallLedger` service is resolved from the graph,
+   * and a hub process (no worker service) records nothing.
    */
   ledger?: ToolCallLedgerHandle
   /** The hub-observed run truth; mirrors in-flight calls for auto-resume when supplied. */
@@ -85,39 +87,31 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const toolHost = ToolRoute.hostForRole()
   const available = (ref: ToolRoute.ToolRef) => ToolRoute.runsOn(ToolRoute.routeTool(ref), toolHost)
 
-  // The ledger row is the durable truth a crash is recovered from. Resolve it
-  // once per tool set: an explicit handle wins, otherwise the worker's typed
-  // repository backs it. The hub has no worker DB, so it records nothing.
+  // The ledger row is the durable truth a crash is recovered from. Production
+  // consumes the worker's `ToolCallLedger` service; a direct caller may still
+  // supply a synchronous handle (tests). A hub process has no service, so it
+  // records nothing.
   const ledger = yield* Effect.gen(function* () {
-    if (input.ledger !== undefined) return input.ledger
+    if (input.ledger !== undefined) return fromHandle(input.ledger)
+    const service = yield* Effect.serviceOption(ToolCallLedger.Service)
+    if (Option.isSome(service) && service.value.available) return service.value
+    // A reduced caller may provide the worker database without the ledger
+    // service. Build the same service over it; absent a real worker DB (the
+    // fail-loud boundary) the tool path keeps its previous no-ledger behavior.
     const workerDb = yield* Effect.serviceOption(WorkerDb)
-    if (Option.isNone(workerDb)) return undefined
-    // The reduced graph binds `WorkerDb` to a fail-loud boundary when no worker
-    // database is supplied (degraded boot, in-process tests). That boundary has
-    // no typed write surface; absent a real worker DB the tool path keeps its
-    // previous no-ledger behavior instead of failing every call.
+    if (Option.isNone(workerDb) || typeof workerDb.value.filename !== "string") return undefined
     const repository = workerDb.value.repository
     if (typeof repository?.insert !== "function" || typeof repository?.select !== "function") return undefined
-    // Standalone ledger writes must wait for the worker's result transactions.
-    // The Database service owns the one connection semaphore every processor
-    // transaction holds; without it (reduced test graphs) the write stays local.
     const database = yield* Effect.serviceOption(Database.Service)
     const exclusive: LedgerExclusive | undefined = Option.isSome(database)
       ? <A>(operation: () => A) =>
           database.value.db
             .transaction(() => Effect.sync(operation), { behavior: "immediate" })
-            // A busy ledger write owns no outer transaction, so the whole
+            // Busy ledger writes own no outer transaction, so the whole
             // exclusive transaction replays instead of a single statement.
             .pipe(withBusyRetry, Effect.orDie)
       : undefined
-    // The event-sequence lease owner is this worker's generation identity. The
-    // ledger binds every write to it so a superseded generation cannot start or
-    // settle a call after its successor claimed the session.
-    const ownerID = workerDb.value.eventBinding.leaseOwner
-    return createToolCallLedger(repository, {
-      ...(exclusive === undefined ? {} : { exclusive }),
-      ...(ownerID === undefined ? {} : { fence: { ownerID } }),
-    })
+    return yield* ToolCallLedger.makeFromWorker(workerDb.value, exclusive === undefined ? {} : { exclusive })
   })
 
   /**
@@ -133,14 +127,16 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   ): Effect.Effect<void> => {
     if (ledger === undefined) return Effect.void
     const finish = { callID: ledgerKey, sessionID: input.session.id, outcome }
-    const write = phase === "commit" ? Effect.sync(() => ledger.finish(finish)) : ledger.finishStandalone(finish)
+    const write = phase === "commit" ? ledger.finish(finish) : ledger.finishStandalone(finish)
     return write.pipe(
       Effect.asVoid,
       Effect.catchCause((cause) => {
         const error = Cause.squash(cause)
         // A duplicate finish (abort result, then the processor's event) must not
         // turn a successful tool into a failure.
-        if (error instanceof ToolCallNotStartedError) return Effect.void
+        if (error instanceof ToolCallNotStartedError || error instanceof ToolCallNotStartedServiceError) {
+          return Effect.void
+        }
         return Effect.logError("tool ledger finish failed", { callID: ledgerKey, sessionID: input.session.id, error })
       }),
     )

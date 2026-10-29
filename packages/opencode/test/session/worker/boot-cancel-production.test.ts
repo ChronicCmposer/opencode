@@ -9,13 +9,14 @@ import { Database } from "bun:sqlite"
 import { existsSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { createSpawnGate } from "@/session/worker/spawn-gate"
+import { makeSpawnGate } from "@/session/worker/worker-pools"
 import {
   createBunExecutorWorkerPool,
   createBunExecutorTransport,
   createSessionHub,
   createWorkerCancellation,
 } from "@/session/worker/hub"
+import { createTestBarrier } from "../../lib/run-barrier-test"
 import type { ExecutorWorker } from "@/session/worker/execute"
 import { BOOT_CANCELLED, type BootTelemetry } from "@/session/worker/cancel"
 import { flush, settleOf, sid } from "../../lib/async"
@@ -47,7 +48,7 @@ describe("production boot cancellation", () => {
   test("cancel during materialization returns the boot outcome, releases one permit, and runs nothing", async () => {
     const dir = mkdtempSync(join(tmpdir(), "boot-cancel-"))
     const marker = join(dir, "executed")
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000 })
     const telemetry: BootTelemetry[] = []
     const pool = createBunExecutorWorkerPool({
       entry: GATED_FIXTURE,
@@ -114,11 +115,14 @@ describe("production boot cancellation", () => {
       }
     }
     ;(globalThis as { Worker?: unknown }).Worker = ClosingWorker
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000 })
     try {
       const transport = createBunExecutorTransport({ entry: "fake://boot-close", spawnGate: gate })
       transport.post({ type: "run", id: 1, sessionID: sid("ses_boot_close"), kind: "session" })
       await waitFor(() => gate.held === true, "the spawn permit")
+      // The permit is granted before the isolate is constructed; let the boot
+      // continuation reach `new Worker` so this cancels the materializing boot.
+      await flush()
 
       expect(await transport.cancelBoot?.()).toEqual(BOOT_CANCELLED)
       // The typed boot outcome is an orderly close: the isolate sees `shutdown`
@@ -139,7 +143,7 @@ describe("production boot cancellation", () => {
     const dir = mkdtempSync(join(tmpdir(), "boot-cancel-wal-"))
     const dbPath = join(dir, "boot.sqlite")
     const dbReadyPath = join(dir, "db-ready")
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000 })
     const pool = createBunExecutorWorkerPool({
       entry: GATED_FIXTURE,
       // The fixture opens the WAL handle and holds `BEGIN IMMEDIATE` before the
@@ -182,7 +186,7 @@ describe("production boot cancellation", () => {
   test("cancel is idempotent and never double-releases the permit", async () => {
     const dir = mkdtempSync(join(tmpdir(), "boot-cancel-idem-"))
     const marker = join(dir, "executed")
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000 })
     const pool = createBunExecutorWorkerPool({
       entry: GATED_FIXTURE,
       workerData: { bootDelayMs: 60_000, markerPath: marker },
@@ -224,7 +228,7 @@ describe("production boot cancellation", () => {
       }
     }
     ;(globalThis as { Worker?: unknown }).Worker = DyingWorker
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000 })
     const telemetry: BootTelemetry[] = []
     try {
       const transport = createBunExecutorTransport({
@@ -234,6 +238,7 @@ describe("production boot cancellation", () => {
       })
       transport.post({ type: "run", id: 1, sessionID: sid("ses_dying"), kind: "session" })
       await waitFor(() => gate.held === true, "the spawn permit")
+      await flush()
 
       expect(await transport.cancelBoot?.()).toEqual(BOOT_CANCELLED)
       expect(gate.held).toBe(false)
@@ -254,14 +259,14 @@ describe("dispatch boot cancellation", () => {
   test("cancel during the first boot reports a typed boot outcome and releases the permit", async () => {
     const dir = mkdtempSync(join(tmpdir(), "boot-cancel-dispatch-"))
     const marker = join(dir, "executed")
-    const gate = createSpawnGate({ timeoutMs: 1_000 })
+    const gate = makeSpawnGate({ timeoutMs: 1_000 })
     const sessionID = sid("ses_boot_dispatch")
     const pool = createBunExecutorWorkerPool({
       entry: GATED_FIXTURE,
       workerData: { bootDelayMs: 60_000, markerPath: marker },
       spawnGate: gate,
     })
-    const hub = createSessionHub({ pool, cancellation: (p) => createWorkerCancellation(p, { graceMs: 5_000 }) })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool, cancellation: (p) => createWorkerCancellation(p, { graceMs: 5_000 }) })
     try {
       const run = settleOf(hub.ensureRunning(sessionID))
       // The permit is held once the isolate has been constructed, before the

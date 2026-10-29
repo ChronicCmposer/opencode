@@ -16,7 +16,9 @@
 import type { SessionID } from "@/session/schema"
 import { defined } from "@/util/object"
 import { parsePositiveInt } from "@/util/parse"
-import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
+import { Effect } from "effect"
+import type { EffectBridge } from "@/effect/bridge"
+import { workerLogMessage } from "./worker-logging"
 import { defaultSchedule } from "./port"
 
 export const CANCEL_GRACE_ENV = "OPENCODE_SESSION_CANCEL_GRACE_MS"
@@ -118,8 +120,8 @@ export interface CancelControllerOptions {
   readonly now?: () => number
   /** The worker this controller belongs to, when known. */
   readonly workerID?: number
-  /** Optional structured logger seam; absent defaults to a no-op. */
-  readonly log?: WorkerLogger
+  /** Optional re-entry bridge for the cancel request line. */
+  readonly bridge?: EffectBridge.Shape
 }
 
 export interface CancelController {
@@ -140,7 +142,7 @@ export function createCancelController(options: CancelControllerOptions): Cancel
   const graceMs = options.graceMs ?? resolveCancelGraceMs()
   const schedule = options.schedule ?? defaultSchedule
   const now = options.now ?? (() => Date.now())
-  const log = options.log ?? noopWorkerLogger
+  const bridge = options.bridge
   // Each in-flight request keeps its settle handle so `dispose` can fail it
   // loud instead of leaving a caller waiting on a promise that will never settle.
   const inFlight = new Map<SessionID, InFlightRequest>()
@@ -239,7 +241,7 @@ export function createCancelController(options: CancelControllerOptions): Cancel
       if (existing !== undefined) return existing.promise
       // A new (non-joining) request is the one that emits; the idempotent join
       // above never re-logs.
-      log(workerLogMessage("cancel requested"), { sessionID, workerID: options.workerID, graceMs })
+      void bridge?.fork(Effect.logInfo(workerLogMessage("cancel requested"), { sessionID, workerID: options.workerID, graceMs }))
       let rejectRequest!: (error: unknown) => void
       const inner = new Promise<CancelOutcome>((resolve, reject) => {
         rejectRequest = reject
@@ -288,7 +290,7 @@ export type BootTelemetry =
   | { readonly type: "boot-cancelled"; readonly phase: "boot" }
   | { readonly type: "abort-death"; readonly phase: "boot"; readonly reason: string }
 
-/** The permit slice boot cancellation needs; `spawn-gate.SpawnPermit` satisfies it. */
+/** The permit slice boot cancellation needs; `SpawnPermit` satisfies it. */
 export interface BootPermit {
   release(outcome?: "ready" | "failed", error?: unknown): void
 }
@@ -402,4 +404,4 @@ export function createBootLifecycle<T>(options: BootLifecycleOptions<T>): BootLi
   }
 }
 
-export * as CancelModule from "./cancel"
+export * as Cancel from "./cancel"

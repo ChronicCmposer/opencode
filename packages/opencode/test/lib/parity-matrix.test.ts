@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { Effect, Layer, ManagedRuntime, Schema } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
+import { durableLogStub } from "./durable-log-stub"
 import {
   PARITY_CRASHES,
   PARITY_DATABASES,
@@ -33,7 +34,7 @@ const LiveDelta = EventV2.define({
 })
 
 const databaseStub = Layer.succeed(Database.Service, { db: {} as never })
-const eventLayer = EventV2.layerWith().pipe(Layer.provide(databaseStub))
+const eventLayer = EventV2.layerWith().pipe(Layer.provide(durableLogStub), Layer.provide(databaseStub))
 
 const script = { name: "matrix-synthetic", prompt: "hello" }
 

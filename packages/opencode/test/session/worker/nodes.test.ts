@@ -411,6 +411,7 @@ describe("34 graph membership", () => {
       "@opencode/Permission",
       "@opencode/Question",
       "@opencode/EventV2Bridge",
+      "@opencode/RunBarrier",
     ])
   })
 })

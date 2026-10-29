@@ -12,11 +12,11 @@ import {
   DbExecutorRemoteError,
   DbExecutorRollbackError,
   DbExecutorTimeoutError,
-  fromExecutor,
   layer,
   make,
   node,
   Service,
+  toPromiseExecutor,
   type DbExecutor,
 } from "@/session/worker/db-executor"
 import { it } from "../../lib/effect"
@@ -273,6 +273,70 @@ describe("db executor hardening", () => {
     }
   })
 
+  test("a busy ROLLBACK is retried in place without poisoning the executor", async () => {
+    // The worker entry injects SQLITE_BUSY into the first ROLLBACK only. The
+    // transaction body fails on the UNIQUE constraint, the first rollback is
+    // busy, and the in-place retry must release the transaction so the handle
+    // stays usable (a single-shot rollback would poison it).
+    const executor = createDbExecutor({
+      filename: ":memory:",
+      entry: new URL("./schema-gate-minor-rollback-busy-once.ts", import.meta.url),
+    })
+    try {
+      await executor.run("CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+      const outcome = await executor
+        .transaction([
+          { sql: "INSERT INTO item (name) VALUES (?)", params: ["dup"] },
+          { sql: "INSERT INTO item (name) VALUES (?)", params: ["dup"] },
+        ])
+        .then(
+          () => "resolved",
+          (error: unknown) => error,
+        )
+      expect(outcome).toBeInstanceOf(DbExecutorRemoteError)
+      expect(outcome).not.toBeInstanceOf(DbExecutorRollbackError)
+      expect(String((outcome as Error).message)).toContain("UNIQUE constraint failed")
+      // The retried ROLLBACK released the transaction; no row survives and the
+      // connection is not poisoned.
+      expect(await executor.query("SELECT * FROM item")).toEqual([])
+    } finally {
+      await executor.close()
+    }
+  })
+
+  test("an exhausted busy ROLLBACK yields the typed rollback error and poisons", async () => {
+    // Every ROLLBACK is busy, so the bounded in-place retry is spent and the
+    // transaction state is unknown: the worker must surface
+    // `DbExecutorRollbackError` and refuse all later work.
+    const executor = createDbExecutor({
+      filename: ":memory:",
+      entry: new URL("./schema-gate-minor-rollback-busy-exhaust.ts", import.meta.url),
+    })
+    try {
+      await executor.run("CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+      const outcome = await executor
+        .transaction([
+          { sql: "INSERT INTO item (name) VALUES (?)", params: ["dup"] },
+          { sql: "INSERT INTO item (name) VALUES (?)", params: ["dup"] },
+        ])
+        .then(
+          () => "resolved",
+          (error: unknown) => error,
+        )
+      expect(outcome).toBeInstanceOf(DbExecutorRollbackError)
+      const error = outcome as DbExecutorRollbackError
+      expect(String(error.cause.message)).toContain("UNIQUE constraint failed")
+      expect(String(error.rollbackCause.message)).toContain("remained busy")
+      const next = await executor.query("SELECT 1 AS n").then(
+        () => "resolved",
+        (failure: unknown) => (failure as Error).name,
+      )
+      expect(next).toBe("DbExecutorPoisonedError")
+    } finally {
+      await executor.close()
+    }
+  })
+
   test("reports the real isolate thread id, not 0", async () => {
     const executor = createDbExecutor({ filename: ":memory:" })
     try {
@@ -312,7 +376,6 @@ describe("db executor service", () => {
   it.live("layer installs an executor that forwards run/query/transaction", () =>
     Effect.gen(function* () {
       const executor = yield* Service
-      expect(executor.executor).toBeDefined()
       expect(executor.threadId).toBe(0)
 
       yield* executor.run("CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT)")
@@ -346,20 +409,20 @@ describe("db executor service", () => {
     }),
   )
 
-  it.live("service methods match the Promise factory adapter", () =>
+  it.live("the temporary Promise edge forwards the live service", () =>
     Effect.gen(function* () {
-      const raw = createDbExecutor({ filename: ":memory:" })
-      const service = fromExecutor(raw)
+      const service = yield* make({ filename: ":memory:" })
+      const legacy = toPromiseExecutor(service)
       try {
-        expect(service.executor).toBe(raw)
-        yield* service.run("CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT)")
-        expect(yield* service.transaction([{ sql: "INSERT INTO item (name) VALUES (?)", params: ["a"] }])).toEqual([
-          { changes: 1, lastInsertRowid: 1 },
-        ])
-        // `fromExecutor` never owns or reorders the adapter's requests.
-        expect(service.threadId).toBe(raw.threadId)
+        yield* Effect.tryPromise(() => legacy.run("CREATE TABLE item (id INTEGER PRIMARY KEY, name TEXT)"))
+        expect(
+          yield* Effect.tryPromise(() =>
+            legacy.transaction([{ sql: "INSERT INTO item (name) VALUES (?)", params: ["a"] }]),
+          ),
+        ).toEqual([{ changes: 1, lastInsertRowid: 1 }])
+        expect(service.threadId).toBe(legacy.threadId)
         expect(yield* service.query("SELECT name FROM item")).toEqual(
-          yield* Effect.promise(() => raw.query("SELECT name FROM item")),
+          yield* Effect.tryPromise(() => legacy.query("SELECT name FROM item")),
         )
       } finally {
         yield* service.close()

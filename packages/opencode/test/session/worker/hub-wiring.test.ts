@@ -33,7 +33,11 @@ import {
   type ProductionHubServices,
   type SessionHub,
 } from "@/session/worker/hub"
-import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
+import { RunBarrier } from "@/session/run-barrier"
+import { createTestBarrier } from "../../lib/run-barrier-test"
+import type { EffectBridge } from "@/effect/bridge"
+import { workerLogMessage } from "@/session/worker/worker-logging"
+import { recordingBridge } from "../../lib/recorders"
 import { reapSupport } from "@/session/worker/pid-registry"
 import { sessionWorkerInit } from "../../lib/session-worker-init"
 import { pollUntil } from "../../lib/poll"
@@ -45,7 +49,7 @@ import { createRecordingScheduler } from "../../lib/scheduler"
 import { withParts } from "../../lib/session-parts"
 import { createFakeExecutorPool, FakeExecutorWorker } from "../../lib/fake-worker-pool"
 import { createLazyExecutorWorkerPool } from "../../lib/lazy-worker-pool"
-import { fromPool } from "@/session/worker/worker-pools"
+import type { Interface as WorkerPoolsInterface } from "@/session/worker/worker-pools"
 import type { WorkerPorts } from "@/session/worker/worker-ports"
 
 const it = testEffect(Layer.empty)
@@ -124,7 +128,7 @@ const flagsOn = RuntimeFlags.layer({ experimentalSessionWorkers: true })
 describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
   it.live("startShell calls the hub's startShell and opens the caller's ready latch", () => {
     const pool = createFakeExecutorPool(1, { value: withParts(sid("ses_shell")) })
-    const base = createSessionHub({ pool })
+    const base = createSessionHub({ ...{ barrier: createTestBarrier() }, pool })
     let shellCalls = 0
     const hub: SessionHub = {
       ...base,
@@ -154,7 +158,7 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
 
   it.live("startShell maps a hub busy rejection to Session.BusyError", () => {
     const pool = createFakeExecutorPool(1)
-    const base = createSessionHub({ pool })
+    const base = createSessionHub({ ...{ barrier: createTestBarrier() }, pool })
     const hub: SessionHub = {
       ...base,
       startShell: async (sessionID) => {
@@ -178,7 +182,7 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
 
   it.live("cancel delegates to the hub cancel path", () => {
     const pool = createFakeExecutorPool(1)
-    const base = createSessionHub({ pool })
+    const base = createSessionHub({ ...{ barrier: createTestBarrier() }, pool })
     const cancelled: SessionID[] = []
     const hub: SessionHub = {
       ...base,
@@ -198,7 +202,7 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
 
   it.live("cancel emits session.status idle after the hub cancel resolves", () => {
     const pool = createFakeExecutorPool(1)
-    const base = createSessionHub({ pool })
+    const base = createSessionHub({ ...{ barrier: createTestBarrier() }, pool })
     const order: string[] = []
     const hub: SessionHub = {
       ...base,
@@ -234,7 +238,7 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
     const flagOffCancelled: string[] = []
 
     const flagOnPool = createFakeExecutorPool(1)
-    const flagOnHub = createSessionHub({ pool: flagOnPool })
+    const flagOnHub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: flagOnPool })
     const flagOn = withTmpdirInstance()(
       Effect.gen(function* () {
         const state = yield* SessionRunState.Service
@@ -271,7 +275,7 @@ describe("12 — flag-on hub wiring (startShell / cancel delegation)", () => {
     const flagOffCalls: StatusCall[] = []
 
     const flagOnPool = createFakeExecutorPool(1)
-    const flagOnHub = createSessionHub({ pool: flagOnPool })
+    const flagOnHub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool: flagOnPool })
     const flagOn = withTmpdirInstance()(
       Effect.gen(function* () {
         const state = yield* SessionRunState.Service
@@ -343,7 +347,7 @@ describe("12 — integrated flag-on cancel (outcome + idle + session.cancelled)"
       onCancel: (id) => flagOnCalls.push({ sessionID: id, status: { type: "idle" } }),
     })
     const { publisher, published } = recordingPublisher()
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       events: publisher,
       cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort, graceMs: 5_000 }),
@@ -428,7 +432,7 @@ describe("12 — integrated flag-on cancel (outcome + idle + session.cancelled)"
     const sessionID = sid("ses_noop")
     const pool = createFakeExecutorPool(1, { mode: "blocking", value: withParts(sessionID) })
     const { publisher, published } = recordingPublisher()
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       events: publisher,
       cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort }),
@@ -497,7 +501,7 @@ describe("12 — exactly one flag-on cancel idle per case (ON ≡ OFF)", () => {
       value: withParts(sessionID),
       onCancel: (id) => onCalls.push({ sessionID: id, status: { type: "idle" } }),
     })
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort, graceMs: 5_000 }),
     })
@@ -555,7 +559,7 @@ describe("12 — exactly one flag-on cancel idle per case (ON ≡ OFF)", () => {
     const onCalls: StatusCall[] = []
     const offCalls: StatusCall[] = []
     const pool = createFakeExecutorPool(1, { mode: "blocking", value: withParts(sessionID) })
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort, graceMs: 5_000 }),
     })
@@ -621,7 +625,7 @@ describe("parent cancel settles every child to exactly one idle", () => {
         if (id === parentID) calls.push({ sessionID: id, status: { type: "idle" } })
       },
     })
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       events: publisher,
       cancellation: () => ({
@@ -671,7 +675,7 @@ describe("parent cancel settles every child to exactly one idle", () => {
         if (id === parentID) calls.push({ sessionID: id, status: { type: "idle" } })
       },
     })
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       cancellation: () => ({ portFor: (worker) => pool.byID(worker.id)?.cancelPort, graceMs: 5_000 }),
     })
@@ -713,11 +717,20 @@ describe("parent cancel settles every child to exactly one idle", () => {
 interface RecordedLogLine {
   readonly message: string
   readonly fields: Record<string, unknown>
+  readonly level: string
 }
 
-const recordingLog = (): { readonly log: WorkerLogger; readonly lines: RecordedLogLine[] } => {
+const recordingLog = (): { readonly bridge: EffectBridge.Shape; readonly lines: RecordedLogLine[] } => {
   const lines: RecordedLogLine[] = []
-  return { log: (message, fields) => void lines.push({ message, fields }), lines }
+  const sink = Logger.make<unknown, void>(({ logLevel, message }) => {
+    const [head, fields] = Array.isArray(message) ? message : [message, undefined]
+    lines.push({
+      message: typeof head === "string" ? head : String(head),
+      fields: typeof fields === "object" && fields !== null ? (fields as Record<string, unknown>) : {},
+      level: logLevel.toLowerCase(),
+    })
+  })
+  return { bridge: recordingBridge(sink), lines }
 }
 
 const lineFor = (lines: RecordedLogLine[], event: string): RecordedLogLine => {
@@ -731,21 +744,21 @@ const productionHubWithLog = (options: {
   readonly count?: number
   readonly env?: Record<string, string | undefined>
   readonly entry?: string | URL
-  readonly log: WorkerLogger
+  readonly bridge: EffectBridge.Shape
 }): SessionHub =>
-  createProductionSessionHub({
+  createProductionSessionHub({ ...{ barrier: createTestBarrier() },
     init: sessionWorkerInit(),
     ...(options.count === undefined ? {} : { count: options.count }),
     poolFactory: () => createFakeExecutorPool(options.count ?? 1),
-    log: options.log,
+    bridge: options.bridge,
     ...(options.env === undefined ? {} : { env: options.env }),
     ...(options.entry === undefined ? {} : { entry: options.entry }),
   })
 
 describe("hub construction resolution", () => {
   test("logs the resolved pool with count and parallelism (no warm headroom)", async () => {
-    const { log, lines } = recordingLog()
-    const hub = productionHubWithLog({ count: 4, env: {}, log })
+    const { bridge, lines } = recordingLog()
+    const hub = productionHubWithLog({ count: 4, env: {}, bridge })
     try {
       const line = lineFor(lines, "pool resolved")
       expect(line.fields.workerCount).toBe(4)
@@ -761,8 +774,8 @@ describe("hub construction resolution", () => {
   })
 
   test("logs workerCount 0 when no count is configured (diagnostic only)", async () => {
-    const { log, lines } = recordingLog()
-    const hub = productionHubWithLog({ env: {}, log })
+    const { bridge, lines } = recordingLog()
+    const hub = productionHubWithLog({ env: {}, bridge })
     try {
       const line = lineFor(lines, "pool resolved")
       // `workerCount` is diagnostic, not a prewarm: no configured count means 0.
@@ -774,8 +787,8 @@ describe("hub construction resolution", () => {
   })
 
   test("logs the resolved worker entry and its source (explicit path)", async () => {
-    const { log, lines } = recordingLog()
-    const hub = productionHubWithLog({ count: 1, env: {}, entry: "/opt/session-worker.js", log })
+    const { bridge, lines } = recordingLog()
+    const hub = productionHubWithLog({ count: 1, env: {}, entry: "/opt/session-worker.js", bridge })
     try {
       const line = lineFor(lines, "worker entry resolved")
       expect(line.fields.entry).toBe("/opt/session-worker.js")
@@ -786,8 +799,8 @@ describe("hub construction resolution", () => {
   })
 
   test("reports the env source when the entry comes from the environment", async () => {
-    const { log, lines } = recordingLog()
-    const hub = productionHubWithLog({ count: 1, env: { OPENCODE_SESSION_WORKER_PATH: "/env/worker.js" }, log })
+    const { bridge, lines } = recordingLog()
+    const hub = productionHubWithLog({ count: 1, env: { OPENCODE_SESSION_WORKER_PATH: "/env/worker.js" }, bridge })
     try {
       const line = lineFor(lines, "worker entry resolved")
       expect(line.fields.entry).toBe("/env/worker.js")
@@ -799,19 +812,20 @@ describe("hub construction resolution", () => {
 
   test("logs reap support for this platform", async () => {
     const support = reapSupport()
-    const { log, lines } = recordingLog()
-    const hub = productionHubWithLog({ count: 1, env: {}, log })
+    const { bridge, lines } = recordingLog()
+    const hub = productionHubWithLog({ count: 1, env: {}, bridge })
     try {
       const line = lineFor(lines, "reap support")
-      expect(line.fields).toEqual({ level: "INFO", supported: support.supported, reason: support.reason })
+      expect(line.level).toBe("info")
+      expect(line.fields).toEqual({ supported: support.supported, reason: support.reason })
     } finally {
       await hub.terminateAll()
     }
   })
 
   test("logs a pid report with the mirrored entry count", async () => {
-    const { log, lines } = recordingLog()
-    const hub = productionHubWithLog({ count: 1, env: {}, log })
+    const { bridge, lines } = recordingLog()
+    const hub = productionHubWithLog({ count: 1, env: {}, bridge })
     const channel = new MessageChannel()
     try {
       hub.attachHubProxyPort(7, channel.port1)
@@ -827,7 +841,7 @@ describe("hub construction resolution", () => {
       await pollUntil(() => lines.some((entry) => entry.message === workerLogMessage("pid report")), {
         message: "pid report never logged",
       })
-      expect(lineFor(lines, "pid report").fields).toEqual({ level: "INFO", workerID: 7, entries: 2 })
+      expect(lineFor(lines, "pid report").fields).toEqual({ workerID: 7, entries: 2 })
     } finally {
       channel.port1.close()
       channel.port2.close()
@@ -850,6 +864,7 @@ describe("hub construction resolution", () => {
 
 /** The nine services `productionSessionHubLayer` requires; none is called at build. */
 const productionWiringServices = Layer.mergeAll(
+  RunBarrier.layer,
   Layer.mock(Config.Service, {}),
   Layer.mock(Auth.Service, {}),
   Layer.mock(ModelsDev.Service, {}),
@@ -981,7 +996,7 @@ describe("production hub service wiring", () => {
     let builds = 0
     const disposed: number[] = []
     const pool = createFakeExecutorPool(1)
-    const hub = createProductionSessionHub({
+    const hub = createProductionSessionHub({ ...{ barrier: createTestBarrier() },
       init: sessionWorkerInit(),
       poolFactory: () => pool,
       ports: () => {
@@ -1079,6 +1094,13 @@ describe("production hub service wiring", () => {
       attachWorkerPorts: () => Effect.succeed(() => {}),
       attachHubProxyPort: () => Effect.succeed(() => {}),
       disposeWorker: () => Effect.void,
+      attachments: {
+        attachWorkerPorts: () => () => {},
+        attachHubProxyPort: () => () => {},
+        disposeWorker: () => {},
+        disposeAll: () => {},
+        attached: () => ({ workerPorts: [], hubProxy: [] }),
+      },
       disposeAll: () => Effect.sync(() => void (portDisposals += 1)),
       attached: () => Effect.succeed({ workerPorts: [], hubProxy: [] }),
     }
@@ -1099,11 +1121,28 @@ describe("production hub service wiring", () => {
       Effect.scoped(
         Effect.gen(function* () {
           const scope = yield* Scope.Scope
-          createProductionSessionHub({
+          createProductionSessionHub({ ...{ barrier: createTestBarrier() },
             init: sessionWorkerInit(),
             scope,
             workerPorts: ports,
-            workerPools: fromPool(pool),
+            workerPools: {
+              executorPool: pool,
+              spawn: (id) => Effect.sync(() => pool.spawn(id)),
+              releaseSession: (sessionID, workerID) =>
+                Effect.sync(() => {
+                  pool.releaseSession?.(sessionID, workerID)
+                }),
+              byID: (id) => Effect.sync(() => pool.byID(id)),
+              resultFor: (sessionID) => Effect.sync(() => pool.resultFor(sessionID)),
+              workers: Effect.sync(() => pool.workers),
+              terminateAll: () => Effect.promise(() => pool.terminateAll()),
+              stats: Effect.sync(() => ({
+                workers: pool.workers.length,
+                idleWorkers: 0,
+                idleCapacity: 0,
+                idleEvictions: 0,
+              })),
+            } satisfies WorkerPoolsInterface,
           })
         }),
       ),
@@ -1113,7 +1152,7 @@ describe("production hub service wiring", () => {
     expect(poolTerminations).toBe(0)
   })
 
-  test("the production node still declares exactly its nine service deps", () => {
+  test("the production node still declares exactly its ten service deps", () => {
     const names = productionSessionHubNode().dependencies.map((dependency) => dependency.name)
     expect(names).toEqual([
       "@opencode/Config",
@@ -1125,6 +1164,7 @@ describe("production hub service wiring", () => {
       "@opencode/Permission",
       "@opencode/Question",
       "@opencode/EventV2Bridge",
+      "@opencode/RunBarrier",
     ])
   })
 })
@@ -1147,7 +1187,7 @@ describe("retired worker hub-side port disposal", () => {
   test("cancel disposes the worker's egress server", async () => {
     const pool = createFakeExecutorPool(1, { mode: "blocking" })
     const disposed: number[] = []
-    const hub = createSessionHub({ pool, ports: egressBackends(disposed) })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool, ports: egressBackends(disposed) })
     const sessionID = sid("ses_dispose_cancel")
     const channel = new MessageChannel()
     try {
@@ -1172,7 +1212,7 @@ describe("retired worker hub-side port disposal", () => {
     const pool = createFakeExecutorPool(1)
     const scheduler = createRecordingScheduler()
     const disposed: number[] = []
-    const hub = createSessionHub({
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       ports: egressBackends(disposed),
       schedule: scheduler.schedule,

@@ -18,6 +18,7 @@
 
 import { createExecutorWorkerPool, type ExecutorRun, type SessionExecutionResult } from "@/session/worker/execute"
 import { createSessionHub, type SessionHub } from "@/session/worker/hub"
+import { createTestBarrier } from "../lib/run-barrier-test"
 import { type Scheduler } from "@/session/worker/dispatch"
 import { REAP_MS_ENV, resolveReapMs } from "@/session/worker/pool"
 import { defaultSchedule } from "@/session/worker/port"
@@ -167,7 +168,7 @@ function createHub(options: {
     if (resolveReapMs() !== SOAK_REAP_MS) {
       throw new Error(`${REAP_MS_ENV} did not resolve to ${SOAK_REAP_MS}`)
     }
-    return createSessionHub(options)
+    return createSessionHub({ ...options, barrier: createTestBarrier() })
   } finally {
     if (previous === undefined) delete process.env[REAP_MS_ENV]
     else process.env[REAP_MS_ENV] = previous

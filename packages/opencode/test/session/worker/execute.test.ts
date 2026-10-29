@@ -31,17 +31,25 @@ import {
 } from "@/session/worker/execute"
 import type { PromptInput } from "@/session/prompt"
 import type { CancelFrame } from "@/session/worker/cancel"
-import type { WorkerLogger } from "@/session/worker/log"
+import { Logger } from "effect"
+import { recordingBridge } from "../../lib/recorders"
 
 const sid = (value: string) => value as SessionID
 
-/** A recording logger: captures every `(message, fields)` pair in call order. */
+/** A recording bridge: captures every `(message, fields)` pair in call order. */
 function recordingLog(): {
-  readonly log: WorkerLogger
+  readonly bridge: ReturnType<typeof recordingBridge>
   readonly entries: Array<{ message: string; fields: Record<string, unknown> }>
 } {
   const entries: Array<{ message: string; fields: Record<string, unknown> }> = []
-  return { log: (message, fields) => entries.push({ message, fields }), entries }
+  const sink = Logger.make<unknown, void>(({ message }) => {
+    const [head, fields] = Array.isArray(message) ? message : [message, undefined]
+    entries.push({
+      message: typeof head === "string" ? head : String(head),
+      fields: typeof fields === "object" && fields !== null ? (fields as Record<string, unknown>) : {},
+    })
+  })
+  return { bridge: recordingBridge(sink), entries }
 }
 
 /** A transport that answers nothing and can be terminated; enough to build a worker. */
@@ -656,8 +664,8 @@ describe("13 executor cancel port", () => {
       type: "cancelled",
       id: (request as { readonly id?: number }).id,
     }))
-    const { log, entries } = recordingLog()
-    const worker = createExecutorWorker({ id: 1, transport, log })
+    const { bridge, entries } = recordingLog()
+    const worker = createExecutorWorker({ id: 1, transport, bridge })
 
     worker.cancelPort?.notify({ type: "cancel", sessionID: "ses_1" })
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -679,8 +687,8 @@ describe("13 executor cancel port", () => {
         return 0
       },
     }
-    const { log, entries } = recordingLog()
-    const worker = createExecutorWorker({ id: 1, transport, log })
+    const { bridge, entries } = recordingLog()
+    const worker = createExecutorWorker({ id: 1, transport, bridge })
 
     worker.cancelPort?.notify({ type: "cancel", sessionID: "ses_1" })
     await new Promise((resolve) => setTimeout(resolve, 0))
@@ -694,8 +702,8 @@ describe("13 executor cancel port", () => {
 
 describe("worker spawning logging", () => {
   test("createExecutorWorker emits 'worker spawning' with the default reason", () => {
-    const { log, entries } = recordingLog()
-    createExecutorWorker({ id: 7, transport: noopTransport(), workKind: "session", log })
+    const { bridge, entries } = recordingLog()
+    createExecutorWorker({ id: 7, transport: noopTransport(), workKind: "session", bridge })
 
     expect(entries).toContainEqual({
       message: "session workers: worker spawning",
@@ -704,14 +712,14 @@ describe("worker spawning logging", () => {
   })
 
   test("createExecutorWorker includes sessionID when known and honors an explicit reason", () => {
-    const { log, entries } = recordingLog()
+    const { bridge, entries } = recordingLog()
     createExecutorWorker({
       id: 3,
       transport: noopTransport(),
       workKind: "session",
       sessionID: sid("ses_1"),
       reason: "rebind",
-      log,
+      bridge,
     })
 
     expect(entries).toContainEqual({

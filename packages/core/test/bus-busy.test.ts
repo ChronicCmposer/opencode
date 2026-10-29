@@ -1,4 +1,4 @@
-// M9 — the Bus publish path retries `SQLITE_BUSY` as a whole transaction within
+// M9 — the DurableLog publish path retries `SQLITE_BUSY` as a whole transaction within
 // a bounded budget and surfaces a typed exhaustion. A busy failure must never
 // leave a half-open transaction that makes the next attempt fail with
 // "cannot start a transaction within a transaction".
@@ -12,7 +12,7 @@ import { Effect, Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import { Node } from "../src/effect/app-node"
 import { LayerNode } from "../src/effect/layer-node"
-import { Bus } from "../src/bus"
+import { DurableLog } from "../src/durable-log"
 import { BusyExhaustedError } from "../src/database/transaction"
 
 const Note = Event.define({
@@ -50,7 +50,7 @@ function native(): Database {
   return handle
 }
 
-function connection(native: Database): Bus.Connection {
+function connection(native: Database): DurableLog.Connection {
   return {
     all: (sql, params = []) => native.query(sql).all(...(params as never[])) as Array<Record<string, unknown>>,
     run: (sql, params = []) => ({ changes: Number(native.query(sql).run(...(params as never[])).changes) }),
@@ -59,7 +59,7 @@ function connection(native: Database): Bus.Connection {
 }
 
 /** Fail the first `failures` calls that touch `match` with a native busy error. */
-function flaky(target: Bus.Connection, match: string, failures: number): Bus.Connection {
+function flaky(target: DurableLog.Connection, match: string, failures: number): DurableLog.Connection {
   let remaining = failures
   return {
     all: (sql, params) => target.all(sql, params),
@@ -79,10 +79,10 @@ afterEach(() => {
   for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true })
 })
 
-describe("Bus publish busy retry (M9 / D5)", () => {
+describe("DurableLog publish busy retry (M9 / D5)", () => {
   test("retries a busy BEGIN and publishes once without a nested transaction", () => {
     const handle = native()
-    const bus = Bus.create({
+    const bus = DurableLog.create({
       connection: flaky(connection(handle), "BEGIN IMMEDIATE", 2),
       ownerID: "gen-1",
       definitions: [Note],
@@ -97,7 +97,7 @@ describe("Bus publish busy retry (M9 / D5)", () => {
     const handle = native()
     const target = connection(handle)
     let runs = 0
-    const flakyRun: Bus.Connection = {
+    const flakyRun: DurableLog.Connection = {
       all: target.all,
       run: (sql, params) => {
         if (sql.startsWith("INSERT INTO event ") && runs === 0) {
@@ -108,7 +108,7 @@ describe("Bus publish busy retry (M9 / D5)", () => {
       },
       exec: target.exec,
     }
-    const bus = Bus.create({ connection: flakyRun, ownerID: "gen-1", definitions: [Note] })
+    const bus = DurableLog.create({ connection: flakyRun, ownerID: "gen-1", definitions: [Note] })
 
     expect(bus.publish([{ definition: Note, data: { sessionID: "s1", text: "body" } }])[0]?.durable?.seq).toBe(0)
     expect(handle.query("SELECT COUNT(*) AS count FROM event").get()).toEqual({ count: 1 })
@@ -117,7 +117,7 @@ describe("Bus publish busy retry (M9 / D5)", () => {
 
   test("exhaustion is typed and terminal", () => {
     const handle = native()
-    const bus = Bus.create({
+    const bus = DurableLog.create({
       connection: flaky(connection(handle), "BEGIN IMMEDIATE", 1_000),
       ownerID: "gen-1",
       definitions: [Note],
@@ -138,7 +138,7 @@ describe("Bus publish busy retry (M9 / D5)", () => {
   test("a non-busy failure is not retried", () => {
     const handle = native()
     const target = connection(handle)
-    const failing: Bus.Connection = {
+    const failing: DurableLog.Connection = {
       all: target.all,
       run: target.run,
       exec: (sql) => {
@@ -146,35 +146,35 @@ describe("Bus publish busy retry (M9 / D5)", () => {
         return target.exec(sql)
       },
     }
-    const bus = Bus.create({ connection: failing, ownerID: "gen-1", definitions: [Note] })
+    const bus = DurableLog.create({ connection: failing, ownerID: "gen-1", definitions: [Note] })
 
     expect(() => bus.publish([{ definition: Note, data: { sessionID: "s1", text: "x" } }])).toThrow(/no such table/)
   })
 })
 
-describe("Bus service idiom", () => {
+describe("DurableLog service idiom", () => {
   test("Service tag, make adapter equivalence, and global node shape", async () => {
-    const fromFactory = Bus.create({ connection: connection(native()), ownerID: "gen-service" })
-    const fromMake = await Effect.runPromise(Bus.make({ connection: connection(native()), ownerID: "gen-service" }))
+    const fromFactory = DurableLog.create({ connection: connection(native()), ownerID: "gen-service" })
+    const fromMake = await Effect.runPromise(DurableLog.make({ connection: connection(native()), ownerID: "gen-service" }))
 
-    expect(Bus.Service.key).toBe("@opencode/Bus")
+    expect(DurableLog.Service.key).toBe("@opencode/DurableLog")
     expect(Object.keys(fromMake).sort()).toEqual(Object.keys(fromFactory).sort())
 
-    const node = Bus.node({ connection: connection(native()), ownerID: "gen-service" })
+    const node = DurableLog.nodeWith({ connection: connection(native()), ownerID: "gen-service" })
     expect(node.kind).toBe("layer")
-    expect(node.name).toBe("@opencode/Bus")
-    expect(node.service).toBe(Bus.Service)
+    expect(node.name).toBe("@opencode/DurableLog")
+    expect(node.service).toBe(DurableLog.Service)
     expect(node.tag).toBe(Node.tags.values.global)
     expect(node.dependencies).toEqual([])
   })
 
-  test("layer and node provide a Bus equivalent to create", async () => {
+  test("layer and node provide a DurableLog equivalent to create", async () => {
     const viaLayer = await Effect.runPromise(
       Effect.gen(function* () {
-        return yield* Bus.Service
+        return yield* DurableLog.Service
       }).pipe(
         Effect.provide(
-          Bus.layer({
+          DurableLog.layer({
             connection: connection(native()),
             ownerID: "gen-service",
             definitions: [Note],
@@ -184,11 +184,11 @@ describe("Bus service idiom", () => {
     )
     const viaNode = await Effect.runPromise(
       Effect.gen(function* () {
-        return yield* Bus.Service
+        return yield* DurableLog.Service
       }).pipe(
         Effect.provide(
           LayerNode.compile(
-            Bus.node({
+            DurableLog.nodeWith({
               connection: connection(native()),
               ownerID: "gen-service",
               definitions: [Note],

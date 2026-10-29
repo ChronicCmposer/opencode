@@ -11,9 +11,10 @@ import { Permission } from "@/permission"
 import { Provider } from "@/provider/provider"
 import { Question } from "@/question"
 import { SessionStatus } from "@/session/status"
+import { RunBarrier } from "@/session/run-barrier"
 import { productionServiceReplacements } from "./production-deps"
 
-/** The nine service deps `productionSessionHubNode()` declares, in order. */
+/** The ten service deps `productionSessionHubNode()` declares, in order. */
 const DECLARED_DEP_NAMES = [
   "@opencode/Config",
   "@opencode/Auth",
@@ -24,9 +25,10 @@ const DECLARED_DEP_NAMES = [
   "@opencode/Permission",
   "@opencode/Question",
   "@opencode/EventV2Bridge",
+  "@opencode/RunBarrier",
 ] as const
 
-/** The same nine nodes, so the replacement list can be exercised as a layer. */
+/** The same ten nodes, so the replacement list can be exercised as a layer. */
 const DECLARED_NODES = [
   Config.node,
   Auth.node,
@@ -37,6 +39,7 @@ const DECLARED_NODES = [
   Permission.node,
   Question.node,
   EventV2Bridge.node,
+  RunBarrier.node,
 ]
 
 /** Build a runtime graph over the declared deps, using the shared replacements. */

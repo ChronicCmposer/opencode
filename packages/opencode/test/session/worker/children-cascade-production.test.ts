@@ -33,6 +33,7 @@ import {
 import { SessionCancelledError, WorkerCrashedError } from "@/session/worker/dispatch"
 import { createHubProxyClient } from "@/session/worker/hub-proxy-wire"
 import { productionSessionHubLayer, SessionHubService, createSessionChildrenIndex } from "@/session/worker/hub"
+import { RunBarrier } from "@/session/run-barrier"
 import type { SessionSpawnRequest } from "@/session/worker/subagent"
 import { pollUntil } from "../../lib/poll"
 import { testEffect } from "../../lib/effect"
@@ -60,6 +61,7 @@ const providerModel = {
 } as unknown as Provider.Model
 
 const deps = Layer.mergeAll(
+  RunBarrier.layer,
   Layer.mock(Config.Service, {
     get: () => Effect.succeed({} as ConfigV1.Info),
     directories: () => Effect.succeed(["/tmp/ocx-cascade"]),

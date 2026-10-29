@@ -48,7 +48,8 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionWorkerNodes } from "@/session/worker/nodes"
-import { SessionHubModule } from "@/session/worker/hub"
+import { SessionHub } from "@/session/worker/hub"
+import { RunBarrier } from "@/session/run-barrier"
 
 /**
  * The service-node graph shared by the production `AppLayer` and the HTTP API
@@ -88,7 +89,8 @@ export function appServiceNodes<const Extra extends readonly LayerNode.AnyNode[]
     RuntimeFlags.node,
     EventV2Bridge.node,
     SessionRunState.node,
-    ...SessionWorkerNodes.sessionWorkerNodes({ hubNode: SessionHubModule.productionSessionHubNode() }),
+    RunBarrier.node,
+    ...SessionWorkerNodes.sessionWorkerNodes({ hubNode: SessionHub.productionSessionHubNode() }),
     SessionProcessor.node,
     SessionCompaction.node,
     SessionRevert.node,

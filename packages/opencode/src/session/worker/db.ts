@@ -15,7 +15,7 @@
 //   and executes against `main` through an explicit capability;
 // * the SQLite authorizer refuses DDL/ATTACH/PRAGMA, hub-only writes, raw
 //   writes to scoped tables, secret hub-table reads, and direct `main`
-//   scoped-table access from the public handles. The Bus/EventV2 path receives
+//   scoped-table access from the public handles. The DurableLog/EventV2 path receives
 //   narrow operations, never a public raw handle.
 //
 // There is no SQL-text statement parser/rewriter in this module. Public handles
@@ -27,9 +27,9 @@
 import path from "node:path"
 import { Context, Effect, Layer, Schema } from "effect"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
-import { Database as DatabaseService } from "@opencode-ai/core/database/database"
+import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
-import { Bus, createDurableRepository } from "@opencode-ai/core/bus"
+import { DurableLog, createDurableRepository } from "@opencode-ai/core/durable-log"
 import { makeSqliteClient, type SqliteNativeRunner } from "@opencode-ai/core/database/sqlite-adapter"
 import {
   openNodeConnection,
@@ -39,8 +39,8 @@ import {
   type QueryParams,
   type WriteOutcome,
 } from "@opencode-ai/core/database/connection"
-import * as SqlClient from "effect/unstable/sql/SqlClient"
-import * as Reactivity from "effect/unstable/reactivity/Reactivity"
+import { SqlClient } from "effect/unstable/sql/SqlClient"
+import { Reactivity } from "effect/unstable/reactivity"
 import type { SQLQueryBindings } from "bun:sqlite"
 import {
   SCHEMA_BODY_HASH,
@@ -150,7 +150,7 @@ export interface WorkerStatement<Row = Record<string, unknown>> {
   run(...params: SQLQueryBindings[]): WriteOutcome
 }
 
-/** The synchronous surface the per-worker Bus also consumes. */
+/** The synchronous surface the per-worker DurableLog also consumes. */
 export interface WorkerConnection {
   readonly owner: string
   readonly filename: string
@@ -192,17 +192,17 @@ export { TABLE_SCHEMA } from "./repository/tables.gen"
 export interface WorkerBusCreateOptions {
   readonly ownerID: string
   readonly aggregateID?: string
-  readonly definitions?: Bus.Options["definitions"]
+  readonly definitions?: DurableLog.Options["definitions"]
   readonly blobDir?: string
   readonly blobLimitBytes?: number
   readonly leaseTimeoutMs?: number
 }
 
-/** Bus operations a worker may use; the raw `connection`/transaction handles are absent. */
-export type WorkerBusHandle = Omit<Bus.Interface, "connection" | "transaction" | "transactionAsync">
+/** DurableLog operations a worker may use; the raw `connection`/transaction handles are absent. */
+export type WorkerBusHandle = Omit<DurableLog.Interface, "connection" | "transaction" | "transactionAsync">
 
 export interface WorkerBus extends WorkerBusHandle {
-  /** Build a scoped Bus for tests/custom callers; the returned handle has no raw connection. */
+  /** Build a scoped DurableLog for tests/custom callers; the returned handle has no raw connection. */
   readonly create: (options: WorkerBusCreateOptions) => WorkerBusHandle
   /** Delete one aggregate's durable log, optionally with an explicit D16 directory. */
   readonly deleteAggregate: (aggregateID: string, options?: { readonly blobDir?: string }) => number
@@ -225,8 +225,14 @@ export interface WorkerDatabase {
   readonly drizzleConnection: WorkerConnection
   /** The narrow typed write API; the only write path by contract. */
   readonly repository: WorkerRepository
-  /** Narrow Bus/EventV2 operations; no public raw trusted connection. */
+  /** Narrow DurableLog/EventV2 operations; no public raw trusted connection. */
   readonly bus: WorkerBus
+  /**
+   * The full DurableLog service EventV2 yields. It is repository-backed, so it
+   * carries no raw `connection`; EventV2 reads the lease capability and the
+   * shared write primitives from it.
+   */
+  readonly durableLog: DurableLog.Interface
   /** Per-database EventV2 worker binding (lease generation, aggregate fence). */
   readonly eventBinding: EventV2.WorkerScope
   /** Read rows. Reads of hub-owned state are allowed; writes are not. */
@@ -399,7 +405,7 @@ export function openWorkerDatabase(
       catch: asWorkerDatabaseError,
     })
 
-    // The Bus/EventV2 path needs main-table SQL (its own BEGIN IMMEDIATE and
+    // The DurableLog/EventV2 path needs main-table SQL (its own BEGIN IMMEDIATE and
     // blob refcount probe). It gets a second, viewless handle with an authorizer
     // restricted to the durable log, so it is never a public raw connection and
     // cannot touch the bound session's projection tables.
@@ -436,13 +442,15 @@ export function openWorkerDatabase(
 }
 
 /** Build the worker `Database.Service` over the private validated Drizzle runner. */
-export function databaseLayer(database: WorkerDatabase): Layer.Layer<DatabaseService.Service> {
+export function databaseLayer(
+  database: WorkerDatabase,
+): Layer.Layer<Database.Service | EventV2.WorkerScopeService | DurableLog.Service> {
   const client = makeSqliteClient(
     { spanAttributes: { "db.system.name": "sqlite" } },
     workerRunner(drizzleRunners.get(database) ?? database.drizzleConnection),
   )
-  return Layer.effect(
-    DatabaseService.Service,
+  const databaseService = Layer.effect(
+    Database.Service,
     Effect.gen(function* () {
       const operations = {
         deleteAggregate: (aggregateID: string, options?: { readonly blobDir?: string }) =>
@@ -455,11 +463,20 @@ export function databaseLayer(database: WorkerDatabase): Layer.Layer<DatabaseSer
         }).pipe(Effect.andThen(database.close)),
       )
       const sql = Object.assign(yield* client, { config: { filename: database.filename } })
-      const db = yield* EffectDrizzleSqlite.makeWithDefaults().pipe(Effect.provideService(SqlClient.SqlClient, sql))
-      EventV2.bindWorkerScope(db, database.eventBinding)
-      return { db } satisfies DatabaseService.Interface
+      const db = yield* EffectDrizzleSqlite.makeWithDefaults().pipe(Effect.provideService(SqlClient, sql))
+      return { db } satisfies Database.Interface
     }),
   ).pipe(Layer.provide(Reactivity.layer))
+  // The scope is provided alongside the Database so every layer built over this
+  // database (EventV2 included) sees the worker's typed Context service. The hub
+  // graph provides no scope, which is the explicit scopeless state.
+  return Layer.mergeAll(
+    databaseService,
+    Layer.succeed(EventV2.WorkerScopeService, database.eventBinding),
+    // EventV2 requires this service; the worker's DurableLog is the same
+    // repository-backed writer the worker bus exposes.
+    Layer.succeed(DurableLog.Service, database.durableLog),
+  )
 }
 
 /** The per-worker DB service. One instance per worker graph. */
@@ -496,7 +513,8 @@ function makeWorkerDatabase(options: MakeWorkerDatabaseOptions): WorkerDatabase 
   const strict = guardBoundConnection(connection)
   const drizzle = guardReadOnly(connection)
   const drizzleRunner = trustedRunner(connection, options.withMain, sessionID)
-  const bus = makeWorkerBus(options.busConnection, filename, sessionID)
+  const durableBus = makeWorkerBus(options.busConnection, filename, sessionID)
+  const bus = durableBus.bus
 
   const all = <Row = Record<string, unknown>>(sql: string, params: QueryParams = []) =>
     Effect.try({
@@ -510,7 +528,7 @@ function makeWorkerDatabase(options: MakeWorkerDatabaseOptions): WorkerDatabase 
       catch: asWorkerDatabaseError,
     })
 
-  const eventBinding = EventV2.createWorkerScope(sessionID)
+  const eventBinding = EventV2.makeWorkerScope(sessionID === undefined ? {} : { sessionID })
   const database = {
     filename,
     identity: options.identity,
@@ -521,6 +539,7 @@ function makeWorkerDatabase(options: MakeWorkerDatabaseOptions): WorkerDatabase 
     drizzleConnection: drizzle,
     repository,
     bus,
+    durableLog: durableBus.service,
     all,
     ...(bound ? {} : { run }),
     close: Effect.sync(() => {
@@ -686,8 +705,8 @@ export function makeUnboundWorkerAuthorizer(): Authorizer {
 }
 
 /**
- * The Bus/EventV2 handle is viewless and may read/write only the durable log;
- * its Bus is scoped to one aggregate by construction. Projection tables remain
+ * The DurableLog/EventV2 handle is viewless and may read/write only the durable log;
+ * its DurableLog is scoped to one aggregate by construction. Projection tables remain
  * unreachable even on this trusted handle.
  */
 export function makeBusAuthorizer(sessionID: string): Authorizer {
@@ -1043,13 +1062,17 @@ function routeWriteToMain(sql: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Bus capability.
+// DurableLog capability.
 // ---------------------------------------------------------------------------
 
 let nextBusOwner = 0
 
-function makeWorkerBus(connection: NodeConnection, filename: string, sessionID: string | undefined): WorkerBus {
-  const create = (options: WorkerBusCreateOptions): WorkerBusHandle => {
+function makeWorkerBus(
+  connection: NodeConnection,
+  filename: string,
+  sessionID: string | undefined,
+): { readonly bus: WorkerBus; readonly service: DurableLog.Interface } {
+  const createService = (options: WorkerBusCreateOptions): DurableLog.Interface => {
     const aggregateID = options.aggregateID ?? sessionID
     if (sessionID !== undefined && options.aggregateID !== undefined && options.aggregateID !== sessionID) {
       throw new CrossSessionAccessError({ table: "event", sessionID })
@@ -1057,7 +1080,7 @@ function makeWorkerBus(connection: NodeConnection, filename: string, sessionID: 
     const blobDir =
       options.blobDir ??
       (filename === IN_MEMORY_FILENAME ? undefined : path.join(path.dirname(filename), "event-blobs"))
-    const bus = Bus.create({
+    return DurableLog.create({
       repository: createDurableRepository(capabilityConnection(connection, (operation) => operation())),
       ownerID: options.ownerID,
       ...(options.definitions === undefined ? {} : { definitions: options.definitions }),
@@ -1066,29 +1089,29 @@ function makeWorkerBus(connection: NodeConnection, filename: string, sessionID: 
       ...(options.blobLimitBytes === undefined ? {} : { blobLimitBytes: options.blobLimitBytes }),
       ...(options.leaseTimeoutMs === undefined ? {} : { leaseTimeoutMs: options.leaseTimeoutMs }),
     })
-    return safeBusHandle(bus)
   }
+  const create = (options: WorkerBusCreateOptions): WorkerBusHandle => safeBusHandle(createService(options))
   nextBusOwner += 1
-  const defaultBus = create({
+  const service = createService({
     ownerID: `worker-bus-${process.pid}-${nextBusOwner}`,
     ...(sessionID === undefined ? {} : { aggregateID: sessionID }),
   })
+  const defaultBus = safeBusHandle(service)
   const deleteAggregate = (aggregateID: string, options: { readonly blobDir?: string } = {}): number => {
     if (sessionID !== undefined && aggregateID !== sessionID) {
       throw new CrossSessionAccessError({ table: "event", sessionID })
     }
     if (options.blobDir === undefined) return defaultBus.deleteAggregate(aggregateID)
-    const bus = create({
+    return create({
       ownerID: `worker-delete-${process.pid}-${nextBusOwner}`,
       aggregateID,
       blobDir: options.blobDir,
-    })
-    return bus.deleteAggregate(aggregateID)
+    }).deleteAggregate(aggregateID)
   }
-  return Object.assign(defaultBus, { create, deleteAggregate })
+  return { bus: Object.assign(defaultBus, { create, deleteAggregate }), service }
 }
 
-function capabilityConnection(connection: NodeConnection, withMain: <T>(operation: () => T) => T): Bus.Connection {
+function capabilityConnection(connection: NodeConnection, withMain: <T>(operation: () => T) => T): DurableLog.Connection {
   return {
     filename: connection.filename,
     all: (sql, params = []) => withMain(() => connection.all(sql, params)),
@@ -1097,7 +1120,7 @@ function capabilityConnection(connection: NodeConnection, withMain: <T>(operatio
   }
 }
 
-function safeBusHandle(bus: Bus.Interface): WorkerBusHandle {
+function safeBusHandle(bus: DurableLog.Interface): WorkerBusHandle {
   const { connection: _connection, transaction: _transaction, transactionAsync: _transactionAsync, ...safe } = bus
   return safe
 }
@@ -1339,4 +1362,4 @@ function asWorkerDatabaseError(error: unknown): WorkerDatabaseError {
   return new WorkerDatabaseOpenError({ reason: reasonOf(error) })
 }
 
-export * as WorkerDbModule from "./db"
+export * as WorkerDbApi from "./db"

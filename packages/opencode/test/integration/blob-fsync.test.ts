@@ -11,7 +11,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { afterEach, describe, expect, spyOn, test } from "bun:test"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 
 const directories: string[] = []
 const restores: Array<() => void> = []
@@ -68,10 +68,10 @@ describe("blob-fsync: durable content-addressed writes", () => {
   test("fsyncs the file before the rename and the directory after it", () => {
     const directory = workspace()
     const payload = JSON.stringify({ text: "x".repeat(1024) })
-    const hash = Bus.digest(payload)
+    const hash = DurableLog.digest(payload)
     const trace = traceDurability()
 
-    Bus.writeBlobFile(directory, hash, payload)
+    DurableLog.writeBlobFile(directory, hash, payload)
 
     expect(trace.events).toEqual(["fsync-file", "rename", "fsync-dir"])
     // The file data must be flushed through a writable descriptor; only the
@@ -84,11 +84,11 @@ describe("blob-fsync: durable content-addressed writes", () => {
   test("dedupes an already-durable blob without rewriting but still re-syncs it", () => {
     const directory = workspace()
     const payload = JSON.stringify({ text: "dedupe" })
-    const hash = Bus.digest(payload)
-    Bus.writeBlobFile(directory, hash, payload)
+    const hash = DurableLog.digest(payload)
+    DurableLog.writeBlobFile(directory, hash, payload)
 
     const trace = traceDurability()
-    Bus.writeBlobFile(directory, hash, payload)
+    DurableLog.writeBlobFile(directory, hash, payload)
 
     // The fast path must not rewrite or rename the existing file, but a
     // committed blob row still requires the file and its directory entry to be
@@ -100,12 +100,12 @@ describe("blob-fsync: durable content-addressed writes", () => {
   test("propagates a failed fsync and leaves no temp file behind", () => {
     const directory = workspace()
     const payload = JSON.stringify({ text: "failure" })
-    const hash = Bus.digest(payload)
+    const hash = DurableLog.digest(payload)
     const trace = traceDurability()
     trace.failFileSync = true
 
     // A failed data flush must fail the write and leave no temp file.
-    expect(() => Bus.writeBlobFile(directory, hash, payload)).toThrow("fsync failed")
+    expect(() => DurableLog.writeBlobFile(directory, hash, payload)).toThrow("fsync failed")
     expect(fs.readdirSync(directory)).toEqual([])
   })
 })

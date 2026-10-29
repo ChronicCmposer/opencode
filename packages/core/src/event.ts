@@ -5,11 +5,10 @@ import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 import { and, asc, eq, gt, inArray } from "drizzle-orm"
 import { Database } from "./database/database"
-import { withBusyRetry } from "./database/busy"
 import { EventSequenceTable, EventTable } from "./event/sql"
 import { Location } from "./location"
-import { makeGlobalNode } from "./effect/app-node"
-import { Bus } from "./bus"
+import { makeGlobalNode, Node, type GlobalNode } from "./effect/app-node"
+import { DurableLog } from "./durable-log"
 import { isDeepStrictEqual } from "node:util"
 import type { SqlClient } from "effect/unstable/sql/SqlClient"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
@@ -25,7 +24,11 @@ export const latestSequence = Effect.fn("EventV2.latestSequence")(function* (
   db: Database.Interface["db"],
   aggregateID: string,
 ) {
-  assertAggregateScope(workerScopeOf(db), "event_sequence", aggregateID)
+  assertAggregateScope(
+    Option.getOrUndefined(yield* Effect.serviceOption(WorkerScopeService)),
+    "event_sequence",
+    aggregateID,
+  )
   const row = yield* db
     .select({ seq: EventSequenceTable.seq })
     .from(EventSequenceTable)
@@ -58,7 +61,7 @@ export class StaleOwnerError extends Schema.TaggedErrorClass<StaleOwnerError>()(
 
 /**
  * The narrow durable-log operations a bound worker's EventV2 aggregate deletion
- * may use. The worker DB owns a viewless Bus handle with a session-bound
+ * may use. The worker DB owns a viewless DurableLog handle with a session-bound
  * authorizer and exposes only these operations (never a raw connection); the
  * BlobStore refcount probe is inherently cross-aggregate and must not run
  * through the session-filtered views.
@@ -67,28 +70,55 @@ export interface WorkerDurableOperations {
   deleteAggregate(aggregateID: string, options?: { readonly blobDir?: string }): number
 }
 
-/** The per-database worker binding: lease generation, aggregate fence, deletion capability. */
+/**
+ * The per-worker scope: lease generation, aggregate fence, and deletion
+ * capability. A worker graph provides this as a Context service; the hub graph
+ * omits it, and absence is the explicit "scopeless" state. The lease owner is an
+ * explicit mutable cell owned by the scope (never process-global identity
+ * state), exposed synchronously for the writer port and as Effects for EventV2.
+ */
 export interface WorkerScope {
-  leaseOwner?: string
-  sessionID?: string
+  readonly sessionID?: string
   durable?: WorkerDurableOperations
+  leaseOwner: string | undefined
+  getLeaseOwner(): Effect.Effect<string | undefined>
+  setLeaseOwner(owner: string): Effect.Effect<void>
+  clear(): Effect.Effect<void>
 }
 
-const workerScopes = new WeakMap<object, WorkerScope>()
+/** The Context key a worker graph provides and EventV2 reads optionally. */
+export class WorkerScopeService extends Context.Service<WorkerScopeService, WorkerScope>()(
+  "@opencode/EventV2/WorkerScope",
+) {}
 
-/** Create the binding a worker database carries for its EventV2 layer. */
-export function createWorkerScope(sessionID?: string): WorkerScope {
-  return sessionID === undefined ? {} : { sessionID }
+export interface WorkerScopeOptions {
+  readonly sessionID?: string
+  readonly leaseOwner?: string
+  readonly durable?: WorkerDurableOperations
 }
 
-/** Attach a worker binding to the database instance it scopes. */
-export function bindWorkerScope(db: object, scope: WorkerScope): void {
-  workerScopes.set(db, scope)
-}
-
-/** The binding for one database, or `undefined` for an unbound hub database. */
-export function workerScopeOf(db: object): WorkerScope | undefined {
-  return workerScopes.get(db)
+/** Build the one scope value a worker database carries for its EventV2 layer. */
+export function makeWorkerScope(options: WorkerScopeOptions = {}): WorkerScope {
+  let leaseOwner = options.leaseOwner
+  return {
+    ...(options.sessionID === undefined ? {} : { sessionID: options.sessionID }),
+    ...(options.durable === undefined ? {} : { durable: options.durable }),
+    get leaseOwner() {
+      return leaseOwner
+    },
+    set leaseOwner(value) {
+      leaseOwner = value
+    },
+    getLeaseOwner: () => Effect.sync(() => leaseOwner),
+    setLeaseOwner: (owner) =>
+      Effect.sync(() => {
+        leaseOwner = owner
+      }),
+    clear: () =>
+      Effect.sync(() => {
+        leaseOwner = undefined
+      }),
+  }
 }
 
 /** Durable writes renew the worker lease; a dead generation stops renewing. */
@@ -96,13 +126,13 @@ const WORKER_LEASE_TTL_MS = 30_000
 
 /**
  * Preserve EventV2's typed owner error while delegating the actual owner check
- * and conditional renewal to the Bus primitives.
+ * and conditional renewal to the DurableLog primitives.
  */
 function asEventOwnerError<A>(work: () => A): A {
   try {
     return work()
   } catch (error) {
-    if (error instanceof Bus.StaleOwnerError) throw new StaleOwnerError({ message: error.message })
+    if (error instanceof DurableLog.StaleOwnerError) throw new StaleOwnerError({ message: error.message })
     throw error
   }
 }
@@ -177,7 +207,7 @@ const decodeWithDefinition = (event: SerializedEvent, definition: Definition): P
 
 /**
  * The one durable-event decode policy, shared by the Effect read paths and the
- * synchronous worker Bus. An unknown or non-durable stored type is a hard,
+ * synchronous worker DurableLog. An unknown or non-durable stored type is a hard,
  * descriptive failure rather than a fabricated payload.
  */
 export const decodeDurablePayload = (
@@ -216,7 +246,11 @@ export const readAggregate = Effect.fn("EventV2.readAggregate")(function* <A>(
   },
 ) {
   const after = input.after ?? -1
-  assertAggregateScope(workerScopeOf(db), "event", input.aggregateID)
+  assertAggregateScope(
+    Option.getOrUndefined(yield* Effect.serviceOption(WorkerScopeService)),
+    "event",
+    input.aggregateID,
+  )
   const rows = yield* db
     .select()
     .from(EventTable)
@@ -324,7 +358,7 @@ export interface LayerOptions {
   readonly beforeAggregateRead?: (aggregateID: string) => Effect.Effect<void>
   /**
    * D16 content-addressed directory owned by this EventV2 layer. Defaults to a
-   * sibling of the database file, matching the worker Bus and the hub writer.
+   * sibling of the database file, matching the worker DurableLog and the hub writer.
    */
   readonly blobDir?: string
 }
@@ -342,37 +376,23 @@ function clientFilename(client: DurableClient): string | undefined {
 }
 
 /**
- * The Bus drives a synchronous connection, so this adapter is only used for
+ * The DurableLog drives a synchronous connection, so this adapter is only used for
  * clients whose statements complete synchronously (the hub database and the
  * unbound delete path). A bound worker deletes through its durable capability;
  * EventV2's writes and reads use the Effect client directly.
  */
-function busConnection(client: DurableClient): Bus.Connection {
-  const all = (sql: string, params: ReadonlyArray<unknown> = []) =>
-    Effect.runSync(client.unsafe<Record<string, unknown>>(sql, params))
-  const filename = clientFilename(client)
-  return {
-    ...(filename === undefined ? {} : { filename }),
-    all,
-    run: (sql, params) => {
-      all(sql, params)
-      const [row] = all("SELECT changes() AS changes")
-      return { changes: Number(row?.changes ?? 0) }
-    },
-    exec: (sql) => {
-      all(sql)
-    },
-  }
+function busConnection(client: DurableClient): DurableLog.Connection {
+  return DurableLog.connectionFromClient(client)
 }
 
 /**
  * The D16 directory for the file this client actually opened. `undefined` means
- * "unknown or in-memory"; the Bus then derives from its connection filename and
+ * "unknown or in-memory"; the DurableLog then derives from its connection filename and
  * fails loud if a file-backed row cannot be collected, rather than guessing the
  * global database's directory.
  */
 function defaultBlobDirectory(client: DurableClient): string | undefined {
-  return Bus.blobDirectoryFor(clientFilename(client))
+  return DurableLog.blobDirectoryFor(clientFilename(client))
 }
 
 function durableClient(db: Database.Interface["db"]): DurableClient | undefined {
@@ -388,14 +408,6 @@ function hasEventBlobTable(client: DurableClient): Effect.Effect<boolean> {
     )
 }
 
-/** A schema with the dedicated worker-lease columns (post `add_worker_lease`). */
-function hasWorkerLeaseColumns(client: DurableClient): Effect.Effect<boolean> {
-  return client.unsafe<{ readonly name: string }>("PRAGMA table_info(event_sequence)").pipe(
-    Effect.map((columns) => columns.some((column) => column.name === "worker_owner_id")),
-    Effect.orDie,
-  )
-}
-
 /**
  * Stage an oversized durable payload through D16's content-addressed file before
  * the write transaction starts. Returns the reference the event row stores; an
@@ -406,32 +418,32 @@ function prepareOversizedPayload(
   encoded: Record<string, unknown>,
   explicitBlobDir: string | undefined,
   supportsTable: boolean,
-): Bus.BlobReference | undefined {
+): DurableLog.BlobReference | undefined {
   const payload = JSON.stringify(encoded)
   const size = Buffer.byteLength(payload)
-  if (size <= Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES) return undefined
+  if (size <= DurableLog.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES) return undefined
   const client = durableClient(db)
   if (client === undefined) {
     throw new InvalidDurableEventError({
       type: "event",
-      message: `durable payload is ${size} bytes (limit ${Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES}) but this database has no Bus blob path`,
+      message: `durable payload is ${size} bytes (limit ${DurableLog.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES}) but this database has no DurableLog blob path`,
     })
   }
   if (!supportsTable) {
     throw new InvalidDurableEventError({
       type: "event",
-      message: `durable payload is ${size} bytes (limit ${Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES}) but this schema has no event_blob table`,
+      message: `durable payload is ${size} bytes (limit ${DurableLog.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES}) but this schema has no event_blob table`,
     })
   }
   const blobDir = explicitBlobDir ?? defaultBlobDirectory(client)
   if (blobDir === undefined) {
     throw new InvalidDurableEventError({
       type: "event",
-      message: `durable payload is ${size} bytes (limit ${Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES}) and no blob directory is configured`,
+      message: `durable payload is ${size} bytes (limit ${DurableLog.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES}) and no blob directory is configured`,
     })
   }
-  const hash = Bus.digest(payload)
-  Bus.writeBlobFile(blobDir, hash, payload)
+  const hash = DurableLog.digest(payload)
+  DurableLog.writeBlobFile(blobDir, hash, payload)
   return { __eventBlob: hash, size }
 }
 
@@ -441,7 +453,7 @@ const BLOB_QUERY_CHUNK = 500
 /**
  * Load blob rows through the Effect client so both synchronous and
  * worker-backed (asynchronous acquisition) clients can resolve references.
- * `Bus.blobRowQuery`/`blobRowsBySeq` keep this identical to the sync Bus read.
+ * `DurableLog.blobRowQuery`/`blobRowsBySeq` keep this identical to the sync DurableLog read.
  */
 const loadBlobRows = (
   client: DurableClient,
@@ -451,16 +463,16 @@ const loadBlobRows = (
   Effect.gen(function* () {
     const rows = new Map<number, Record<string, unknown>>()
     for (let offset = 0; offset < sequences.length; offset += BLOB_QUERY_CHUNK) {
-      const query = Bus.blobRowQuery(aggregateID, sequences.slice(offset, offset + BLOB_QUERY_CHUNK))
+      const query = DurableLog.blobRowQuery(aggregateID, sequences.slice(offset, offset + BLOB_QUERY_CHUNK))
       const chunk = yield* client.unsafe<Record<string, unknown>>(query.sql, query.params)
-      for (const [seq, row] of Bus.blobRowsBySeq(chunk)) rows.set(seq, row)
+      for (const [seq, row] of DurableLog.blobRowsBySeq(chunk)) rows.set(seq, row)
     }
     return rows
   }).pipe(Effect.orDie)
 
 /**
- * Resolve `event.data` blob references for a page of stored rows. The Bus owns
- * the hash/path validation, so EventV2 reads and synchronous Bus reads agree on
+ * Resolve `event.data` blob references for a page of stored rows. The DurableLog owns
+ * the hash/path validation, so EventV2 reads and synchronous DurableLog reads agree on
  * what a valid D16 reference is. The capability is threaded in from the layer
  * (or implied by a stored reference) so no schema probe runs on this path.
  */
@@ -471,14 +483,14 @@ function resolveStoredRows(
   explicitBlobDir: string | undefined,
   supportsTable: boolean,
 ): Effect.Effect<ReadonlyArray<StoredEventRow>> {
-  const referenced = rows.filter((row) => Bus.isBlobReference(row.data))
+  const referenced = rows.filter((row) => DurableLog.isBlobReference(row.data))
   if (referenced.length === 0) return Effect.succeed(rows)
   const client = durableClient(db)
   if (client === undefined) {
     return Effect.die(
       new InvalidDurableEventError({
         type: "event",
-        message: `aggregate ${aggregateID} has blob-backed events but this database has no Bus blob path`,
+        message: `aggregate ${aggregateID} has blob-backed events but this database has no DurableLog blob path`,
       }),
     )
   }
@@ -489,17 +501,17 @@ function resolveStoredRows(
       referenced.map((row) => row.seq),
     )
     const blobDir = explicitBlobDir ?? defaultBlobDirectory(client)
-    const blob: Bus.BlobStore = {
+    const blob: DurableLog.BlobStore = {
       ...(blobDir === undefined ? {} : { dir: blobDir }),
-      limitBytes: Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES,
+      limitBytes: DurableLog.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES,
       supportsTable,
     }
     const files = new Map<string, string>()
     return rows.map((row) => {
-      if (!Bus.isBlobReference(row.data)) return row
+      if (!DurableLog.isBlobReference(row.data)) return row
       return {
         ...row,
-        data: Bus.resolveBlobData(serializeStoredRow(row), blobRows.get(row.seq), blob, files),
+        data: DurableLog.resolveBlobData(serializeStoredRow(row), blobRows.get(row.seq), blob, files),
       }
     })
   })
@@ -508,40 +520,41 @@ function resolveStoredRows(
 /**
  * Delete one aggregate's durable log, blob rows, sequence row, and any
  * content-addressed files left with zero references across every aggregate, in
- * one Bus `BEGIN IMMEDIATE`. The Bus is scoped to this aggregate, so a deletion
+ * one DurableLog `BEGIN IMMEDIATE`. The DurableLog is scoped to this aggregate, so a deletion
  * can never widen to another session.
  */
 export const deleteAggregate = (
   db: Database.Interface["db"],
   aggregateID: string,
   options: { readonly blobDir?: string } = {},
-): Effect.Effect<number> => {
-  const worker = workerScopeOf(db)
-  assertAggregateScope(worker, "event", aggregateID)
-  const client = (db as Database.Interface["db"] & { readonly $client?: DurableClient }).$client
-  if (client === undefined) return removeRows(db, aggregateID)
-  const blobDir = options.blobDir ?? defaultBlobDirectory(client)
-  if (worker?.sessionID !== undefined && worker.durable === undefined) {
-    return Effect.die(
-      new InvalidDurableEventError({
-        type: "event",
-        message: "a bound worker's aggregate deletion requires the worker durable capability",
-      }),
-    )
-  }
-  return Effect.sync(() => {
-    if (worker?.durable !== undefined) {
-      return worker.durable.deleteAggregate(aggregateID, blobDir === undefined ? {} : { blobDir })
+): Effect.Effect<number> =>
+  Effect.gen(function* () {
+    const worker = Option.getOrUndefined(yield* Effect.serviceOption(WorkerScopeService))
+    assertAggregateScope(worker, "event", aggregateID)
+    const client = (db as Database.Interface["db"] & { readonly $client?: DurableClient }).$client
+    if (client === undefined) return yield* removeRows(db, aggregateID)
+    const blobDir = options.blobDir ?? defaultBlobDirectory(client)
+    if (worker?.sessionID !== undefined && worker.durable === undefined) {
+      return yield* Effect.die(
+        new InvalidDurableEventError({
+          type: "event",
+          message: "a bound worker's aggregate deletion requires the worker durable capability",
+        }),
+      )
     }
-    const bus = Bus.create({
-      connection: busConnection(client),
-      ownerID: "event-v2-delete",
-      aggregateID,
-      ...(blobDir === undefined ? {} : { blobDir }),
-    })
-    return bus.deleteAggregate(aggregateID)
-  }).pipe(Effect.orDie)
-}
+    return yield* Effect.sync(() => {
+      if (worker?.durable !== undefined) {
+        return worker.durable.deleteAggregate(aggregateID, blobDir === undefined ? {} : { blobDir })
+      }
+      const bus = DurableLog.create({
+        connection: busConnection(client),
+        ownerID: "event-v2-delete",
+        aggregateID,
+        ...(blobDir === undefined ? {} : { blobDir }),
+      })
+      return bus.deleteAggregate(aggregateID)
+    }).pipe(Effect.orDie)
+  })
 
 /** Fallback for reduced database stubs that carry no SQL client. */
 const removeRows = (db: Database.Interface["db"], aggregateID: string): Effect.Effect<number> =>
@@ -554,219 +567,6 @@ const removeRows = (db: Database.Interface["db"], aggregateID: string): Effect.E
       }),
     )
     .pipe(Effect.orDie)
-
-/** The block-reservation upsert: one sequence writer for new appends. */
-const RESERVE_SEQUENCE = `
-  INSERT INTO event_sequence (aggregate_id, seq, owner_id)
-  VALUES (?, ?, ?)
-  ON CONFLICT(aggregate_id) DO UPDATE SET
-    seq = event_sequence.seq + excluded.seq + 1,
-    owner_id = COALESCE(event_sequence.owner_id, excluded.owner_id)
-  RETURNING seq
-`
-
-const RESERVE_SEQUENCE_WITH_WORKER_LEASE = `
-  INSERT INTO event_sequence (aggregate_id, seq)
-  VALUES (?, ?)
-  ON CONFLICT(aggregate_id) DO UPDATE SET
-    seq = event_sequence.seq + excluded.seq + 1
-  RETURNING seq
-`
-
-/** One aggregate's cursor as the Bus owner checks expect it. */
-const parseSequenceRow = (row: Record<string, unknown> | undefined): Bus.SequenceState | undefined => {
-  if (row === undefined) return undefined
-  const seq = Number(row.seq)
-  if (!Number.isInteger(seq)) {
-    throw new Error(`event_sequence contained a non-integer sequence: ${String(row.seq)}`)
-  }
-  return {
-    seq,
-    syncOwnerID: typeof row.owner_id === "string" ? row.owner_id : undefined,
-    workerOwnerID: typeof row.worker_owner_id === "string" ? row.worker_owner_id : undefined,
-    workerHeartbeatAt: typeof row.worker_heartbeat_at === "number" ? row.worker_heartbeat_at : undefined,
-    workerExpiresAt: typeof row.worker_expires_at === "number" ? row.worker_expires_at : undefined,
-  }
-}
-
-const requireReservedSequence = (row: Record<string, unknown> | undefined): number => {
-  if (row === undefined) throw new Error("sequence reservation returned no row")
-  const seq = Number(row.seq)
-  if (!Number.isInteger(seq)) throw new Error("sequence reservation returned a non-integer")
-  return seq
-}
-
-interface PreparedWrite {
-  readonly aggregateID: string
-  readonly seq: number
-  readonly id: ID
-  readonly type: string
-  readonly encoded: Record<string, unknown>
-}
-
-/**
- * The durable-write primitives used inside EventV2's commit transaction. They
- * issue the same statements as `Bus.createDurableRepository` but through the
- * Effect client, so a worker-backed client whose transaction connection is
- * asynchronous never reaches `Effect.runSync`.
- */
-function createDurableWrites(client: DurableClient, workerLease: boolean) {
-  const rows = <A extends object>(sql: string, params: ReadonlyArray<unknown> = []) =>
-    client.unsafe<A>(sql, params).pipe(Effect.orDie)
-  const execute = (sql: string, params: ReadonlyArray<unknown> = []) =>
-    rows<Record<string, unknown>>(sql, params).pipe(Effect.asVoid)
-
-  const sequence = (aggregateID: string): Effect.Effect<Bus.SequenceState | undefined> =>
-    rows<Record<string, unknown>>(
-      workerLease
-        ? "SELECT seq, owner_id, worker_owner_id, worker_heartbeat_at, worker_expires_at FROM event_sequence WHERE aggregate_id = ?"
-        : "SELECT seq, owner_id FROM event_sequence WHERE aggregate_id = ?",
-      [aggregateID],
-    ).pipe(Effect.map((rows) => parseSequenceRow(rows[0])))
-
-  const fillSyncOwner = (input: { readonly aggregateID: string; readonly ownerID: string }) =>
-    execute("UPDATE event_sequence SET owner_id = ? WHERE aggregate_id = ? AND owner_id IS NULL", [
-      input.ownerID,
-      input.aggregateID,
-    ])
-
-  const claimLease = (input: {
-    readonly aggregateID: string
-    readonly ownerID: string
-    readonly leaseTimeoutMs: number
-  }) =>
-    Effect.gen(function* () {
-      const current = yield* sequence(input.aggregateID)
-      const now = Date.now()
-      const expiresAt = input.leaseTimeoutMs > 0 ? now + input.leaseTimeoutMs : null
-      if (!workerLease) {
-        if (current?.syncOwnerID !== undefined && current.syncOwnerID !== input.ownerID) {
-          return yield* Effect.die(
-            new StaleOwnerError({
-              message: `Aggregate ${input.aggregateID} is leased to ${current.syncOwnerID}, not ${input.ownerID}`,
-            }),
-          )
-        }
-        if (current === undefined) {
-          yield* execute("INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (?, -1, ?)", [
-            input.aggregateID,
-            input.ownerID,
-          ])
-        } else if (current.syncOwnerID === undefined) {
-          yield* fillSyncOwner(input)
-        }
-        return
-      }
-      if (current?.workerOwnerID !== undefined && current.workerOwnerID !== input.ownerID) {
-        return yield* Effect.die(
-          new StaleOwnerError({
-            message: `Aggregate ${input.aggregateID} worker lease is held by ${current.workerOwnerID}, not ${input.ownerID}`,
-          }),
-        )
-      }
-      if (current === undefined) {
-        yield* execute(
-          "INSERT INTO event_sequence (aggregate_id, seq, worker_owner_id, worker_heartbeat_at, worker_expires_at) VALUES (?, -1, ?, ?, ?)",
-          [input.aggregateID, input.ownerID, now, expiresAt],
-        )
-        return
-      }
-      yield* execute(
-        "UPDATE event_sequence SET worker_owner_id = ?, worker_heartbeat_at = ?, worker_expires_at = ? WHERE aggregate_id = ?",
-        [input.ownerID, now, expiresAt, input.aggregateID],
-      )
-    })
-
-  const renewLease = (input: {
-    readonly aggregateID: string
-    readonly ownerID: string
-    readonly leaseTimeoutMs: number
-  }) =>
-    Effect.gen(function* () {
-      if (!workerLease) return
-      const now = Date.now()
-      const expiresAt = input.leaseTimeoutMs > 0 ? now + input.leaseTimeoutMs : null
-      const updated = yield* rows<Record<string, unknown>>(
-        `UPDATE event_sequence SET worker_owner_id = ?, worker_heartbeat_at = ?, worker_expires_at = ?
-         WHERE aggregate_id = ? AND (worker_owner_id IS NULL OR worker_owner_id = ?)
-         RETURNING aggregate_id`,
-        [input.ownerID, now, expiresAt, input.aggregateID, input.ownerID],
-      )
-      if (updated.length !== 1) {
-        return yield* Effect.die(
-          new StaleOwnerError({
-            message: `Aggregate ${input.aggregateID} worker lease is not held by ${input.ownerID}`,
-          }),
-        )
-      }
-    })
-
-  const appendSequence = (input: {
-    readonly aggregateID: string
-    readonly block: number
-    readonly syncOwnerID?: string
-  }): Effect.Effect<number> =>
-    rows<Record<string, unknown>>(
-      workerLease ? RESERVE_SEQUENCE_WITH_WORKER_LEASE : RESERVE_SEQUENCE,
-      workerLease
-        ? [input.aggregateID, input.block - 1]
-        : [input.aggregateID, input.block - 1, input.syncOwnerID ?? null],
-    ).pipe(Effect.map((reserved) => requireReservedSequence(reserved[0])))
-
-  const advanceSequence = (input: {
-    readonly aggregateID: string
-    readonly seq: number
-    readonly syncOwnerID?: string
-  }) =>
-    execute(
-      `INSERT INTO event_sequence (aggregate_id, seq, owner_id)
-       VALUES (?, ?, ?)
-       ON CONFLICT(aggregate_id) DO UPDATE SET
-         seq = excluded.seq,
-         owner_id = COALESCE(event_sequence.owner_id, excluded.owner_id)`,
-      [input.aggregateID, input.seq, input.syncOwnerID ?? null],
-    )
-
-  const appendEvent = (input: PreparedWrite) =>
-    execute("INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)", [
-      input.id,
-      input.aggregateID,
-      input.seq,
-      input.type,
-      JSON.stringify(input.encoded),
-    ])
-
-  const claimSyncOwner = (input: { readonly aggregateID: string; readonly ownerID: string }) =>
-    execute("UPDATE event_sequence SET owner_id = ? WHERE aggregate_id = ?", [input.ownerID, input.aggregateID])
-
-  const writePreparedEvent = (blob: Bus.BlobStore, event: PreparedWrite) =>
-    Effect.gen(function* () {
-      const encoded = JSON.stringify(event.encoded)
-      const size = Buffer.byteLength(encoded)
-      if (size <= blob.limitBytes) {
-        yield* appendEvent(event)
-        return
-      }
-      Bus.ensureStagedBlob(blob, encoded)
-      const hash = Bus.digest(encoded)
-      yield* execute(
-        "INSERT INTO event_blob (aggregate_id, seq, type, hash, size, data, file_path) VALUES (?, ?, ?, ?, ?, NULL, ?)",
-        [event.aggregateID, event.seq, event.type, hash, size, hash],
-      )
-      yield* appendEvent({ ...event, encoded: { __eventBlob: hash, size } })
-    })
-
-  return {
-    sequence,
-    claimLease,
-    renewLease,
-    fillSyncOwner,
-    appendSequence,
-    advanceSequence,
-    claimSyncOwner,
-    writePreparedEvent,
-  }
-}
 
 export const layerWith = (options?: LayerOptions) =>
   Layer.effect(
@@ -781,22 +581,27 @@ export const layerWith = (options?: LayerOptions) =>
       // TODO: Bind durable projectors to exact type+version before supporting incompatible historical payloads.
       const listeners = new Array<Subscriber>()
       const { db } = yield* Database.Service
-      const worker = workerScopeOf(db)
+      // The one durable-write implementation. EventV2 requires the service; its
+      // worker-lease capability decides the fence, and the same shared primitives
+      // are used inside the transaction below.
+      const durableLog = yield* DurableLog.Service
+      const worker = Option.getOrUndefined(yield* Effect.serviceOption(WorkerScopeService))
       const client = durableClient(db)
       const blobDir = options?.blobDir ?? (client === undefined ? undefined : defaultBlobDirectory(client))
       // Probe the schema once, through the Effect client. A worker-backed client
       // acquires its connection asynchronously, so a synchronous probe here would
       // fail layer construction with `AsyncFiberError`.
       const supportsTable = client === undefined ? false : yield* hasEventBlobTable(client)
-      const supportsWorkerLease = client === undefined ? false : yield* hasWorkerLeaseColumns(client)
-      // The same store `Bus.create` uses: an inline body below the frame-headroom
+      const supportsWorkerLease = durableLog.workerLease
+      // The same store `DurableLog.create` uses: an inline body below the frame-headroom
       // bound, and a commit-scoped re-stage for any file a concurrent GC unlinked.
-      const blob: Bus.BlobStore = {
+      const blob: DurableLog.BlobStore = {
         ...(blobDir === undefined ? {} : { dir: blobDir }),
-        limitBytes: Bus.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES,
+        limitBytes: DurableLog.DEFAULT_INLINE_PAYLOAD_LIMIT_BYTES,
         supportsTable,
       }
-      const writes = client === undefined ? undefined : createDurableWrites(client, supportsWorkerLease)
+      const writes =
+        client === undefined ? undefined : DurableLog.createEffectDurableRepository(client, supportsWorkerLease)
 
       const getOrCreate = (definition: Definition) =>
         Effect.gen(function* () {
@@ -858,6 +663,18 @@ export const layerWith = (options?: LayerOptions) =>
                   }),
                 )
               }
+              const leaseOwner = worker === undefined ? undefined : yield* worker.getLeaseOwner()
+              // A worker generation must never be written into the v1 sync
+              // `owner_id` column. A schema without `worker_owner_id` cannot
+              // carry a worker lease at all, so refuse before any write.
+              if (leaseOwner !== undefined && !supportsWorkerLease) {
+                return yield* Effect.die(
+                  new DurableLog.WorkerLeaseUnsupportedError({
+                    type: event.type,
+                    message: `Aggregate ${aggregateID} requires a worker lease but this schema has no worker_owner_id column`,
+                  }),
+                )
+              }
               const list = projectors.get(event.type) ?? []
               const encoded = Schema.encodeUnknownSync(definition.data)(event.data) as Record<string, unknown>
               // Stage the D16 file before the write lock; the transaction
@@ -878,31 +695,29 @@ export const layerWith = (options?: LayerOptions) =>
                             )
                           }
                           const row = yield* writes.sequence(aggregateID)
-                          if (worker?.leaseOwner !== undefined) {
-                            if (supportsWorkerLease) {
-                              // Same owner check and conditional renewal as the
-                              // Bus publisher; a superseded generation can never
-                              // re-stamp its lease.
-                              asEventOwnerError(() =>
-                                Bus.assertWritableOwner(row, worker.leaseOwner!, aggregateID, true),
-                              )
-                            } else {
-                              // Legacy schema: the worker identity is carried by
-                              // the v1 sync owner column.
-                              yield* writes.claimLease({
-                                aggregateID,
-                                ownerID: worker.leaseOwner!,
-                                leaseTimeoutMs: WORKER_LEASE_TTL_MS,
-                              })
-                            }
+                          if (leaseOwner !== undefined) {
+                            // Same owner check and conditional renewal as the DurableLog
+                            // publisher; a superseded generation can never re-stamp
+                            // its lease.
+                            asEventOwnerError(() =>
+                              DurableLog.assertWritableOwner(row, leaseOwner, aggregateID, true),
+                            )
                           }
                           const renew = () => {
-                            if (worker?.leaseOwner === undefined || !supportsWorkerLease) return Effect.void
-                            return writes.renewLease({
+                            if (leaseOwner === undefined) return Effect.void
+                            return DurableLog.renewWorkerLease(writes, {
                               aggregateID,
-                              ownerID: worker.leaseOwner!,
+                              ownerID: leaseOwner,
                               leaseTimeoutMs: WORKER_LEASE_TTL_MS,
-                            })
+                            }).pipe(
+                              // Keep EventV2's typed owner error on the public
+                              // surface while the check itself stays in DurableLog.
+                              Effect.catchDefect((defect) =>
+                                defect instanceof DurableLog.StaleOwnerError
+                                  ? Effect.die(new StaleOwnerError({ message: defect.message }))
+                                  : Effect.die(defect),
+                              ),
+                            )
                           }
                           const latest = row?.seq ?? -1
                           if (input?.strictOwner && row?.syncOwnerID && row.syncOwnerID !== input.ownerID) {
@@ -974,7 +789,7 @@ export const layerWith = (options?: LayerOptions) =>
                                 message: `Event ${event.id} already exists at aggregate ${stored.aggregateID} sequence ${stored.seq}`,
                               }),
                             )
-                          // Reserve through the Bus primitive: a new append uses
+                          // Reserve through the DurableLog primitive: a new append uses
                           // the block-reservation upsert, an exact replay sets
                           // the observed position.
                           if (input === undefined) {
@@ -1002,7 +817,7 @@ export const layerWith = (options?: LayerOptions) =>
                             yield* projector(committed)
                           }
                           if (commit) yield* commit(seq)
-                          yield* writes.writePreparedEvent(blob, {
+                          yield* DurableLog.writePreparedEvent(writes, blob, {
                             aggregateID,
                             seq,
                             id: event.id,
@@ -1014,10 +829,10 @@ export const layerWith = (options?: LayerOptions) =>
                         }),
                       { behavior: "immediate" },
                     )
-                    // A busy BEGIN/statement/COMMIT must replay this whole
-                    // transaction with a fresh snapshot; replaying one
-                    // statement inside the failed transaction cannot recover.
-                    .pipe(withBusyRetry, Effect.orDie)
+                    // The adapter retries a busy `BEGIN IMMEDIATE`/`COMMIT` at
+                    // the transaction boundary; the body itself is never
+                    // replayed inside a failed transaction.
+                    .pipe(Effect.orDie)
                   if (committed) {
                     yield* Effect.forEach(
                       pubsub.durable.get(committed.aggregateID) ?? [],
@@ -1183,12 +998,21 @@ export const layerWith = (options?: LayerOptions) =>
       }
 
       function remove(aggregateID: string) {
-        return deleteAggregate(db, aggregateID, options?.blobDir === undefined ? {} : { blobDir: options.blobDir })
+        const deletion = deleteAggregate(
+          db,
+          aggregateID,
+          options?.blobDir === undefined ? {} : { blobDir: options.blobDir },
+        )
+        // The service's effects run in the caller's context; re-provide the
+        // captured scope so a direct layer (without a graph root) still fences.
+        return worker === undefined
+          ? deletion
+          : deletion.pipe(Effect.provideService(WorkerScopeService, worker))
       }
 
       function claim(aggregateID: string, ownerID: string) {
-        assertAggregateScope(workerScopeOf(db), "event_sequence", aggregateID)
         return Effect.gen(function* () {
+          assertAggregateScope(worker, "event_sequence", aggregateID)
           if (writes === undefined) {
             return yield* Effect.die(
               new InvalidDurableEventError({
@@ -1208,23 +1032,24 @@ export const layerWith = (options?: LayerOptions) =>
 
       const streamAll = (): Stream.Stream<Payload> => Stream.fromPubSub(pubsub.all)
 
-      const readAfter = (aggregateID: string, after: number) => {
-        assertAggregateScope(workerScopeOf(db), "event", aggregateID)
-        return (options?.beforeAggregateRead?.(aggregateID) ?? Effect.void).pipe(
-          Effect.andThen(
-            db
-              .select()
-              .from(EventTable)
-              .where(and(eq(EventTable.aggregate_id, aggregateID), gt(EventTable.seq, after)))
-              .orderBy(asc(EventTable.seq))
-              .all(),
-          ),
-          Effect.orDie,
-          Effect.flatMap((rows) => resolveStoredRows(db, aggregateID, rows, options?.blobDir, supportsTable)),
-          Effect.flatMap((rows) => Effect.forEach(rows, (row) => decodeSerializedEvent(serializeStoredRow(row)))),
-          Effect.orDie,
-        )
-      }
+      const readAfter = (aggregateID: string, after: number) =>
+        Effect.suspend(() => {
+          assertAggregateScope(worker, "event", aggregateID)
+          return (options?.beforeAggregateRead?.(aggregateID) ?? Effect.void).pipe(
+            Effect.andThen(
+              db
+                .select()
+                .from(EventTable)
+                .where(and(eq(EventTable.aggregate_id, aggregateID), gt(EventTable.seq, after)))
+                .orderBy(asc(EventTable.seq))
+                .all(),
+            ),
+            Effect.orDie,
+            Effect.flatMap((rows) => resolveStoredRows(db, aggregateID, rows, options?.blobDir, supportsTable)),
+            Effect.flatMap((rows) => Effect.forEach(rows, (row) => decodeSerializedEvent(serializeStoredRow(row)))),
+            Effect.orDie,
+          )
+        })
 
       const subscribeDurable = (aggregateID: string) =>
         Effect.gen(function* () {
@@ -1313,4 +1138,20 @@ export const layerWith = (options?: LayerOptions) =>
   )
 
 export const layer = layerWith()
-export const node = makeGlobalNode({ service: Service, layer: layer, deps: [Database.node] })
+const eventNode: GlobalNode<Service> = {
+  kind: "layer",
+  name: Service.key,
+  service: Service,
+  implementation: layer,
+  dependencies: [],
+  tag: Node.tags.values.global,
+}
+// `durable-log.ts` and `event.ts` form a type-level cycle (the log decodes
+// through EventV2). Resolve the DurableLog dependency lazily so whichever module
+// is imported first can finish evaluating before the graph reads it.
+Object.defineProperty(eventNode, "dependencies", {
+  configurable: true,
+  enumerable: true,
+  get: () => [Database.node, DurableLog.node],
+})
+export const node = eventNode

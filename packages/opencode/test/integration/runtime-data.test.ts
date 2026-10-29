@@ -1,6 +1,6 @@
 // Runtime/data contracts: orderly DB close, worker cap, typed build mismatch,
 // D16 blobs, session scope, migrations-once, non-blocking busy backoff, the
-// derived zero-live-worker gate, the Bus write contract, and the per-worker
+// derived zero-live-worker gate, the DurableLog write contract, and the per-worker
 // page-cache budget.
 
 import fs from "node:fs"
@@ -10,7 +10,7 @@ import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test"
 import { Database as BunDatabase } from "bun:sqlite"
 import { Effect, Schema } from "effect"
 import { Event } from "@opencode-ai/schema/event"
-import { Bus } from "@opencode-ai/core/bus"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import {
   DEFAULT_WORKER_CACHE_SIZE_KIB,
@@ -21,6 +21,7 @@ import { inImmediateTransactionAsync, retryBusyAsync } from "@opencode-ai/core/d
 import { createDbExecutor } from "@/session/worker/db-executor"
 import { buildHashStatus, verifyReadyBuild } from "@/session/worker/build-hash"
 import { createProductionSessionHub } from "@/session/worker/hub"
+import { createTestBarrier } from "../lib/run-barrier-test"
 import { createLazyExecutorWorkerPool } from "../lib/lazy-worker-pool"
 import { migrationStatements, ledgerStatements } from "@/session/writer/migration.statements.gen"
 import { currentSchemaIdentity, ensureProductionSchema, markSchemaIdentity, schemaIdentity } from "@/session/db/schema"
@@ -181,7 +182,7 @@ describe("compiled build mismatch (D15)", () => {
 })
 
 describe("event_blob D16", () => {
-  test("an oversized durable payload is stored by reference and fetched through the Bus", () => {
+  test("an oversized durable payload is stored by reference and fetched through the DurableLog", () => {
     const directory = workspace()
     const filename = path.join(directory, "blob.db")
     const blobDir = path.join(directory, "blobs")
@@ -194,7 +195,7 @@ describe("event_blob D16", () => {
     const connection = openConnection({ filename })
     try {
       markSchemaIdentity(connection)
-      const bus = Bus.create({
+      const bus = DurableLog.create({
         connection,
         ownerID: "gen-blob",
         definitions: [Note],
@@ -360,7 +361,7 @@ describe("zero-live-worker gate (D7)", () => {
     // The schema gate is off-loop and lazy: construction stays sync, the first
     // dispatch awaits it and observes the typed live-worker refusal before any
     // isolate is spawned.
-    const hub = createProductionSessionHub({
+    const hub = createProductionSessionHub({ ...{ barrier: createTestBarrier() },
       init: sessionWorkerInit(),
       databasePath: filename,
       liveWorkers: () => 1,
@@ -373,17 +374,17 @@ describe("zero-live-worker gate (D7)", () => {
   })
 })
 
-describe("Bus write contract (D13)", () => {
-  test("ad-hoc durable writes are rejected; the trusted Bus path still works", async () => {
+describe("DurableLog write contract (D13)", () => {
+  test("ad-hoc durable writes are rejected; the trusted DurableLog path still works", async () => {
     const filename = migratedDatabase()
     seedSessions(filename)
     const database = await openWorker(filename, "session-a")
 
     // A bound worker exposes no raw `run`; every write must go through the
-    // repository or the trusted Bus.
+    // repository or the trusted DurableLog.
     expect((database as { readonly run?: unknown }).run).toBeUndefined()
 
-    // The repository refuses durable tables outright: they belong to the Bus.
+    // The repository refuses durable tables outright: they belong to the DurableLog.
     // (The cast models an untyped caller; the typed surface makes this a
     // compile error.)
     const untyped = database.repository as unknown as {
@@ -418,7 +419,7 @@ describe("Bus write contract (D13)", () => {
     expect(published[0]?.durable?.seq).toBe(0)
     await expect(
       bus.publishAsync([{ definition: Note, data: { sessionID: "session-b", text: "stolen" } }]),
-    ).rejects.toBeInstanceOf(Bus.CrossAggregateError)
+    ).rejects.toBeInstanceOf(DurableLog.CrossAggregateError)
   })
 })
 

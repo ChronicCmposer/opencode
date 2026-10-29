@@ -18,6 +18,7 @@ import { openConnection } from "@opencode-ai/core/database/connection"
 import { currentSchemaIdentity, ensureProductionSchemaAsync, schemaIdentity } from "@/session/db/schema"
 import { MessageID } from "@/session/schema"
 import { createProductionSessionHub } from "@/session/worker/hub"
+import { createTestBarrier } from "../lib/run-barrier-test"
 import { sessionWorkerInit } from "../lib/session-worker-init"
 import { workerSnapshot } from "../lib/snapshot"
 import { TestLLMServer } from "../lib/llm-server"
@@ -102,7 +103,7 @@ describe("production DB boot (D7)", () => {
         yield* llm.text("production-db-boot")
 
         const outcome = yield* Effect.promise(async () => {
-          const hub = createProductionSessionHub({
+          const hub = createProductionSessionHub({ ...{ barrier: createTestBarrier() },
             init: () =>
               sessionWorkerInit({
                 snapshot: workerSnapshot({ directory }),

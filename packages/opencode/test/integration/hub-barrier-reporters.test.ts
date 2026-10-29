@@ -8,6 +8,7 @@
 //   * the production `egressBarrier` waits on the worker's real durable ack.
 
 import { describe, expect, test } from "bun:test"
+import { Effect, Fiber } from "effect"
 import { createLifecycleTracker } from "@/session/ledger/lifecycle"
 import {
   buildProductionPortBackends,
@@ -17,62 +18,13 @@ import {
 import { ackFrame, eventFrame } from "@/session/worker/frame"
 import { encodeFrame } from "@/session/egress/frame"
 import { createHubProxyClient } from "@/session/worker/hub-proxy-wire"
-import {
-  RUN_BARRIER_TIMEOUT_MS,
-  RunBarrierTimeout,
-  createRunBarrier,
-  type RunBarrierScheduler,
-} from "@/session/run-barrier"
+import { RunBarrier, RunBarrierTimeout } from "@/session/run-barrier"
 import { createFakeExecutorPool } from "../lib/fake-worker-pool"
-import { flush, sid } from "../lib/async"
+import { flush, pollUntil, sid, withDeadline } from "../lib/async"
+import { testEffect } from "../lib/effect"
+import { advanceBarrierTimeout, clockedRunBarrierLayer, createTestBarrier } from "../lib/run-barrier-test"
 
-function fakeScheduler() {
-  let now = 0
-  let nextID = 1
-  const timers = new Map<number, { readonly at: number; readonly run: () => void }>()
-  return {
-    scheduler: {
-      schedule: (run: () => void, delayMs: number) => {
-        const id = nextID++
-        timers.set(id, { at: now + delayMs, run })
-        return id
-      },
-      cancel: (handle: unknown) => void timers.delete(handle as number),
-    } satisfies RunBarrierScheduler,
-    advance(ms: number) {
-      now += ms
-      for (const [id, timer] of [...timers.entries()]) {
-        if (timer.at <= now) {
-          timers.delete(id)
-          timer.run()
-        }
-      }
-    },
-  }
-}
-
-/** Whether `promise` is still pending after a short settle window. */
-async function stillPending(promise: Promise<unknown>): Promise<boolean> {
-  const outcome = await Promise.race([
-    promise.then(
-      () => "settled" as const,
-      () => "settled" as const,
-    ),
-    new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 25)),
-  ])
-  return outcome === "pending"
-}
-
-/** Whether `promise` settles inside the bound (a missing reporter fails loud). */
-async function settlesWithin(promise: Promise<unknown>, ms = 1_000): Promise<boolean> {
-  return Promise.race([
-    promise.then(
-      () => true,
-      () => true,
-    ),
-    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ms)),
-  ])
-}
+const it = testEffect(clockedRunBarrierLayer)
 
 function reportsCommit(sessionID: string, workerID: number, hub: ReturnType<typeof createSessionHub>) {
   const channel = new MessageChannel()
@@ -97,6 +49,7 @@ describe("run-barrier phase reporters", () => {
     const pool = createFakeExecutorPool(1, { mode: "blocking" })
     const outcomes: string[] = []
     const hub = createSessionHub({
+      ...{ barrier: createTestBarrier() },
       pool,
       lifecycle,
       ports: { hubProxy: {} },
@@ -111,10 +64,14 @@ describe("run-barrier phase reporters", () => {
     const port = reportsCommit(sessionID, 1, hub)
 
     try {
-      expect(await stillPending(run)).toBe(true)
+      // The run is still in flight: the hub's published bind says so, not a sleep.
+      await pollUntil(() => hub.sessionOfWorker(1) === sessionID, {
+        message: "run never bound to its worker",
+      })
+      expect(hub.dispatcher.busySlotCount).toBe(1)
       await port.commit("msg_committed")
-      await (pool.spawned[0] ?? pool.workers[0])!.cancel(sessionID)
-      expect(await settlesWithin(run)).toBe(true)
+      await (pool.spawned[0] ?? pool.workers[0]).cancel(sessionID)
+      await withDeadline(run, { timeoutMs: 5_000, message: "reported run never drained" })
       expect(hub.barrier.state(sessionID)).toBe("drained")
       expect(lifecycle.crashState(sessionID).lastCommittedMessageID).toBe("msg_committed")
       // The promotion phase was reported from the decision the hub observed.
@@ -127,11 +84,9 @@ describe("run-barrier phase reporters", () => {
 
   test("a run that commits nothing drains explicitly and admits the next prompt", async () => {
     const lifecycle = createLifecycleTracker()
-    const clock = fakeScheduler()
-    const barrier = createRunBarrier({ scheduler: clock.scheduler })
     // `auto` settles the run without any lifecycle report: a no-commit run.
     const pool = createFakeExecutorPool(1)
-    const hub = createSessionHub({ pool, lifecycle, barrier })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool, lifecycle })
     const sessionID = sid("ses_barrier_no_commit")
 
     try {
@@ -153,7 +108,7 @@ describe("run-barrier phase reporters", () => {
   test("an in-flight tool holds the barrier until its report", async () => {
     const lifecycle = createLifecycleTracker()
     const pool = createFakeExecutorPool(1, { mode: "blocking" })
-    const hub = createSessionHub({ pool, lifecycle, ports: { hubProxy: {} } })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool, lifecycle, ports: { hubProxy: {} } })
     const sessionID = sid("ses_barrier_in_flight_tool")
 
     const run = hub.ensureRunning(sessionID)
@@ -162,14 +117,16 @@ describe("run-barrier phase reporters", () => {
     try {
       await port.toolStarted("call_slow")
       await port.commit("msg_committed")
-      await (pool.spawned[0] ?? pool.workers[0])!.cancel(sessionID)
+      await (pool.spawned[0] ?? pool.workers[0]).cancel(sessionID)
       await flush()
       // The run ended, but its tool never settled: no fabricated `tools`.
-      expect(hub.barrier.state(sessionID)).toBe("draining")
-      expect(await stillPending(run)).toBe(true)
+      await pollUntil(() => hub.barrier.state(sessionID) === "draining", {
+        message: "barrier never stayed draining with a tool in flight",
+      })
+      expect(hub.dispatcher.busySlotCount).toBe(1)
 
       await port.toolFinished("call_slow")
-      await run
+      await withDeadline(run, { timeoutMs: 5_000, message: "tool-settled run never drained" })
       expect(hub.barrier.state(sessionID)).toBe("drained")
     } finally {
       port.dispose()
@@ -177,55 +134,65 @@ describe("run-barrier phase reporters", () => {
     }
   })
 
-  test("a tool that never settles times out typed; cancel wins", async () => {
-    const lifecycle = createLifecycleTracker()
-    const clock = fakeScheduler()
-    const barrier = createRunBarrier({ scheduler: clock.scheduler })
-    const pool = createFakeExecutorPool(1, { mode: "blocking" })
-    const hub = createSessionHub({ pool, lifecycle, barrier, ports: { hubProxy: {} } })
-    const sessionID = sid("ses_barrier_tool_timeout")
+  it.effect("a tool that never settles times out typed; cancel wins", () =>
+    Effect.gen(function* () {
+      const barrier = yield* RunBarrier.Service
+      const lifecycle = createLifecycleTracker()
+      const pool = createFakeExecutorPool(1, { mode: "blocking" })
+      const hub = createSessionHub({ pool, lifecycle, barrier, ports: { hubProxy: {} } })
+      const sessionID = sid("ses_barrier_tool_timeout")
 
-    const run = hub.ensureRunning(sessionID)
-    await flush()
-    const port = reportsCommit(sessionID, 1, hub)
-    try {
-      await port.toolStarted("call_stuck")
-      await port.commit("msg_committed")
-      await (pool.spawned[0] ?? pool.workers[0])!.cancel(sessionID)
-      await flush()
-      expect(hub.barrier.state(sessionID)).toBe("draining")
+      const run = yield* Effect.promise(() => hub.ensureRunning(sessionID).catch(() => undefined)).pipe(
+        Effect.forkChild,
+      )
+      yield* Effect.promise(flush)
+      const port = reportsCommit(sessionID, 1, hub)
+      try {
+        yield* Effect.promise(() => port.toolStarted("call_stuck"))
+        yield* Effect.promise(() => port.commit("msg_committed"))
+        yield* Effect.promise(() => (pool.spawned[0] ?? pool.workers[0]).cancel(sessionID))
+        yield* Effect.promise(flush)
+        expect(hub.barrier.state(sessionID)).toBe("draining")
 
-      clock.advance(RUN_BARRIER_TIMEOUT_MS)
-      await run
-      await flush()
-      expect(hub.barrier.state(sessionID)).toBe("timed-out")
-      await expect(hub.ensureRunning(sessionID)).rejects.toBeInstanceOf(RunBarrierTimeout)
-    } finally {
-      port.dispose()
-      await hub.terminateAll()
-    }
+        yield* advanceBarrierTimeout()
+        yield* Fiber.join(run)
+        yield* Effect.promise(flush)
+        expect(hub.barrier.state(sessionID)).toBe("timed-out")
+        const refused = yield* Effect.tryPromise({
+          try: () => hub.ensureRunning(sessionID),
+          catch: (error) => error,
+        }).pipe(Effect.flip)
+        expect(refused).toBeInstanceOf(RunBarrierTimeout)
+      } finally {
+        port.dispose()
+        yield* Effect.promise(() => hub.terminateAll())
+      }
 
-    const cancelledID = sid("ses_barrier_tool_cancel")
-    const cancelledPool = createFakeExecutorPool(1, { mode: "blocking" })
-    const cancelledHub = createSessionHub({
-      pool: cancelledPool,
-      lifecycle: createLifecycleTracker(),
-      ports: { hubProxy: {} },
-    })
-    const cancelledRun = cancelledHub.ensureRunning(cancelledID).catch(() => undefined)
-    await flush()
-    const cancelledPort = reportsCommit(cancelledID, 1, cancelledHub)
-    try {
-      await cancelledPort.toolStarted("call_cancelled")
-      await cancelledHub.cancel(cancelledID)
-      await cancelledRun
-      await flush()
-      expect(cancelledHub.barrier.state(cancelledID)).toBe("cancelled")
-    } finally {
-      cancelledPort.dispose()
-      await cancelledHub.terminateAll()
-    }
-  })
+      const cancelledID = sid("ses_barrier_tool_cancel")
+      const cancelledPool = createFakeExecutorPool(1, { mode: "blocking" })
+      const cancelledHub = createSessionHub({
+        ...{ barrier: createTestBarrier() },
+        pool: cancelledPool,
+        lifecycle: createLifecycleTracker(),
+        ports: { hubProxy: {} },
+      })
+      const cancelledRun = yield* Effect.promise(() => cancelledHub.ensureRunning(cancelledID).catch(() => undefined)).pipe(
+        Effect.forkChild,
+      )
+      yield* Effect.promise(flush)
+      const cancelledPort = reportsCommit(cancelledID, 1, cancelledHub)
+      try {
+        yield* Effect.promise(() => cancelledPort.toolStarted("call_cancelled"))
+        yield* Effect.promise(() => cancelledHub.cancel(cancelledID))
+        yield* Fiber.join(cancelledRun)
+        yield* Effect.promise(flush)
+        expect(cancelledHub.barrier.state(cancelledID)).toBe("cancelled")
+      } finally {
+        cancelledPort.dispose()
+        yield* Effect.promise(() => cancelledHub.terminateAll())
+      }
+    }),
+  )
 })
 
 describe("production durable-egress barrier", () => {
@@ -242,7 +209,7 @@ describe("production durable-egress barrier", () => {
     expect(resolved).toBe(false)
 
     barrier.observeAck(sessionID, 1)
-    expect(await settlesWithin(wait)).toBe(true)
+    await withDeadline(wait, { timeoutMs: 5_000, message: "egress barrier never observed its ack" })
     expect(resolved).toBe(true)
   })
 
@@ -278,7 +245,7 @@ describe("production durable-egress barrier", () => {
 
       // The worker's sender posts the ack immediately after its durable batch.
       channel.port2.postMessage(encodeFrame(ackFrame({ count: 1 })))
-      expect(await settlesWithin(wait)).toBe(true)
+      await withDeadline(wait, { timeoutMs: 5_000, message: "egress barrier never observed its ack" })
       expect(resolved).toBe(true)
     } finally {
       dispose()

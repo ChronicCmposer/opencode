@@ -21,13 +21,7 @@
 // node table, so a regression that reintroduces an excluded node such as
 // `Database` into the session graph fails at build time, not at run time.
 
-import { Context, Effect, Layer, Option, Ref, Schema, Stream } from "effect"
-import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
-import * as Reactivity from "effect/unstable/reactivity/Reactivity"
-import * as SqlClient from "effect/unstable/sql/SqlClient"
-import type { Acquirer, Connection } from "effect/unstable/sql/SqlConnection"
-import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
-import * as Statement from "effect/unstable/sql/Statement"
+import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
@@ -49,6 +43,7 @@ import type { SessionID } from "@/session/schema"
 import { SessionStatus } from "@/session/status"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { Latest } from "@/event-manifest"
 
 import { Session } from "@/session/session"
@@ -149,6 +144,7 @@ import {
   type WorkerPluginHost,
 } from "./plugin-host"
 import { WorkerDb, databaseLayer, type WorkerDatabase } from "./db"
+import { ToolCallLedger } from "@/session/ledger/tool-call"
 import { changedHubOwnedSessionColumns, HUB_OWNED_METADATA, SESSION_IMMUTABLE_COLUMNS } from "./repository/policy"
 import { PidReporter, type PidReporterInterface } from "./pid-registry"
 import {
@@ -168,27 +164,12 @@ export type { PidReport, PidReportEntry, PidReporterInterface } from "./pid-regi
 // ---------------------------------------------------------------------------
 
 /**
- * The transaction primitives the legacy writer handle exposes: a pinned
- * transaction is identified by an opaque handle, statements run against it, then
- * it commits or rolls back.
- *
- * The production per-worker path no longer uses these; they remain optional so
- * reduced test/degraded handles stay structurally assignable, and
- * {@link writerDatabaseLayer} turns a missing primitive into a loud failure
- * rather than a silent `undefined`.
+ * The worker-side writer seam. D5 makes the worker's own WAL connection the
+ * only database source, so the writer handle is deliberately narrow: it can
+ * publish a durable event and read rows, and it has no transaction primitives.
+ * Transaction control belongs to the `WorkerDatabase` the graph installs.
  */
-export interface WriterTransactionHandle {
-  /** Pin a transaction and return its opaque handle (e.g. `"tx-1"`). */
-  begin(): Promise<string>
-  /** Run a statement against the pinned transaction; rejects on a typed failure. */
-  txQuery(handle: string, method: string, sql: string, params?: readonly unknown[]): Promise<unknown>
-  /** Commit the pinned transaction; the handle is spent. */
-  commit(handle: string): Promise<void>
-  /** Roll back the pinned transaction, discarding its writes. */
-  rollback(handle: string): Promise<void>
-}
-
-export interface WriterClientHandle extends Partial<WriterTransactionHandle> {
+export interface WriterClientHandle {
   readonly query: (method: string, sql: string, params?: readonly unknown[]) => Promise<unknown>
   readonly publish: (event: { id: string; type: string; aggregateID: string; data: unknown }) => Promise<{
     readonly seq: number | null
@@ -960,12 +941,19 @@ export function snapshotRuntimeFlagsLayer(snapshot: WorkerSnapshot): Layer.Layer
   return Layer.succeed(RuntimeFlags.Service, snapshot.flags)
 }
 
-/** Database is writer-owned: any access is a loud violation, never a silent `{}`. */
+/**
+ * Database is worker-owned. A graph with no `WorkerDatabase` must still build
+ * (EventV2 duck-types the Drizzle client at layer construction), but any actual
+ * query is a loud violation, never a silent `{}`.
+ */
 export function databaseBoundaryLayer(): Layer.Layer<Database.Service> {
   const database: Database.Interface = {
-    get db(): never {
-      throw new SessionLayerBoundaryError("Database", "db")
-    },
+    db: new Proxy({} as Database.Interface["db"], {
+      get: (_target, member) => {
+        if (member === "$client") return undefined
+        throw new SessionLayerBoundaryError("Database", String(member))
+      },
+    }),
   }
   return Layer.succeed(Database.Service, database)
 }
@@ -1107,195 +1095,11 @@ export function permissionBoundaryLayer(): Layer.Layer<Permission.Service> {
   })
 }
 
-/** A writer primitive the reduced/degraded handle did not implement. */
-const missingWriterPrimitive = (method: keyof WriterTransactionHandle) => (): Promise<never> =>
-  Promise.reject(new SessionLayerBoundaryError("WriterClient", method))
-
-type WriterSqlHandle = Required<WriterTransactionHandle> & { readonly query: WriterClientHandle["query"] }
-
-/**
- * Parse the worker writer handle into the statement surface the writer-backed
- * `SqlClient` drives. A production writer supplies every primitive; a partial
- * handle yields a method that fails loud when the Database actually needs it.
- */
-function writerSqlHandle(writer: WriterClientHandle): WriterSqlHandle {
-  return {
-    query: writer.query,
-    begin: writer.begin ?? missingWriterPrimitive("begin"),
-    txQuery: writer.txQuery ?? missingWriterPrimitive("txQuery"),
-    commit: writer.commit ?? missingWriterPrimitive("commit"),
-    rollback: writer.rollback ?? missingWriterPrimitive("rollback"),
-  }
-}
-
-type QueryMethod = "all" | "values" | "run" | "exec"
-
-const writerSqlError =
-  (operation: string) =>
-  (cause: unknown): SqlError =>
-    new SqlError({ reason: classifySqliteError(cause, { message: "writer statement failed", operation }) })
-
-const transactionNotOpen = (operation: string) =>
-  writerSqlError(operation)(new Error("statement executed outside an open writer transaction"))
-
-function asRows(value: unknown): ReadonlyArray<Record<string, unknown>> {
-  if (!Array.isArray(value)) throw new Error("writer returned a non-array for a row query")
-  for (const row of value) {
-    if (typeof row !== "object" || row === null || Array.isArray(row)) {
-      throw new Error("writer returned a non-object row")
-    }
-  }
-  return value as ReadonlyArray<Record<string, unknown>>
-}
-
-function asValues(value: unknown): ReadonlyArray<ReadonlyArray<unknown>> {
-  if (!Array.isArray(value)) throw new Error("writer returned a non-array for a value query")
-  for (const row of value) {
-    if (!Array.isArray(row)) throw new Error("writer returned a non-array row for a value query")
-  }
-  return value as ReadonlyArray<ReadonlyArray<unknown>>
-}
-
-const writerQuery = <A>(
-  writer: WriterSqlHandle,
-  method: QueryMethod,
-  sql: string,
-  params: ReadonlyArray<unknown>,
-  parse: (value: unknown) => A,
-): Effect.Effect<A, SqlError> =>
-  Effect.tryPromise({
-    try: async () => parse(await writer.query(method, sql, params)),
-    catch: writerSqlError("execute"),
-  })
-
-const writerTxQuery = <A>(
-  writer: WriterSqlHandle,
-  handle: string,
-  method: QueryMethod,
-  sql: string,
-  params: ReadonlyArray<unknown>,
-  parse: (value: unknown) => A,
-): Effect.Effect<A, SqlError> =>
-  Effect.tryPromise({
-    try: async () => parse(await writer.txQuery(handle, method, sql, params)),
-    catch: writerSqlError("execute"),
-  })
-
-const makeStatelessWriterConnection = (writer: WriterSqlHandle): Connection => ({
-  execute: (sql, params, transformRows) => {
-    const rows = writerQuery(writer, "all", sql, params, asRows)
-    return transformRows ? Effect.map(rows, transformRows) : rows
-  },
-  executeRaw: (sql, params) => writerQuery(writer, "all", sql, params, asRows),
-  executeValues: (sql, params) => writerQuery(writer, "values", sql, params, asValues),
-  executeUnprepared: (sql, params, transformRows) => {
-    const rows = writerQuery(writer, "all", sql, params, asRows)
-    return transformRows ? Effect.map(rows, transformRows) : rows
-  },
-  executeStream: () => Stream.die("writer SqlClient does not support streaming"),
-})
-
-const makeTransactionWriterConnection = (writer: WriterSqlHandle, handle: Ref.Ref<string | undefined>): Connection => {
-  const requireHandle = Effect.flatMap(Ref.get(handle), (tx) =>
-    tx === undefined ? Effect.fail(transactionNotOpen("execute")) : Effect.succeed(tx),
-  )
-  const txRows = (method: QueryMethod, sql: string, params: ReadonlyArray<unknown>) =>
-    Effect.flatMap(requireHandle, (tx) => writerTxQuery(writer, tx, method, sql, params, asRows))
-  const txValues = (sql: string, params: ReadonlyArray<unknown>) =>
-    Effect.flatMap(requireHandle, (tx) => writerTxQuery(writer, tx, "values", sql, params, asValues))
-
-  return {
-    execute: (sql, params, transformRows) => {
-      const rows = txRows("all", sql, params)
-      return transformRows ? Effect.map(rows, transformRows) : rows
-    },
-    executeRaw: (sql, params) => txRows("all", sql, params),
-    executeValues: (sql, params) => txValues(sql, params),
-    executeUnprepared: (sql, params, transformRows) =>
-      Effect.gen(function* () {
-        const tx = yield* Ref.get(handle)
-        const statement = sql.trim().toLowerCase()
-        if (statement.startsWith("begin")) {
-          if (tx !== undefined) {
-            return yield* Effect.fail(writerSqlError("begin")(new Error("writer transaction is already open")))
-          }
-          const opened = yield* Effect.tryPromise({ try: () => writer.begin(), catch: writerSqlError("begin") })
-          yield* Ref.set(handle, opened)
-          return []
-        }
-        if (statement.startsWith("commit")) {
-          if (tx === undefined) return yield* Effect.fail(transactionNotOpen("commit"))
-          yield* Effect.tryPromise({ try: () => writer.commit(tx), catch: writerSqlError("commit") })
-          yield* Ref.set(handle, undefined)
-          return []
-        }
-        if (statement.startsWith("rollback") && !statement.startsWith("rollback to savepoint")) {
-          if (tx === undefined) return yield* Effect.fail(transactionNotOpen("rollback"))
-          yield* Effect.tryPromise({ try: () => writer.rollback(tx), catch: writerSqlError("rollback") })
-          yield* Ref.set(handle, undefined)
-          return []
-        }
-        const rows = yield* txRows("all", sql, params)
-        return transformRows === undefined ? rows : transformRows(rows)
-      }),
-    executeStream: () => Stream.die("writer SqlClient does not support streaming"),
-  }
-}
-
-const acquireWriterTransaction = (writer: WriterSqlHandle): Acquirer =>
-  Effect.gen(function* () {
-    const handle = yield* Ref.make<string | undefined>(undefined)
-    yield* Effect.addFinalizer(() =>
-      Ref.get(handle).pipe(
-        Effect.flatMap((tx) =>
-          tx === undefined
-            ? Effect.void
-            : Effect.tryPromise({ try: () => writer.rollback(tx), catch: () => undefined }).pipe(Effect.ignore),
-        ),
-      ),
-    )
-    return makeTransactionWriterConnection(writer, handle)
-  })
-
-function writerSqlClientLayer(writer: WriterSqlHandle): Layer.Layer<SqlClient.SqlClient> {
-  const client = SqlClient.make({
-    acquirer: Effect.succeed(makeStatelessWriterConnection(writer)),
-    compiler: Statement.makeCompilerSqlite(),
-    transactionAcquirer: acquireWriterTransaction(writer),
-    spanAttributes: [["db.system.name", "sqlite"]],
-  })
-  return Layer.effect(SqlClient.SqlClient, client).pipe(Layer.provide(Reactivity.layer))
-}
-
-/**
- * The worker `Database`, backed by the hub-owned writer (legacy path until the
- * worker opens its own connection). The production path is
- * {@link workerDatabaseLayer}, which installs the per-worker WAL connection.
- */
-export function writerDatabaseLayer(writer: WriterClientHandle): Layer.Layer<Database.Service> {
-  const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
-  return Layer.effect(
-    Database.Service,
-    Effect.map(makeDatabase, (db): Database.Interface => ({ db })),
-  ).pipe(Layer.provide(writerSqlClientLayer(writerSqlHandle(writer))))
-}
-
 /** The worker `Database` over its own WAL connection and table allowlist. */
-export function workerDatabaseLayer(database: WorkerDatabase): Layer.Layer<Database.Service> {
+export function workerDatabaseLayer(
+  database: WorkerDatabase,
+): Layer.Layer<Database.Service | EventV2.WorkerScopeService | DurableLog.Service> {
   return databaseLayer(database)
-}
-
-/** The Database source a worker was given: its own connection or the legacy writer. */
-export type WorkerDatabaseSource = WriterClientHandle | WorkerDatabase
-
-/** Distinguish the per-worker connection from the legacy writer handle at the seam. */
-function isWorkerDatabase(source: WorkerDatabaseSource): source is WorkerDatabase {
-  return "identity" in source && "connection" in source && "filename" in source
-}
-
-/** Build the `Database` replacement for whichever source the worker was given. */
-export function databaseSourceLayer(source: WorkerDatabaseSource): Layer.Layer<Database.Service> {
-  return isWorkerDatabase(source) ? workerDatabaseLayer(source) : writerDatabaseLayer(source)
 }
 
 /**
@@ -1637,11 +1441,11 @@ function workerProjectionPolicy(database?: WorkerDatabase): SessionProjector.Pro
 
 /**
  * Boundary replacements every session layer needs. `Database` is replaced by
- * the per-worker WAL connection when one is supplied (otherwise the legacy
- * writer proxy, or a fail-loud boundary). MCP/LSP are hub-owned and stay
+ * the per-worker WAL connection when one is supplied (otherwise a fail-loud
+ * boundary: D5 has no writer-proxy fallback). MCP/LSP are hub-owned and stay
  * excluded from the worker graph. `SessionProjector` is intentionally NOT replaced: it runs in-worker,
  * registering `EventV2.project` subscribers so durable session events materialize
- * the `session`/`message`/`part` rows, inside the writer-pinned transaction.
+ * the `session`/`message`/`part` rows.
  *
  * Every other hub/writer-owned node reachable from the real
  * `SessionPrompt` graph is replaced by a FUNCTIONAL boundary layer, not
@@ -1652,21 +1456,21 @@ function workerProjectionPolicy(database?: WorkerDatabase): SessionProjector.Pro
  */
 export function boundaryReplacements(
   snapshot: WorkerSnapshot,
-  database?: WorkerDatabaseSource,
+  database?: WorkerDatabase,
   backgroundJob?: Layer.Layer<BackgroundJob.Service>,
   boundaries: SharedBoundaryOptions = {},
 ): LayerNode.Replacements {
   return [
     ...sharedBoundaryReplacements(snapshot, boundaries),
     [ModelsDev.node, snapshotModelsDevLayer(snapshot)],
-    [Database.node, database === undefined ? databaseBoundaryLayer() : databaseSourceLayer(database)],
+    [Database.node, database === undefined ? databaseBoundaryLayer() : workerDatabaseLayer(database)],
     // `SessionProjector` deliberately has NO boundary replacement: it runs IN the
     // worker. `Session.updateMessage`/`updatePart` publish durable events, and the
     // projector materializes the `session`/`message`/`part` rows the loop reads
     // back. Its `EventV2.project` subscribers run inside `EventV2`'s durable-commit
-    // `db.transaction`, which the writer-backed Database routes through the writer
-    // tx primitives — so projection is atomic with the event insert, exactly as
-    // flag-off. (The node-table classifies it `worker-local`.)
+    // `db.transaction` on the worker's own WAL connection, so projection is atomic
+    // with the event insert, exactly as flag-off. (The node-table classifies it
+    // `worker-local`.)
     // Hub-owned authorities the reduced graph yields. Each is a
     // FUNCTIONAL boundary: the graph BOOTS (an `Layer.empty` provides nothing, so
     // `SessionPrompt`'s `yield* MCP.Service`/`LSP.Service` would fail at build)
@@ -2580,7 +2384,7 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
     ],
     // The shared fragment owns `Plugin` and `Permission`; the full graph adds
     // the remaining hub authorities (SessionStatus/Question) as replacements.
-    ...boundaryReplacements(options.snapshot, options.clients.database ?? options.clients.writer, options.backgroundJob, {
+    ...boundaryReplacements(options.snapshot, options.clients.database, options.backgroundJob, {
       ...(options.hubProxies === undefined ? {} : { hubProxies: options.hubProxies }),
       ...(options.plugins === undefined ? {} : { plugins: options.plugins }),
       ...(options.pluginTools === undefined ? {} : { pluginTools: options.pluginTools }),
@@ -2621,7 +2425,13 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
     options.boundSessionID === undefined && options.clients.database?.sessionID === undefined
       ? withLogging
       : withLogging.pipe(Layer.provide(Layer.succeed(SessionProjector.Policy, workerProjectionPolicy(options.clients.database))))
-  return { root: base, replacements, layer: withProjectionPolicy }
+  // The tool-call ledger is a consumer edge: its service reads `WorkerDb` (the
+  // repository and the live lease owner) and `Database` (the connection's
+  // exclusive transaction) from the graph. It stays a non-graph seam so the node
+  // table is unchanged; a reduced graph with no real worker database yields an
+  // unavailable service and the tool path keeps its no-ledger behavior.
+  const withLedger = ToolCallLedger.workerLayer.pipe(Layer.provideMerge(withProjectionPolicy))
+  return { root: base, replacements, layer: withLedger }
 }
 
 export * as SessionWorkerLayer from "./layer"

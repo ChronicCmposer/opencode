@@ -83,6 +83,13 @@ export const SESSION_ALLOWLIST: readonly NodeEntry[] = [
   entry("Image", "@opencode/Image", ["session"], "worker-local"),
   entry("EventV2Bridge", "@opencode/EventV2Bridge", ["session"], "worker-local", "worker-local egress mesh"),
   entry("Event", "@opencode/Event", ["session"], "worker-local"),
+  entry(
+    "DurableLog",
+    "@opencode/DurableLog",
+    ["session"],
+    "worker-local",
+    "typed durable writer EventV2 yields; per-worker repository-backed",
+  ),
   entry("Snapshot", "@opencode/Snapshot", ["session"], "worker-local"),
   entry("LLMClient", "@opencode/LLMClient", ["session"], "worker-local", "platform HTTP client"),
   entry("RequestExecutor", "@opencode/LLM/RequestExecutor", ["session"], "worker-local"),

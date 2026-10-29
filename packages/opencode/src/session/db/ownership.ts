@@ -10,8 +10,8 @@ import { deriveSessionScopedTables, listSchemaTables, type SqliteQuery } from ".
 export { SCHEMA_TABLES, WORKER_WRITABLE_TABLES }
 
 /**
- * The durable log is written by the Bus, not by session-scoped DML, so it is not
- * part of the generated `session_id` allowlist. The Bus owns its access rule.
+ * The durable log is written by the DurableLog, not by session-scoped DML, so it is not
+ * part of the generated `session_id` allowlist. The DurableLog owns its access rule.
  */
 export const DURABLE_LOG_TABLES: readonly string[] = Object.freeze(["event", "event_sequence", "event_blob"])
 
@@ -101,7 +101,7 @@ export function assertWorkerTableParity(connection: SqliteQuery): void {
   }
 }
 
-/** Session-scoped DML target. Durable-log writes are governed by the Bus contract. */
+/** Session-scoped DML target. Durable-log writes are governed by the DurableLog contract. */
 export function isWorkerWritable(table: string): boolean {
   return workerTables.has(table)
 }

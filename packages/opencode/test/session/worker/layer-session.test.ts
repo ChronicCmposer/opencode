@@ -14,7 +14,7 @@ import path from "node:path"
 import { Effect, Layer } from "effect"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
-import { SessionPrompt } from "@/session/prompt"
+import { SessionPromptService } from "@/session/prompt-service"
 import { SessionProcessor } from "@/session/processor"
 import { LLM } from "@/session/llm"
 import { SessionStatus } from "@/session/status"
@@ -90,7 +90,7 @@ describe("full worker graph boot", () => {
     const services = await Effect.runPromise(
       Effect.gen(function* () {
         return {
-          prompt: yield* Effect.serviceOption(SessionPrompt.Service),
+          prompt: yield* Effect.serviceOption(SessionPromptService.Service),
           processor: yield* Effect.serviceOption(SessionProcessor.Service),
           llm: yield* Effect.serviceOption(LLM.Service),
         }
@@ -352,7 +352,7 @@ describe("full-graph prompt path against the mock provider", () => {
       const sessionID = await Effect.runPromise(seed(ctx, provider.model, "hi"))
       const result = await Effect.runPromise(
         Effect.gen(function* () {
-          const prompt = yield* SessionPrompt.Service
+          const prompt = yield* SessionPromptService.Service
           return yield* prompt.loop({ sessionID })
         }).pipe(Effect.provide(ctx.layer), Effect.provideService(InstanceRef, ctx.instance)),
       )
@@ -388,6 +388,7 @@ describe("full-graph prompt path against the mock provider", () => {
         env: { values: {} },
         clients: {
           writer: ctx.writer,
+          database: ctx.database,
           egress: { emit: () => {}, emitDurable: () => {} },
           backgroundJob: { wait: async () => null, cancel: async () => {} },
         },
@@ -403,19 +404,21 @@ describe("full-graph prompt path against the mock provider", () => {
       })
       const result = await Effect.runPromise(
         Effect.gen(function* () {
-          const prompt = yield* SessionPrompt.Service
-          return yield* prompt.loop({ sessionID })
+          const prompt = yield* SessionPromptService.Service
+          const value = yield* prompt.loop({ sessionID })
+          // The durable rows prove the writer-backed Database ran through the
+          // production graph, not just the harness's overridden one. Read them
+          // before the layer scope closes the worker connection.
+          return { value, messages: ctx.rows("message").length }
         }).pipe(Effect.provide(built.layer), Effect.provideService(InstanceRef, ctx.instance)),
       )
-      const value = result as { parts: ReadonlyArray<{ type: string; text?: string }> }
+      const value = result.value as { parts: ReadonlyArray<{ type: string; text?: string }> }
       const text = value.parts
         .filter((part) => part.type === "text")
         .map((part) => part.text ?? "")
         .join("")
       expect(text).toBe("past")
-      // The durable rows prove the writer-backed Database ran through the
-      // production graph, not just the harness's overridden one.
-      expect(ctx.rows("message")).toHaveLength(2)
+      expect(result.messages).toBe(2)
     } finally {
       await ctx.dispose()
       fs.rmSync(directory, { recursive: true, force: true })
@@ -468,7 +471,7 @@ describe("real project ambient InstanceRef (Fix B)", () => {
       const sessionID = await Effect.runPromise(seedWith(ctx, instance, provider.model, "hi"))
       const result = await Effect.runPromise(
         Effect.gen(function* () {
-          const prompt = yield* SessionPrompt.Service
+          const prompt = yield* SessionPromptService.Service
           return yield* prompt.loop({ sessionID })
         }).pipe(Effect.provide(ctx.layer), Effect.provideService(InstanceRef, instance)),
       )

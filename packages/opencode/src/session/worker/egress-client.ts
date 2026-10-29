@@ -24,7 +24,9 @@ import {
   type MeshWorkerClient,
 } from "@/session/egress/mesh"
 import { createEgressSender, type EgressSender } from "@/session/egress/sender"
-import { noopWorkerLogger, workerLogMessage, type WorkerLogger } from "./log"
+import { Effect } from "effect"
+import type { EffectBridge } from "@/effect/bridge"
+import { workerLogMessage } from "./worker-logging"
 import { connectPeer, messageOf, peerLifecycle } from "./port"
 
 export interface WorkerEgressClientOptions {
@@ -39,8 +41,8 @@ export interface WorkerEgressClientOptions {
    * has no control plane (`mesh === undefined`).
    */
   readonly controlPort?: MessagePort
-  /** Optional structured logger seam; absent defaults to a no-op (flag-off behavior). */
-  readonly log?: WorkerLogger
+  /** Optional re-entry bridge for the peer lifecycle lines. */
+  readonly bridge?: EffectBridge.Shape
   /**
    * The worker's owner id, when the caller knows it. Included on the lifecycle
    * log lines so a hub-side reader can correlate the egress peer with its pool
@@ -121,21 +123,19 @@ export function createWorkerEgressClient(
   port: MessagePort,
   options: WorkerEgressClientOptions = {},
 ): WorkerEgressSubscriptionClient {
-  return connectPeer(options.log ?? noopWorkerLogger, "egress", options.workerID, () =>
-    buildEgressClient(port, options),
-  )
+  return connectPeer(options.bridge, "egress", options.workerID, () => buildEgressClient(port, options))
 }
 
 /** The connect seam: adapt the data and control ports; a start failure throws. */
 function buildEgressClient(port: MessagePort, options: WorkerEgressClientOptions): WorkerEgressSubscriptionClient {
-  const log = options.log ?? noopWorkerLogger
+  const bridge = options.bridge
   const workerID = options.workerID
   const sender: EgressSender = createEgressSender({
     port,
     ...(options.windowMs === undefined ? {} : { windowMs: options.windowMs }),
     ...(options.maxBatch === undefined ? {} : { maxBatch: options.maxBatch }),
     ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
-    log,
+    ...(bridge === undefined ? {} : { bridge }),
   })
   const mesh = options.controlPort === undefined ? undefined : createMeshWorkerClient(options.controlPort)
   const subscriptions = new Map<string, WorkerDurableSubscription>()
@@ -167,11 +167,13 @@ function buildEgressClient(port: MessagePort, options: WorkerEgressClientOptions
       } catch (error) {
         // A throwing subscriber is a caller bug, but isolation matters more:
         // every other subscription must still be told to heal.
-        log(workerLogMessage("egress resync subscriber failed"), {
-          ...peerLifecycle("egress", workerID)("warn"),
-          pattern: subscription.pattern,
-          reason: messageOf(error),
-        })
+        void bridge?.fork(
+          Effect.logWarning(workerLogMessage("egress resync subscriber failed"), {
+            ...peerLifecycle("egress", workerID)("warn"),
+            pattern: subscription.pattern,
+            reason: messageOf(error),
+          }),
+        )
       }
     }
   }
@@ -219,10 +221,12 @@ function buildEgressClient(port: MessagePort, options: WorkerEgressClientOptions
           : { aggregateID: frame.payload.aggregateID, seq: frame.payload.seq },
       )
     } catch (error) {
-      log(workerLogMessage("egress resync frame rejected"), {
-        ...peerLifecycle("egress", workerID)("warn"),
-        reason: messageOf(error),
-      })
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("egress resync frame rejected"), {
+          ...peerLifecycle("egress", workerID)("warn"),
+          reason: messageOf(error),
+        }),
+      )
     }
   }
   port.onmessage = onDataMessage
@@ -252,11 +256,13 @@ function buildEgressClient(port: MessagePort, options: WorkerEgressClientOptions
         // The hub never registered the pattern, so drop the local entry: a stale
         // subscription would route nothing yet outlive its unsubscribe handle.
         if (subscriptions.get(subscription.pattern) === subscription) subscriptions.delete(subscription.pattern)
-        log(workerLogMessage("egress durable subscribe failed"), {
-          ...peerLifecycle("egress", workerID)("warn"),
-          pattern: subscription.pattern,
-          reason: messageOf(error),
-        })
+        void bridge?.fork(
+          Effect.logWarning(workerLogMessage("egress durable subscribe failed"), {
+            ...peerLifecycle("egress", workerID)("warn"),
+            pattern: subscription.pattern,
+            reason: messageOf(error),
+          }),
+        )
       })
       return () => {
         if (subscriptions.get(subscription.pattern) !== subscription) return
@@ -270,9 +276,9 @@ function buildEgressClient(port: MessagePort, options: WorkerEgressClientOptions
       subscriptions.clear()
       sender.end()
       mesh?.dispose()
-      log(workerLogMessage("egress closed"), peerLifecycle("egress", workerID)("info"))
+      void bridge?.fork(Effect.logInfo(workerLogMessage("egress closed"), peerLifecycle("egress", workerID)("info")))
     },
   }
 }
 
-export * as WorkerEgressClientModule from "./egress-client"
+export * as WorkerEgressClient from "./egress-client"

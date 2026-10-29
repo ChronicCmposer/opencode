@@ -20,7 +20,7 @@ import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceRef } from "@/effect/instance-ref"
 import { RuntimeFlags } from "@/effect/runtime-flags"
-import type { SessionPrompt } from "@/session/prompt"
+import { SessionPromptService } from "@/session/prompt-service"
 import { MessageID, SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { markSchemaIdentity } from "@/session/db/schema"
@@ -39,8 +39,6 @@ const DEEP = SessionID.make("ses_typed_verify_deep")
 const PROJECT = "prj_typed_verify"
 const DIRECTORIES: string[] = []
 const CLEANUPS: Array<() => void | Promise<void>> = []
-
-const SessionPromptService = Context.Service<SessionPrompt.Interface>("@opencode/SessionPrompt")
 
 function workspace(): string {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-typed-hub-"))
@@ -114,7 +112,7 @@ function metadataOf(filename: string, id: SessionID): Record<string, unknown> {
   }
 }
 
-function childReply(input: SessionPrompt.PromptInput): SessionV1.WithParts {
+function childReply(input: SessionPromptService.PromptInput): SessionV1.WithParts {
   const id = MessageID.ascending()
   return {
     info: {
@@ -144,22 +142,22 @@ function childReply(input: SessionPrompt.PromptInput): SessionV1.WithParts {
   }
 }
 
-function recordingPrompt(sessions: Session.Interface, prompts: SessionPrompt.PromptInput[]): SessionPrompt.Interface {
+function recordingPrompt(sessions: Session.Interface, prompts: SessionPromptService.PromptInput[]): SessionPromptService.Interface {
   return {
-    prompt: (input: SessionPrompt.PromptInput) =>
+    prompt: (input: SessionPromptService.PromptInput) =>
       Effect.sync(() => {
         prompts.push(input)
         return childReply(input)
       }),
     cancel: () =>
       Effect.succeed({ sessionID: ROOT, mode: "terminated", winner: "cancel", acknowledged: false, durationMs: 0 }),
-  } as unknown as SessionPrompt.Interface
+  } as unknown as SessionPromptService.Interface
 }
 
 async function openHub(
   filename: string,
   directory: string,
-  makePrompt: (sessions: Session.Interface) => SessionPrompt.Interface,
+  makePrompt: (sessions: Session.Interface) => SessionPromptService.Interface,
 ): Promise<{ readonly sessions: Session.Interface; readonly run: HubProxyRunner }> {
   const hubLayer = LayerNode.compile(
     LayerNode.group([
@@ -192,7 +190,7 @@ async function openHub(
       effect.pipe(
         Effect.provide(hubContext),
         Effect.provideService(InstanceRef, instance),
-        Effect.provideService(SessionPromptService, prompt),
+        Effect.provideService(SessionPromptService.Service, prompt),
       ),
     )
   return { sessions, run }
@@ -238,7 +236,7 @@ describe("hub-owned session depth", () => {
     migratedDatabase(filename)
     seedSessions(filename, directory)
 
-    const prompts: SessionPrompt.PromptInput[] = []
+    const prompts: SessionPromptService.PromptInput[] = []
     const { sessions, run } = await openHub(filename, directory, (service) => recordingPrompt(service, prompts))
     const depths = new Map<SessionID, number>()
     const edges = createSessionChildrenIndex()
@@ -285,7 +283,7 @@ describe("hub-owned session depth", () => {
     migratedDatabase(filename)
     seedSessions(filename, directory)
 
-    const prompts: SessionPrompt.PromptInput[] = []
+    const prompts: SessionPromptService.PromptInput[] = []
     const { sessions, run } = await openHub(filename, directory, (service) => recordingPrompt(service, prompts))
     const deps = {
       run,

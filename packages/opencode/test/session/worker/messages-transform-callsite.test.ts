@@ -37,7 +37,7 @@ import {
   type WorkerSnapshot,
 } from "@/session/worker/layer"
 import { workerGraphReplacements } from "@/session/worker/session-worker"
-import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
+import { createE2EContext, memoizeWorkerLayer, type E2EContext, type MemoizedWorkerLayer } from "../../lib/e2e-context"
 import { pluginPassThroughReplacement } from "../../lib/worker-plugin-routes"
 import { startMockProvider, type MockProviderHandle } from "../../lib/mock-provider"
 import { workerSnapshot } from "../../lib/snapshot"
@@ -92,26 +92,30 @@ function freshArrayHost(): WorkerPluginHost {
   return freshArrayHostCapturing()
 }
 
-/** The full worker graph over the E2E writer, with a supplied plugin host. */
+/** The full worker graph over the E2E worker database, with a supplied plugin host. */
 function workerLayer(
   snapshot: WorkerSnapshot,
   provider: MockProviderHandle,
+  database: E2EContext["database"],
   writer: WriterClientHandle,
   plugins: WorkerPluginHost,
-): Layer.Layer<unknown, unknown> {
+): MemoizedWorkerLayer {
   const config = modelConfig(provider)
-  return buildSessionWorkerLayer({
-    snapshot,
-    env: { values: {} },
-    clients: {
-      writer,
-      egress: { emit: () => {}, emitDurable: () => {} },
-      backgroundJob: { wait: async () => null, cancel: async () => {} },
-    },
-    modelClient: llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(snapshot, config))),
-    plugins,
-    replacements: [...workerGraphReplacements(config), pluginPassThroughReplacement(plugins)],
-  }).layer
+  return memoizeWorkerLayer(
+    buildSessionWorkerLayer({
+      snapshot,
+      env: { values: {} },
+      clients: {
+        writer,
+        database,
+        egress: { emit: () => {}, emitDurable: () => {} },
+        backgroundJob: { wait: async () => null, cancel: async () => {} },
+      },
+      modelClient: llmModelClientLayer(config).pipe(Layer.provide(reducedLlmLayer(snapshot, config))),
+      plugins,
+      replacements: [...workerGraphReplacements(config), pluginPassThroughReplacement(plugins)],
+    }).layer,
+  )
 }
 
 /** Create a session with one user text message and return its id. */
@@ -172,23 +176,24 @@ async function harness() {
 describe("experimental.chat.messages.transform call sites consume the returned array", () => {
   test("prompt.ts applies a hub-proxied (fresh-array) messages transform to the LLM request", async () => {
     const { provider, snapshot, ctx, dispose } = await harness()
+    const worker = workerLayer(snapshot, provider, ctx.database, ctx.writer, freshArrayHost())
     try {
-      const layer = workerLayer(snapshot, provider, ctx.writer, freshArrayHost())
-      const sessionID = await Effect.runPromise(seed(layer, ctx.instance, provider.model, "hello-original"))
-      await Effect.runPromise(runLoop(layer, ctx.instance, sessionID))
+      const sessionID = await Effect.runPromise(seed(worker.layer, ctx.instance, provider.model, "hello-original"))
+      await Effect.runPromise(runLoop(worker.layer, ctx.instance, sessionID))
 
       expect(provider.requests.length).toBeGreaterThanOrEqual(1)
       expect(JSON.stringify(provider.requests.map((request) => request.body))).toContain(MARKER)
     } finally {
+      await worker.dispose()
       await dispose()
     }
   }, 60_000)
 
   test("compaction.ts applies a hub-proxied (fresh-array) messages transform to the summary prompt", async () => {
     const { provider, snapshot, ctx, dispose } = await harness()
+    const worker = workerLayer(snapshot, provider, ctx.database, ctx.writer, freshArrayHost())
     try {
-      const layer = workerLayer(snapshot, provider, ctx.writer, freshArrayHost())
-      const sessionID = await Effect.runPromise(seed(layer, ctx.instance, provider.model, "hello-original"))
+      const sessionID = await Effect.runPromise(seed(worker.layer, ctx.instance, provider.model, "hello-original"))
       await Effect.runPromise(
         Effect.gen(function* () {
           const sessions = yield* Session.Service
@@ -197,34 +202,36 @@ describe("experimental.chat.messages.transform call sites consume the returned a
           const parent = messages.findLast((message) => message.info.role === "user")
           if (parent === undefined) throw new Error("seed produced no user message")
           yield* compaction.process({ parentID: parent.info.id, messages, sessionID, auto: false })
-        }).pipe(Effect.provide(layer), Effect.provideService(InstanceRef, ctx.instance)),
+        }).pipe(Effect.provide(worker.layer), Effect.provideService(InstanceRef, ctx.instance)),
       )
 
       expect(JSON.stringify(provider.requests.map((request) => request.body))).toContain(MARKER)
     } finally {
+      await worker.dispose()
       await dispose()
     }
   }, 60_000)
 
   test("the fresh-array (hub-proxied) path is the one reconciled into `msgs`", async () => {
     const { provider, snapshot, ctx, dispose } = await harness()
+    // Capture the exact `msgs` array the call site hands to the trigger. A
+    // hub-proxied trigger returns a FRESH array across the port, so the ONLY
+    // way `msgs` can carry the marker is if the call site spliced the returned
+    // array back into it. Remove that reconciliation and this test goes red.
+    let msgsSeenByTrigger: MessageLike[] | undefined
+    const host = freshArrayHostCapturing((messages) => {
+      msgsSeenByTrigger = messages
+    })
+    const worker = workerLayer(snapshot, provider, ctx.database, ctx.writer, host)
     try {
-      // Capture the exact `msgs` array the call site hands to the trigger. A
-      // hub-proxied trigger returns a FRESH array across the port, so the ONLY
-      // way `msgs` can carry the marker is if the call site spliced the returned
-      // array back into it. Remove that reconciliation and this test goes red.
-      let msgsSeenByTrigger: MessageLike[] | undefined
-      const host = freshArrayHostCapturing((messages) => {
-        msgsSeenByTrigger = messages
-      })
-      const layer = workerLayer(snapshot, provider, ctx.writer, host)
-      const sessionID = await Effect.runPromise(seed(layer, ctx.instance, provider.model, "hello-original"))
-      await Effect.runPromise(runLoop(layer, ctx.instance, sessionID))
+      const sessionID = await Effect.runPromise(seed(worker.layer, ctx.instance, provider.model, "hello-original"))
+      await Effect.runPromise(runLoop(worker.layer, ctx.instance, sessionID))
 
       expect(msgsSeenByTrigger).toBeDefined()
       expect(JSON.stringify(msgsSeenByTrigger)).toContain(MARKER)
       expect(JSON.stringify(provider.requests.map((request) => request.body))).toContain(MARKER)
     } finally {
+      await worker.dispose()
       await dispose()
     }
   }, 60_000)
