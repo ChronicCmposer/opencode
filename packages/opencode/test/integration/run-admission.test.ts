@@ -38,6 +38,7 @@ import {
   REAL_WORKER_TEST_TIMEOUT_MS,
   REAL_WORKER_TRANSPORT_TIMEOUT_MS,
 } from "../lib/worker-timeouts"
+import { noMcpNoSnapshotHubProxy } from "../lib/hub-proxy-defaults"
 
 function shellInput(sessionID: ReturnType<typeof sid>) {
   return { sessionID, agent: "build", command: "true" }
@@ -190,6 +191,7 @@ function startProductionHub(input: {
     runIdleTimeoutMs: REAL_WORKER_IDLE_TIMEOUT_MS,
     ports: {
       hubProxy: {
+        ...noMcpNoSnapshotHubProxy,
         "sessionStatus.get": () => ({ type: "idle" }),
         "sessionStatus.list": () => new Map(),
         "sessionStatus.set": () => undefined,

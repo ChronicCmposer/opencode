@@ -39,6 +39,7 @@ import {
 } from "@/session/worker/layer"
 import type { HubProxyAuthorities } from "@/session/worker/hub"
 import { buildHubProxyHandlers } from "@/session/worker/hub"
+import { noMcpNoSnapshotHubProxy } from "../lib/hub-proxy-defaults"
 import { openWorkerDatabase, type WorkerDatabase } from "@/session/worker/db"
 import { migrationStatements } from "@/session/writer/migration.statements.gen"
 import { Provider } from "@/provider/provider"
@@ -195,6 +196,7 @@ function hubPort(
   }
   const handlers: HubProxyHandlers = {
     ...buildHubProxyHandlers(authorities, instantRunner),
+    ...noMcpNoSnapshotHubProxy,
     "session.discardReverted": (request) => {
       const { sessionID, messageIDs } = request as { sessionID: string; messageIDs: ReadonlyArray<string> }
       if (options.failClear) throw new Error("hub discard failed")

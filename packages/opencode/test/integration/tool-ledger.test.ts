@@ -50,6 +50,7 @@ import {
   REAL_WORKER_TRANSPORT_TIMEOUT_MS,
 } from "../lib/worker-timeouts"
 import { Cause, Effect, Exit, Layer, Schema } from "effect"
+import { noMcpNoSnapshotHubProxy } from "../lib/hub-proxy-defaults"
 
 const callID = "call-p0"
 const sessionID = SessionID.make("ses_tool_p0")
@@ -444,6 +445,7 @@ function startHub(input: {
     runIdleTimeoutMs: REAL_WORKER_IDLE_TIMEOUT_MS,
     ports: {
       hubProxy: {
+        ...noMcpNoSnapshotHubProxy,
         "sessionStatus.get": () => ({ type: "idle" }),
         "sessionStatus.list": () => new Map(),
         "sessionStatus.set": () => undefined,

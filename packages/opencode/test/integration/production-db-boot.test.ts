@@ -25,6 +25,7 @@ import { TestLLMServer } from "../lib/llm-server"
 import { testEffect } from "../lib/effect"
 import { sid } from "../lib/async"
 import { REAL_WORKER_TEST_TIMEOUT_MS, REAL_WORKER_TRANSPORT_TIMEOUT_MS } from "../lib/worker-timeouts"
+import { noMcpNoSnapshotHubProxy } from "../lib/hub-proxy-defaults"
 
 const it = testEffect(TestLLMServer.layer)
 
@@ -117,6 +118,7 @@ describe("production DB boot (D7)", () => {
             // services; this harness only needs the status surface.
             ports: {
               hubProxy: {
+                ...noMcpNoSnapshotHubProxy,
                 "sessionStatus.get": () => ({ type: "idle" }),
                 "sessionStatus.list": () => new Map(),
                 "sessionStatus.set": () => undefined,

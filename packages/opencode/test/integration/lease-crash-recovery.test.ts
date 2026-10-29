@@ -33,6 +33,7 @@ import {
   REAL_WORKER_TRANSPORT_TIMEOUT_MS,
 } from "../lib/worker-timeouts"
 import { Effect } from "effect"
+import { noMcpNoSnapshotHubProxy } from "../lib/hub-proxy-defaults"
 
 const it = testEffect(TestLLMServer.layer)
 const SESSION_WORKER = new URL("../../src/session/worker/session-worker.ts", import.meta.url)
@@ -178,6 +179,7 @@ function startHub(input: {
     ...(input.cancellation === undefined ? {} : { cancellation: input.cancellation }),
     ports: {
       hubProxy: {
+        ...noMcpNoSnapshotHubProxy,
         "sessionStatus.get": () => ({ type: "idle" }),
         "sessionStatus.list": () => new Map(),
         "sessionStatus.set": () => undefined,

@@ -522,7 +522,8 @@ export function snapshotProxyLayer(client: HubProxyClient): Layer.Layer<Snapshot
   return Layer.succeed(Snapshot.Service, {
     init: () => Effect.void,
     cleanup: () => Effect.void,
-    track: () => call<string | undefined>("snapshot.track", []),
+    // An untracked project comes back as `null` over the wire; parts store `snapshot` as optional, never null.
+    track: () => call<string | null>("snapshot.track", []).pipe(Effect.map((hash) => hash ?? undefined)),
     patch: (hash) => call<Snapshot.Patch>("snapshot.patch", [hash]),
     restore: (hash) => call<void>("snapshot.restore", [hash]),
     revert: (patches) => call<void>("snapshot.revert", [patches]),
@@ -806,7 +807,11 @@ export function mcpBoundaryLayer(hub?: HubProxyClient): Layer.Layer<MCP.Service>
     readResource:
       hub === undefined
         ? () => Effect.succeed(undefined)
-        : (clientName, uri) => fromHub<McpResult<"readResource">>("mcp.readResource", [clientName, uri]),
+        : (clientName, uri) =>
+            // The wire carries a missing resource as `null`; the service contract is `undefined`.
+            fromHub<McpResult<"readResource"> | null>("mcp.readResource", [clientName, uri]).pipe(
+              Effect.map((content) => content ?? undefined),
+            ),
     hasStoredTokens: () => Effect.succeed(false),
     getAuthStatus: () => Effect.succeed("not_authenticated"),
     supportsOAuth: () => Effect.succeed(false),

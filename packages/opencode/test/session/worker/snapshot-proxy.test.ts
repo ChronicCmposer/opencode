@@ -75,3 +75,12 @@ it.instance(
     }),
   { git: true },
 )
+
+it.live("an untracked project's snapshot stays undefined across the wire, never null", () =>
+  Effect.gen(function* () {
+    const served = serveHubProxyFor({ "snapshot.track": () => undefined })
+    yield* Effect.addFinalizer(() => Effect.sync(() => served.dispose()))
+    const snapshot = yield* Effect.service(Snapshot.Service).pipe(Effect.provide(snapshotProxyLayer(served.client)))
+    expect(yield* snapshot.track()).toBeUndefined()
+  }),
+)
