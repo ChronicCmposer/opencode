@@ -538,6 +538,8 @@ export interface DurableHealPosition {
   readonly aggregateID: string
   readonly seq: number
   readonly after?: number
+  /** Also publish `seq` itself: the position was lost, not merely gapped. */
+  readonly inclusive?: boolean
 }
 
 export interface DurableHealReaderOptions {
@@ -712,7 +714,7 @@ export function createHubEventSink(options: HubEventSinkOptions): HubEventSink {
    */
   const healRange = async (position: DurableHealPosition): Promise<void> => {
     if (readDurable === undefined) return
-    const upTo = position.seq - 1
+    const upTo = position.inclusive === true ? position.seq : position.seq - 1
     let cursor = position.after ?? lastDurable.get(position.aggregateID) ?? -1
     while (cursor < upTo) {
       let page: readonly DurableHealEntry[]
@@ -737,10 +739,19 @@ export function createHubEventSink(options: HubEventSinkOptions): HubEventSink {
     }
   }
 
+  // Every heal runs behind the previous one, so a worker-reported resync and a
+  // receiver gap never publish the same aggregate concurrently.
+  let healChain: Promise<void> = Promise.resolve()
+  const serializedHeal = (position: DurableHealPosition): Promise<void> => {
+    const next = healChain.then(() => healRange(position))
+    healChain = next.catch(() => {})
+    return next
+  }
+
   const heal = (position: DurableHealPosition): void | Promise<void> => {
     resyncs += 1
     if (readDurable === undefined) return
-    return healRange(position)
+    return serializedHeal(position)
   }
 
   return {
@@ -781,7 +792,7 @@ export function createHubEventSink(options: HubEventSinkOptions): HubEventSink {
       // A worker-reported resync may carry the exact position it lost. Heal it
       // the same way as a receiver gap; the counter above already recorded it.
       if (readDurable !== undefined && payload?.aggregateID !== undefined && payload.seq !== undefined) {
-        void healRange({ aggregateID: payload.aggregateID, seq: payload.seq })
+        void serializedHeal({ aggregateID: payload.aggregateID, seq: payload.seq, inclusive: true }).catch(() => {})
       }
     },
     ack() {
@@ -821,10 +832,17 @@ export interface EgressDeliveryBarrier {
    * what was observed and is never carried forward as credit.
    */
   observeAck(sessionID: SessionID, count?: number): void
-  /** Resolve once every durable frame observed for the current run is acknowledged. */
-  wait(sessionID: SessionID): Promise<void>
+  /**
+   * Resolve once every durable frame observed for the current run is acknowledged.
+   * `expected` is the run's durable count from the worker's `done` reply: the
+   * wait also holds until that many hand-offs were acknowledged, so a reply that
+   * overtakes its events-port frames cannot settle early.
+   */
+  wait(sessionID: SessionID, expected?: number): Promise<void>
   /** Drop the current run's progress; `wait` also resets implicitly when it settles. */
   reset(sessionID: SessionID): void
+  /** Forget the session entirely when it leaves the hub. */
+  release(sessionID: SessionID): void
 }
 
 export interface EgressDeliveryBarrierOptions {
@@ -835,13 +853,18 @@ export interface EgressDeliveryBarrierOptions {
 
 export const DEFAULT_EGRESS_BARRIER_TIMEOUT_MS = 5_000
 
+interface EgressWaiter {
+  readonly expected: number | undefined
+  readonly resolve: () => void
+}
+
 interface EgressProgress {
   /** Durables observed since the last ack (the current sender batch). */
   outstanding: number
   /** Diagnostics for the current run; reset when the run settles. */
   observed: number
   acked: number
-  waiters: Set<() => void>
+  waiters: Set<EgressWaiter>
   timer: ReturnType<typeof setTimeout> | undefined
 }
 
@@ -870,14 +893,30 @@ export function createEgressDeliveryBarrier(options: EgressDeliveryBarrierOption
     state.outstanding = 0
     state.observed = 0
     state.acked = 0
-    for (const waiter of state.waiters) waiter()
+    for (const waiter of state.waiters) waiter.resolve()
     state.waiters.clear()
   }
 
-  /** Release every waiter once the current batch is fully acknowledged. */
+  const satisfied = (state: EgressProgress, expected: number | undefined): boolean =>
+    state.outstanding === 0 && state.acked >= (expected ?? 0)
+
+  /** Spend the acknowledgements a settled wait accounted for. */
+  const consume = (state: EgressProgress, expected: number | undefined): void => {
+    state.observed = 0
+    state.acked = expected === undefined ? 0 : state.acked - expected
+  }
+
+  /** Release every waiter whose batch is now fully acknowledged. */
   const settle = (state: EgressProgress): void => {
-    if (state.outstanding > 0) return
-    clear(state)
+    for (const waiter of state.waiters) {
+      if (!satisfied(state, waiter.expected)) continue
+      state.waiters.delete(waiter)
+      consume(state, waiter.expected)
+      waiter.resolve()
+    }
+    if (state.waiters.size > 0 || state.timer === undefined) return
+    clearTimeout(state.timer)
+    state.timer = undefined
   }
 
   return {
@@ -897,11 +936,14 @@ export function createEgressDeliveryBarrier(options: EgressDeliveryBarrierOption
       state.outstanding = Math.max(0, state.outstanding - count)
       settle(state)
     },
-    wait(sessionID) {
+    wait(sessionID, expected) {
       const state = progressOf(sessionID)
-      if (state.outstanding === 0) return Promise.resolve()
+      if (satisfied(state, expected)) {
+        consume(state, expected)
+        return Promise.resolve()
+      }
       return new Promise<void>((resolve) => {
-        state.waiters.add(resolve)
+        state.waiters.add({ expected, resolve })
         state.timer ??= setTimeout(() => {
           state.timer = undefined
           void bridge?.fork(
@@ -910,6 +952,7 @@ export function createEgressDeliveryBarrier(options: EgressDeliveryBarrierOption
               outstanding: state.outstanding,
               observed: state.observed,
               acked: state.acked,
+              expected,
               timeoutMs,
             }),
           )
@@ -921,13 +964,20 @@ export function createEgressDeliveryBarrier(options: EgressDeliveryBarrierOption
       const state = progress.get(sessionID)
       if (state !== undefined) clear(state)
     },
+    release(sessionID) {
+      const state = progress.get(sessionID)
+      if (state === undefined) return
+      clear(state)
+      progress.delete(sessionID)
+    },
   }
 }
 
 /**
  * Serve a worker's events port with the shared egress receiver (length-prefixed
  * `WorkerFrameEnvelope` frames, backpressure-aware), routing every decoded frame
- * to `sink`. A malformed frame fails loud: the receiver closes the port.
+ * to `sink`. A malformed or undeliverable frame is reported through `onError`,
+ * dropped, and answered with a resync request; the port stays open.
  *
  * A durable event identified by its aggregate `(aggregateID, seq)` is additionally
  * handed to `onDurable` — the hub's cross-isolate mesh commit path, so another
@@ -951,6 +1001,15 @@ export function serveEventsPort(
   bridge?: EffectBridge.Shape,
 ): () => void {
   let closed = false
+  /** Ask the worker to re-read its own log; a dead peer only loses the request. */
+  const requestResync = (payload: DurableResyncPayload): void => {
+    if (closed) return
+    try {
+      port.postMessage(encodeFrame(resyncWithPositionFrame(payload)))
+    } catch (error) {
+      onError?.(error instanceof Error ? error : new Error(String(error)))
+    }
+  }
   const deliver = (event: EventV2Event, meta: { readonly aggregateID: string; readonly seq: number } | undefined): void => {
     if (closed) return
     sink.event(event, {
@@ -979,6 +1038,7 @@ export function serveEventsPort(
       const resolver = sink.resolveBlob
       if (resolver === undefined) {
         sink.resync({ aggregateID: position.aggregateID, seq: position.seq })
+        requestResync({ aggregateID: position.aggregateID, seq: position.seq })
         return
       }
       return Effect.gen(function* () {
@@ -990,6 +1050,7 @@ export function serveEventsPort(
         if (closed) return
         if (data === undefined) {
           sink.resync({ aggregateID: position.aggregateID, seq: position.seq })
+          requestResync({ aggregateID: position.aggregateID, seq: position.seq })
           return
         }
         deliver({ ...event, properties: data }, meta)
@@ -1017,14 +1078,14 @@ export function serveEventsPort(
           // delivery chain did: the sink still records the gap via `heal`.
           if (!healed) return
         }
-        if (closed) return
-        try {
-          port.postMessage(encodeFrame(resyncWithPositionFrame({ aggregateID: got.aggregateID, seq: got.seq })))
-        } catch (error) {
-          // The peer may already be gone; the sink counter still records the gap.
-          onError?.(error instanceof Error ? error : new Error(String(error)))
-        }
+        requestResync({ aggregateID: got.aggregateID, seq: got.seq })
       }),
+    // A frame that fails decode or size limits is dropped and the worker is asked
+    // to resend; the port stays open so later durables still arrive.
+    onFrameRejected: (error) => {
+      onError?.(error)
+      requestResync({})
+    },
     onEnd: () => sink.end(),
     onResync: (payload) => sink.resync(payload),
     onAck: (payload) => sink.ack(payload),

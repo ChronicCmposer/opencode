@@ -28,6 +28,18 @@ export interface EgressSenderOptions {
   readonly bridge?: EffectBridge.Shape
 }
 
+const emittedBySession = new Map<string, number>()
+
+/** Durable events pushed for one aggregate since {@link resetDurableEmitted}. */
+export function durableEmitted(aggregateID: string): number {
+  return emittedBySession.get(aggregateID) ?? 0
+}
+
+/** Start a fresh durable count for one run. */
+export function resetDurableEmitted(aggregateID: string): void {
+  emittedBySession.delete(aggregateID)
+}
+
 export interface EgressSender {
   pushDelta(event: EventV2Event): void
   /** Push a durable boundary event; its aggregate identity is mandatory. */
@@ -75,7 +87,11 @@ export function createEgressSender(options: EgressSenderOptions): EgressSender {
 
   return {
     pushDelta: (event) => coalescer.pushDelta(event),
-    pushDurable: (event, meta) => coalescer.pushDurable(event, requireDurableMeta(meta)),
+    pushDurable: (event, meta) => {
+      const checked = requireDurableMeta(meta)
+      coalescer.pushDurable(event, checked)
+      emittedBySession.set(checked.aggregateID, durableEmitted(checked.aggregateID) + 1)
+    },
     end: () => {
       if (coalescer.ended) return
       // Flush pending deltas first, then post the RUN-END flush boundary: a

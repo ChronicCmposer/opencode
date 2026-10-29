@@ -22,6 +22,7 @@ import type { BootCancelResult, CancelFrame, CancelPort } from "./cancel"
 import { workerLogMessage } from "./worker-logging"
 import { WorkerRuntime } from "./runtime-edge"
 import { committedMessage, resetCommitted } from "@/session/ledger/lifecycle"
+import { durableEmitted, resetDurableEmitted } from "@/session/egress/sender"
 import { errorTagOf, messageOf } from "./port"
 import { readyFrame, type ReadyBuildFrame } from "./build-hash"
 import type { DispatchOrigin } from "@/session/origin"
@@ -42,6 +43,12 @@ export interface SessionExecutionResult {
    * authoritative message (F11) instead of a separate best-effort report.
    */
   readonly committed?: string | null
+  /**
+   * Durable events this run emitted on the egress port. The hub barrier holds
+   * until that many hand-offs were acknowledged, because this reply travels on
+   * a different channel and can overtake the events-port frames.
+   */
+  readonly durable?: number
 }
 
 /**
@@ -329,10 +336,15 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
         onFailure: (cause): SessionExecutorOutbound => failed(id, Cause.squash(cause)),
         onSuccess: (result): SessionExecutorOutbound => {
           const committed = committedMessage(result.sessionID)
+          const durable = durableEmitted(result.sessionID)
           return {
             type: "done",
             id,
-            result: committed === undefined ? result : { ...result, committed },
+            result: {
+              ...result,
+              ...(committed === undefined ? {} : { committed }),
+              ...(durable === 0 ? {} : { durable }),
+            },
           }
         },
       }),
@@ -348,6 +360,7 @@ export function createSessionExecutor(options: SessionExecutorOptions): SessionE
     shell?: ShellInput,
   ): Promise<SessionExecutorOutbound> => {
     resetCommitted(sessionID)
+    resetDurableEmitted(sessionID)
     let work: SessionWork
     try {
       work = options.work(kind)
@@ -660,7 +673,7 @@ export interface ExecutorWorkerOptions {
    * not resolve until the run's egress write is acked, so the dispatcher cannot
    * hand the worker its next run early. Absent leaves the reply path unchanged.
    */
-  readonly egressBarrier?: (sessionID: SessionID) => Promise<void> | undefined
+  readonly egressBarrier?: (sessionID: SessionID, durable?: number) => Promise<void> | undefined
   /** Optional re-entry bridge for the worker spawn line. */
   readonly bridge?: EffectBridge.Shape
 }
@@ -820,7 +833,7 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
     if (message.type !== "done") throw new Error(`unexpected executor reply: ${message.type}`)
     // Do not resolve the run until its durable egress write is acked, so
     // the dispatcher cannot hand this worker the next run ahead of that write.
-    await options.egressBarrier?.(run.sessionID)
+    await options.egressBarrier?.(run.sessionID, message.result.durable)
     recordResult(message.result)
   }
 

@@ -456,9 +456,8 @@ export function buildProductionPortBackends(options: ProductionPortBackendsOptio
             return sink.acks
           },
         }
-        // A rejected frame closes the receiver's port, so the failure MUST be
-        // observed here: a silent stop would leave the hub believing egress is
-        // healthy while no further event ever arrives.
+        // A rejected frame is dropped and the worker is asked to resend; the
+        // port stays open, so the rejection is logged rather than fatal.
         const onEgressError = (error: Error): void => {
           const bound = boundSession()
           void bridge?.fork(
@@ -1871,6 +1870,7 @@ export function productionSessionHubLayer(
           // per-session maps. The retired generation was already released before
           // this hook, so pending asks/ports/lease are gone.
           resolvers.releaseSession(sessionID)
+          egressDelivery.release(sessionID)
           options.onSessionReleased?.(sessionID)
         },
         onDispatch: resolvers.recordDispatch,

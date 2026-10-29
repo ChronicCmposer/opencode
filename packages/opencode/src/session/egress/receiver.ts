@@ -14,9 +14,10 @@
 // aggregates never look gapped. The `end`/`resync`/`ack` control frames are
 // surfaced distinctly rather than swallowed.
 //
-// Backpressure (spec Q16): when the downstream consumer reports pressure, a
-// non-durable delta is DROPPED and a resync is surfaced, so a slow hub never
-// blocks the worker. Durable events are never dropped.
+// Backpressure (spec Q16): when a caller supplies a `pressure` probe and it
+// reports pressure, a non-durable delta is DROPPED and a resync is surfaced.
+// The production hub passes no probe, so it never drops for pressure; durable
+// events are never dropped either way.
 
 import { Cause, Effect, Queue, Schema, Stream } from "effect"
 
@@ -70,6 +71,12 @@ export interface EgressPortOptions {
   readonly onAck?: (payload: EventsAckPayload | undefined) => void
   /** Called once on the first framing/ordering error; the receiver then stops. */
   readonly onError?: (error: Error) => void
+  /**
+   * Recoverable-frame policy: when supplied, a frame that fails decode/size
+   * checks or whose delivery throws is dropped, counted as a resync and reported
+   * here, and the port STAYS OPEN. Without it the first such failure is fatal.
+   */
+  readonly onFrameRejected?: (error: Error) => void
   /**
    * Durable-gap policy: when supplied, a gap/out-of-order frame is surfaced here
    * (with the position that arrived and the last accepted one) and the port
@@ -208,9 +215,11 @@ export function createEgressPort(port: MessagePort, options: EgressPortOptions):
             yield* settle(options.onDurableGap(meta, last))
           }
         }
+        // Advance only once delivery succeeded: a frame that failed to deliver
+        // leaves the cursor behind, so the next frame surfaces as a gap and heals it.
+        yield* settle(options.onFrame(frame, text))
         lastByAggregate.set(meta.aggregateID, meta)
         received++
-        yield* settle(options.onFrame(frame, text))
         return
       }
       if (options.pressure?.() === true) {
@@ -223,11 +232,21 @@ export function createEgressPort(port: MessagePort, options: EgressPortOptions):
       yield* settle(options.onFrame(frame, text))
     })
 
+  const reject = (error: Error): void => {
+    dropped++
+    resyncs++
+    options.onFrameRejected?.(error)
+  }
+
   const process = (message: PortMessage): Effect.Effect<void, Error> =>
     Effect.gen(function* () {
       if (released || ended || lastError !== undefined) return
       if (message._tag === "failure") {
-        yield* fail(message.error)
+        if (options.onFrameRejected === undefined) {
+          yield* fail(message.error)
+          return
+        }
+        reject(message.error)
         return
       }
       const frame = message.frame
@@ -318,7 +337,13 @@ export function createEgressPort(port: MessagePort, options: EgressPortOptions):
     // before a later terminal frame finalizes the stream.
     program: Stream.runForEach(stream, (message) =>
       Effect.gen(function* () {
-        yield* process(message)
+        yield* process(message).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause) || lastError !== undefined || options.onFrameRejected === undefined
+              ? Effect.failCause(cause)
+              : Effect.sync(() => reject(asError(Cause.squash(cause)))),
+          ),
+        )
         yield* Effect.yieldNow
       }),
     ).pipe(Effect.catchCause(reportFatal)),
