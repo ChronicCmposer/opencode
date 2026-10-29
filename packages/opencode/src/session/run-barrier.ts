@@ -1,31 +1,3 @@
-// Per-Session run barrier (D18).
-//
-// A run is not finished when the model loop stops. Before the next run may be
-// admitted, one Session must observe four things:
-//
-//   1. its durable commits landed,
-//   2. the projectors ran (inside the committing transaction),
-//   3. tools settled, and
-//   4. the background-promotion decision was made.
-//
-// Delta acknowledgements are deliberately absent: deltas are advisory and may be
-// dropped (D17), so they can never be a correctness barrier.
-//
-// Phases settle only when their real observation is reported. A begun run opens
-// an unreported report set; `RunBarrierRun` accepts one report per phase from the
-// code that actually observed it. A zero-tool run settles `tools` explicitly
-// through `noTools`; it is never inferred from the run having started. A run that
-// commits nothing (a shell turn, an early loop exit, a compaction stop) settles
-// both commit-side phases through `noCommit`; that is an explicit `none`, not a
-// fabricated commit. A missing report is a typed `RunBarrierTimeout` (or a
-// `RunBarrierReportError` refusal for an invalid/stale report), and cancellation
-// wins over every drain.
-//
-// The barrier is per Session and bounded at 5 s. Expiry raises the typed
-// `RunBarrierTimeout` and leaves the Session in `timed-out`, so the next run is
-// refused until an explicit `reset` (an operator retry) or `abandon` (recovery
-// for a barrier whose owning run/worker is gone and can never settle). A live
-// worker keeps the refusal: timed-out is not a free pass.
 
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Context, Deferred, Effect, Layer, Schema } from "effect"
@@ -41,11 +13,7 @@ export type RunBarrierPhase = (typeof RUN_BARRIER_PHASES)[number]
 /** The background-promotion outcome a run observed (or deliberately decided). */
 export type RunBarrierPromotionOutcome = "promoted" | "not-promoted" | "no-job"
 
-/**
- * What a reporter actually observed. The observation kind must match the phase:
- * a commit cannot stand in for a projector, and `tool-none` is the explicit
- * zero-tool settlement.
- */
+/** What a reporter actually observed. */
 export type RunBarrierObservation =
   | { readonly kind: "commit"; readonly messageID: string }
   | { readonly kind: "projector"; readonly projector: string }
@@ -66,10 +34,7 @@ export interface RunBarrierCommitOutcome {
   readonly committed: string | null
 }
 
-/**
- * The report handle for one run. Reports are only accepted for the run that
- * opened them: a late token cannot settle a successor run.
- */
+/** The report handle for one run. */
 export interface RunBarrierRun {
   readonly sessionID: string
   /** Record a real observation. Returns `false` when this run was superseded. */
@@ -79,12 +44,7 @@ export interface RunBarrierRun {
   tool(callID: string): boolean
   /** Settle a run that observed no tool calls; never inferred from run start. */
   noTools(): boolean
-  /**
-   * Settle a run that committed nothing (a shell turn, a loop that exited
-   * before its first model step, a compaction stop). The commit-side phases are
-   * reported as `none`; this never fabricates a commit. A run that already
-   * reported a real commit is refused.
-   */
+  /** Settle a run that committed nothing (a shell turn, a loop that exited before its first model step, a compaction stop). */
   noCommit(): boolean
   promotion(outcome: RunBarrierPromotionOutcome): boolean
   reported(phase: RunBarrierPhase): boolean
@@ -126,10 +86,7 @@ export class RunBarrierReportError extends Schema.TaggedErrorClass<RunBarrierRep
   message: Schema.String,
 }) {}
 
-/**
- * The barrier was asked to wait for a run that never opened a report set, so no
- * phase can ever settle. This is a typed refusal, not a timeout.
- */
+/** The barrier was asked to wait for a run that never opened a report set, so no phase can ever settle. */
 export class RunBarrierMissingReportError extends Schema.TaggedErrorClass<RunBarrierMissingReportError>()(
   "RunBarrier.MissingReport",
   {
@@ -177,95 +134,77 @@ const OBSERVATION_KINDS: Record<RunBarrierPhase, readonly RunBarrierObservation[
 /** Maximum retained Session states. A draining barrier is never evicted. */
 export const RUN_BARRIER_MAX_SESSIONS = 1024
 
-function requireText(value: unknown, label: string, sessionID: string): string {
-  if (typeof value !== "string" || value.length === 0) {
-    throw new RunBarrierReportError({
-      sessionID,
-      message: `run barrier report ${label} must be a non-empty string`,
-    })
-  }
-  return value
+function textError(value: unknown, label: string, sessionID: string): RunBarrierReportError | undefined {
+  if (typeof value === "string" && value.length > 0) return undefined
+  return new RunBarrierReportError({
+    sessionID,
+    message: `run barrier report ${label} must be a non-empty string`,
+  })
 }
 
-function validateReport(sessionID: string, report: RunBarrierPhaseReport): RunBarrierPhaseReport {
-  if (report === null || typeof report !== "object") {
-    throw new RunBarrierReportError({ sessionID, message: "run barrier report must be an object" })
-  }
+function reportError(sessionID: string, message: string): RunBarrierReportError {
+  return new RunBarrierReportError({ sessionID, message })
+}
+
+function validateReport(sessionID: string, report: RunBarrierPhaseReport): RunBarrierReportError | undefined {
+  if (report === null || typeof report !== "object") return reportError(sessionID, "run barrier report must be an object")
   if (report.sessionID !== sessionID) {
-    throw new RunBarrierReportError({
+    return reportError(
       sessionID,
-      message: `run barrier report for session ${sessionID} came from ${String(report.sessionID)}`,
-    })
+      `run barrier report for session ${sessionID} came from ${String(report.sessionID)}`,
+    )
   }
   if (!RUN_BARRIER_PHASES.includes(report.phase)) {
-    throw new RunBarrierReportError({
-      sessionID,
-      message: `run barrier report has unknown phase ${String(report.phase)}`,
-    })
+    return reportError(sessionID, `run barrier report has unknown phase ${String(report.phase)}`)
   }
   const observation = report.observation
   if (observation === null || typeof observation !== "object") {
-    throw new RunBarrierReportError({
-      sessionID,
-      message: `run barrier ${report.phase} report has no observation`,
-    })
+    return reportError(sessionID, `run barrier ${report.phase} report has no observation`)
   }
   if (!OBSERVATION_KINDS[report.phase].includes(observation.kind)) {
-    throw new RunBarrierReportError({
+    return reportError(
       sessionID,
-      message: `run barrier ${report.phase} report cannot use observation ${String(observation.kind)}`,
-    })
+      `run barrier ${report.phase} report cannot use observation ${String(observation.kind)}`,
+    )
   }
   switch (observation.kind) {
     case "commit":
-      requireText(observation.messageID, "messageID", sessionID)
-      break
+      return textError(observation.messageID, "messageID", sessionID)
     case "projector":
-      requireText(observation.projector, "projector", sessionID)
-      break
+      return textError(observation.projector, "projector", sessionID)
     case "tool":
-      requireText(observation.callID, "callID", sessionID)
-      break
+      return textError(observation.callID, "callID", sessionID)
     case "tool-none":
-      break
     case "none":
-      break
+      return undefined
     case "promotion":
       if (
         observation.outcome !== "promoted" &&
         observation.outcome !== "not-promoted" &&
         observation.outcome !== "no-job"
       ) {
-        throw new RunBarrierReportError({
+        return reportError(
           sessionID,
-          message: `run barrier promotion report has unknown outcome ${String(observation.outcome)}`,
-        })
+          `run barrier promotion report has unknown outcome ${String(observation.outcome)}`,
+        )
       }
-      break
+      return undefined
   }
-  return report
 }
 
-/** The barrier surface every consumer uses. Only `wait` performs Effect work. */
+/** The barrier surface every consumer uses. */
 export interface Interface {
-  /**
-   * Open a fresh report set for a run. No phase is settled by this call: the
-   * caller must report each phase from the place that observed it.
-   */
-  readonly beginRun: (sessionID: string) => RunBarrierRun
+  /** Open a fresh report set for a run. */
+  readonly beginRun: (sessionID: string) => Effect.Effect<RunBarrierRun, RunBarrierBusyError | RunBarrierReportError>
   /** Admit the next run only after all four phases were really reported. */
   readonly wait: (sessionID: string) => Effect.Effect<RunBarrierOutcome, RunBarrierWaitError>
   /** Cancel the active barrier (or the next one) for `sessionID`. */
-  readonly cancel: (sessionID: string) => void
+  readonly cancel: (sessionID: string) => Effect.Effect<void>
   readonly state: (sessionID: string) => RunBarrierState
   /** Clear a timed-out/cancelled/drained state so a later run may be admitted. */
-  readonly reset: (sessionID: string) => void
-  /**
-   * Forget a barrier whose owning run can no longer settle (its worker was
-   * retired by a crash or terminate). Refuses a still-draining barrier: a live
-   * run keeps ownership of its drain. Idempotent.
-   */
-  readonly abandon: (sessionID: string) => void
+  readonly reset: (sessionID: string) => Effect.Effect<void, RunBarrierBusyError>
+  /** Forget a barrier whose owning run can no longer settle (its worker was retired by a crash or terminate). */
+  readonly abandon: (sessionID: string) => Effect.Effect<void, RunBarrierBusyError | RunBarrierReportError>
   /** Number of retained Session states (bounded). */
   readonly size: number
 }
@@ -294,17 +233,10 @@ function makeBarrier(): Interface {
     }
     const report = (input: RunBarrierPhaseReport): boolean => {
       if (!current()) return false
-      let report: RunBarrierPhaseReport
-      try {
-        report = validateReport(record.sessionID, input)
-      } catch (error) {
-        if (error instanceof RunBarrierReportError) return invalidate(error)
-        throw error
-      }
+      const invalid = validateReport(record.sessionID, input)
+      if (invalid !== undefined) return invalidate(invalid)
+      const report = input
       const observed = record.kinds.get(report.phase)
-      // Some phases have more than one possible observation (`tools` and the
-      // commit-side phases accept an explicit zero/none settle). A run cannot
-      // claim a real observation and its explicit absence for the same phase.
       if (observed !== undefined && observed !== report.observation.kind) {
         return invalidate(
           new RunBarrierReportError({
@@ -373,12 +305,12 @@ function makeBarrier(): Interface {
       message: `run barrier for session ${sessionID} previously failed`,
     })
 
-  const beginRun = (sessionID: string): RunBarrierRun => {
+  const beginRun = Effect.fn("RunBarrier.beginRun")(function* (sessionID: string) {
     if (sessionID.length === 0) {
-      throw new RunBarrierReportError({ sessionID, message: "run barrier requires a non-empty sessionID" })
+      return yield* reportError(sessionID, "run barrier requires a non-empty sessionID")
     }
     if (active.has(sessionID) || stateOf(sessionID) === "draining") {
-      throw new RunBarrierBusyError({ sessionID })
+      return yield* new RunBarrierBusyError({ sessionID })
     }
     const record: RunRecord = {
       sessionID,
@@ -391,7 +323,7 @@ function makeBarrier(): Interface {
     }
     runs.set(sessionID, record)
     return makeRun(record)
-  }
+  })
 
   const wait = Effect.fn("RunBarrier.wait")(function* (sessionID: string) {
     if (sessionID.length === 0) {
@@ -403,7 +335,6 @@ function makeBarrier(): Interface {
       return yield* new RunBarrierTimeout({ sessionID, timeoutMs: RUN_BARRIER_TIMEOUT_MS })
     }
     if (state === "failed") return yield* failureOf(sessionID)
-    // A cancelled Session does not start a next run either; reset re-admits it.
     if (state === "cancelled") return { sessionID, status: "cancelled" as const }
     if (state === "draining") return yield* new RunBarrierBusyError({ sessionID })
 
@@ -457,7 +388,6 @@ function makeBarrier(): Interface {
     )
 
     active.delete(sessionID)
-    // A cancel that landed while the drain completed still owns the state.
     if (stateOf(sessionID) !== "cancelled") remember(sessionID, "drained")
     return outcome
   })
@@ -465,31 +395,31 @@ function makeBarrier(): Interface {
   return {
     beginRun,
     wait,
-    cancel(sessionID) {
-      const record = active.get(sessionID)
-      remember(sessionID, "cancelled")
-      if (record !== undefined) {
-        Deferred.doneUnsafe(record.done, Effect.fail(new RunBarrierCancelled({ sessionID })))
-      }
-    },
+    cancel: (sessionID) =>
+      Effect.sync(() => {
+        const record = active.get(sessionID)
+        remember(sessionID, "cancelled")
+        if (record !== undefined) {
+          Deferred.doneUnsafe(record.done, Effect.fail(new RunBarrierCancelled({ sessionID })))
+        }
+      }),
     state: stateOf,
-    reset(sessionID) {
-      if (active.has(sessionID)) throw new RunBarrierBusyError({ sessionID })
+    reset: Effect.fn("RunBarrier.reset")(function* (sessionID: string) {
+      if (active.has(sessionID)) return yield* new RunBarrierBusyError({ sessionID })
       states.delete(sessionID)
       failures.delete(sessionID)
       runs.delete(sessionID)
-    },
-    abandon(sessionID) {
+    }),
+    abandon: Effect.fn("RunBarrier.abandon")(function* (sessionID: string) {
       if (sessionID.length === 0) {
-        throw new RunBarrierReportError({ sessionID, message: "run barrier requires a non-empty sessionID" })
+        return yield* reportError(sessionID, "run barrier requires a non-empty sessionID")
       }
-      // A live drain still owns the phases; abandoning it would let the next run
-      // overtake work that is genuinely in flight.
-      if (active.has(sessionID)) throw new RunBarrierBusyError({ sessionID })
+      // A live drain still owns the phases; abandoning would let the next run overtake in-flight work.
+      if (active.has(sessionID)) return yield* new RunBarrierBusyError({ sessionID })
       states.delete(sessionID)
       failures.delete(sessionID)
       runs.delete(sessionID)
-    },
+    }),
     get size() {
       return states.size
     },

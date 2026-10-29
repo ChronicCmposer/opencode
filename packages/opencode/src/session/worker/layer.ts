@@ -1,25 +1,4 @@
 // Reduced session-worker AppLayer.
-//
-// The hub composes ~47 nodes (`src/effect/app-runtime.ts`). A session worker
-// must compose a *reduced* graph: the session pipeline, its model-facing
-// services and one WAL connection per worker live in the worker, while
-// migration, schema state, OS children and process-global state stay on the hub
-// (see `node-table.ts`).
-//
-// This module builds that reduced layer from:
-//   * the allowlisted real nodes (default group `SESSION_NODES`);
-//   * two client nodes (`WriterClient` / `EventEgressClient`) that reach the
-//     worker's WAL-backed writer seam and the egress authority;
-//   * an immutable per-worker `WorkerSnapshot` + `WorkerEnv`;
-//   * boundary replacement layers for the excluded nodes (Database, MCP/LSP, Npm,
-//     ModelsDev, …). `Database` is replaced by the per-worker WAL connection
-//     (`WorkerDbNode`); `SessionProjector` is NOT replaced: it runs in-worker so
-//     durable events materialize the session/message/part rows the loop reads
-//     back.
-//
-// `buildSessionWorkerLayer` composes the graph and then asserts it against the
-// node table, so a regression that reintroduces an excluded node such as
-// `Database` into the session graph fails at build time, not at run time.
 
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -45,7 +24,6 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { DurableLog } from "@opencode-ai/core/durable-log"
 import { Latest } from "@/event-manifest"
-import { WorkerRuntime } from "./runtime-edge"
 
 import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
@@ -87,14 +65,13 @@ import { McpBrowser } from "@/mcp/browser"
 import { Npm } from "@opencode-ai/core/npm"
 import { Account } from "@/account/account"
 import { AccountRepo } from "@/account/repo"
-// Residual hub/writer-owned boundaries (node-table `SESSION_EXCLUDED`).
 import { Storage } from "@/storage/storage"
 import { Git } from "@/git"
 import { BackgroundJob } from "@/background/job"
 import { Global } from "@opencode-ai/core/global"
 import { RipgrepBinary } from "@opencode-ai/core/ripgrep/binary"
 import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
-import { BackgroundJob as CoreBackgroundJob } from "@opencode-ai/core/background-job"
+import { make } from "@opencode-ai/core/background-job"
 import { buildLocationServiceMap } from "@opencode-ai/core/location-services"
 
 import {
@@ -160,16 +137,8 @@ import type { CancelOutcome } from "./cancel"
 export { PidReporter } from "./pid-registry"
 export type { PidReport, PidReportEntry, PidReporterInterface } from "./pid-registry"
 
-// ---------------------------------------------------------------------------
-// Client nodes — the worker-side handles to the writer / egress / hub.
-// ---------------------------------------------------------------------------
 
-/**
- * The worker-side writer seam. D5 makes the worker's own WAL connection the
- * only database source, so the writer handle is deliberately narrow: it can
- * publish a durable event and read rows, and it has no transaction primitives.
- * Transaction control belongs to the `WorkerDatabase` the graph installs.
- */
+/** The worker-side writer seam. */
 export interface WriterClientHandle {
   readonly query: (method: string, sql: string, params?: readonly unknown[]) => Promise<unknown>
   readonly publish: (event: { id: string; type: string; aggregateID: string; data: unknown }) => Promise<{
@@ -183,23 +152,8 @@ export interface EventEgressClientHandle {
   readonly emit: (event: EventV2Event) => void
   /** Forward a durable boundary event with its aggregate `(aggregateID, seq)`. */
   readonly emitDurable?: (event: EventV2Event, meta: { readonly aggregateID: string; readonly seq: number }) => void
-  /**
-   * The mesh control-plane client, present exactly when the worker was given a
-   * control port. It is the single source of truth for "can this worker receive
-   * cross-isolate durable wakeups": a handle with no mesh (`mesh === undefined`)
-   * has no transport to carry them, so {@link wireDurableWakeups} leaves the
-   * wakeup bridge unwired instead of reaching {@link subscribeDurable}. A
-   * DIRECT `subscribeDurable` call on a control-plane-less client still fails
-   * loud — that is a genuine caller misconfiguration, not this legitimate
-   * hub-less topology.
-   */
+  /** The mesh control-plane client, present exactly when the worker was given a control port. */
   readonly mesh?: MeshWorkerClient | undefined
-  /**
-   * Register a durable wakeup subscription with the hub mesh (spec 5.9). The
-   * production egress client owns the control port and provides this; a reduced
-   * handle with no mesh (degraded boot / test stub) omits it, so the wakeup
-   * bridge is simply not wired.
-   */
   readonly subscribeDurable?: (subscription: WorkerDurableSubscription) => () => void
 }
 
@@ -210,11 +164,7 @@ export interface BackgroundJobClientHandle {
 
 const workerTags = LayerNode.tags({ worker: [] })
 
-/**
- * A client node is a service class, its unbound graph node, and the replacement
- * layer that installs a handle. The service key comes from `node-table.ts`, so
- * the table and the layer can never drift apart.
- */
+/** A client node is a service class, its unbound graph node, and the replacement layer that installs a handle. */
 function defineClientNode<Shape>(key: string) {
   class Service extends Context.Service<Service, Shape>()(key) {}
   return {
@@ -233,15 +183,9 @@ export const EventEgressClientService = eventEgressClient.Service
 export const WriterClientNode = writerClient.node
 export const EventEgressClientNode = eventEgressClient.node
 
-/**
- * The per-worker database node. A worker graph contains exactly one, backed by
- * that worker's WAL connection; it replaces the writer-proxied `Database`.
- */
+/** The per-worker database node. */
 export const WorkerDbNode = LayerNode.unbound(WorkerDb, workerTags.values.worker)
 
-// ---------------------------------------------------------------------------
-// Worker EventV2 bridge (spec Q6/Q13/Q15).
-// ---------------------------------------------------------------------------
 
 /** The live worker-event subscription; the service key is the node-table allowlist key. */
 export interface WorkerEventBridgeService {
@@ -252,30 +196,11 @@ export class WorkerEventBridge extends Context.Service<WorkerEventBridge, Worker
   EVENT_BRIDGE_KEY,
 ) {}
 
-// ---------------------------------------------------------------------------
-// Worker durable wakeups (spec 5.9): hub mesh commit → in-isolate EventV2.
-// ---------------------------------------------------------------------------
 
-/**
- * The single durable wakeup pattern a worker subscribes to. The hub routes every
- * matching durable commit over the mesh control plane; the worker's own EventV2
- * performs the per-aggregate filtering, so the worker asks for the whole durable
- * stream (`"*"` is the hub matcher's match-everything pattern).
- */
+/** The single durable wakeup pattern a worker subscribes to. */
 export const WORKER_DURABLE_WAKE_PATTERN = "*"
 
-/**
- * Parse a durable commit into this build's definition: the aggregate it belongs
- * to and the definition version, or `undefined` when the commit's type names no
- * durable definition this build knows. The mesh frame carries the event verbatim
- * (`{ id, type, properties }`) with no aggregate of its own, so it is parsed from
- * the payload exactly as core's durable commit does: the definition's
- * `durable.aggregate` field names the payload property. An unknown type is
- * skipped rather than fatal — the commit is still republished live-only — so a
- * synthetic or version-skewed durable event never breaks the control port. A
- * KNOWN durable type whose payload omits the aggregate field is malformed and
- * fails loud.
- */
+/** Parse a durable commit into this build's definition: the aggregate it belongs to and the definition version. */
 function durablePositionOf(
   commit: DurableCommit,
 ): { readonly aggregateID: string; readonly version: number } | undefined {
@@ -299,35 +224,16 @@ function wakeAggregate(
 ): void {
   const wakeDurable = events.wakeDurable
   if (wakeDurable === undefined) return
-  WorkerRuntime.runSync(wakeDurable(aggregateID))
+  Effect.runSync(wakeDurable(aggregateID))
 }
 
-/**
- * Bridge one hub-delivered durable commit into the worker's in-isolate EventV2.
- * The commit already durably committed in the hub writer, so it is republished
- * LIVE-ONLY — never re-committed — crossing verbatim as `{ id, type, properties }`
- * (`properties` is the EventV2 `data` reference). Its committed aggregate is then
- * woken so the isolate's `durable()` subscribers re-read and observe it.
- * Synchronous because the mesh delivery runs on the synchronous control-port
- * handler.
- *
- * The republished payload keeps the committed position (`durable.aggregateID` /
- * `durable.seq`) the mesh delivered, stamped with the definition version from
- * this build's manifest, so the isolate's durable subscribers and the sync
- * envelope see the original position. A commit whose type this build does not
- * know has no version to stamp and crosses live-only.
- *
- * The payload is stamped with {@link DURABLE_WAKEUP_METADATA_KEY} so the
- * worker's own event bridge ({@link createWorkerEventBridge}) does not
- * re-forward it: the mesh delivers a worker its OWN durable commit back too, and
- * re-forwarding would make the hub publish that event a second time.
- */
+/** Bridge one hub-delivered durable commit into the worker's in-isolate EventV2. */
 export function republishDurableCommit(
   events: Pick<EventV2.Interface, "publishLive" | "wakeDurable">,
   commit: DurableCommit,
 ): void {
   const position = durablePositionOf(commit)
-  WorkerRuntime.runSync(
+  Effect.runSync(
     events.publishLive({
       id: EventV2.ID.make(commit.event.id),
       type: commit.event.type,
@@ -344,46 +250,24 @@ export function republishDurableCommit(
       metadata: { [DURABLE_WAKEUP_METADATA_KEY]: true },
     }),
   )
-  // The durable write already happened in the hub writer; the in-isolate
-  // `durable()` subscribers only need waking so their aggregate stream re-reads
-  // and observes it. A reduced handle without the seam, or a commit whose type
-  // this build does not know, skips the wake.
+  // The durable write already happened in the hub writer; the in-isolate `durable()` subscribers only need waking so their aggregate stream re-reads and.
   if (position === undefined) return
   wakeAggregate(events, position.aggregateID)
 }
 
-/**
- * Wire the worker's durable wakeups: subscribe to the hub mesh through the egress
- * handle's control plane and republish each delivered commit into the isolate's
- * EventV2. Returns a disposer.
- *
- * A handle with no subscription surface, or with no mesh control plane (the
- * hub-less / degraded topology, e.g. the in-process parity harness), cannot be
- * woken durably: the bridge is simply not wired and the returned disposer is a
- * no-op. This is a legitimate topology, never an error — only a DIRECT
- * `subscribeDurable` call without a control port fails loud.
- */
+/** Wire the worker's durable wakeups: subscribe to the hub mesh through the egress handle's control plane and republish each delivered commit into the. */
 /** The EventV2 seams a durable wakeup needs; `durable` enables gap detection. */
 type WakeupEvents = Pick<EventV2.Interface, "publishLive" | "wakeDurable"> &
   Partial<Pick<EventV2.Interface, "durable">>
 
-/**
- * Read a database snapshot for one aggregate through the production durable
- * stream. `takeUntil` is what makes the read terminate: the snapshot cursor is a
- * commit that already exists in SQLite, so the scan stops at it instead of
- * waiting on the live tail.
- *
- * `after` is the last commit this isolate already observed. Reading only
- * `(after, seq]` is what keeps a real gap from re-scanning the whole aggregate
- * log; an empty range is answered without touching the stream at all.
- */
+/** Read a database snapshot for one aggregate through the production durable stream. */
 function durableSnapshotOf(events: WakeupEvents): SnapshotReader | undefined {
   const durable = events.durable
   if (durable === undefined) return undefined
   return async (aggregateID, seq, after = -1) => {
     // -1 is the only "before the first event" cursor; 0 is a real event.
     if (seq < 0 || after >= seq) return []
-    const payloads = await WorkerRuntime.runPromise(
+    const payloads = await Effect.runPromise(
       durable({ aggregateID, after }).pipe(
         Stream.takeUntil((payload) => (payload.durable?.seq ?? -1) >= seq),
         Stream.runCollect,
@@ -397,21 +281,7 @@ function durableSnapshotOf(events: WakeupEvents): SnapshotReader | undefined {
   }
 }
 
-/**
- * Wire the worker's durable wakeups. A handle with no subscription surface, or
- * with no mesh control plane (the hub-less / degraded topology, e.g. the
- * in-process parity harness), cannot be woken durably: the bridge is simply not
- * wired and the returned disposer is a no-op. This is a legitimate topology,
- * never an error — only a DIRECT `subscribeDurable` call without a control port
- * fails loud.
- *
- * When the event service exposes `durable()`, each aggregate's delivered
- * sequence is ALSO tracked with the delta-resync machinery: a mesh gap (a commit
- * that never arrived, not just an overflow resync) produces a typed `Resync` and
- * reads the database snapshot at the last confirmed position. The wake then makes
- * the isolate's own `durable()` subscribers re-read the same log, so the session
- * heals without closing the control plane.
- */
+/** Wire the worker's durable wakeups. */
 export function wireDurableWakeups(
   events: WakeupEvents,
   egress: Pick<EventEgressClientHandle, "subscribeDurable" | "mesh">,
@@ -430,11 +300,8 @@ export function wireDurableWakeups(
       aggregateID,
       snapshot,
       onDelta: () => {},
-      // The commit already crossed live in `onDurable`; this subscription exists
-      // only to detect a gap and heal it from the snapshot.
+      // The commit already crossed live in `onDurable`; this subscription exists only to detect a gap and heal it from the snapshot.
       onDurable: () => {},
-      // The wake heals the isolate's own `durable()` subscribers; the snapshot
-      // read above is the DB observation that proves the position is readable.
       onResync: () => wakeAggregate(events, aggregateID),
     })
     const tracker = {
@@ -457,9 +324,7 @@ export function wireDurableWakeups(
       republishDurableCommit(events, commit)
       trackerFor(aggregateID)?.receiveDurable(commit)
     },
-    // A resync means the hub dropped a delivery (overflow or receiver gap). With
-    // an exact position, wake that aggregate so its `durable()` stream re-reads
-    // SQLite; without one, wake everything this worker has observed.
+    // A resync means the hub dropped a delivery (overflow or receiver gap).
     onResync: (_pattern, position) => {
       if (position !== undefined) {
         wakeAggregate(events, position.aggregateID)
@@ -474,22 +339,16 @@ export function wireDurableWakeups(
   }
 }
 
-/**
- * The egress handle IS the events-port sink: it accepts the verbatim
- * `{ id, type, properties }` event and its transport builds the `eventFrame`.
- */
+/** The egress handle IS the events-port sink: it accepts the verbatim `{ id, type, properties }` event and its transport builds the `eventFrame`. */
 const eventBridgeLayer = Layer.effect(
   WorkerEventBridge,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
     const egress = yield* EventEgressClientService
     const bridge = yield* createWorkerEventBridge(events, egress)
-    // The hub→worker durable wakeup mesh: the egress control client owns the
-    // subscription; each delivered commit is republished into this isolate's
-    // EventV2. A handle without a mesh yields a no-op.
+    // The hub→worker durable wakeup mesh: the egress control client owns the subscription; each delivered commit is republished into this isolate's EventV2.
     const unsubscribeDurable = wireDurableWakeups(events, egress)
-    // Both subscriptions live exactly as long as the layer scope; disposing the
-    // scope (worker shutdown) unsubscribes.
+    // Both subscriptions live exactly as long as the layer scope; disposing the scope (worker shutdown) unsubscribes.
     yield* Effect.addFinalizer(() => Effect.sync(() => unsubscribeDurable()).pipe(Effect.andThen(bridge.dispose)))
     return WorkerEventBridge.of({ dispose: bridge.dispose })
   }),
@@ -501,16 +360,7 @@ export const WorkerEventBridgeNode = LayerNode.make({
   deps: [EventV2Bridge.node, EventEgressClientNode],
 })
 
-// ---------------------------------------------------------------------------
-// Hub-proxy nodes: `SessionStatus` / `Permission` /
-// `Question` are hub-resident authorities. A worker reaches them with a
-// blocking RPC over its control port; the proxy services satisfy the *real*
-// hub service interfaces, so a session graph that depends on them composes
-// unchanged. This is the generic hub-proxy wire the three nodes share.
-// ---------------------------------------------------------------------------
 
-// The wire itself lives in `hub-proxy-wire.ts` so neither the worker nor the hub
-// imports the other. Re-exported here so existing consumers keep the same path.
 export { createHubProxyClient, HubProxyRemoteError, serveHubProxy } from "./hub-proxy-wire"
 export type {
   HubProxyClient,
@@ -521,14 +371,7 @@ export type {
   HubProxyRequest,
 } from "./hub-proxy-wire"
 
-/**
- * Rebuild a hub authority's typed domain error from its wire form. The wire
- * flattens a thrown error to a message + `_tag`; without this, a remote
- * `Permission` / `Question` rejection reaches the processor as a generic
- * `HubProxyRemoteError`, so its `instanceof PermissionV1.RejectedError` abort
- * check misses and the run continues instead of stopping. Rebuilding the
- * original class keeps the worker's abort behaviour identical to flag-off.
- */
+/** Rebuild a hub authority's typed domain error from its wire form. */
 function restoreHubProxyError(error: unknown): Error {
   if (!(error instanceof HubProxyRemoteError)) return error instanceof Error ? error : new Error(String(error))
   switch (error.tag) {
@@ -561,6 +404,9 @@ function hubProxyCall<A>(
   method: HubProxyMethod,
   args: readonly unknown[],
 ): Effect.Effect<A, Error> {
+  if (client.callEffect !== undefined) {
+    return (client.callEffect(method, args) as Effect.Effect<A, unknown>).pipe(Effect.mapError(restoreHubProxyError))
+  }
   return Effect.tryPromise({
     try: () => client.call(method, args) as Promise<A>,
     catch: restoreHubProxyError,
@@ -619,19 +465,11 @@ export interface HubProxyClients {
   readonly sessionStatus: HubProxyClient
   readonly permission: HubProxyClient
   readonly question: HubProxyClient
-  /**
-   * Optional dedicated subagent-dispatch client. Production multiplexes all
-   * four over one port, so an absent value falls back to `sessionStatus`
-   * (identical client). Present so a test can route dispatch independently.
-   */
+  /** Optional dedicated subagent-dispatch client. */
   readonly subagent?: HubProxyClient
 }
 
-/**
- * Worker-side `SessionSpawnProxy` over the hub-proxy control port. `Session.spawn`
- * reads it optionally, so a worker forwards the spawn to the hub instead of
- * running the child on its own isolate.
- */
+/** Worker-side `SessionSpawnProxy` over the hub-proxy control port. */
 export function sessionSpawnProxyLayer(
   client: HubProxyClient,
   boundSessionID?: SessionID,
@@ -665,25 +503,14 @@ export function sessionSpawnClient(clients: HubProxyClients): HubProxyClient {
   return clients.subagent ?? clients.sessionStatus
 }
 
-/**
- * Worker-side clear-revert authority. `revert` is hub-owned session state, so a
- * bound worker asks the hub to clear it over the control port instead of
- * publishing a worker-authored `session.updated` with `revert: null` (which the
- * projection policy refuses as an actual change to a hub column).
- */
+/** Worker-side revert-discard authority. */
 export function clearRevertProxyLayer(client: HubProxyClient): Layer.Layer<SessionRevert.ClearRevertAuthority> {
   return Layer.succeed(SessionRevert.ClearRevertAuthority, {
-    clear: (sessionID: SessionID) =>
-      hubProxyCall<void>(client, "session.clearRevert", [{ sessionID }]).pipe(Effect.orDie),
+    discard: (input) => hubProxyCall<void>(client, "session.discardReverted", [input]).pipe(Effect.orDie),
   })
 }
 
-/**
- * The hub-proxy authorities as REPLACEMENTS, never as appended root nodes: the
- * authority services are already part of the declared graph, so replacing them by
- * name keeps exactly one node per service key and makes the proxy implementation
- * (not a duplicate root) the one that is built.
- */
+/** The hub-proxy authorities as REPLACEMENTS, never as appended root nodes: the authority services are already part of the declared graph. */
 export function hubProxyReplacements(clients: HubProxyClients): LayerNode.Replacements {
   return [
     [SessionStatusProxyNode, sessionStatusProxyLayer(clients.sessionStatus)],
@@ -692,45 +519,25 @@ export function hubProxyReplacements(clients: HubProxyClients): LayerNode.Replac
   ]
 }
 
-/**
- * The hub proxies not already composed by {@link sharedBoundaryReplacements}.
- * `Permission` belongs to the shared snapshot/permission fragment both graphs
- * install, so only the status/question authorities remain here.
- */
+/** The hub proxies not already composed by {@link sharedBoundaryReplacements}. */
 function hubAuthorityReplacements(clients: HubProxyClients): LayerNode.Replacements {
   return hubProxyReplacements(clients).filter(([node]) => node.name !== Permission.node.name)
 }
 
-// ---------------------------------------------------------------------------
-// Immutable per-worker snapshot + environment overlay.
-// ---------------------------------------------------------------------------
 
 export interface WorkerSnapshot {
   /** Monotonic snapshot epoch; a bump invalidates stale-tolerant caches. */
   readonly epoch: number
   readonly directory: string
-  /**
-   * The project id the worker's ambient `InstanceRef` carries. Shipped from the
-   * hub's instance context so the isolate can rebuild a valid `Project.Info` —
-   * `Snapshot.state`, `Session.create` and the event bridge all read `project.id`
-   * and previously crashed on the `project: undefined as never` placeholder.
-   */
+  /** The project id the worker's ambient `InstanceRef` carries. */
   readonly projectId?: string
   /** The project VCS (`"git"`) when the hub's project is version-controlled. */
   readonly projectVcs?: "git"
   /** The project worktree; defaults to `directory` in the worker. */
   readonly worktree?: string
-  /**
-   * The hub's `config.directories()`, shipped verbatim so worker-side discovery
-   * (skills/agents/commands) scans the same roots; absent ⇒ fall back to
-   * `[directory]`.
-   */
+  /** The hub's `config.directories()`, shipped verbatim so worker-side discovery (skills/agents/commands) scans the same roots. */
   readonly directories?: readonly string[]
-  /**
-   * The hub's resolved ripgrep executable path. Shipped so the worker runs the
-   * same `rg` the hub uses instead of locating/downloading its own; absent ⇒ the
-   * worker falls back to a PATH-resolved `rg`.
-   */
+  /** The hub's resolved ripgrep executable path. */
   readonly ripgrepPath?: string
   readonly config: ConfigV1.Info
   readonly auth: Readonly<Record<string, unknown>>
@@ -751,9 +558,6 @@ export class WorkerEnvService extends Context.Service<WorkerEnvService, WorkerEn
 export const WorkerSnapshotNode = LayerNode.unbound(WorkerSnapshotService, workerTags.values.worker)
 export const WorkerEnvNode = LayerNode.unbound(WorkerEnvService, workerTags.values.worker)
 
-// ---------------------------------------------------------------------------
-// Pipeline seam — the model call the worker runs (real LLM or a mock).
-// ---------------------------------------------------------------------------
 
 export interface PipelineMessage {
   readonly role: string
@@ -806,7 +610,6 @@ const pipelineLayer = Layer.effect(
     const run = (input: PipelineInput): Effect.Effect<PipelineResult, Error> =>
       Effect.gen(function* () {
         const completion = yield* model.complete(input)
-        // A rejected publish is a typed error, not an unhandled defect.
         const published = yield* Effect.tryPromise({
           try: () =>
             writer.publish({
@@ -817,8 +620,7 @@ const pipelineLayer = Layer.effect(
             }),
           catch: (error) => (error instanceof Error ? error : new Error(String(error))),
         })
-        // Only a durable commit is egressed; a non-committed (idempotent replay
-        // or non-durable) publish emits nothing.
+        // Only a durable commit is egressed; a non-committed (idempotent replay or non-durable) publish emits nothing.
         const emitted = published.committed ? 1 : 0
         if (published.committed) {
           const boundary: EventV2Event = {
@@ -826,11 +628,7 @@ const pipelineLayer = Layer.effect(
             type: "session.text",
             properties: { text: completion.text, epoch: snapshot.epoch },
           }
-          // The committed `session.text` is a durable boundary (5.5), so prefer
-          // the transport's durable path when the handle offers one: it carries
-          // the commit's aggregate `(aggregateID, seq)` and bypasses delta
-          // coalescing. A committed publish always has a sequence; a null one is
-          // a broken writer contract, never a silently non-durable event.
+          // The committed `session.text` is a durable boundary (5.5), so prefer the transport's durable path when the handle offers one: it carries the commit's.
           if (published.seq === null) {
             return yield* Effect.fail(
               new Error(`committed publish for aggregate ${input.sessionID} returned no sequence`),
@@ -858,9 +656,6 @@ export const SessionPipelineNode = LayerNode.make({
   deps: [ModelClientNode, WriterClientNode, EventEgressClientNode, WorkerSnapshotNode],
 })
 
-// ---------------------------------------------------------------------------
-// Boundary replacement layers (production wiring is Phases 7/10).
-// ---------------------------------------------------------------------------
 
 /** Raised when worker code reaches a boundary owned by the hub / writer. */
 export class SessionLayerBoundaryError extends Schema.TaggedErrorClass<SessionLayerBoundaryError>(
@@ -884,17 +679,7 @@ export class SessionLayerBoundaryError extends Schema.TaggedErrorClass<SessionLa
 const boundaryViolation = (boundary: string, member: string): Effect.Effect<never> =>
   Effect.die(new SessionLayerBoundaryError(boundary, member))
 
-/**
- * Build a hub/writer-owned boundary service from the table of reads a
- * worker legitimately performs. Every method NOT listed fails loud with a
- * {@link SessionLayerBoundaryError} the moment it is called, so a method added
- * to the interface later is denied by default instead of silently returning
- * `undefined` or a `Layer.mock` no-op.
- *
- * The service is a `Proxy` because the method set is only known from the
- * interface type (erased at runtime): an unlisted property resolves to a
- * fail-loud function, so the table can never omit a denial.
- */
+/** Build a hub/writer-owned boundary service from the table of reads a worker legitimately performs. */
 function failLoudBoundary<I, S extends object>(
   boundary: string,
   service: Context.Key<I, S>,
@@ -935,26 +720,12 @@ export function snapshotModelsDevLayer(snapshot: WorkerSnapshot): Layer.Layer<Mo
   })
 }
 
-/**
- * Immutable snapshot-backed RuntimeFlags.
- *
- * A worker must NEVER re-derive flags from its own `process.env` / ConfigProvider:
- * the hub already resolved them once (including any per-layer override) and froze
- * the result into {@link WorkerSnapshot.flags}. Serving that value verbatim keeps
- * the isolate in lockstep with the hub — the previous gap let the reduced LLM
- * sub-graph see the hub flags while the full session loop silently fell back to
- * the process environment, so a flag set only on the hub (e.g.
- * `experimentalBackgroundSubagents`) never reached the session graph.
- */
+/** Immutable snapshot-backed RuntimeFlags. */
 export function snapshotRuntimeFlagsLayer(snapshot: WorkerSnapshot): Layer.Layer<RuntimeFlags.Service> {
   return Layer.succeed(RuntimeFlags.Service, snapshot.flags)
 }
 
-/**
- * Database is worker-owned. A graph with no `WorkerDatabase` must still build
- * (EventV2 duck-types the Drizzle client at layer construction), but any actual
- * query is a loud violation, never a silent `{}`.
- */
+/** Database is worker-owned. */
 export function databaseBoundaryLayer(): Layer.Layer<Database.Service> {
   const database: Database.Interface = {
     db: new Proxy({} as Database.Interface["db"], {
@@ -972,17 +743,7 @@ export function workerDbBoundaryLayer(): Layer.Layer<WorkerDb> {
   return Layer.succeed(WorkerDb, failLoudService<WorkerDatabase>("WorkerDb"))
 }
 
-// ---------------------------------------------------------------------------
-// Functional boundary layers for the hub-owned authorities.
-//
-// A worker legitimately owns no MCP/LSP servers, no OS process, no git checkout
-// and no storage. Each layer below therefore serves the flag-off EMPTY value for
-// the reads the session path performs (an MCP catalog with no servers, an LSP
-// with no clients) and fails loud with a {@link SessionLayerBoundaryError} for a
-// mutation a worker may not perform. The previous `Layer.mock(Service, {})`
-// provided neither: an unlisted read died with `Unimplemented method "<name>"`,
-// aborting the prompt loop the moment it read the MCP catalog.
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Functional boundary layers for the hub-owned authorities.
 
 /** The MCP boundary: a worker owns no servers, so every catalog read is empty. */
 export function mcpBoundaryLayer(): Layer.Layer<MCP.Service> {
@@ -1073,14 +834,7 @@ export function gitBoundaryLayer(): Layer.Layer<Git.Service> {
   return failLoudBoundary("Git", Git.Service, {})
 }
 
-/**
- * The ripgrep binary a worker runs.
- *
- * `Ripgrep` runs in-worker (the worker has the real `AppProcess` over its
- * `CrossSpawnSpawner`), but it must never download or locate the binary itself:
- * the hub resolved the real path and froze it into the snapshot. Serve that path
- * verbatim, falling back to a PATH-resolved `rg` when the snapshot omits it.
- */
+/** The ripgrep binary a worker runs. */
 export function snapshotRipgrepBinaryLayer(snapshot: WorkerSnapshot): Layer.Layer<RipgrepBinary.Service> {
   return Layer.succeed(RipgrepBinary.Service, { filepath: Effect.succeed(snapshot.ripgrepPath ?? "rg") })
 }
@@ -1090,14 +844,7 @@ export function mcpBrowserBoundaryLayer(): Layer.Layer<McpBrowser.Service> {
   return failLoudBoundary("McpBrowser", McpBrowser.Service, {})
 }
 
-/**
- * The `Permission` boundary for a worker with no hub control plane (degraded
- * boot). `Permission` is a hub-resident authority, so a worker that cannot reach
- * the hub must fail loud when a session asks for authorization — never a silent
- * `Layer.mock` no-op that would let a denied tool run. `list` is a neutral read
- * and stays empty; `ask`/`reply` die with a descriptive
- * {@link SessionLayerBoundaryError}.
- */
+/** The `Permission` boundary for a worker with no hub control plane (degraded boot). */
 export function permissionBoundaryLayer(): Layer.Layer<Permission.Service> {
   return failLoudBoundary("Permission", Permission.Service, {
     list: () => Effect.succeed([]),
@@ -1111,25 +858,12 @@ export function workerDatabaseLayer(
   return databaseLayer(database)
 }
 
-/**
- * The process-local `BackgroundJob` registry. Per-session workers run their own
- * background jobs; cascade cancellation reaches their child sessions through
- * `Session.children`, so no hub-side job registry is needed.
- */
+/** The process-local `BackgroundJob` registry. */
 export function localBackgroundJobLayer(): Layer.Layer<BackgroundJob.Service> {
-  return Layer.effect(BackgroundJob.Service, CoreBackgroundJob.make)
+  return Layer.effect(BackgroundJob.Service, make)
 }
 
-/**
- * The snapshot-backed and hub-authority fragments BOTH the full worker graph and
- * the reduced in-worker `LLM` sub-graph compose. Single-sourcing them means a
- * change to `Auth`/`Config`/`RuntimeFlags`/`Plugin`/`Permission` wiring can never
- * land in one view only.
- *
- * `Permission` is a hub-resident authority: route it over the hub-proxy control
- * port when the worker has one, otherwise fail loud (never a silent mock, which
- * would let a denied tool run in a degraded isolate).
- */
+/** The snapshot-backed and hub-authority fragments BOTH the full worker graph and the reduced in-worker `LLM` sub-graph compose. */
 export interface SharedBoundaryOptions {
   readonly hubProxies?: HubProxyClients
   readonly plugins?: WorkerPluginHost
@@ -1143,13 +877,7 @@ export function sharedBoundaryReplacements(
   return [
     [Auth.node, snapshotAuthLayer(snapshot)],
     [Config.node, snapshotConfigLayer(snapshot)],
-    // The hub resolved every runtime flag (including any per-layer override) and
-    // froze it into the snapshot; the worker serves that value rather than
-    // re-deriving from its own `process.env`.
     [RuntimeFlags.node, snapshotRuntimeFlagsLayer(snapshot)],
-    // The worker owns `Plugin`: the hub loads plugins (decision 70), but the
-    // model-facing hooks run here. Replacing the real node for the whole graph
-    // means the global `Plugin` layer is never built in the isolate.
     workerPluginReplacement(options.plugins, options.pluginTools),
     [
       Permission.node,
@@ -1168,23 +896,14 @@ const SESSION_PATCH_METADATA_KEY = "sessionPatch"
 
 type MutableSessionInfo = { -readonly [K in keyof SessionV1.SessionInfo]: SessionV1.SessionInfo[K] }
 
-/**
- * The columns a `session.updated` publisher declared it actually changed.
- * `undefined` means an older/undeltaed publisher, which keeps the conservative
- * full-image comparison.
- */
+/** The columns a `session.updated` publisher declared it actually changed. */
 function emittedSessionColumns(event: SessionProjector.ProjectedEvent): ReadonlySet<string> | undefined {
   const value = event.metadata?.[SESSION_PATCH_METADATA_KEY]
   if (!Array.isArray(value)) return undefined
   return new Set(value.filter((column): column is string => typeof column === "string"))
 }
 
-/**
- * Keep the projector's full-image write safe for a delta patch: every
- * hub-owned column the patch did not emit is restored from the authoritative
- * row, so a stale worker snapshot can never resurrect billing/share/revert or
- * identity state that the hub advanced concurrently.
- */
+/** Keep the projector's full-image write safe for a delta patch: every hub-owned column the patch did not emit is restored from the authoritative row. */
 function restoreUnemittedSessionColumns(
   info: MutableSessionInfo,
   authoritative: SessionV1.SessionInfo,
@@ -1229,13 +948,7 @@ function parseSessionJsonColumn(value: unknown): unknown {
   }
 }
 
-/**
- * The authoritative session row read synchronously on the worker's connection.
- * `authorize` is called before `SessionProjector` builds its write effect, so
- * the delta normalization below must read the row at call time to be seen by
- * that effect. The worker connection is inside the durable-commit transaction,
- * so this read observes every committed hub write.
- */
+/** The authoritative session row read synchronously on the worker's connection. */
 function readSessionProjectionRow(
   database: WorkerDatabase,
   sessionID: string,
@@ -1252,17 +965,7 @@ function readSessionProjectionRow(
   } as unknown as typeof SessionTable.$inferSelect
 }
 
-/**
- * The projection authority of a bound worker. The durable aggregate fence only
- * checks `data.sessionID`; this policy also pins every nested identity to it,
- * rejects worker-authored session-root lifecycle, and refuses immutable session
- * columns plus hub-owned `metadata.depth`. It runs before any projector write,
- * inside the same durable-commit transaction.
- *
- * A delta patch (`metadata.sessionPatch`) is normalized synchronously at call
- * time: every hub-owned column it did not emit is replaced with the
- * authoritative row before `SessionProjector` builds its full-image write.
- */
+/** The projection authority of a bound worker. */
 function workerProjectionPolicy(database?: WorkerDatabase): SessionProjector.ProjectionPolicy {
   return {
     authorize: (event, db) => {
@@ -1284,15 +987,12 @@ function workerProjectionPolicy(database?: WorkerDatabase): SessionProjector.Pro
           return yield* rejectProjection(event, event.data.sessionID, "the session root is hub authority")
         }
 
-        // Relocation is a control-plane operation: it rewrites the immutable
-        // directory/workspace identity and must not originate in a worker.
+        // Relocation is a control-plane operation: it rewrites the immutable directory/workspace identity and must not originate in a worker.
         if (event.type === SessionEvent.Moved.type) {
           return yield* rejectProjection(event, event.data.sessionID, "session location is hub authority")
         }
 
-        // Revert state is hub authority in every shape, not only the
-        // `Session.Info` image: the dedicated revert branches write the same
-        // hub-owned `revert` column without consulting the column whitelist.
+        // Revert state is hub authority in every shape, not only the `Session.Info` image: the dedicated revert branches write the same hub-owned `revert`.
         if (
           event.type === SessionEvent.RevertEvent.Staged.type ||
           event.type === SessionEvent.RevertEvent.Cleared.type ||
@@ -1316,17 +1016,11 @@ function workerProjectionPolicy(database?: WorkerDatabase): SessionProjector.Pro
             .where(eq(SessionTable.id, event.data.sessionID))
             .get()
             .pipe(Effect.orDie)
-          // A missing row makes the projector update a no-op; it can never mint
-          // the root, because Created is rejected above.
+          // A missing row makes the projector update a no-op; it can never mint the root, because Created is rejected above.
           if (current === undefined) return
-          // A delta publisher names exactly the columns it changed. Judge (and
-          // write) only those, so a stale full image cannot be rejected for, or
-          // overwrite, hub-owned columns it merely echoed.
+          // A delta publisher names exactly the columns it changed.
           const emitted = emittedSessionColumns(event)
           const isEmitted = (column: string) => emitted === undefined || emitted.has(column)
-          // Mirror the projector's write semantics: an absent optional field is
-          // omitted from the UPDATE (preserved), while `workspaceID` is written
-          // as null when absent.
           const next: Record<string, unknown> = {
             id: info.id,
             project_id: info.projectID,
@@ -1363,11 +1057,7 @@ function workerProjectionPolicy(database?: WorkerDatabase): SessionProjector.Pro
               }
             }
           }
-          // The projector writes the whole `sessionRow(info)` image (undefined
-          // fields are omitted by `SET`). Compare the columns this event emitted
-          // with the row the policy already loaded and allow only worker-owned
-          // columns to change; a repeated hub value is a no-op, a changed one is
-          // authority.
+          // The projector writes the whole `sessionRow(info)` image (undefined fields are omitted by `SET`).
           const currentRow = current as Record<string, unknown>
           const image = sessionRow(info) as Record<string, unknown>
           const emittedImage =
@@ -1448,21 +1138,7 @@ function workerProjectionPolicy(database?: WorkerDatabase): SessionProjector.Pro
   }
 }
 
-/**
- * Boundary replacements every session layer needs. `Database` is replaced by
- * the per-worker WAL connection when one is supplied (otherwise a fail-loud
- * boundary: D5 has no writer-proxy fallback). MCP/LSP are hub-owned and stay
- * excluded from the worker graph. `SessionProjector` is intentionally NOT replaced: it runs in-worker,
- * registering `EventV2.project` subscribers so durable session events materialize
- * the `session`/`message`/`part` rows.
- *
- * Every other hub/writer-owned node reachable from the real
- * `SessionPrompt` graph is replaced by a FUNCTIONAL boundary layer, not
- * `Layer.empty`: the graph must boot (a dependency on an absent service is a
- * build failure), and a worker that reaches a hub-owned authority fails loud at
- * call time. `BackgroundJob` uses the hub client when supplied; otherwise the
- * process-local registry.
- */
+/** Boundary replacements every session layer needs. */
 export function boundaryReplacements(
   snapshot: WorkerSnapshot,
   database?: WorkerDatabase,
@@ -1473,51 +1149,26 @@ export function boundaryReplacements(
     ...sharedBoundaryReplacements(snapshot, boundaries),
     [ModelsDev.node, snapshotModelsDevLayer(snapshot)],
     [Database.node, database === undefined ? databaseBoundaryLayer() : workerDatabaseLayer(database)],
-    // `SessionProjector` deliberately has NO boundary replacement: it runs IN the
-    // worker. `Session.updateMessage`/`updatePart` publish durable events, and the
-    // projector materializes the `session`/`message`/`part` rows the loop reads
-    // back. Its `EventV2.project` subscribers run inside `EventV2`'s durable-commit
-    // `db.transaction` on the worker's own WAL connection, so projection is atomic
-    // with the event insert, exactly as flag-off. (The node-table classifies it
-    // `worker-local`.)
-    // Hub-owned authorities the reduced graph yields. Each is a
-    // FUNCTIONAL boundary: the graph BOOTS (an `Layer.empty` provides nothing, so
-    // `SessionPrompt`'s `yield* MCP.Service`/`LSP.Service` would fail at build)
-    // AND a session that reads a neutral catalog (MCP `clients`/`instructions`,
-    // LSP `diagnostics`) gets the flag-off empty value instead of aborting. A
-    // genuinely unsupported mutation (an MCP `add`, a git `run`) still fails loud
-    // with a `SessionLayerBoundaryError`.
+    // `SessionProjector` deliberately has NO boundary replacement: it runs IN the worker.
     [MCP.node, mcpBoundaryLayer()],
     [LSP.node, lspBoundaryLayer()],
     [McpAuth.node, mcpAuthBoundaryLayer()],
     [Npm.node, npmBoundaryLayer()],
     [Account.node, accountBoundaryLayer()],
     [AccountRepo.node, accountRepoBoundaryLayer()],
-    // Residual hub/writer/infra boundaries (see `SESSION_EXCLUDED`).
     [Storage.node, storageBoundaryLayer()],
     [Git.node, gitBoundaryLayer()],
     [BackgroundJob.node, backgroundJob ?? localBackgroundJobLayer()],
-    // `Global` is a plain record of paths (no I/O); the real value is safe and
-    // lets any read of `Global.Path`/`Service` work rather than return undefined.
+    // `Global` is a plain record of paths (no I/O); the real value is safe and lets any read of `Global.Path`/`Service` work rather than return undefined.
     [Global.node, Layer.succeed(Global.Service, Global.make())],
-    // `AppProcess` and `Ripgrep` run IN the worker: the worker already has a real
-    // `CrossSpawnSpawner` (via `ToolRegistry`), so its ripgrep search path is
-    // functional, not a fail-loud boundary. Only the binary path is frozen — the
-    // worker must never locate or download `rg` on its own.
+    // `AppProcess` and `Ripgrep` run IN the worker: the worker already has a real `CrossSpawnSpawner` (via `ToolRegistry`).
     [RipgrepBinary.node, snapshotRipgrepBinaryLayer(snapshot)],
     [McpBrowser.node, mcpBrowserBoundaryLayer()],
-    // The hub composes the location service map; the worker never resolves a
-    // location for a V1 session, so a lazily-built empty map satisfies the graph
-    // without pulling the V2 location graph into the isolate.
+    // The hub composes the location service map; the worker never resolves a location for a V1 session.
     [LocationServiceMap.node, buildLocationServiceMap()],
   ]
 }
 
-// ---------------------------------------------------------------------------
-// In-worker LLM: the stream stays in the isolate. A worker
-// builds a *reduced* `Provider` from its serializable model snapshot and runs
-// the real `LLM` node over it. Nothing proxies the `Response`/`ReadableStream`.
-// ---------------------------------------------------------------------------
 
 /** The serializable provider/model bootstrap a worker receives (see `init.ts`). */
 export interface WorkerModelModalities {
@@ -1545,16 +1196,7 @@ export interface WorkerModelLimit {
   readonly output: number
 }
 
-/**
- * The reduced provider bootstrap a worker consumes. Identity and transport come
- * from the hub; `capabilities` / `limit` / `options` / `variants` /
- * `providerOptions` are the REAL serialized model descriptor, so the worker's
- * outgoing request params equal flag-off (no synthesized temperature capability,
- * no 4096 output cap, no dropped reasoning/variant/option surface).
- *
- * The descriptor fields are optional so a legacy/minimal bootstrap still boots;
- * an absent field is treated as "not advertised" rather than re-invented.
- */
+/** The reduced provider bootstrap a worker consumes. */
 export interface WorkerModelConfig {
   readonly providerID: string
   readonly modelID: string
@@ -1588,13 +1230,7 @@ function reducedProviderInfo(config: WorkerModelConfig, model: Provider.Model): 
   }
 }
 
-/**
- * Raised when a session asks the worker for a provider/model other than the one
- * the hub serialized into its bootstrap. A worker owns exactly one model, so the
- * mismatch is diagnosed at the provider boundary — naming both models — before
- * any request is made, instead of surfacing as a generic
- * `ProviderModelNotFoundError` die mid-run.
- */
+/** Raised when a session asks the worker for a provider/model other than the one the hub serialized into its bootstrap. */
 export class WorkerModelMismatchError extends Schema.TaggedErrorClass<WorkerModelMismatchError>()(
   "WorkerModelMismatchError",
   {
@@ -1621,9 +1257,7 @@ function reducedProviderModel(config: WorkerModelConfig): Provider.Model {
     api: { id: config.apiId, url: config.baseUrl, npm: workerNpm(config) },
     name: config.modelID,
     capabilities: {
-      // The descriptor's real capabilities; absent means "not advertised", so we
-      // never synthesize `temperature: true` (which forced `transform.temperature`
-      // to 1.0 for glm/minimax/kimi/gemini) or a dropped reasoning surface.
+      // The descriptor's real capabilities; absent means "not advertised".
       temperature: capabilities?.temperature ?? false,
       reasoning: capabilities?.reasoning ?? false,
       attachment: capabilities?.attachment ?? false,
@@ -1633,9 +1267,6 @@ function reducedProviderModel(config: WorkerModelConfig): Provider.Model {
       output: capabilities?.output ?? allModalities,
     },
     cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-    // The descriptor's real limits. An absent output limit means "unbounded"
-    // (`maxOutputTokens` then falls back to the global max) rather than the
-    // synthesized 4096 cap that truncated worker turns.
     limit: { context: config.limit?.context ?? 128_000, output: config.limit?.output ?? 0 },
     status: "active",
     options: { ...(config.options ?? {}) },
@@ -1700,12 +1331,7 @@ function wrapSseIdle(response: Response, ms: number, controller: AbortController
   })
 }
 
-/**
- * The worker transport fetch: applies the serialized `headerTimeout` / `timeout`
- * / `chunkTimeout` provider options the same way the hub's `resolveSDK` installs
- * `timeoutFetch` (`provider.ts:1852`), so a worker request is bounded like
- * flag-off instead of using the unbounded global `fetch`.
- */
+/** The worker transport fetch: applies the serialized `headerTimeout` / `timeout` / `chunkTimeout` provider options the same way the hub's `resolveSDK`. */
 /** Bun's `fetch` accepts a `timeout` extension `RequestInit` does not declare. */
 interface BunRequestInit extends RequestInit {
   /** `false` disables Bun's own request timeout. */
@@ -1738,18 +1364,7 @@ function workerTimeoutFetch(options: Readonly<Record<string, unknown>>): typeof 
   }) as typeof fetch
 }
 
-/**
- * Build the reduced provider's SDK from the serialized `npm`, so a worker makes
- * the provider-shaped request the hub resolved instead of always an
- * OpenAI-compatible body. Unknown packages keep the OpenAI-compatible default
- * (the previous behavior), so a provider that is OpenAI-compatible but has no
- * bundled SDK still works.
- *
- * The serialized `providerOptions` are spread into the SDK the same way the
- * hub's `resolveSDK` does (`provider.ts:1791-1865`): the base URL / API key /
- * headers override them, `includeUsage` is set for OpenAI-compatible providers,
- * and a timeout-aware `fetch` bounds the request.
- */
+/** Build the reduced provider's SDK from the serialized `npm`, so a worker makes the provider-shaped request the hub resolved instead of always an. */
 function createWorkerLanguageSdk(config: WorkerModelConfig): WorkerLanguageSdk {
   const npm = workerNpm(config)
   const providerOptions = config.providerOptions ?? {}
@@ -1778,18 +1393,12 @@ function createWorkerLanguageSdk(config: WorkerModelConfig): WorkerLanguageSdk {
   }
 }
 
-/**
- * The reduced in-worker `Provider`: a client over the serialized
- * `{providerID, modelID, apiId, npm, baseUrl, apiKey}` bootstrap plus the real
- * serialized model descriptor. `getLanguage` returns a real AI-SDK language
- * model, so the worker makes the HTTP call itself.
- */
+/** The reduced in-worker `Provider`: a client over the serialized `{providerID, modelID, apiId, npm, baseUrl. */
 export function reducedModelProviderLayer(config: WorkerModelConfig): Layer.Layer<Provider.Service> {
   const sdk = createWorkerLanguageSdk(config)
   const model = reducedProviderModel(config)
   const info = reducedProviderInfo(config, model)
-  // The reduced provider serves exactly one model; any other request is a
-  // programming error surfaced loudly rather than silently mis-served.
+  // The reduced provider serves exactly one model; any other request is a programming error surfaced loudly rather than silently mis-served.
   const mismatch = (requestedProvider: ProviderV2.ID, requestedModel: ModelV2.ID) =>
     new WorkerModelMismatchError({
       requestedProviderID: requestedProvider,
@@ -1812,17 +1421,10 @@ export function reducedModelProviderLayer(config: WorkerModelConfig): Layer.Laye
     getSmallModel: () => Effect.succeed(undefined),
     defaultModel: () => Effect.succeed({ providerID: info.id, modelID: model.id }),
   }
-  // The reduced provider is structurally a `Provider.Interface`, but its
-  // single-model mismatch is a more specific typed error than the interface's
-  // `ModelNotFoundError`. The cast keeps that diagnosis intact; the worker's
-  // prompt path surfaces it verbatim instead of a generic not-found die.
   return Layer.succeed(Provider.Service, service as unknown as Provider.Interface)
 }
 
-/**
- * The boundary `Plugin.trigger`, erased to its runtime shape so the no-op and
- * host-backed layers share one signature.
- */
+/** The boundary `Plugin.trigger`, erased to its runtime shape so the no-op and host-backed layers share one signature. */
 type PluginTrigger = Plugin.Interface["trigger"]
 
 /** The hooks the reduced worker graph can actually dispatch in this isolate. */
@@ -1838,21 +1440,10 @@ const WORKER_DISPATCHED_HOOKS: ReadonlySet<string> = new Set([
   "experimental.chat.messages.transform",
 ])
 
-/**
- * No plugin host means no configured hook exists, so the trigger is a true
- * no-op. An unsupported hook is only a failure when a loaded plugin declared it.
- */
+/** No plugin host means no configured hook exists, so the trigger is a true no-op. */
 const noopPluginTrigger = ((_name: string, _input: unknown, output: unknown) => Effect.succeed(output)) as PluginTrigger
 
-/**
- * Dispatch one `Plugin.trigger` to the matching worker-hosted hook.
- *
- * A routed-but-unsupported hook is a true no-op when no loaded plugin declared
- * it: the worker invokes `experimental.text.complete` on every text-end, so a
- * host existing (because `init.plugins` is an array) must not fail an
- * unimplemented hook. A hook a plugin *did* declare stays a typed failure at
- * invocation (D19) rather than being silently skipped.
- */
+/** Dispatch one `Plugin.trigger` to the matching worker-hosted hook. */
 function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknown, output: unknown): Promise<unknown> {
   const route = workerHookRoute(name)
   if (route === undefined) throw new UnclassifiedPluginHookError({ plugin: "worker", hook: name })
@@ -1887,34 +1478,17 @@ function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknow
   }
 }
 
-/**
- * Hub-executed plugin tools as the worker sees them: the clone-safe descriptors
- * plus the executor that proxies a call back over the hub control port. Bundled
- * so a descriptor without an executor (an unexecutable stub) is unrepresentable.
- */
+/** Hub-executed plugin tools as the worker sees them: the clone-safe descriptors plus the executor that proxies a call back over the hub control port. */
 export interface RemotePluginTools {
   readonly descriptors: readonly PluginToolDescriptor[]
   readonly executor: PluginToolExecutor
-  /**
-   * The hub abort bridge, forwarded onto every rebuilt remote definition so the
-   * registry's `toolCtx.abort` subscription reaches the hub's in-flight call.
-   * Optional: a handle without a hub control port omits it.
-   */
+  /** The hub abort bridge, forwarded onto every rebuilt remote definition so the registry's `toolCtx.abort` subscription reaches the hub's in-flight call. */
   readonly abort?: PluginToolAbort
-  /**
-   * Re-fetch the hub's descriptors and swap them into this handle — the lazy
-   * self-heal action attached to each remote definition as its `refresh` seam.
-   * Optional: present only when the handle can reach the hub's list authority.
-   */
+  /** Re-fetch the hub's descriptors and swap them into this handle — the lazy self-heal action attached to each remote definition as its `refresh` seam. */
   readonly refreshFromHub?: () => Promise<void>
 }
 
-/**
- * Raised when a remote plugin-tool id is ambiguous: it is declared twice, or it
- * collides with a local/builtin tool the registry already owns. Plugin tool ids
- * are bare plugin keys (`registry.ts:199`), so a collision would otherwise
- * silently shadow a tool; fail loud instead.
- */
+/** Raised when a remote plugin-tool id is ambiguous: it is declared twice, or it collides with a local/builtin tool the registry already owns. */
 export class PluginToolIDCollisionError extends Schema.TaggedErrorClass<PluginToolIDCollisionError>(
   "PluginToolIDCollisionError",
 )("PluginTool.IDCollision", {
@@ -1935,14 +1509,7 @@ export class PluginToolIDCollisionError extends Schema.TaggedErrorClass<PluginTo
   }
 }
 
-/**
- * The collision policy for remote plugin-tool descriptors, applied before
- * registration. Fails loud when the same id is declared twice, or when an id is
- * already reserved by a local/builtin tool (the `reservedIDs` the registry
- * knows). Returns the descriptors unchanged so a caller can chain into
- * registration; the registry passes its builtin ids here, and
- * {@link refreshablePluginTools} applies the same policy at its boundary.
- */
+/** The collision policy for remote plugin-tool descriptors, applied before registration. */
 export function assertPluginToolDescriptorsUnique(
   descriptors: readonly PluginToolDescriptor[],
   reservedIDs: Iterable<string> = [],
@@ -1957,30 +1524,12 @@ export function assertPluginToolDescriptorsUnique(
   return descriptors
 }
 
-/**
- * A {@link RemotePluginTools} whose descriptor set can be replaced in place
- * after a hub-side plugin reload (design Q4). `descriptors` is a live getter, so
- * the worker's `Plugin.Service.list()` reads whatever set is current at call
- * time; a caller that captured the layer before a refresh still sees the new
- * set. The registry (L2) owns re-registration; this seam only keeps the source
- * live.
- */
 export interface RefreshablePluginTools extends RemotePluginTools {
   /** Replace the descriptor set; the next `list()` reflects it. Fails loud on a collision. */
   refresh(descriptors: readonly PluginToolDescriptor[]): void
 }
 
-/**
- * Build the live {@link RefreshablePluginTools} handle. The returned value IS
- * the `RemotePluginTools` to pass as `SessionLayerOptions.pluginTools`; call
- * `refresh` after a plugin reload to replace the descriptors. Both the initial
- * set and every refresh apply {@link assertPluginToolDescriptorsUnique}, so an
- * ambiguous remote id is rejected at the boundary rather than registered.
- *
- * `abort` and `list` (when supplied) are the hub seams: `abort` becomes each
- * remote definition's abort bridge, and `list` backs `refreshFromHub`, the lazy
- * re-fetch the registry triggers after an `UnknownPluginToolError`.
- */
+/** Build the live {@link RefreshablePluginTools} handle. */
 export function refreshablePluginTools(
   initialDescriptors: readonly PluginToolDescriptor[],
   executor: PluginToolExecutor,
@@ -2005,14 +1554,6 @@ export function refreshablePluginTools(
   }
 }
 
-/**
- * The boundary `Plugin` for a worker, parameterised by its `trigger` (decision
- * 70): the hub owns plugin *loading*, but the model-facing hooks run in the
- * isolate. A no-op trigger yields the pass-through; a host-backed trigger runs
- * `chat.params` / `chat.headers`, the tool hooks, and the system/messages
- * transforms in-worker, so plugin-set sampling/headers and pruning match
- * flag-off. One layer covers both cases.
- */
 function workerPluginLayer(trigger: PluginTrigger, pluginTools?: RemotePluginTools): Layer.Layer<Plugin.Service> {
   const plugin = {
     trigger,
@@ -2022,14 +1563,7 @@ function workerPluginLayer(trigger: PluginTrigger, pluginTools?: RemotePluginToo
   return Layer.succeed(Plugin.Service, plugin)
 }
 
-/**
- * The synthetic `Hooks` a worker lists for its hub-executed plugin tools.
- * `remotePluginToolHooks` builds one remote definition per descriptor, so the
- * real `ToolRegistry` registers a proxy stub. Absent the remote tools (degraded
- * boot, or no plugin tools), the worker lists nothing. The descriptor set is
- * re-validated on every read so a colliding id fails loud before registration,
- * whether the caller used {@link refreshablePluginTools} or a plain literal.
- */
+/** The synthetic `Hooks` a worker lists for its hub-executed plugin tools. */
 function remotePluginHooks(pluginTools?: RemotePluginTools): Hooks[] {
   if (pluginTools === undefined) return []
   const descriptors = assertPluginToolDescriptorsUnique(pluginTools.descriptors)
@@ -2041,19 +1575,16 @@ function remotePluginHooks(pluginTools?: RemotePluginTools): Hooks[] {
   return [remotePluginToolHooks(descriptors, pluginTools.executor, callbacks) as unknown as Hooks]
 }
 
-/**
- * The worker-safe `Plugin.node` replacement: the worker-hosted hooks when a
- * {@link WorkerPluginHost} is supplied, otherwise a no-op pass-through. This is
- * the single source for the replacement, used by both the full worker graph
- * ({@link buildSessionWorkerLayer}) and the reduced `LLM` sub-graph
- * ({@link reducedLlmLayer}), so neither ever builds the global `Plugin` layer.
- */
+/** The worker-safe `Plugin.node` replacement: the worker-hosted hooks when a {@link WorkerPluginHost} is supplied, otherwise a no-op pass-through. */
 function workerPluginReplacement(plugins?: WorkerPluginHost, pluginTools?: RemotePluginTools): LayerNode.Replacement {
   const trigger: PluginTrigger =
     plugins === undefined
       ? noopPluginTrigger
       : (((name: string, input: unknown, output: unknown) =>
-          Effect.promise(() => runWorkerPluginHook(plugins, name, input, output))) as PluginTrigger)
+          Effect.tryPromise({
+            try: () => runWorkerPluginHook(plugins, name, input, output),
+            catch: (cause) => cause,
+          }).pipe(Effect.orDie)) as PluginTrigger)
   return [Plugin.node, workerPluginLayer(trigger, pluginTools)]
 }
 
@@ -2070,11 +1601,6 @@ function streamInputFor(model: Provider.Model, input: PipelineInput): LLM.Stream
   } as unknown as LLM.StreamInput
 }
 
-/**
- * An `LLM.stream`-backed `ModelClient`: concatenates the streamed `text-delta`
- * events of one provider turn (design decision 20 — the stream is consumed
- * in-worker, never proxied).
- */
 export function llmModelClientLayer(config: WorkerModelConfig): Layer.Layer<ModelClient, never, LLM.Service> {
   const model = reducedProviderModel(config)
   return Layer.effect(
@@ -2096,14 +1622,7 @@ export function llmModelClientLayer(config: WorkerModelConfig): Layer.Layer<Mode
   )
 }
 
-/**
- * A fail-loud service for a worker boundary the *standalone* reduced LLM
- * sub-graph must never call. Every member access dies with a descriptive
- * {@link SessionLayerBoundaryError} naming the boundary and member, so a
- * mis-wired worker surfaces a precise diagnosis instead of a generic
- * `UnimplementedError`. The full worker graph supplies the real nodes; this
- * sub-graph only needs a satisfiable service so `LLM` compiles.
- */
+/** A fail-loud service for a worker boundary the *standalone* reduced LLM sub-graph must never call. */
 function failLoudService<T extends object>(boundary: string): T {
   return new Proxy(
     {},
@@ -2116,39 +1635,17 @@ function failLoudService<T extends object>(boundary: string): T {
   ) as T
 }
 
-/**
- * The `EventV2Bridge` boundary for the standalone reduced LLM sub-graph: the
- * isolate publishes through its own event port in the full graph, so this
- * sub-graph never reaches the hub bridge and fails loud if it ever does.
- */
+/** The `EventV2Bridge` boundary for the standalone reduced LLM sub-graph: the isolate publishes through its own event port in the full graph. */
 function eventV2BridgeBoundaryLayer(): Layer.Layer<EventV2Bridge.Service> {
   return Layer.succeed(EventV2Bridge.Service, failLoudService<EventV2.Interface>("EventV2Bridge"))
 }
 
-/**
- * The `LLMClient` boundary for the standalone reduced LLM sub-graph: the full
- * worker graph builds the real platform client, so this sub-graph never issues a
- * request and fails loud if it ever does.
- */
+/** The `LLMClient` boundary for the standalone reduced LLM sub-graph: the full worker graph builds the real platform client. */
 function llmClientBoundaryLayer(): Layer.Layer<LLMClientService> {
   return Layer.succeed(LLMClient.Service, failLoudService<LLMClientShape>("LLMClient"))
 }
 
-/**
- * The boundary replacements for the standalone reduced LLM sub-graph.
- * `Permission` is a hub-resident authority: route it over the hub-proxy control
- * port when the worker has one, otherwise fail loud. `EventV2Bridge`/`LLMClient`
- * are hub-owned; this sub-graph only needs satisfiable services so `LLM`
- * compiles and never reaches them. `Plugin` is a worker-safe replacement here
- * (host when supplied, no-op otherwise); the full worker graph additionally
- * replaces `Plugin.node` at the top level ({@link buildSessionWorkerLayer}).
- * `pluginTools`, when supplied, reaches this sub-graph's `Plugin` replacement
- * too, so a tool-consuming reduced node sees the hub-executed remote tools
- * exactly as the full graph does.
- *
- * Exported so a test can assert the per-node boundary wiring without resolving
- * the sub-graph's (single, `LLM`) output service.
- */
+/** The boundary replacements for the standalone reduced LLM sub-graph. */
 export function llmBoundaryReplacements(
   snapshot: WorkerSnapshot,
   config: WorkerModelConfig,
@@ -2164,11 +1661,7 @@ export function llmBoundaryReplacements(
   ]
 }
 
-/**
- * The worker-local `LLM` service: the real `LLM` node composed over the reduced
- * provider, the snapshot Config/Auth/ModelsDev and the hub-proxy authorities.
- * This keeps the provider stream inside the isolate (design decision 20).
- */
+/** The worker-local `LLM` service: the real `LLM` node composed over the reduced provider. */
 export function reducedLlmLayer(
   snapshot: WorkerSnapshot,
   config: WorkerModelConfig,
@@ -2179,16 +1672,8 @@ export function reducedLlmLayer(
   return AppNodeBuilderV1.build(LLM.node, llmBoundaryReplacements(snapshot, config, hubProxies, plugins, pluginTools))
 }
 
-// ---------------------------------------------------------------------------
-// Groups + builder
-// ---------------------------------------------------------------------------
 
-/**
- * The ONE ordered registration list for the real session nodes. The groups and
- * the key→node registry are derived from it, so there is a single place to add
- * a node; `REQUIRED_SESSION_NODE_KEYS` (node-table.ts) is the independent
- * declaration of what must be present, checked at module init below.
- */
+/** The ONE ordered registration list for the real session nodes. */
 const SESSION_NODE_LIST = [
   Session.node,
   SessionPrompt.node,
@@ -2229,11 +1714,7 @@ export const SESSION_NODE_REGISTRY: ReadonlyMap<string, LayerNode.AnyNode> = new
   SESSION_NODE_LIST.map((node) => [node.name, node]),
 )
 
-/**
- * Required-key parity, checked when this module initialises. A node added to the
- * list but not to `REQUIRED_SESSION_NODE_KEYS` (or vice versa) is a table/layer
- * drift that would otherwise surface only when a worker graph fails to build.
- */
+/** Required-key parity, checked when this module initialises. */
 function assertRequiredSessionNodeParity(): void {
   const registered = [...SESSION_NODE_REGISTRY.keys()]
   const missing = REQUIRED_SESSION_NODE_KEYS.filter((key) => !SESSION_NODE_REGISTRY.has(key))
@@ -2276,13 +1757,7 @@ export const SESSION_NODES = LayerNode.group([
   ...SESSION_CLIENT_NODES,
 ])
 
-/**
- * The declared *runnable* graph: every required session-node service plus the
- * worker-infrastructure nodes (pipeline seam, clients, snapshot, env). A worker
- * is "able to satisfy" the real `SessionPrompt`/`SessionProcessor` loop when
- * `validateSessionLayer(RUNNABLE_SESSION_NODES, boundaryReplacements(...))` is
- * clean and fails closed on any unclassified reachable node.
- */
+/** The declared *runnable* graph: every required session-node service plus the worker-infrastructure nodes (pipeline seam, clients, snapshot, env). */
 export const RUNNABLE_SESSION_NODES = LayerNode.group([
   ...REQUIRED_SESSION_NODES,
   SessionPipelineNode,
@@ -2290,14 +1765,7 @@ export const RUNNABLE_SESSION_NODES = LayerNode.group([
   ...SESSION_CLIENT_NODES,
 ])
 
-/**
- * The reduced pipeline subset: the one-shot `SessionPipeline` seam, runtime
- * flags and the worker infrastructure. `ModelClient` is the injectable model
- * seam, so a test can point it at the mock provider. Retained as an explicit,
- * lightweight graph for pipeline-only tests; the production default is the full
- * runnable session graph (`RUNNABLE_SESSION_NODES`), which now boots against the
- * functional boundary layers.
- */
+/** The reduced pipeline subset: the one-shot `SessionPipeline` seam, runtime flags and the worker infrastructure. */
 export const PIPELINE_SESSION_NODES = LayerNode.group([
   SessionPipelineNode,
   RuntimeFlags.node,
@@ -2320,50 +1788,19 @@ export interface SessionLayerOptions {
   }
   /** Model seam; required because the layer never talks to a real provider by default. */
   readonly modelClient: Layer.Layer<ModelClient>
-  /**
-   * Hub-resident authority proxies. When supplied, the
-   * `SessionStatus` / `Permission` / `Question` hub-proxy nodes join the graph
-   * and their services are provided over the ports.
-   */
+  /** Hub-resident authority proxies. */
   readonly hubProxies?: HubProxyClients
-  /**
-   * The one session this isolate is bound to. The hub-proxy session scope uses
-   * it to authorize child create/read/children/cancel so a worker can never
-   * reach another session's rows. Absent on degraded graphs that run inline.
-   */
+  /** The one session this isolate is bound to. */
   readonly boundSessionID?: SessionID
-  /**
-   * Functional `BackgroundJob` replacement; the default is the process-local
-   * registry (per-session workers own their background jobs).
-   */
+  /** Functional `BackgroundJob` replacement; the default is the process-local registry (per-session workers own their background jobs). */
   readonly backgroundJob?: Layer.Layer<BackgroundJob.Service>
-  /**
-   * Worker→hub PID reporter. Production supplies the control-port-backed
-   * reporter so a detached shell child's process group reaches the hub mirror.
-   * Absent on degraded/hub-only paths, where the shell tool is a no-op.
-   */
+  /** Worker→hub PID reporter. */
   readonly pidReporter?: PidReporterInterface
-  /**
-   * The worker-hosted plugin hooks. The session layer owns the `Plugin.node`
-   * replacement (the hub loads plugins, decision 70), so the model-facing hooks
-   * run in this isolate. Absent, the graph uses a no-op pass-through; the global
-   * `Plugin` layer is never built in the worker.
-   */
+  /** The worker-hosted plugin hooks. */
   readonly plugins?: WorkerPluginHost
-  /**
-   * Hub-executed plugin tools: clone-safe descriptors plus the hub-proxy
-   * executor. The worker's `Plugin.Service.list()` then exposes one remote stub
-   * per descriptor, which `ToolRegistry` registers and whose execution proxies
-   * to the hub. Absent (degraded boot, no hub client, or no plugin tools) the
-   * worker lists no plugin tools. Supply {@link refreshablePluginTools} to let a
-   * hub-side plugin reload replace the set after boot.
-   */
+  /** Hub-executed plugin tools: clone-safe descriptors plus the hub-proxy executor. */
   readonly pluginTools?: RemotePluginTools
-  /**
-   * Non-graph worker logging layer (see `worker-logging.ts`). Merged beside the
-   * non-graph seams so the worker's `Effect.log*` reaches the main sink; absent
-   * keeps the graph byte-for-byte unchanged.
-   */
+  /** Non-graph worker logging layer (see `worker-logging.ts`). */
   readonly logging?: Layer.Layer<never>
   /** Extra replacements, e.g. the real LLM-backed `ModelClient` in production. */
   readonly replacements?: LayerNode.Replacements
@@ -2375,16 +1812,10 @@ export interface SessionWorkerLayer {
   readonly layer: Layer.Layer<unknown, unknown>
 }
 
-/**
- * Compose the reduced session layer, assert it against the node table, and
- * return the compiled layer. Fails loud (`SessionLayerViolationError`) if an
- * excluded node leaked in or a required client node is missing.
- */
+/** Compose the reduced session layer, assert it against the node table, and return the compiled layer. */
 export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWorkerLayer {
   const base = options.nodes ?? RUNNABLE_SESSION_NODES
-  // Hub-proxy authorities are REPLACEMENTS over nodes the base graph already
-  // contains (SessionStatus/Permission/Question); appending a second proxy group
-  // would duplicate those service keys in the root.
+  // Hub-proxy authorities are REPLACEMENTS over nodes the base graph already contains (SessionStatus/Permission/Question).
   const replacements: LayerNode.Replacements = [
     [WriterClientNode, writerClient.layer(options.clients.writer)],
     [EventEgressClientNode, eventEgressClient.layer(options.clients.egress)],
@@ -2397,8 +1828,6 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
         ? workerDbBoundaryLayer()
         : Layer.succeed(WorkerDb, options.clients.database),
     ],
-    // The shared fragment owns `Plugin` and `Permission`; the full graph adds
-    // the remaining hub authorities (SessionStatus/Question) as replacements.
     ...boundaryReplacements(options.snapshot, options.clients.database, options.backgroundJob, {
       ...(options.hubProxies === undefined ? {} : { hubProxies: options.hubProxies }),
       ...(options.plugins === undefined ? {} : { plugins: options.plugins }),
@@ -2410,41 +1839,24 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
 
   assertSessionLayer(base, replacements)
   const built = AppNodeBuilderV1.build(base, replacements)
-  // `PidReporter` is not a graph node: the shell tool reads it optionally at
-  // execution time, so merging it keeps degraded graphs (no reporter) building
-  // unchanged while the production graph sees the control-port reporter.
   const withPid =
     options.pidReporter === undefined ? built : Layer.merge(built, Layer.succeed(PidReporter, options.pidReporter))
-  // `SessionSpawnProxy` is likewise not a graph node: `Session.spawn`
-  // reads it optionally, so a hub-reaching worker forwards `session.spawn` while
-  // a degraded/hub-less graph builds unchanged (and runs sub-agents inline).
   const layer =
     options.hubProxies === undefined
       ? withPid
       : Layer.merge(withPid, sessionSpawnProxyLayer(sessionSpawnClient(options.hubProxies), options.boundSessionID))
-  // The clear-revert authority is a non-graph seam: `SessionRevert` reads it
-  // optionally, so a hub-only graph keeps `Session.clearRevert` while a worker
-  // routes the hub-owned write over its control port.
+  // The clear-revert authority is a non-graph seam: `SessionRevert` reads it optionally.
   const withClearRevert =
     options.hubProxies === undefined
       ? layer
       : Layer.merge(layer, clearRevertProxyLayer(options.hubProxies.sessionStatus))
-  // `logging` is not a graph node either: it contributes only context references
-  // (the file sink + minimum level), so merging it leaves the graph and its
-  // node-table assertion untouched. Absent keeps the layer unchanged.
+  // `logging` is not a graph node either: it contributes only context references (the file sink + minimum level).
   const withLogging = options.logging === undefined ? withClearRevert : Layer.merge(withClearRevert, options.logging)
-  // The strict projection authority is a non-graph seam too. Only a BOUND worker
-  // (one with a durable session aggregate) may publish session events; an
-  // unbound/degraded graph keeps the hub's projection behavior unchanged.
+  // The strict projection authority is a non-graph seam too.
   const withProjectionPolicy =
     options.boundSessionID === undefined && options.clients.database?.sessionID === undefined
       ? withLogging
       : withLogging.pipe(Layer.provide(Layer.succeed(SessionProjector.Policy, workerProjectionPolicy(options.clients.database))))
-  // The tool-call ledger is a consumer edge: its service reads `WorkerDb` (the
-  // repository and the live lease owner) and `Database` (the connection's
-  // exclusive transaction) from the graph. It stays a non-graph seam so the node
-  // table is unchanged; a reduced graph with no real worker database yields an
-  // unavailable service and the tool path keeps its no-ledger behavior.
   const withLedger = ToolCallLedger.workerLayer.pipe(Layer.provideMerge(withProjectionPolicy))
   return { root: base, replacements, layer: withLedger }
 }

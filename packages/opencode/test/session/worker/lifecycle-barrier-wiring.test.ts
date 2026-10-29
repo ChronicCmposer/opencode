@@ -34,12 +34,14 @@ function observableBarrier(service: RunBarrier.Interface): ObservableBarrier {
   const suppressPromotion = new Set<string>()
   return {
     barrier: {
-      beginRun(sessionID) {
-        const run = service.beginRun(sessionID)
-        const captured = suppressPromotion.has(sessionID) ? { ...run, promotion: () => false } : run
-        runs.set(sessionID, captured)
-        return captured
-      },
+      beginRun: (sessionID) =>
+        service.beginRun(sessionID).pipe(
+          Effect.map((run) => {
+            const captured = suppressPromotion.has(sessionID) ? { ...run, promotion: () => false } : run
+            runs.set(sessionID, captured)
+            return captured
+          }),
+        ),
       wait: (sessionID) => service.wait(sessionID),
       cancel: (sessionID) => service.cancel(sessionID),
       state: (sessionID) => service.state(sessionID),

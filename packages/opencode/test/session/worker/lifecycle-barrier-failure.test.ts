@@ -15,7 +15,7 @@ describe("distinct barrier failure state (contained)", () => {
   it.effect("a refused report surfaces the typed error and a `failed` state", () =>
     Effect.gen(function* () {
       const barrier = yield* RunBarrier.Service
-      const run = barrier.beginRun("s1")
+      const run = yield* barrier.beginRun("s1")
 
       expect(() =>
         run.report({ sessionID: "s1", phase: "projectors", observation: { kind: "commit", messageID: "msg_1" } }),
@@ -31,7 +31,7 @@ describe("distinct barrier failure state (contained)", () => {
   it.effect("a timed-out barrier keeps the timeout state", () =>
     Effect.gen(function* () {
       const barrier = yield* RunBarrier.Service
-      const run = barrier.beginRun("s2")
+      const run = yield* barrier.beginRun("s2")
       run.commit("msg_1")
       run.projector("session-row")
       run.noTools()

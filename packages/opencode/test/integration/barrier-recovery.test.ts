@@ -45,7 +45,7 @@ describe("run-barrier recovery after a crash", () => {
         // A dead generation left a side-effecting call in flight (indeterminate
         // for resume) and the barrier expired: nothing can settle either now.
         lifecycle.toolStarted(sessionID, "call_from_dead_worker", true)
-        barrier.beginRun(sessionID)
+        yield* barrier.beginRun(sessionID)
         const timedOut = yield* barrier.wait(sessionID).pipe(Effect.exit, Effect.forkChild)
         yield* Effect.yieldNow
         yield* advanceBarrierTimeout()
@@ -141,7 +141,7 @@ describe("run-barrier recovery after a crash", () => {
       const sessionID = sid("ses_barrier_cancel_wins")
 
       try {
-        barrier.beginRun(sessionID)
+        yield* barrier.beginRun(sessionID)
         const pending = yield* barrier.wait(sessionID).pipe(Effect.forkChild)
         yield* Effect.yieldNow
         expect(barrier.state(sessionID)).toBe("draining")

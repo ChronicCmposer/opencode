@@ -63,7 +63,7 @@ describe("MCP/LSP hub bridge", () => {
   test("the hub ships MCP and LSP tool descriptors to the worker", async () => {
     const context = Context.make(Plugin.Service, plugin).pipe(Context.add(MCP.Service, mcp))
 
-    const descriptors = await resolveContextHubToolDescriptors(context as unknown as Context.Context<never>)
+    const descriptors = await Effect.runPromise(resolveContextHubToolDescriptors(context as unknown as Context.Context<never>))
     const ids = descriptors.map((descriptor) => descriptor.id)
 
     expect(ids).toContain("mcp_search")

@@ -166,9 +166,9 @@ interface Harness {
 }
 
 /**
- * A hub-proxy port whose `session.clearRevert` authority performs the hub's
- * real write: it clears the persisted `revert` column outside the worker. The
- * worker must reach it instead of writing `revert: null` itself.
+ * A hub-proxy port whose `session.discardReverted` authority performs the hub's
+ * real write: it deletes the reverted rows and clears the persisted `revert`
+ * column in one transaction outside the worker.
  */
 function hubPort(
   filename: string,
@@ -195,13 +195,20 @@ function hubPort(
   }
   const handlers: HubProxyHandlers = {
     ...buildHubProxyHandlers(authorities, instantRunner),
-    "session.clearRevert": (request) => {
-      const sessionID = String((request as { sessionID: unknown }).sessionID)
-      if (options.failClear) throw new Error("hub clear failed")
+    "session.discardReverted": (request) => {
+      const { sessionID, messageIDs } = request as { sessionID: string; messageIDs: ReadonlyArray<string> }
+      if (options.failClear) throw new Error("hub discard failed")
       cleared.push(sessionID)
-      // The hub's real `Session.clearRevert` write, on the hub side of the
-      // boundary: it owns the `revert` column.
-      admin(filename, "UPDATE session SET revert = NULL, time_updated = ? WHERE id = ?", [Date.now(), sessionID])
+      // The hub's single transaction: delete the reverted rows and clear `revert` together.
+      const connection = openConnection({ filename })
+      try {
+        connection.exec("BEGIN")
+        for (const id of messageIDs) connection.run("DELETE FROM message WHERE id = ?", [id] as never)
+        connection.run("UPDATE session SET revert = NULL, time_updated = ? WHERE id = ?", [Date.now(), sessionID] as never)
+        connection.exec("COMMIT")
+      } finally {
+        connection.close()
+      }
     },
   }
   const channel = new MessageChannel()
@@ -342,7 +349,7 @@ describe("worker-mode revert cleanup", () => {
     }
   }, 60_000)
 
-  test("cleanup clears the revert before deleting any row", async () => {
+  test("a failed hub discard leaves every row and the revert untouched", async () => {
     await using provider = startMockProvider({ chunks: ["unused"] })
     const testHarness = await harness(provider, { failClear: true })
     try {
@@ -370,9 +377,7 @@ describe("worker-mode revert cleanup", () => {
         Effect.provideService(InstanceRef, testHarness.instance),
       )
 
-      // The hub clear fails. Because the clear is the first write, no row has
-      // been deleted: a crash here leaves the session recoverable, never a
-      // revert pointer aimed at deleted rows.
+      // The hub discard fails as one unit: no row is deleted and the revert pointer stays valid.
       await expect(Effect.runPromise(cleanup)).rejects.toThrow()
       const ids = adminRows<{ id: string }>(testHarness.filename, "SELECT id FROM message WHERE session_id = ? ORDER BY id", [
         SESSION,
