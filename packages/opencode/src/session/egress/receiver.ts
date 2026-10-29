@@ -1,4 +1,10 @@
-// Hub-side egress receiver over the events envelope (spec Q6/Q16/Q21).
+// Hub end of a worker's egress port. Frames are decoded once at the port and
+// driven through one stream, so delivery, blob resolution, gap healing and
+// control frames all observe arrival order, which is commit order for a single
+// worker. Durable `(aggregateID, seq)` pairs are checked per aggregate, so
+// interleaved aggregates never look gapped. Under backpressure a non-durable
+// delta may be dropped and a resync surfaced; durable events are never dropped.
+// Interrupts on the fatal path stay silent: they mean the hub closed the port.
 
 import { Cause, Effect, Queue, Schema, Stream } from "effect"
 
