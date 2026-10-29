@@ -38,7 +38,7 @@ describe("egress fatal callback reporting", () => {
     })
     try {
       channel.port2.postMessage(eventText())
-      await pollUntil(() => errors.length === 1 && channel.port1.onmessage === null, {
+      await pollUntil(() => errors.length === 1, {
         message: "a throwing onFrame closed the port without reporting the error",
       })
       expect(errors).toEqual([thrown])
@@ -65,7 +65,7 @@ describe("egress fatal callback reporting", () => {
     })
     try {
       channel.port2.postMessage(eventText())
-      await pollUntil(() => errors.length === 1 && channel.port1.onmessage === null, {
+      await pollUntil(() => errors.length === 1, {
         message: "a failing handler Effect closed the port without reporting the error",
       })
       expect(errors).toEqual([failure])
@@ -91,7 +91,7 @@ describe("egress fatal callback reporting", () => {
     })
     try {
       channel.port2.postMessage(encodeFrame(endFrame()))
-      await pollUntil(() => errors.length === 1 && channel.port1.onmessage === null, {
+      await pollUntil(() => errors.length === 1, {
         message: "a throwing onEnd closed the port without reporting the error",
       })
       expect(errors).toEqual([thrown])
@@ -147,10 +147,12 @@ describe("egress fatal callback reporting", () => {
     const dispose = serveEventsPort(channel.port1, sink, (error) => errors.push(error))
     try {
       channel.port2.postMessage(eventText())
-      await pollUntil(() => errors.length === 1 && channel.port1.onmessage === null, {
+      await pollUntil(() => errors.length === 1, {
         message: "serveEventsPort swallowed a throwing sink without calling onError",
       })
       expect(errors).toEqual([thrown])
+      // The throw is reported, the frame dropped, and the port stays open.
+      expect(channel.port1.onmessage).not.toBeNull()
     } finally {
       dispose()
       channel.port1.close()

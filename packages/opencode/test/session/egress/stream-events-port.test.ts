@@ -6,8 +6,9 @@
 // exactly one observed error, and non-durable backpressure drop.
 
 import { describe, expect, test } from "bun:test"
+import { Effect } from "effect"
 import { type DurableResyncPayload, decodeFrame, encodeFrame } from "@/session/egress/frame"
-import { createEgressReceiver } from "@/session/egress/receiver"
+import { createEgressPort, createEgressReceiver } from "@/session/egress/receiver"
 import { type HubEventSink, serveEventsPort } from "@/session/worker/hub"
 import {
   ackFrame,
@@ -116,23 +117,41 @@ describe("events stream lifecycle", () => {
     }
   })
 
-  test("a malformed frame closes the port and reports exactly one error", async () => {
+  test("a malformed frame is dropped, reported once, and answered with a resync while the port stays open", async () => {
     const channel = new MessageChannel()
     const errors: Error[] = []
+    const requests: unknown[] = []
+    channel.port2.onmessage = (event) => void requests.push(decodeFrame(event.data as string))
     const { sink, events } = recordingSink()
     const dispose = serveEventsPort(channel.port1, sink, (error) => errors.push(error))
     try {
       channel.port2.postMessage("{not json")
       await pollUntil(() => errors.length === 1, { message: "malformed frame was silently swallowed" })
-      expect(channel.port1.onmessage).toBeNull()
-      // Delivery stops after the first failure; a later valid frame never lands.
+      await pollUntil(() => requests.length === 1, { message: "no resync was requested" })
+      expect((requests[0] as { kind: string }).kind).toBe("resync")
+      expect(channel.port1.onmessage).not.toBeNull()
       channel.port2.postMessage(encodeFrame(eventFrame({ event: delta("late") })))
-      await pollUntil(() => false, { timeoutMs: 20 }).catch(() => {})
+      await pollUntil(() => events.length === 1, { message: "later frame was not delivered" })
       expect(errors.length).toBe(1)
-      expect(events).toEqual([])
     } finally {
       dispose()
       channel.port1.close()
+      channel.port2.close()
+    }
+  })
+
+  test("a malformed frame closes a receiver that has no rejection handler", async () => {
+    const channel = new MessageChannel()
+    const errors: Error[] = []
+    const connection = createEgressPort(channel.port1, { onFrame: () => {}, onError: (error) => errors.push(error) })
+    const fiber = Effect.runFork(connection.program.pipe(Effect.catch(() => Effect.void)))
+    try {
+      channel.port2.postMessage("{not json")
+      await pollUntil(() => errors.length === 1, { message: "malformed frame was silently swallowed" })
+      expect(channel.port1.onmessage).toBeNull()
+    } finally {
+      connection.close()
+      fiber.interruptUnsafe()
       channel.port2.close()
     }
   })
