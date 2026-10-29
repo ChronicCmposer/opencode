@@ -22,9 +22,10 @@ import {
   FiberMap,
   FiberSet,
   Layer,
-  ManagedRuntime,
   Schema,
+  Scope,
 } from "effect"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import type { SessionID } from "@/session/schema"
 import { isWorkerCrashPhase, workerCrashed, type WorkerCrashPhase, type WorkerCrashed } from "@/session/ledger/crash"
 import type { AutoResumeDecision } from "@/session/ledger/resume"
@@ -394,22 +395,15 @@ interface Engine {
   readonly runRetire: (key: SessionID, effect: Effect.Effect<void>) => Fiber.Fiber<void>
 }
 
-class DispatchEngine extends Context.Service<DispatchEngine, Engine>()("@opencode/SessionDispatchEngine") {}
-
-const engineLayer = Layer.effect(
-  DispatchEngine,
-  Effect.gen(function* () {
-    const background = yield* FiberSet.make<void>()
-    const fork = (yield* FiberSet.runtime(background)()) as <A, E>(
-      effect: Effect.Effect<A, E>,
-    ) => Fiber.Fiber<A, E>
-    const reaping = yield* FiberMap.make<SessionID, void>()
-    const runReap = yield* FiberMap.runtime(reaping)()
-    const retiring = yield* FiberMap.make<SessionID, void>()
-    const runRetire = yield* FiberMap.runtime(retiring)()
-    return DispatchEngine.of({ fork, background, reaping, runReap, retiring, runRetire })
-  }),
-)
+const makeEngine: Effect.Effect<Engine, never, Scope.Scope> = Effect.gen(function* () {
+  const background = yield* FiberSet.make<void>()
+  const fork = (yield* FiberSet.runtime(background)()) as <A, E>(effect: Effect.Effect<A, E>) => Fiber.Fiber<A, E>
+  const reaping = yield* FiberMap.make<SessionID, void>()
+  const runReap = yield* FiberMap.runtime(reaping)()
+  const retiring = yield* FiberMap.make<SessionID, void>()
+  const runRetire = yield* FiberMap.runtime(retiring)()
+  return { fork, background, reaping, runReap, retiring, runRetire }
+})
 
 /** How an admitted run may begin after its build/shutdown preflight. */
 type StartAdmission =
@@ -494,7 +488,12 @@ function createPending(
   }
 }
 
-export function createDispatcher(options: DispatcherOptions): Dispatcher {
+function buildDispatcher(
+  options: DispatcherOptions,
+  engine: Engine,
+  runPromise: <A, E>(effect: Effect.Effect<A, E>) => Promise<A>,
+  scope: Scope.Scope,
+): Dispatcher {
   const pool = options.pool
   const cancellation = options.cancellation
   const bridge = options.bridge
@@ -504,13 +503,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const resumeDecisionTimeoutMs = options.resumeDecisionTimeoutMs ?? DEFAULT_RESUME_DECISION_TIMEOUT_MS
   const terminateTimeoutMs = options.terminateTimeoutMs ?? DEFAULT_TERMINATE_TIMEOUT_MS
   const writeBarrierTimeoutMs = options.writeBarrierTimeoutMs ?? DEFAULT_WRITE_BARRIER_TIMEOUT_MS
-
-  // The Effect engine owns every background fiber and timer. The promise-facing
-  // public methods cross this one managed-runtime boundary; the engine itself is
-  // pure Effect (FiberSet for supervision, FiberMap for session-keyed timers).
-  const runtime = ManagedRuntime.make(engineLayer)
-  const engine = runtime.runSync(DispatchEngine.use(Effect.succeed))
-  const promiseOf = <A, E>(deferred: Deferred.Deferred<A, E>): Promise<A> => runtime.runPromise(Deferred.await(deferred))
+  const promiseOf = <A, E>(deferred: Deferred.Deferred<A, E>): Promise<A> => runPromise(Deferred.await(deferred))
 
   // Plain single-owner state. Every transition below is synchronous, so a
   // check and the write it guards cannot interleave in JS's run-to-completion.
@@ -579,7 +572,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       reportTimeout()
       return Promise.resolve(undefined)
     }
-    return runtime.runPromise(
+    return runPromise(
       Effect.tryPromise({ try: () => promise, catch: (error) => error }).pipe(
         Effect.timeoutOrElse({
           duration: Duration.millis(timeoutMs),
@@ -844,7 +837,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
         ),
       ),
     )
-    return scope === "generation" ? runtime.runPromise(Deferred.await(exit)) : Promise.resolve()
+    return scope === "generation" ? runPromise(Deferred.await(exit)) : Promise.resolve()
   }
 
   /**
@@ -894,7 +887,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     // A terminal retirement already owns this session's release gate; join its
     // release rather than starting a second, competing one.
     const retiring = retiringDone.get(sessionID)
-    if (retiring !== undefined) return runtime.runPromise(Deferred.await(retiring))
+    if (retiring !== undefined) return runPromise(Deferred.await(retiring))
     clearIdle(sessionID)
     detachController(worker.id)
     return beginRetirement(sessionID, worker, "generation")
@@ -1021,7 +1014,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const retirementBarrier = (sessionID: SessionID): Promise<void> => {
     const exit = retiringDone.get(sessionID)
     if (exit === undefined) return Promise.resolve()
-    return runtime.runPromise(
+    return runPromise(
       Deferred.await(exit).pipe(
         Effect.timeoutOrElse({
           duration: terminateTimeoutMs,
@@ -1862,7 +1855,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     workers.clear()
     // Every direct terminate stays bounded; a wedged isolate must not hang
     // shutdown, because the pool and backends are torn down after this.
-    await runtime.runPromise(
+    await runPromise(
       Effect.forEach(
         workersToTerminate,
         (worker) =>
@@ -1877,7 +1870,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     // idempotent release settle; the same owner completes the Deferred.
     for (const [, fiber] of engine.retiring) fiber.interruptUnsafe()
     const exits = [...retiringDone.values()]
-    await runtime.runPromise(
+    await runPromise(
       Effect.forEach(
         exits,
         (exit) =>
@@ -1890,7 +1883,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     retiringDone.clear()
     // Release timers and standby fibers; a wedged release is bounded by the
     // timeout rather than awaited forever.
-    await runtime.runPromise(
+    await runPromise(
       Effect.all(
         [FiberMap.clear(engine.reaping), FiberSet.clear(engine.background)],
         { concurrency: "unbounded", discard: true },
@@ -1899,7 +1892,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     await pool.terminateAll().catch(() => undefined)
     cancellation?.reapAll?.()
     disposed = true
-    await runtime.dispose()
+    await runPromise(Scope.close(scope, Exit.void))
   }
 
   return {
@@ -1928,6 +1921,50 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     dispose: terminateAll,
     [Symbol.asyncDispose]: terminateAll,
   }
+}
+
+export interface Interface {
+  readonly dispatcher: Dispatcher
+  readonly ensureRunning: (request: DispatchRequest) => Effect.Effect<void, unknown>
+  readonly cancel: (sessionID: SessionID) => Effect.Effect<CascadeReport | undefined, unknown>
+}
+
+export class Service extends Context.Service<Service, Interface>()("@opencode/SessionDispatch") {}
+
+export const make = (options: DispatcherOptions): Effect.Effect<Dispatcher, never, Scope.Scope> =>
+  Effect.gen(function* () {
+    const scope = yield* Scope.Scope
+    const services = yield* Effect.context<never>()
+    const engine = yield* makeEngine
+    return buildDispatcher(options, engine, Effect.runPromiseWith(services), scope)
+  })
+
+export const layer = (options: DispatcherOptions): Layer.Layer<Service> =>
+  Layer.effect(
+    Service,
+    Effect.gen(function* () {
+      const dispatcher = yield* make(options)
+      yield* Effect.addFinalizer(() =>
+        Effect.tryPromise({ try: () => dispatcher.terminateAll(), catch: (cause) => cause }).pipe(Effect.ignore),
+      )
+      return Service.of({
+        dispatcher,
+        ensureRunning: (request) => dispatcher.dispatchEffect(request),
+        cancel: (sessionID) =>
+          Effect.tryPromise({ try: () => dispatcher.cancelWithGrace(sessionID), catch: (cause) => cause }),
+      })
+    }),
+  )
+
+export const node = (options: DispatcherOptions) => LayerNode.make({ service: Service, layer: layer(options), deps: [] })
+
+/**
+ * Compatibility constructor for callers that still hold a Promise-shaped
+ * dispatcher (hub.ts, tests); the one synchronous edge into the Effect world.
+ */
+export function createDispatcher(options: DispatcherOptions): Dispatcher {
+  const scope = Scope.makeUnsafe()
+  return Effect.runSync(make(options).pipe(Scope.provide(scope)))
 }
 
 export * as SessionDispatch from "./dispatch"

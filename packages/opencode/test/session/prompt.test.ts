@@ -329,6 +329,7 @@ const shellSeamRunState = Layer.succeed(
   SessionRunState.Service.of({
     assertNotBusy: () => Effect.void,
     cancel: () => Effect.succeed(undefined),
+    awaitBusy: () => Effect.void,
     ensureRunning: () => Effect.die("unexpected ensureRunning in the shell seam test"),
     startShell: (...args) => {
       shellStartCalls.push(args)
