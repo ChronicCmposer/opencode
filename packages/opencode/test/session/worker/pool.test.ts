@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { createSessionBoundExecutorWorker } from "../../lib/lazy-worker-pool"
 import { Effect, Exit, Layer, Scope } from "effect"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
@@ -16,7 +17,7 @@ import {
   resolveWorkerModel,
 } from "@/session/worker/init"
 import { DEFAULT_REAP_MS, REAP_MS_ENV, reapMsWarning, resolveReapMs } from "@/session/worker/pool"
-import { createSessionBoundExecutorWorker, createSessionHub, makeProduction } from "@/session/worker/hub"
+import { createSessionHub, makeProduction } from "@/session/worker/hub"
 import type { IdleBoundedExecutorWorkerPool, ProductionWorkerPoolOptions } from "@/session/worker/hub"
 import { createTestBarrier } from "../../lib/run-barrier-test"
 import type { DbExecutor } from "@/session/worker/db-executor"

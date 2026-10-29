@@ -2041,7 +2041,6 @@ export {
   createBunExecutorTransport,
   createBunExecutorWorkerPool,
   createIdleIsolateCap,
-  createSessionBoundExecutorWorker,
   createWorkerCap,
   describeSessionWorkerEntry,
   layer as WorkerPoolsLayer,

@@ -5,7 +5,6 @@ import {
   createBunExecutorTransport,
   createBunExecutorWorkerPool,
   createIdleIsolateCap,
-  createSessionBoundExecutorWorker,
   createWorkerCap,
   layer,
   liveSessionWorkerCount,
@@ -378,7 +377,6 @@ describe("WorkerPools service surface", () => {
       "spawnBunExecutorWorker",
       "createWorkerCap",
       "createIdleIsolateCap",
-      "createSessionBoundExecutorWorker",
       "makeProduction",
       "makeSpawnGate",
     ]) {
@@ -394,6 +392,5 @@ describe("WorkerPools service surface", () => {
     expect(typeof spawnBunExecutorWorker).toBe("function")
     expect(typeof createWorkerCap).toBe("function")
     expect(typeof createIdleIsolateCap).toBe("function")
-    expect(typeof createSessionBoundExecutorWorker).toBe("function")
   })
 })

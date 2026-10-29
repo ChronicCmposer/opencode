@@ -319,4 +319,18 @@ describe("abort listener lifecycle", () => {
     expect(removed).toBe(1)
     first.release()
   })
+
+  test("closing the gate interrupts queued holders so they never take a permit", async () => {
+    const gate = makeSpawnGate({ timeoutMs: 1_000, capacity: 1 })
+    const holder = await gate.acquire()
+    const queued = observe(gate.acquire())
+
+    await pollUntil(() => gate.waiting === 1, { message: "the waiter never queued" })
+    await gate.close?.()
+    await pollUntil(() => gate.waiting === 0, { message: "the queued holder was not interrupted" })
+
+    holder.release()
+    await pollUntil(() => gate.active === 0, { message: "the held permit was not released" })
+    expect(queued.value).toBeUndefined()
+  })
 })
