@@ -72,7 +72,7 @@ describe("worker system.transform hub proxy (sys-transform-ws3)", () => {
     const systemTransform = hubProxySystemTransform(client)
     expect(systemTransform).toBeDefined()
 
-    const host = createWorkerPluginHost([], { systemTransform: systemTransform! })
+    const host = createWorkerPluginHost([{ name: "hub", hooks: {}, proxied: ["experimental.chat.system.transform"] }], { systemTransform: systemTransform! })
     const result = await triggerSystemTransform(
       buildSessionWorkerLayer(options({ plugins: host })),
       { sessionID: "ses_1", model: { providerID: "mock", modelID: "m" } },

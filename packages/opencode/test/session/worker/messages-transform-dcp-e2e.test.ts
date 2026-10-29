@@ -35,6 +35,8 @@ import { workerGraphReplacements } from "@/session/worker/session-worker"
 import { createE2EContext, memoizeWorkerLayer, type E2EContext, type MemoizedWorkerLayer } from "../../lib/e2e-context"
 import { pluginPassThroughReplacement } from "../../lib/worker-plugin-routes"
 import { startMockProvider, type MockProviderHandle } from "../../lib/mock-provider"
+
+const hubTransformPlugin = { name: "hub-transform", hooks: {}, proxied: ["experimental.chat.messages.transform"] }
 import { workerSnapshot } from "../../lib/snapshot"
 
 /** The exact sentinel `@tarquinen/opencode-dcp` writes in place of pruned output. */
@@ -81,7 +83,7 @@ function pruneOldToolResults(messages: MessageLike[]): void {
  * carrying the pruned content, exactly like `hubProxyMessagesTransform`.
  */
 function dcpStubHost(): WorkerPluginHost {
-  return createWorkerPluginHost([], {
+  return createWorkerPluginHost([hubTransformPlugin], {
     messagesTransform: async (_input, output) => {
       const messages = structuredClone(output.messages) as MessageLike[]
       pruneOldToolResults(messages)

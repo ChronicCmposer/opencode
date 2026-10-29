@@ -67,6 +67,8 @@ import { recordingHubAuthorities } from "../../lib/hub-proxy"
 import { createE2EContext, memoizeWorkerLayer, type E2EContext, type MemoizedWorkerLayer } from "../../lib/e2e-context"
 import { pluginPassThroughReplacement } from "../../lib/worker-plugin-routes"
 import { startMockProvider, type MockProviderHandle } from "../../lib/mock-provider"
+
+const hubTransformPlugin = { name: "hub-transform", hooks: {}, proxied: ["experimental.chat.messages.transform"] }
 import { workerSnapshot } from "../../lib/snapshot"
 
 /** The exact sentinel `@tarquinen/opencode-dcp` writes in place of pruned output. */
@@ -313,7 +315,7 @@ describe("DCP parity: a hub plugin tool and the next transform share hub state",
       const bridge = hubProxyMessagesTransform(proxy.client)
       if (bridge === undefined) throw new Error("hub proxy client did not yield a messages-transform bridge")
 
-      const layer = minimalWorkerLayer(createWorkerPluginHost([], { messagesTransform: bridge }), {
+      const layer = minimalWorkerLayer(createWorkerPluginHost([hubTransformPlugin], { messagesTransform: bridge }), {
         descriptors: [compressDescriptor],
         executor,
       })
@@ -372,7 +374,7 @@ describe("DCP parity: a hub plugin tool and the next transform share hub state",
         provider,
         ctx.database,
         ctx.writer,
-        createWorkerPluginHost([], { messagesTransform: bridge }),
+        createWorkerPluginHost([hubTransformPlugin], { messagesTransform: bridge }),
         { descriptors: [compressDescriptor], executor },
       )
       const sessionID = await Effect.runPromise(seed(layer.layer, ctx.instance, directory, provider.model))

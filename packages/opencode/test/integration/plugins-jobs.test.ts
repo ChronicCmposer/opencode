@@ -280,7 +280,12 @@ describe("non-container hook replacements", () => {
         instantRunner,
       ),
     )
-    return { host: createWorkerPluginHost([], { hubHook: hubProxyPluginTrigger(served.client) }), served }
+    return { host: createWorkerPluginHost(
+        [{ name: "hub", hooks: {}, proxied: ["tool.execute.before", "chat.message"] }],
+        { hubHook: hubProxyPluginTrigger(served.client) },
+      ),
+      served,
+    }
   }
 
   test("a non-container args replacement is applied to the caller's value", async () => {

@@ -51,7 +51,7 @@ async function triggerMessagesTransform(
 describe("worker messages.transform dispatch", () => {
   test("the injected hub-proxy transform reaches the host through Plugin.Service", async () => {
     const calls: Array<{ input: unknown; output: unknown }> = []
-    const host = createWorkerPluginHost([], {
+    const host = createWorkerPluginHost([{ name: "hub", hooks: {}, proxied: ["experimental.chat.messages.transform"] }], {
       messagesTransform: async (input, output) => {
         calls.push({ input, output })
         return { messages: [...output.messages, { role: "user", content: "pruned" }] }
