@@ -706,6 +706,18 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   }
 
   /**
+   * Detach the controller a replaced generation used. An in-flight cancel keeps
+   * its controller until it settles (the successor run may be the one it is
+   * cancelling); later cancels get a fresh controller for the new generation.
+   */
+  const detachController = (workerID: number): void => {
+    const controller = controllers.get(workerID)
+    if (controller === undefined) return
+    controllers.delete(workerID)
+    if (controller.pending === 0) controller.dispose()
+  }
+
+  /**
    * The shared retirement release gate. `scope` selects which lifetime the hook
    * releases: a terminal retirement ("session": crash/reap/cancel/idle eviction)
    * also runs the pool's session cleanup and the session-release hook, while an
@@ -753,13 +765,13 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
           // round-trip); await it before signalling the successor.
           const released = hook?.(sessionID, worker.id) as PromiseLike<unknown> | undefined
           if (released !== undefined && typeof released.then === "function") {
-            // A generation release must complete its synchronous epoch advance
-            // and exact-owner capture BEFORE the successor is admitted, so the
-            // whole hook is awaited unbounded. Only the lease UPDATE inside the
-            // hub is bounded; a terminal session release keeps the old deadline.
-            if (scope === "generation") await released
-            else
-              await boundedPromise(Promise.resolve(released), terminateTimeoutMs, () =>
+            // The synchronous epoch advance and exact-owner capture happen when
+            // the hook is called, before the successor is admitted; only the
+            // async tail is bounded so a wedged release cannot hold the slot.
+            await boundedPromise(
+              Promise.resolve(released),
+              terminateTimeoutMs,
+              () =>
                 void bridge?.fork(
                   Effect.logWarning(workerLogMessage("release callback timed out"), {
                     sessionID,
@@ -767,7 +779,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
                     timeoutMs: terminateTimeoutMs,
                   }),
                 ),
-              )
+            )
           }
         } catch (error) {
           // A callback that throws must not leave the exit signal failed (a
@@ -869,7 +881,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       // dispatch can create a new entry.
       if (workerID === undefined) return Promise.resolve()
       clearIdle(sessionID)
-      disposeController(workerID)
+      detachController(workerID)
       return invokeGenerationRelease(sessionID, workerID)
     }
     if (workerID !== undefined && worker.id !== workerID) {
@@ -884,7 +896,7 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     const retiring = retiringDone.get(sessionID)
     if (retiring !== undefined) return runtime.runPromise(Deferred.await(retiring))
     clearIdle(sessionID)
-    disposeController(worker.id)
+    detachController(worker.id)
     return beginRetirement(sessionID, worker, "generation")
   }
 
@@ -1825,16 +1837,16 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
     }
   }
 
-  const terminateAll = async (): Promise<void> => {
-    if (disposed) return
+  let shutdown: Promise<void> | undefined
+  const terminateAll = (): Promise<void> => {
+    shutdown ??= runShutdown()
+    return shutdown
+  }
+
+  const runShutdown = async (): Promise<void> => {
     // The shutdown latch, the run table, and the waiter table flip together:
     // a dispatch can either observe the pre-shutdown state or the latch, never a
     // cleared table that still admits work.
-    if (terminated) {
-      disposed = true
-      await runtime.dispose()
-      return
-    }
     terminated = true
     const pendingRuns = [...runs.values()]
     const pendingWaiters = [...waiters.values()].flat()
@@ -1876,8 +1888,8 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       ),
     )
     retiringDone.clear()
-    // Release timers and standby fibers; a wedged release is interrupted rather
-    // than awaited forever.
+    // Release timers and standby fibers; a wedged release is bounded by the
+    // timeout rather than awaited forever.
     await runtime.runPromise(
       Effect.all(
         [FiberMap.clear(engine.reaping), FiberSet.clear(engine.background)],

@@ -26,7 +26,7 @@
 import { randomUUID } from "node:crypto"
 import path from "node:path"
 import { threadId, workerData } from "node:worker_threads"
-import { Cause, Context, Effect, Exit, Fiber, Layer, Option, Schema, Scope } from "effect"
+import { Cause, Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Scope } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { isRole, setProcessRole } from "@/effect/process-role"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -1612,7 +1612,14 @@ export function bootstrapSessionWorker(
       // reaches the real loop (table B). Before that there is nothing to cancel.
       control: {
         cancel: (sessionID) => {
-          if (control !== undefined) return control.cancel(sessionID)
+          const registered = control
+          if (registered !== undefined) {
+            if (!activeRuns.has(sessionID)) return registered.cancel(sessionID)
+            // The run exists but may not be busy yet (its prompt is still being
+            // persisted): hold the cancel until the run table sees it, or the
+            // run ends first.
+            return WorkerRuntime.runPromise(cancelOnceBusy(registered, sessionID, activeRuns))
+          }
           // No graph/control yet: latch the cancel only for a run that is
           // building. With no run in flight there is nothing to cancel, so the
           // latch must not carry into the next run.
@@ -1650,6 +1657,25 @@ export function bootstrapSessionWorker(
     throw error
   }
 }
+
+/**
+ * Deliver a cancel to a run that has been admitted but is not yet busy in the
+ * run table. Resolves once the cancel was delivered or the run is gone.
+ */
+export const cancelOnceBusy = (
+  control: SessionRunControl,
+  sessionID: SessionID,
+  activeRuns: ReadonlySet<SessionID>,
+): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    while (activeRuns.has(sessionID)) {
+      if (yield* Effect.promise(() => control.busy(sessionID))) {
+        yield* Effect.promise(() => control.cancel(sessionID))
+        return
+      }
+      yield* Effect.sleep(Duration.millis(10))
+    }
+  })
 
 /**
  * The worker's ambient `InstanceRef`, rebuilt from the hub-shipped snapshot. The

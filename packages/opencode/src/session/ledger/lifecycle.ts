@@ -368,15 +368,14 @@ export function createProxyReporting(
       () => undefined,
     )
   return {
-    // Record the commit locally first, then await the hub's acknowledgement.
-    // The run `done` reply carries the local record for the successful path
-    // (F11); awaiting the RPC is what keeps `crashState()` current when a crash
-    // wins the race. No deadline is applied here: a 5 s cutoff would let the
-    // crash read a stale tracker. A torn-down port still resolves the caller.
+    // Record the commit locally first, then await the hub's acknowledgement
+    // within the lifecycle deadline. The run `done` reply carries the local
+    // record for the successful path; a late or lost ack must not wedge the
+    // run, and a torn-down port still resolves the caller.
     commit: async (sessionID, messageID) => {
       if (typeof messageID === "string" && messageID.length > 0) committedBySession.set(sessionID, messageID)
       try {
-        await call("lifecycle.commit", [sessionID, messageID])
+        await withDeadline("lifecycle.commit", timeoutMs, () => call("lifecycle.commit", [sessionID, messageID]))
       } catch {
         // Best effort on teardown: the durable message row remains the truth.
       }
