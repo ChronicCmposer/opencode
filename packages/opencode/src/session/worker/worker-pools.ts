@@ -1055,6 +1055,13 @@ export interface IdleWorkerEntry {
   readonly sessionID: SessionID
 }
 
+/**
+ * Default deadline for one idle-eviction step (the retirement hook and the
+ * isolate terminate). A wedged hook/terminate must not pin the single-flight
+ * and let idle isolates grow past the cap.
+ */
+const DEFAULT_IDLE_EVICT_TIMEOUT_MS = 5_000
+
 export interface IdleIsolateCapOptions {
   /** Idle isolates retained; defaults to {@link resolveIdleWorkerCapacity}. */
   readonly capacity?: number
@@ -1065,6 +1072,14 @@ export interface IdleIsolateCapOptions {
    * gone.
    */
   readonly onEvict: (entry: IdleWorkerEntry) => unknown
+  /** Deadline for one eviction step; defaults to 5s. */
+  readonly evictTimeoutMs?: number
+  /**
+   * Diagnostic seam: runs after the owner's final `recheck` drain and before the
+   * single-flight is released. Production does not set it; the idle-cap race
+   * test uses it to land a request in the exact handoff window.
+   */
+  readonly onBeforeRelease?: () => void | Promise<void>
   readonly log?: WorkerLogger
 }
 
@@ -1086,6 +1101,11 @@ export interface IdleIsolateCap {
   forget(workerID: number): void
   /** Stop tracking every worker without terminating (pool teardown does that). */
   clear(): void
+  /**
+   * Ask for another enforcement pass. Atomic with the flight lifecycle: when a
+   * flight is in progress the request becomes a recheck instead of being lost.
+   */
+  requestEnforce(): void
 }
 
 export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolateCap {
@@ -1117,9 +1137,32 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
     recheck: false,
   })
 
-  /** Apply one synchronous transition; callers never await while holding it. */
+  /**
+   * Apply one synchronous transition from a Promise-facing call site. The body
+   * never suspends and never re-enters the state, so `runSync` is safe here;
+   * fiber-internal code (`enforce`/`evict`) uses `yield*` instead. This is the
+   * documented Promise/Effect boundary for the cap.
+   */
   const mutate = <A>(change: (current: IdleCapState) => readonly [A, IdleCapState]): A =>
     Effect.runSync(SynchronizedRef.modify(state, change))
+
+  const evictTimeoutMs = options.evictTimeoutMs ?? DEFAULT_IDLE_EVICT_TIMEOUT_MS
+  const boundedEvict = <A>(effect: Effect.Effect<A, unknown>, message: string, entry: Tracked) =>
+    effect.pipe(
+      Effect.timeoutOrElse({
+        duration: evictTimeoutMs,
+        orElse: () =>
+          Effect.sync(() => {
+            options.log?.(workerLogMessage(message), {
+              level: "WARN",
+              workerID: entry.worker.id,
+              sessionID: entry.sessionID,
+              timeoutMs: evictTimeoutMs,
+            })
+          }),
+      }),
+      Effect.catchCause(() => Effect.void),
+    )
 
   const evict = Effect.fnUntraced(function* (entry: Tracked) {
     yield* SynchronizedRef.modify(state, (current) => {
@@ -1135,10 +1178,12 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
     const sessionID = entry.sessionID
     if (sessionID !== undefined) {
       // Await the retirement so a successor is never admitted while the old
-      // generation's ports/lease are still live. Cleanup is best-effort: the
-      // isolate must still be terminated when the hook throws or rejects.
-      yield* Effect.tryPromise(() => Promise.resolve(options.onEvict({ worker: entry.worker, sessionID }))).pipe(
-        Effect.catchCause(() => Effect.void),
+      // generation's ports/lease are still live. Both the hook and the close are
+      // bounded: a wedged eviction must not pin the single-flight forever.
+      yield* boundedEvict(
+        Effect.tryPromise(() => Promise.resolve(options.onEvict({ worker: entry.worker, sessionID }))),
+        "idle worker eviction timed out",
+        entry,
       )
     }
     options.log?.(workerLogMessage("idle worker evicted"), {
@@ -1148,8 +1193,12 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
       capacity,
     })
     // Await the same in-flight close a later retire will join: eviction is not
-    // complete until the isolate has exited and its lease release has landed.
-    yield* Effect.tryPromise(() => entry.worker.terminate()).pipe(Effect.catchCause(() => Effect.void))
+    // complete until the isolate has exited (or the deadline elapses).
+    yield* boundedEvict(
+      Effect.tryPromise(() => entry.worker.terminate()),
+      "idle worker terminate timed out",
+      entry,
+    )
   })
 
   /**
@@ -1170,8 +1219,7 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
       return
     }
     try {
-      let again = true
-      while (again) {
+      while (true) {
         yield* SynchronizedRef.modify(state, (current) => [undefined, { ...current, recheck: false }] as const)
         while (true) {
           const next = yield* SynchronizedRef.modify(state, (current) => {
@@ -1209,16 +1257,38 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
           }
           yield* evict(entry)
         }
-        again = yield* SynchronizedRef.modify(state, (current) => [current.recheck, current] as const)
+        const again = yield* SynchronizedRef.modify(state, (current) => [current.recheck, current] as const)
+        if (!again) break
       }
     } finally {
-      yield* SynchronizedRef.modify(state, (current) => [undefined, { ...current, enforcing: undefined }] as const)
+      // The diagnostic seam must never be able to break the flight.
+      if (options.onBeforeRelease !== undefined) {
+        yield* Effect.tryPromise(() => Promise.resolve(options.onBeforeRelease!())).pipe(
+          Effect.catchCause(() => Effect.void),
+        )
+      }
+      // Take-and-clear `recheck` together with `enforcing`: a request that lands
+      // after the final drain is either seen here (and starts another pass) or
+      // sees no flight and starts one itself. It can never be dropped.
+      const again = yield* SynchronizedRef.modify(state, (current) => [
+        current.recheck,
+        { ...current, enforcing: undefined, recheck: false },
+      ] as const)
       yield* Deferred.succeed(flight, undefined)
+      if (again) requestEnforce()
     }
   })
 
   const requestEnforce = (): void => {
-    void Effect.runPromise(enforce()).catch(() => undefined)
+    // Atomic with the flight lifecycle: set `recheck` synchronously when a
+    // flight exists, otherwise start one. Reading then writing non-atomically
+    // would recreate the lost-request window this function exists to close.
+    const active = mutate((current) => {
+      if (current.enforcing === undefined) return [false, current] as const
+      if (current.recheck) return [true, current] as const
+      return [true, { ...current, recheck: true }] as const
+    })
+    if (!active) void Effect.runPromise(enforce()).catch(() => undefined)
   }
 
   const track = (worker: ExecutorWorker): ExecutorWorker => {
@@ -1299,6 +1369,7 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
       return SynchronizedRef.getUnsafe(state).evictions
     },
     track,
+    requestEnforce,
     forget: (workerID) => {
       mutate((current) => {
         const tracked = new Map(current.tracked)

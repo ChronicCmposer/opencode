@@ -33,7 +33,7 @@ import { workerLogMessage, type WorkerLogger } from "@/session/worker/log"
 import { createWorkerHarness } from "../../lib/worker-harness"
 import { withFaults } from "../../lib/faults"
 import { capture, flush, pollUntil, sid } from "../../lib/async"
-import { FaultPool, FakeSessionWorker, createFakeWorkerPool } from "../../lib/fake-worker-pool"
+import { FaultPool, FakeSessionWorker, createFakeWorkerPool, type FakeCancelPort } from "../../lib/fake-worker-pool"
 import { createRecordingScheduler } from "../../lib/scheduler"
 
 const createTestScheduler = createRecordingScheduler
@@ -342,18 +342,295 @@ describe("Pending settlement is single-owner", () => {
     // Completion lands before the cancel request; the controller must observe it,
     // start the completion barrier, and the caller must settle exactly once.
     pool.spawned[0].finish(sessionID)
-    expect(await dispatcher.cancelWithGrace(sessionID)).toMatchObject({
+    await pollUntil(() => barrierCalls.length === 1, { message: "the completion barrier never started" })
+    const cancelling = dispatcher.cancelWithGrace(sessionID)
+    await pollUntil(() => settlements === 1, { message: "the caller never settled" })
+    expect(events).toEqual(["completed"])
+
+    // Only release/promotion waits for the barrier; the caller already settled.
+    Deferred.doneUnsafe(barrier, Effect.void)
+    expect(await cancelling).toMatchObject({
       mode: "completed",
       winner: "completion",
     })
-    expect(settlements).toBe(1)
-    expect(events).toEqual(["completed"])
-    expect(barrierCalls).toEqual([sessionID])
-
-    Deferred.doneUnsafe(barrier, Effect.void)
     await run
     await flush()
     expect(settlements).toBe(1)
+    expect(barrierCalls).toEqual([sessionID])
+    await dispatcher.terminateAll()
+  })
+
+  test("a completion-winner cancel keeps a parked waiter parked until the write barrier resolves", async () => {
+    const pool = createFakeWorkerPool(1)
+    const barrier = Deferred.makeUnsafe<void>()
+    const barrierCalls: SessionID[] = []
+    const dispatcher = createDispatcher({
+      pool,
+      writeBarrier: (sessionID) => {
+        barrierCalls.push(sessionID)
+        return Effect.runPromise(Deferred.await(barrier))
+      },
+      cancellation: {
+        portFor: (worker) => (worker as FakeSessionWorker).cancelPort,
+        graceMs: 500,
+        schedule: createTestScheduler().schedule,
+      },
+    })
+
+    const sessionID = sid("ses_completion_barrier_waiter")
+    const root = capture(dispatcher.dispatch({ sessionID }))
+    await pollUntil(() => pool.spawned.length === 1, { message: "the root run never started" })
+
+    pool.spawned[0].finish(sessionID)
+    await pollUntil(() => barrierCalls.length === 1, { message: "the write barrier never started" })
+
+    // Start the cancel first: it drains the waiters that existed at request
+    // time, then suspends on the boot probe. Park a new waiter during that
+    // window; completion wins the race, but this waiter must stay parked until
+    // the write barrier resolves.
+    const cancelling = dispatcher.cancelWithGrace(sessionID)
+    const waiter = capture(dispatcher.dispatch({ sessionID, depth: 1 }))
+    await pollUntil(() => dispatcher.queuedCount === 1, { message: "the waiter was never parked" })
+
+    // The caller settles at cancel settlement; only release/promotion waits.
+    expect((await root).ok).toBe(true)
+    expect(dispatcher.workerForSession(sessionID)).toBe(pool.spawned[0].id)
+    expect(dispatcher.busySlotCount).toBe(1)
+    expect(dispatcher.queuedCount).toBe(1)
+    expect(pool.spawned[0].runs).toHaveLength(1)
+    expect(barrierCalls).toEqual([sessionID])
+
+    Deferred.doneUnsafe(barrier, Effect.void)
+    expect(await cancelling).toMatchObject({
+      mode: "completed",
+      winner: "completion",
+    })
+    await pollUntil(() => pool.spawned[0].runs.length === 2, {
+      message: "the waiter was not promoted after the write barrier resolved",
+    })
+    expect(barrierCalls).toEqual([sessionID])
+    pool.spawned[0].finish(sessionID)
+    await pollUntil(() => barrierCalls.length === 2, {
+      message: "the promoted run did not take its own write barrier",
+    })
+    expect(await waiter).toEqual({ ok: true, value: undefined })
+    await dispatcher.terminateAll()
+  })
+
+  test("a cancel-first grace completion still runs the write barrier before release", async () => {
+    const pool = createFakeWorkerPool(1, { onCancel: "ignore", acknowledge: false })
+    const barrier = Deferred.makeUnsafe<void>()
+    const barrierCalls: SessionID[] = []
+    const dispatcher = createDispatcher({
+      pool,
+      writeBarrier: (sessionID) => {
+        barrierCalls.push(sessionID)
+        return Effect.runPromise(Deferred.await(barrier))
+      },
+      cancellation: {
+        portFor: (worker) => (worker as FakeSessionWorker).cancelPort,
+        graceMs: 500,
+        schedule: createTestScheduler().schedule,
+      },
+    })
+
+    const sessionID = sid("ses_cancel_first_barrier")
+    const root = capture(dispatcher.dispatch({ sessionID }))
+    await pollUntil(() => pool.spawned.length === 1, { message: "the root run never started" })
+
+    // The cancel opens the grace window first; the worker ignores the frame so
+    // the test can complete the run while `cancelPending` is true.
+    const cancelling = dispatcher.cancelWithGrace(sessionID)
+    const cancelPort = pool.spawned[0].cancelPort as FakeCancelPort
+    await pollUntil(() => cancelPort.sent.some((frame) => frame.type === "cancel"), {
+      message: "the cancel frame was never delivered",
+    })
+    const waiter = capture(dispatcher.dispatch({ sessionID, depth: 1 }))
+    await pollUntil(() => dispatcher.queuedCount === 1, { message: "the waiter was never parked" })
+
+    pool.spawned[0].finish(sessionID)
+    await pollUntil(() => barrierCalls.length === 1, {
+      message: "a completion during the cancel grace skipped the write barrier",
+    })
+    await flush()
+
+    // The caller settles at cancel settlement; only the release/promotion waits
+    // for the barrier.
+    expect(await root).toEqual({ ok: true, value: undefined })
+    // The barrier owns the release: the worker is retained and the waiter stays
+    // parked even though the cancel request already reported completion.
+    expect(dispatcher.workerForSession(sessionID)).toBe(pool.spawned[0].id)
+    expect(dispatcher.busySlotCount).toBe(1)
+    expect(dispatcher.queuedCount).toBe(1)
+    expect(pool.spawned[0].runs).toHaveLength(1)
+
+    Deferred.doneUnsafe(barrier, Effect.void)
+    expect(await cancelling).toMatchObject({ mode: "completed", winner: "completion" })
+    await pollUntil(() => pool.spawned[0].runs.length === 2, {
+      message: "the waiter was not promoted after the write barrier resolved",
+    })
+    expect(await root).toEqual({ ok: true, value: undefined })
+    pool.spawned[0].finish(sessionID)
+    await pollUntil(() => barrierCalls.length === 2, {
+      message: "the promoted run did not take its own write barrier",
+    })
+    expect(await waiter).toEqual({ ok: true, value: undefined })
+    await dispatcher.terminateAll()
+  })
+
+  test("an acknowledged cancel waits for the write barrier before admitting a parked waiter", async () => {
+    // Acknowledge the cancel so cancel wins, but ignore the frame so the run can
+    // complete on its own and install the write barrier during the grace window.
+    const pool = createFakeWorkerPool(1, { onCancel: "ignore" })
+    const barrier = Deferred.makeUnsafe<void>()
+    const barrierCalls: SessionID[] = []
+    const dispatcher = createDispatcher({
+      pool,
+      writeBarrier: (sessionID) => {
+        barrierCalls.push(sessionID)
+        return Effect.runPromise(Deferred.await(barrier))
+      },
+      cancellation: {
+        portFor: (worker) => (worker as FakeSessionWorker).cancelPort,
+        graceMs: 500,
+        schedule: createTestScheduler().schedule,
+      },
+    })
+
+    const sessionID = sid("ses_ack_cancel_barrier_waiter")
+    const root = capture(dispatcher.dispatch({ sessionID }))
+    await pollUntil(() => pool.spawned.length === 1, { message: "the root run never started" })
+
+    const cancelling = dispatcher.cancelWithGrace(sessionID)
+    const cancelPort = pool.spawned[0].cancelPort as FakeCancelPort
+    await pollUntil(() => cancelPort.sent.some((frame) => frame.type === "cancel"), {
+      message: "the cancel frame was never delivered",
+    })
+    const waiter = capture(dispatcher.dispatch({ sessionID, depth: 1 }))
+    await pollUntil(() => dispatcher.queuedCount === 1, { message: "the waiter was never parked" })
+
+    pool.spawned[0].finish(sessionID)
+    await pollUntil(() => barrierCalls.length === 1, {
+      message: "a completion during the acknowledged cancel skipped the write barrier",
+    })
+    // The caller is settled as-is (it never waits for durability).
+    expect(await root).toMatchObject({ ok: false, error: expect.any(SessionCancelledError) })
+    await flush()
+
+    // The barrier still gates admission: the worker is retained and the waiter
+    // stays parked until the barrier resolves.
+    expect(dispatcher.workerForSession(sessionID)).toBe(pool.spawned[0].id)
+    expect(dispatcher.busySlotCount).toBe(1)
+    expect(dispatcher.queuedCount).toBe(1)
+    expect(pool.spawned[0].runs).toHaveLength(1)
+    expect(barrierCalls).toEqual([sessionID])
+
+    Deferred.doneUnsafe(barrier, Effect.void)
+    expect(await cancelling).toMatchObject({
+      mode: "cooperative",
+      winner: "cancel",
+      acknowledged: true,
+    })
+    await pollUntil(() => pool.spawned[0].runs.length === 2, {
+      message: "the waiter was not promoted after the barrier resolved",
+    })
+    // The old barrier resolved before promotion, so it cannot delete the
+    // successor's session/worker handle.
+    expect(dispatcher.workerForSession(sessionID)).toBe(pool.spawned[0].id)
+    expect(dispatcher.registry.has(sessionID)).toBe(true)
+    expect(dispatcher.busySlotCount).toBe(1)
+
+    pool.spawned[0].finish(sessionID)
+    await pollUntil(() => barrierCalls.length === 2, {
+      message: "the promoted run did not take its own write barrier",
+    })
+    expect(await waiter).toEqual({ ok: true, value: undefined })
+    await dispatcher.terminateAll()
+  })
+
+  test("a write barrier that never settles is bounded and finalizes once", async () => {
+    const pool = createFakeWorkerPool(1)
+    const { log, lines } = recordingLogger()
+    const barrierCalls: SessionID[] = []
+    const dispatcher = createDispatcher({
+      pool,
+      log,
+      writeBarrierTimeoutMs: 25,
+      writeBarrier: (sessionID) => {
+        barrierCalls.push(sessionID)
+        return new Promise<void>(() => {})
+      },
+    })
+
+    const sessionID = sid("ses_write_barrier_timeout")
+    const run = capture(dispatcher.dispatch({ sessionID }))
+    await pollUntil(() => pool.spawned.length === 1, { message: "the run never started" })
+    pool.spawned[0].finish(sessionID)
+
+    const outcome = await Promise.race([
+      run.then(() => "resolved" as const),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 1_000)),
+    ])
+
+    expect(outcome).toBe("resolved")
+    expect(await run).toEqual({ ok: true, value: undefined })
+    expect(barrierCalls).toEqual([sessionID])
+    expect(dispatcher.busySlotCount).toBe(0)
+    expect(dispatcher.workerForSession(sessionID)).toBeUndefined()
+    expect(lines.filter((line) => line.message === workerLogMessage("session write barrier timed out"))).toHaveLength(1)
+    expect(lines.filter((line) => line.message === workerLogMessage("session completed"))).toHaveLength(1)
+    await dispatcher.terminateAll()
+  })
+
+  test("an immediate write barrier deadline ignores a rejecting barrier without an unhandled rejection", async () => {
+    const pool = createFakeWorkerPool(1)
+    const dispatcher = createDispatcher({
+      pool,
+      writeBarrierTimeoutMs: 0,
+      // The deadline already elapsed, so the rejection must be observed and
+      // discarded instead of surfacing as an unhandled rejection.
+      writeBarrier: () => Promise.reject(new Error("barrier failed after the deadline")),
+    })
+
+    const sessionID = sid("ses_write_barrier_immediate_reject")
+    const run = capture(dispatcher.dispatch({ sessionID }))
+    await pollUntil(() => pool.spawned.length === 1, { message: "the run never started" })
+    pool.spawned[0].finish(sessionID)
+
+    expect(await run).toEqual({ ok: true, value: undefined })
+    expect(dispatcher.busySlotCount).toBe(0)
+    expect(dispatcher.workerForSession(sessionID)).toBeUndefined()
+    // Let any late unhandled rejection surface before the test ends.
+    await flush()
+    await dispatcher.terminateAll()
+  })
+
+  test("a throwing write barrier timeout logger still resolves the run", async () => {
+    const pool = createFakeWorkerPool(1)
+    const log: WorkerLogger = (message) => {
+      if (message === workerLogMessage("session write barrier timed out")) throw new Error("logger exploded")
+    }
+    const dispatcher = createDispatcher({
+      pool,
+      log,
+      writeBarrierTimeoutMs: 0,
+      writeBarrier: () => new Promise<void>(() => {}),
+    })
+
+    const sessionID = sid("ses_write_barrier_throwing_log")
+    const run = capture(dispatcher.dispatch({ sessionID }))
+    await pollUntil(() => pool.spawned.length === 1, { message: "the run never started" })
+    pool.spawned[0].finish(sessionID)
+
+    const outcome = await Promise.race([
+      run.then(() => "resolved" as const),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 1_000)),
+    ])
+
+    expect(outcome).toBe("resolved")
+    expect(await run).toEqual({ ok: true, value: undefined })
+    expect(dispatcher.busySlotCount).toBe(0)
+    expect(dispatcher.workerForSession(sessionID)).toBeUndefined()
     await dispatcher.terminateAll()
   })
 
@@ -867,6 +1144,33 @@ describe("dispatch observability logging", () => {
     await flush()
     expect(pool.spawned[0].alive).toBe(false)
     expect(dispatcher.registry.entry(sessionID)).toBeUndefined()
+    await dispatcher.terminateAll()
+  })
+
+  test("a scheduler that resumes synchronously still arms a working reap timer", async () => {
+    const pool = createFakeWorkerPool(1)
+    const dispatcher = createDispatcher({
+      pool,
+      reapMs: 1_000,
+      // The scheduler seam allows a callback to run during registration. The
+      // timer identity fence must already be installed before that callback.
+      schedule: (_delayMs, run) => {
+        run()
+        return () => {}
+      },
+    })
+    const sessionID = sid("ses_sync_reap")
+
+    const run = dispatcher.dispatch({ sessionID })
+    await flush()
+    pool.spawned[0].finish(sessionID)
+    await run
+
+    await pollUntil(() => !dispatcher.registry.has(sessionID) && !pool.spawned[0].alive, {
+      message: "a synchronously fired reap callback was lost",
+      timeoutMs: 1_000,
+    })
+    expect(pool.spawned[0].alive).toBe(false)
     await dispatcher.terminateAll()
   })
 
@@ -1683,6 +1987,172 @@ describe("retirement exit cannot park the successor", () => {
     await flush()
     pool.spawned[1].finish(sid("ses_release_failure"))
     await successor
+    await dispatcher.terminateAll()
+  })
+})
+
+describe("bounded retirement barriers", () => {
+  test("retire and awaitRelease resolve within the terminate deadline when terminate never settles", async () => {
+    const worker = new FakeSessionWorker(1)
+    worker.terminate = () => new Promise<void>(() => {})
+    const pool: WorkerPool = { spawn: () => worker, terminateAll: async () => {} }
+    const dispatcher = createDispatcher({ pool, terminateTimeoutMs: 25 })
+    const sessionID = sid("ses_bounded_retire")
+
+    const run = dispatcher.dispatch({ sessionID })
+    await flush()
+    worker.finish(sessionID)
+    await run
+    await flush()
+
+    const retiring = dispatcher.retire(sessionID)
+    const awaiting = dispatcher.awaitRelease(sessionID)
+    const outcome = await Promise.race([
+      Promise.all([retiring, awaiting]).then(() => "resolved" as const),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 1_000)),
+    ])
+
+    expect(outcome).toBe("resolved")
+    expect(dispatcher.registry.has(sessionID)).toBe(false)
+    await dispatcher.terminateAll()
+  })
+
+  test("terminateAll drains a wedged retirement and completes its exit exactly once", async () => {
+    const worker = new FakeSessionWorker(1)
+    worker.terminate = () => new Promise<void>(() => {})
+    const released: SessionID[] = []
+    const pool: WorkerPool = { spawn: () => worker, terminateAll: async () => {} }
+    const dispatcher = createDispatcher({
+      pool,
+      terminateTimeoutMs: 25,
+      onSessionReleased: (sessionID) => {
+        released.push(sessionID)
+      },
+    })
+    const sessionID = sid("ses_bounded_terminate_all")
+
+    const run = dispatcher.dispatch({ sessionID })
+    void run.catch(() => undefined)
+    await flush()
+
+    // Start the wedged retirement before shutdown so terminateAll has to join a
+    // live retirement barrier instead of only terminating the worker directly.
+    const retiring = dispatcher.retire(sessionID)
+    const outcome = await Promise.race([
+      dispatcher.terminateAll().then(() => "resolved" as const),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 1_000)),
+    ])
+
+    expect(outcome).toBe("resolved")
+    await retiring
+    // Shutdown settles the retirement barrier instead of leaving a suspended
+    // `terminating` entry behind; the release hook still ran exactly once.
+    await dispatcher.awaitRelease(sessionID)
+    expect(dispatcher.retiringCount).toBe(0)
+    expect(released).toEqual([sessionID])
+    await expect(run).rejects.toBeInstanceOf(SessionCancelledError)
+  })
+
+  test("a wedged retirement fiber is stopped at the watchdog so shutdown does not wait again", async () => {
+    const worker = new FakeSessionWorker(1)
+    worker.terminate = () => new Promise<void>(() => {})
+    const released: SessionID[] = []
+    const pool: WorkerPool = { spawn: () => worker, terminateAll: async () => {} }
+    const dispatcher = createDispatcher({
+      pool,
+      terminateTimeoutMs: 500,
+      onSessionReleased: (sessionID) => {
+        released.push(sessionID)
+      },
+    })
+    const sessionID = sid("ses_wedged_retirement_fiber")
+
+    const run = dispatcher.dispatch({ sessionID })
+    await flush()
+    worker.finish(sessionID)
+    await run
+    await flush()
+
+    const retiring = dispatcher.retire(sessionID)
+    const outcome = await Promise.race([
+      retiring.then(() => "resolved" as const),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2_000)),
+    ])
+
+    expect(outcome).toBe("resolved")
+    expect(dispatcher.retiringCount).toBe(0)
+
+    // The wedged fiber must be off the shutdown drain: if it were still tracked,
+    // terminateAll would pay the full terminate deadline again.
+    const started = Date.now()
+    await dispatcher.terminateAll()
+    expect(Date.now() - started).toBeLessThan(300)
+    expect(dispatcher.retiringCount).toBe(0)
+    await dispatcher.awaitRelease(sessionID)
+    expect(released).toEqual([sessionID])
+  })
+
+  test("terminateAll drains a reap probe that never settles", async () => {
+    const pool = createFakeWorkerPool(1)
+    const dispatcher = createDispatcher({
+      pool,
+      reapMs: 1_000,
+      terminateTimeoutMs: 25,
+      // Fire the reap callback during registration so the probe starts without
+      // waiting on wall-clock time.
+      schedule: (_delayMs, run) => {
+        run()
+        return () => {}
+      },
+    })
+    const sessionID = sid("ses_reap_probe_never_settles")
+
+    const run = dispatcher.dispatch({ sessionID })
+    await pollUntil(() => pool.spawned.length === 1, { message: "the run never started" })
+    const worker = pool.spawned[0]
+    // A background probe that never answers must not wedge shutdown.
+    worker.activeWorkGate = new Promise<void>(() => {})
+    worker.finish(sessionID)
+    await run
+    await flush()
+
+    const outcome = await Promise.race([
+      dispatcher.terminateAll().then(() => "resolved" as const),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 1_000)),
+    ])
+
+    expect(outcome).toBe("resolved")
+    expect(dispatcher.registry.entries()).toHaveLength(0)
+    expect(worker.alive).toBe(false)
+  })
+
+  test("a throwing pool releaseSession still runs onSessionReleased", async () => {
+    const worker = new FakeSessionWorker(1)
+    const released: SessionID[] = []
+    const pool: WorkerPool = {
+      spawn: () => worker,
+      releaseSession: () => {
+        throw new Error("pool release failed")
+      },
+      terminateAll: async () => {},
+    }
+    const dispatcher = createDispatcher({
+      pool,
+      onSessionReleased: (releasedSessionID) => {
+        released.push(releasedSessionID)
+      },
+    })
+    const sessionID = sid("ses_throwing_pool_release")
+
+    const run = dispatcher.dispatch({ sessionID })
+    await flush()
+    worker.finish(sessionID)
+    await run
+    await flush()
+
+    await dispatcher.retire(sessionID)
+    await dispatcher.awaitRelease(sessionID)
+    expect(released).toEqual([sessionID])
     await dispatcher.terminateAll()
   })
 })

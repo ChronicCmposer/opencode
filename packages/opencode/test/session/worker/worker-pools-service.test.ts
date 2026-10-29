@@ -259,6 +259,55 @@ describe("WorkerPools service surface", () => {
     expect(evicted).toEqual([1])
   })
 
+  test("a recheck set after the final drain still causes another enforcement", async () => {
+    const evicted: number[] = []
+    let cap!: ReturnType<typeof createIdleIsolateCap>
+    let injected = false
+    let releaseThird!: () => void
+    const thirdGate = new Promise<void>((resolve) => {
+      releaseThird = resolve
+    })
+    cap = createIdleIsolateCap({
+      capacity: 1,
+      onEvict: (entry) => {
+        evicted.push(entry.worker.id)
+      },
+      // Runs after the owner's last drain and before the single-flight is
+      // released: exactly the window where a concurrent recheck used to vanish.
+      onBeforeRelease: async () => {
+        if (injected) return
+        injected = true
+        releaseThird()
+        await thirdRun
+        cap.requestEnforce()
+      },
+    })
+    const workers = [1, 2, 3].map((id) => {
+      const inner: ExecutorWorker = {
+        id,
+        alive: true,
+        execute: id === 3 ? () => thirdGate : async () => {},
+        cancel: async () => {},
+        assertNotBusy: async () => false,
+        resultFor: () => undefined,
+        terminate: async () => {},
+      }
+      return cap.track(inner)
+    })
+    const thirdRun = workers[2]!.execute({ sessionID: sid("ses_idle_cap_recheck_third"), depth: 0 })
+
+    await Promise.all([
+      workers[0]!.execute({ sessionID: sid("ses_idle_cap_recheck_first"), depth: 0 }),
+      workers[1]!.execute({ sessionID: sid("ses_idle_cap_recheck_second"), depth: 0 }),
+    ])
+
+    await pollUntil(() => injected && cap.idle === 1 && cap.evictions === 2, {
+      message: "the post-drain recheck was lost",
+      timeoutMs: 2_000,
+    })
+    expect(evicted).toEqual([1, 2])
+  })
+
   test("a throwing eviction hook still terminates and counts the eviction", async () => {
     const terminated: number[] = []
     const cap = createIdleIsolateCap({
@@ -289,6 +338,47 @@ describe("WorkerPools service surface", () => {
     expect(cap.evictions).toBe(1)
     expect(cap.idle).toBe(1)
     expect(terminated).toEqual([1])
+  })
+
+  test("idle-cap enforcement is bounded when the retirement hook and terminate never settle", async () => {
+    const evicted: number[] = []
+    const terminated: number[] = []
+    const cap = createIdleIsolateCap({
+      capacity: 1,
+      evictTimeoutMs: 25,
+      onEvict: (entry) => {
+        evicted.push(entry.worker.id)
+        return new Promise<void>(() => {})
+      },
+    })
+    const workers = [1, 2, 3].map((id) => {
+      const inner: ExecutorWorker = {
+        id,
+        alive: true,
+        execute: async () => {},
+        cancel: async () => {},
+        assertNotBusy: async () => false,
+        resultFor: () => undefined,
+        terminate: () => {
+          terminated.push(id)
+          return new Promise<void>(() => {})
+        },
+      }
+      return cap.track(inner)
+    })
+
+    await Promise.all(
+      workers.map((worker, index) => worker.execute({ sessionID: sid(`ses_idle_cap_wedged_${index}`), depth: 0 })),
+    )
+
+    // A wedged retirement must not pin the single-flight forever: the cap still
+    // drains down to capacity and later settlements are never parked behind it.
+    await pollUntil(() => cap.idle === 1 && cap.evictions === 2 && terminated.length === 2, {
+      message: "a wedged eviction hooked the idle-cap enforcement",
+      timeoutMs: 2_000,
+    })
+    expect(evicted.sort()).toEqual([1, 2])
+    expect(terminated.sort()).toEqual([1, 2])
   })
 
   test("every existing production factory stays exported as an adapter", async () => {
