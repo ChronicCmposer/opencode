@@ -19,15 +19,8 @@ import {
   type CancelPort,
   type CancelScheduler,
 } from "@/session/worker/cancel"
-import {
-  createDispatcher,
-  SessionCancelledError,
-  WorkerCrashedError,
-  type CancellationConfig,
-  type SessionRun,
-  type SessionWorker,
-  type WorkerPool,
-} from "@/session/worker/dispatch"
+import { SessionCancelledError, WorkerCrashedError, type CancellationConfig, type SessionRun, type SessionWorker, type WorkerPool } from "@/session/worker/dispatch"
+import { createDispatcher } from "../../lib/dispatcher"
 import { createWorkerHarness } from "../../lib/worker-harness"
 import { capture, flush, sid } from "../../lib/async"
 import { createFakeWorkerPool, type FakeSessionWorker } from "../../lib/fake-worker-pool"

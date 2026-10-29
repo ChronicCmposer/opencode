@@ -1,6 +1,6 @@
 // The pure hub.
 
-import { Cause, Context, Effect, Exit, Fiber, Schema } from "effect"
+import { Cause, Context, Effect, Exit, Fiber, Schema, Scope } from "effect"
 import path from "node:path"
 import { InstanceRef } from "../../effect/instance-ref"
 import { SessionStatus } from "../status"
@@ -26,7 +26,7 @@ import { type DbExecutor } from "./db-executor"
 import type { DispatchOrigin } from "../origin"
 import { defined } from "../../util/object"
 import {
-  createDispatcher,
+  SessionDispatch,
   type CancellationConfig,
   type CommitOutcome,
   type Dispatcher,
@@ -41,12 +41,7 @@ import {
   type RunBarrierPromotionOutcome,
   type RunBarrierRun,
 } from "../run-barrier"
-import {
-  createSessionDispatch,
-  type ExecutorWorkerPool,
-  type SessionDispatch,
-  type SessionExecutionResult,
-} from "./execute"
+import { createSessionDispatch, type ExecutorWorkerPool, type SessionExecutionResult } from "./execute"
 import { type CancelOutcome } from "./cancel"
 import { type PidRegistry, type PidReport } from "./pid-registry"
 import type { HubProxyHandlers, HubProxyStreamHandler } from "./hub-proxy-wire"
@@ -1244,123 +1239,126 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     if (state === "cancelled" || state === "failed") yield* barrier.reset(sessionID)
   })
 
-  dispatcher = createDispatcher({
-    pool,
-    crashState: (sessionID) => lifecycle.crashState(sessionID),
-    recordCrash: (payload) => lifecycle.observeCrash(payload),
-    resumeDecision: (payload) => {
-      const decide = (indeterminate: readonly IndeterminateCall[]) =>
-        decideAutoResume({
-          sessionID: payload.sessionID,
-          phase: payload.phase,
-          attempts: lifecycle.attempts(payload.sessionID),
-          cancelled: lifecycle.cancelled(payload.sessionID),
-          lastCommittedMessageID: payload.lastCommittedMessageID,
-          indeterminate,
-        })
-      // The durable `tool_call` rows are the crash truth.
-      if (db === undefined) return decide(lifecycle.indeterminate(payload.sessionID))
-      return boundedResumeDecision(
-        () =>
-          db
-            .query(
-              "SELECT call_id, side_effecting FROM tool_call WHERE session_id = ? AND state = 'started' ORDER BY time_started, call_id",
-              [payload.sessionID],
-            )
-            .then((rows) =>
-              decide(
-                rows.map((row) => ({
-                  callID: String(row.call_id),
-                  sideEffecting: Number(row.side_effecting) === 1,
-                })),
-              ),
-            )
-            .catch(() => decide(lifecycle.indeterminate(payload.sessionID))),
-        resumeDecisionTimeoutMs,
-        () => {
-          void bridge?.fork(
-            Effect.logWarning(workerLogMessage("resume decision timed out"), {
-              sessionID: payload.sessionID,
-              timeoutMs: resumeDecisionTimeoutMs,
-            }),
-          )
-          return {
-            resume: false,
+  // The hub is constructed synchronously by its callers; the dispatcher's scope is closed by its own terminateAll.
+  dispatcher = Effect.runSync(
+    SessionDispatch.make({
+      pool,
+      crashState: (sessionID) => lifecycle.crashState(sessionID),
+      recordCrash: (payload) => lifecycle.observeCrash(payload),
+      resumeDecision: (payload) => {
+        const decide = (indeterminate: readonly IndeterminateCall[]) =>
+          decideAutoResume({
             sessionID: payload.sessionID,
             phase: payload.phase,
-            reason: "indeterminate",
-          }
-        },
-      )
-    },
-    onAutoResume: (decision, payload) => {
-      // Cancel always wins: a decision computed before the cancel but resolved after it must never dispatch a successor run.
-      if (lifecycle.cancelled(decision.sessionID)) {
-        void bridge?.fork(
-          Effect.logInfo(workerLogMessage("auto-resume refused after cancel"), { sessionID: decision.sessionID }),
+            attempts: lifecycle.attempts(payload.sessionID),
+            cancelled: lifecycle.cancelled(payload.sessionID),
+            lastCommittedMessageID: payload.lastCommittedMessageID,
+            indeterminate,
+          })
+        // The durable `tool_call` rows are the crash truth.
+        if (db === undefined) return decide(lifecycle.indeterminate(payload.sessionID))
+        return boundedResumeDecision(
+          () =>
+            db
+              .query(
+                "SELECT call_id, side_effecting FROM tool_call WHERE session_id = ? AND state = 'started' ORDER BY time_started, call_id",
+                [payload.sessionID],
+              )
+              .then((rows) =>
+                decide(
+                  rows.map((row) => ({
+                    callID: String(row.call_id),
+                    sideEffecting: Number(row.side_effecting) === 1,
+                  })),
+                ),
+              )
+              .catch(() => decide(lifecycle.indeterminate(payload.sessionID))),
+          resumeDecisionTimeoutMs,
+          () => {
+            void bridge?.fork(
+              Effect.logWarning(workerLogMessage("resume decision timed out"), {
+                sessionID: payload.sessionID,
+                timeoutMs: resumeDecisionTimeoutMs,
+              }),
+            )
+            return {
+              resume: false,
+              sessionID: payload.sessionID,
+              phase: payload.phase,
+              reason: "indeterminate",
+            }
+          },
         )
-        return
-      }
-      lifecycle.recordAttempt(decision.sessionID)
-      if (options.resumeRun !== undefined) {
-        // The dispatcher settles the original crashed caller from this promise.
-        return options.resumeRun(decision, payload)
-      }
-      // No explicit resume owner: run the successor detached.
-      void dispatch
-        .ensureRunning(decision.sessionID as SessionID)
-        .then(() => lifecycle.resetAttempts(decision.sessionID))
-        .catch((error: unknown) => {
+      },
+      onAutoResume: (decision, payload) => {
+        // Cancel always wins: a decision computed before the cancel but resolved after it must never dispatch a successor run.
+        if (lifecycle.cancelled(decision.sessionID)) {
           void bridge?.fork(
-            Effect.logWarning(workerLogMessage("auto-resume failed"), {
-              sessionID: decision.sessionID,
-              error: error instanceof Error ? error.message : String(error),
+            Effect.logInfo(workerLogMessage("auto-resume refused after cancel"), { sessionID: decision.sessionID }),
+          )
+          return
+        }
+        lifecycle.recordAttempt(decision.sessionID)
+        if (options.resumeRun !== undefined) {
+          // The dispatcher settles the original crashed caller from this promise.
+          return options.resumeRun(decision, payload)
+        }
+        // No explicit resume owner: run the successor detached.
+        void dispatch
+          .ensureRunning(decision.sessionID as SessionID)
+          .then(() => lifecycle.resetAttempts(decision.sessionID))
+          .catch((error: unknown) => {
+            void bridge?.fork(
+              Effect.logWarning(workerLogMessage("auto-resume failed"), {
+                sessionID: decision.sessionID,
+                error: error instanceof Error ? error.message : String(error),
+              }),
+            )
+          })
+        return undefined
+      },
+      writeBarrier: runBarrier,
+      commitOutcome: (sessionID) => commitOutcomes.get(sessionID),
+      onRunStart: (sessionID) => {
+        // A lost generation's calls can never settle.
+        if (lostGenerations.delete(sessionID)) {
+          for (const call of lifecycle.indeterminate(sessionID)) lifecycle.toolFinished(sessionID, call.callID)
+        }
+        commitOutcomes.delete(sessionID)
+        lifecycle.beginRun(sessionID)
+        // Synchronous dispatcher callback: reporters need the run registered before it returns.
+        const begun = Effect.runSyncExit(barrier.beginRun(sessionID))
+        if (Exit.isSuccess(begun)) {
+          activeRuns.set(sessionID, begun.value)
+        } else {
+          activeRuns.delete(sessionID)
+          void bridge?.fork(
+            Effect.logWarning(workerLogMessage("run barrier begin failed"), {
+              sessionID,
+              error: Cause.pretty(begun.cause),
             }),
           )
-        })
-      return undefined
-    },
-    writeBarrier: runBarrier,
-    commitOutcome: (sessionID) => commitOutcomes.get(sessionID),
-    onRunStart: (sessionID) => {
-      // A lost generation's calls can never settle.
-      if (lostGenerations.delete(sessionID)) {
-        for (const call of lifecycle.indeterminate(sessionID)) lifecycle.toolFinished(sessionID, call.callID)
-      }
-      commitOutcomes.delete(sessionID)
-      lifecycle.beginRun(sessionID)
-      // Synchronous dispatcher callback: reporters need the run registered before it returns.
-      const begun = Effect.runSyncExit(barrier.beginRun(sessionID))
-      if (Exit.isSuccess(begun)) {
-        activeRuns.set(sessionID, begun.value)
-      } else {
-        activeRuns.delete(sessionID)
-        void bridge?.fork(
-          Effect.logWarning(workerLogMessage("run barrier begin failed"), {
-            sessionID,
-            error: Cause.pretty(begun.cause),
-          }),
-        )
-      }
-    },
-    onGenerationRetired: async (sessionID, workerID) => {
-      // A model switch replaces one generation but keeps the session live, so only the generation-scoped hook runs (never the session release).
-      await releaseGenerationResources(sessionID, workerID, { lost: false }, options.onGenerationReleased)
-    },
-    onSessionReleased: async (sessionID, workerID) => {
-      await releaseGenerationResources(sessionID, workerID, { lost: true }, options.onGenerationReleased)
-      leaseOwnerBySession.delete(sessionID)
-      await options.onSessionReleased?.(sessionID)
-    },
-    ...defined({
-      cancellation,
-      reapMs: options.reapMs,
-      schedule: options.schedule,
-      ...(bridge === undefined ? {} : { bridge }),
-    }),
-  })
+        }
+      },
+      onGenerationRetired: async (sessionID, workerID) => {
+        // A model switch replaces one generation but keeps the session live, so only the generation-scoped hook runs (never the session release).
+        await releaseGenerationResources(sessionID, workerID, { lost: false }, options.onGenerationReleased)
+      },
+      onSessionReleased: async (sessionID, workerID) => {
+        await releaseGenerationResources(sessionID, workerID, { lost: true }, options.onGenerationReleased)
+        leaseOwnerBySession.delete(sessionID)
+        await options.onSessionReleased?.(sessionID)
+      },
+      ...defined({
+        cancellation,
+        reapMs: options.reapMs,
+        schedule: options.schedule,
+        ...(bridge === undefined ? {} : { bridge }),
+      }),
+    }).pipe(Scope.provide(Scope.makeUnsafe())),
+  )
   // Depth is carried explicitly on the run (`metadata.depth` -> Session.spawn).
-  const dispatch: SessionDispatch = createSessionDispatch({
+  const dispatch = createSessionDispatch({
     dispatcher,
     pool,
     commitOutcome: (sessionID) => commitOutcomes.get(sessionID),

@@ -5,7 +5,8 @@
 import { describe, expect, test } from "bun:test"
 import { capture, flush, sid } from "../../lib/async"
 import { createFakeWorkerPool, type FakeSessionWorker } from "../../lib/fake-worker-pool"
-import { createDispatcher, ParentCrashedError } from "@/session/worker/dispatch"
+import { ParentCrashedError } from "@/session/worker/dispatch"
+import { createDispatcher } from "../../lib/dispatcher"
 
 describe("dead-worker reuse guard (m8)", () => {
   test("a crash during cancel grace retires the worker and cascades to children", async () => {

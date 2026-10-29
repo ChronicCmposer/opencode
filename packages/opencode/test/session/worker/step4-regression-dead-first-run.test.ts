@@ -10,7 +10,8 @@ import { describe, expect, test } from "bun:test"
 import { Effect, Exit, Scope } from "effect"
 import { makeProduction, type ProductionWorkerPoolOptions } from "@/session/worker/worker-pools"
 import type { ExecutorWorkerPool } from "@/session/worker/execute"
-import { createDispatcher, WorkerCrashedError } from "@/session/worker/dispatch"
+import { WorkerCrashedError } from "@/session/worker/dispatch"
+import { createDispatcher } from "../../lib/dispatcher"
 import { pollUntil, sid } from "../../lib/async"
 
 const ready = (threadId: number) => ({ type: "ready", threadId })

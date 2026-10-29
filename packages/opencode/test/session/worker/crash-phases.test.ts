@@ -5,7 +5,8 @@
 
 import { describe, expect, test } from "bun:test"
 import { createBunSqliteConnection } from "@/session/writer/connection"
-import { createDispatcher, ParentCrashedError, SessionCancelledError, WorkerCrashedError } from "@/session/worker/dispatch"
+import { ParentCrashedError, SessionCancelledError, WorkerCrashedError } from "@/session/worker/dispatch"
+import { createDispatcher } from "../../lib/dispatcher"
 import { WORKER_CRASH_PHASES, crashes, record, type WorkerCrashPhase, type WorkerCrashed } from "@/session/ledger/crash"
 import { LEDGER_SQL, type LedgerConnection } from "@/session/ledger/tool-call"
 import { capture, flush, sid } from "../../lib/async"

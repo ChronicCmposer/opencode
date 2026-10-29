@@ -8,7 +8,8 @@
 import { describe, expect, test } from "bun:test"
 import { Logger } from "effect"
 import { recordingBridge } from "../../lib/recorders"
-import { createDispatcher, SessionCancelledError } from "@/session/worker/dispatch"
+import { SessionCancelledError } from "@/session/worker/dispatch"
+import { createDispatcher } from "../../lib/dispatcher"
 import {
   createExecutorWorker,
   createExecutorWorkerPool,

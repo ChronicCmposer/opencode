@@ -20,7 +20,7 @@ import {
   type SessionExecutorInbound,
   type SessionExecutorOutbound,
 } from "@/session/worker/execute"
-import { createDispatcher } from "@/session/worker/dispatch"
+import { createDispatcher } from "./dispatcher"
 import { createLeakDetector, type LeakReport } from "./leak-detector"
 import {
   LINUX_CLOCK_TICKS_PER_SECOND,

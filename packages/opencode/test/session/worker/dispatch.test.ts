@@ -11,15 +11,8 @@ import path from "node:path"
 import { Deferred, Effect } from "effect"
 import type { SessionID } from "@/session/schema"
 import type { ShellInput } from "@/session/prompt"
-import {
-  createDispatcher,
-  SessionCancelledError,
-  WorkerCrashedError,
-  CANCELLED_MODES,
-  type Dispatcher,
-  type DispatchRequest,
-  type WorkerPool,
-} from "@/session/worker/dispatch"
+import { SessionCancelledError, WorkerCrashedError, CANCELLED_MODES, type Dispatcher, type DispatchRequest, type WorkerPool } from "@/session/worker/dispatch"
+import { createDispatcher } from "../../lib/dispatcher"
 import {
   createExecutorWorker,
   createSessionDispatch,

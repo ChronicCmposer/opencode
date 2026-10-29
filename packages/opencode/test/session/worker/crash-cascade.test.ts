@@ -11,12 +11,8 @@
 // spawned.
 
 import { describe, expect, test } from "bun:test"
-import {
-  createDispatcher,
-  SessionCancelledError,
-  WorkerCrashedError,
-  type CancellationConfig,
-} from "@/session/worker/dispatch"
+import { SessionCancelledError, WorkerCrashedError, type CancellationConfig } from "@/session/worker/dispatch"
+import { createDispatcher } from "../../lib/dispatcher"
 import { SessionWorkerReplyTimeoutError } from "@/session/worker/execute"
 import { capture, flush, sid } from "../../lib/async"
 import { createFakeWorkerPool } from "../../lib/fake-worker-pool"

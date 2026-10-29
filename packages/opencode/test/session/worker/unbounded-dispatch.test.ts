@@ -2,7 +2,7 @@
 // Every session is admitted on its own lazily-materialized worker.
 
 import { describe, expect, test } from "bun:test"
-import { createDispatcher } from "@/session/worker/dispatch"
+import { createDispatcher } from "../../lib/dispatcher"
 import { createFakeWorkerPool } from "../../lib/fake-worker-pool"
 import { flush, sid } from "../../lib/async"
 

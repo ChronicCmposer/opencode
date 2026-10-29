@@ -8,7 +8,7 @@ import { Effect, Exit, Scope } from "effect"
 import { makeProduction, makeSpawnGate } from "@/session/worker/worker-pools"
 import type { ProductionWorkerPoolOptions } from "@/session/worker/worker-pools"
 import type { ExecutorWorkerPool } from "@/session/worker/execute"
-import { createDispatcher } from "@/session/worker/dispatch"
+import { createDispatcher } from "../../lib/dispatcher"
 import { createRecordingScheduler } from "../../lib/scheduler"
 import { flush, pollUntil, sid } from "../../lib/async"
 

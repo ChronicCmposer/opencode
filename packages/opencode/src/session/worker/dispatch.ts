@@ -1920,9 +1920,9 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Se
 export const make = (options: DispatcherOptions): Effect.Effect<Dispatcher, never, Scope.Scope> =>
   Effect.gen(function* () {
     const scope = yield* Scope.Scope
-    const services = yield* Effect.context<never>()
     const engine = yield* makeEngine
-    return buildDispatcher(options, engine, Effect.runPromiseWith(services), scope)
+    const runPromise = yield* FiberSet.makeRuntimePromise()
+    return buildDispatcher(options, engine, runPromise, scope)
   })
 
 export const layer = (options: DispatcherOptions): Layer.Layer<Service> =>
@@ -1944,14 +1944,5 @@ export const layer = (options: DispatcherOptions): Layer.Layer<Service> =>
 
 export const node = (options: DispatcherOptions) =>
   LayerNode.make({ service: Service, layer: layer(options), deps: [] })
-
-/**
- * Compatibility constructor for callers that still hold a Promise-shaped
- * dispatcher (hub.ts, tests); the one synchronous edge into the Effect world.
- */
-export function createDispatcher(options: DispatcherOptions): Dispatcher {
-  const scope = Scope.makeUnsafe()
-  return Effect.runSync(make(options).pipe(Scope.provide(scope)))
-}
 
 export * as SessionDispatch from "./dispatch"

@@ -3,7 +3,8 @@
 
 import { describe, expect, test } from "bun:test"
 import { createSessionWorkerRegistry } from "@/session/worker/session-registry"
-import { createDispatcher, SessionCancelledError } from "@/session/worker/dispatch"
+import { SessionCancelledError } from "@/session/worker/dispatch"
+import { createDispatcher } from "../../lib/dispatcher"
 import { sid } from "../../lib/async"
 import { flush } from "../../lib/async"
 import { createFakeWorkerPool } from "../../lib/fake-worker-pool"

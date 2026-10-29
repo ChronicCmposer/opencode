@@ -8,12 +8,8 @@ import path from "node:path"
 import { Cause, Effect } from "effect"
 import type { SessionID } from "@/session/schema"
 import type { RunBarrierCommitOutcome, RunBarrierRun } from "@/session/run-barrier"
-import {
-  Cancelled,
-  cancelledFromCause,
-  createDispatcher,
-  type WorkerPool,
-} from "@/session/worker/dispatch"
+import { Cancelled, cancelledFromCause, type WorkerPool } from "@/session/worker/dispatch"
+import { createDispatcher } from "../../lib/dispatcher"
 import {
   createSessionHub,
   type SessionHub,

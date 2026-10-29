@@ -10,7 +10,8 @@ import {
   createSessionDispatch,
   type ExecutorTransport,
 } from "@/session/worker/execute"
-import { createDispatcher, WorkerCrashedError } from "@/session/worker/dispatch"
+import { WorkerCrashedError } from "@/session/worker/dispatch"
+import { createDispatcher } from "../../lib/dispatcher"
 import {
   CRASH_ATTEMPTS_BEFORE_DEAD,
   createSupervision,

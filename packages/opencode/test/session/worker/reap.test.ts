@@ -3,7 +3,7 @@
 // prompt. A new dispatch lazily spawns a fresh worker.
 
 import { describe, expect, test } from "bun:test"
-import { createDispatcher } from "@/session/worker/dispatch"
+import { createDispatcher } from "../../lib/dispatcher"
 import { DEFAULT_REAP_MS, REAP_MS_ENV, resolveReapMs } from "@/session/worker/pool"
 import { createFakeWorkerPool } from "../../lib/fake-worker-pool"
 import { createRecordingScheduler } from "../../lib/scheduler"
