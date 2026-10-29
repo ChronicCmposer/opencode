@@ -12,11 +12,9 @@ import {
   Layer,
   Option,
   Queue,
-  Ref,
   Scope,
   ScopedCache,
   Semaphore,
-  SynchronizedRef,
 } from "effect"
 import type { SessionID } from "@/session/schema"
 import type { EffectBridge } from "@/effect/bridge"
@@ -48,6 +46,7 @@ import { BuildMismatch, verifyReadyBuild } from "./build-hash"
 import type { SessionWorkerInit } from "./session-worker"
 import { workerLogMessage } from "./worker-logging"
 import { sessionThreadName } from "@/session/worker/thread-name"
+import { WorkerRuntime } from "./runtime-edge"
 
 import type { WorkerTransferredPorts } from "./worker-ports"
 
@@ -128,11 +127,10 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
   const timeoutMs = requirePositive("timeoutMs", options.timeoutMs)
   const capacity = requirePositiveInteger("capacity", options.capacity ?? DEFAULT_SPAWN_CAPACITY)
   const semaphore = Semaphore.makeUnsafe(capacity)
-  const active = Ref.makeUnsafe(0)
-  const waiting = Ref.makeUnsafe(0)
-
-  const activeCount = (): number => Ref.getUnsafe(active)
-  const waitingCount = (): number => Ref.getUnsafe(waiting)
+  // Plain counters: every mutation below is synchronous, so JavaScript's single
+  // thread already gives the gate the atomicity it needs.
+  let activeCount = 0
+  let waitingCount = 0
 
   const acquire = (signal?: AbortSignal): Promise<SpawnPermit> => {
     if (signal?.aborted === true) return Promise.reject(new SpawnGateAbortedError())
@@ -153,9 +151,9 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
 
     const hold = semaphore.withPermits(1)(
       Effect.gen(function* () {
-        yield* Ref.update(waiting, (count) => (count === 0 ? 0 : count - 1))
+        waitingCount = Math.max(0, waitingCount - 1)
         waitingCounted = false
-        yield* Ref.update(active, (count) => count + 1)
+        activeCount += 1
         holding = true
         yield* Deferred.succeed(granted, undefined)
         yield* Deferred.await(released)
@@ -165,9 +163,9 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
     // Count the waiter before the fiber can run, so `waiting` is observable the
     // moment `acquire` is called (and never double-counted on abort).
     waitingCounted = true
-    Effect.runSync(Ref.update(waiting, (count) => count + 1))
+    waitingCount += 1
 
-    const fiber = Effect.runFork(
+    const fiber = WorkerRuntime.runFork(
       Effect.raceFirst(
         hold,
         Deferred.await(aborted).pipe(Effect.andThen(Effect.interrupt)),
@@ -178,11 +176,11 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
             detach()
             if (waitingCounted) {
               waitingCounted = false
-              Effect.runSync(Ref.update(waiting, (count) => (count === 0 ? 0 : count - 1)))
+              waitingCount = Math.max(0, waitingCount - 1)
             }
             if (holding) {
               holding = false
-              Effect.runSync(Ref.update(active, (count) => (count === 0 ? 0 : count - 1)))
+              activeCount = Math.max(0, activeCount - 1)
             }
           }),
         ),
@@ -200,7 +198,7 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
       }
     }
 
-    return Effect.runPromise(
+    return WorkerRuntime.runPromise(
       Effect.raceFirst(
         Deferred.await(granted).pipe(Effect.map(permit)),
         Deferred.await(aborted).pipe(Effect.andThen(Effect.fail(new SpawnGateAbortedError()))),
@@ -215,7 +213,7 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
       (error: unknown) => {
         // A failed acquisition must leave the queue: interrupt the pending
         // `withPermits` scope so it can never construct afterwards.
-        Effect.runFork(Fiber.interrupt(fiber))
+        WorkerRuntime.runFork(Fiber.interrupt(fiber))
         throw error
       },
     )
@@ -224,16 +222,16 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
   return {
     acquire,
     get held() {
-      return activeCount() > 0
+      return activeCount > 0
     },
     get active() {
-      return activeCount()
+      return activeCount
     },
     get capacity() {
       return capacity
     },
     get waiting() {
-      return waitingCount()
+      return waitingCount
     },
   }
 }
@@ -519,7 +517,7 @@ export function liveSessionWorkerCount(databasePath?: string): number {
  * (promise APIs) that still need a deadline; Effect paths use `timeoutOrElse`.
  */
 function scheduleTimeout(ms: number, fire: () => void): () => void {
-  const fiber = Effect.runFork(
+  const fiber = WorkerRuntime.runFork(
     Effect.sleep(Duration.millis(ms)).pipe(Effect.andThen(Effect.sync(fire))),
   )
   let cancelled = false
@@ -1384,21 +1382,23 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
     readonly active: ReadonlySet<number>
     readonly evictions: number
   }
-  const state = SynchronizedRef.makeUnsafe<IdleCapState>({
+  let state: IdleCapState = {
     tracked: new Map(),
     idle: new Map(),
     active: new Set(),
     evictions: 0,
-  })
+  }
 
   /**
    * Apply one synchronous transition from a Promise-facing call site. The body
-   * never suspends and never re-enters the state, so `runSync` is safe here;
-   * fiber-internal code (`enforce`/`evict`) uses `yield*` instead. This is the
-   * documented Promise/Effect boundary for the cap.
+   * never suspends and never re-enters the state, so applying it directly is
+   * safe.
    */
-  const mutate = <A>(change: (current: IdleCapState) => readonly [A, IdleCapState]): A =>
-    Effect.runSync(SynchronizedRef.modify(state, change))
+  const mutate = <A>(change: (current: IdleCapState) => readonly [A, IdleCapState]): A => {
+    const [value, next] = change(state)
+    state = next
+    return value
+  }
 
   const evictTimeoutMs = options.evictTimeoutMs ?? DEFAULT_IDLE_EVICT_TIMEOUT_MS
   const boundedEvict = <A>(effect: Effect.Effect<A, unknown>, message: string, entry: Tracked) =>
@@ -1420,7 +1420,7 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
     )
 
   const evict = Effect.fnUntraced(function* (entry: Tracked) {
-    yield* SynchronizedRef.modify(state, (current) => {
+    mutate((current) => {
       entry.terminated = true
       const tracked = new Map(current.tracked)
       tracked.delete(entry.worker.id)
@@ -1464,7 +1464,7 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
    */
   const enforceOnce = Effect.fnUntraced(function* () {
     while (true) {
-      const next = yield* SynchronizedRef.modify(state, (current) => {
+      const next = mutate((current) => {
         if (current.idle.size <= capacity) return [undefined, current] as const
         const oldest = current.idle.entries().next()
         if (oldest.done) return [undefined, current] as const
@@ -1486,7 +1486,7 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
           Effect.catchCause(() => Effect.succeed(false)),
         )
         if (background) {
-          yield* SynchronizedRef.modify(state, (current) => {
+          mutate((current) => {
             if (entry.terminated || current.active.has(workerID)) return [undefined, current] as const
             const idle = new Map(current.idle)
             idle.set(workerID, entry)
@@ -1507,9 +1507,9 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
    * request that arrived during the previous pass into one more pass. A failed
    * pass is logged and the loop continues; closing the scope interrupts it.
    */
-  const requests = Effect.runSync(Queue.unbounded<void>())
-  const scope = Effect.runSync(Scope.make())
-  Effect.runSync(
+  const requests = WorkerRuntime.runSync(Queue.unbounded<void>())
+  const scope = Scope.makeUnsafe()
+  WorkerRuntime.runFork(
     Effect.forkIn(
       Effect.gen(function* () {
         while (true) {
@@ -1608,10 +1608,10 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
   return {
     capacity,
     get idle() {
-      return SynchronizedRef.getUnsafe(state).idle.size
+      return state.idle.size
     },
     get evictions() {
-      return SynchronizedRef.getUnsafe(state).evictions
+      return state.evictions
     },
     track,
     requestEnforce,
@@ -1629,7 +1629,7 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
     clear: () => {
       mutate((current) => [undefined, { ...current, tracked: new Map(), idle: new Map(), active: new Set() }] as const)
       // Closing the scope interrupts and joins the one enforcement consumer.
-      Effect.runSync(Scope.close(scope, Exit.void))
+      WorkerRuntime.runSync(Scope.close(scope, Exit.void))
     },
   }
 }
@@ -2090,8 +2090,9 @@ interface InitFlight {
 }
 
 /**
- * The production pool's init bookkeeping. `makeProduction` keeps this state in
- * a `SynchronizedRef` so the scoped cache and the init cache observe one order.
+ * The production pool's init bookkeeping. Every read and modification is
+ * synchronous, so the scoped cache and the init cache observe one order without
+ * an intermediate Effect synchronization layer.
  */
 interface ProductionInitState {
   inFlight(key: string): InitFlight | undefined
@@ -2164,15 +2165,14 @@ type ProductionInitMaps = {
 /**
  * Effect-owned production init state. Reads and pure modifications stay
  * synchronous, so the adapter observes exactly the ordering the plain-map
- * factory has while the service owns the state through a `SynchronizedRef`.
+ * factory has.
  */
-function synchronizedProductionInitState(
-  ref: SynchronizedRef.SynchronizedRef<ProductionInitMaps>,
-): ProductionInitState {
+function productionInitState(): ProductionInitState {
+  let maps: ProductionInitMaps = { inFlight: new Map(), cache: new Map() }
   const update = (change: (maps: ProductionInitMaps) => ProductionInitMaps): void => {
-    Effect.runSync(SynchronizedRef.modify(ref, (maps) => [undefined, change(maps)] as const))
+    maps = change(maps)
   }
-  const current = (): ProductionInitMaps => SynchronizedRef.getUnsafe(ref)
+  const current = (): ProductionInitMaps => maps
   return {
     inFlight: (key) => current().inFlight.get(key),
     startInFlight: (key, flight) =>
@@ -2222,7 +2222,7 @@ const promiseEffect = <A>(run: () => Promise<A>): Effect.Effect<A> =>
  * as a settled join because the caller is tearing the resource down anyway.
  */
 const joinWithin = (promise: Promise<unknown>, timeoutMs: number): Promise<void> =>
-  Effect.runPromise(
+  WorkerRuntime.runPromise(
     Effect.tryPromise({ try: () => promise, catch: (error) => error }).pipe(
       Effect.timeoutOrElse({
         duration: Duration.millis(timeoutMs),
@@ -2245,11 +2245,7 @@ export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Eff
     const bridge = options.bridge
     const runIdleTimeoutMs = resolveRunIdleTimeoutMs(options)
     logRunIdleTimeoutWarning(bridge, options)
-    const initRef = yield* SynchronizedRef.make<ProductionInitMaps>({
-      inFlight: new Map(),
-      cache: new Map(),
-    })
-    const state = synchronizedProductionInitState(initRef)
+    const state = productionInitState()
     const resolveSource: (
       sessionID?: SessionID,
       model?: WorkerModelSelection,
@@ -2264,7 +2260,7 @@ export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Eff
       const existing = state.inFlight(key)
       if (existing !== undefined) return existing.promise
       const deferred = Deferred.makeUnsafe<SessionWorkerInit, unknown>()
-      const flight: InitFlight = { deferred, promise: Effect.runPromise(Deferred.await(deferred)) }
+      const flight: InitFlight = { deferred, promise: WorkerRuntime.runPromise(Deferred.await(deferred)) }
       state.startInFlight(key, flight)
       Promise.resolve()
         .then(() => resolveSource(sessionID, model))
@@ -2392,7 +2388,7 @@ export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Eff
     )
     const invalidate = (key: string): Promise<void> => {
       lookups.delete(key)
-      return Effect.runPromise(ScopedCache.invalidate(cache, key)).catch(() => undefined)
+      return WorkerRuntime.runPromise(ScopedCache.invalidate(cache, key)).catch(() => undefined)
     }
     const idleCap = createIdleIsolateCap({
       capacity: options.maxIdleWorkers ?? resolveIdleWorkerCapacity(),
@@ -2469,7 +2465,7 @@ export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Eff
               lookups.set(key, { sessionID: run.sessionID, workerID: id, init: generation.init })
               if (current === undefined) {
                 try {
-                  current = await Effect.runPromise(ScopedCache.get(cache, key))
+                  current = await WorkerRuntime.runPromise(ScopedCache.get(cache, key))
                 } catch (error) {
                   // A failed lookup is cached by the cache's TTL; drop it so the
                   // next turn retries the init/spawn instead of replaying it.
@@ -2549,7 +2545,7 @@ export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Eff
         await Promise.all(workers.map((worker) => worker.terminate().catch(() => undefined)))
         // Every slot join above is bounded; the cache scope close is bounded too
         // so a lingering lookup cannot park shutdown after its deadline.
-        await Effect.runPromise(
+        await WorkerRuntime.runPromise(
           Scope.close(cacheScope, Exit.void).pipe(
             Effect.timeoutOrElse({
               duration: Duration.millis(MATERIALIZE_JOIN_TIMEOUT_MS),

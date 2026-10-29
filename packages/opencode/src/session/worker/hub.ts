@@ -14,6 +14,7 @@
 // down with the layer scope.
 
 import { Context, Effect, Fiber } from "effect"
+import { WorkerRuntime } from "./runtime-edge"
 import path from "node:path"
 import { InstanceRef } from "../../effect/instance-ref"
 import { SessionStatus } from "../status"
@@ -1056,7 +1057,7 @@ function forkEventsProgram(
       // Fall through to the default runtime.
     }
   }
-  return { fiber: Effect.runFork(program), owned: true }
+  return { fiber: WorkerRuntime.runFork(program), owned: true }
 }
 
 
@@ -1397,7 +1398,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     // run `done` reply returns exactly this value.
     commitOutcomes.set(sessionID, { committed })
     try {
-      await Effect.runPromise(barrier.wait(sessionID))
+      await WorkerRuntime.runPromise(barrier.wait(sessionID))
     } finally {
       activeRuns.delete(sessionID)
     }

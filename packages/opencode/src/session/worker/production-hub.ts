@@ -109,6 +109,7 @@ import {
   type WorkerTransferredPorts,
 } from "./worker-ports"
 import { SessionHubService } from "./hub"
+import { WorkerRuntime } from "./runtime-edge"
 /**
  * Fallback instance context for a dispatch with no ambient `InstanceRef`.
  *
@@ -202,11 +203,11 @@ async function loadDispatchedSession(
   if (context === undefined || sessionID === undefined) return undefined
   const session = Context.getOption(context, Session.Service)
   if (Option.isNone(session)) return undefined
-  const info = await Effect.runPromise(
+  const info = await WorkerRuntime.runPromise(
     session.value.get(sessionID).pipe(Effect.match({ onFailure: () => undefined, onSuccess: (value) => value })),
   )
   // `findMessage` searches newest-first, so this is the message being processed.
-  const lastUser = await Effect.runPromise(
+  const lastUser = await WorkerRuntime.runPromise(
     session.value
       .findMessage(sessionID, (message) => message.info.role === "user")
       .pipe(Effect.match({ onFailure: () => Option.none(), onSuccess: (value) => value })),
@@ -260,7 +261,7 @@ async function resolveContextPluginSources(
   if (Option.isNone(plugin)) return undefined
   // `Plugin.list` resolves the per-directory `InstanceState`, so run it under the
   // dispatching instance's captured context.
-  const hooks = await Effect.runPromise(Effect.provide(plugin.value.list(), context))
+  const hooks = await WorkerRuntime.runPromise(Effect.provide(plugin.value.list(), context))
   if (hooks.length === 0) return undefined
   return hooks.map((hook, index) => ({ name: `plugin-${index}`, hooks: hook as WorkerPluginHooks }))
 }
@@ -695,9 +696,9 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   const scope = options.scope
   // A direct caller without a layer scope still gets the single scoped pool:
   // its `terminateAll` closes the pool's own cache scope on shutdown.
-  const poolScope = scope ?? Effect.runSync(Scope.make())
+  const poolScope = scope ?? Scope.makeUnsafe()
   const runScoped = <A>(effect: Effect.Effect<A, never, Scope.Scope>): A =>
-    Effect.runSync(Scope.provide(poolScope)(effect))
+    WorkerRuntime.runSync(Scope.provide(poolScope)(effect))
   // One backend build for both the hub's dispose bookkeeping and the port
   // service: a function source is memoized here, so neither owner can construct
   // a second egress mesh. The resolved flag is set only AFTER the source
@@ -1382,7 +1383,7 @@ export function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSess
   const runHubProxyFor =
     (context: Context.Context<never> | undefined): HubProxyRunner =>
     (effect) =>
-      Effect.runPromise(context === undefined ? effect : Effect.provide(effect, context))
+      WorkerRuntime.runPromise(context === undefined ? effect : Effect.provide(effect, context))
   // Every hub-proxy permission/question ask is tagged with the generation epoch
   // of the session it belongs to. Retiring a generation advances that session's
   // epoch and synchronously fails only asks tagged with an older epoch, so a
@@ -1572,7 +1573,7 @@ export function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSess
     // A non-serializable provider option or plugin hook is a configuration
     // defect: die loud rather than widen every graph's error channel with the
     // typed failure.
-    return Effect.runPromise(
+    return WorkerRuntime.runPromise(
       buildSessionWorkerInit(initOptions).pipe(
         Effect.provideService(Config.Service, services.config),
         Effect.provideService(Auth.Service, services.auth),

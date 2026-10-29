@@ -9,6 +9,7 @@
 // `serveHubProxy` workaround.
 
 import { Effect, Option, Schema } from "effect"
+import { WorkerRuntime } from "./runtime-edge"
 import { createRequestChannel, errorTagOf, messageOf, workerFrameChannel } from "./port"
 import { ProtocolError, assertJsonRepresentable } from "./frame"
 import { parseJson } from "@/util/safe-json"
@@ -224,7 +225,7 @@ export function createHubProxyClient(port: MessagePort, options: HubProxyClientO
     // settles — before the request is even posted, so no event can slip past it.
     let id: number | undefined
     try {
-      const reply = await Effect.runPromise(
+      const reply = await WorkerRuntime.runPromise(
         requests.request((requestId) => {
           id = requestId
           if (onEvent !== undefined) eventHandlers.set(requestId, onEvent)

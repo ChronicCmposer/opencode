@@ -21,6 +21,7 @@ import { EXECUTOR_BUSY_RETRY_CONFIG, retryBusySync } from "@opencode-ai/core/dat
 import { withBusyRetry, type BusyRetriesExhaustedError } from "@opencode-ai/core/database/busy"
 import { Context, Deferred, Duration, Effect, Exit, Layer, Schedule, Schema, Scope, Semaphore } from "effect"
 import { resolveWorkerEntry } from "./port"
+import { WorkerRuntime } from "./runtime-edge"
 
 export type DbParams = ReadonlyArray<unknown> | Record<string, unknown>
 
@@ -329,7 +330,7 @@ export interface CheckpointTarget {
  */
 export function scheduleCheckpoint(target: CheckpointTarget, intervalMs: number): () => void {
   if (!Number.isFinite(intervalMs) || intervalMs <= 0) return () => {}
-  const scope = Effect.runSync(Scope.make())
+  const scope = Scope.makeUnsafe()
   const tick = Effect.sync(() => {
     try {
       target.exec("PRAGMA wal_checkpoint(PASSIVE)")
@@ -337,12 +338,12 @@ export function scheduleCheckpoint(target: CheckpointTarget, intervalMs: number)
       // A concurrently held write lock is expected; the next tick retries.
     }
   })
-  Effect.runSync(tick.pipe(Effect.repeat(Schedule.spaced(Duration.millis(intervalMs))), Effect.forkIn(scope)))
+  WorkerRuntime.runSync(tick.pipe(Effect.repeat(Schedule.spaced(Duration.millis(intervalMs))), Effect.forkIn(scope)))
   let stopped = false
   return () => {
     if (stopped) return
     stopped = true
-    Effect.runSync(Scope.close(scope, Exit.void))
+    WorkerRuntime.runSync(Scope.close(scope, Exit.void))
   }
 }
 
@@ -864,10 +865,10 @@ export function node(options: DbExecutorOptions): LayerNode.Node<Service, never,
 
 function promiseFacade(service: Interface, close: () => Promise<void>): DbExecutor {
   return {
-    run: (sql, params) => Effect.runPromise(service.run(sql, params)),
-    query: (sql, params) => Effect.runPromise(service.query(sql, params)),
-    queryInTransaction: (sql, params) => Effect.runPromise(service.queryInTransaction(sql, params)),
-    transaction: (statements) => Effect.runPromise(service.transaction(statements)),
+    run: (sql, params) => WorkerRuntime.runPromise(service.run(sql, params)),
+    query: (sql, params) => WorkerRuntime.runPromise(service.query(sql, params)),
+    queryInTransaction: (sql, params) => WorkerRuntime.runPromise(service.queryInTransaction(sql, params)),
+    transaction: (statements) => WorkerRuntime.runPromise(service.transaction(statements)),
     close,
     get threadId() {
       return service.threadId
@@ -877,7 +878,7 @@ function promiseFacade(service: Interface, close: () => Promise<void>): DbExecut
 
 /** Adapt a live service to the legacy Promise surface (hub internals only). */
 export function toPromiseExecutor(service: Interface): DbExecutor {
-  return promiseFacade(service, () => Effect.runPromise(service.close()))
+  return promiseFacade(service, () => WorkerRuntime.runPromise(service.close()))
 }
 
 /**
@@ -887,10 +888,10 @@ export function toPromiseExecutor(service: Interface): DbExecutor {
  * handle must be closed; that closes the service scope (worker + checkpoint).
  */
 export function makePromiseExecutor(options: DbExecutorOptions): DbExecutor {
-  const scope = Effect.runSync(Scope.make())
-  const service = Effect.runSync(Scope.provide(scope)(make(options)))
+  const scope = Scope.makeUnsafe()
+  const service = WorkerRuntime.runSync(Scope.provide(scope)(make(options)))
   let closing: Promise<void> | undefined
-  return promiseFacade(service, () => (closing ??= Effect.runPromise(Scope.close(scope, Exit.void))))
+  return promiseFacade(service, () => (closing ??= WorkerRuntime.runPromise(Scope.close(scope, Exit.void))))
 }
 
 /** @deprecated Use {@link Service} / {@link make} in production; kept for legacy tests. */

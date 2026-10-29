@@ -20,6 +20,7 @@ import type { PromptInput, ShellInput } from "@/session/prompt"
 import type { EffectBridge } from "@/effect/bridge"
 import type { BootCancelResult, CancelFrame, CancelPort } from "./cancel"
 import { workerLogMessage } from "./worker-logging"
+import { WorkerRuntime } from "./runtime-edge"
 import { committedMessage, resetCommitted } from "@/session/ledger/lifecycle"
 import { errorTagOf, messageOf } from "./port"
 import { readyFrame, type ReadyBuildFrame } from "./build-hash"
@@ -239,7 +240,7 @@ export type SessionExecutorOutbound =
 
 export type SessionEffectRunner = <A, E>(effect: Effect.Effect<A, E>) => Promise<A>
 
-const runEffect: SessionEffectRunner = (effect) => Effect.runPromise(effect)
+const runEffect: SessionEffectRunner = (effect) => WorkerRuntime.runPromise(effect)
 
 const isAddressed = (message: SessionExecutorOutbound, id: number): boolean => "id" in message && message.id === id
 
@@ -285,7 +286,7 @@ export interface SessionExecutorOptions {
    * callback never unwinds or fails the run.
    */
   readonly onRunStart?: (sessionID: SessionID, depth: number) => void
-  /** Effect runner seam; defaults to `Effect.runPromise`. */
+  /** Effect runner seam; defaults to the shared runtime boundary. */
   readonly run?: SessionEffectRunner
 }
 
@@ -426,7 +427,7 @@ export function installSessionExecutor(
   options: SessionExecutorInstallOptions,
 ): InstalledSessionExecutor {
   const ownsScope = options.scope === undefined
-  const workerScope = options.scope ?? Effect.runSync(Scope.make())
+  const workerScope = options.scope ?? Scope.makeUnsafe()
   const machine = createSessionRunMachine({ scope: workerScope, onIdle: options.onIdle, onBusy: options.onBusy })
   const executor = createSessionExecutor({
     machine,
@@ -456,7 +457,7 @@ export function installSessionExecutor(
     handle: executor.handle,
     dispose: async () => {
       if (!ownsScope) return
-      await Effect.runPromise(Scope.close(workerScope, Exit.void))
+      await WorkerRuntime.runPromise(Scope.close(workerScope, Exit.void))
     },
   }
 }
@@ -734,7 +735,7 @@ export async function awaitReplyWithLiveness(
   try {
     // Bridge the interruptible probe at the one Promise-shaped edge: the run
     // reply and the probe race, and the loser's fiber is interrupted.
-    return await Effect.runPromise(
+    return await WorkerRuntime.runPromise(
       Effect.raceFirst(
         Effect.tryPromise({ try: () => reply, catch: (error) => error }),
         probeLoop,

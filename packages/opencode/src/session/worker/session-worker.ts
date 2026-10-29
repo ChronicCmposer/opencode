@@ -38,6 +38,7 @@ import { SessionID } from "@/session/schema"
 import { Snapshot } from "@/snapshot"
 import { InstanceRef } from "@/effect/instance-ref"
 import { EffectBridge } from "@/effect/bridge"
+import { WorkerRuntime } from "./runtime-edge"
 import { setThreadName } from "@/util/thread-name"
 import type { InstanceContext } from "@/project/instance-context"
 import { Provider } from "@/provider/provider"
@@ -369,7 +370,7 @@ export function createWorkerDatabaseWriter(
   const readConnection =
     options.queryConnection ?? options.connection ?? ownedConnection ?? openWriterConnection(databaseFilename)
   const ownerID = `worker-${options.workerID ?? threadId}-${process.pid}-${randomUUID()}`
-  if (options.eventBinding !== undefined) Effect.runSync(options.eventBinding.setLeaseOwner(ownerID))
+  if (options.eventBinding !== undefined) WorkerRuntime.runSync(options.eventBinding.setLeaseOwner(ownerID))
   // A session worker's DurableLog is scoped to its one session aggregate: publishing,
   // claiming, reading, or releasing another session's log is refused.
   const blobDir = options.blobDir ?? path.join(path.dirname(databaseFilename), "event-blobs")
@@ -454,7 +455,7 @@ export function createWorkerDatabaseWriter(
     dispose: () => {
       if (heartbeat !== undefined) clearInterval(heartbeat)
       if (options.sessionID !== undefined) bus.release(options.sessionID)
-      if (options.eventBinding !== undefined) Effect.runSync(options.eventBinding.clear())
+      if (options.eventBinding !== undefined) WorkerRuntime.runSync(options.eventBinding.clear())
       ownedConnection?.close()
     },
   }
@@ -798,9 +799,9 @@ export function createSessionWork(options: SessionWorkOptions): SessionWork {
           const withInstance = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
             options.instance === undefined ? effect : Effect.provideService(effect, InstanceRef, options.instance)
           options.registerControl({
-            cancel: (id) => Effect.runPromise(withInstance(runState.value.cancel(id)).pipe(Effect.asVoid)),
+            cancel: (id) => WorkerRuntime.runPromise(withInstance(runState.value.cancel(id)).pipe(Effect.asVoid)),
             busy: (id) =>
-              Effect.runPromise(
+              WorkerRuntime.runPromise(
                 withInstance(runState.value.assertNotBusy(id)).pipe(
                   Effect.match({ onFailure: () => true, onSuccess: () => false }),
                 ),
@@ -880,7 +881,7 @@ export function hasRunningBackgroundJob(jobs: readonly BackgroundJob.Info[], ses
  */
 export function createBackgroundWorkProbe(jobs: BackgroundJob.Interface): (sessionID: SessionID) => Promise<boolean> {
   return (sessionID) =>
-    Effect.runPromise(jobs.list().pipe(Effect.map((running) => hasRunningBackgroundJob(running, sessionID))))
+    WorkerRuntime.runPromise(jobs.list().pipe(Effect.map((running) => hasRunningBackgroundJob(running, sessionID))))
 }
 
 /**
@@ -902,7 +903,7 @@ export function createHubSyncedBackgroundJobs(
   const mirrored = new Set<string>()
 
   const reportSettlement = async (id: string): Promise<void> => {
-    const waited = await Effect.runPromise(local.wait({ id }))
+    const waited = await WorkerRuntime.runPromise(local.wait({ id }))
     const info = waited.info
     if (info === undefined || info.status === "running") return
     await client.call("backgroundJob.settle", [
@@ -933,7 +934,7 @@ export function createHubSyncedBackgroundJobs(
     void reportSettlement(info.id).catch(() => undefined)
     void client
       .call("backgroundJob.awaitPromotion", [info.id])
-      .then((promoted) => (promoted === true ? Effect.runPromise(local.promote(info.id)) : undefined))
+      .then((promoted) => (promoted === true ? WorkerRuntime.runPromise(local.promote(info.id)) : undefined))
       .catch(() => undefined)
       .finally(() => mirrored.delete(info.id))
   }
@@ -1055,23 +1056,23 @@ export function workerGraphReplacements(
 
 /**
  * The worker-side logger. The isolate runs no long-lived Effect fiber (each frame
- * is executed with `Effect.runPromise`), so a bridge is created synchronously from
+ * is executed with the shared runtime boundary), so a bridge is created synchronously from
  * the worker's own instance context. `bridge.fork` then runs each `Effect.logInfo`
  * on the default Effect runtime, so the peer lifecycle lines reach the worker's
  * output instead of being dropped by the no-op default.
  */
 export function workerLogBridge(snapshot: WorkerSnapshot, logging?: Layer.Layer<never>): EffectBridge.Shape {
-  const bridge = Effect.runSync(
+  const bridge = WorkerRuntime.runSync(
     EffectBridge.make().pipe(Effect.provideService(InstanceRef, workerInstanceContext(snapshot))),
   )
   if (logging === undefined) return bridge
-  // The file sink opens asynchronously, so `Effect.runSync` cannot build it into
+  // The file sink opens asynchronously, so the synchronous boundary cannot build it into
   // the bridge context. Provide the logging layer per emitted line instead — the
   // bridge logger only emits a handful of lifecycle lines.
   return {
     ...bridge,
     fork: <A, E, R>(effect: Effect.Effect<A, E, R>): Fiber.Fiber<A, E> =>
-      Effect.runFork(effect.pipe(Effect.provide(logging)) as Effect.Effect<A, E, never>),
+      WorkerRuntime.runFork(effect.pipe(Effect.provide(logging)) as Effect.Effect<A, E, never>),
   }
 }
 
@@ -1320,7 +1321,7 @@ export function bootstrapSessionWorker(
       // Always attempt the native handle close: it owns the WAL write lock, and a
       // half-open transaction is rolled back by SQLite's close.
       const db = database
-      if (db !== undefined) disposeSafely(() => Effect.runSync(db.close))
+      if (db !== undefined) disposeSafely(() => WorkerRuntime.runSync(db.close))
     }
   }
   /**
@@ -1340,12 +1341,12 @@ export function bootstrapSessionWorker(
     // The registry scope outlives every run, so close it explicitly with the
     // worker bootstrap; a still-running job is interrupted with the isolate.
     const jobs = backgroundJobScope
-    if (jobs !== undefined) await Effect.runPromise(Scope.close(jobs, Exit.void)).catch(() => undefined)
+    if (jobs !== undefined) await WorkerRuntime.runPromise(Scope.close(jobs, Exit.void)).catch(() => undefined)
     // Close durable resources before the graph scope; close is idempotent.
     closeResources()
     // Close the worker-lifetime graph scope (DB/egress/bridge finalizers).
     const graph = workerScope
-    if (graph !== undefined) await Effect.runPromise(Scope.close(graph, Exit.void)).catch(() => undefined)
+    if (graph !== undefined) await WorkerRuntime.runPromise(Scope.close(graph, Exit.void)).catch(() => undefined)
   }
   /**
    * Synchronous best-effort teardown for the mid-bootstrap failure path. The
@@ -1358,10 +1359,10 @@ export function bootstrapSessionWorker(
     const executor = installed
     if (executor !== undefined) void executor.dispose().catch(() => undefined)
     const jobs = backgroundJobScope
-    if (jobs !== undefined) void Effect.runPromise(Scope.close(jobs, Exit.void)).catch(() => undefined)
+    if (jobs !== undefined) void WorkerRuntime.runPromise(Scope.close(jobs, Exit.void)).catch(() => undefined)
     closeResources()
     const graph = workerScope
-    if (graph !== undefined) void Effect.runPromise(Scope.close(graph, Exit.void)).catch(() => undefined)
+    if (graph !== undefined) void WorkerRuntime.runPromise(Scope.close(graph, Exit.void)).catch(() => undefined)
   }
   // A raw worker message (not an executor frame), handled here rather than in
   // `execute.ts`; the executor's unknown-frame path is harmless.
@@ -1394,7 +1395,7 @@ export function bootstrapSessionWorker(
     if (usePrompt) {
       // One connection per worker generation: the schema gate is read-only and a
       // mismatch refuses boot before any run starts (D5/D7).
-      database = Effect.runSync(
+      database = WorkerRuntime.runSync(
         openWorkerDatabase({
           filename: Database.path(),
           ...(init.sessionID === undefined ? {} : { sessionID: init.sessionID }),
@@ -1504,8 +1505,8 @@ export function bootstrapSessionWorker(
     // so a `Layer.effect` registry would be rebuilt (and its jobs interrupted) at
     // every turn boundary; a single `Layer.succeed` value keeps a background job
     // alive after the turn that started it, which the idle-reap probe observes.
-    backgroundJobScope = Effect.runSync(Scope.make())
-    const backgroundJobContext = Effect.runSync(Layer.buildWithScope(localBackgroundJobLayer(), backgroundJobScope))
+    backgroundJobScope = Scope.makeUnsafe()
+    const backgroundJobContext = WorkerRuntime.runSync(Layer.buildWithScope(localBackgroundJobLayer(), backgroundJobScope))
     const backgroundJobs = Context.get(backgroundJobContext, BackgroundJob.Service)
     // A full-port worker mirrors its jobs over the control port so the hub's
     // promotion endpoint can see foreground jobs; a degraded boot stays local.
@@ -1558,7 +1559,7 @@ export function bootstrapSessionWorker(
     // the cached context (the per-worker DB included) and only its own run scope;
     // the old per-run `Effect.provide(layer)` disposed the DB after the first turn
     // The scope is closed by `dispose()`.
-    workerScope = Effect.runSync(Scope.make())
+    workerScope = Scope.makeUnsafe()
 
     // The worker-local run control is registered once the first `run` resolves the
     // worker's `SessionRunState`; the executor proxy reads it live.

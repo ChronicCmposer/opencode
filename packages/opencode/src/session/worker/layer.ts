@@ -45,6 +45,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { DurableLog } from "@opencode-ai/core/durable-log"
 import { Latest } from "@/event-manifest"
+import { WorkerRuntime } from "./runtime-edge"
 
 import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
@@ -298,7 +299,7 @@ function wakeAggregate(
 ): void {
   const wakeDurable = events.wakeDurable
   if (wakeDurable === undefined) return
-  Effect.runSync(wakeDurable(aggregateID))
+  WorkerRuntime.runSync(wakeDurable(aggregateID))
 }
 
 /**
@@ -326,7 +327,7 @@ export function republishDurableCommit(
   commit: DurableCommit,
 ): void {
   const position = durablePositionOf(commit)
-  Effect.runSync(
+  WorkerRuntime.runSync(
     events.publishLive({
       id: EventV2.ID.make(commit.event.id),
       type: commit.event.type,
@@ -382,7 +383,7 @@ function durableSnapshotOf(events: WakeupEvents): SnapshotReader | undefined {
   return async (aggregateID, seq, after = -1) => {
     // -1 is the only "before the first event" cursor; 0 is a real event.
     if (seq < 0 || after >= seq) return []
-    const payloads = await Effect.runPromise(
+    const payloads = await WorkerRuntime.runPromise(
       durable({ aggregateID, after }).pipe(
         Stream.takeUntil((payload) => (payload.durable?.seq ?? -1) >= seq),
         Stream.runCollect,

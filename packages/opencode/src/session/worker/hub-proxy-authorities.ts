@@ -1,5 +1,6 @@
 // Hub-proxy handler/authority map and per-worker bound authority helpers.
 import { Context, Deferred, Effect, Option } from "effect"
+import { WorkerRuntime } from "./runtime-edge"
 import { z } from "zod"
 import path from "node:path"
 import type { Hooks, ToolContext, ToolDefinition } from "@opencode-ai/plugin"
@@ -478,7 +479,7 @@ export async function resolveContextHubToolDescriptors(
   if (context === undefined) return descriptors
   const mcp = Context.getOption(context, MCP.Service)
   if (Option.isSome(mcp)) {
-    const tools = await Effect.runPromise(Effect.provide(mcp.value.tools(), context))
+    const tools = await WorkerRuntime.runPromise(Effect.provide(mcp.value.tools(), context))
     for (const [id, entry] of Object.entries(tools)) {
       descriptors.push({
         id,
@@ -796,7 +797,7 @@ export async function resolveContextPluginToolDescriptors(
   if (Option.isNone(plugin)) return []
   // `Plugin.list` resolves the per-directory `InstanceState`, so run it under the
   // dispatching instance's captured context.
-  const hooks = await Effect.runPromise(Effect.provide(plugin.value.list(), context))
+  const hooks = await WorkerRuntime.runPromise(Effect.provide(plugin.value.list(), context))
   const descriptors: PluginToolDescriptor[] = []
   for (const hook of hooks) {
     for (const [id, definition] of Object.entries(hook.tool ?? {})) {
@@ -1461,7 +1462,7 @@ export function createWorkerJobMirror(): WorkerJobMirror {
           sessionID: boundSessionID,
           registry: registry.value,
           run,
-          done: Effect.runSync(Deferred.make<{ readonly output?: string; readonly error?: string }>()),
+          done: Deferred.makeUnsafe<{ readonly output?: string; readonly error?: string }>(),
           promotionWaiters: new Set(),
           promoted: false,
           settled: false,
