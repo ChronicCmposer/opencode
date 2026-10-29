@@ -11,21 +11,17 @@
 //   * core's `Database` layer uses {@link withSchemaGate}, which forks a scoped
 //     renewal fiber for the migration duration and releases the lease in a
 //     finalizer on success, failure, and interruption.
-//   * the session hub's synchronous/async schema-ensure uses the plain helpers
-//     ({@link waitForSchemaGate}, {@link startSchemaGateRenewal}, …), so the
+//   * the session hub's schema-ensure uses the plain helpers
+//     ({@link waitForSchemaGateAsync}, {@link startSchemaGateRenewal}, …), so the
 //     lease rules can never drift between the two paths.
 
 export * as SchemaGate from "./schema-gate"
 
 import { randomUUID } from "node:crypto"
 import { Deferred, Effect, Schema, Schedule, type Scope } from "effect"
-import { openConnection, sleepSync, type Connection } from "./connection"
-import {
-  BusyExhaustedError,
-  inImmediateTransaction,
-  retryBusySync,
-  type BusyRetryConfig,
-} from "./transaction"
+import { openConnection, type Connection } from "./connection"
+import { BusyExhaustedError } from "./busy"
+import { inImmediateTransaction, retryBusySync, type BusyRetryConfig } from "./transaction"
 
 const SCHEMA_GATE_TABLE_SQL =
   "CREATE TABLE IF NOT EXISTS schema_gate (id INTEGER PRIMARY KEY CHECK (id = 1), owner TEXT NOT NULL, expires_at INTEGER NOT NULL)"
@@ -39,11 +35,18 @@ export const SCHEMA_GATE_RENEW_MS = 30 * 1000
 /** Pause between acquisition attempts while another process holds the gate. */
 export const SCHEMA_GATE_POLL_MS = 25
 
-/** Bounded wait for the gate; a stuck peer eventually expires instead. */
-export const SCHEMA_GATE_TIMEOUT_MS = 2 * 60 * 1000
+/**
+ * Bounded wait for the gate. It outlasts one TTL plus a renewal interval, so a
+ * peer that crashes right after renewing expires before the waiter gives up, and
+ * the wait is extended further while a live lease is observed.
+ */
+export const SCHEMA_GATE_TIMEOUT_MS = SCHEMA_GATE_TTL_MS + SCHEMA_GATE_RENEW_MS + 5_000
 
-/** Busy budget for opening/applying the sidecar's WAL pragmas. */
-export const SCHEMA_GATE_BUSY_TIMEOUT_MS = 5_000
+/**
+ * Busy budget for the sidecar. It is short because acquisition and renewal run
+ * synchronously on the caller's thread; contention is absorbed by the async poll.
+ */
+export const SCHEMA_GATE_BUSY_TIMEOUT_MS = 100
 
 export class SchemaGateTimeoutError extends Schema.TaggedErrorClass<SchemaGateTimeoutError>(
   "SchemaGateTimeoutError",
@@ -133,27 +136,41 @@ function holdGate(connection: Pick<Connection, "run">, token: GateToken): void {
   ])
 }
 
+export type GateAttempt =
+  | { readonly acquired: true }
+  | { readonly acquired: false; readonly heldUntil: number | undefined }
+
 /**
- * One acquisition attempt. Returns `false` when a live lease is held elsewhere
- * or when the sidecar's write lock is busy after its bounded retries; both mean
+ * One acquisition attempt. Not acquired means a live lease is held elsewhere
+ * (`heldUntil` is its expiry) or the sidecar's write lock stayed busy; both mean
  * "poll again", never "fail the migration".
  */
-export function acquireSchemaGate(connection: Connection, token: GateToken): boolean {
+export function attemptSchemaGate(connection: Connection, token: GateToken): GateAttempt {
   try {
-    return inImmediateTransaction(connection, (tx) => {
+    return inImmediateTransaction(connection, (tx): GateAttempt => {
       tx.exec(SCHEMA_GATE_TABLE_SQL)
       const heldUntil = readGateExpiry(tx)
-      if (heldUntil !== undefined && heldUntil > Date.now()) return false
+      if (heldUntil !== undefined && heldUntil > Date.now()) return { acquired: false, heldUntil }
       // Start the lease at acquisition, not at token creation: a caller that
       // waited out a peer's migration must not hold an already-expired row.
       token.expiresAt = Date.now() + token.ttlMs
       holdGate(tx, token)
-      return true
+      return { acquired: true }
     })
   } catch (error) {
-    if (error instanceof BusyExhaustedError) return false
+    if (error instanceof BusyExhaustedError) return { acquired: false, heldUntil: undefined }
     throw error
   }
+}
+
+export function acquireSchemaGate(connection: Connection, token: GateToken): boolean {
+  return attemptSchemaGate(connection, token).acquired
+}
+
+/** A waiter never gives up before the lease it is waiting on has expired. */
+function extendDeadline(deadline: number, attempt: GateAttempt): number {
+  if (attempt.acquired || attempt.heldUntil === undefined) return deadline
+  return Math.max(deadline, attempt.heldUntil + SCHEMA_GATE_POLL_MS)
 }
 
 export function releaseSchemaGate(connection: Pick<Connection, "run">, token: GateToken): void {
@@ -249,27 +266,18 @@ export function startSchemaGateRenewal(
   return { lost, stop }
 }
 
-export function waitForSchemaGate(
-  connection: Connection,
-  token: GateToken,
-  timeoutMs: number = SCHEMA_GATE_TIMEOUT_MS,
-): void {
-  const deadline = Date.now() + timeoutMs
-  while (!acquireSchemaGate(connection, token)) {
-    if (Date.now() > deadline) throw new SchemaGateTimeoutError()
-    sleepSync(SCHEMA_GATE_POLL_MS)
-  }
-}
-
 export async function waitForSchemaGateAsync(
   connection: Connection,
   token: GateToken,
   timeoutMs: number = SCHEMA_GATE_TIMEOUT_MS,
   onWait?: () => void,
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (!acquireSchemaGate(connection, token)) {
+  let deadline = Date.now() + timeoutMs
+  while (true) {
+    const attempt = attemptSchemaGate(connection, token)
+    if (attempt.acquired) return
     onWait?.()
+    deadline = extendDeadline(deadline, attempt)
     if (Date.now() > deadline) throw new SchemaGateTimeoutError()
     await new Promise((resolve) => setTimeout(resolve, SCHEMA_GATE_POLL_MS))
   }
@@ -323,7 +331,7 @@ function acquireLease(
 ): Effect.Effect<SchemaGateLease, SchemaGateTimeoutError, Scope.Scope> {
   const ttlMs = options.ttlMs ?? SCHEMA_GATE_TTL_MS
   const pollMs = options.pollMs ?? SCHEMA_GATE_POLL_MS
-  const deadline = Date.now() + (options.timeoutMs ?? SCHEMA_GATE_TIMEOUT_MS)
+  let deadline = Date.now() + (options.timeoutMs ?? SCHEMA_GATE_TIMEOUT_MS)
 
   return Effect.gen(function* () {
     const token = newGateToken(ttlMs)
@@ -350,13 +358,14 @@ function acquireLease(
     )
     options.onLeaseOpened?.(connection)
     while (true) {
-      const acquired = yield* Effect.sync(() => {
-        const won = acquireSchemaGate(connection, token)
-        if (won) ownsLease = true
-        return won
+      const attempt = yield* Effect.sync(() => {
+        const result = attemptSchemaGate(connection, token)
+        if (result.acquired) ownsLease = true
+        return result
       })
-      if (acquired) return makeLease(connection, token, () => releaseOwnership(connection))
+      if (attempt.acquired) return makeLease(connection, token, () => releaseOwnership(connection))
       options.onWaitForLease?.()
+      deadline = extendDeadline(deadline, attempt)
       if (Date.now() > deadline) return yield* Effect.fail(new SchemaGateTimeoutError())
       yield* Effect.sleep(pollMs)
     }

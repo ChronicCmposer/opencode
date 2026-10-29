@@ -143,7 +143,7 @@ export function assertConfiguredHooksSupported(input: {
 }
 
 /** Infrastructure failures that must stay typed; there is no silent fallback. */
-export const ROLLOUT_INFRA_FAILURES = ["BuildMismatch", "SchemaMismatch", "BusyRetriesExhaustedError"] as const
+export const ROLLOUT_INFRA_FAILURES = ["BuildMismatch", "SchemaMismatch", "BusyExhausted"] as const
 export type RolloutInfraFailure = (typeof ROLLOUT_INFRA_FAILURES)[number]
 
 /** Read the schema/Effect error tag without trusting the value shape. */

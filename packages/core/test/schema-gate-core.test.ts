@@ -15,8 +15,8 @@ import {
   newGateToken,
   openSchemaGate,
   releaseSchemaGate,
+  renewSchemaGate,
   schemaGateFilename,
-  waitForSchemaGate,
   withSchemaGate,
 } from "../src/database/schema-gate"
 import { tmpdir } from "./fixture/tmpdir"
@@ -47,7 +47,7 @@ describe("core database schema gate", () => {
     const filename = path.join(tmp.path, "gated.sqlite")
     const gate = openSchemaGate(filename)
     const token = newGateToken()
-    waitForSchemaGate(gate, token)
+    expect(acquireSchemaGate(gate, token)).toBe(true)
 
     const build = Effect.runPromise(Effect.scoped(Layer.build(Database.layerFromPath(filename))))
 
@@ -72,7 +72,7 @@ describe("core database schema gate", () => {
     const filename = path.join(tmp.path, "signal.sqlite")
     const gate = openSchemaGate(filename)
     const token = newGateToken()
-    waitForSchemaGate(gate, token)
+    expect(acquireSchemaGate(gate, token)).toBe(true)
 
     let resolveWait!: () => void
     const waiting = new Promise<void>((resolve) => {
@@ -148,6 +148,41 @@ describe("core database schema gate", () => {
     } finally {
       after.close()
     }
+  }, 10_000)
+
+  test("a waiter outlasts its timeout while the peer's lease is live and acquires after the peer crashes", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "peer-crash.sqlite")
+    const peer = openSchemaGate(filename)
+    const peerToken = newGateToken(300)
+    expect(acquireSchemaGate(peer, peerToken)).toBe(true)
+
+    let ran = false
+    let waited = false
+    const waiter = Effect.runPromise(
+      withSchemaGate(
+        filename,
+        () =>
+          Effect.sync(() => {
+            ran = true
+          }),
+        { pollMs: 5, timeoutMs: 100, ttlMs: 300, onWaitForLease: () => (waited = true) },
+      ),
+    )
+
+    try {
+      // The peer renews just before the waiter's own timeout, then crashes (no
+      // further renewals, no release). The lease now outlives the waiter's deadline.
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      renewSchemaGate(peer, peerToken)
+      expect(peerToken.expiresAt).toBeGreaterThan(Date.now() + 200)
+      await waiter
+    } finally {
+      peer.close()
+    }
+
+    expect(waited).toBe(true)
+    expect(ran).toBe(true)
   }, 10_000)
 
   test("releases the gate when the migration is interrupted", async () => {
@@ -254,7 +289,7 @@ describe("core database schema gate", () => {
     const filename = path.join(tmp.path, "acquisition.sqlite")
     const holder = openSchemaGate(filename)
     const holderToken = newGateToken()
-    waitForSchemaGate(holder, holderToken)
+    expect(acquireSchemaGate(holder, holderToken)).toBe(true)
 
     let opened: Connection | undefined
     let resolveWait!: () => void

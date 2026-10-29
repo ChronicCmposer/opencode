@@ -23,7 +23,6 @@
 // `pgrep -f 'oc serve'` instead. Names are clipped to the kernel's 15-byte
 // `comm` limit (see `@/util/thread-name`).
 
-import { randomUUID } from "node:crypto"
 import path from "node:path"
 import { threadId, workerData } from "node:worker_threads"
 import { Cause, Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Scope } from "effect"
@@ -369,7 +368,7 @@ export function createWorkerDatabaseWriter(
   // repository/DurableLog-only.
   const readConnection =
     options.queryConnection ?? options.connection ?? ownedConnection ?? openWriterConnection(databaseFilename)
-  const ownerID = `worker-${options.workerID ?? threadId}-${process.pid}-${randomUUID()}`
+  const ownerID = DurableLog.workerOwnerID(options.workerID ?? threadId)
   if (options.eventBinding !== undefined) WorkerRuntime.runSync(options.eventBinding.setLeaseOwner(ownerID))
   // A session worker's DurableLog is scoped to its one session aggregate: publishing,
   // claiming, reading, or releasing another session's log is refused.

@@ -8,7 +8,6 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { randomUUID } from "node:crypto"
 import { afterEach, describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
 import { Schema } from "effect"
@@ -80,7 +79,7 @@ function bus(database: ReturnType<typeof open>, ownerID: string) {
   })
 }
 
-const owner = (workerID: number, pid: number) => `worker-${workerID}-${pid}-${randomUUID()}`
+const owner = (workerID: number, pid: number) => DurableLog.workerOwnerID(workerID, pid)
 
 function lease(database: ReturnType<typeof open>, aggregateID: string) {
   return database.native
@@ -141,6 +140,18 @@ describe("DurableLog lease after a hub restart", () => {
     // generation could match the owner, so the expiry fence must refuse it.
     expect(() => restarted.heartbeat("s1")).toThrow(DurableLog.StaleOwnerError)
     expect(lease(database, "s1")).toMatchObject({ worker_owner_id: deadOwner, worker_expires_at: 0 })
+  })
+
+  test("a dead-looking PID from another host scope is never released by the sweep", () => {
+    const database = open()
+    const foreignOwner = `worker-1-${DEAD_PID}-deadbeef-${crypto.randomUUID()}`
+    bus(database, foreignOwner).claim("s1")
+
+    const restarted = bus(database, owner(1, process.pid))
+    expect(restarted.releaseDeadLeases()).toBe(0)
+    expect(lease(database, "s1")?.worker_expires_at).toBeGreaterThan(Date.now())
+    expect(DurableLog.isDeadWorkerOwner(foreignOwner)).toBe(false)
+    expect(DurableLog.isDeadWorkerOwner(owner(1, DEAD_PID))).toBe(true)
   })
 
   test("startup clears only dead-generation leases and keeps live fencing", () => {

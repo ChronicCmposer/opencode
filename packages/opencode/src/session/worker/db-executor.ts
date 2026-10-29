@@ -18,7 +18,7 @@ import { isMainThread, parentPort, threadId, workerData } from "node:worker_thre
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { executorPragmas, resolveWalConfig } from "@opencode-ai/core/database/pragmas"
 import { EXECUTOR_BUSY_RETRY_CONFIG, retryBusySync } from "@opencode-ai/core/database/transaction"
-import { withBusyRetry, type BusyRetriesExhaustedError } from "@opencode-ai/core/database/busy"
+import { withBusyRetry, type BusyExhaustedError } from "@opencode-ai/core/database/busy"
 import { Context, Deferred, Duration, Effect, Exit, Layer, Schedule, Schema, Scope, Semaphore } from "effect"
 import { resolveWorkerEntry } from "./port"
 import { WorkerRuntime } from "./runtime-edge"
@@ -156,7 +156,7 @@ export type DbExecutorError =
   | DbExecutorPoisonedError
 
 /** A service failure: executor errors plus the shared busy-retry terminal error. */
-export type DbExecutorFailureError = DbExecutorError | BusyRetriesExhaustedError
+export type DbExecutorFailureError = DbExecutorError | BusyExhaustedError
 
 export interface DbExecutorOptions {
   /** SQLite filename opened inside the executor thread. */
@@ -181,6 +181,8 @@ export interface DbExecutorOptions {
    * missing or unmigrated database is refused without leaving a stray file.
    */
   readonly create?: boolean
+  /** Test seam: reports each periodic checkpoint tick as issued or deferred. */
+  readonly onCheckpoint?: (outcome: "issued" | "deferred") => void
 }
 
 export interface DbExecutorWorkerData {
@@ -306,6 +308,18 @@ function runTransaction(db: Database, statements: ReadonlyArray<DbStatement>): R
       throw error
     }
   }, EXECUTOR_BUSY_RETRY_CONFIG)
+}
+
+/**
+ * Classifies a statement that opens or closes a caller-driven transaction. The
+ * migration path drives `BEGIN`/`COMMIT` as separate messages, and nothing else
+ * may run on the handle between them.
+ */
+export function transactionBoundary(sql: string): "begin" | "end" | undefined {
+  if (/^\s*BEGIN\b/i.test(sql)) return "begin"
+  if (/^\s*(COMMIT|END)\b/i.test(sql)) return "end"
+  if (/^\s*ROLLBACK\b(?!\s+TO\b)/i.test(sql)) return "end"
+  return undefined
 }
 
 function execute(db: Database, request: DbExecutorRequest): unknown {
@@ -503,6 +517,8 @@ interface ExecutorState {
   closed: boolean
   nextId: number
   executorThreadId: number
+  /** A caller-driven transaction (migration) is open on the isolate's handle. */
+  transactionOpen: boolean
   readonly pending: Map<number, PendingRequest>
 }
 
@@ -546,10 +562,12 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
     closed: false,
     nextId: 1,
     executorThreadId: 0,
+    transactionOpen: false,
     pending: new Map(),
   }
 
   const failPending = (error: DbExecutorError): void => {
+    state.transactionOpen = false
     for (const request of [...state.pending.values()]) request.reject(error)
     state.pending.clear()
   }
@@ -750,12 +768,31 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
         })) as Effect.Effect<ReadonlyArray<Record<string, unknown>>, DbExecutorError>,
       ),
     queryInTransaction: (sql, params) =>
-      requestOnce((id) => ({
-        type: "query",
-        id,
-        sql,
-        ...(params === undefined ? {} : { params }),
-      })) as Effect.Effect<ReadonlyArray<Record<string, unknown>>, DbExecutorError>,
+      Effect.suspend(() => {
+        const boundary = transactionBoundary(sql)
+        // Mark the transaction open when BEGIN is sent, not when it is answered:
+        // a checkpoint queued behind it would otherwise run inside the migration.
+        if (boundary === "begin") state.transactionOpen = true
+        return (
+          requestOnce((id) => ({
+            type: "query",
+            id,
+            sql,
+            ...(params === undefined ? {} : { params }),
+          })) as Effect.Effect<ReadonlyArray<Record<string, unknown>>, DbExecutorError>
+        ).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              if (boundary === "end") state.transactionOpen = false
+            }),
+          ),
+          Effect.tapError(() =>
+            Effect.sync(() => {
+              if (boundary === "begin") state.transactionOpen = false
+            }),
+          ),
+        )
+      }),
     transaction: (statements) =>
       requestOnce((id) => ({ type: "transaction", id, statements })) as Effect.Effect<
         ReadonlyArray<DbTransactionResult>,
@@ -792,6 +829,11 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
     checkpoint: () =>
       Effect.suspend(() => {
         if (state.closed || state.worker === undefined) return Effect.void
+        if (state.transactionOpen) {
+          options.onCheckpoint?.("deferred")
+          return Effect.void
+        }
+        options.onCheckpoint?.("issued")
         return requestOnce((id) => ({ type: "query", id, sql: "PRAGMA wal_checkpoint(PASSIVE)" })).pipe(
           Effect.asVoid,
           Effect.catchCause(() => Effect.logWarning("db executor passive checkpoint failed")),

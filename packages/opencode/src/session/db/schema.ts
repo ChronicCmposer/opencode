@@ -1,11 +1,14 @@
 // Schema gate (D7).
 //
 // Identity is `PRAGMA user_version` plus the ordered migration journal ids plus
-// the hash of the shipped SQL bodies (persisted in `schema_meta`). Only the hub
-// migrates, and only with zero live workers; it applies every statement, writes
-// the body hash, verifies the journal, and marks `user_version` inside ONE
-// `BEGIN IMMEDIATE` transaction. A worker probes read-only and refuses a mismatch
-// with `SchemaMismatch`: it never runs DDL and never marks schema state.
+// the hash of the shipped SQL bodies (persisted in `schema_meta`). Any process
+// that owns a hub or the core `Database` layer may migrate, serialized by the
+// sidecar lease in `@opencode-ai/core/database/schema-gate`; a session worker is
+// never one of them. The migrating hub applies the statements, writes the body
+// hash, verifies the journal, and marks `user_version` while it holds the lease,
+// refusing to migrate when it has live workers. A worker probes read-only and
+// refuses a mismatch with `SchemaMismatch`: it never runs DDL and never marks
+// schema state.
 
 import { Effect, Schema, Stream } from "effect"
 import { Reactivity } from "effect/unstable/reactivity"
@@ -16,19 +19,25 @@ import { Statement } from "effect/unstable/sql"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import path from "node:path"
 import { DatabaseMigration } from "@opencode-ai/core/database/migration"
-import { openConnection, type Connection, type ConnectionOptions } from "@opencode-ai/core/database/connection"
+import {
+  assertSqliteDriverParity,
+  openConnection,
+  type Connection,
+  type ConnectionOptions,
+} from "@opencode-ai/core/database/connection"
+import { withBusyRetry } from "@opencode-ai/core/database/busy"
 import { isBusyError, inImmediateTransaction, retryBusySync } from "@opencode-ai/core/database/transaction"
 import { transactionControl } from "@opencode-ai/core/database/sqlite-adapter"
 import {
   SCHEMA_GATE_RENEW_MS,
   SchemaGateTimeoutError,
   newGateToken,
+  attemptSchemaGate,
   openSchemaGate,
   releaseSchemaGate,
   renewSchemaGate,
   schemaGateFilename,
   startSchemaGateRenewal,
-  waitForSchemaGate,
   waitForSchemaGateAsync,
   type SchemaGateRenewal,
 } from "@opencode-ai/core/database/schema-gate"
@@ -312,8 +321,9 @@ export function ensureProductionSchema(options: EnsureSchemaOptions): SchemaIden
     }
     // Two processes now serialize on the database row, not on a process-local
     // cache. Core's incremental journal, the ledger, and the marker all run
-    // while the gate is held.
-    waitForSchemaGate(gate!, token)
+    // while the gate is held. This entry point is synchronous and never waits:
+    // a held gate is refused, and a caller that must wait uses the async ensure.
+    if (!attemptSchemaGate(gate!, token).acquired) throw new SchemaGateTimeoutError()
     try {
       if (sameSchemaIdentity(expected, schemaIdentity(connection))) {
         assertWorkerTableParity(connection)
@@ -411,6 +421,7 @@ async function assertWorkerTableParityAsync(executor: DbExecutor): Promise<void>
 }
 
 export async function ensureProductionSchemaAsync(options: EnsureSchemaAsyncOptions): Promise<SchemaIdentity> {
+  assertSqliteDriverParity()
   const inMemory = options.filename === ":memory:"
   const expected = currentSchemaIdentity()
   const cacheKey = inMemory ? undefined : path.resolve(options.filename)
@@ -480,9 +491,10 @@ export async function ensureProductionSchemaAsync(options: EnsureSchemaAsyncOpti
     }
   }
 
-  // Take the cross-process gate BEFORE opening the executor. A peer is then not
-  // switching WAL/pragma on the same file while this handle opens, which is the
-  // open-time busy window that used to flake when two processes booted together.
+  // Take the cross-process gate before migrating. An executor this call owns is
+  // opened only after acquisition, so a peer is not switching WAL/pragma while it
+  // opens; a caller-supplied executor (the hub's) is already open, and the gate
+  // serializes the migration itself rather than the open.
   const gate = openSchemaGate(options.filename)
   const token = newGateToken()
   let executor: DbExecutor | undefined
@@ -715,13 +727,6 @@ function executorConnection(executor: DbExecutor): SqlConnection {
 
 const CORE_MIGRATION_RETRY = { retries: 4, baseDelayMs: 25, maxDelayMs: 500 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms)
-    timer.unref?.()
-  })
-}
-
 /**
  * Run core's incremental journal off-loop over the executor connection as ONE
  * `BEGIN IMMEDIATE` transaction (`applyBatched`): read the journal, apply every
@@ -740,16 +745,14 @@ async function applyCoreMigrationsOnExecutor(executor: DbExecutor, onBusy?: () =
   const db = await Effect.runPromise(
     EffectDrizzleSqlite.makeWithDefaults().pipe(Effect.provideService(SqlClient, client)),
   )
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      await Effect.runPromise(DatabaseMigration.applyBatched(db))
-      return
-    } catch (error) {
-      if (!isBusyError(error) || attempt >= CORE_MIGRATION_RETRY.retries) throw error
-      onBusy?.()
-      await sleep(Math.min(CORE_MIGRATION_RETRY.baseDelayMs * 2 ** attempt, CORE_MIGRATION_RETRY.maxDelayMs))
-    }
-  }
+  await Effect.runPromise(
+    withBusyRetry(
+      DatabaseMigration.applyBatched(db).pipe(
+        Effect.tapError((error) => Effect.sync(() => (isBusyError(error) ? onBusy?.() : undefined))),
+      ),
+      CORE_MIGRATION_RETRY,
+    ),
+  )
 }
 
 export interface GatedConnection {

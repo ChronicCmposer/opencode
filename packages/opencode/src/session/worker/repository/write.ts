@@ -1,8 +1,9 @@
 // Typed write engine.
 //
-// Every public write is one savepoint: validation (scope, columns, immutable
-// fields, hub-owned metadata, FK ownership, unique-key ownership) and the write
-// itself are atomic, and a nested call joins the caller's open transaction.
+// Batches and writes that validate against the stored row (immutable fields,
+// hub-owned metadata) run in one savepoint, so validation and the write are
+// atomic and a nested call joins the caller's open transaction. Other
+// single-statement writes skip the savepoint; see `insertOne`.
 
 import type { WriteOutcome } from "@opencode-ai/core/database/connection"
 import { createWriteCapability, type RepositoryConnection, type WriteCapability } from "./capability"
@@ -855,14 +856,23 @@ function atomic<T>(capability: WriteCapability, work: () => T): T {
 }
 
 /**
+ * Validation that compares assigned values against the stored row (immutable
+ * columns, session-column rules) must see the same row the write changes.
+ */
+function validatesAgainstStoredRow(entry: TableRegistryEntry): boolean {
+  return entry.immutable.length > 0 || entry.table === "session" || HUB_OWNED_METADATA[entry.table] !== undefined
+}
+
+/**
  * Single-statement writes are already atomic in SQLite, and validation only
- * reads, so the per-write SAVEPOINT/RELEASE round trip is pure overhead. The
- * caller's enclosing transaction (if any) still provides rollback for the
- * operation; only the redundant nested savepoint is skipped. Batches and
- * caller-supplied `atomic` callbacks keep the savepoint.
+ * reads, so the per-write SAVEPOINT/RELEASE round trip is pure overhead for
+ * plain inserts and for updates and upserts on tables without immutable or
+ * session columns. Updates and upserts that validate against the stored row run
+ * inside the savepoint so the check and the write share one snapshot. Batches
+ * and caller-supplied `atomic` callbacks keep the savepoint.
  *
- * Explicit tradeoff: validation (scope/immutable/ownership reads) and the write
- * are NOT snapshot-atomic against a concurrent hub writer. The SQLite statement
+ * For the remaining tables, validation (scope/ownership reads) and the write are
+ * NOT snapshot-atomic against a concurrent hub writer. The SQLite statement
  * itself is atomic, and an upsert's ownership predicate is re-checked inside the
  * write, so a vanished/foreign row cannot be repointed; a caller that needs a
  * read-write snapshot must wrap the call in `atomic`/its own transaction.
@@ -948,7 +958,9 @@ export function makeRepository(capability: WriteCapability): WorkerRepository {
     insert(first: any, second?: any) {
       const input = normalizeInsert(first as never, second as never)
       const entry = writeEntry(input.table, "insert")
-      return insertOne(capability, entry, input.values as Row, input.conflict as RepositoryConflict | undefined)
+      const conflict = input.conflict as RepositoryConflict | undefined
+      const write = () => insertOne(capability, entry, input.values as Row, conflict)
+      return conflict !== undefined && validatesAgainstStoredRow(entry) ? atomic(capability, write) : write()
     },
     insertMany(first: any, second?: any) {
       const input =
@@ -991,21 +1003,25 @@ export function makeRepository(capability: WriteCapability): WorkerRepository {
     upsert(first: any, second?: any, third?: any) {
       const input = normalizeUpsert(first as never, second as never, third as never)
       const entry = writeEntry(input.table, "upsert")
-      return insertOne(capability, entry, input.values as Row, input.conflict as unknown as RepositoryConflict)
+      const write = () => insertOne(capability, entry, input.values as Row, input.conflict as unknown as RepositoryConflict)
+      return validatesAgainstStoredRow(entry) ? atomic(capability, write) : write()
     },
     update(table: any, values: any, where: any) {
       const entry = writeEntry(table, "update")
       const assignments: Row = { ...(values as Row) }
       columnsOf(entry, assignments)
-      const predicate = scopedWhere(capability, entry, where as Row)
-      const current = currentRows(capability, entry, predicate)
-      assertImmutable(capability, entry, assignments, current)
-      assertSessionUpdateColumns(capability, entry, assignments, current)
-      assertAssignmentScope(capability, entry, assignments, "move a row out of scope")
-      assertForeignKeyOwnership(capability, entry, assignments)
-      assertUniqueOwnership(capability, entry, assignments)
-      const statement = updateStatement(entry, assignments, predicate)
-      return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
+      const write = () => {
+        const predicate = scopedWhere(capability, entry, where as Row)
+        const current = currentRows(capability, entry, predicate)
+        assertImmutable(capability, entry, assignments, current)
+        assertSessionUpdateColumns(capability, entry, assignments, current)
+        assertAssignmentScope(capability, entry, assignments, "move a row out of scope")
+        assertForeignKeyOwnership(capability, entry, assignments)
+        assertUniqueOwnership(capability, entry, assignments)
+        const statement = updateStatement(entry, assignments, predicate)
+        return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
+      }
+      return validatesAgainstStoredRow(entry) ? atomic(capability, write) : write()
     },
     delete(table: any, where: any) {
       const entry = writeEntry(table, "delete")

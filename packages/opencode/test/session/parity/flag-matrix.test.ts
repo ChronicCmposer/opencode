@@ -7,7 +7,7 @@
 // absence.
 
 import { describe, expect, test } from "bun:test"
-import { BusyRetriesExhaustedError } from "@opencode-ai/core/database/busy"
+import { BusyExhaustedError } from "@opencode-ai/core/database/busy"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { BuildMismatch, buildHashStatus } from "@/session/worker/build-hash"
 import {
@@ -82,8 +82,8 @@ describe("typed infrastructure failures", () => {
     expect(isRolloutInfraFailure(new BuildMismatch({ expected: "a", actual: "b" }), "BuildMismatch")).toBe(true)
     expect(
       isRolloutInfraFailure(
-        new BusyRetriesExhaustedError({ attempts: 5, lastCause: new Error("locked") }),
-        "BusyRetriesExhaustedError",
+        new BusyExhaustedError(5, new Error("locked")),
+        "BusyExhausted",
       ),
     ).toBe(true)
   })

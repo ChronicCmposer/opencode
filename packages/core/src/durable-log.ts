@@ -2,6 +2,7 @@ export * as DurableLog from "./durable-log"
 
 import { createHash, randomUUID } from "node:crypto"
 import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
 import { Context, Effect, Layer, Schema } from "effect"
 import type { SqlClient } from "effect/unstable/sql/SqlClient"
@@ -456,14 +457,14 @@ export function writeBlobFile(directory: string, hash: string, payload: string):
 }
 
 export class InvalidDurableEventError extends Schema.TaggedErrorClass<InvalidDurableEventError>()(
-  "Bus.InvalidDurableEvent",
+  "DurableLog.InvalidDurableEvent",
   {
     type: Schema.String,
     message: Schema.String,
   },
 ) {}
 
-export class StaleOwnerError extends Schema.TaggedErrorClass<StaleOwnerError>()("Bus.StaleOwner", {
+export class StaleOwnerError extends Schema.TaggedErrorClass<StaleOwnerError>()("DurableLog.StaleOwner", {
   message: Schema.String,
 }) {}
 
@@ -473,18 +474,18 @@ export class StaleOwnerError extends Schema.TaggedErrorClass<StaleOwnerError>()(
  * v1 sync `owner_id` column instead of silently repurposing it.
  */
 export class WorkerLeaseUnsupportedError extends Schema.TaggedErrorClass<WorkerLeaseUnsupportedError>()(
-  "Bus.WorkerLeaseUnsupported",
+  "DurableLog.WorkerLeaseUnsupported",
   {
     type: Schema.String,
     message: Schema.String,
   },
 ) {}
 
-export class LeaseConflictError extends Schema.TaggedErrorClass<LeaseConflictError>()("Bus.LeaseConflict", {
+export class LeaseConflictError extends Schema.TaggedErrorClass<LeaseConflictError>()("DurableLog.LeaseConflict", {
   message: Schema.String,
 }) {}
 
-export class CrossAggregateError extends Schema.TaggedErrorClass<CrossAggregateError>()("Bus.CrossAggregate", {
+export class CrossAggregateError extends Schema.TaggedErrorClass<CrossAggregateError>()("DurableLog.CrossAggregate", {
   aggregateID: Schema.String,
   scopedAggregateID: Schema.String,
 }) {
@@ -493,11 +494,11 @@ export class CrossAggregateError extends Schema.TaggedErrorClass<CrossAggregateE
   }
 }
 
-export class UnknownAggregateError extends Schema.TaggedErrorClass<UnknownAggregateError>()("Bus.UnknownAggregate", {
+export class UnknownAggregateError extends Schema.TaggedErrorClass<UnknownAggregateError>()("DurableLog.UnknownAggregate", {
   message: Schema.String,
 }) {}
 
-export class StaleStateVersionError extends Schema.TaggedErrorClass<StaleStateVersionError>()("Bus.StaleStateVersion", {
+export class StaleStateVersionError extends Schema.TaggedErrorClass<StaleStateVersionError>()("DurableLog.StaleStateVersion", {
   expected: Schema.Int,
   actual: Schema.Int,
 }) {}
@@ -592,16 +593,46 @@ const parseSequence = (row: Record<string, unknown>): SequenceRow => {
   }
 }
 
+function readHostScope(): string {
+  const attempt = (probe: () => string): string => {
+    try {
+      return probe().trim()
+    } catch {
+      return ""
+    }
+  }
+  const identity = [
+    os.hostname(),
+    attempt(() => fs.readlinkSync("/proc/self/ns/pid")),
+    attempt(() => fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8")),
+  ].join("|")
+  return createHash("sha256").update(identity).digest("hex").slice(0, 8)
+}
+
 /**
- * `worker-<hubId>-<pid>-<uuid>` is the worker generation identity from
- * `session-worker.ts`; the PID is the hub process that spawned the isolate. A
- * lease is "provably dead" only when that PID no longer exists. An unparseable
- * owner (legacy/test identity) is treated as live so a stale generation can never
- * self-certify ownership.
+ * Identifies the host, boot, and PID namespace this process runs in. A PID in an
+ * owner string is only meaningful to a process that shares this scope.
+ */
+export const HOST_SCOPE = readHostScope()
+
+/**
+ * `worker-<id>-<pid>-<hostScope>-<uuid>` is the worker generation identity. The
+ * host scope lets a sweeper decide whether the PID can be probed at all.
+ */
+export function workerOwnerID(workerID: string | number, pid: number = process.pid): string {
+  return `worker-${workerID}-${pid}-${HOST_SCOPE}-${randomUUID()}`
+}
+
+/**
+ * A lease is "provably dead" only when its owner was minted in this process's
+ * host scope and that PID no longer exists. An owner from another host or PID
+ * namespace, a legacy shape, or an unparseable identity is treated as live so a
+ * peer's lease is only ever reclaimed by expiry.
  */
 export function isDeadWorkerOwner(ownerID: string): boolean {
   const parts = ownerID.split("-")
-  if (parts[0] !== "worker" || parts.length < 7) return false
+  if (parts[0] !== "worker" || parts.length < 8) return false
+  if (parts[3] !== HOST_SCOPE) return false
   const pid = Number(parts[2])
   if (!Number.isSafeInteger(pid) || pid <= 0) return false
   try {

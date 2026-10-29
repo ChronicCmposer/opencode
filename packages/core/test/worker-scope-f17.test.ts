@@ -127,7 +127,7 @@ describe("F17 legacy worker claim refusal", () => {
     )
 
     expect(exit._tag).toBe("Failure")
-    expect(String(exit)).toContain("Bus.WorkerLeaseUnsupported")
+    expect(String(exit)).toContain("DurableLog.WorkerLeaseUnsupported")
     expect(database.native.query("SELECT owner_id FROM event_sequence").all()).toEqual([])
     expect(database.native.query("SELECT COUNT(*) AS count FROM event").get()).toEqual({ count: 0 })
   })

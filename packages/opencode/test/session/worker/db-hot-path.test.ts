@@ -17,9 +17,11 @@ import { classifyWorkerStatement } from "@/session/worker/db"
 import {
   DbExecutorTimeoutError,
   createDbExecutor,
+  transactionBoundary,
   type DbExecutor,
 } from "@/session/worker/db-executor"
 import { connectedRepository, sameJsonValue } from "@/session/worker/repository/write"
+import { pollUntil } from "../../lib/poll"
 import { DEFAULT_TEST_TIMEOUT_MS } from "../../lib/worker-timeouts"
 
 setDefaultTimeout(DEFAULT_TEST_TIMEOUT_MS)
@@ -121,6 +123,32 @@ describe("repository hot path", () => {
     repository.update("message", { data: '{"text":"updated"}' }, { id: "message-a" })
     expect(executed.filter((sql) => /^\s*savepoint\b/i.test(sql))).toEqual([])
     expect(executed.some((sql) => /^UPDATE main\."message"/.test(sql))).toBe(true)
+  })
+
+  test("an update validated against immutable session columns runs inside a savepoint", () => {
+    const connection = migratedConnection()
+    const executed: string[] = []
+    const repository = connectedRepository({
+      all: (sql, params) => connection.all(sql, params),
+      values: (sql, params) => connection.values(sql, params),
+      run: (sql, params) => {
+        executed.push(sql)
+        return connection.run(sql, params)
+      },
+      exec: (sql) => {
+        executed.push(sql)
+        connection.exec(sql)
+      },
+    })
+
+    repository.update("session", { title: "renamed" }, { id: "session-a" })
+
+    const savepoint = executed.findIndex((sql) => /^\s*savepoint\b/i.test(sql))
+    const write = executed.findIndex((sql) => /^UPDATE main\."session"/.test(sql))
+    const release = executed.findIndex((sql) => /^\s*release\b/i.test(sql))
+    expect(savepoint).toBeGreaterThanOrEqual(0)
+    expect(write).toBeGreaterThan(savepoint)
+    expect(release).toBeGreaterThan(write)
   })
 
   test("a multi-statement batch still keeps its savepoint", () => {
@@ -271,5 +299,35 @@ describe("executor replacement", () => {
     const ready = events.lastIndexOf(`ready:${secondThread}`)
     expect(closed).toBeGreaterThanOrEqual(0)
     expect(ready, JSON.stringify({ events, firstThread, secondThread })).toBeGreaterThan(closed)
+  })
+
+  test("classifies statements that open or close a caller-driven transaction", () => {
+    expect(transactionBoundary("BEGIN IMMEDIATE")).toBe("begin")
+    expect(transactionBoundary("  begin")).toBe("begin")
+    expect(transactionBoundary("COMMIT")).toBe("end")
+    expect(transactionBoundary("ROLLBACK")).toBe("end")
+    expect(transactionBoundary("ROLLBACK TO sp")).toBeUndefined()
+    expect(transactionBoundary("SELECT 1")).toBeUndefined()
+  })
+
+  test("the periodic checkpoint cannot interleave with an open migration transaction", async () => {
+    const outcomes: string[] = []
+    const executor = createDbExecutor({
+      filename: path.join(workspace(), "checkpoint.db"),
+      checkpointIntervalMs: 5,
+      onCheckpoint: (outcome) => void outcomes.push(outcome),
+    })
+    executors.push(executor)
+    await executor.query("SELECT 1")
+    await pollUntil(() => outcomes.includes("issued"), { message: "no checkpoint was issued while idle" })
+
+    await executor.queryInTransaction!("BEGIN IMMEDIATE")
+    outcomes.length = 0
+    await pollUntil(() => outcomes.includes("deferred"), { message: "checkpoint was not deferred during the transaction" })
+    expect(outcomes).not.toContain("issued")
+
+    await executor.queryInTransaction!("COMMIT")
+    outcomes.length = 0
+    await pollUntil(() => outcomes.includes("issued"), { message: "checkpoint did not resume after commit" })
   })
 })

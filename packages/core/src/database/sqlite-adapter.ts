@@ -13,7 +13,7 @@ import { Statement } from "effect/unstable/sql"
 import { make, SafeIntegers, type SqlClient } from "effect/unstable/sql/SqlClient"
 import type { Connection } from "effect/unstable/sql/SqlConnection"
 import { classifySqliteError, SqlError, UnknownError } from "effect/unstable/sql/SqlError"
-import { BusyRetriesExhaustedError, withBusyRetry } from "./busy"
+import { BusyExhaustedError, withBusyRetry } from "./busy"
 import { resolveBusyRetryConfig } from "./pragmas"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
@@ -146,11 +146,11 @@ function beginImmediate(query: string): string {
  * stays reachable through the `UnknownError` reason.
  */
 function foldBusyExhaustion<A, E, R>(
-  effect: Effect.Effect<A, E | BusyRetriesExhaustedError, R>,
+  effect: Effect.Effect<A, E | BusyExhaustedError, R>,
 ): Effect.Effect<A, SqlError | E, R> {
   return effect.pipe(
     Effect.mapError((error): SqlError | E =>
-      error instanceof BusyRetriesExhaustedError
+      error instanceof BusyExhaustedError
         ? new SqlError({ reason: new UnknownError({ cause: error, message: error.message }) })
         : error,
     ),
@@ -252,7 +252,7 @@ const makeRetryingConnection = (
   state: TransactionState,
 ): SqliteAdapterConnection => {
   const busy = resolveBusyRetryConfig()
-  // `withBusyRetry` reports exhaustion as a typed `BusyRetriesExhaustedError`;
+  // `withBusyRetry` reports exhaustion as a typed `BusyExhaustedError`;
   // the `Connection` interface only admits `SqlError`, so fold it back into that
   // channel here (the last busy cause is preserved as the reason's cause).
   const retryBusy = <A, E, R>(effect: Effect.Effect<A, E, R>) =>

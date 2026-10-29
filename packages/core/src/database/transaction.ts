@@ -9,7 +9,11 @@
 
 import { Schema } from "effect"
 import type { Connection } from "./connection"
-import { isBusySqlError } from "./busy"
+import { BusyExhaustedError, busyDelayMs, isBusySqlError } from "./busy"
+import type { BusyRetryConfig } from "./pragmas"
+
+export { BusyExhaustedError }
+export type { BusyRetryConfig }
 
 /**
  * The transaction helpers only ever call `exec`; taking this structural slice
@@ -20,14 +24,7 @@ export interface TransactionConnection {
   exec(sql: string): void
 }
 
-export interface BusyRetryConfig {
-  /** Additional attempts after the first one. */
-  readonly retries: number
-  readonly baseDelayMs: number
-  readonly maxDelayMs: number
-}
-
-/** Default budget (5 retries, 10ms x10, capped at 1s). */
+/** Default budget (5 retries, 10ms doubling, capped at 1s). */
 export const DEFAULT_BUSY_RETRY_CONFIG: BusyRetryConfig = Object.freeze({
   retries: 5,
   baseDelayMs: 10,
@@ -52,29 +49,6 @@ export const EXECUTOR_BUSY_RETRY_CONFIG: BusyRetryConfig = Object.freeze({
  * recognised by one path and missed by the other.
  */
 export const isBusyError: (error: unknown) => boolean = isBusySqlError
-
-/** Typed terminal failure: the fixed retry budget was spent. */
-export class BusyExhaustedError extends Schema.TaggedErrorClass<BusyExhaustedError>("BusyExhaustedError")(
-  "Database.BusyExhausted",
-  {
-    attempts: Schema.Number,
-    lastCause: Schema.Unknown,
-  },
-) {
-  readonly tag = "SQLITE_BUSY_EXHAUSTED"
-
-  constructor(
-    override readonly attempts: number,
-    override readonly lastCause: unknown,
-  ) {
-    super({ attempts, lastCause })
-    this.name = "BusyExhaustedError"
-  }
-
-  override get message() {
-    return `SQLite remained busy after ${this.attempts} attempt(s)`
-  }
-}
 
 /** A failed ROLLBACK leaves the transaction state unknown; the connection is poisoned. */
 export class TransactionRollbackError extends Schema.TaggedErrorClass<TransactionRollbackError>(
@@ -148,10 +122,6 @@ function resolveConfig(options: Partial<BusyRetryConfig>): BusyRetryConfig {
   }
 }
 
-function backoff(config: BusyRetryConfig, failedAttempt: number): number {
-  return Math.min(config.baseDelayMs * 10 ** (failedAttempt - 1), config.maxDelayMs)
-}
-
 /** How one failed attempt waits before the next; omitted means retry at once. */
 type BusyWait = (failedAttempt: number) => void | Promise<void>
 
@@ -189,7 +159,7 @@ function retryBusyNow<T>(work: () => T, config: BusyRetryConfig): T {
  * never a synchronous throw: callers may use either `await` or `.catch`.
  */
 async function retryBusyLater<T>(work: () => T, config: BusyRetryConfig): Promise<T> {
-  return retryBusy(work, config, (failedAttempt) => sleep(backoff(config, failedAttempt)))
+  return retryBusy(work, config, (failedAttempt) => sleep(busyDelayMs(config, failedAttempt)))
 }
 
 /**

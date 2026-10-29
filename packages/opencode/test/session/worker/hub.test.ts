@@ -116,7 +116,6 @@ import { Provider } from "@/provider/provider"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { randomUUID } from "node:crypto"
 import { openConnection } from "@opencode-ai/core/database/connection"
 import { tmpdir } from "../../fixture/fixture"
 
@@ -2987,14 +2986,14 @@ describe("idle isolate cap", () => {
 
 describe("startup dead-lease sweep", () => {
   const DEAD_PID = 2_000_000_000
-  const owner = (id: number, pid: number) => `worker-${id}-${pid}-${randomUUID()}`
+  const owner = (id: number, pid: number) => DurableLog.workerOwnerID(id, pid)
 
   function scratch(): { filename: string; directory: string } {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-hub-lease-sweep-"))
     return { filename: path.join(directory, "opencode.db"), directory }
   }
 
-  test("marks only provably dead generations reclaimable", () => {
+  test("marks only provably dead generations reclaimable", async () => {
     const { filename, directory } = scratch()
     const connection = openConnection({ filename })
     try {
@@ -3021,8 +3020,9 @@ describe("startup dead-lease sweep", () => {
       )
 
       const logs: Array<{ message: string; fields: Record<string, unknown> }> = []
-      const released = sweepDeadLeasesAtStartup(
+      const released = await sweepDeadLeasesAtStartup(
         filename,
+        undefined,
         recordingBridgeFrom((line) => void logs.push({ message: line.message, fields: line.fields })),
       )
 
@@ -3043,13 +3043,14 @@ describe("startup dead-lease sweep", () => {
     }
   })
 
-  test("a missing database is logged and never thrown", () => {
+  test("a missing database is logged and never thrown", async () => {
     const { filename, directory } = scratch()
     try {
       const logs: string[] = []
       expect(
-        sweepDeadLeasesAtStartup(
+        await sweepDeadLeasesAtStartup(
           filename,
+          undefined,
           recordingBridgeFrom((line) => void logs.push(line.message)),
         ),
       ).toBe(0)

@@ -243,7 +243,7 @@ describe("adapter transaction retry boundary", () => {
       expect(inserts).toBe(1)
 
       // Retrying the *whole* transaction re-begins and replays the body.
-      await Effect.runPromise(withBusyRetry(transaction, { retries: 2, sleep: () => Effect.void }))
+      await Effect.runPromise(withBusyRetry(transaction, { retries: 2, baseDelayMs: 1, maxDelayMs: 1 }))
       expect(statements.filter((sql) => sql === "BEGIN IMMEDIATE")).toHaveLength(2)
       expect(inserts).toBe(2)
       expect(native.query("SELECT name FROM item").all()).toEqual([{ name: "row" }])
