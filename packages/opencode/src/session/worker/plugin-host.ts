@@ -116,6 +116,30 @@ export interface WorkerPluginHooks {
   ) => void | Promise<void>
   readonly "shell.env"?: (input: unknown, output: ShellEnvOutput) => void | Promise<void>
   readonly "tool.definition"?: (input: unknown, output: ToolDefinitionOutput) => void | Promise<void>
+  readonly "command.execute.before"?: (input: unknown, output: CommandBeforeOutput) => void | Promise<void>
+  readonly "experimental.session.compacting"?: (input: unknown, output: SessionCompactingOutput) => void | Promise<void>
+  readonly "experimental.compaction.autocontinue"?: (
+    input: unknown,
+    output: CompactionAutocontinueOutput,
+  ) => void | Promise<void>
+  readonly "experimental.text.complete"?: (input: unknown, output: TextCompleteOutput) => void | Promise<void>
+}
+
+export interface CommandBeforeOutput {
+  parts: unknown[]
+}
+
+export interface SessionCompactingOutput {
+  context: string[]
+  prompt?: string
+}
+
+export interface CompactionAutocontinueOutput {
+  enabled: boolean
+}
+
+export interface TextCompleteOutput {
+  text: string
 }
 
 /**
@@ -182,6 +206,10 @@ export interface WorkerPluginHost {
   messagesTransform(input: MessagesTransformInput, output: MessagesTransformOutput): Promise<MessagesTransformOutput>
   shellEnv(input: unknown, output: ShellEnvOutput): Promise<ShellEnvOutput>
   toolDefinition(input: unknown, output: ToolDefinitionOutput): Promise<ToolDefinitionOutput>
+  commandBefore(input: unknown, output: CommandBeforeOutput): Promise<CommandBeforeOutput>
+  sessionCompacting(input: unknown, output: SessionCompactingOutput): Promise<SessionCompactingOutput>
+  compactionAutocontinue(input: unknown, output: CompactionAutocontinueOutput): Promise<CompactionAutocontinueOutput>
+  textComplete(input: unknown, output: TextCompleteOutput): Promise<TextCompleteOutput>
 }
 
 /**
@@ -375,21 +403,31 @@ function applyChatMessage(output: ChatMessageOutput, next: ChatMessageOutput): C
  * so this side table is the only way to tell "declared but unsupported" from
  * "not declared at all" without widening the host interface.
  */
-const declaredHooksByHost = new WeakMap<WorkerPluginHost, ReadonlySet<string>>()
+const declaredHooksByHost = new WeakMap<WorkerPluginHost, ReadonlyMap<string, readonly string[]>>()
 
 /** Whether any loaded plugin behind `host` declared `hook`. */
 export function workerPluginHostDeclaresHook(host: WorkerPluginHost, hook: string): boolean {
   return declaredHooksByHost.get(host)?.has(hook) ?? false
 }
 
-function declaredHooksOf(plugins: readonly WorkerPlugin[]): ReadonlySet<string> {
-  const declared = new Set<string>()
+/** The names of the loaded plugins behind `host` that declared `hook`. */
+export function workerPluginHostDeclarers(host: WorkerPluginHost, hook: string): readonly string[] {
+  return declaredHooksByHost.get(host)?.get(hook) ?? []
+}
+
+function declaredHooksOf(plugins: readonly WorkerPlugin[]): ReadonlyMap<string, readonly string[]> {
+  const declared = new Map<string, string[]>()
+  const add = (hook: string, plugin: string) => {
+    const names = declared.get(hook) ?? []
+    if (!names.includes(plugin)) names.push(plugin)
+    declared.set(hook, names)
+  }
   for (const plugin of plugins) {
     for (const [name, value] of Object.entries(plugin.hooks)) {
-      if (typeof value === "function") declared.add(name)
+      if (typeof value === "function") add(name, plugin.name)
     }
-    for (const name of plugin.proxied ?? []) declared.add(name)
-    for (const name of plugin.declared ?? []) declared.add(name)
+    for (const name of plugin.proxied ?? []) add(name, plugin.name)
+    for (const name of plugin.declared ?? []) add(name, plugin.name)
   }
   return declared
 }
@@ -477,6 +515,55 @@ export function createWorkerPluginHost(
         output,
         await forwardHook(plugins, (hooks) => hooks["shell.env"], "shell.env", input, output, options),
       ),
+    // The caller keeps a reference to the `parts` array it passed in, so the
+    // hub's result is spliced into that array rather than handed back.
+    commandBefore: async (input, output) => {
+      const next = await forwardHook(
+        plugins,
+        (hooks) => hooks["command.execute.before"],
+        "command.execute.before",
+        input,
+        output,
+        options,
+      )
+      if (!replaceContents(output.parts, next.parts)) throw new NonContainerReplacementError("parts", kindOf(next.parts))
+      return output
+    },
+    sessionCompacting: async (input, output) =>
+      applyInPlace(
+        output,
+        await forwardHook(
+          plugins,
+          (hooks) => hooks["experimental.session.compacting"],
+          "experimental.session.compacting",
+          input,
+          output,
+          options,
+        ),
+      ),
+    // The provider entry carries functions and credentials, so only the model's
+    // identity crosses the isolate; the hub rebuilds `model` and `provider`.
+    compactionAutocontinue: async (input, output) => {
+      const local = await runHook(plugins, (hooks) => hooks["experimental.compaction.autocontinue"], input, output)
+      const forward = options?.hubHook
+      if (forward === undefined) return local
+      return applyInPlace(
+        local,
+        await forward("experimental.compaction.autocontinue", autocontinueWireInput(input), local),
+      )
+    },
+    textComplete: async (input, output) =>
+      applyInPlace(
+        output,
+        await forwardHook(
+          plugins,
+          (hooks) => hooks["experimental.text.complete"],
+          "experimental.text.complete",
+          input,
+          output,
+          options,
+        ),
+      ),
     // `parameters` is an Effect Schema on the worker, which cannot cross the
     // isolate. The hook's model-facing effect is description + JSON schema, so
     // those (clone-safe) fields are forwarded; the worker's local `parameters`
@@ -500,6 +587,23 @@ export function createWorkerPluginHost(
   }
   declaredHooksByHost.set(host, declaredHooksOf(plugins))
   return host
+}
+
+/**
+ * The clone-safe form of an autocontinue input: `model` and `provider` are
+ * replaced by the model's identity, which the hub resolves back.
+ */
+export function autocontinueWireInput(input: unknown): unknown {
+  if (!isRecord(input)) return input
+  const model = isRecord(input.model) ? input.model : undefined
+  const { model: _model, provider: _provider, ...rest } = input
+  return {
+    ...rest,
+    modelRef: {
+      providerID: model?.providerID,
+      modelID: model?.id,
+    },
+  }
 }
 
 /**

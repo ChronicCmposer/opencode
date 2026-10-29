@@ -228,10 +228,8 @@ export const effectLayer = Layer.effect(
 
           // A configured plugin that declares a worker hook with no route at all
           // stops startup when workers are enabled. A routed-but-unsupported hook
-          // (`command.execute.before`, compaction, `text.complete`) is deferred:
-          // it fails typed only when the worker actually invokes it, so a plugin
-          // that merely declares it does not break startup. Loading errors above
-          // stay loud but non-fatal.
+          // fails typed only when the worker actually invokes it. Loading errors
+          // above stay loud but non-fatal.
           if (flags.experimentalSessionWorkers) {
             yield* Effect.sync(() => {
               for (const hook of hooks.slice(firstNewHook)) assertPluginHookStartup(load.spec, hook)

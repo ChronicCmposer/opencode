@@ -1072,6 +1072,7 @@ export function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSess
   ): NonNullable<HubProxyAuthorities["pluginTrigger"]> =>
     pluginTriggerAuthority({
       plugin: () => (context === undefined ? Option.none() : Context.getOption(context, Plugin.Service)),
+      provider: () => (context === undefined ? Option.none() : Context.getOption(context, Provider.Service)),
       run: runHubProxyFor(context),
     })
   // The per-hub in-flight plugin-tool abort registry.

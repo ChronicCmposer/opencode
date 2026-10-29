@@ -267,11 +267,11 @@ describe("tool.execute.before/after are real in a worker", () => {
     const real = await loadRealPlugin()
     try {
       const { wired } = await productionWorker(real.hooks)
-      const error = await wired.bridge("command.execute.before", {}, { parts: [] }).catch((failure: unknown) => failure)
+      const error = await wired.bridge("future.trigger", {}, {}).catch((failure: unknown) => failure)
       // The wire reconstructs the remote tagged error (the `_tag` metadata is
       // carried so callers can branch on the domain failure, not a bare string).
       expect((error as { tag?: string }).tag).toBe("UnsupportedPluginHookError")
-      expect(String((error as Error).message)).toContain("command.execute.before")
+      expect(String((error as Error).message)).toContain("future.trigger")
     } finally {
       await real.dispose()
     }
@@ -387,23 +387,18 @@ describe("admission through the production init factory", () => {
     }
   })
 
-  test("an unsupported hook added after startup is admitted and fails typed only when invoked", async () => {
+  test("a command hook added after startup is admitted and dispatched", async () => {
     const real = await loadRealPlugin()
     try {
-      // A routed-but-unsupported hook must not break startup: the worker only
-      // fails when it actually dispatches the hook (D19).
       const hooks = { ...real.hooks, "command.execute.before": (() => {}) as never }
       const result = await build(hooks)
       expect(result._tag).toBe("Success")
       if (result._tag !== "Success") throw new Error("expected startup admission")
 
       const { layer } = await productionWorker(hooks)
-      const invoked = await trigger(layer, "command.execute.before", {}, { parts: [] })
-      expect(Exit.isFailure(invoked)).toBe(true)
-      if (!Exit.isFailure(invoked)) throw new Error("expected the worker trigger to fail")
-      const failure = Cause.squash(invoked.cause)
-      expect(failure).toBeInstanceOf(UnsupportedPluginHookError)
-      expect((failure as UnsupportedPluginHookError).hook).toBe("command.execute.before")
+      const parts: unknown[] = []
+      const invoked = await trigger(layer, "command.execute.before", {}, { parts })
+      if (Exit.isFailure(invoked)) throw new Error(Cause.pretty(invoked.cause))
     } finally {
       await real.dispose()
     }

@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test"
 import { Cause, Effect, Exit, Layer } from "effect"
 import { Plugin } from "@/plugin"
-import { UnclassifiedPluginHookError, UnsupportedPluginHookError } from "@/plugin/routes"
+import { UnclassifiedPluginHookError } from "@/plugin/routes"
 import { ModelClient, buildSessionWorkerLayer } from "@/session/worker/layer"
 import {
   DuplicatePluginError,
@@ -197,10 +197,8 @@ describe("worker plugin host", () => {
     expect((result as { system: string[] }).system).toEqual(["base", "worker"])
   })
 
-  test("a declared unsupported or unclassified trigger is a typed failure, never a pass-through", async () => {
-    // A loaded plugin declares the unsupported hook: invocation fails typed. An
-    // undeclared unsupported hook is a true no-op (see plugin-text-complete).
-    const host = createWorkerPluginHost([{ name: "empty", hooks: {}, declared: ["command.execute.before"] }])
+  test("an unclassified trigger is a typed failure naming the plugin, never a pass-through", async () => {
+    const host = createWorkerPluginHost([{ name: "future-plugin", hooks: {}, declared: ["future.trigger"] }])
     const built = buildSessionWorkerLayer({
       snapshot: workerSnapshot(),
       env: { values: {} },
@@ -219,16 +217,12 @@ describe("worker plugin host", () => {
         return yield* plugin.trigger(name as never, {} as never, { env: {} })
       }).pipe(Effect.provide(built.layer), Effect.exit)
 
-    const unsupported = await Effect.runPromise(trigger("command.execute.before"))
-    expect(Exit.isFailure(unsupported)).toBe(true)
-    if (Exit.isFailure(unsupported)) {
-      expect(Cause.squash(unsupported.cause)).toBeInstanceOf(UnsupportedPluginHookError)
-    }
-
     const unclassified = await Effect.runPromise(trigger("future.trigger"))
     expect(Exit.isFailure(unclassified)).toBe(true)
     if (Exit.isFailure(unclassified)) {
-      expect(Cause.squash(unclassified.cause)).toBeInstanceOf(UnclassifiedPluginHookError)
+      const failure = Cause.squash(unclassified.cause)
+      expect(failure).toBeInstanceOf(UnclassifiedPluginHookError)
+      expect((failure as UnclassifiedPluginHookError).plugin).toBe("future-plugin")
     }
   })
 

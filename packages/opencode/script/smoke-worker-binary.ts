@@ -23,9 +23,10 @@
 //
 // Exit code is 0 on PASS and 1 on FAIL; both print a human-readable report.
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
+import { pathToFileURL } from "node:url"
 import { startMockProvider } from "../test/lib/mock-provider"
 import { readSsePayloads } from "../test/lib/sse"
 import { testProviderConfig } from "../test/lib/test-provider"
@@ -46,7 +47,26 @@ export const FAILURE_SIGNATURES: readonly RegExp[] = [
   // first worker query, before any streamed frame.
   /no such table: \w+/i,
   /Failed query: \w+/i,
+  /ModuleNotFound/i,
+  /UnsupportedPluginHookError|unsupported worker hook/i,
 ]
+
+/**
+ * A local plugin declaring every hook the worker triggers outside the chat path.
+ * Its `text.complete` appends this marker, so the gate proves the hook ran on the
+ * hub and its result reached the client.
+ */
+export const TEXT_COMPLETE_MARKER = "[smoke:text.complete]"
+
+const SMOKE_PLUGIN = `export default async () => ({
+  "experimental.text.complete": async (_input, output) => {
+    output.text = output.text + " ${TEXT_COMPLETE_MARKER}"
+  },
+  "command.execute.before": async () => {},
+  "experimental.session.compacting": async () => {},
+  "experimental.compaction.autocontinue": async () => {},
+})
+`
 
 const SERVER_PASSWORD = "smoke-worker-gate"
 const SERVER_USERNAME = "opencode"
@@ -113,7 +133,8 @@ function isolatedEnv(home: string, configJSON: string): Record<string, string> {
     OPENCODE_DISABLE_AUTOUPDATE: "1",
     OPENCODE_DISABLE_MODELS_FETCH: "1",
     OPENCODE_DISABLE_AUTOCOMPACT: "1",
-    OPENCODE_PURE: "1",
+    // Not OPENCODE_PURE: it drops configured plugins, and the gate's own smoke
+    // plugin must load. HOME and the inline config already isolate the run.
     OPENCODE_EXPERIMENTAL_SESSION_WORKERS: "true",
     OPENCODE_SERVER_PASSWORD: SERVER_PASSWORD,
     OPENCODE_SERVER_USERNAME: SERVER_USERNAME,
@@ -175,9 +196,14 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
   }
 
   await using provider = startMockProvider({ chunks: ["Hel", "lo"] })
-  const configJSON = JSON.stringify({ ...testProviderConfig(provider.baseUrl), model: "test/test-model" })
-
   const home = mkdtempSync(path.join(tmpdir(), "oc-smoke-worker-"))
+  const pluginFile = path.join(home, "smoke-plugin.js")
+  writeFileSync(pluginFile, SMOKE_PLUGIN)
+  const configJSON = JSON.stringify({
+    ...testProviderConfig(provider.baseUrl),
+    model: "test/test-model",
+    plugin: [pathToFileURL(pluginFile).href],
+  })
   const worktree = path.join(home, "worktree")
   mkdirSync(worktree, { recursive: true })
 
@@ -203,6 +229,7 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
 
   const sseAbort = new AbortController()
   const eventTypeSeen = new Set<string>()
+  let markerSeen = false
   let sseDrain: Promise<void> | undefined
 
   try {
@@ -225,6 +252,7 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
       throw new Error(`GET /global/event failed: HTTP ${eventResponse.status}`)
     }
     sseDrain = readSsePayloads(eventResponse.body, (event) => {
+      if (!markerSeen && JSON.stringify(event).includes(TEXT_COMPLETE_MARKER)) markerSeen = true
       const type = observedType(event)
       if (type === undefined || eventTypeSeen.has(type)) return
       eventTypeSeen.add(type)
@@ -236,10 +264,15 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
     const session = await createSession(url, worktree)
     await promptAsync(url, worktree, session)
     await waitForEventTypes(eventTypeSeen, [...REQUIRED_EVENT_TYPES])
+    const markerDeadline = Date.now() + EVENT_TIMEOUT_MS
+    while (!markerSeen && Date.now() < markerDeadline) await sleep(POLL_INTERVAL_MS)
 
-    const missing = REQUIRED_EVENT_TYPES.filter((type) => !eventTypeSeen.has(type))
+    const missing: string[] = REQUIRED_EVENT_TYPES.filter((type) => !eventTypeSeen.has(type))
+    if (!markerSeen) missing.push(`text.complete marker ${TEXT_COMPLETE_MARKER}`)
+    // A failed turn still streams parts and goes idle; the error only shows as this event.
+    if (eventTypeSeen.has("session.error")) missing.push("no session.error")
     const signatures = findSignatures(stdout, stderr)
-    const passed = missing.length === 0
+    const passed = missing.length === 0 && signatures.length === 0
     return result(passed, {
       binary,
       observedTypes: observed,

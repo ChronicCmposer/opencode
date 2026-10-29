@@ -126,17 +126,13 @@ describe("plugin hook startup contract", () => {
     expect(() => bootWorker(init)).not.toThrow()
   })
 
-  test("invoking the configured unsupported hook fails typed", async () => {
+  test("invoking a configured command hook in the worker succeeds", async () => {
     const result = await buildInit({ "command.execute.before": async () => {} })
     if (result._tag !== "Success") throw new Error("expected startup admission")
     const worker = bootWorker(parseSessionWorkerInit(result.success))
 
     const exit = await trigger(worker.layer, "command.execute.before")
-    expect(Exit.isFailure(exit)).toBe(true)
-    if (!Exit.isFailure(exit)) throw new Error("expected the worker trigger to fail")
-    const failure = Cause.squash(exit.cause)
-    expect(failure).toBeInstanceOf(UnsupportedPluginHookError)
-    expect((failure as UnsupportedPluginHookError).hook).toBe("command.execute.before")
+    if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
   })
 
   test("an unclassified hook is still a startup defect", async () => {

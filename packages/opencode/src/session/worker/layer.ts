@@ -119,6 +119,11 @@ import {
   type ToolAfterOutput,
   type ToolBeforeOutput,
   type ToolDefinitionOutput,
+  type CommandBeforeOutput,
+  type SessionCompactingOutput,
+  type CompactionAutocontinueOutput,
+  type TextCompleteOutput,
+  workerPluginHostDeclarers,
   type WorkerPluginHost,
 } from "./plugin-host"
 import { WorkerDb, databaseLayer, type WorkerDatabase } from "./db"
@@ -1438,6 +1443,10 @@ const WORKER_DISPATCHED_HOOKS: ReadonlySet<string> = new Set([
   "tool.definition",
   "experimental.chat.system.transform",
   "experimental.chat.messages.transform",
+  "command.execute.before",
+  "experimental.session.compacting",
+  "experimental.compaction.autocontinue",
+  "experimental.text.complete",
 ])
 
 /** No plugin host means no configured hook exists, so the trigger is a true no-op. */
@@ -1446,13 +1455,14 @@ const noopPluginTrigger = ((_name: string, _input: unknown, output: unknown) => 
 /** Dispatch one `Plugin.trigger` to the matching worker-hosted hook. */
 function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknown, output: unknown): Promise<unknown> {
   const route = workerHookRoute(name)
-  if (route === undefined) throw new UnclassifiedPluginHookError({ plugin: "worker", hook: name })
+  const plugin = workerPluginHostDeclarers(host, name).join(", ") || "worker"
+  if (route === undefined) throw new UnclassifiedPluginHookError({ plugin, hook: name })
   if (route === "unsupported") {
     if (!workerPluginHostDeclaresHook(host, name)) return Promise.resolve(output)
-    throw new UnsupportedPluginHookError({ plugin: "worker", hook: name })
+    throw new UnsupportedPluginHookError({ plugin, hook: name })
   }
   if (!WORKER_DISPATCHED_HOOKS.has(name)) {
-    throw new UnsupportedPluginHookError({ plugin: "worker", hook: name })
+    throw new UnsupportedPluginHookError({ plugin, hook: name })
   }
   switch (name) {
     case "chat.params":
@@ -1473,8 +1483,16 @@ function runWorkerPluginHook(host: WorkerPluginHost, name: string, input: unknow
       return host.systemTransform(input as SystemTransformInput, output as SystemTransformOutput)
     case "experimental.chat.messages.transform":
       return host.messagesTransform(input as MessagesTransformInput, output as MessagesTransformOutput)
+    case "command.execute.before":
+      return host.commandBefore(input, output as CommandBeforeOutput)
+    case "experimental.session.compacting":
+      return host.sessionCompacting(input, output as SessionCompactingOutput)
+    case "experimental.compaction.autocontinue":
+      return host.compactionAutocontinue(input, output as CompactionAutocontinueOutput)
+    case "experimental.text.complete":
+      return host.textComplete(input, output as TextCompleteOutput)
     default:
-      throw new UnsupportedPluginHookError({ plugin: "worker", hook: name })
+      throw new UnsupportedPluginHookError({ plugin, hook: name })
   }
 }
 

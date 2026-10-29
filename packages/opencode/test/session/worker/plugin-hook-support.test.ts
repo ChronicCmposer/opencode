@@ -13,7 +13,6 @@ import path from "node:path"
 import {
   DECLARED_ONLY_HOOKS,
   UnclassifiedPluginHookError,
-  UnsupportedPluginHookError,
   WORKER_HOOK_ROUTES,
   assertPluginHookAdmission,
   assertPluginHookStartup,
@@ -94,7 +93,7 @@ describe("worker hook route table", () => {
       "experimental.compaction.autocontinue",
       "experimental.text.complete",
     ] as const) {
-      expect(WORKER_HOOK_ROUTES[name]).toBe("unsupported")
+      expect(WORKER_HOOK_ROUTES[name]).toBe("hub-proxy")
     }
   })
 
@@ -105,18 +104,13 @@ describe("worker hook route table", () => {
     expect(pluginHookAdmissionError("declared", { "permission.ask": async () => {} })).toBeUndefined()
   })
 
-  test("an unsupported invoked hook is a typed admission failure", () => {
-    const error = pluginHookAdmissionError("configured", { "command.execute.before": async () => {} })
-    expect(error).toBeInstanceOf(UnsupportedPluginHookError)
-    expect(error?.hook).toBe("command.execute.before")
-    expect(pluginHookAdmissionError("configured", { "chat.message": async () => {} })).toBeUndefined()
-  })
-
-  test("startup tolerates a configured unsupported hook", () => {
-    const hooks = { "command.execute.before": async () => {} }
-    expect(pluginHookStartupError("configured", hooks)).toBeUndefined()
-    expect(() => assertPluginHookStartup("configured", hooks)).not.toThrow()
-    expect(pluginHookStartupError("configured", { "chat.message": async () => {} })).toBeUndefined()
+  test("every invoked hook is admitted: none is left unsupported", () => {
+    expect(Object.values(WORKER_HOOK_ROUTES)).not.toContain("unsupported")
+    for (const name of Object.keys(WORKER_HOOK_ROUTES)) {
+      const hooks = { [name]: async () => {} }
+      expect(pluginHookAdmissionError("configured", hooks)).toBeUndefined()
+      expect(() => assertPluginHookStartup("configured", hooks)).not.toThrow()
+    }
   })
 
   test("startup still rejects an unclassified hook", () => {

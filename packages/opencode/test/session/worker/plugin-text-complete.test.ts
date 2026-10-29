@@ -21,7 +21,6 @@ import { InstanceRef } from "@/effect/instance-ref"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Plugin } from "@/plugin"
 import { Provider } from "@/provider/provider"
-import { UnsupportedPluginHookError } from "@/plugin/routes"
 import { ModelClient, buildSessionWorkerLayer } from "@/session/worker/layer"
 import { buildSessionWorkerInit, resolveWorkerPlugins } from "@/session/worker/init"
 import { createWorkerPluginHost, type WorkerPluginHooks } from "@/session/worker/plugin-host"
@@ -131,16 +130,12 @@ describe("experimental.text.complete in a worker", () => {
     expect(exit.value).toEqual({ text: "streamed text" })
   })
 
-  test("a declared unsupported hook fails typed at invocation", async () => {
+  test("a declared text.complete hook no longer fails the turn", async () => {
     const result = await buildInit({ "experimental.text.complete": async () => {} })
     expect(result._tag).toBe("Success")
     if (result._tag !== "Success") throw new Error("expected startup admission")
 
     const exit = await triggerTextComplete(bootWorker(parseSessionWorkerInit(result.success)).layer, "streamed text")
-    expect(Exit.isFailure(exit)).toBe(true)
-    if (!Exit.isFailure(exit)) throw new Error("expected the worker trigger to fail")
-    const failure = Cause.squash(exit.cause)
-    expect(failure).toBeInstanceOf(UnsupportedPluginHookError)
-    expect((failure as UnsupportedPluginHookError).hook).toBe("experimental.text.complete")
+    if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
   })
 })

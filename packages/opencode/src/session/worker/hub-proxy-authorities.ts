@@ -17,6 +17,7 @@ import { SessionScopeError, type SessionCancelRequest, type SessionChildrenReque
 import { type RunBarrierPromotionOutcome } from "@/session/run-barrier"
 import { type CancelOutcome } from "./cancel"
 import { Plugin } from "@/plugin"
+import { Provider } from "@/provider/provider"
 import { UnsupportedPluginHookError, workerHookRoute } from "@/plugin/routes"
 import type { MessagesTransformInput, MessagesTransformOutput, SystemTransformInput, SystemTransformOutput } from "./plugin-host"
 import type { HubProxyHandlers, HubProxyStreamHandler } from "./hub-proxy-wire"
@@ -225,6 +226,7 @@ export function messagesTransformAuthority(options: {
 /** Build the hub-resident authority for the worker's hub-proxied plugin hook bridge. */
 export function pluginTriggerAuthority(options: {
   readonly plugin: () => Option.Option<Plugin.Interface>
+  readonly provider?: () => Option.Option<Provider.Interface>
   readonly run: HubProxyRunner
 }): NonNullable<HubProxyAuthorities["pluginTrigger"]> {
   return (name, input, output) => {
@@ -233,11 +235,34 @@ export function pluginTriggerAuthority(options: {
       return Promise.reject(new UnsupportedPluginHookError({ plugin: "worker", hook: name }))
     }
     const plugin = options.plugin()
-    return Option.isNone(plugin)
-      ? Promise.resolve(output)
-      : options.run(plugin.value.trigger(name as never, input as never, output as never))
+    if (Option.isNone(plugin)) return Promise.resolve(output)
+    const trigger = plugin.value.trigger
+    if (name !== "experimental.compaction.autocontinue") {
+      return options.run(trigger(name as never, input as never, output as never))
+    }
+    const provider = options.provider?.() ?? Option.none()
+    return options.run(
+      Effect.gen(function* () {
+        const full = yield* autocontinueInputOnHub(input, provider)
+        return yield* trigger(name as never, full as never, output as never)
+      }),
+    )
   }
 }
+
+/** Rebuild the autocontinue `model` and `provider` the worker could not send across the isolate. */
+const autocontinueInputOnHub = Effect.fnUntraced(function* (
+  input: unknown,
+  provider: Option.Option<Provider.Interface>,
+) {
+  if (typeof input !== "object" || input === null) return input
+  const { modelRef, ...rest } = input as { readonly modelRef?: { providerID?: string; modelID?: string } }
+  if (Option.isNone(provider) || modelRef?.providerID === undefined || modelRef.modelID === undefined) return rest
+  const providerID = modelRef.providerID as Provider.Model["providerID"]
+  const info = yield* provider.value.getProvider(providerID)
+  const model = yield* provider.value.getModel(providerID, modelRef.modelID as Provider.Model["id"]).pipe(Effect.orDie)
+  return { ...rest, model, provider: { source: info.source, info, options: info.options } }
+})
 
 /** Raised when a worker asks the hub to run a plugin tool id that no loaded plugin currently exposes — a stale descriptor. */
 export class UnknownPluginToolError extends Schema.TaggedErrorClass<UnknownPluginToolError>(

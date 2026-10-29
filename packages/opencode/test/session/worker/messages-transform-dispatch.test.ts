@@ -83,6 +83,10 @@ describe("worker messages.transform dispatch", () => {
       shellEnv: async (_input, output) => output,
       toolDefinition: async (_input, output) => output,
       systemTransform: async (_input, output) => output,
+      commandBefore: async (_input, output) => output,
+      sessionCompacting: async (_input, output) => output,
+      compactionAutocontinue: async (_input, output) => output,
+      textComplete: async (_input, output) => output,
       messagesTransform: async (input, output) => {
         calls.push({ input, output })
         return { messages: [...output.messages, { role: "assistant", content: "routed" }] }

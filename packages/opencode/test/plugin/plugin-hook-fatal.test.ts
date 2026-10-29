@@ -16,7 +16,6 @@ import { Auth } from "../../src/auth"
 import { Account } from "../../src/account/account"
 import { RuntimeFlags } from "../../src/effect/runtime-flags"
 import { Plugin } from "../../src/plugin/index"
-import { UnsupportedPluginHookError } from "../../src/plugin/routes"
 import { ModelClient, buildSessionWorkerLayer } from "../../src/session/worker/layer"
 import { createWorkerPluginHost } from "../../src/session/worker/plugin-host"
 import { TestInstance } from "../fixture/fixture"
@@ -158,10 +157,8 @@ describe("configured plugin hook route", () => {
 })
 
 describe("worker invocation of an unsupported hook", () => {
-  test("fails typed only when the worker triggers the hook", async () => {
+  test("the worker dispatches a configured command hook instead of failing", async () => {
     const exit = await triggerWorkerHook("command.execute.before")
-    expect(Exit.isFailure(exit)).toBe(true)
-    if (!Exit.isFailure(exit)) throw new Error("expected the worker trigger to fail")
-    expect(Cause.squash(exit.cause)).toBeInstanceOf(UnsupportedPluginHookError)
+    if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
   })
 })

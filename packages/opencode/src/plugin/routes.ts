@@ -40,10 +40,12 @@ export const WORKER_HOOK_ROUTES = {
   // instance lives on the hub, so the trigger is forwarded over the control
   // port and its returned `{message, parts}` is reconciled in place.
   "chat.message": "hub-proxy",
-  "command.execute.before": "unsupported",
-  "experimental.session.compacting": "unsupported",
-  "experimental.compaction.autocontinue": "unsupported",
-  "experimental.text.complete": "unsupported",
+  // Slash commands, compaction and text completion run in the worker; their
+  // plugins live on the hub, so each is forwarded and its output applied back.
+  "command.execute.before": "hub-proxy",
+  "experimental.session.compacting": "hub-proxy",
+  "experimental.compaction.autocontinue": "hub-proxy",
+  "experimental.text.complete": "hub-proxy",
 } as const satisfies Readonly<Record<string, WorkerHookRoute>>
 
 export type WorkerHookName = keyof typeof WORKER_HOOK_ROUTES

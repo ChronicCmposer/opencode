@@ -123,7 +123,7 @@ The run barrier is per Session. It waits for durable commits, projectors, tool s
 
 ### D19 — Hook routing table
 
-`WORKER_HOOK_ROUTES` is hardcoded and keyed off the 14 actually invoked hooks (a 14-entry table; `permission.ask` is declared-only). A configured plugin that invokes an unsupported hook is fatal at startup. A dynamically discovered unsupported hook is a typed admission failure on the next run. There is no silent skip and no fallback. Do not add a new plugin declaration API to hide an unsupported route.
+`WORKER_HOOK_ROUTES` is hardcoded and keyed off the 14 actually invoked hooks (a 14-entry table; `permission.ask` is declared-only). Every invoked hook runs on the hub: the worker forwards it over the control port and applies the result to the caller, including `command.execute.before`, both compaction hooks and `experimental.text.complete`. Autocontinue crosses as the model's identity and the hub rebuilds `model` and `provider`, because the provider entry carries functions and credentials. An unclassified hook is fatal at startup and names the plugin that declared it. There is no silent skip and no fallback. Do not add a new plugin declaration API to hide an unsupported route.
 
 ### D20 — One tool routing point
 
@@ -209,7 +209,7 @@ Landed on the green baseline: layer/graph, dispatch/runtime, and test-infra. Arc
 4. **DB ownership.** No writer isolate or writer RPC remains. Each worker uses a WAL connection; hub DDL is gated by zero live workers; the table allowlist is generated; `SchemaMismatch` and busy-retry tests pass.
 5. **Crash and idempotency.** `WorkerCrashed` covers all phases including commit-after-durable; the tool ledger marks orphans indeterminate and never auto-replays; auto-resume is capped at 10; boot cancel releases one permit and appends no message.
 6. **Transport.** JSON strings cross `postMessage`; Schema decodes once; the 4 MiB test passes; deltas resync without dropping durables; the 5-second run barrier times out without starting the next run.
-7. **Tools and plugins.** One tool routing point; broker and port/client/layer nodes are gone; MCP/LSP run on the hub; the 14-entry hook route table fails startup on configured unsupported hooks; permission/question state stays hub-owned.
+7. **Tools and plugins.** One tool routing point; broker and port/client/layer nodes are gone; MCP/LSP run on the hub; the 14-entry hook route table forwards every invoked hook to the hub and fails startup on unclassified hooks; permission/question state stays hub-owned.
 8. **Effect and structure.** Hub boundaries have an import-boundary test; changed modules expose `Foo.Service` and follow Effect naming; no new Promise service internals.
 9. **Rollout.** Two flag states only; kill switch drains existing Sessions and blocks new ones; status exposes mode and disabled reason; flag removal waits one release after full parity green; kill switch remains two releases.
 10. **Comments.** Purge only after re-baseline, in package-scoped comment-only commits, with this spec as the rationale; no `.parallel-implement` or plan references remain in source; 1% remains a guideline.
