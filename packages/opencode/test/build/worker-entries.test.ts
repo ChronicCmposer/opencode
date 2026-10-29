@@ -39,6 +39,13 @@ const ENTRIES: readonly WorkerEntry[] = [
     consumer: "src/session/worker/worker-pools.ts",
   },
   {
+    name: "db-executor",
+    source: "./src/session/worker/db-executor.ts",
+    shim: "db-executor.js",
+    define: "OPENCODE_DB_EXECUTOR_PATH",
+    consumer: "src/session/worker/db-executor.ts",
+  },
+  {
     name: "tree-sitter",
     shim: "opentui-tree-sitter-worker.js",
     define: "OTUI_TREE_SITTER_WORKER_PATH",
@@ -48,7 +55,7 @@ const ENTRIES: readonly WorkerEntry[] = [
 
 const read = (relative: string): Promise<string> => Bun.file(path.join(PACKAGE_DIR, relative)).text()
 
-// Read the build script once; three assertions inspect the same source.
+// Read the build script once; the assertions inspect the same source.
 const buildSource = await read("script/build.ts")
 
 describe("script/build.ts bundles every worker entry", () => {
@@ -72,6 +79,17 @@ describe("script/build.ts bundles every worker entry", () => {
     const build = buildSource
     const missing = ENTRIES.filter((entry) => !build.includes(`${entry.define}:`)).map((entry) => entry.name)
     expect(missing).toEqual([])
+  })
+
+  test("every worker-path define read in src has an entry here", async () => {
+    const glob = new Bun.Glob("src/**/*.ts")
+    const defines = new Set<string>()
+    for await (const file of glob.scan({ cwd: PACKAGE_DIR })) {
+      for (const match of (await read(file)).matchAll(/typeof (OPENCODE_[A-Z_]+_PATH) !== "undefined"/g)) defines.add(match[1]!)
+    }
+    const known = new Set(ENTRIES.map((entry) => entry.define))
+    expect([...defines].filter((define) => !known.has(define)).sort()).toEqual([])
+    expect(defines.size).toBeGreaterThan(0)
   })
 
   test("each define is consumed by its client", async () => {

@@ -174,6 +174,8 @@ for (const item of targets) {
   const workerPath = "./src/cli/tui/worker.ts"
   const sessionWorkerSourcePath = "./src/session/worker/session-worker.ts"
   const sessionWorkerPath = "session-worker.js"
+  const dbExecutorSourcePath = "./src/session/worker/db-executor.ts"
+  const dbExecutorPath = "db-executor.js"
   const treeSitterWorkerPath = "opentui-tree-sitter-worker.js"
   const bunfsRoot = item.os === "win32" ? "B:/~BUN/root/" : "/$bunfs/root/"
 
@@ -182,6 +184,7 @@ for (const item of targets) {
   // flat bunfs name, so embed a tiny shim that imports the bundled entrypoint rather
   // than duplicating the worker bundle.
   const sessionWorkerShim = workerShim(sessionWorkerSourcePath)
+  const dbExecutorShim = workerShim(dbExecutorSourcePath)
 
   await Bun.build({
     conditions: ["bun", "node"],
@@ -204,6 +207,7 @@ for (const item of targets) {
     },
     files: {
       [sessionWorkerPath]: sessionWorkerShim,
+      [dbExecutorPath]: dbExecutorShim,
       [treeSitterWorkerPath]: treeSitterWorker,
       ...(embeddedFileMap ? { "opencode-web-ui.gen.ts": embeddedFileMap } : {}),
     },
@@ -212,6 +216,8 @@ for (const item of targets) {
       workerPath,
       sessionWorkerSourcePath,
       sessionWorkerPath,
+      dbExecutorSourcePath,
+      dbExecutorPath,
       treeSitterWorkerPath,
       ...(embeddedFileMap ? ["opencode-web-ui.gen.ts"] : []),
     ],
@@ -222,6 +228,7 @@ for (const item of targets) {
       OTUI_TREE_SITTER_WORKER_PATH: bunfsRoot + treeSitterWorkerPath,
       OPENCODE_WORKER_PATH: workerPath,
       OPENCODE_SESSION_WORKER_PATH: bunfsRoot + sessionWorkerPath,
+      OPENCODE_DB_EXECUTOR_PATH: bunfsRoot + dbExecutorPath,
       OPENCODE_CHANNEL: `'${Script.channel}'`,
       // Compile the fault-injection seam out of production binaries. `define`
       // values are raw code, so `"false"` inlines the boolean literal `false`
