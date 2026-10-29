@@ -19,7 +19,6 @@ import {
 } from "@opencode-ai/core/database/pragmas"
 import { inImmediateTransactionAsync, retryBusyAsync } from "@opencode-ai/core/database/transaction"
 import { createDbExecutor } from "@/session/worker/db-executor"
-import { buildHashStatus, verifyReadyBuild } from "@/session/worker/build-hash"
 import { createProductionSessionHub } from "@/session/worker/hub"
 import { createTestBarrier } from "../lib/run-barrier-test"
 import { createLazyExecutorWorkerPool } from "../lib/lazy-worker-pool"
@@ -163,21 +162,6 @@ describe("worker cap + queue (D5)", () => {
     expect(peak).toBe(2)
     expect(running).toBe(0)
     await pool.terminateAll()
-  })
-})
-
-describe("compiled build mismatch (D15)", () => {
-  test("a different bundle constant is a typed BuildMismatch, not a generic error", () => {
-    const hub = buildHashStatus({ env: {}, dev: true })
-    expect(() =>
-      verifyReadyBuild({ type: "ready", threadId: 1, buildHash: "different-bundle" }, hub.buildHash),
-    ).toThrow(/build mismatch/)
-    try {
-      verifyReadyBuild({ type: "ready", threadId: 1, buildHash: "different-bundle" }, hub.buildHash)
-    } catch (error) {
-      expect(error).toBeInstanceOf(Error)
-      expect((error as { _tag?: string })._tag).toBe("BuildMismatch")
-    }
   })
 })
 

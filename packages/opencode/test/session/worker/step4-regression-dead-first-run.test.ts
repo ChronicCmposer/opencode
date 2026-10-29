@@ -8,13 +8,12 @@
 
 import { describe, expect, test } from "bun:test"
 import { Effect, Exit, Scope } from "effect"
-import { resolveBuildHash } from "@/session/worker/build-hash"
 import { makeProduction, type ProductionWorkerPoolOptions } from "@/session/worker/worker-pools"
 import type { ExecutorWorkerPool } from "@/session/worker/execute"
 import { createDispatcher, WorkerCrashedError } from "@/session/worker/dispatch"
 import { pollUntil, sid } from "../../lib/async"
 
-const ready = (threadId: number) => ({ type: "ready", threadId, buildHash: resolveBuildHash({ env: {} }).hash })
+const ready = (threadId: number) => ({ type: "ready", threadId })
 
 /** A controllable isolate: it boots, holds runs, and can die like a real one. */
 class FakeIsolate {

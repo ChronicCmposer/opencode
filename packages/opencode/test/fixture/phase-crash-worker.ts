@@ -4,7 +4,6 @@
 // truth rather than defaulting every crash to "stream".
 
 import { parentPort, threadId, workerData } from "node:worker_threads"
-import { readyFrame } from "@/session/worker/build-hash"
 
 const data = (workerData ?? {}) as { readonly phase?: string }
 
@@ -12,7 +11,7 @@ if (data.phase === "boot") {
   throw new Error("intentional boot-phase crash")
 }
 
-parentPort?.postMessage(readyFrame(threadId))
+parentPort?.postMessage({ type: "ready", threadId })
 
 if (data.phase === "materialize") {
   setTimeout(() => {

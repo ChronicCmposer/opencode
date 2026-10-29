@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test"
 import { BusyExhaustedError } from "@opencode-ai/core/database/busy"
-import { BuildMismatch } from "@/session/worker/build-hash"
 import {
   DECLARED_ONLY_HOOKS,
   UnsupportedConfiguredHookError,
@@ -95,7 +94,7 @@ describe("startup plugin validation", () => {
 
 describe("typed infrastructure failures", () => {
   test("build mismatch and busy exhaustion stay typed", () => {
-    expect(isRolloutInfraFailure(new BuildMismatch({ expected: "a", actual: "b" }), "BuildMismatch")).toBe(true)
+    expect(isRolloutInfraFailure(Object.assign(new Error("mismatch"), { _tag: "BuildMismatch" }), "BuildMismatch")).toBe(true)
     expect(
       isRolloutInfraFailure(
         new BusyExhaustedError(5, new Error("locked")),

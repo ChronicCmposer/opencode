@@ -26,7 +26,6 @@ import {
   type WorkerFramePort,
 } from "./frame"
 
-/** Timer seam shared by dispatch and cancel; unref'd. */
 export type PortScheduler = (delayMs: number, run: () => void) => () => void
 
 export const defaultSchedule: PortScheduler = (delayMs, run) => {
@@ -35,16 +34,8 @@ export const defaultSchedule: PortScheduler = (delayMs, run) => {
   return () => clearTimeout(timer)
 }
 
-/** Coerce an unknown thrown value to a message, for error frames. */
 export const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error))
 
-/**
- * The `_tag` (or a non-generic `name`) of a thrown tagged error, when it carries
- * one. The executor frame and the hub-proxy wire both stamp a tagged error with
- * its tag, so this is the single reader they share rather than re-deriving it.
- * A plain `Error` has `name === "Error"`, which is not a domain tag, so it is
- * reported as untagged.
- */
 export function errorTagOf(error: unknown): string | undefined {
   if (typeof error !== "object" || error === null) return undefined
   const tag = (error as { _tag?: unknown })._tag
@@ -53,16 +44,7 @@ export function errorTagOf(error: unknown): string | undefined {
   return typeof name === "string" && name !== "Error" ? name : undefined
 }
 
-/**
- * Resolve a worker isolate entry: a runtime env override first, then the
- * build-time define, then the caller's source-relative fallback. The packaged
- * binary cannot resolve a source path (`new URL("./x.ts", import.meta.url)`
- * becomes `/$bunfs/root/x.ts`), so the build injects a define; this is the one
- * resolution order every worker shares.
- *
- * `fallback` is passed in rather than constructed here so it resolves against the
- * caller's `import.meta.url`.
- */
+// The packaged binary cannot resolve a source path (`new URL("./x.ts", import.meta.url)` becomes `/$bunfs/root/x.ts`), so the build injects a define; this is the one resolution order every worker shares.
 export function resolveWorkerEntry(input: {
   readonly env?: Record<string, string | undefined>
   readonly definedPath?: string
@@ -74,16 +56,11 @@ export function resolveWorkerEntry(input: {
   return resolved === undefined || resolved === "" ? input.fallback : resolved
 }
 
-/** The frame-agnostic channel shape a `MessagePort` is adapted to. */
 export interface FrameChannel<Frame> {
   post(frame: Frame): void
   onMessage(handler: (frame: Frame) => void): () => void
 }
 
-/**
- * Adapt a real `MessagePort` to `FrameChannel`. Incoming messages are cast to
- * `Frame` at this boundary; `port.start()` is called so a fresh port receives.
- */
 export function portFromMessagePort<Frame>(port: MessagePort): FrameChannel<Frame> {
   return {
     post: (frame) => port.postMessage(frame),
@@ -96,39 +73,17 @@ export function portFromMessagePort<Frame>(port: MessagePort): FrameChannel<Fram
   }
 }
 
-/** The minimum shape every enveloped frame carries for correlation. */
 export interface WorkerFrameCarrier {
   readonly kind: string
   readonly id?: number
 }
 
-/**
- * Adapt a `MessagePort` whose frames share the versioned worker envelope. Outbound
- * frames are encoded to ONE JSON string and size-checked; inbound messages are
- * decoded exactly once with the frame Schema at this boundary, so a frame from
- * another port or with a mismatched payload discriminant fails loud instead of
- * being blindly cast. There is no structured-clone fallback.
- */
+// Outbound frames are encoded to ONE JSON string and size-checked; inbound messages are decoded exactly once with the frame Schema at this boundary, so a frame from another port or with a mismatched payload discriminant fails loud instead of being blindly cast.
 export interface WorkerFrameChannelOptions<Frame = unknown> {
-  /**
-   * Host-boundary containment: receive a decode failure as a typed error instead
-   * of an exception escaping the message listener. When supplied, the channel
-   * isolates itself after the first failure (no further frames are delivered),
-   * so one malformed worker frame can never take the host down.
-   */
+  // When supplied, the channel isolates itself after the first failure (no further frames are delivered), so one malformed worker frame can never take the host down.
   readonly onProtocolError?: (error: unknown) => void
-  /**
-   * Decode the family payload once at the port boundary. A throw is contained by
-   * the same host boundary as a malformed envelope.
-   */
   readonly decodePayload?: (payload: unknown) => Frame
-  /**
-   * Validate an outbound frame before it is encoded. Left unset on the egress
-   * hot path, where the encoder's plain fast path is deliberate. An untrusted
-   * control boundary (hub-proxy) supplies `assertJsonRepresentable` so a
-   * function or symbol payload fails loud instead of being silently dropped by
-   * `JSON.stringify`.
-   */
+  // Validate an outbound frame before it is encoded.
   readonly validateOutbound?: (frame: Frame) => void
 }
 
@@ -177,9 +132,6 @@ export function workerFrameChannel<Frame extends WorkerFrameCarrier>(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Request/response correlation
-// ---------------------------------------------------------------------------
 
 /**
  * A reply deadline fired before the peer answered. The request id identifies the
@@ -198,55 +150,25 @@ export class WorkerReplyTimeout extends Schema.TaggedErrorClass<WorkerReplyTimeo
 }
 
 export interface RequestChannelOptions<Frame, Reply extends Frame, Id> {
-  /** Narrow an inbound frame to a correlated reply; non-replies are ignored. */
   readonly isReply: (frame: Frame) => frame is Reply
-  /** Read the correlation id from a reply. */
   readonly idOf: (reply: Reply) => Id
-  /** Mint the next correlation id for an outbound request. */
   readonly nextId: () => Id
-  /** Default per-request timeout; `undefined` disables timeouts. */
   readonly timeoutMs?: number
-  /** Build the failure used once the channel is disposed. */
   readonly disposedError: () => unknown
-  /** Build the failure used when a request times out. */
   readonly timeoutError: (id: Id, timeoutMs: number) => unknown
   /** Map a `post` failure before failing the request; defaults to the raw thrown error. */
   readonly mapPostError?: (error: unknown) => unknown
-  /**
-   * Reject a request whose id is already in flight, instead of silently
-   * overwriting its waiter. Omitted callers keep the historical overwrite
-   * behaviour; a caller with caller-supplied ids supplies it.
-   */
   readonly duplicateError?: (id: Id) => unknown
-  /**
-   * Gate the actual `post` behind a transport becoming ready, so the deadline
-   * also covers the wait for the transport. The frame is built and registered
-   * immediately; `post` runs once this resolves, or the request fails with the
-   * transport's failure. Omitted callers post inline.
-   */
   readonly awaitPost?: () => Promise<void>
 }
 
-/**
- * A framed request/response channel: `request` correlates a reply by id,
- * `onFrame` observes every inbound frame (for unsolicited pushes), `fail`
- * completes every in-flight `Deferred` with one failure without tearing the
- * channel down, and `dispose` fails every in-flight request permanently.
- */
 export interface RequestChannel<Frame, Reply extends Frame, Id> {
   request(build: (id: Id) => Frame, timeoutMs?: number, id?: Id): Effect.Effect<Reply, unknown>
   onFrame(handler: (frame: Frame) => void): () => void
-  /** Fail every in-flight request with `error`, leaving the channel usable. */
   fail(error: unknown): void
   dispose(): void
 }
 
-/**
- * Build a request/response channel over `channel`. Each in-flight request is a
- * `Deferred`: the message handler completes the matching one, a deadline is
- * `Effect.timeoutOrElse`, and a disconnect fails every pending `Deferred` in one
- * place. The frame codec stays with the caller.
- */
 export function createRequestChannel<Frame, Reply extends Frame, Id>(
   channel: FrameChannel<Frame>,
   options: RequestChannelOptions<Frame, Reply, Id>,
@@ -269,7 +191,6 @@ export function createRequestChannel<Frame, Reply extends Frame, Id>(
 
   const mapPostError = options.mapPostError ?? ((error: unknown) => error)
 
-  /** Complete every pending waiter with `error`; the map is the one place. */
   const failPending = (error: unknown): void => {
     const waiters = Array.from(pending.values())
     pending.clear()
@@ -337,22 +258,12 @@ export function createRequestChannel<Frame, Reply extends Frame, Id>(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Request/reply server loop
-// ---------------------------------------------------------------------------
 
-/** The outcome of serving one inbound frame: its value, or the error it failed with. */
 export type ServeOutcome<Request, Value> =
   | { readonly ok: true; readonly request: Request; readonly value: Value }
   | { readonly ok: false; readonly request: Request | undefined; readonly error: unknown }
 
-/**
- * Serve a request/reply loop over `channel`: parse each raw frame, execute the
- * trusted request, and hand the outcome to `respond`. A parse failure is
- * delivered with `request: undefined`, so the caller correlates the error reply
- * from the raw frame instead. `respond` runs only after the execute promise
- * settles, so a rejected execute is answered — never an unhandled rejection.
- */
+// `respond` runs only after the execute promise settles, so a rejected execute is answered — never an unhandled rejection.
 export function servePort<Request, Value>(
   channel: FrameChannel<unknown>,
   parse: (raw: unknown) => Request,
@@ -376,21 +287,12 @@ export function servePort<Request, Value>(
   })
 }
 
-/** Read a string `requestId` from a raw frame, or `"unknown"` when it is absent. */
 export function rawRequestId(raw: unknown): string {
   const requestId = (raw as { requestId?: unknown } | null)?.requestId
   return typeof requestId === "string" ? requestId : "unknown"
 }
 
-// ---------------------------------------------------------------------------
-// Peer lifecycle logging
-// ---------------------------------------------------------------------------
 
-/**
- * The lifecycle log fields for one peer at a given severity. Returned as a
- * function of `level` so a single call site can emit both the INFO `connected`
- * / `closed` lines and the WARN `connect failed` line from one source.
- */
 export function peerLifecycle(
   peer: string,
   workerID: number | undefined,
@@ -398,12 +300,7 @@ export function peerLifecycle(
   return (level) => ({ peer, level, ...(workerID === undefined ? {} : { workerID }) })
 }
 
-/**
- * Build a port-backed client, emitting the peer lifecycle lines: an INFO
- * `${peer} connected` once `build` succeeds, or a WARN `${peer} connect failed`
- * (with the error `reason`) before rethrowing. `build` is where the port is
- * started, so a start failure surfaces here.
- */
+// Build a port-backed client, emitting the peer lifecycle lines: an INFO `${peer} connected` once `build` succeeds, or a WARN `${peer} connect failed` (with the error `reason`) before rethrowing.
 export function connectPeer<T>(
   bridge: EffectBridge.Shape | undefined,
   peer: string,

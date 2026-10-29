@@ -7,7 +7,6 @@
 
 import { describe, expect, test } from "bun:test"
 import { Effect, Exit, Scope } from "effect"
-import { resolveBuildHash } from "@/session/worker/build-hash"
 import type { SessionID } from "@/session/schema"
 import {
   createExecutorWorker,
@@ -463,7 +462,7 @@ describe("5.7 executor robustness", () => {
     const posted: unknown[] = []
     const workerScope: ExecutorWorkerScope = { onmessage: null, postMessage: (message) => posted.push(message) }
     const installed = installSessionExecutor(workerScope, { work: echoWork })
-    expect(posted[0]).toEqual({ type: "ready", threadId: 0, buildHash: resolveBuildHash({ env: {} }).hash })
+    expect(posted[0]).toEqual({ type: "ready", threadId: 0 })
     await expect(installed.dispose()).resolves.toBeUndefined()
   })
 

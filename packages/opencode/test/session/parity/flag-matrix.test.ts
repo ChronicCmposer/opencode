@@ -9,7 +9,6 @@
 import { describe, expect, test } from "bun:test"
 import { BusyExhaustedError } from "@opencode-ai/core/database/busy"
 import { RuntimeFlags } from "@/effect/runtime-flags"
-import { BuildMismatch, buildHashStatus } from "@/session/worker/build-hash"
 import {
   DECLARED_ONLY_HOOKS,
   assertConfiguredHooksSupported,
@@ -33,31 +32,17 @@ describe("rollout flag is two-state only", () => {
 
 describe("status projection", () => {
   test("build identity and mode are carried together", () => {
-    const build = buildHashStatus({ env: {}, definedHash: "deadbeef" })
-    expect(build).toMatchObject({ buildHash: "deadbeef", source: "build", override: false })
-
     const status = parseRolloutStatus(
       createRolloutStatus({
         enabled: false,
         disabledReason: "operator kill switch",
-        buildHash: build.buildHash,
-        protocolSchemaVersion: build.protocolSchemaVersion,
-        buildHashSource: build.source,
-        override: build.override,
+        buildHash: "deadbeef",
+        protocolSchemaVersion: 7,
+        buildHashSource: "build",
+        override: false,
       }),
     )
     expect(status).toMatchObject({ mode: "off", disabledReason: "operator kill switch", buildHash: "deadbeef" })
-  })
-
-  test("a development override is visible in status", () => {
-    const logs: string[] = []
-    const build = buildHashStatus({
-      env: { OPENCODE_DEV: "1", OPENCODE_BUILD_HASH_OVERRIDE: "dev-hash" },
-      definedHash: "build-hash",
-      log: (message) => void logs.push(message),
-    })
-    expect(build).toMatchObject({ buildHash: "dev-hash", source: "override", override: true })
-    expect(logs).toHaveLength(1)
   })
 })
 
@@ -79,7 +64,7 @@ describe("kill-switch contract", () => {
 
 describe("typed infrastructure failures", () => {
   test("build mismatch and busy exhaustion do not collapse to a generic error", () => {
-    expect(isRolloutInfraFailure(new BuildMismatch({ expected: "a", actual: "b" }), "BuildMismatch")).toBe(true)
+    expect(isRolloutInfraFailure(Object.assign(new Error("mismatch"), { _tag: "BuildMismatch" }), "BuildMismatch")).toBe(true)
     expect(
       isRolloutInfraFailure(
         new BusyExhaustedError(5, new Error("locked")),

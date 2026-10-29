@@ -12,7 +12,6 @@ import {
   ToolCallLedgerError,
   ToolCallNotStartedError,
 } from "@/session/ledger/tool-call"
-import { MissingBuildHashError } from "@/session/worker/build-hash"
 import { SessionExecutorRequestError, SessionWorkerReplyTimeoutError } from "@/session/worker/execute"
 import { FrameTooLargeError, ProtocolError, UnsupportedFrameVersionError } from "@/session/worker/frame"
 import { ForeignLifecycleReportError } from "@/session/worker/hub"
@@ -122,11 +121,6 @@ describe("worker error idiom", () => {
     expect(crash._tag).toBe("WorkerCrash.Record")
     expect(crash.tag).toBe("WORKER_CRASH_RECORD")
     expect(crash.message).toBe("bad crash")
-
-    const hash = new MissingBuildHashError()
-    expect(hash._tag).toBe("WorkerBuildHash.Missing")
-    expect(hash.tag).toBe("BUILD_HASH_MISSING")
-    expect(hash.message).toContain("OPENCODE_BUILD_HASH")
 
     const rpc = new LifecycleRpcTimeoutError("commit", 5000)
     expect(rpc._tag).toBe("Lifecycle.RpcTimeout")

@@ -61,7 +61,6 @@ import { Session } from "../session"
 import type { SessionPrompt } from "../prompt"
 import type { ShellInput } from "../prompt"
 import { isWorkerCrashPhase, recordAsync } from "../ledger/crash"
-import { BuildMismatch, resolveBuildHash } from "./build-hash"
 
 import { createCancelReporter, type CancelReport } from "./cancel-report"
 import {
@@ -1482,22 +1481,6 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   const lostGenerations = new Set<SessionID>()
 
   /**
-   * A compiled build mismatch is permanent for this entry: respawning the same
-   * bundle crash-loops. The typed error is kept until the resolved build hash
-   * changes, so a retry before a rebuild fails fast with the same typed cause.
-   */
-  const blockedBuilds = new Map<SessionID, BuildMismatch>()
-  const assertBuildAdmissible = (sessionID: SessionID): void => {
-    const blocked = blockedBuilds.get(sessionID)
-    if (blocked === undefined) return
-    if (blocked.expected !== resolveBuildHash().hash) {
-      blockedBuilds.delete(sessionID)
-      return
-    }
-    throw blocked
-  }
-
-  /**
    * A retired generation can never run `dispose()` (crash, hard terminate), so
    * its worker lease would otherwise stay live until the 30 s TTL and the
    * immediate successor's `DurableLog.reclaim` would fail with `Bus.LeaseConflict`.
@@ -1727,15 +1710,6 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     crashState: (sessionID) => lifecycle.crashState(sessionID),
     recordCrash: (payload) => lifecycle.observeCrash(payload),
     resumeDecision: (payload) => {
-      // A compiled build mismatch is permanent for this entry: respawning the
-      // same bundle would crash-loop. The dispatcher carries the typed cause on
-      // the in-memory payload, so no string matching is involved; keep the
-      // session blocked until the resolved build changes.
-      const cause = (payload as { readonly cause?: unknown }).cause
-      if (cause instanceof BuildMismatch) {
-        blockedBuilds.set(payload.sessionID as SessionID, cause)
-        return { resume: false, sessionID: payload.sessionID, phase: payload.phase, reason: "phase" }
-      }
       const decide = (indeterminate: readonly IndeterminateCall[]) =>
         decideAutoResume({
           sessionID: payload.sessionID,
@@ -1818,7 +1792,6 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     },
     writeBarrier: runBarrier,
     commitOutcome: (sessionID) => commitOutcomes.get(sessionID),
-    assertAdmissible: assertBuildAdmissible,
     onRunStart: (sessionID) => {
       // A lost generation's calls can never settle. Release them into the OLD
       // phases first (so the fresh `tools` phase below is not pre-resolved and
@@ -1892,7 +1865,6 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
         // The off-loop schema gate must complete before any isolate can spawn.
         yield* Effect.promise(() => awaitBootGate())
         yield* Effect.try({ try: () => admitBarrier(sessionID), catch: (error) => error })
-        yield* Effect.try({ try: () => assertBuildAdmissible(sessionID), catch: (error) => error })
         // A retired generation's release must land before its successor boots and
         // claims the aggregate; otherwise the successor can be admitted against a
         // still-live lease.
@@ -1901,7 +1873,6 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
           catch: (error) => error,
         })
         const result = yield* dispatch.ensureRunningEffect(sessionID, resolveDepth(sessionID), origin)
-        blockedBuilds.delete(sessionID)
         lifecycle.resetAttempts(sessionID)
         // Record the owner this generation claimed, so a later retirement can
         // release exactly it without re-reading a possibly-successor-owned row.
@@ -1917,14 +1888,12 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       // The off-loop schema gate must complete before any isolate can spawn.
       await awaitBootGate()
       admitBarrier(sessionID)
-      assertBuildAdmissible(sessionID)
       // A retired generation's release must land before its successor boots and
       // claims the aggregate; otherwise the successor can be admitted against a
       // still-live lease.
       await awaitRetiredLeaseRelease(sessionID)
       try {
         const result = await dispatch.ensureRunning(sessionID, resolveDepth(sessionID), origin)
-        blockedBuilds.delete(sessionID)
         lifecycle.resetAttempts(sessionID)
         // Record the owner this generation claimed, so a later retirement can
         // release exactly it without re-reading a possibly-successor-owned row.
@@ -1939,11 +1908,9 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       onDispatch?.(sessionID)
       await awaitBootGate()
       admitBarrier(sessionID)
-      assertBuildAdmissible(sessionID)
       await awaitRetiredLeaseRelease(sessionID)
       try {
         const result = await dispatch.startShell(sessionID, shell, resolveDepth(sessionID))
-        blockedBuilds.delete(sessionID)
         lifecycle.resetAttempts(sessionID)
         await rememberLeaseOwner(sessionID)
         return result

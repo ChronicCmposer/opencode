@@ -82,12 +82,4 @@ describe("script/build.ts bundles every worker entry", () => {
     }
     expect(missing).toEqual([])
   })
-
-  test("the packaged identity and worker hash defines are injected and consumed", async () => {
-    expect(buildSource).toContain("OPENCODE_PACKAGED:")
-    expect(buildSource).toContain("OPENCODE_BUILD_HASH:")
-    const buildHash = await read("src/session/worker/build-hash.ts")
-    expect(buildHash).toContain("OPENCODE_PACKAGED")
-    expect(buildHash).toContain("OPENCODE_BUILD_HASH")
-  })
 })
