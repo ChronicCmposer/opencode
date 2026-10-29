@@ -44,6 +44,7 @@ function createMaterializingExecutorWorker(
   cap?: WorkerCap,
 ): ExecutorWorker {
   const state: MaterializingWorkerState = { inner: undefined, terminated: false, materializing: undefined }
+  let termination: Promise<void> | undefined
   const worker: ExecutorWorker = {
     id,
     get alive() {
@@ -62,20 +63,26 @@ function createMaterializingExecutorWorker(
     assertNotBusy: (sessionID) =>
       state.inner === undefined ? Promise.resolve(false) : state.inner.assertNotBusy(sessionID),
     resultFor: (sessionID) => state.inner?.resultFor(sessionID),
+    hasActiveWork: (sessionID) => state.inner?.hasActiveWork?.(sessionID) ?? Promise.resolve(false),
+    awaitEgress: (sessionID) => state.inner?.awaitEgress?.(sessionID) ?? Promise.resolve(),
     cancelPort: createExecutorCancelPort({ cancel: (sessionID) => worker.cancel(sessionID), ...(bridge === undefined ? {} : { bridge }) }),
-    terminate: async () => {
+    terminate: () => {
+      if (termination !== undefined) return termination
       state.terminated = true
       const materializing = state.materializing
       state.materializing = undefined
       const current = state.inner
       state.inner = undefined
-      if (current !== undefined) {
-        await current.terminate()
-        return
-      }
-      if (materializing !== undefined) {
-        await materializing.then((worker) => worker.terminate()).catch(() => undefined)
-      }
+      termination = (async () => {
+        if (current !== undefined) {
+          await current.terminate()
+          return
+        }
+        if (materializing !== undefined) {
+          await materializing.then((worker) => worker.terminate()).catch(() => undefined)
+        }
+      })()
+      return termination
     },
   }
   return worker

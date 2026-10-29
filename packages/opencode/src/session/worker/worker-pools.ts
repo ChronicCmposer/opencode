@@ -158,7 +158,10 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
       Deferred.doneUnsafe(aborted, Effect.void)
     }
     signal?.addEventListener("abort", onAbort, { once: true })
+    let detached = false
     const detach = (): void => {
+      if (detached) return
+      detached = true
       signal?.removeEventListener("abort", onAbort)
     }
 
@@ -189,25 +192,22 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
       }
     }
 
+    const cleanup = Effect.sync(() => {
+      detach()
+      if (waitingCounted) {
+        waitingCounted = false
+        waitingCount = Math.max(0, waitingCount - 1)
+      }
+      if (holding) {
+        holding = false
+        activeCount = Math.max(0, activeCount - 1)
+      }
+    })
+
     const holder = Effect.raceFirst(
       hold,
       Deferred.await(aborted).pipe(Effect.andThen(Effect.interrupt)),
-    ).pipe(
-      Effect.catchCause(() => Effect.void),
-      Effect.ensuring(
-        Effect.sync(() => {
-          detach()
-          if (waitingCounted) {
-            waitingCounted = false
-            waitingCount = Math.max(0, waitingCount - 1)
-          }
-          if (holding) {
-            holding = false
-            activeCount = Math.max(0, activeCount - 1)
-          }
-        }),
-      ),
-    )
+    ).pipe(Effect.catchCause(() => Effect.void), Effect.ensuring(cleanup))
 
     // The holder lives in the gate's scope so it outlives this call while held;
     // a failed or interrupted acquisition interrupts it so it can never
@@ -223,7 +223,7 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
             duration: timeoutMs,
             orElse: () => Effect.fail(new SpawnGateTimeoutError(timeoutMs)),
           }),
-          Effect.onError(() => Fiber.interrupt(fiber)),
+          Effect.onError(() => Fiber.interrupt(fiber).pipe(Effect.andThen(cleanup))),
         )
       }),
     )
@@ -2284,7 +2284,6 @@ export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Eff
                   )
                 }
               }
-              if (terminated) throw new Error(`executor worker ${id} is terminated`)
               boundSession = run.sessionID
               boundKey = key
               lookups.set(key, { sessionID: run.sessionID, workerID: id, init: generation.init })
