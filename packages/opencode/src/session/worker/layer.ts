@@ -1369,6 +1369,15 @@ function workerTimeoutFetch(options: Readonly<Record<string, unknown>>): typeof 
   }) as typeof fetch
 }
 
+export class WorkerSdkUnsupportedError extends Schema.TaggedErrorClass<WorkerSdkUnsupportedError>()(
+  "WorkerSdkUnsupportedError",
+  { npm: Schema.String },
+) {
+  override get message() {
+    return `session workers cannot build the ${this.npm} SDK`
+  }
+}
+
 /** Build the reduced provider's SDK from the serialized `npm`, so a worker makes the provider-shaped request the hub resolved instead of always an. */
 function createWorkerLanguageSdk(config: WorkerModelConfig): WorkerLanguageSdk {
   const npm = workerNpm(config)
@@ -1391,10 +1400,13 @@ function createWorkerLanguageSdk(config: WorkerModelConfig): WorkerLanguageSdk {
       return createGoogleGenerativeAI(options) as unknown as WorkerLanguageSdk
     case "@ai-sdk/openai":
       return createOpenAI(options) as unknown as WorkerLanguageSdk
-    default:
+    case "@ai-sdk/openai-compatible":
       return createOpenAICompatible(
         options as Parameters<typeof createOpenAICompatible>[0],
       ) as unknown as WorkerLanguageSdk
+    default:
+      // Dispatch routes sessions with other packages in-process, so reaching here is a programming error.
+      throw new WorkerSdkUnsupportedError({ npm })
   }
 }
 

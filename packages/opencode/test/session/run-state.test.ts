@@ -423,3 +423,58 @@ describe("SessionRunState — hub rejections are typed", () => {
     )
   })
 })
+
+describe("SessionRunState.ensureRunning — worker compatibility", () => {
+  const hubWith = (sessionID: SessionID, reason: string | undefined, dispatched: SessionID[]) => {
+    const base = createSessionHub({
+      barrier: createTestBarrier(),
+      pool: createFakeExecutorPool(1, { value: withParts(sessionID) }),
+    })
+    return {
+      ...base,
+      workerIncompatibility: () => Effect.succeed(reason),
+      ensureRunningEffect: (id: SessionID, origin?: DispatchOrigin) => {
+        dispatched.push(id)
+        return base.ensureRunningEffect(id, origin)
+      },
+    } satisfies SessionHub
+  }
+
+  const run = (reason: string | undefined) => {
+    const sessionID = sid(reason === undefined ? "ses_worker_ok" : "ses_worker_incompatible")
+    const dispatched: SessionID[] = []
+    const hub = hubWith(sessionID, reason, dispatched)
+    let localRan = false
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const work = Effect.sync(() => {
+          localRan = true
+          return withParts(sessionID)
+        })
+        yield* state.ensureRunning(sessionID, work, work)
+        return { localRan, dispatched }
+      }).pipe(
+        Effect.provide(runStateLayer),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+      ),
+    )
+  }
+
+  it.live("a worker-incompatible model runs in-process with the flag on", () =>
+    Effect.gen(function* () {
+      const result = yield* run("provider uses OAuth")
+      expect(result.localRan).toBe(true)
+      expect(result.dispatched).toEqual([])
+    }),
+  )
+
+  it.live("a worker-compatible model still dispatches to the hub", () =>
+    Effect.gen(function* () {
+      const result = yield* run(undefined)
+      expect(result.localRan).toBe(false)
+      expect(result.dispatched).toHaveLength(1)
+    }),
+  )
+})

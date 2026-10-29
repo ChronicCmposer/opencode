@@ -45,6 +45,7 @@ import type {
 } from "./plugin-host"
 import { buildWorkerSnapshot, type BuildWorkerSnapshotOptions } from "./snapshot"
 import { stringHeaders } from "./headers"
+import { isWorkerSdkPackage } from "./sdk-packages"
 import type { PluginToolDescriptor } from "./plugin-tool-wire"
 
 // ---------------------------------------------------------------------------
@@ -292,6 +293,28 @@ export const resolveWorkerModel = Effect.fn("WorkerModel.resolve")(function* (op
     providerOptions: info.options,
   }
   return resolved
+})
+
+/**
+ * Why the session's model cannot run in a worker, or `undefined` when it can.
+ * Non-serializable options (OAuth/plugin fetch loaders), OAuth credentials
+ * (the worker would send an empty key) and SDK packages the worker cannot
+ * build all make the session run in-process instead.
+ */
+export const workerModelIncompatibility = Effect.fn("WorkerModel.incompatibility")(function* (
+  options: ResolveWorkerModelOptions = {},
+) {
+  const auth = yield* Auth.Service
+  const resolved = yield* resolveWorkerModel(options).pipe(Effect.result)
+  if (resolved._tag === "Failure") return resolved.failure.message
+  if (!isWorkerSdkPackage(resolved.success.npm ?? "@ai-sdk/openai-compatible")) {
+    return `${resolved.success.providerID}/${resolved.success.modelID} uses ${resolved.success.npm}, which workers do not support`
+  }
+  const credential = yield* auth.get(resolved.success.providerID).pipe(Effect.orElseSucceed(() => undefined))
+  if (credential?.type === "oauth") {
+    return `${resolved.success.providerID} authenticates with OAuth, which workers cannot use`
+  }
+  return undefined
 })
 
 // ---------------------------------------------------------------------------

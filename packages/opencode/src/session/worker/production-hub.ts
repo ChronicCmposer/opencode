@@ -35,6 +35,7 @@ import { createEpochSequence, makeInstanceContext, type EpochSequence } from "./
 import {
   buildSessionWorkerInit,
   resolveWorkerPlugins,
+  workerModelIncompatibility,
   type BuildSessionWorkerInitOptions,
   type WorkerModelSelection,
   type WorkerPluginSource,
@@ -404,6 +405,7 @@ export interface ProductionSessionHubOptions {
   readonly onDispatch?: (sessionID: SessionID) => void
   /** Resolve a session's subagent depth for the dispatch path (see `SessionHubOptions`). */
   readonly depthOf?: (sessionID: SessionID) => number | undefined
+  readonly workerIncompatibility?: (sessionID: SessionID) => Effect.Effect<string | undefined>
   /** Live-only event publisher (worker republish + `session.cancelled`). */
   readonly events?: LiveEventPublisher
   /** Per-session live publisher, so a cancel carries the cancelled session's location. */
@@ -711,6 +713,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
       onWorkerCrashed: crashSink,
       onDispatch: options.onDispatch,
       depthOf: options.depthOf,
+      workerIncompatibility: options.workerIncompatibility,
       events: options.events,
       eventPublisherFor: options.eventPublisherFor,
       onCancelRequested: options.onCancelRequested,
@@ -838,6 +841,8 @@ interface PerSessionResolvers {
   readonly instanceOfSession: (sessionID: SessionID | undefined) => InstanceContext | undefined
   readonly resolveInit: (sessionID?: SessionID) => Promise<SessionWorkerInit>
   readonly generationOfSession: (sessionID: SessionID) => Promise<string>
+  /** Why the session's model cannot run in a worker; evaluated in the caller's fiber, before any dispatch state is recorded. */
+  readonly workerIncompatibility: (sessionID: SessionID) => Effect.Effect<string | undefined>
   readonly recordDispatch: (sessionID: SessionID) => void
   readonly releaseSession: (sessionID: SessionID) => void
   readonly clearSessions: () => void
@@ -1208,6 +1213,23 @@ export function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSess
         )
       }),
     )
+  const workerIncompatibility = (sessionID: SessionID): Effect.Effect<string | undefined> =>
+    Effect.gen(function* () {
+      const context = captureRuntimeContext()
+      const dispatched = yield* loadDispatchedSession(context, sessionID)
+      const model = dispatched?.model
+      const instance = resolveSessionInstance(sessionID, dispatched, instanceOfSession, logBridge)
+      return yield* workerModelIncompatibility(
+        model === undefined ? deps.initOptions?.model : { ...deps.initOptions?.model, session: model },
+      ).pipe(
+        Effect.provideService(Config.Service, services.config),
+        Effect.provideService(Auth.Service, services.auth),
+        Effect.provideService(ModelsDev.Service, services.modelsDev),
+        Effect.provideService(Provider.Service, services.provider),
+        Effect.provideService(RuntimeFlags.Service, services.flags),
+        Effect.provideService(InstanceRef, instance),
+      )
+    })
   /** Cheap generation probe: read the dispatching session's requested model without building the full worker init. */
   const generationOfSession = (sessionID: SessionID): Promise<string> =>
     runPromise(
@@ -1275,6 +1297,7 @@ export function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSess
     instanceOfSession,
     resolveInit,
     generationOfSession,
+    workerIncompatibility,
     recordDispatch,
     releaseSession,
     clearSessions,
@@ -1431,6 +1454,7 @@ export function productionSessionHubLayer(
         onDispatch: resolvers.recordDispatch,
         // The production dispatch path must carry the child's `metadata.depth`.
         depthOf: resolvers.depthOf,
+        workerIncompatibility: resolvers.workerIncompatibility,
         onCancelRequested: (sessionID) => {
           // Abort hub-executed tools and fail blocked permission/question asks at the moment of the cancel, not only after the grace window.
           resolvers.abortPluginTools(sessionID)
