@@ -81,7 +81,63 @@ export interface HubProxyAuthorities {
   readonly pluginToolAbort?: (input: { readonly sessionID: string; readonly callID: string }) => void | Promise<void>
   /** Optional worker-job mirror authority. */
   readonly backgroundJob?: WorkerBackgroundJobAuthority
+  /** MCP reads, served from the hub's MCP service in the worker's instance context. */
+  readonly mcp?: McpHubAuthority
 }
+
+/** The hub-side MCP reads a worker may perform; every value is JSON. */
+export interface McpHubAuthority {
+  readonly clients: () => Promise<Readonly<Record<string, McpClientInfo>>>
+  readonly instructions: () => Promise<unknown>
+  readonly resources: (clientName?: string) => Promise<unknown>
+  readonly resourceTemplates: (clientName?: string) => Promise<unknown>
+  readonly readResource: (clientName: string, uri: string) => Promise<unknown>
+}
+
+/** The serialisable slice of an MCP client a worker consults. */
+export interface McpClientInfo {
+  readonly capabilities: Record<string, unknown> | undefined
+}
+
+/** Serve MCP reads from the hub's MCP service in the worker's captured context. */
+export function mcpAuthorityFor(run: HubProxyRunner): McpHubAuthority {
+  const withMcp = <A>(use: (mcp: MCP.Interface) => Effect.Effect<A>) =>
+    run(
+      Effect.gen(function* () {
+        const mcp = yield* Effect.serviceOption(MCP.Service)
+        if (Option.isNone(mcp))
+          return yield* Effect.die(new Error("the hub has no MCP service in the dispatched context"))
+        return yield* use(mcp.value)
+      }),
+    )
+  return {
+    clients: () =>
+      withMcp((mcp) =>
+        mcp
+          .clients()
+          .pipe(
+            Effect.map((clients) =>
+              Object.fromEntries(
+                Object.entries(clients).map(([name, client]) => [
+                  name,
+                  { capabilities: client.getServerCapabilities() as Record<string, unknown> | undefined },
+                ]),
+              ),
+            ),
+          ),
+      ),
+    instructions: () => withMcp((mcp) => mcp.instructions()),
+    resources: (clientName) => withMcp((mcp) => mcp.resources(clientName)),
+    resourceTemplates: (clientName) => withMcp((mcp) => mcp.resourceTemplates(clientName)),
+    readResource: (clientName, uri) => withMcp((mcp) => mcp.readResource(clientName, uri)),
+  }
+}
+
+function mcpAuthority(authorities: HubProxyAuthorities): McpHubAuthority {
+  if (authorities.mcp === undefined) throw new Error('the hub has no "mcp" authority wired; cannot read MCP state')
+  return authorities.mcp
+}
+
 
 /** One worker-reported terminal job state, settled into the hub mirror. */
 export interface WorkerBackgroundJobSettle {
@@ -160,6 +216,13 @@ export function buildHubProxyHandlers(authorities: HubProxyAuthorities, run: Hub
       authorities.backgroundJob?.settle(input as WorkerBackgroundJobSettle) ?? Promise.resolve(),
     "backgroundJob.awaitPromotion": (id) =>
       authorities.backgroundJob?.awaitPromotion(id as string) ?? Promise.resolve(false),
+    "mcp.clients": () => mcpAuthority(authorities).clients(),
+    "mcp.instructions": () => mcpAuthority(authorities).instructions(),
+    "mcp.resources": (clientName) => mcpAuthority(authorities).resources(clientName as string | undefined),
+    "mcp.resourceTemplates": (clientName) =>
+      mcpAuthority(authorities).resourceTemplates(clientName as string | undefined),
+    "mcp.readResource": (clientName, uri) =>
+      mcpAuthority(authorities).readResource(clientName as string, uri as string),
     "session.spawn": (request) =>
       authorities.sessionSpawn === undefined
         ? Promise.reject(new Error('the hub has no "sessionSpawn" authority wired; cannot spawn a session'))
@@ -1152,6 +1215,7 @@ export interface HubProxyAuthorityDeps extends SessionScopeAuthorityDeps {
   readonly pluginToolAbort?: NonNullable<HubProxyAuthorities["pluginToolAbort"]>
   readonly discardReverted?: NonNullable<HubProxyAuthorities["discardReverted"]>
   readonly backgroundJob?: NonNullable<HubProxyAuthorities["backgroundJob"]>
+  readonly mcp?: McpHubAuthority
 }
 
 /** The production authority map for one worker. */
@@ -1177,6 +1241,7 @@ export function hubProxyAuthoritiesFor(deps: HubProxyAuthorityDeps): HubProxyAut
     ...(deps.backgroundJob === undefined || deps.boundSessionID === undefined
       ? {}
       : { backgroundJob: deps.backgroundJob }),
+    ...(deps.mcp === undefined ? {} : { mcp: deps.mcp }),
     sessionSpawn: sessionSpawnFor(deps.boundSessionID, deps),
     sessionCreate: createSessionFor(deps.boundSessionID, deps.run),
     sessionGet: getSessionFor(deps.boundSessionID, deps.run),

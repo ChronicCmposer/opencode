@@ -101,6 +101,11 @@ export type HubProxyMethod =
   | "lifecycle.phase"
   | "lifecycle.toolStarted"
   | "lifecycle.toolFinished"
+  | "mcp.clients"
+  | "mcp.instructions"
+  | "mcp.resources"
+  | "mcp.resourceTemplates"
+  | "mcp.readResource"
 
 /** A typed failure returned by a hub authority across the port. */
 export class HubProxyRemoteError extends Schema.TaggedErrorClass<HubProxyRemoteError>("HubProxyRemoteError")(
