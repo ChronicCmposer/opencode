@@ -7,7 +7,7 @@
 // `BEGIN IMMEDIATE` transaction. A worker probes read-only and refuses a mismatch
 // with `SchemaMismatch`: it never runs DDL and never marks schema state.
 
-import { Effect, Stream } from "effect"
+import { Effect, Schema, Stream } from "effect"
 import { Reactivity } from "effect/unstable/reactivity"
 import { make, SqlClient } from "effect/unstable/sql/SqlClient"
 import type { Connection as SqlConnection } from "effect/unstable/sql/SqlConnection"
@@ -48,19 +48,25 @@ interface MigrationRow {
   readonly id: string
 }
 
-export class SchemaMismatch extends Error {
+export class SchemaMismatch extends Schema.TaggedErrorClass<SchemaMismatch>("SchemaMismatch")(
+  "WorkerDb.SchemaMismatch",
+  {
+    expected: Schema.Struct({ version: Schema.Number, contentHash: Schema.String }),
+    observed: Schema.Struct({ version: Schema.Number, contentHash: Schema.String }),
+  },
+) {
   readonly tag = "WorkerDb.SchemaMismatch"
-  readonly expected: SchemaIdentity
-  readonly observed: SchemaIdentity
 
   constructor(expected: SchemaIdentity, observed: SchemaIdentity) {
-    super(
-      `schema mismatch: expected version ${expected.version}/${expected.contentHash}, ` +
-        `observed ${observed.version}/${observed.contentHash}`,
-    )
+    super({ expected, observed })
     this.name = "SchemaMismatch"
-    this.expected = expected
-    this.observed = observed
+  }
+
+  override get message() {
+    return (
+      `schema mismatch: expected version ${this.expected.version}/${this.expected.contentHash}, ` +
+      `observed ${this.observed.version}/${this.observed.contentHash}`
+    )
   }
 }
 
@@ -70,25 +76,34 @@ export class SchemaMismatch extends Error {
  * custom executor without `queryInTransaction` cannot honour that (F1), so the
  * path fails fast instead of silently falling back to retrying `query`.
  */
-export class MissingQueryInTransactionError extends Error {
+export class MissingQueryInTransactionError extends Schema.TaggedErrorClass<MissingQueryInTransactionError>(
+  "MissingQueryInTransactionError",
+)("WorkerDb.MissingQueryInTransaction", {}) {
   readonly tag = "WorkerDb.MissingQueryInTransaction"
 
   constructor() {
-    super(
-      "schema migration requires an executor with queryInTransaction; a busy in-transaction statement must fail the batch, not replay DML",
-    )
+    super({})
     this.name = "MissingQueryInTransactionError"
+  }
+
+  override get message() {
+    return "schema migration requires an executor with queryInTransaction; a busy in-transaction statement must fail the batch, not replay DML"
   }
 }
 
-export class LiveWorkersError extends Error {
+export class LiveWorkersError extends Schema.TaggedErrorClass<LiveWorkersError>("LiveWorkersError")(
+  "WorkerDb.LiveWorkers",
+  { liveWorkers: Schema.Number },
+) {
   readonly tag = "WorkerDb.LiveWorkers"
-  readonly liveWorkers: number
 
   constructor(liveWorkers: number) {
-    super(`schema migration requires zero live workers, found ${liveWorkers}`)
+    super({ liveWorkers })
     this.name = "LiveWorkersError"
-    this.liveWorkers = liveWorkers
+  }
+
+  override get message() {
+    return `schema migration requires zero live workers, found ${this.liveWorkers}`
   }
 }
 

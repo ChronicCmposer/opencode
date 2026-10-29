@@ -7,6 +7,7 @@
 // is typed and terminal; a caller must never retry a non-idempotent body on an
 // ambiguous (non-busy) commit failure.
 
+import { Schema } from "effect"
 import type { Connection } from "./connection"
 import { isBusySqlError } from "./busy"
 
@@ -53,38 +54,62 @@ export const EXECUTOR_BUSY_RETRY_CONFIG: BusyRetryConfig = Object.freeze({
 export const isBusyError: (error: unknown) => boolean = isBusySqlError
 
 /** Typed terminal failure: the fixed retry budget was spent. */
-export class BusyExhaustedError extends Error {
+export class BusyExhaustedError extends Schema.TaggedErrorClass<BusyExhaustedError>("BusyExhaustedError")(
+  "Database.BusyExhausted",
+  {
+    attempts: Schema.Number,
+    lastCause: Schema.Unknown,
+  },
+) {
   readonly tag = "SQLITE_BUSY_EXHAUSTED"
-  readonly attempts: number
-  readonly lastCause: unknown
 
-  constructor(attempts: number, lastCause: unknown) {
-    super(`SQLite remained busy after ${attempts} attempt(s)`)
+  constructor(
+    override readonly attempts: number,
+    override readonly lastCause: unknown,
+  ) {
+    super({ attempts, lastCause })
     this.name = "BusyExhaustedError"
-    this.attempts = attempts
-    this.lastCause = lastCause
+  }
+
+  override get message() {
+    return `SQLite remained busy after ${this.attempts} attempt(s)`
   }
 }
 
 /** A failed ROLLBACK leaves the transaction state unknown; the connection is poisoned. */
-export class TransactionRollbackError extends Error {
+export class TransactionRollbackError extends Schema.TaggedErrorClass<TransactionRollbackError>(
+  "TransactionRollbackError",
+)("Database.TransactionRollback", {
+  cause: Schema.optional(Schema.Defect()),
+  rollbackCause: Schema.Unknown,
+}) {
   readonly tag = "DB_CORE_ROLLBACK_FAILED"
-  override readonly cause: unknown
-  readonly rollbackCause: unknown
 
-  constructor(cause: unknown, rollbackCause: unknown) {
-    super("transaction rollback failed; connection is poisoned")
+  constructor(
+    override readonly cause: unknown,
+    override readonly rollbackCause: unknown,
+  ) {
+    super({ cause, rollbackCause })
     this.name = "TransactionRollbackError"
-    this.cause = cause
-    this.rollbackCause = rollbackCause
+  }
+
+  override get message() {
+    return "transaction rollback failed; connection is poisoned"
   }
 }
 
-export class TransactionPoisonedError extends Error {
+export class TransactionPoisonedError extends Schema.TaggedErrorClass<TransactionPoisonedError>(
+  "TransactionPoisonedError",
+)("Database.TransactionPoisoned", {}) {
   readonly tag = "DB_CORE_CONNECTION_POISONED"
+
   constructor() {
-    super("database connection is poisoned by a failed rollback")
+    super({})
     this.name = "TransactionPoisonedError"
+  }
+
+  override get message() {
+    return "database connection is poisoned by a failed rollback"
   }
 }
 

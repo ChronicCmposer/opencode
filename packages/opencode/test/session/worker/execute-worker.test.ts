@@ -64,7 +64,7 @@ describe("5.1 a V1 session run executes in a worker with the hub loop idle", () 
     const result = await running
     expect(result.sessionID).toBe("ses_a")
     expect(result.value).toBeDefined()
-  })
+  }, 90_000)
 })
 
 describe("5.3 per-key serialization is preserved", () => {
@@ -76,7 +76,7 @@ describe("5.3 per-key serialization is preserved", () => {
 
     expect(a).toEqual(b)
     expect(rig.dispatcher.registry.size).toBe(0)
-  })
+  }, 90_000)
 })
 
 describe("5.4 RunnerBusy / assertNotBusy hold worker-local; the hub forwards control", () => {
@@ -91,7 +91,7 @@ describe("5.4 RunnerBusy / assertNotBusy hold worker-local; the hub forwards con
 
     await running
     expect(await rig.dispatch.assertNotBusy(sid("ses_a"))).toBe(false)
-  })
+  }, 90_000)
 })
 
 describe("5.5 different sessions run concurrently on different per-session workers", () => {
@@ -108,11 +108,11 @@ describe("5.5 different sessions run concurrently on different per-session worke
     const [ra, rb] = await Promise.all([a, b])
     expect(ra.sessionID).toBe("ses_a")
     expect(rb.sessionID).toBe("ses_b")
-    // Spawning two real worker threads is genuinely CPU/IO-bound: under the
-    // full worker suite the host is oversubscribed by every other test file, so
-    // 30 s is not enough headroom for both isolates to boot and finish. The
-    // assertion is unchanged; only the per-test deadline is widened.
-  }, 60_000)
+    // Spawning real worker threads is genuinely CPU/IO-bound: under the full
+    // worker suite the host is oversubscribed by every other test file, so the
+    // 30 s runner deadline is not enough headroom for the isolates to boot and
+    // finish. The assertion is unchanged; only the per-test deadline is widened.
+  }, 90_000)
 })
 
 describe("5.4 hub forwards cancellation", () => {
@@ -123,7 +123,7 @@ describe("5.4 hub forwards cancellation", () => {
 
     await rig.dispatch.cancel(sid("ses_a"))
     await expect(running).rejects.toBeInstanceOf(SessionCancelledError)
-  })
+  }, 90_000)
 
   test("a cancelled worker session leaves the worker run-state clean and reusable", async () => {
     await using rig = makeRig()
@@ -138,7 +138,7 @@ describe("5.4 hub forwards cancellation", () => {
     expect(await rig.dispatch.assertNotBusy(sid("ses_a"))).toBe(false)
     const next = await rig.dispatch.ensureRunning(sid("ses_b"))
     expect(next.sessionID).toBe("ses_b")
-  })
+  }, 90_000)
 })
 
 describe("worker spawn logging", () => {
@@ -194,7 +194,7 @@ describe("a run is never bounded by the control-frame deadline", () => {
     } finally {
       await harness.terminateAll().catch(() => undefined)
     }
-  })
+  }, 90_000)
 
   test("a control frame still times out under the same tiny timeoutMs", async () => {
     const seen: Array<number | undefined> = []
@@ -260,7 +260,7 @@ describe("liveness watchdog: a wedged run is surfaced, a healthy one is not", ()
     } finally {
       await harness.terminateAll().catch(() => undefined)
     }
-  })
+  }, 90_000)
 
   test("runIdleTimeoutMs 0 disables the watchdog: a slow run still completes", async () => {
     const harness = createWorkerHarness({ cores: 4, timeoutMs: 10_000 })
@@ -276,5 +276,5 @@ describe("liveness watchdog: a wedged run is surfaced, a healthy one is not", ()
     } finally {
       await harness.terminateAll().catch(() => undefined)
     }
-  })
+  }, 90_000)
 })

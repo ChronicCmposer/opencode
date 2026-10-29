@@ -38,7 +38,7 @@ describe("sanitizePluginToolResult", () => {
     expect(caught).toBeInstanceOf(PluginToolNotSerializableError)
     const error = caught as PluginToolNotSerializableError
     // The tag is what the wire carries to the worker for `instanceof` rebuilding.
-    expect(error._tag).toBe("PluginToolNotSerializableError")
+    expect(error._tag).toBe("PluginTool.NotSerializable")
     expect(error.toolID).toBe("compress")
     expect(error.detail).toBe("metadata")
     expect(error.message).toContain("compress")
@@ -103,7 +103,7 @@ describe("pluginToolAuthority result serialization", () => {
     }
     expect(caught).toBeInstanceOf(PluginToolNotSerializableError)
     expect((caught as PluginToolNotSerializableError).toolID).toBe("compress")
-    expect((caught as PluginToolNotSerializableError)._tag).toBe("PluginToolNotSerializableError")
+    expect((caught as PluginToolNotSerializableError)._tag).toBe("PluginTool.NotSerializable")
   })
 
   test("a clone-safe plugin tool resolves normally", async () => {

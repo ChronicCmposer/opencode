@@ -14,6 +14,8 @@
 // The clock and timer are injected so the window is deterministic in tests, and
 // so production can drive it from the cross-worker fake clock.
 
+import { Schema } from "effect"
+
 import { type EventsFrame, type EventV2Event, endFrame, eventFrame } from "@/session/worker/frame"
 
 import type { DurableMeta } from "./frame"
@@ -64,10 +66,16 @@ export interface Coalescer {
 }
 
 /** Thrown when a delta or durable is pushed after `end()`. */
-export class CoalescerEndedError extends Error {
+export class CoalescerEndedError extends Schema.TaggedErrorClass<CoalescerEndedError>("CoalescerEndedError")(
+  "Egress.CoalescerEnded",
+  {},
+) {
   constructor() {
-    super("coalescer has ended")
+    super({})
     this.name = "CoalescerEndedError"
+  }
+  override get message() {
+    return "coalescer has ended"
   }
 }
 

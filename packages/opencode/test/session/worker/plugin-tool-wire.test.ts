@@ -163,7 +163,7 @@ describe("PluginToolNotSerializableError (W0b)", () => {
   test("carries the tag and toolID other modules match on", () => {
     const error = new PluginToolNotSerializableError("compress", "metadata")
 
-    expect(error._tag).toBe("PluginToolNotSerializableError")
+    expect(error._tag).toBe("PluginTool.NotSerializable")
     expect(error.toolID).toBe("compress")
     expect(error.detail).toBe("metadata")
     expect(error).toBeInstanceOf(Error)

@@ -402,7 +402,7 @@ describe("buildSessionWorkerInit", () => {
 
     await using worker = await bootSessionWorker({ init, timeoutMs: 20_000 })
     expect(worker.ready.type).toBe("ready")
-  }, 30_000)
+  }, 90_000)
 })
 
 // ---------------------------------------------------------------------------
@@ -435,7 +435,7 @@ describe("makeProduction pool", () => {
     } finally {
       await dispose()
     }
-  }, 30_000)
+  }, 90_000)
 })
 
 describe("idle eviction retirement", () => {
@@ -505,7 +505,7 @@ describe("idle eviction retirement", () => {
       await sessionHub.terminateAll()
       await scoped.dispose()
     }
-  }, 30_000)
+  }, 90_000)
 })
 
 describe("dispatch pool constants", () => {

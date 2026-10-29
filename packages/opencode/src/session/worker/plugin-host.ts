@@ -19,6 +19,8 @@
 // and a mutable `output`; hooks run in registration order and each observes the
 // previous hook's mutations. A throwing hook aborts the chain (fail loud).
 
+import { Schema } from "effect"
+
 export {
   DECLARED_ONLY_HOOKS,
   UnclassifiedPluginHookError,
@@ -202,10 +204,16 @@ export interface WorkerPluginHostOptions {
 }
 
 /** Raised when two plugins share a name (fail loud). */
-export class DuplicatePluginError extends Error {
-  constructor(name: string) {
-    super(`duplicate plugin: ${name}`)
+export class DuplicatePluginError extends Schema.TaggedErrorClass<DuplicatePluginError>("DuplicatePluginError")(
+  "WorkerPlugins.DuplicatePlugin",
+  { pluginName: Schema.String },
+) {
+  constructor(pluginName: string) {
+    super({ pluginName })
     this.name = "DuplicatePluginError"
+  }
+  override get message() {
+    return `duplicate plugin: ${this.pluginName}`
   }
 }
 
@@ -215,13 +223,21 @@ export class DuplicatePluginError extends Error {
  * old value would make the hook's replacement vanish, so the mismatch fails at
  * the hook boundary instead.
  */
-export class NonContainerReplacementError extends Error {
+export class NonContainerReplacementError extends Schema.TaggedErrorClass<NonContainerReplacementError>(
+  "NonContainerReplacementError",
+)("WorkerPlugins.NonContainerReplacement", {
+  field: Schema.String,
+  kind: Schema.String,
+}) {
   constructor(
-    readonly field: string,
-    readonly kind: string,
+    override readonly field: string,
+    override readonly kind: string,
   ) {
-    super(`plugin replaced "${field}" with a ${kind}; the field requires a matching container`)
+    super({ field, kind })
     this.name = "NonContainerReplacementError"
+  }
+  override get message() {
+    return `plugin replaced "${this.field}" with a ${this.kind}; the field requires a matching container`
   }
 }
 

@@ -182,7 +182,11 @@ describe("worker generation owner lease", () => {
       await gen.publish(durable("gen-1"))
 
       // Simulate the TTL elapsing between writes: the heartbeat must renew it.
-      observer.run("UPDATE event_sequence SET worker_expires_at = 0 WHERE aggregate_id = ?", ["session-lease"])
+      // `0` is the released sentinel, so an elapsed TTL is a past timestamp.
+      observer.run("UPDATE event_sequence SET worker_expires_at = ? WHERE aggregate_id = ?", [
+        Date.now() - 1_000,
+        "session-lease",
+      ])
       await new Promise((resolve) => setTimeout(resolve, 80))
       expect(lease()?.worker_expires_at).toBeGreaterThan(0)
 

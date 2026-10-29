@@ -545,9 +545,16 @@ const INSERT_EVENT = "INSERT INTO event (id, aggregate_id, seq, type, data) VALU
 const INSERT_BLOB =
   "INSERT INTO event_blob (aggregate_id, seq, type, hash, size, data, file_path) VALUES (?, ?, ?, ?, ?, NULL, ?)"
 
+// A released lease is `worker_expires_at = 0` (whether `releaseLease` cleared
+// the owner or `releaseDeadLeases` kept it). Renewal must never re-stamp that
+// row: doing so would resurrect the old generation's lease and defeat the
+// ledger fence. An ownerless row with a NULL expiry is a fresh row, not a
+// release, so the first writer may still claim it here.
 const RENEW_LEASE = `
   UPDATE event_sequence SET worker_owner_id = ?, worker_heartbeat_at = ?, worker_expires_at = ?
-  WHERE aggregate_id = ? AND (worker_owner_id IS NULL OR worker_owner_id = ?)
+  WHERE aggregate_id = ?
+    AND (worker_owner_id = ? OR (worker_owner_id IS NULL AND worker_expires_at IS NULL))
+    AND (worker_expires_at IS NULL OR worker_expires_at <> 0)
 `
 
 const FILL_SYNC_OWNER = "UPDATE event_sequence SET owner_id = ? WHERE aggregate_id = ? AND owner_id IS NULL"

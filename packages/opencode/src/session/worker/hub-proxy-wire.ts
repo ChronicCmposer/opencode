@@ -130,20 +130,17 @@ export type HubProxyMethod =
   | "lifecycle.toolFinished"
 
 /** A typed failure returned by a hub authority across the port. */
-export class HubProxyRemoteError extends Error {
-  /**
-   * The remote error's `_tag` when it was a tagged domain error, else
-   * `undefined`. Lets a caller rebuild the original error class.
-   */
-  readonly tag: string | undefined
-  /** The remote error's own serialisable fields (e.g. `feedback`, `ruleset`). */
-  readonly data: unknown
-
+export class HubProxyRemoteError extends Schema.TaggedErrorClass<HubProxyRemoteError>("HubProxyRemoteError")(
+  "HubProxy.Remote",
+  {
+    message: Schema.String,
+    tag: Schema.optional(Schema.String),
+    data: Schema.optional(Schema.Unknown),
+  },
+) {
   constructor(message: string, options: { tag?: string; data?: unknown } = {}) {
-    super(message)
+    super({ message, tag: options.tag, data: options.data })
     this.name = "HubProxyRemoteError"
-    this.tag = options.tag
-    this.data = options.data
   }
 }
 

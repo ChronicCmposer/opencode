@@ -18,7 +18,7 @@
 // non-durable delta is DROPPED and a resync is surfaced, so a slow hub never
 // blocks the worker. Durable events are never dropped.
 
-import { Cause, Effect, Queue, Stream } from "effect"
+import { Cause, Effect, Queue, Schema, Stream } from "effect"
 
 import {
   type AggregatePosition,
@@ -38,14 +38,24 @@ type EventFrame = Extract<EventsFrame, { readonly kind: "event" }>
  * seq, or a gap in that aggregate's sequence. Named so callers can distinguish
  * it from a framing error and decide to fail loud or resync.
  */
-export class DurableOrderError extends Error {
+export class DurableOrderError extends Schema.TaggedErrorClass<DurableOrderError>("DurableOrderError")(
+  "Egress.DurableOrder",
+  {
+    reason: Schema.Literals(["out-of-order", "gap"]),
+    got: Schema.Struct({ aggregateID: Schema.String, seq: Schema.Number }),
+    last: Schema.Struct({ aggregateID: Schema.String, seq: Schema.Number }),
+  },
+) {
   constructor(
-    readonly reason: "out-of-order" | "gap",
-    got: AggregatePosition,
-    last: AggregatePosition,
+    override readonly reason: "out-of-order" | "gap",
+    override readonly got: AggregatePosition,
+    override readonly last: AggregatePosition,
   ) {
-    super(`${reason} durable egress: got ${got.aggregateID}#${got.seq}, last ${last.aggregateID}#${last.seq}`)
+    super({ reason, got, last })
     this.name = "DurableOrderError"
+  }
+  override get message() {
+    return `${this.reason} durable egress: got ${this.got.aggregateID}#${this.got.seq}, last ${this.last.aggregateID}#${this.last.seq}`
   }
 }
 

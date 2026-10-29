@@ -1,5 +1,5 @@
 // Hub-proxy handler/authority map and per-worker bound authority helpers.
-import { Context, Deferred, Effect, Option } from "effect"
+import { Context, Deferred, Effect, Option, Schema } from "effect"
 import { WorkerRuntime } from "./runtime-edge"
 import { z } from "zod"
 import path from "node:path"
@@ -362,11 +362,18 @@ export function pluginTriggerAuthority(options: {
  * currently exposes — a stale descriptor, or a plugin reloaded mid-generation.
  * Fail loud: an empty success would silently hide the config/version skew.
  */
-export class UnknownPluginToolError extends Error {
-  readonly _tag = "UnknownPluginToolError"
-  constructor(readonly toolID: string) {
-    super(`unknown plugin tool "${toolID}": no loaded plugin exposes that tool id`)
+export class UnknownPluginToolError extends Schema.TaggedErrorClass<UnknownPluginToolError>(
+  "UnknownPluginToolError",
+)("HubProxyAuthorities.UnknownPluginTool", {
+  toolID: Schema.String,
+}) {
+  constructor(override readonly toolID: string) {
+    super({ toolID })
     this.name = "UnknownPluginToolError"
+  }
+
+  override get message() {
+    return `unknown plugin tool "${this.toolID}": no loaded plugin exposes that tool id`
   }
 }
 
@@ -375,14 +382,21 @@ export class UnknownPluginToolError extends Error {
  * decoder. The worker ships args verbatim (`Schema.Unknown`), so the hub validates
  * them at the boundary; a bad arg is a fail-loud caller error, not a tool result.
  */
-export class InvalidPluginToolArgsError extends Error {
-  readonly _tag = "InvalidPluginToolArgsError"
+export class InvalidPluginToolArgsError extends Schema.TaggedErrorClass<InvalidPluginToolArgsError>(
+  "InvalidPluginToolArgsError",
+)("PluginTool.InvalidArgs", {
+  toolID: Schema.String,
+  detail: Schema.String,
+}) {
   constructor(
-    readonly toolID: string,
-    readonly detail: string,
+    override readonly toolID: string,
+    override readonly detail: string,
   ) {
-    super(`invalid args for plugin tool "${toolID}": ${detail}`)
+    super({ toolID, detail })
     this.name = "InvalidPluginToolArgsError"
+  }
+  override get message() {
+    return `invalid args for plugin tool "${this.toolID}": ${this.detail}`
   }
 }
 
@@ -683,7 +697,9 @@ function pluginToolExecute(
       : findPluginToolDefinition(yield* current.value.list(), input.toolID)
     if (definition === undefined) {
       return yield* executeHubTool(input, emit, registerAbort).pipe(
-        Effect.catchTag("UnknownPluginToolError", () => Effect.fail(new UnknownPluginToolError(input.toolID))),
+        Effect.catchTag("HubProxyAuthorities.UnknownPluginTool", () =>
+          Effect.fail(new UnknownPluginToolError(input.toolID)),
+        ),
       )
     }
     validatePluginToolArgs(input.toolID, definition, input.args)

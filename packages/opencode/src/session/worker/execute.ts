@@ -96,10 +96,15 @@ export class SessionBusyError extends Schema.TaggedErrorClass<SessionBusyError>(
  * here (not in `hub.ts`) because `dispatch.ts` imports `execute.ts` while
  * `hub.ts` imports `dispatch.ts`; placing it in `hub.ts` would close a cycle.
  */
-export class SessionWorkerReplyTimeoutError extends Error {
-  constructor(readonly waitMs: number) {
-    super(`timed out waiting for a session worker reply after ${waitMs}ms`)
+export class SessionWorkerReplyTimeoutError extends Schema.TaggedErrorClass<SessionWorkerReplyTimeoutError>(
+  "SessionWorkerReplyTimeoutError",
+)("SessionExecutor.ReplyTimeout", { waitMs: Schema.Number }) {
+  constructor(override readonly waitMs: number) {
+    super({ waitMs })
     this.name = "SessionWorkerReplyTimeoutError"
+  }
+  override get message() {
+    return `timed out waiting for a session worker reply after ${this.waitMs}ms`
   }
 }
 
@@ -109,18 +114,25 @@ export class SessionWorkerReplyTimeoutError extends Error {
  * as both `tag` and `_tag`, so `errorTagOf` and callers that branch on Effect
  * error tags see the worker's classification instead of a generic failure.
  */
-export class SessionExecutorRequestError extends Error {
-  readonly tag: string | undefined
-  readonly _tag: string
+export class SessionExecutorRequestError extends Schema.TaggedErrorClass<SessionExecutorRequestError>(
+  "SessionExecutorRequestError",
+)("SessionExecutor.Request", {
+  requestID: Schema.Number,
+  tag: Schema.optional(Schema.String),
+  message: Schema.String,
+}) {
   constructor(
-    readonly requestID: number,
-    tag: string | undefined,
+    override readonly requestID: number,
+    override readonly tag: string | undefined,
     message: string,
   ) {
-    super(message)
+    super({ requestID, tag, message })
     this.name = "SessionExecutorRequestError"
-    this.tag = tag
-    this._tag = tag ?? "SessionExecutorRequestError"
+    Object.defineProperty(this, "_tag", {
+      value: tag ?? "SessionExecutorRequestError",
+      enumerable: true,
+      configurable: true,
+    })
   }
 }
 

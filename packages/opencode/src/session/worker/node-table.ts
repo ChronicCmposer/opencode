@@ -11,6 +11,7 @@
 // nodes (e.g. `session-projector`) use an explicit `name`; both are covered.
 
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Schema } from "effect"
 export type Role = "session" | "hub"
 
 /**
@@ -361,16 +362,27 @@ export function validateSessionLayer(
 }
 
 /** Raised when a session layer violates the node table (fail loud). */
-export class SessionLayerViolationError extends Error {
-  readonly report: SessionLayerReport
-  constructor(report: SessionLayerReport) {
-    const parts: string[] = []
-    if (report.excluded.length > 0) parts.push(`excluded nodes present: ${report.excluded.join(", ")}`)
-    if (report.missingClients.length > 0) parts.push(`missing client nodes: ${report.missingClients.join(", ")}`)
-    if (report.unknown.length > 0) parts.push(`unclassified nodes present: ${report.unknown.join(", ")}`)
-    super(`session layer violates the node table (${parts.join("; ")})`)
+export class SessionLayerViolationError extends Schema.TaggedErrorClass<SessionLayerViolationError>(
+  "SessionLayerViolationError",
+)("WorkerLayer.NodeViolation", {
+  report: Schema.Struct({
+    excluded: Schema.Array(Schema.String),
+    missingClients: Schema.Array(Schema.String),
+    unknown: Schema.Array(Schema.String),
+    ok: Schema.Boolean,
+  }),
+}) {
+  constructor(override readonly report: SessionLayerReport) {
+    super({ report })
     this.name = "SessionLayerViolationError"
-    this.report = report
+  }
+  override get message() {
+    const parts: string[] = []
+    if (this.report.excluded.length > 0) parts.push(`excluded nodes present: ${this.report.excluded.join(", ")}`)
+    if (this.report.missingClients.length > 0)
+      parts.push(`missing client nodes: ${this.report.missingClients.join(", ")}`)
+    if (this.report.unknown.length > 0) parts.push(`unclassified nodes present: ${this.report.unknown.join(", ")}`)
+    return `session layer violates the node table (${parts.join("; ")})`
   }
 }
 

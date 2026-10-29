@@ -26,7 +26,7 @@
 import { randomUUID } from "node:crypto"
 import path from "node:path"
 import { threadId, workerData } from "node:worker_threads"
-import { Cause, Context, Effect, Exit, Fiber, Layer, Option, Scope } from "effect"
+import { Cause, Context, Effect, Exit, Fiber, Layer, Option, Schema, Scope } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { isRole, setProcessRole } from "@/effect/process-role"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -469,10 +469,16 @@ export interface WorkerClientPorts {
 }
 
 /** Raised when a required worker client port was not supplied. */
-export class MissingWorkerPortError extends Error {
-  constructor(readonly field: string) {
-    super(`session worker is missing the "${field}" MessagePort`)
+export class MissingWorkerPortError extends Schema.TaggedErrorClass<MissingWorkerPortError>("MissingWorkerPortError")(
+  "WorkerSession.MissingPort",
+  { field: Schema.String },
+) {
+  constructor(override readonly field: string) {
+    super({ field })
     this.name = "MissingWorkerPortError"
+  }
+  override get message() {
+    return `session worker is missing the "${this.field}" MessagePort`
   }
 }
 

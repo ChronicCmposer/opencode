@@ -194,11 +194,17 @@ export function resolveBuildHash(options: ResolveBuildHashOptions = {}): Resolve
 }
 
 /** Raised when a packaged/production run has no compiled-in build hash. */
-export class MissingBuildHashError extends Error {
+export class MissingBuildHashError extends Schema.TaggedErrorClass<MissingBuildHashError>("MissingBuildHashError")(
+  "WorkerBuildHash.Missing",
+  {},
+) {
   readonly tag = "BUILD_HASH_MISSING"
   constructor() {
-    super("session worker build hash is missing: a packaged build must define OPENCODE_BUILD_HASH")
+    super({})
     this.name = "MissingBuildHashError"
+  }
+  override get message() {
+    return "session worker build hash is missing: a packaged build must define OPENCODE_BUILD_HASH"
   }
 }
 

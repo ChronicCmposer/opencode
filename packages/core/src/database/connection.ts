@@ -11,6 +11,7 @@
 // the retained `session/writer/connection.ts` helper.
 
 import { randomUUID } from "node:crypto"
+import { Schema } from "effect"
 import { Database, type SQLQueryBindings } from "bun:sqlite"
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue, type StatementSync } from "node:sqlite"
 import { isBusySqlError } from "./busy"
@@ -111,11 +112,21 @@ export interface Connection {
   close(): void
 }
 
-export class ConnectionClosedError extends Error {
+export class ConnectionClosedError extends Schema.TaggedErrorClass<ConnectionClosedError>("ConnectionClosedError")(
+  "Database.ConnectionClosed",
+  {
+    filename: Schema.String,
+  },
+) {
   readonly tag = "DB_CORE_CONNECTION_CLOSED"
-  constructor(filename: string) {
-    super(`database connection is closed: ${filename}`)
+
+  constructor(override readonly filename: string) {
+    super({ filename })
     this.name = "ConnectionClosedError"
+  }
+
+  override get message() {
+    return `database connection is closed: ${this.filename}`
   }
 }
 

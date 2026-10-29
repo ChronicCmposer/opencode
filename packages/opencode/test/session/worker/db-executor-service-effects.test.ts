@@ -112,22 +112,33 @@ describe("db executor service", () => {
 
   it.live("interruption reaches the executor instead of waiting for a response", () =>
     Effect.gen(function* () {
-      const executor = yield* make({
-        filename: ":memory:",
-        timeoutMs: 0,
-        entry: HANGING_WORKER,
-      })
-      // The fixture never answers SLOW; only the request callback's interruption
-      // cleanup can let this fiber finish.
-      const fiber = yield* executor.query("SLOW").pipe(Effect.forkScoped({ startImmediately: true }))
-      yield* Effect.sleep("20 millis")
+      const scratch = scratchDirectory()
+      // The hanging fixture treats an absolute `filename` as a readiness marker;
+      // the marker is published once `SLOW` is actually in flight.
+      const received = path.join(scratch.directory, "slow-received")
+      try {
+        const executor = yield* make({
+          filename: received,
+          timeoutMs: 0,
+          entry: HANGING_WORKER,
+        })
+        // The fixture never answers SLOW; only the request callback's
+        // interruption cleanup can let this fiber finish.
+        const fiber = yield* executor.query("SLOW").pipe(Effect.forkScoped({ startImmediately: true }))
+        yield* pollWithTimeout(
+          Effect.sync(() => (fs.existsSync(received) ? true : undefined)),
+          "the hanging worker never received the SLOW request",
+        )
 
-      // `Fiber.interrupt` only returns once the request callback's interruption
-      // cleanup has run; a Promise-only handshake would leave this suspended.
-      yield* Fiber.interrupt(fiber)
+        // `Fiber.interrupt` only returns once the request callback's interruption
+        // cleanup has run; a Promise-only handshake would leave this suspended.
+        yield* Fiber.interrupt(fiber)
 
-      // Teardown still completes its orderly close handshake.
-      yield* executor.close()
+        // Teardown still completes its orderly close handshake.
+        yield* executor.close()
+      } finally {
+        yield* scratch.cleanup
+      }
     }),
   )
 

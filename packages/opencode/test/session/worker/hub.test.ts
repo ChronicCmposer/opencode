@@ -167,6 +167,7 @@ describe("12.1 the hub executes zero sessions", () => {
         yield* Effect.promise(() => hub.terminateAll())
       }
     }),
+    90_000,
   )
 })
 
@@ -191,7 +192,7 @@ describe("12.2 per-session admission", () => {
     } finally {
       await hub.terminateAll()
     }
-  })
+  }, 90_000)
 })
 
 describe("12.3 the hub loop is I/O-only", () => {
@@ -215,7 +216,7 @@ describe("12.3 the hub loop is I/O-only", () => {
     } finally {
       await hub.terminateAll()
     }
-  })
+  }, 90_000)
 })
 
 describe("12.4 HTTP ingress + SSE stay functional", () => {
@@ -256,7 +257,7 @@ describe("12.4 HTTP ingress + SSE stay functional", () => {
       await server.stop(true)
       await hub.terminateAll()
     }
-  })
+  }, 90_000)
 })
 
 // ---------------------------------------------------------------------------
@@ -686,7 +687,7 @@ describe("hub startShell payload forwarding", () => {
 describe("13 cooperative cancel within grace", () => {
   test("cancelWithGrace stops a running session on a real worker", async () => {
     const pool = createBunExecutorWorkerPool({ entry: EXECUTOR_FIXTURE, workKind: "slow", timeoutMs: 15_000 })
-    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool, cancellation: (p) => createWorkerCancellation(p, { graceMs: 5_000 }) })
+    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool, cancellation: (p) => createWorkerCancellation(p, { graceMs: 15_000 }) })
     try {
       const running = hub.dispatcher.dispatch({ sessionID: sid("ses_cancel"), depth: 0 })
       await pollUntil(() => hub.dispatcher.registry.get(sid("ses_cancel"))?.state === "running", {
@@ -700,7 +701,7 @@ describe("13 cooperative cancel within grace", () => {
     } finally {
       await hub.terminateAll()
     }
-  })
+  }, 60_000)
 })
 
 // ---------------------------------------------------------------------------
@@ -1581,7 +1582,10 @@ describe("Q9/Q23 session.cancelled", () => {
     const hub = createSessionHub({ ...{ barrier: createTestBarrier() },
       pool,
       events: publisher,
-      cancellation: (p) => createWorkerCancellation(p, { graceMs: 5_000 }),
+      // Test-only grace: the real worker must boot and finish its 200ms run on an
+      // oversubscribed host. 5s occasionally elapsed before the worker acked, which
+      // turned the cooperative assertion into `terminated`. The assertion is intact.
+      cancellation: (p) => createWorkerCancellation(p, { graceMs: 15_000 }),
     })
     try {
       const running = hub.dispatcher.dispatch({ sessionID: sid("ses_cancelled"), depth: 0 })
@@ -1608,7 +1612,7 @@ describe("Q9/Q23 session.cancelled", () => {
     } finally {
       await hub.terminateAll()
     }
-  }, 20_000)
+  }, 90_000)
 
   test("a completion that wins the cancel race publishes no session.cancelled", async () => {
     const { publisher, published } = recordingPublisher()

@@ -16,6 +16,8 @@
 // `retryAt` arithmetic: no timer is scheduled, so there is one authority for
 // when the window ends and no timer can outlive the state.
 
+import { Schema } from "effect"
+
 import type { DispatchOrigin } from "@/session/origin"
 
 export const CRASH_BACKOFF_INITIAL_MS = 1_000
@@ -63,10 +65,16 @@ export interface Supervision {
 }
 
 /** Raised by the hub-facing gate when a background/auto dispatch targets a dead session. */
-export class SessionWorkerDeadError extends Error {
-  constructor(readonly sessionID: string) {
-    super(`session ${sessionID} is dead after repeated worker crashes; retry requires a user-initiated dispatch`)
+export class SessionWorkerDeadError extends Schema.TaggedErrorClass<SessionWorkerDeadError>("SessionWorkerDeadError")(
+  "SessionSupervision.WorkerDead",
+  { sessionID: Schema.String },
+) {
+  constructor(override readonly sessionID: string) {
+    super({ sessionID })
     this.name = "SessionWorkerDeadError"
+  }
+  override get message() {
+    return `session ${this.sessionID} is dead after repeated worker crashes; retry requires a user-initiated dispatch`
   }
 }
 

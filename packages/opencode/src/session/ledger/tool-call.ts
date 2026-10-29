@@ -132,10 +132,13 @@ export interface ToolCallFence {
   readonly ownerID: string
 }
 
-export class ToolCallLedgerError extends Error {
+export class ToolCallLedgerError extends Schema.TaggedErrorClass<ToolCallLedgerError>("ToolCallLedgerError")(
+  "ToolCallLedger.Error",
+  { message: Schema.String },
+) {
   readonly tag = "TOOL_CALL_LEDGER"
   constructor(message: string) {
-    super(message)
+    super({ message })
     this.name = "ToolCallLedgerError"
   }
 }
@@ -143,6 +146,7 @@ export class ToolCallLedgerError extends Error {
 export class ToolCallAlreadyStartedError extends ToolCallLedgerError {
   constructor(callID: string, sessionID: string) {
     super(`tool call ${callID} is already recorded for session ${sessionID}`)
+    Object.defineProperty(this, "_tag", { value: "ToolCallLedger.AlreadyStarted", enumerable: true, configurable: true })
     this.name = "ToolCallAlreadyStartedError"
   }
 }
@@ -150,6 +154,7 @@ export class ToolCallAlreadyStartedError extends ToolCallLedgerError {
 export class ToolCallNotStartedError extends ToolCallLedgerError {
   constructor(callID: string, sessionID: string) {
     super(`tool call ${callID} was never started for session ${sessionID}`)
+    Object.defineProperty(this, "_tag", { value: "ToolCallLedger.NotStarted", enumerable: true, configurable: true })
     this.name = "ToolCallNotStartedError"
   }
 }
@@ -162,6 +167,7 @@ export class ToolCallNotStartedError extends ToolCallLedgerError {
 export class StaleWorkerGenerationError extends ToolCallLedgerError {
   constructor(sessionID: string, expected: string, actual: string | undefined) {
     super(`worker generation ${expected} is stale for session ${sessionID}: current lease owner is ${actual ?? "none"}`)
+    Object.defineProperty(this, "_tag", { value: "ToolCallLedger.StaleGeneration", enumerable: true, configurable: true })
     this.name = "StaleWorkerGenerationError"
   }
 }

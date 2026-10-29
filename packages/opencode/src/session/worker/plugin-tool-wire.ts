@@ -12,6 +12,7 @@
 // the hub (`hub.ts`) import it, so it must not reach back into either.
 
 import type { JSONSchema7 } from "@ai-sdk/provider"
+import { Schema } from "effect"
 
 /** The clone-safe projection of one plugin tool, shipped to the worker init. */
 export interface PluginToolDescriptor {
@@ -108,14 +109,21 @@ export interface RemotePluginToolDefinition {
  * one. Hub-side code throws this; it surfaces to the worker as a tagged
  * `HubProxyRemoteError`.
  */
-export class PluginToolNotSerializableError extends Error {
-  readonly _tag = "PluginToolNotSerializableError"
+export class PluginToolNotSerializableError extends Schema.TaggedErrorClass<PluginToolNotSerializableError>(
+  "PluginToolNotSerializableError",
+)("PluginTool.NotSerializable", {
+  toolID: Schema.String,
+  detail: Schema.String,
+}) {
   constructor(
-    readonly toolID: string,
-    readonly detail: string,
+    override readonly toolID: string,
+    override readonly detail: string,
   ) {
-    super(`plugin tool "${toolID}" returned a non-serializable ${detail}`)
+    super({ toolID, detail })
     this.name = "PluginToolNotSerializableError"
+  }
+  override get message() {
+    return `plugin tool "${this.toolID}" returned a non-serializable ${this.detail}`
   }
 }
 

@@ -13,7 +13,7 @@
 // pool-spawning layer node (`makeSessionHubNode`) provides it and tears the pool
 // down with the layer scope.
 
-import { Context, Effect, Fiber } from "effect"
+import { Context, Effect, Fiber, Schema } from "effect"
 import { WorkerRuntime } from "./runtime-edge"
 import path from "node:path"
 import { InstanceRef } from "../../effect/instance-ref"
@@ -151,18 +151,26 @@ export function workerCrashedFrom(error: unknown): WorkerCrashed | undefined {
  * Lifecycle truth is hub-owned and a worker may only report the session it is
  * bound to; a foreign id is a scope violation, never a silent no-op (D6/D21).
  */
-export class ForeignLifecycleReportError extends Error {
-  readonly _tag = "ForeignLifecycleReportError"
+export class ForeignLifecycleReportError extends Schema.TaggedErrorClass<ForeignLifecycleReportError>(
+  "ForeignLifecycleReportError",
+)("WorkerHub.ForeignLifecycleReport", {
+  workerID: Schema.Number,
+  boundSessionID: Schema.optional(Schema.String),
+  reportedSessionID: Schema.String,
+}) {
   constructor(
-    readonly workerID: number,
-    readonly boundSessionID: SessionID | undefined,
-    readonly reportedSessionID: string,
+    override readonly workerID: number,
+    override readonly boundSessionID: SessionID | undefined,
+    override readonly reportedSessionID: string,
   ) {
-    super(
-      `worker ${workerID} is bound to ${boundSessionID ?? "no session"}; ` +
-        `refusing a lifecycle report for ${reportedSessionID}`,
-    )
+    super({ workerID, boundSessionID, reportedSessionID })
     this.name = "ForeignLifecycleReportError"
+  }
+  override get message() {
+    return (
+      `worker ${this.workerID} is bound to ${this.boundSessionID ?? "no session"}; ` +
+      `refusing a lifecycle report for ${this.reportedSessionID}`
+    )
   }
 }
 

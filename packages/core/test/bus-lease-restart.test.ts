@@ -114,6 +114,35 @@ describe("DurableLog lease after a hub restart", () => {
     expect(lease(database, "s1")?.worker_owner_id).toBe(successorOwner)
   })
 
+  test("a released lease is never re-stamped by a renewal", () => {
+    const database = open()
+    const ownerID = owner(1, process.pid)
+    const log = bus(database, ownerID)
+    log.claim("s1")
+
+    log.release("s1")
+    expect(lease(database, "s1")).toMatchObject({ worker_owner_id: null, worker_expires_at: 0 })
+
+    // A heartbeat after release must fail rather than adopt the unowned row and
+    // write the old owner/expiry back.
+    expect(() => log.heartbeat("s1")).toThrow(DurableLog.StaleOwnerError)
+    expect(lease(database, "s1")).toMatchObject({ worker_owner_id: null, worker_expires_at: 0 })
+  })
+
+  test("a startup-released dead lease is not revived by its old owner", () => {
+    const database = open()
+    const deadOwner = owner(1, DEAD_PID)
+    const restarted = bus(database, deadOwner)
+    restarted.claim("s1")
+    expect(restarted.releaseDeadLeases()).toBe(1)
+    expect(lease(database, "s1")).toMatchObject({ worker_owner_id: deadOwner, worker_expires_at: 0 })
+
+    // The sweep keeps the owner but zeroes the expiry; a still-running old
+    // generation could match the owner, so the expiry fence must refuse it.
+    expect(() => restarted.heartbeat("s1")).toThrow(DurableLog.StaleOwnerError)
+    expect(lease(database, "s1")).toMatchObject({ worker_owner_id: deadOwner, worker_expires_at: 0 })
+  })
+
   test("startup clears only dead-generation leases and keeps live fencing", () => {
     const database = open()
     const deadOwner = owner(1, DEAD_PID)

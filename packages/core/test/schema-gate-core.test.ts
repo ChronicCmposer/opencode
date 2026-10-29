@@ -10,6 +10,7 @@ import { Database } from "../src/database/database"
 import { openConnection, type Connection } from "../src/database/connection"
 import {
   SchemaGateLostError,
+  SchemaGateTimeoutError,
   acquireSchemaGate,
   newGateToken,
   openSchemaGate,
@@ -204,12 +205,33 @@ describe("core database schema gate", () => {
 
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) {
-        expect(Cause.squash(exit.cause)).toBeInstanceOf(SchemaGateLostError)
+        const lost = Cause.squash(exit.cause)
+        expect(lost).toBeInstanceOf(SchemaGateLostError)
+        expect((lost as SchemaGateLostError)._tag).toBe("WorkerDb.SchemaGateLost")
+        expect((lost as SchemaGateLostError).tag).toBe("WorkerDb.SchemaGateLost")
       }
     } finally {
       thief.close()
     }
   }, 10_000)
+
+  test("gate errors are tagged and keep their legacy tags and messages", () => {
+    const timeout = new SchemaGateTimeoutError()
+    expect(timeout._tag).toBe("WorkerDb.SchemaGateTimeout")
+    expect(timeout.tag).toBe("WorkerDb.SchemaGateTimeout")
+    expect(timeout.name).toBe("SchemaGateTimeoutError")
+    expect(timeout.message).toBe("timed out waiting for the cross-process schema gate")
+    expect(timeout).toBeInstanceOf(Error)
+
+    const cause = new Error("renew failed")
+    const lost = new SchemaGateLostError({ cause })
+    expect(lost._tag).toBe("WorkerDb.SchemaGateLost")
+    expect(lost.tag).toBe("WorkerDb.SchemaGateLost")
+    expect(lost.name).toBe("SchemaGateLostError")
+    expect(lost.message).toBe("the cross-process schema gate lease was lost before completion")
+    expect(lost.cause).toBe(cause)
+    expect(lost).toBeInstanceOf(Error)
+  })
 
   test("a successful migration releases the lease", async () => {
     await using tmp = await tmpdir()

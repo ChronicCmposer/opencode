@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import { Schema } from "effect"
 import { LEDGER_SQL, type LedgerConnection } from "./tool-call"
 
 export const WORKER_CRASH_PHASES = ["boot", "materialize", "stream", "tool", "commit"] as const
@@ -26,10 +27,12 @@ export interface RecordCrashInput extends Omit<WorkerCrashed, "retryable"> {
   readonly timeCreated?: number
 }
 
-export class WorkerCrashRecordError extends Error {
+export class WorkerCrashRecordError extends Schema.TaggedErrorClass<WorkerCrashRecordError>(
+  "WorkerCrashRecordError",
+)("WorkerCrash.Record", { message: Schema.String }) {
   readonly tag = "WORKER_CRASH_RECORD"
   constructor(message: string) {
-    super(message)
+    super({ message })
     this.name = "WorkerCrashRecordError"
   }
 }

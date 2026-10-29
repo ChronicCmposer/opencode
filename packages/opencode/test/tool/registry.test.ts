@@ -224,7 +224,9 @@ let healDescriptors: readonly PluginToolDescriptor[] = [staleDescriptor]
 const refreshCalls: string[] = []
 const staleExecutor: PluginToolExecutor = {
   execute: async () => {
-    throw new HubProxyRemoteError('unknown plugin tool "stale_plugin_tool"', { tag: "UnknownPluginToolError" })
+    throw new HubProxyRemoteError('unknown plugin tool "stale_plugin_tool"', {
+      tag: "HubProxyAuthorities.UnknownPluginTool",
+    })
   },
 }
 const healPluginLayer = Layer.succeed(

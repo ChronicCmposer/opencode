@@ -448,7 +448,7 @@ function isUnknownPluginToolError(error: unknown): boolean {
   return (
     typeof error === "object" &&
     error !== null &&
-    (error as { readonly tag?: unknown }).tag === "UnknownPluginToolError"
+    (error as { readonly tag?: unknown }).tag === "HubProxyAuthorities.UnknownPluginTool"
   )
 }
 

@@ -863,13 +863,21 @@ export const SessionPipelineNode = LayerNode.make({
 // ---------------------------------------------------------------------------
 
 /** Raised when worker code reaches a boundary owned by the hub / writer. */
-export class SessionLayerBoundaryError extends Error {
+export class SessionLayerBoundaryError extends Schema.TaggedErrorClass<SessionLayerBoundaryError>(
+  "SessionLayerBoundaryError",
+)("WorkerLayer.Boundary", {
+  boundary: Schema.String,
+  member: Schema.String,
+}) {
   constructor(
-    readonly boundary: string,
-    readonly member: string,
+    override readonly boundary: string,
+    override readonly member: string,
   ) {
-    super(`session worker boundary "${boundary}" cannot use "${member}": ${boundary} is hub/writer-owned`)
+    super({ boundary, member })
     this.name = "SessionLayerBoundaryError"
+  }
+  override get message() {
+    return `session worker boundary "${this.boundary}" cannot use "${this.member}": ${this.boundary} is hub/writer-owned`
   }
 }
 
@@ -1907,17 +1915,23 @@ export interface RemotePluginTools {
  * are bare plugin keys (`registry.ts:199`), so a collision would otherwise
  * silently shadow a tool; fail loud instead.
  */
-export class PluginToolIDCollisionError extends Error {
+export class PluginToolIDCollisionError extends Schema.TaggedErrorClass<PluginToolIDCollisionError>(
+  "PluginToolIDCollisionError",
+)("PluginTool.IDCollision", {
+  id: Schema.String,
+  kind: Schema.Literals(["duplicate", "reserved"]),
+}) {
   constructor(
-    readonly id: string,
-    readonly kind: "duplicate" | "reserved",
+    override readonly id: string,
+    override readonly kind: "duplicate" | "reserved",
   ) {
-    super(
-      kind === "duplicate"
-        ? `plugin tool id "${id}" is declared by more than one remote descriptor`
-        : `plugin tool id "${id}" collides with a locally registered tool`,
-    )
+    super({ id, kind })
     this.name = "PluginToolIDCollisionError"
+  }
+  override get message() {
+    return this.kind === "duplicate"
+      ? `plugin tool id "${this.id}" is declared by more than one remote descriptor`
+      : `plugin tool id "${this.id}" collides with a locally registered tool`
   }
 }
 

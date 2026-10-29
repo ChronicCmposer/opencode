@@ -4,6 +4,8 @@
 // schema (`script/migration-statements.ts`). Runtime classification is derived
 // from SQLite itself so the generated allowlist can be checked for drift.
 
+import { Schema } from "effect"
+
 import { SCHEMA_TABLES, WORKER_WRITABLE_TABLES } from "./allowlist.gen"
 import { deriveSessionScopedTables, listSchemaTables, type SqliteQuery } from "./derive"
 
@@ -34,22 +36,27 @@ export interface Drift {
   readonly unexpected: readonly string[]
 }
 
-export class TableAllowlistDriftError extends Error {
+export class TableAllowlistDriftError extends Schema.TaggedErrorClass<TableAllowlistDriftError>(
+  "TableAllowlistDriftError",
+)("WorkerDb.TableAllowlistDrift", {
+  sessionScoped: Schema.Struct({ missing: Schema.Array(Schema.String), unexpected: Schema.Array(Schema.String) }),
+  tables: Schema.Struct({ missing: Schema.Array(Schema.String), unexpected: Schema.Array(Schema.String) }),
+}) {
   readonly tag = "WorkerDb.TableAllowlistDrift"
-  readonly sessionScoped: Drift
-  readonly tables: Drift
 
   constructor(input: { readonly sessionScoped: Drift; readonly tables: Drift }) {
-    super(
-      `session_id tables changed without regenerating the allowlist ` +
-        `(missing: [${input.sessionScoped.missing.join(", ")}], ` +
-        `unexpected: [${input.sessionScoped.unexpected.join(", ")}]; ` +
-        `schema tables missing: [${input.tables.missing.join(", ")}], ` +
-        `unexpected: [${input.tables.unexpected.join(", ")}])`,
-    )
+    super(input)
     this.name = "TableAllowlistDriftError"
-    this.sessionScoped = input.sessionScoped
-    this.tables = input.tables
+  }
+
+  override get message() {
+    return (
+      `session_id tables changed without regenerating the allowlist ` +
+      `(missing: [${this.sessionScoped.missing.join(", ")}], ` +
+      `unexpected: [${this.sessionScoped.unexpected.join(", ")}]; ` +
+      `schema tables missing: [${this.tables.missing.join(", ")}], ` +
+      `unexpected: [${this.tables.unexpected.join(", ")}])`
+    )
   }
 }
 

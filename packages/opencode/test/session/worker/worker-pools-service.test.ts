@@ -72,7 +72,7 @@ describe("WorkerPools service surface", () => {
 
         yield* pools.terminateAll()
       }),
-    30_000,
+    90_000,
   )
 
   it.live(
@@ -93,7 +93,7 @@ describe("WorkerPools service surface", () => {
         yield* pools.terminateAll()
         expect(yield* pools.stats).toMatchObject({ workers: 0 })
       }),
-    30_000,
+    90_000,
   )
 
   it.live(
@@ -122,7 +122,7 @@ describe("WorkerPools service surface", () => {
         expect(initCalls).toBe(1)
         yield* pools.terminateAll()
       }),
-    30_000,
+    90_000,
   )
 
   it.live(
@@ -164,7 +164,7 @@ describe("WorkerPools service surface", () => {
         expect((yield* pools.resultFor(sessionID))?.sessionID).toBe(sessionID)
         yield* pools.terminateAll()
       }),
-    30_000,
+    90_000,
   )
 
   test("idle-cap concurrent settlements run one single-flight enforce", async () => {

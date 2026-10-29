@@ -12,6 +12,8 @@
 // maps forever. It is deliberately synchronous so the dispatcher's crash path
 // (which must never block on the DB thread) can read it directly.
 
+import { Schema } from "effect"
+
 import type { WorkerCrashed, WorkerCrashPhase } from "./crash"
 import type { IndeterminateCall } from "./resume"
 
@@ -290,17 +292,26 @@ export function reporting(): LifecycleReporting | undefined {
   return installed
 }
 
-/** Every lifecycle RPC is bounded; a wedged control port must not hang a run. */
+/**
+ * Bound for the lifecycle reports that may be dropped on teardown
+ * (`toolStarted`, `toolFinished`, `phase`). `commit` deliberately awaits its
+ * acknowledgement without this deadline so a crash cannot read a stale tracker.
+ */
 export const LIFECYCLE_RPC_TIMEOUT_MS = 5_000
 
-export class LifecycleRpcTimeoutError extends Error {
+export class LifecycleRpcTimeoutError extends Schema.TaggedErrorClass<LifecycleRpcTimeoutError>(
+  "LifecycleRpcTimeoutError",
+)("Lifecycle.RpcTimeout", { method: Schema.String, timeoutMs: Schema.Number }) {
   readonly tag = "LIFECYCLE_RPC_TIMEOUT"
   constructor(
-    readonly method: string,
-    readonly timeoutMs: number,
+    override readonly method: string,
+    override readonly timeoutMs: number,
   ) {
-    super(`lifecycle RPC ${method} was not acknowledged within ${timeoutMs}ms`)
+    super({ method, timeoutMs })
     this.name = "LifecycleRpcTimeoutError"
+  }
+  override get message() {
+    return `lifecycle RPC ${this.method} was not acknowledged within ${this.timeoutMs}ms`
   }
 }
 
@@ -338,10 +349,11 @@ function withDeadline<T>(
 /**
  * Build the hub-proxy backed reporting seam. `toolStarted` is the one
  * authority-bearing report: it must reject when the hub has not observed the
- * call, so the tool path can fail closed before its side effect. The other
- * reports are best effort: the durable ledger/message row remains the
- * authoritative truth, and a torn-down port during cancel must not turn a tool
- * into a failure.
+ * call, so the tool path can fail closed before its side effect. `commit` is
+ * ordering-bearing too, but its failure is swallowed: the durable message row
+ * remains the truth, while a crash immediately after `await commit()` must
+ * still see the hub tracker updated. The remaining reports are best effort: a
+ * torn-down port during cancel must not turn a tool into a failure.
  */
 export function createProxyReporting(
   call: (method: string, args: readonly unknown[]) => Promise<unknown>,
@@ -356,13 +368,18 @@ export function createProxyReporting(
       () => undefined,
     )
   return {
-    // The commit outcome rides the run's `done` reply (from the worker-local
-    // record); this RPC is demoted to a crash-ledger hint and never gates the
-    // barrier with a 5 s best-effort deadline.
-    commit: (sessionID, messageID) => {
+    // Record the commit locally first, then await the hub's acknowledgement.
+    // The run `done` reply carries the local record for the successful path
+    // (F11); awaiting the RPC is what keeps `crashState()` current when a crash
+    // wins the race. No deadline is applied here: a 5 s cutoff would let the
+    // crash read a stale tracker. A torn-down port still resolves the caller.
+    commit: async (sessionID, messageID) => {
       if (typeof messageID === "string" && messageID.length > 0) committedBySession.set(sessionID, messageID)
-      void call("lifecycle.commit", [sessionID, messageID]).catch(() => undefined)
-      return Promise.resolve()
+      try {
+        await call("lifecycle.commit", [sessionID, messageID])
+      } catch {
+        // Best effort on teardown: the durable message row remains the truth.
+      }
     },
     toolStarted: (sessionID, callID, sideEffecting = true) =>
       send("lifecycle.toolStarted", [sessionID, callID, sideEffecting]),

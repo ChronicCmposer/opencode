@@ -71,7 +71,7 @@ describe("pluginToolAuthority argument validation", () => {
     }
 
     expect(caught).toBeInstanceOf(InvalidPluginToolArgsError)
-    expect((caught as InvalidPluginToolArgsError)._tag).toBe("InvalidPluginToolArgsError")
+    expect((caught as InvalidPluginToolArgsError)._tag).toBe("PluginTool.InvalidArgs")
     expect((caught as Error).message).toContain("compress")
     expect(executed).toBe(false)
   })

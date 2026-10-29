@@ -18,7 +18,7 @@
 export * as SchemaGate from "./schema-gate"
 
 import { randomUUID } from "node:crypto"
-import { Deferred, Effect, Schedule, type Scope } from "effect"
+import { Deferred, Effect, Schema, Schedule, type Scope } from "effect"
 import { openConnection, sleepSync, type Connection } from "./connection"
 import {
   BusyExhaustedError,
@@ -45,24 +45,36 @@ export const SCHEMA_GATE_TIMEOUT_MS = 2 * 60 * 1000
 /** Busy budget for opening/applying the sidecar's WAL pragmas. */
 export const SCHEMA_GATE_BUSY_TIMEOUT_MS = 5_000
 
-export class SchemaGateTimeoutError extends Error {
+export class SchemaGateTimeoutError extends Schema.TaggedErrorClass<SchemaGateTimeoutError>(
+  "SchemaGateTimeoutError",
+)("WorkerDb.SchemaGateTimeout", {}) {
   readonly tag = "WorkerDb.SchemaGateTimeout"
 
   constructor() {
-    super("timed out waiting for the cross-process schema gate")
+    super({})
     this.name = "SchemaGateTimeoutError"
+  }
+
+  override get message() {
+    return "timed out waiting for the cross-process schema gate"
   }
 }
 
-export class SchemaGateLostError extends Error {
+export class SchemaGateLostError extends Schema.TaggedErrorClass<SchemaGateLostError>("SchemaGateLostError")(
+  "WorkerDb.SchemaGateLost",
+  {
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
   readonly tag = "WorkerDb.SchemaGateLost"
 
   constructor(options: { readonly cause?: unknown } = {}) {
-    super(
-      "the cross-process schema gate lease was lost before completion",
-      options.cause === undefined ? undefined : { cause: options.cause },
-    )
+    super({ cause: options.cause })
     this.name = "SchemaGateLostError"
+  }
+
+  override get message() {
+    return "the cross-process schema gate lease was lost before completion"
   }
 }
 

@@ -197,14 +197,20 @@ function nativeBindings(params: DbParams | undefined): SQLQueryBindings[] {
   return (Array.isArray(params) ? [...params] : [params]) as SQLQueryBindings[]
 }
 
-class RollbackFailure extends Error {
+class RollbackFailure extends Schema.TaggedErrorClass<RollbackFailure>("DbExecutorRollbackError")(
+  "DbExecutor.RollbackFailure",
+  { original: Schema.Unknown, rollback: Schema.Unknown },
+) {
   readonly tag = "DB_EXECUTOR_ROLLBACK_FAILED"
   constructor(
-    readonly original: unknown,
-    readonly rollback: unknown,
+    override readonly original: unknown,
+    override readonly rollback: unknown,
   ) {
-    super(errorMessage(original))
+    super({ original, rollback })
     this.name = "DbExecutorRollbackError"
+  }
+  override get message() {
+    return errorMessage(this.original)
   }
 }
 

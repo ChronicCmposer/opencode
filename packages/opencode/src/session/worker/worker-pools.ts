@@ -14,6 +14,7 @@ import {
   Queue,
   Scope,
   ScopedCache,
+  Schema,
   Semaphore,
 } from "effect"
 import type { SessionID } from "@/session/schema"
@@ -83,21 +84,30 @@ export interface SpawnGateHandle {
 }
 
 /** A spawn could not obtain a boot slot within the configured timeout. */
-export class SpawnGateTimeoutError extends Error {
-  readonly timeoutMs: number
-
-  constructor(timeoutMs: number) {
-    super(`spawn gate: no worker spawn permit became available within ${timeoutMs}ms`)
+export class SpawnGateTimeoutError extends Schema.TaggedErrorClass<SpawnGateTimeoutError>("SpawnGateTimeoutError")(
+  "WorkerPools.SpawnGateTimeout",
+  { timeoutMs: Schema.Number },
+) {
+  constructor(override readonly timeoutMs: number) {
+    super({ timeoutMs })
     this.name = "SpawnGateTimeoutError"
-    this.timeoutMs = timeoutMs
+  }
+  override get message() {
+    return `spawn gate: no worker spawn permit became available within ${this.timeoutMs}ms`
   }
 }
 
 /** A boot slot acquisition was aborted before it was granted. */
-export class SpawnGateAbortedError extends Error {
+export class SpawnGateAbortedError extends Schema.TaggedErrorClass<SpawnGateAbortedError>("SpawnGateAbortedError")(
+  "WorkerPools.SpawnGateAborted",
+  {},
+) {
   constructor() {
-    super("spawn gate: acquisition aborted before a worker spawn permit was granted")
+    super({})
     this.name = "SpawnGateAbortedError"
+  }
+  override get message() {
+    return "spawn gate: acquisition aborted before a worker spawn permit was granted"
   }
 }
 

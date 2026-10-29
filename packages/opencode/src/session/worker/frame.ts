@@ -218,10 +218,13 @@ export function ackFrame(payload?: EventsAckPayload, id?: number): EventsFrame {
 // ---------------------------------------------------------------------------
 
 /** Raised when a frame does not match the protocol; a caller bug, so fail loud. */
-export class ProtocolError extends Error {
+export class ProtocolError extends Schema.TaggedErrorClass<ProtocolError>("ProtocolError")(
+  "WorkerFrame.Protocol",
+  { message: Schema.String },
+) {
   readonly tag = "PROTOCOL"
   constructor(message: string) {
-    super(message)
+    super({ message })
     this.name = "ProtocolError"
   }
 }
@@ -230,19 +233,19 @@ export class ProtocolError extends Error {
 export class UnsupportedFrameVersionError extends ProtocolError {
   constructor(readonly version: unknown) {
     super(`unsupported worker frame version: ${JSON.stringify(version)} (expected ${WORKER_FRAME_VERSION})`)
+    Object.defineProperty(this, "_tag", { value: "WorkerFrame.UnsupportedVersion", enumerable: true, configurable: true })
     this.name = "UnsupportedFrameVersionError"
   }
 }
 
 /** Raised when one JSON message exceeds {@link MAX_WORKER_FRAME_BYTES}. */
 export class FrameTooLargeError extends ProtocolError {
-  readonly _tag = "FrameTooLargeError"
-
   constructor(
     readonly byteLength: number,
     readonly limit: number = MAX_WORKER_FRAME_BYTES,
   ) {
     super(`worker frame is ${byteLength} bytes (limit ${limit}); the frame was rejected, not truncated`)
+    Object.defineProperty(this, "_tag", { value: "WorkerFrame.TooLarge", enumerable: true, configurable: true })
     this.name = "FrameTooLargeError"
   }
 }

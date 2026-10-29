@@ -34,7 +34,10 @@ import {
   transactionControl,
   type SqliteNativeRunner,
 } from "@opencode-ai/core/database/sqlite-adapter"
+import { ConnectionClosedError } from "@opencode-ai/core/database/connection"
 import {
+  BusyExhaustedError,
+  TransactionPoisonedError,
   TransactionRollbackError,
   inImmediateTransaction,
   isPoisoned,
@@ -339,8 +342,55 @@ describe("busy ROLLBACK recovery", () => {
     }
 
     expect(failure).toBeInstanceOf(TransactionRollbackError)
+    expect((failure as TransactionRollbackError)._tag).toBe("Database.TransactionRollback")
     expect(rollbacks).toBe(2)
     expect(isPoisoned(connection)).toBe(true)
+  })
+})
+
+describe("database error idiom", () => {
+  test("busy exhaustion keeps its name, legacy tag, fields, and message", () => {
+    const error = new BusyExhaustedError(4, busyFailure)
+
+    expect(error._tag).toBe("Database.BusyExhausted")
+    expect(error.tag).toBe("SQLITE_BUSY_EXHAUSTED")
+    expect(error.name).toBe("BusyExhaustedError")
+    expect(error.message).toBe("SQLite remained busy after 4 attempt(s)")
+    expect(error.attempts).toBe(4)
+    expect(error.lastCause).toBe(busyFailure)
+    expect(error).toBeInstanceOf(Error)
+  })
+
+  test("rollback and poisoned errors keep their typed identity", () => {
+    const cause = new Error("commit failed")
+    const rollbackCause = new Error("disk gone")
+    const rollback = new TransactionRollbackError(cause, rollbackCause)
+
+    expect(rollback._tag).toBe("Database.TransactionRollback")
+    expect(rollback.tag).toBe("DB_CORE_ROLLBACK_FAILED")
+    expect(rollback.name).toBe("TransactionRollbackError")
+    expect(rollback.message).toBe("transaction rollback failed; connection is poisoned")
+    expect(rollback.cause).toBe(cause)
+    expect(rollback.rollbackCause).toBe(rollbackCause)
+    expect(rollback).toBeInstanceOf(Error)
+
+    const poisoned = new TransactionPoisonedError()
+    expect(poisoned._tag).toBe("Database.TransactionPoisoned")
+    expect(poisoned.tag).toBe("DB_CORE_CONNECTION_POISONED")
+    expect(poisoned.name).toBe("TransactionPoisonedError")
+    expect(poisoned.message).toBe("database connection is poisoned by a failed rollback")
+    expect(poisoned).toBeInstanceOf(Error)
+  })
+
+  test("a closed connection reports the filename with a namespaced tag", () => {
+    const error = new ConnectionClosedError("/tmp/closed.sqlite")
+
+    expect(error._tag).toBe("Database.ConnectionClosed")
+    expect(error.tag).toBe("DB_CORE_CONNECTION_CLOSED")
+    expect(error.name).toBe("ConnectionClosedError")
+    expect(error.message).toBe("database connection is closed: /tmp/closed.sqlite")
+    expect(error.filename).toBe("/tmp/closed.sqlite")
+    expect(error).toBeInstanceOf(Error)
   })
 })
 
