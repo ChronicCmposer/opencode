@@ -515,6 +515,22 @@ export function clearRevertProxyLayer(client: HubProxyClient): Layer.Layer<Sessi
   })
 }
 
+/** Worker-side `Snapshot` that runs every git operation on the hub. */
+export function snapshotProxyLayer(client: HubProxyClient): Layer.Layer<Snapshot.Service> {
+  const call = <A>(method: HubProxyMethod, args: readonly unknown[]) =>
+    hubProxyCall<A>(client, method, args).pipe(Effect.orDie)
+  return Layer.succeed(Snapshot.Service, {
+    init: () => Effect.void,
+    cleanup: () => Effect.void,
+    track: () => call<string | undefined>("snapshot.track", []),
+    patch: (hash) => call<Snapshot.Patch>("snapshot.patch", [hash]),
+    restore: (hash) => call<void>("snapshot.restore", [hash]),
+    revert: (patches) => call<void>("snapshot.revert", [patches]),
+    diff: (hash) => call<string>("snapshot.diff", [hash]),
+    diffFull: (from, to) => call<Snapshot.FileDiff[]>("snapshot.diffFull", [from, to]),
+  })
+}
+
 /** The hub-proxy authorities as REPLACEMENTS, never as appended root nodes: the authority services are already part of the declared graph. */
 export function hubProxyReplacements(clients: HubProxyClients): LayerNode.Replacements {
   return [

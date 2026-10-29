@@ -129,6 +129,8 @@ The run barrier is per Session. It waits for durable commits, projectors, tool s
 
 Route tools at one point: local worker or hub. Delete `broker/*` and the port/client/layer nodes. MCP and LSP run on the hub with the Session working directory and context. Workers never spawn MCP or LSP processes. V1 already runs LSP hub-only outside the worker path; preserve that parity. Do not delete LSP.
 
+Snapshot (git tracking, patch, diff, revert) is a hub authority reached over hub-proxy (`snapshot.*`); the worker holds no git process authority. Every call runs in the session's instance context on the hub, so workers and in-process sessions in one project share the hub Snapshot's per-gitdir locks. `snapshot.diffFull` replies are shed to fit one frame by dropping the largest patch bodies (counts stay).
+
 ### D21 — Permissions, questions, and cancellation
 
 The hub owns permission and question state. Interruption uses interruptible fibers and a per-request cancel frame. Worker disposal performs cleanup. Cooperative cancel returns the last assistant message; hard terminate occurs after a typed grace period. A parent cancel cascades to children only.

@@ -101,6 +101,12 @@ export type HubProxyMethod =
   | "lifecycle.phase"
   | "lifecycle.toolStarted"
   | "lifecycle.toolFinished"
+  | "snapshot.track"
+  | "snapshot.patch"
+  | "snapshot.restore"
+  | "snapshot.revert"
+  | "snapshot.diff"
+  | "snapshot.diffFull"
 
 /** A typed failure returned by a hub authority across the port. */
 export class HubProxyRemoteError extends Schema.TaggedErrorClass<HubProxyRemoteError>("HubProxyRemoteError")(
