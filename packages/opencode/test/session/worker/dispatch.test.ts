@@ -824,6 +824,52 @@ describe("dispatch observability logging", () => {
     await dispatcher.terminateAll()
   })
 
+  test("an idle timer cleared by a new turn cannot retire the live worker", async () => {
+    const pool = createFakeWorkerPool(1)
+    const armed: Array<() => void> = []
+    const dispatcher = createDispatcher({
+      pool,
+      reapMs: 1_000,
+      // The timer is already queued in the host: cancelling it is best-effort,
+      // so the dispatcher itself must make the stale callback harmless.
+      schedule: (_delayMs, run) => {
+        armed.push(run)
+        return () => {}
+      },
+    })
+    const sessionID = sid("ses_stale_reap")
+
+    const first = dispatcher.dispatch({ sessionID })
+    await flush()
+    pool.spawned[0].finish(sessionID)
+    await first
+    await flush()
+    expect(armed).toHaveLength(1)
+
+    // A new turn resets the window. The stale callback below still fires after
+    // the replacement window is armed.
+    const second = dispatcher.dispatch({ sessionID })
+    await flush()
+    pool.spawned[0].finish(sessionID)
+    await second
+    await flush()
+    expect(armed).toHaveLength(2)
+
+    armed[0]!()
+    await flush()
+
+    // The cleared timer was interrupted: it must not retire the worker or
+    // consume the replacement window.
+    expect(pool.spawned[0].alive).toBe(true)
+    expect(dispatcher.registry.entry(sessionID)).toBeDefined()
+
+    armed[1]!()
+    await flush()
+    expect(pool.spawned[0].alive).toBe(false)
+    expect(dispatcher.registry.entry(sessionID)).toBeUndefined()
+    await dispatcher.terminateAll()
+  })
+
   test("a plain session failure logs an ERROR 'worker run failed' line", async () => {
     const pool = createFakeWorkerPool(1)
     const { log, lines } = recordingLogger()
@@ -1447,6 +1493,138 @@ describe("retirement waits for a confirmed exit", () => {
     await cancelling
     await pollUntil(() => released.length === 1, { message: "the release callback never ran" })
     expect(released).toEqual([sid("ses_confirmed_exit")])
+    await dispatcher.terminateAll()
+  })
+
+  test("repeated release barriers join one retirement and observe one release", async () => {
+    let confirmExit!: () => void
+    const exit = new Promise<void>((resolve) => {
+      confirmExit = resolve
+    })
+    let confirmRelease!: () => void
+    const releaseGate = new Promise<void>((resolve) => {
+      confirmRelease = resolve
+    })
+    let releaseCalls = 0
+    const worker = new FakeSessionWorker(1)
+    worker.terminate = async () => {
+      await exit
+      worker.alive = false
+    }
+    const pool: WorkerPool = {
+      spawn: () => worker,
+      releaseSession: () => {
+        releaseCalls += 1
+      },
+      terminateAll: async () => {},
+    }
+    const dispatcher = createDispatcher({ pool, onSessionReleased: () => releaseGate })
+    const sessionID = sid("ses_joined_release")
+
+    const run = dispatcher.dispatch({ sessionID })
+    await flush()
+    worker.finish(sessionID)
+    await run
+    await flush()
+
+    const retiring = dispatcher.retire(sessionID)
+    const joining = dispatcher.awaitRelease(sessionID)
+    let settled = 0
+    void retiring.then(() => {
+      settled += 1
+    })
+    void joining.then(() => {
+      settled += 1
+    })
+    await flush()
+    expect(releaseCalls).toBe(0)
+    expect(settled).toBe(0)
+
+    confirmExit()
+    await pollUntil(() => releaseCalls === 1, { message: "releaseSession never ran after the exit" })
+    await flush()
+    // The isolate exited, but the async release callback is still pending.
+    expect(settled).toBe(0)
+
+    confirmRelease()
+    await Promise.all([retiring, joining])
+    expect(settled).toBe(2)
+    expect(releaseCalls).toBe(1)
+    await dispatcher.terminateAll()
+  })
+
+  test("a cancel/crash race retires once and releases once", async () => {
+    const worker = new FakeSessionWorker(1)
+    let releaseCalls = 0
+    const pool: WorkerPool = {
+      spawn: () => worker,
+      releaseSession: () => {
+        releaseCalls += 1
+      },
+      terminateAll: async () => {},
+    }
+    const dispatcher = createDispatcher({ pool })
+    const sessionID = sid("ses_cancel_crash_race")
+
+    const run = capture(dispatcher.dispatch({ sessionID }))
+    await flush()
+
+    // The crash rejection lands while the cancel request is still suspending on
+    // its boot probe: both terminal paths target the same generation.
+    const cancelling = dispatcher.cancel(sessionID)
+    worker.crashWith(sessionID, new Error("race crash"))
+    await Promise.all([cancelling, run])
+    await dispatcher.awaitRelease(sessionID)
+
+    expect(releaseCalls).toBe(1)
+    expect(dispatcher.registry.entry(sessionID)).toBeUndefined()
+    await dispatcher.terminateAll()
+  })
+
+  test("a successor waits for the retiring generation's release callback", async () => {
+    let confirmRelease!: () => void
+    const releaseGate = new Promise<void>((resolve) => {
+      confirmRelease = resolve
+    })
+    const released: SessionID[] = []
+    const spawned: FakeSessionWorker[] = []
+    const pool: WorkerPool = {
+      spawn: (id) => {
+        const worker = new FakeSessionWorker(id ?? spawned.length + 1)
+        spawned.push(worker)
+        return worker
+      },
+      terminateAll: async () => {},
+    }
+    const dispatcher = createDispatcher({
+      pool,
+      onSessionReleased: async (sessionID) => {
+        await releaseGate
+        released.push(sessionID)
+      },
+    })
+    const sessionID = sid("ses_successor_release")
+
+    const first = dispatcher.dispatch({ sessionID })
+    await flush()
+    spawned[0].finish(sessionID)
+    await first
+    await flush()
+
+    // The isolate exits at once, but the release callback is held open.
+    void dispatcher.retire(sessionID)
+    await flush()
+    const successor = dispatcher.dispatch({ sessionID })
+    await flush()
+    expect(spawned).toHaveLength(1)
+
+    confirmRelease()
+    await pollUntil(() => spawned.length === 2, {
+      message: "the successor started before the retirement release completed",
+    })
+    spawned[1].finish(sessionID)
+    await successor
+    expect(released).toEqual([sessionID])
     await dispatcher.terminateAll()
   })
 })
