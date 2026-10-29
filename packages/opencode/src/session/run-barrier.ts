@@ -448,6 +448,12 @@ function makeBarrier(): Interface {
           return Effect.fail(error)
         }),
       ),
+      Effect.onInterrupt(() =>
+        Effect.sync(() => {
+          active.delete(sessionID)
+          if (stateOf(sessionID) === "draining") remember(sessionID, "idle")
+        }),
+      ),
     )
 
     active.delete(sessionID)

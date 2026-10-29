@@ -108,6 +108,25 @@ describe("v2 one worker per session", () => {
   })
 })
 
+describe("terminateAll is serialized", () => {
+  test("concurrent callers share one shutdown and the pool closes once", async () => {
+    let poolTerminations = 0
+    const pool: WorkerPool = {
+      spawn: (id) => new FakeSessionWorker(id ?? -1, { mode: "finish" }),
+      terminateAll: async () => {
+        poolTerminations++
+        await flush()
+      },
+    }
+    const dispatcher = createDispatcher({ pool })
+
+    await Promise.all([dispatcher.terminateAll(), dispatcher.terminateAll()])
+    await dispatcher.terminateAll()
+
+    expect(poolTerminations).toBe(1)
+  })
+})
+
 describe("crash handling retires the session worker at-most-once", () => {
   test("the crashed run rejects and is not requeued; a later dispatch spawns fresh", async () => {
     const pool = createFakeWorkerPool(1)

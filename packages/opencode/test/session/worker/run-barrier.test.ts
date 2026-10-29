@@ -366,4 +366,21 @@ describe("run barrier service", () => {
       expect(barrier.size).toBe(1)
     }),
   )
+
+  it.effect("an interrupted wait leaves the session admissible for the next run", () =>
+    Effect.gen(function* () {
+      const barrier = yield* RunBarrier.Service
+      barrier.beginRun("s1")
+      const fiber = yield* barrier.wait("s1").pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      expect(barrier.state("s1")).toBe("draining")
+
+      yield* Fiber.interrupt(fiber)
+      expect(barrier.state("s1")).toBe("idle")
+
+      const next = barrier.beginRun("s1")
+      reportAll(next)
+      expect(yield* barrier.wait("s1")).toEqual({ sessionID: "s1", status: "drained" })
+    }),
+  )
 })

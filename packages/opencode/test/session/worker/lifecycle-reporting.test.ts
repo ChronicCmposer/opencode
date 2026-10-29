@@ -67,4 +67,9 @@ describe("lifecycle proxy reporting", () => {
   test("the production bound is five seconds", () => {
     expect(LIFECYCLE_RPC_TIMEOUT_MS).toBe(5_000)
   })
+
+  test("commit resolves after the deadline when the hub never acks", async () => {
+    const reporting = createProxyReporting(() => new Promise(() => {}), { timeoutMs: 10 })
+    await expect(reporting.commit("ses_1", "msg_1")).resolves.toBeUndefined()
+  })
 })
