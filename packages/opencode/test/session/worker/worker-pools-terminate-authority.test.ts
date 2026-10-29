@@ -5,7 +5,6 @@
 
 import { describe, expect, test } from "bun:test"
 import { Effect, Exit, Scope } from "effect"
-import { resolveBuildHash } from "@/session/worker/build-hash"
 import { makeProduction, makeSpawnGate } from "@/session/worker/worker-pools"
 import type { ProductionWorkerPoolOptions } from "@/session/worker/worker-pools"
 import type { ExecutorWorkerPool } from "@/session/worker/execute"
@@ -13,7 +12,7 @@ import { createDispatcher } from "@/session/worker/dispatch"
 import { createRecordingScheduler } from "../../lib/scheduler"
 import { flush, pollUntil, sid } from "../../lib/async"
 
-const ready = (threadId: number) => ({ type: "ready", threadId, buildHash: resolveBuildHash({ env: {} }).hash })
+const ready = (threadId: number) => ({ type: "ready", threadId })
 
 class FakeWorker {
   static instances: FakeWorker[] = []

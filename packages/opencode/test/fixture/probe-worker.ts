@@ -98,10 +98,7 @@ async function runProcessRole(): Promise<void> {
  * so the test can read the OS thread name; teardown is the only stop.
  */
 async function runNoName(): Promise<void> {
-  // The production transport verifies the ready-frame build hash, so this
-  // no-name probe still sends a valid handshake (it only avoids self-naming).
-  const { readyFrame } = await import("@/session/worker/build-hash")
-  postToParent(readyFrame(0))
+  postToParent({ type: "ready", threadId: 0 })
   setInterval(() => {}, 1 << 30)
 }
 

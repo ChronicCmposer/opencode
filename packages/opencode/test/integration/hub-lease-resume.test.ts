@@ -24,7 +24,6 @@ import { createTestBarrier } from "../lib/run-barrier-test"
 import type { DbExecutor } from "@/session/worker/db-executor"
 import type { SessionID } from "@/session/schema"
 import { sid } from "../lib/async"
-import { BuildMismatch, resolveBuildHash } from "@/session/worker/build-hash"
 import { pollUntil } from "../lib/poll"
 
 const SESSION = "ses_resume_deadline"
@@ -275,100 +274,6 @@ describe("retirement awaits the scoped lease release", () => {
     try {
       await expect(hub.releaseGeneration(sessionID, 9)).rejects.toThrow("release hook failed")
       expect(zeroed).toEqual([[sessionID, "worker-9-1-uuid"]])
-    } finally {
-      await hub.terminateAll()
-    }
-  })
-})
-
-describe("a typed build mismatch is returned as-is and blocks respawn", () => {
-  test("the caller sees BuildMismatch and a retry does not respawn the stale bundle", async () => {
-    const sessionID = "ses_build_mismatch"
-    const mismatch = new BuildMismatch({ expected: resolveBuildHash().hash, actual: "stale-bundle" })
-    let executed = 0
-    const worker: ExecutorWorker = {
-      id: 7,
-      get alive() {
-        return false
-      },
-      async execute() {
-        executed += 1
-        throw mismatch
-      },
-      async cancel() {},
-      async assertNotBusy() {
-        return false
-      },
-      resultFor: () => undefined,
-      async terminate() {},
-    }
-    const pool: ExecutorWorkerPool = {
-      workers: [worker],
-      spawn: () => worker,
-      terminateAll: async () => {},
-      byID: (id) => (id === worker.id ? worker : undefined),
-      resultFor: () => undefined,
-    }
-    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool, onWorkerCrashed: () => {} })
-    try {
-      await expect(hub.ensureRunning(sid(sessionID))).rejects.toBeInstanceOf(BuildMismatch)
-      expect(executed).toBe(1)
-      // The bundle did not change, so a retry fails fast with the same typed
-      // error instead of crash-looping a fresh isolate.
-      await expect(hub.ensureRunning(sid(sessionID))).rejects.toBeInstanceOf(BuildMismatch)
-      expect(executed).toBe(1)
-    } finally {
-      await hub.terminateAll()
-    }
-  })
-})
-
-describe("a build mismatch rejects a parked waiter instead of respawning", () => {
-  test("a concurrent waiter is rejected with the typed cause and never executes", async () => {
-    const sessionID = "ses_build_mismatch_waiter"
-    const mismatch = new BuildMismatch({ expected: resolveBuildHash().hash, actual: "stale-bundle" })
-    let alive = true
-    let executed = 0
-    const gate = deferred<void>()
-    const worker: ExecutorWorker = {
-      id: 9,
-      get alive() {
-        return alive
-      },
-      async execute() {
-        executed += 1
-        if (executed === 1) await gate.promise
-        alive = false
-        throw mismatch
-      },
-      async cancel() {},
-      async assertNotBusy() {
-        return false
-      },
-      resultFor: () => undefined,
-      async terminate() {},
-    }
-    const pool: ExecutorWorkerPool = {
-      workers: [worker],
-      spawn: () => worker,
-      terminateAll: async () => {},
-      byID: (id) => (id === worker.id ? worker : undefined),
-      resultFor: () => undefined,
-    }
-    const hub = createSessionHub({ ...{ barrier: createTestBarrier() }, pool, onWorkerCrashed: () => {} })
-    try {
-      const first = hub.dispatcher.dispatch({ sessionID: sid(sessionID), depth: 0 }).catch((error) => error)
-      // A different run identity parks behind the first.
-      const second = hub.dispatcher.dispatch({ sessionID: sid(sessionID), depth: 1 }).catch((error) => error)
-      await pollUntil(() => executed === 1, { message: "the first run never executed" })
-      expect(hub.dispatcher.queuedCount).toBe(1)
-
-      gate.resolve()
-      const [firstOutcome, secondOutcome] = await Promise.all([first, second])
-      expect(firstOutcome).toBeInstanceOf(BuildMismatch)
-      expect(secondOutcome).toBeInstanceOf(BuildMismatch)
-      // The stale bundle is never respawned for the parked waiter.
-      expect(executed).toBe(1)
     } finally {
       await hub.terminateAll()
     }

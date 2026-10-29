@@ -107,7 +107,7 @@ The database and durable log are the only authoritative state. No authoritative 
 
 ### D15 — Worker transport
 
-Send JSON strings over `postMessage`. Decode exactly once with Effect Schema at the port boundary. Reject messages above 4 MiB. The build hash is the worker entry bundle hash plus the protocol schema version, checked during the ready handshake. Plugins are excluded from the hash. A mismatch is a typed `BuildMismatch` with no fallback. A development-only override is logged at error level and exposed in status.
+Send JSON strings over `postMessage`. Decode exactly once with Effect Schema at the port boundary. Reject messages above 4 MiB. There is no build-hash verification: the hub and worker ship in one compiled binary, so they cannot mismatch.
 
 ### D16 — Large durable payloads
 
@@ -162,7 +162,7 @@ Run both modes across the matrix: database memory/file, plugins none/supported/u
 | Tools are never re-executed automatically. | D9, D10 |
 | Hooks are never silently skipped. | D19 |
 | One execution mode per Session. | D25 |
-| Build hash is strict; mismatch fails. | D15 |
+| No build-hash handshake; one binary cannot mismatch. | D15 |
 | Workers never run DDL or mark schema state; migration is serialized by the sidecar gate. | D6, D7 |
 | The barrier is commit-based, not delta-ack-based. | D18 |
 | Deltas may be dropped; durable events may not. | D17 |
@@ -209,7 +209,7 @@ Landed on the green baseline: layer/graph, dispatch/runtime, and test-infra. Arc
 3. **Green baseline.** `rebaseline/green` at `a1f9457f` remains green: locked `bun turbo typecheck` is 30/30, and the baseline targeted suite is 639 pass, 1 skip, 0 fail. New tests do not regress these gates.
 4. **DB ownership.** No writer isolate or writer RPC remains. Each worker uses a WAL connection; hub DDL is gated by zero live workers; the table allowlist is generated; `SchemaMismatch` and busy-retry tests pass.
 5. **Crash and idempotency.** `WorkerCrashed` covers all phases including commit-after-durable; the tool ledger marks orphans indeterminate and never auto-replays; auto-resume is capped at 10; boot cancel releases one permit and appends no message.
-6. **Transport.** JSON strings cross `postMessage`; Schema decodes once; 4 MiB and `BuildMismatch` tests pass; deltas resync without dropping durables; the 5-second run barrier times out without starting the next run.
+6. **Transport.** JSON strings cross `postMessage`; Schema decodes once; the 4 MiB test passes; deltas resync without dropping durables; the 5-second run barrier times out without starting the next run.
 7. **Tools and plugins.** One tool routing point; broker and port/client/layer nodes are gone; MCP/LSP run on the hub; the 14-entry hook route table fails startup on configured unsupported hooks; permission/question state stays hub-owned.
 8. **Effect and structure.** Hub boundaries have an import-boundary test; changed modules expose `Foo.Service` and follow Effect naming; no new Promise service internals.
 9. **Rollout.** Two flag states only; kill switch drains existing Sessions and blocks new ones; status exposes mode, disabled reason, and build hash; flag removal waits one release after full parity green; kill switch remains two releases.

@@ -10,11 +10,10 @@ import { BOOT_CANCELLED } from "@/session/worker/cancel"
 import { makeSpawnGate, SpawnGateTimeoutError } from "@/session/worker/worker-pools"
 import { createBunExecutorTransport, spawnBunExecutorWorker } from "@/session/worker/hub"
 import type { SessionExecutorInbound } from "@/session/worker/execute"
-import { resolveBuildHash } from "@/session/worker/build-hash"
 import { flush, pollUntil, settleOf, sid, withDeadline } from "../../lib/async"
 
 /** A valid boot-ready frame for a fake isolate (must carry the hub build hash). */
-const ready = (threadId: number) => ({ type: "ready", threadId, buildHash: resolveBuildHash({ env: {} }).hash })
+const ready = (threadId: number) => ({ type: "ready", threadId })
 
 class FakeWorker {
   static instances: FakeWorker[] = []
@@ -207,32 +206,6 @@ describe("spawn-gate wiring", () => {
       expect(malformedReadyWorker.terminated).toBe(true)
       await badProxy.terminate()
       await badReady.terminate()
-    })
-  })
-
-  test("a ready frame with the wrong build hash fails the spawn loud", async () => {
-    await withFakeWorker(async () => {
-      const gate = makeSpawnGate({ timeoutMs: 1_000, capacity: 1 })
-      const transport = createBunExecutorTransport({ entry: "fake://wrong-hash", spawnGate: gate })
-      const run = settleOf(transport.waitFor(() => true))
-      transport.post(runFrame(1, "ses_hash"))
-      await flush()
-      const worker = FakeWorker.instances[0]!
-      worker.emit({ type: "ready", threadId: 1, buildHash: "not-the-hub-hash" })
-
-      const settled = await run
-      expect(settled.ok).toBe(false)
-      if (!settled.ok) expect(String(settled.error)).toContain("build mismatch")
-      expect(transport.alive).toBe(false)
-      // The bundle booted (its native WAL handle exists) but the hub rejected the
-      // build: close it through the shutdown frame before terminate, never
-      // terminate-only, or the WAL lock outlives the thread.
-      await pollUntil(
-        () => worker.posted.some((frame) => (frame as { type?: string }).type === "shutdown"),
-        { message: "a build-mismatched ready frame must close through the orderly shutdown frame" },
-      )
-      expect(worker.terminated).toBe(true)
-      await transport.terminate()
     })
   })
 

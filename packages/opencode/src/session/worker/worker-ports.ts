@@ -10,11 +10,6 @@ import { serveHubProxy } from "./hub-proxy-wire"
 import { workerLogMessage } from "./worker-logging"
 
 
-/**
- * The worker data ports transferred as one `{type:"ports", …}` frame
- * (session-worker.ts). The writer port is intentionally absent: the hub serves no
- * SQLite RPC (D5).
- */
 export interface WorkerTransferredPorts {
   readonly egress?: MessagePort
   readonly egressControl?: MessagePort
@@ -40,22 +35,10 @@ const PidReportSchema = Schema.Struct({
 
 const decodePidReport = Schema.decodeUnknownOption(PidReportSchema)
 
-/**
- * Whether `frame` is a well-formed {@link PidReport}, decoded once with Schema at
- * the port boundary. A pid report is a plain data frame carried on the worker
- * control (hub-proxy) port, recognised by its `type` rather than the hub-proxy
- * `kind` discriminator.
- */
 export function isPidReport(frame: unknown): frame is PidReport {
   return Option.isSome(decodePidReport(frame))
 }
 
-/**
- * The hub-resident authorities a worker's ports are served against. `egress`
- * defaults to a draining receiver; `hubProxy` is served over the worker control
- * port when present. There is deliberately no writer RPC (D5) and no broker
- * authority (D20).
- */
 export interface WorkerPortBackends {
   readonly egress?: (workerID: number, port: MessagePort, control?: MessagePort) => () => void
   readonly hubProxy?: HubProxyHandlers
@@ -67,12 +50,7 @@ export interface WorkerPortBackends {
 
 export type WorkerPortBackendsSource = WorkerPortBackends | (() => WorkerPortBackends | undefined)
 
-/**
- * Serve a worker control port for `{type:"pid-report"}` frames, forwarding each
- * well-formed frame to `onReport`. The raw frame is consumed here and its
- * propagation stopped so the JSON-enveloped hub-proxy server on the same port
- * never sees it. Returns a disposer (the caller's port stays open).
- */
+// The raw frame is consumed here and its propagation stopped so the JSON-enveloped hub-proxy server on the same port never sees it.
 export function servePidReportPort(onReport: (frame: PidReport) => void, port: MessagePort): () => void {
   const listener = (event: MessageEvent) => {
     if (!isPidReport(event.data)) return
@@ -84,7 +62,6 @@ export function servePidReportPort(onReport: (frame: PidReport) => void, port: M
   return () => port.removeEventListener("message", listener)
 }
 
-/** Default egress serving: drain the worker's frames (the SSE route wires a real sink later). */
 export function drainEgressPort(port: MessagePort): () => void {
   const receiver = createEgressReceiver({ port, onFrame: () => {} })
   return () => receiver.close()
@@ -99,24 +76,12 @@ export interface Attachments {
   readonly attached: () => WorkerPortsDiagnostics
 }
 
-/** The workers with an attached data-port server and/or hub-proxy server. */
 export interface WorkerPortsDiagnostics {
   readonly workerPorts: readonly number[]
   readonly hubProxy: readonly number[]
 }
 
-/**
- * The worker-port authority: it owns the attached port servers for this hub and
- * the synchronous {@link Attachments} facade the hub's Promise surface consumes.
- * Configuration is read when the layer is built; there is no per-call options
- * bag.
- *
- * The events port has ONE live implementation: the hub's `serveEventsPort`
- * (`session/worker/hub.ts`), a decoded `Stream.callback` pipeline driven by the
- * hub's `EffectBridge` from this synchronous attach facade. It owns durable
- * ordering, gap healing and backpressure; there is deliberately no second
- * stream-shaped events surface here to drift from it.
- */
+// The worker-port authority: it owns the attached port servers for this hub and the synchronous {@link Attachments} facade the hub's Promise surface consumes.
 export interface Interface {
   readonly attachWorkerPorts: (workerID: number, ports: WorkerTransferredPorts) => Effect.Effect<() => void>
   readonly attachHubProxyPort: (workerID: number, port: MessagePort) => Effect.Effect<() => void>
