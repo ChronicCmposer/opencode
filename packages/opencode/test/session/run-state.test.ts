@@ -271,6 +271,39 @@ describe("SessionRunState — hub rejections are typed", () => {
     )
   })
 
+  it.live("a worker result holding a stored part that no longer decodes completes like in-process", () => {
+    const sessionID = sid("ses_legacy_result")
+    const message = withParts(sessionID)
+    const legacy = {
+      ...message,
+      parts: [{ id: "prt_legacy", sessionID, messageID: message.info.id, type: "tool", tool: "compress", state: { status: "pending", input: {}, raw: "" } }],
+    }
+    const hub = failingHub({ ensureRunningEffect: () => Effect.succeed({ sessionID, value: legacy }) })
+
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const result = yield* state.ensureRunning(sessionID, Effect.succeed(message), Effect.succeed(message))
+        expect(result).toEqual(legacy as never)
+      }).pipe(Effect.provide(runStateLayer), Effect.provideService(SessionHubService, hub), Effect.provide(flagsOn)),
+    )
+  })
+
+  it.live("a worker result that is not a message is a defect", () => {
+    const sessionID = sid("ses_broken_result")
+    const hub = failingHub({ ensureRunningEffect: () => Effect.succeed({ sessionID, value: "not a message" }) })
+
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const exit = yield* state
+          .ensureRunning(sessionID, Effect.succeed(withParts(sessionID)), Effect.succeed(withParts(sessionID)))
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(true)
+      }).pipe(Effect.provide(runStateLayer), Effect.provideService(SessionHubService, hub), Effect.provide(flagsOn)),
+    )
+  })
+
   it.live("ensureRunning surfaces a hub crash as a typed failure, not a defect", () => {
     const sessionID = sid("ses_crash_typed")
     const hub = failingHub({

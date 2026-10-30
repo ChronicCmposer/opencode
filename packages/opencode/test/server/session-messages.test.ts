@@ -5,6 +5,8 @@ import { Effect, Layer } from "effect"
 import { HttpClientResponse } from "effect/unstable/http"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
+import { Database } from "@opencode-ai/core/database/database"
+import { MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
@@ -13,7 +15,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { httpApiLayer, requestInDirectory } from "./httpapi-layer"
 
-const it = testEffect(Layer.mergeAll(LayerNode.compile(SessionNs.node), httpApiLayer))
+const it = testEffect(Layer.mergeAll(LayerNode.compile(LayerNode.group([SessionNs.node, Database.node])), httpApiLayer))
 
 const model = {
   providerID: ProviderV2.ID.make("test"),
@@ -173,6 +175,79 @@ describe("session messages endpoint", () => {
         const body = yield* json<unknown[]>(res)
         expect(Array.isArray(body)).toBe(true)
         expect(body).toHaveLength(1)
+      }),
+    ),
+    { git: true },
+  )
+})
+
+// Rows already stored can lack fields the schema now requires. These pin the
+// upstream v1 contract: reads never fail while hydrating, and the response
+// schema decides, so a list holding such a row is a 400 naming the field.
+describe("session messages with stored rows that no longer match the schema", () => {
+  const insertLegacyPart = Effect.fn("SessionMessagesTest.insertLegacyPart")(function* (
+    sessionID: SessionID,
+    messageID: MessageID,
+  ) {
+    const { db } = yield* Database.Service
+    yield* db
+      .insert(PartTable)
+      .values({
+        id: PartID.ascending(),
+        message_id: messageID,
+        session_id: sessionID,
+        time_created: Date.now(),
+        time_updated: Date.now(),
+        data: { type: "tool", tool: "compress", state: { status: "pending", input: {}, raw: "" } } as never,
+      })
+      .run()
+      .pipe(Effect.orDie)
+  })
+
+  it.instance(
+    "a tool part without callID rejects the list and the message with the field path",
+    withoutWatcher(
+      Effect.gen(function* () {
+        const session = yield* sessionScoped
+        const [messageID] = yield* fill(session.id, 1)
+        yield* insertLegacyPart(session.id, messageID!)
+
+        for (const path of [`/session/${session.id}/message`, `/session/${session.id}/message?limit=10`]) {
+          const res = yield* request(path)
+          expect(res.status).toBe(400)
+          expect(yield* res.text).toContain('[\\"parts\\"][1][\\"callID\\"]')
+        }
+        const one = yield* request(`/session/${session.id}/message/${messageID}`)
+        expect(one.status).toBe(400)
+      }),
+    ),
+    { git: true },
+  )
+
+  it.instance(
+    "a message missing a required field rejects the list but serves its neighbours singly",
+    withoutWatcher(
+      Effect.gen(function* () {
+        const session = yield* sessionScoped
+        const [messageID] = yield* fill(session.id, 1)
+        const { db } = yield* Database.Service
+        yield* db
+          .insert(MessageTable)
+          .values({
+            id: MessageID.ascending(),
+            session_id: session.id,
+            time_created: Date.now() + 5,
+            time_updated: Date.now(),
+            data: { role: "user", time: { created: Date.now() } } as never,
+          })
+          .run()
+          .pipe(Effect.orDie)
+
+        const list = yield* request(`/session/${session.id}/message`)
+        expect(list.status).toBe(400)
+        expect(yield* list.text).toContain('[\\"info\\"][\\"agent\\"]')
+        const one = yield* request(`/session/${session.id}/message/${messageID}`)
+        expect(one.status).toBe(200)
       }),
     ),
     { git: true },

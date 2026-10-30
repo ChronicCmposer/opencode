@@ -407,17 +407,28 @@ function settleHubRun(
   })
 }
 
-/** Parse a worker's JSON result into the trusted `WithParts` at the hub boundary. */
+/**
+ * Read a worker's result message at the hub boundary. In-process the runner's
+ * message is used as loaded, so a message holding a stored part that no longer
+ * matches the schema still completes the run; the hub logs it and does the
+ * same. Only a result that is not a message at all (a broken isolate) is a defect.
+ */
 function parseSessionResult(result: SessionExecutionResult): Effect.Effect<SessionV1.WithParts> {
-  // The schema decodes to a deeply `readonly` tree while the runner contract is
-  // the mutable `WithParts` alias, so the boundary widens via `DeepMutable`
-  // (the repo's parse idiom, cf. `config/parse.ts`). A malformed worker result
-  // is a defect (a broken isolate), not a recoverable typed failure: `orDie`.
-  return Schema.decodeUnknownEffect(SessionV1.WithParts)(result.value).pipe(
-    Effect.orDie,
-    Effect.map((decoded) => decoded as DeepMutable<typeof decoded>),
-  )
+  return Effect.gen(function* () {
+    const decoded = decodeWithParts(result.value)
+    if (Option.isSome(decoded)) return decoded.value as DeepMutable<typeof decoded.value>
+    const value = result.value as { readonly info?: { readonly id?: unknown }; readonly parts?: unknown }
+    if (typeof value?.info !== "object" || !Array.isArray(value.parts)) {
+      return yield* Effect.die(new Error("session worker returned a result that is not a message"))
+    }
+    yield* Effect.logWarning("worker result message does not match its schema; using it as returned", {
+      messageID: value.info?.id,
+    })
+    return result.value as SessionV1.WithParts
+  })
 }
+
+const decodeWithParts = Schema.decodeUnknownOption(SessionV1.WithParts)
 
 export const node = LayerNode.make({ service: Service, layer: layer, deps: [BackgroundJob.node, SessionStatus.node] })
 
