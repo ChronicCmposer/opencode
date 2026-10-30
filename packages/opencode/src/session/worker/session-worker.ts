@@ -416,6 +416,7 @@ export function createWorkerDatabaseWriter(
   // rewritten here. A lease held by a live generation is refused; a dead
   // generation is reclaimed only at the observed sequence inside one
   // `BEGIN IMMEDIATE`, so a raced commit fences the reclaim instead of losing it.
+  const refusedLeaseAggregates = new Set<string>()
   const claimWorkerLease = (aggregateID: string): void => {
     // Refuse a non-worker schema before `ownerOf`: on a pre-`worker_owner_id`
     // journal `ownerOf` reports v1 sync state, which is not a reclaimable worker
@@ -438,6 +439,16 @@ export function createWorkerDatabaseWriter(
       expectedOwnerID: owner,
       expectedSeq: bus.latest(aggregateID),
       nextOwnerID: ownerID,
+      onRefused: (refusal) => {
+        if (refusedLeaseAggregates.has(refusal.aggregateID)) return
+        refusedLeaseAggregates.add(refusal.aggregateID)
+        console.warn(workerLogMessage("lease reclaim refused"), {
+          aggregateID: refusal.aggregateID,
+          ownerID: refusal.ownerID,
+          expiresAt: refusal.expiresAt,
+          reason: "the current lease is still live and its owner is not provably dead",
+        })
+      },
     })
   }
   if (options.sessionID !== undefined) claimWorkerLease(options.sessionID)

@@ -160,6 +160,27 @@ describe("DurableLog lease after a hub restart", () => {
     expect(DurableLog.isDeadWorkerOwner(legacy)).toBe(false)
   })
 
+  test("a refused reclaim reports the live owner and expiry", () => {
+    const database = open()
+    const liveOwner = owner(1, process.pid)
+    bus(database, liveOwner).claim("s1")
+
+    const refusals: DurableLog.LeaseRefusal[] = []
+    const successor = bus(database, owner(2, process.pid))
+    expect(() =>
+      successor.reclaim({
+        aggregateID: "s1",
+        expectedOwnerID: liveOwner,
+        expectedSeq: -1,
+        nextOwnerID: owner(2, process.pid),
+        onRefused: (refusal) => refusals.push(refusal),
+      }),
+    ).toThrow(DurableLog.LeaseConflictError)
+    expect(refusals).toHaveLength(1)
+    expect(refusals[0]).toMatchObject({ aggregateID: "s1", ownerID: liveOwner, dead: false })
+    expect(refusals[0]!.expiresAt).toBeGreaterThan(Date.now())
+  })
+
   test("startup clears only dead-generation leases and keeps live fencing", () => {
     const database = open()
     const deadOwner = owner(1, DEAD_PID)

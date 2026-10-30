@@ -83,6 +83,15 @@ export interface Lease {
   readonly seq: number
 }
 
+/** Why a reclaim was refused: the current lease is still live. */
+export interface LeaseRefusal {
+  readonly aggregateID: string
+  readonly ownerID: string
+  readonly expiresAt: number
+  /** Whether the owner probe considered the owner dead (false for a refusal). */
+  readonly dead: boolean
+}
+
 export interface ReclaimInput {
   readonly aggregateID: string
   readonly expectedOwnerID: string
@@ -93,6 +102,8 @@ export interface ReclaimInput {
   readonly now?: number
   /** Override the dead-generation probe. */
   readonly isDeadOwner?: (ownerID: string) => boolean
+  /** Observes a live-lease refusal before the typed error is thrown. */
+  readonly onRefused?: (refusal: LeaseRefusal) => void
 }
 
 export interface Transaction {
@@ -160,6 +171,8 @@ export interface ReclaimLeaseInput {
   readonly nextOwnerID: string
   readonly now?: number
   readonly isDeadOwner?: (ownerID: string) => boolean
+  /** Observes a live-lease refusal before the typed error is thrown. */
+  readonly onRefused?: (refusal: LeaseRefusal) => void
 }
 
 /** Startup sweep: mark every lease whose owner process is gone reclaimable. */
@@ -530,7 +543,9 @@ export function workerOwnerID(workerID: string | number, pid: number = process.p
 export function isDeadWorkerOwner(ownerID: string): boolean {
   const parts = ownerID.split("-")
   // Exactly nine segments: worker, id, pid, host scope, and the five-part uuid. Owners minted before the
-  // host scope was added have eight and are never judged dead; they wait for their TTL.
+  // host scope was added have eight and are never judged dead. A legacy owner without a host scope cannot
+  // be proven dead from another host (a remote PID may be absent locally), so it waits for its TTL rather
+  // than risking a double-run; the refusal log is the diagnostic.
   if (parts[0] !== "worker" || parts.length !== 9) return false
   if (parts[3] !== HOST_SCOPE) return false
   const pid = Number(parts[2])
@@ -1073,6 +1088,16 @@ export function createDurableRepository(connection: Connection): DurableReposito
     if (current.workerExpiresAt !== undefined && current.workerExpiresAt > now) {
       const ownerIsDead = !released && (input.isDeadOwner ?? isDeadWorkerOwner)(current.workerOwnerID!)
       if (!ownerIsDead) {
+        try {
+          input.onRefused?.({
+            aggregateID: input.aggregateID,
+            ownerID: current.workerOwnerID ?? "",
+            expiresAt: current.workerExpiresAt,
+            dead: false,
+          })
+        } catch {
+          // A diagnostic observer must not change the reclaim decision.
+        }
         throw new LeaseConflictError({
           message: `Worker lease for aggregate ${input.aggregateID} is still live until ${current.workerExpiresAt}; refusing reclaim from a live generation`,
         })
@@ -1470,6 +1495,7 @@ export function create(options: Options): Interface {
         leaseTimeoutMs,
         ...(input.now === undefined ? {} : { now: input.now }),
         ...(input.isDeadOwner === undefined ? {} : { isDeadOwner: input.isDeadOwner }),
+        ...(input.onRefused === undefined ? {} : { onRefused: input.onRefused }),
       })
       return {
         aggregateID: input.aggregateID,
