@@ -669,6 +669,22 @@ const executeHubTool = (
     }).pipe(Effect.ensuring(Effect.sync(() => abort.dispose())))
   }) as Effect.Effect<PluginToolExecuteResult, UnknownPluginToolError | PluginToolExecutionError, PluginToolServices>
 
+/** Rebuild the in-process `extra` from its clone-safe wire form; the model is resolved from the hub's providers. */
+const pluginToolExtraOnHub = Effect.fnUntraced(function* (extra: PluginToolExecuteInput["extra"]) {
+  const provider = yield* Effect.serviceOption(Provider.Service)
+  const ref = extra?.modelRef
+  const model =
+    ref === undefined || Option.isNone(provider)
+      ? undefined
+      : yield* provider.value
+          .getModel(ref.providerID as Provider.Model["providerID"], ref.modelID as Provider.Model["id"])
+          .pipe(Effect.option, Effect.map(Option.getOrUndefined))
+  return {
+    ...(model === undefined ? {} : { model }),
+    ...(extra?.bypassAgentCheck === undefined ? {} : { bypassAgentCheck: extra.bypassAgentCheck }),
+  }
+})
+
 /** Run one plugin tool on the hub: locate its definition, validate the forwarded args, reconstruct the `ToolContext` the plugin expects, execute. */
 function pluginToolExecute(
   plugin: () => Option.Option<Plugin.Interface>,
@@ -702,9 +718,21 @@ function pluginToolExecute(
       signal: new AbortController().signal,
       dispose: () => {},
     }
-    const pluginCtx: ToolContext = {
+    const messages = yield* sessions.messages({ sessionID: input.sessionID as SessionID }).pipe(Effect.orDie)
+    const extra = yield* pluginToolExtraOnHub(input.extra)
+    // In-process the registry spreads the whole tool context into the plugin's, so
+    // plugins rely on `callID`, `extra` and `messages` even though `ToolContext`
+    // does not declare them.
+    const pluginCtx: ToolContext & {
+      readonly callID: string
+      readonly extra: Record<string, unknown>
+      readonly messages: unknown
+    } = {
       sessionID: input.sessionID,
       messageID: input.messageID,
+      callID: input.callID,
+      extra,
+      messages,
       agent: input.agent,
       directory: instance?.directory ?? process.cwd(),
       worktree: instance?.worktree ?? process.cwd(),

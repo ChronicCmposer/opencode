@@ -58,6 +58,7 @@ import {
   isRemotePluginToolDefinition,
   type PluginToolExecuteResult,
   type RemotePluginToolContext,
+  type PluginToolExtra,
   type RemotePluginToolDefinition,
 } from "@/session/worker/plugin-tool-wire"
 
@@ -416,6 +417,23 @@ export function pluginToolJsonSchema(def: ToolDefinition): JSONSchema7 {
 type RemoteProgressSink = (progress: { readonly title?: string; readonly metadata?: unknown }) => void | Promise<void>
 
 /** The optional hub abort bridge a remote definition may expose. */
+/** The clone-safe part of the tool context's `extra`, or nothing when it carries none. */
+function remotePluginToolExtra(extra: Tool.Context["extra"]): { readonly extra?: PluginToolExtra } {
+  const model = extra?.model as { readonly providerID?: string; readonly id?: string } | undefined
+  const modelRef =
+    model?.providerID === undefined || model.id === undefined
+      ? undefined
+      : { providerID: model.providerID, modelID: model.id }
+  const bypassAgentCheck = typeof extra?.bypassAgentCheck === "boolean" ? extra.bypassAgentCheck : undefined
+  if (modelRef === undefined && bypassAgentCheck === undefined) return {}
+  return {
+    extra: {
+      ...(modelRef === undefined ? {} : { modelRef }),
+      ...(bypassAgentCheck === undefined ? {} : { bypassAgentCheck }),
+    },
+  }
+}
+
 type RemoteAbortBridge = (ctx: RemotePluginToolContext) => void | Promise<void>
 
 /** The progress-aware `RemotePluginToolDefinition.execute` shape (wire v2). */
@@ -516,6 +534,7 @@ function fromRemotePluginTool(
           messageID: toolCtx.messageID,
           callID: toolCtx.callID,
           agent: toolCtx.agent,
+          ...remotePluginToolExtra(toolCtx.extra),
         }
         const onProgress: RemoteProgressSink = (progress) =>
           bridge.promise(

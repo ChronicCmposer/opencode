@@ -70,7 +70,7 @@ const hubServices = Layer.mergeAll(
     output: (text: string) => Effect.succeed({ content: text, truncated: false as const }),
   }),
   Layer.mock(Agent.Service, { get: () => Effect.succeed({ permission: [] } as unknown as Agent.Info) }),
-  Layer.mock(Session.Service, { get: () => Effect.succeed({ permission: [] } as unknown as Session.Info) }),
+  Layer.mock(Session.Service, { messages: () => Effect.succeed([]), get: () => Effect.succeed({ permission: [] } as unknown as Session.Info) }),
 )
 
 const run: HubProxyRunner = (effect) =>

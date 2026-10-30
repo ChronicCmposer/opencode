@@ -30,6 +30,16 @@ export interface PluginToolExecuteInput {
   readonly callID: string
   readonly agent: string
   readonly args: unknown
+  readonly extra?: PluginToolExtra
+}
+
+/**
+ * The clone-safe part of the in-process `ToolContext.extra`. The model crosses as
+ * its identity and the hub resolves it; `promptOps` holds functions and stays put.
+ */
+export interface PluginToolExtra {
+  readonly modelRef?: { readonly providerID: string; readonly modelID: string }
+  readonly bypassAgentCheck?: boolean
 }
 
 /** The clone-safe tool result the hub returns across the control port. */
@@ -51,6 +61,7 @@ export interface RemotePluginToolContext {
   readonly messageID: string
   readonly callID?: string
   readonly agent: string
+  readonly extra?: PluginToolExtra
 }
 
 /** The worker-side stand-in for a hub-owned plugin tool. */
@@ -125,6 +136,7 @@ export function remotePluginToolHooks(
             callID: ctx.callID ?? "",
             agent: ctx.agent,
             args,
+            ...(ctx.extra === undefined ? {} : { extra: ctx.extra }),
           },
           onProgress,
         ),

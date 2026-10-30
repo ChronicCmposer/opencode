@@ -129,7 +129,7 @@ async function proxyTool(options: ProxyToolOptions): Promise<ProxiedOutcome> {
             Layer.mock(Agent.Service, {
               get: () => Effect.succeed({ permission: options.ruleset } as unknown as Agent.Info),
             }),
-            Layer.mock(Session.Service, { get: () => Effect.succeed({ permission: [] } as unknown as Session.Info) }),
+            Layer.mock(Session.Service, { messages: () => Effect.succeed([]), get: () => Effect.succeed({ permission: [] } as unknown as Session.Info) }),
           ),
         ),
         Effect.provideService(InstanceRef, options.instance),

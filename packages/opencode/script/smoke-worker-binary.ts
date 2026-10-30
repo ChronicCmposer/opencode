@@ -58,15 +58,36 @@ export const FAILURE_SIGNATURES: readonly RegExp[] = [
  */
 export const TEXT_COMPLETE_MARKER = "[smoke:text.complete]"
 
-const SMOKE_PLUGIN = `export default async () => ({
+/**
+ * The smoke plugin. Its `smoke_context` tool runs on the hub and records the
+ * context fields plugins rely on in-process (`callID`, `messages`, `extra.model`).
+ */
+const smokePlugin = (contextFile: string) => `export default async () => ({
   "experimental.text.complete": async (_input, output) => {
     output.text = output.text + " ${TEXT_COMPLETE_MARKER}"
   },
   "command.execute.before": async () => {},
   "experimental.session.compacting": async () => {},
   "experimental.compaction.autocontinue": async () => {},
+  tool: {
+    smoke_context: {
+      description: "Record the plugin tool context.",
+      args: {},
+      execute: async (_args, ctx) => {
+        await Bun.write(${JSON.stringify(contextFile)}, JSON.stringify({
+          callID: ctx.callID,
+          messages: Array.isArray(ctx.messages) && ctx.messages.length > 0,
+          model: typeof ctx.extra?.model?.id === "string",
+        }))
+        return "recorded"
+      },
+    },
+  },
 })
 `
+
+/** The tool call id the mock model gives the plugin tool; the hub must hand it to the plugin. */
+const SMOKE_CONTEXT_CALL_ID = "call_smoke_context"
 
 /** Prompt marker that makes the mock model call the write tool. */
 const TOOL_TURN_PROMPT = "Write the smoke file."
@@ -208,7 +229,8 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
     select: (body) => selectToolTurnScript(body, toolTurnPath),
   })
   const pluginFile = path.join(home, "smoke-plugin.js")
-  writeFileSync(pluginFile, SMOKE_PLUGIN)
+  const contextFile = path.join(home, "smoke-context.json")
+  writeFileSync(pluginFile, smokePlugin(contextFile))
   const configJSON = JSON.stringify({
     ...testProviderConfig(provider.baseUrl),
     model: "test/test-model",
@@ -289,6 +311,10 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
     const toolDeadline = Date.now() + EVENT_TIMEOUT_MS
     while (Date.now() < toolDeadline && !toolTurnWrote(toolTurnPath)) await sleep(POLL_INTERVAL_MS)
     if (!toolTurnWrote(toolTurnPath)) missing.push(`tool turn write of ${TOOL_TURN_FILE}`)
+    const context = pluginToolContext(contextFile)
+    if (context?.callID !== SMOKE_CONTEXT_CALL_ID) missing.push(`plugin tool ctx.callID ${SMOKE_CONTEXT_CALL_ID}`)
+    if (context?.messages !== true) missing.push("plugin tool ctx.messages")
+    if (context?.model !== true) missing.push("plugin tool ctx.extra.model")
     // Let the follow-up reply land so a late failure still shows up as session.error.
     await sleep(1_000)
     if (eventTypeSeen.has("session.error") && !missing.includes("no session.error")) missing.push("no session.error")
@@ -342,8 +368,16 @@ function selectToolTurnScript(body: Record<string, unknown>, filePath: string): 
         name: "write",
         arguments: JSON.stringify({ filePath, content: TOOL_TURN_CONTENT }),
       },
+      { id: SMOKE_CONTEXT_CALL_ID, name: "smoke_context", arguments: "{}" },
     ],
   }
+}
+
+function pluginToolContext(
+  contextFile: string,
+): { readonly callID?: unknown; readonly messages?: unknown; readonly model?: unknown } | undefined {
+  if (!existsSync(contextFile)) return undefined
+  return JSON.parse(readFileSync(contextFile, "utf8"))
 }
 
 function toolTurnWrote(filePath: string): boolean {

@@ -81,17 +81,14 @@ function contentDeltas(script: MockProviderScript): string[] {
 }
 
 /** OpenAI delta frames for a script's tool calls (start frame, then arguments). */
+// Each call streams under its own `index`; a shared index would merge calls into one.
 function toolCallFrames(calls: readonly MockProviderToolCall[]): string[] {
-  const frames: string[] = []
-  for (const call of calls) {
-    frames.push(
-      frameOf({
-        delta: { tool_calls: [{ index: 0, id: call.id, type: "function", function: { name: call.name, arguments: "" } }] },
-      }),
-    )
-    frames.push(frameOf({ delta: { tool_calls: [{ index: 0, function: { arguments: call.arguments } }] } }))
-  }
-  return frames
+  return calls.flatMap((call, index) => [
+    frameOf({
+      delta: { tool_calls: [{ index, id: call.id, type: "function", function: { name: call.name, arguments: "" } }] },
+    }),
+    frameOf({ delta: { tool_calls: [{ index, function: { arguments: call.arguments } }] } }),
+  ])
 }
 
 /** Build the ordered SSE frames for one scripted reply. */

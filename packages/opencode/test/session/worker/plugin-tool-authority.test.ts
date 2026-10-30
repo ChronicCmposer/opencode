@@ -21,6 +21,10 @@ import { Truncate } from "@/tool/truncate"
 import { Agent } from "@/agent/agent"
 import type { ToolContext as PluginToolContext } from "@opencode-ai/plugin"
 import type { PluginToolExecuteInput } from "@/session/worker/plugin-tool-wire"
+import { Provider } from "@/provider/provider"
+
+/** The session history the hub reads for the plugin's `messages`. */
+const history = [{ info: { id: "msg_previous" }, parts: [] }]
 
 /** The hub-resident services the authority reads from the captured context. */
 const services = Layer.mergeAll(
@@ -29,7 +33,13 @@ const services = Layer.mergeAll(
     output: (text: string) => Effect.succeed({ content: text, truncated: false as const }),
   }),
   Layer.mock(Agent.Service, { get: () => Effect.succeed({ permission: [] } as unknown as Agent.Info) }),
-  Layer.mock(Session.Service, { get: () => Effect.succeed({ permission: [] } as unknown as Session.Info) }),
+  Layer.mock(Session.Service, {
+    get: () => Effect.succeed({ permission: [] } as unknown as Session.Info),
+    messages: () => Effect.succeed(history as never),
+  }),
+  Layer.mock(Provider.Service, {
+    getModel: (providerID: string, modelID: string) => Effect.succeed({ providerID, id: modelID } as never),
+  }),
 )
 
 /** Run a hub-authority effect with the hub-resident services provided. */
@@ -82,6 +92,28 @@ describe("pluginToolAuthority", () => {
     expect(seen?.messageID).toBe("msg_authority")
     expect(seen?.agent).toBe("build")
     expect(seen?.abort).toBeInstanceOf(AbortSignal)
+  })
+
+  test("the context carries callID, messages and extra like the in-process registry spread", async () => {
+    let seen: (PluginToolContext & { callID?: string; messages?: unknown; extra?: Record<string, unknown> }) | undefined
+    const compress = {
+      description: "compress a range",
+      args: {},
+      execute: async (_args: unknown, ctx: PluginToolContext) => {
+        seen = ctx
+        return "ok"
+      },
+    }
+    const authority = pluginToolAuthority({
+      plugin: () => Option.some(fakePlugin([{ tool: { compress } }])),
+      run,
+    })
+
+    await authority({ ...input, extra: { modelRef: { providerID: "p1", modelID: "m1" }, bypassAgentCheck: true } })
+
+    expect(seen?.callID).toBe("call_authority")
+    expect(seen?.messages).toEqual(history)
+    expect(seen?.extra).toEqual({ model: { providerID: "p1", id: "m1" }, bypassAgentCheck: true })
   })
 
   test("missing-id: rejects fail-loud instead of an empty success", async () => {

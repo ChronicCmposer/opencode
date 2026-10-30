@@ -42,7 +42,7 @@ const hubServices = Layer.mergeAll(
     write: (text: string) => Effect.succeed(text),
   }),
   Layer.mock(Agent.Service, { get: () => Effect.succeed({ permission: [] } as unknown as Agent.Info) }),
-  Layer.mock(Session.Service, {
+  Layer.mock(Session.Service, { messages: () => Effect.succeed([]),
     get: () => Effect.succeed({ permission: [] } as unknown as Session.Info),
   }),
 )
