@@ -81,7 +81,7 @@ Auto-resume follows the v2 durable attempt model and is allowed only when the to
 
 ### D10 — Tool-call ledger
 
-The `tool_call` ledger has `unique(call_id, session)`. A call is marked started before its effect begins and finished in the same transaction as its result. An orphaned `started` row is `indeterminate`: it is first-class state, it is never auto-retried, and no side-effecting tool is auto-re-executed. Recovery may report indeterminate work; it may not guess.
+The `tool_call` ledger has `unique(call_id, session)`. A call is marked started before its effect begins and finished in the same transaction as its result. An orphaned `started` row is `indeterminate`: it is first-class state, it is never auto-retried, and no side-effecting tool is auto-re-executed. Recovery may report indeterminate work; it may not guess. A record whose owning message is discarded or whose dead-owner record is older than the session's last assistant message is settled as `finished`/`abandoned`; it stops blocking resume but remains visible as indeterminate work.
 
 ### D11 — Boot cancellation
 
@@ -155,6 +155,16 @@ There are two flag states: off and on. Startup validates configured plugins. Inf
 
 Run both modes across the matrix: database memory/file, plugins none/supported/unsupported, crash none/boot/stream/tool/commit. Parity means identical user-visible event and status sequences and normalized database rows. Zero skips are allowed except the listed worker-only cases. Run a PR subset and the full suite nightly. The full suite is the release gate.
 
+### D27 — Hub–worker parity fixes
+
+Model pricing crosses the boundary. The worker bootstrap carries the model's real `cost` descriptor (input, output, cache read/write, context tiers, and `experimentalOver200K`) as plain data alongside capabilities and limits. The reduced worker provider uses it instead of a zero cost, so `Session.getUsage` computes the same assistant-message cost, step-finish cost, and session total in worker and in-process modes. Unpriced catalog models still produce zero cost. Token usage, including cache read/write, crosses unchanged.
+
+Busy and idle ownership is split. The hub announces `session.status: busy` on admission, before any worker boot or ready handshake, and only when the session is not already busy; a second prompt joining an in-flight cold-start run publishes no extra busy. The worker's own busy publication through its session-bound status authority is skipped when the hub already shows busy, while retry and idle still pass through. Exactly one idle is published per run: the worker owns it for a clean settle or natural finish, and run-state's fallback owns it for boot failure, cancel during boot, barrier refusal, retired-lease timeout, and a switch to in-process. `awaitBusy` on a routed session waits for that hub admission instead of returning immediately.
+
+Rollback event order is fixed. Revert cleanup runs in one transaction in upstream order: message removals, then part removals, then the `session.updated` that clears `revert`. The UI therefore never sees a cleared revert while removed rows are still visible. The transaction can only fail by dying, so no event describes an uncommitted change.
+
+Abandoned tool-call records and lease refusals are settled deliberately. A `tool_call` row owned by a discarded message (`<assistantMessageID>:<callID>`) is marked finished with outcome `abandoned` in the same transaction as the revert cleanup; abandoning only stops it blocking automatic resume and never records a success. At startup, a `started` row whose `worker_owner_id` is provably dead is abandoned unless its message still exists and is the session's last assistant message, in which case it keeps blocking until the user acts. The `worker_crash` row and the indeterminate user-facing message are unchanged. A refused live-lease reclaim logs the aggregate, owner, expiry, and reason, at most once per aggregate per process; legacy owner strings without a host scope still wait for lease expiry because a remote PID cannot be proven dead locally.
+
 ## Invariants
 
 | Invariant | Enforced by |
@@ -173,6 +183,11 @@ Run both modes across the matrix: database memory/file, plugins none/supported/u
 | One tool routing point; MCP/LSP on the hub. | D20 |
 | Effect conventions and intentional naming hold in changed modules. | D23 |
 | Comments stay in this spec, not in code commentary. | D24 |
+| Model pricing and token usage cross to the worker; worker and in-process cost match. | D27 |
+| The hub announces busy on admission; the worker's repeat is skipped; exactly one idle per run. | D27 |
+| Rollback publishes removals before the revert is cleared, in one transaction. | D27 |
+| Abandoning a tool-call record never records a success and never hides indeterminate work. | D10, D27 |
+| A refused lease reclaim is logged once per aggregate per process. | D12, D27 |
 
 ## Superseded and retained plan steps
 
