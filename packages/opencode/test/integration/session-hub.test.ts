@@ -889,4 +889,48 @@ describe("session-hub boundary", () => {
     await expect(boundless.sessionChildren!({ sessionID: BOUND, parentID: BOUND })).rejects.toThrow(/no bound session/)
     await expect(boundless.sessionCancel!({ sessionID: BOUND, targetID: BOUND })).rejects.toThrow(/no bound session/)
   })
+
+  test("worker status writes drop a repeated busy but pass retry and idle through", async () => {
+    const BOUND = SessionID.make("ses_bound_status_dedupe")
+    let current: SessionStatus.Info = { type: "idle" }
+    const writes: string[] = []
+    const sessionStatus = {
+      get: () => Effect.sync(() => current),
+      set: (_sessionID: SessionID, status: SessionStatus.Info) =>
+        Effect.sync(() => {
+          current = status
+          writes.push(status.type)
+        }),
+      list: () => Effect.sync(() => new Map<SessionID, SessionStatus.Info>()),
+    }
+    const base = recordingHubAuthorities()
+    const authorities = hubProxyAuthoritiesFor({
+      run: (effect) => Effect.runPromise(effect),
+      boundSessionID: BOUND,
+      subagentDepth: 1,
+      recordDepth: () => {},
+      registerChild: () => {},
+      sessionStatus,
+      permission: base.authorities.permission,
+      question: base.authorities.question,
+    })
+
+    // The hub publishes admission busy, so the worker's identical repeat is
+    // skipped; a retry and the terminal idle still reach the status service.
+    await Effect.runPromise(authorities.sessionStatus.set(BOUND, { type: "busy" }))
+    await Effect.runPromise(authorities.sessionStatus.set(BOUND, { type: "busy" }))
+    expect(writes).toEqual(["busy"])
+    await Effect.runPromise(
+      authorities.sessionStatus.set(BOUND, {
+        type: "retry",
+        attempt: 1,
+        message: "x",
+        action: {} as never,
+        next: 0,
+      } as never),
+    )
+    expect(writes).toEqual(["busy", "retry"])
+    await Effect.runPromise(authorities.sessionStatus.set(BOUND, { type: "idle" }))
+    expect(writes).toEqual(["busy", "retry", "idle"])
+  })
 })

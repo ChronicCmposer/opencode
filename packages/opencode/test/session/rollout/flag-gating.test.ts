@@ -80,7 +80,10 @@ const runStateLayer = SessionRunState.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       Layer.mock(BackgroundJob.Service, {}),
-      Layer.mock(SessionStatus.Service, { set: () => Effect.void }),
+      Layer.mock(SessionStatus.Service, {
+        set: () => Effect.void,
+        get: () => Effect.succeed({ type: "idle" as const }),
+      }),
     ),
   ),
 )

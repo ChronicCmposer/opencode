@@ -96,6 +96,41 @@ export const layer = Layer.effect(
       return inProcessSessions.has(sessionID) ? undefined : yield* hubIfEnabled
     })
 
+    // Waiters for a routed session's hub-side admission. The hub publishes busy on
+    // admission (before a cold worker boots), so this is the only signal a caller
+    // can await without racing the worker's own busy.
+    const hubBusyLatches = new Map<SessionID, Deferred.Deferred<void>>()
+    const signalHubAdmission = (sessionID: SessionID) =>
+      Effect.sync(() => {
+        const latch = hubBusyLatches.get(sessionID)
+        if (latch === undefined) return
+        hubBusyLatches.delete(sessionID)
+        Deferred.doneUnsafe(latch, Effect.void)
+      })
+
+    // Admit a hub run: publish busy exactly once, only when the session is not
+    // already busy (a second prompt joining an in-flight/cold-starting run must not
+    // publish a repeat). Returns whether THIS call published the admission busy.
+    const admitHubBusy = (sessionID: SessionID) =>
+      Effect.gen(function* () {
+        const current = yield* status.get(sessionID)
+        if (current.type === "busy") return false
+        yield* status.set(sessionID, { type: "busy" })
+        yield* signalHubAdmission(sessionID)
+        return true
+      })
+
+    // A failed admission must not leave the session busy. If the worker already
+    // published idle, leave it alone; otherwise write the one fallback idle.
+    const releaseHubAdmission = (sessionID: SessionID, admitted: boolean) =>
+      admitted
+        ? Effect.gen(function* () {
+            const current = yield* status.get(sessionID)
+            if (current.type !== "idle") yield* status.set(sessionID, { type: "idle" })
+            yield* signalHubAdmission(sessionID)
+          })
+        : Effect.void
+
     // The run-state machine is the portable `Runner` table shared with the
     // session worker (`session/worker/execute.ts`): flag off it lives here in
     // the hub, flag on it lives inside the worker isolate.
@@ -210,8 +245,13 @@ export const layer = Layer.effect(
         // caller's `onInterrupt` is the run's intended result (flag-off parity),
         // not a failure, so a cancelled prompt handler returns the interrupted
         // message instead of `BadRequest`.
-        const run = hub.ensureRunningEffect(sessionID, origin).pipe(Effect.mapError(asRunError))
+        const admitted = yield* admitHubBusy(sessionID)
+        const run = hub.ensureRunningEffect(sessionID, origin).pipe(
+          Effect.mapError(asRunError),
+          Effect.tapError(() => releaseHubAdmission(sessionID, admitted)),
+        )
         const outcome = yield* interruptibleHubRun(run, hub, sessionID, onInterrupt).pipe(
+          Effect.onInterrupt(() => releaseHubAdmission(sessionID, admitted)),
           Effect.map(Option.some),
           Effect.catchTag("SessionCancelledError", () => Effect.succeed(Option.none<SessionExecutionResult>())),
         )
@@ -242,13 +282,21 @@ export const layer = Layer.effect(
         if (ready !== undefined) yield* ready.open
         // `hub.startShell` performs its own busy assertion and rejects with a
         // worker-local `SessionBusyError`; map it onto the domain `Session.BusyError`.
+        const admitted = yield* admitHubBusy(sessionID)
         const run = Effect.tryPromise({
           try: () => hub.startShell(sessionID, shell),
           // A worker-local `SessionBusyError` maps onto the domain
           // `Session.BusyError`; every other failure is a typed run error.
           catch: (error) => (error instanceof SessionBusyError ? busyError(sessionID) : asRunError(error)),
-        })
-        return yield* settleHubRun(interruptibleHubRun(run, hub, sessionID, onInterrupt), onInterrupt)
+        }).pipe(
+          Effect.tapError(() => releaseHubAdmission(sessionID, admitted)),
+        )
+        return yield* settleHubRun(
+          interruptibleHubRun(run, hub, sessionID, onInterrupt).pipe(
+            Effect.onInterrupt(() => releaseHubAdmission(sessionID, admitted)),
+          ),
+          onInterrupt,
+        )
       }
       const { runners } = yield* InstanceState.get(state)
       return yield* runners
@@ -257,7 +305,16 @@ export const layer = Layer.effect(
     })
 
     const awaitBusy = Effect.fn("SessionRunState.awaitBusy")(function* (sessionID: SessionID) {
-      if ((yield* hubIfRouted(sessionID)) !== undefined) return
+      const hub = yield* hubIfRouted(sessionID)
+      if (hub !== undefined) {
+        if ((yield* status.get(sessionID)).type === "busy") return
+        const latch = hubBusyLatches.get(sessionID) ?? Deferred.makeUnsafe<void>()
+        hubBusyLatches.set(sessionID, latch)
+        yield* Deferred.await(latch).pipe(
+          Effect.ensuring(Effect.sync(() => hubBusyLatches.get(sessionID) === latch && hubBusyLatches.delete(sessionID))),
+        )
+        return
+      }
       const { runners, busyLatches } = yield* InstanceState.get(state)
       if (runners.busy(sessionID)) return
       const latch = busyLatches.get(sessionID) ?? Deferred.makeUnsafe<void>()

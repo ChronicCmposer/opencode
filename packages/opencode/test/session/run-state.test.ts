@@ -8,7 +8,7 @@
 // end-to-end shell tests in `prompt.test.ts` do not observe directly.
 
 import { describe, expect } from "bun:test"
-import { Cause, Effect, Exit, Latch, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Latch, Layer } from "effect"
 import { BackgroundJob } from "@/background/job"
 import type { SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
@@ -43,6 +43,35 @@ const runStateLayer = SessionRunState.layer.pipe(
     ),
   ),
 )
+
+/** A `SessionStatus` layer that records every write, in order, for assertions. */
+const recordingStatus = () => {
+  const store = new Map<SessionID, SessionStatus.Info>()
+  const log: string[] = []
+  const calls: Array<{ sessionID: SessionID; status: SessionStatus.Info }> = []
+  const layer = Layer.succeed(SessionStatus.Service, {
+    get: (sessionID) => Effect.sync(() => store.get(sessionID) ?? { type: "idle" as const }),
+    set: (sessionID, status) =>
+      Effect.sync(() => {
+        store.set(sessionID, status)
+        log.push(`${String(sessionID)}:${status.type}`)
+        calls.push({ sessionID, status })
+      }),
+    list: () => Effect.sync(() => new Map(store)),
+  })
+  return { store, log, calls, layer }
+}
+
+/** `SessionRunState.layer` with a recording `SessionStatus` in place of the idle mock. */
+const runStateLayerWith = (status: Layer.Layer<SessionStatus.Service>) =>
+  SessionRunState.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.mock(BackgroundJob.Service, { list: () => Effect.succeed([]) }),
+        status,
+      ),
+    ),
+  )
 
 /** A hub that records the `startShell` arguments it receives, then delegates. */
 const recordingShellHub = (sessionID: SessionID, forwarded: Array<{ sessionID: SessionID; shell?: ShellInput }>) => {
@@ -510,4 +539,165 @@ describe("SessionRunState.ensureRunning — worker compatibility", () => {
       expect(result.dispatched).toHaveLength(1)
     }),
   )
+})
+
+// ---------------------------------------------------------------------------
+// Hub admission: busy is published before a cold worker boots, exactly once
+// per in-flight run, and released with one idle when the boot fails. `awaitBusy`
+// must observe that admission rather than race the worker's own busy.
+// ---------------------------------------------------------------------------
+
+describe("SessionRunState — hub admission busy/idle", () => {
+  const hubWith = (sessionID: SessionID, overrides: Partial<SessionHub>): SessionHub => {
+    const base = createSessionHub({
+      barrier: createTestBarrier(),
+      pool: createFakeExecutorPool(1, { value: withParts(sessionID) }),
+    })
+    return { ...base, ...overrides } satisfies SessionHub
+  }
+
+  it.live("admission busy is published before dispatch and one idle follows a boot failure", () => {
+    const sessionID = sid("ses_cold_admit")
+    const status = recordingStatus()
+    let sawBusyAtDispatch = false
+    const hub = hubWith(sessionID, {
+      ensureRunningEffect: (id) =>
+        Effect.sync(() => {
+          sawBusyAtDispatch = status.store.get(id)?.type === "busy"
+        }).pipe(
+          Effect.andThen(
+            Effect.fail(new WorkerCrashedError({ message: "boot failed", workerID: 1, sessionID })),
+          ),
+        ),
+    })
+
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const exit = yield* state
+          .ensureRunning(sessionID, Effect.succeed(withParts(sessionID)), Effect.succeed(withParts(sessionID)))
+          .pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(sawBusyAtDispatch).toBe(true)
+        expect(status.log.filter((entry) => entry.endsWith(":busy"))).toHaveLength(1)
+        expect(status.log.filter((entry) => entry.endsWith(":idle"))).toHaveLength(1)
+      }).pipe(
+        Effect.provide(runStateLayerWith(status.layer)),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+      ),
+    )
+  })
+
+  it.live("a clean cancel during boot publishes exactly one busy and one idle", () => {
+    const sessionID = sid("ses_cold_cancel")
+    const status = recordingStatus()
+    const hub = hubWith(sessionID, {
+      ensureRunningEffect: () =>
+        Effect.fail(new SessionCancelledError({ message: "cancelled during boot", sessionID })),
+    })
+
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        // A clean cancel during boot is the caller's interrupt result, not a
+        // failure, and the admission busy must be released with exactly one idle.
+        const result = yield* state.ensureRunning(
+          sessionID,
+          Effect.succeed(withParts(sessionID)),
+          Effect.succeed(withParts(sessionID)),
+        )
+
+        expect(result).toEqual(withParts(sessionID))
+        expect(status.calls).toEqual([
+          { sessionID, status: { type: "busy" } },
+          { sessionID, status: { type: "idle" } },
+        ])
+      }).pipe(
+        Effect.provide(runStateLayerWith(status.layer)),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+      ),
+    )
+  })
+
+  it.live("a second prompt during a cold start publishes no extra busy", () => {
+    const sessionID = sid("ses_cold_join")
+    const status = recordingStatus()
+    const gate = Deferred.makeUnsafe<void>()
+    let dispatches = 0
+    const hub = hubWith(sessionID, {
+      ensureRunningEffect: () =>
+        Effect.sync(() => {
+          dispatches += 1
+        }).pipe(
+          Effect.andThen(Deferred.await(gate)),
+          Effect.andThen(Effect.succeed({ sessionID: String(sessionID), value: withParts(sessionID) })),
+        ),
+    })
+
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const work = Effect.succeed(withParts(sessionID))
+        const first = yield* state.ensureRunning(sessionID, work, work).pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          Effect.sync(() => (dispatches >= 1 ? true : undefined)),
+          "first dispatch never started",
+        )
+        const second = yield* state.ensureRunning(sessionID, work, work).pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          Effect.sync(() => (dispatches >= 2 ? true : undefined)),
+          "second dispatch never started",
+        )
+        expect(status.log.filter((entry) => entry.endsWith(":busy"))).toHaveLength(1)
+        yield* Deferred.succeed(gate, undefined)
+        yield* Fiber.await(first)
+        yield* Fiber.await(second)
+      }).pipe(
+        Effect.provide(runStateLayerWith(status.layer)),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+      ),
+    )
+  })
+
+  it.live("awaitBusy on a routed session waits for admission", () => {
+    const sessionID = sid("ses_await_busy")
+    const status = recordingStatus()
+    const gate = Deferred.makeUnsafe<void>()
+    const hub = hubWith(sessionID, {
+      ensureRunningEffect: () =>
+        Deferred.await(gate).pipe(
+          Effect.as({ sessionID: String(sessionID), value: withParts(sessionID) }),
+        ),
+    })
+
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const woke = yield* Deferred.make<void>()
+        const waiter = yield* state
+          .awaitBusy(sessionID)
+          .pipe(Effect.andThen(Deferred.succeed(woke, undefined)), Effect.forkChild)
+        yield* Effect.yieldNow
+        expect(yield* Deferred.isDone(woke)).toBe(false)
+        const work = Effect.succeed(withParts(sessionID))
+        const run = yield* state.ensureRunning(sessionID, work, work).pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          Effect.map(Deferred.isDone(woke), (done) => (done ? true : undefined)),
+          "awaitBusy never resolved after admission",
+        )
+        expect(status.log.filter((entry) => entry.endsWith(":busy"))).toHaveLength(1)
+        yield* Deferred.succeed(gate, undefined)
+        yield* Fiber.await(run)
+        yield* Fiber.await(waiter)
+      }).pipe(
+        Effect.provide(runStateLayerWith(status.layer)),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+      ),
+    )
+  })
 })

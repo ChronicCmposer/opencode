@@ -60,7 +60,10 @@ const runStateLayer = SessionRunState.layer.pipe(
       // The flag-on cancel branch now cancels background jobs too, so `list`
       // must be callable even when no jobs are running.
       Layer.mock(BackgroundJob.Service, { list: () => Effect.succeed([]) }),
-      Layer.mock(SessionStatus.Service, { set: () => Effect.void }),
+      Layer.mock(SessionStatus.Service, {
+        get: () => Effect.succeed({ type: "idle" } as SessionStatus.Info),
+        set: () => Effect.void,
+      }),
     ),
   ),
 )
@@ -83,6 +86,7 @@ const recordingRunStateLayer = (calls: StatusCall[]) =>
       Layer.mergeAll(
         Layer.mock(BackgroundJob.Service, { list: () => Effect.succeed([]) }),
         Layer.mock(SessionStatus.Service, {
+          get: () => Effect.succeed({ type: "idle" } as SessionStatus.Info),
           set: (sessionID, status) => Effect.sync(() => void calls.push({ sessionID, status })),
         }),
       ),
@@ -108,6 +112,7 @@ const recordingBackgroundRunStateLayer = (calls: StatusCall[], jobs: BackgroundJ
             }),
         }),
         Layer.mock(SessionStatus.Service, {
+          get: () => Effect.succeed({ type: "idle" } as SessionStatus.Info),
           set: (sessionID, status) => Effect.sync(() => void calls.push({ sessionID, status })),
         }),
       ),
