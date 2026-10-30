@@ -12,6 +12,8 @@ import { chatChunk, sseData } from "./openai-frames"
 export interface MockProviderUsage {
   readonly input: number
   readonly output: number
+  /** Tokens served from the provider prompt cache (`prompt_tokens_details.cached_tokens`). */
+  readonly cacheRead?: number
 }
 
 /** A streamed tool call in OpenAI delta form. */

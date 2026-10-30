@@ -296,6 +296,7 @@ describe("resolveWorkerModel", () => {
       limit: { context: 1_000, output: 1_000 },
       options: {},
       providerOptions: { baseURL: "https://api.example.com/v1", headers: { "x-provider": "1" } },
+      cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
     })
   })
 
@@ -382,6 +383,7 @@ describe("buildSessionWorkerInit", () => {
       limit: { context: 1_000, output: 1_000 },
       options: {},
       providerOptions: { baseURL: "https://api.example.com/v1", headers: { "x-provider": "1" } },
+      cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
     })
     expect(init.snapshot.directory).toBe("/tmp/opencode-proj")
     expect("workerCount" in init.snapshot).toBe(false)

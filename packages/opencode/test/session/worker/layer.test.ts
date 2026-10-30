@@ -829,6 +829,37 @@ describe("reduced worker provider — consumes the real descriptor", () => {
     expect(model.options).toEqual({})
     expect(info.options).toEqual({})
   })
+
+  test("uses the serialized cost, including tiers and the over-200K price", async () => {
+    const cost: Provider.Model["cost"] = {
+      input: 3,
+      output: 15,
+      cache: { read: 0.3, write: 3.75 },
+      tiers: [
+        {
+          input: 6,
+          output: 30,
+          cache: { read: 0.6, write: 7.5 },
+          tier: { type: "context", size: 200_000 },
+        },
+      ],
+      experimentalOver200K: {
+        input: 4.5,
+        output: 22.5,
+        cache: { read: 0.45, write: 5.625 },
+      },
+    }
+
+    const { model } = await Effect.runPromise(readReducedDescriptor({ ...descriptorConfig, cost }))
+
+    expect(model.cost).toEqual(cost)
+  })
+
+  test("defaults an absent cost to zero", async () => {
+    const { model } = await Effect.runPromise(readReducedDescriptor(reducedConfig))
+
+    expect(model.cost).toEqual({ input: 0, output: 0, cache: { read: 0, write: 0 } })
+  })
 })
 
 // ---------------------------------------------------------------------------

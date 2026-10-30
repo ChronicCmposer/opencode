@@ -117,6 +117,24 @@ export interface SerializedModelLimit {
   readonly output: number
 }
 
+/** The real model pricing, serialized for the isolate boundary. */
+export interface SerializedModelCost {
+  readonly input: number
+  readonly output: number
+  readonly cache: { readonly read: number; readonly write: number }
+  readonly tiers?: ReadonlyArray<{
+    readonly input: number
+    readonly output: number
+    readonly cache: { readonly read: number; readonly write: number }
+    readonly tier: { readonly type: "context"; readonly size: number }
+  }>
+  readonly experimentalOver200K?: {
+    readonly input: number
+    readonly output: number
+    readonly cache: { readonly read: number; readonly write: number }
+  }
+}
+
 /**
  * The plain-data model bootstrap the hub ships to a worker. It carries the
  * REAL descriptor — capabilities, limits, options, variants and provider
@@ -136,6 +154,7 @@ export interface SessionWorkerModel {
   readonly options?: Readonly<Record<string, unknown>>
   readonly variants?: Readonly<Record<string, unknown>>
   readonly providerOptions?: Readonly<Record<string, unknown>>
+  readonly cost?: SerializedModelCost
 }
 
 /**
@@ -650,14 +669,16 @@ function modelConfig(model: SessionWorkerModel): WorkerModelConfig {
     baseUrl: model.baseUrl,
     apiKey: model.apiKey,
     headers: model.headers ?? {},
-    // The wire shapes (`SerializedModelCapabilities` / a loose variants record)
-    // are the frozen isolate contract; `WorkerModelConfig` is the reduced
-    // provider's stricter projection. Narrowing here is the single boundary.
+    // The wire shapes (`SerializedModelCapabilities` / `SerializedModelCost` / a
+    // loose variants record) are the frozen isolate contract; `WorkerModelConfig`
+    // is the reduced provider's stricter projection. Narrowing here is the single
+    // boundary.
     capabilities: model.capabilities as WorkerModelConfig["capabilities"],
     limit: model.limit,
     ...(model.options === undefined ? {} : { options: model.options }),
     ...(model.variants === undefined ? {} : { variants: model.variants as WorkerModelConfig["variants"] }),
     ...(model.providerOptions === undefined ? {} : { providerOptions: model.providerOptions }),
+    ...(model.cost === undefined ? {} : { cost: model.cost as WorkerModelConfig["cost"] }),
   }
 }
 

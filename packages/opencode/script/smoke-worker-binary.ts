@@ -36,6 +36,9 @@ import { testProviderConfig } from "../test/lib/test-provider"
 /** EventV2 types a healthy flag-ON worker run must surface on `/global/event`. */
 export const REQUIRED_EVENT_TYPES = ["message.part.updated", "message.part.delta", "session.status"] as const
 
+/** Non-zero pricing so the gate proves cost crosses the hub→worker boundary. */
+export const SMOKE_MODEL_COST = { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } } as const
+
 /** Log fragments that identify the packaged-worker boot failure this gate exists for. */
 export const FAILURE_SIGNATURES: readonly RegExp[] = [
   /worker\s+\d+\s+crashed/i,
@@ -226,13 +229,29 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
   const toolTurnPath = path.join(worktree, TOOL_TURN_FILE)
   await using provider = startMockProvider({
     chunks: ["Hel", "lo"],
+    // The greeting turn must report tokens so `Session.getUsage` prices it > 0;
+    // without usage the gate's assistant-cost assertion sees 0.
+    usage: { input: 1000, output: 100 },
     select: (body) => selectToolTurnScript(body, toolTurnPath),
   })
   const pluginFile = path.join(home, "smoke-plugin.js")
   const contextFile = path.join(home, "smoke-context.json")
   writeFileSync(pluginFile, smokePlugin(contextFile))
+  const providerConfig = testProviderConfig(provider.baseUrl)
   const configJSON = JSON.stringify({
-    ...testProviderConfig(provider.baseUrl),
+    ...providerConfig,
+    provider: {
+      ...providerConfig.provider,
+      test: {
+        ...providerConfig.provider.test,
+        models: {
+          "test-model": {
+            ...providerConfig.provider.test.models["test-model"],
+            cost: SMOKE_MODEL_COST,
+          },
+        },
+      },
+    },
     model: "test/test-model",
     plugin: [pathToFileURL(pluginFile).href],
   })
@@ -300,8 +319,16 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
     const markerDeadline = Date.now() + EVENT_TIMEOUT_MS
     while (!markerSeen && Date.now() < markerDeadline) await sleep(POLL_INTERVAL_MS)
 
+    const costDeadline = Date.now() + EVENT_TIMEOUT_MS
+    let cost = 0
+    while (cost <= 0 && Date.now() < costDeadline) {
+      cost = await assistantCost(url, worktree, session)
+      if (cost <= 0) await sleep(POLL_INTERVAL_MS)
+    }
+
     const missing: string[] = REQUIRED_EVENT_TYPES.filter((type) => !eventTypeSeen.has(type))
     if (!markerSeen) missing.push(`text.complete marker ${TEXT_COMPLETE_MARKER}`)
+    if (!(cost > 0)) missing.push(`assistant cost > 0 (got ${cost})`)
     // A failed turn still streams parts and goes idle; the error only shows as this event.
     if (eventTypeSeen.has("session.error")) missing.push("no session.error")
 
@@ -437,6 +464,17 @@ async function promptAsync(
   if (response.status !== 204) {
     throw new Error(`POST /session/:id/prompt_async failed: HTTP ${response.status} ${await response.text()}`)
   }
+}
+
+/** The first assistant message's cost, read back from the session. */
+async function assistantCost(url: string, directory: string, sessionID: string): Promise<number> {
+  const response = await fetch(`${url}/session/${sessionID}/message`, {
+    headers: { ...authHeaders(), "x-opencode-directory": directory },
+  })
+  if (!response.ok) return 0
+  const messages = (await response.json()) as ReadonlyArray<{ info?: { role?: unknown; cost?: unknown } }>
+  const assistant = messages.find((message) => message.info?.role === "assistant")
+  return typeof assistant?.info?.cost === "number" ? assistant.info.cost : 0
 }
 
 /** Poll the observed set until every required type arrives or the deadline passes. */

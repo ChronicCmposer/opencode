@@ -2,6 +2,7 @@
 export interface FrameUsage {
   readonly input: number
   readonly output: number
+  readonly cacheRead?: number
 }
 
 export interface ChatChunkInput {
@@ -19,12 +20,15 @@ export function sseData(payload: unknown): string {
   return "data: " + JSON.stringify(payload) + "\n\n"
 }
 
-/** OpenAI `usage` shape from an input/output pair. */
-export function usageTokens(usage: FrameUsage): Record<string, number> {
+/** OpenAI `usage` shape from an input/output pair plus optional cache-read tokens. */
+export function usageTokens(usage: FrameUsage): Record<string, unknown> {
   return {
     prompt_tokens: usage.input,
     completion_tokens: usage.output,
     total_tokens: usage.input + usage.output,
+    ...(usage.cacheRead === undefined
+      ? {}
+      : { prompt_tokens_details: { cached_tokens: usage.cacheRead } }),
   }
 }
 

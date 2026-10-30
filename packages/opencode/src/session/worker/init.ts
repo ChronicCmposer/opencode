@@ -21,6 +21,7 @@ import { Provider, parseModel } from "@/provider/provider"
 
 import type {
   SerializedModelCapabilities,
+  SerializedModelCost,
   SerializedModelLimit,
   SessionWorkerCapabilities,
   SessionWorkerInit,
@@ -205,6 +206,39 @@ function serializeLimit(limit: Provider.Model["limit"]): SerializedModelLimit {
   return { context: limit.context, output: limit.output }
 }
 
+/** Copy the pricing into plain numbers; an unpriced model serializes to zeros. */
+function serializeCost(cost: Provider.Model["cost"]): SerializedModelCost {
+  const finite = (value: number | undefined) => (value !== undefined && Number.isFinite(value) ? value : 0)
+  const cache = (value: Provider.Model["cost"]["cache"] | undefined) => ({
+    read: finite(value?.read),
+    write: finite(value?.write),
+  })
+  return {
+    input: finite(cost.input),
+    output: finite(cost.output),
+    cache: cache(cost.cache),
+    ...(cost.tiers === undefined
+      ? {}
+      : {
+          tiers: cost.tiers.map((tier) => ({
+            input: finite(tier.input),
+            output: finite(tier.output),
+            cache: cache(tier.cache),
+            tier: { type: tier.tier.type, size: finite(tier.tier.size) },
+          })),
+        }),
+    ...(cost.experimentalOver200K === undefined
+      ? {}
+      : {
+          experimentalOver200K: {
+            input: finite(cost.experimentalOver200K.input),
+            output: finite(cost.experimentalOver200K.output),
+            cache: cache(cost.experimentalOver200K.cache),
+          },
+        }),
+  }
+}
+
 function credentialKey(credential: Auth.Info | undefined): string | undefined {
   if (!credential) return undefined
   if (credential.type === "api" || credential.type === "wellknown") return credential.key
@@ -268,7 +302,8 @@ export const resolveWorkerModel = Effect.fn("WorkerModel.resolve")(function* (op
     firstNonCloneablePath(model.variants, "variants") ??
     firstNonCloneablePath(model.capabilities, "capabilities") ??
     firstNonCloneablePath(model.limit, "limit") ??
-    firstNonCloneablePath(model.headers, "headers")
+    firstNonCloneablePath(model.headers, "headers") ??
+    firstNonCloneablePath(model.cost, "cost")
   if (nonCloneable !== undefined) {
     return yield* new WorkerModelNotSerializableError({
       providerID: selection.providerID,
@@ -291,6 +326,7 @@ export const resolveWorkerModel = Effect.fn("WorkerModel.resolve")(function* (op
     options: model.options,
     ...(model.variants === undefined ? {} : { variants: model.variants }),
     providerOptions: info.options,
+    cost: serializeCost(model.cost),
   }
   return resolved
 })
@@ -606,8 +642,9 @@ export const buildSessionWorkerInit = Effect.fn("SessionWorkerInit.build")(funct
   return {
     snapshot,
     env,
-    // The full descriptor crosses verbatim, so the reduced provider reproduces
-    // flag-OFF sampling (capabilities/limits/options/variants/provider options).
+    // The serialized descriptor crosses as plain data, so the reduced provider
+    // reproduces flag-OFF sampling
+    // (capabilities/limits/options/variants/provider options/cost).
     model,
     role: options.role ?? "session",
     ...(options.workerID === undefined ? {} : { workerID: options.workerID }),

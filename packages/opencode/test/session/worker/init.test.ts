@@ -90,6 +90,7 @@ interface ModelLayerInput {
   readonly modelOptions?: Record<string, unknown>
   readonly modelVariants?: Record<string, unknown>
   readonly modelCapabilities?: Record<string, unknown>
+  readonly modelCost?: Provider.Model["cost"]
   readonly config?: Partial<ConfigV1.Info>
 }
 
@@ -112,6 +113,7 @@ const modelLayers = (input: ModelLayerInput = {}) =>
           options: input.modelOptions ?? fixtureModel.options,
           variants: input.modelVariants ?? fixtureModel.variants,
           capabilities: input.modelCapabilities ?? fixtureModel.capabilities,
+          cost: input.modelCost ?? (modelID === DEFAULT_MODEL ? defaultModelRecord : fixtureModel).cost,
         } as unknown as Provider.Model),
     }),
     Layer.mock(Auth.Service, {
@@ -143,6 +145,43 @@ describe("resolveWorkerModel descriptor", () => {
     expect(model.limit).toEqual({ context: 200_000, output: 32_000 })
     expect(model.options).toEqual({ temperature: 0.2, topP: 0.9 })
     expect(model.variants).toEqual({ high: { reasoningEffort: "high" } })
+  })
+
+  test("serializes the model cost", async () => {
+    const model = await runResolve()
+
+    expect(model.cost).toEqual({ input: 1, output: 2, cache: { read: 0, write: 0 } })
+  })
+
+  test("serializes cost tiers and the over-200K price", async () => {
+    const modelCost: Provider.Model["cost"] = {
+      input: 3,
+      output: 15,
+      cache: { read: 0.3, write: 3.75 },
+      tiers: [
+        {
+          input: 6,
+          output: 30,
+          cache: { read: 0.6, write: 7.5 },
+          tier: { type: "context", size: 200_000 },
+        },
+      ],
+      experimentalOver200K: {
+        input: 4.5,
+        output: 22.5,
+        cache: { read: 0.45, write: 5.625 },
+      },
+    }
+
+    const model = await runResolve({ modelCost })
+
+    expect(model.cost).toEqual(modelCost)
+  })
+
+  test("an unpriced model serializes to zero cost", async () => {
+    const model = await runResolve({ modelCost: {} as Provider.Model["cost"] })
+
+    expect(model.cost).toEqual({ input: 0, output: 0, cache: { read: 0, write: 0 } })
   })
 
   test("serializes provider-level options and merges provider + model headers", async () => {

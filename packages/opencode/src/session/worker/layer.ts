@@ -1276,6 +1276,7 @@ export interface WorkerModelConfig {
   readonly variants?: Readonly<Record<string, Readonly<Record<string, unknown>>>>
   /** Provider-level options (`provider.options`), spread into the SDK + transforms. */
   readonly providerOptions?: Readonly<Record<string, unknown>>
+  readonly cost?: Provider.Model["cost"]
 }
 
 const allModalities = { text: true, audio: false, image: false, video: false, pdf: false }
@@ -1331,7 +1332,7 @@ function reducedProviderModel(config: WorkerModelConfig): Provider.Model {
       input: capabilities?.input ?? allModalities,
       output: capabilities?.output ?? allModalities,
     },
-    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    cost: config.cost ?? { input: 0, output: 0, cache: { read: 0, write: 0 } },
     limit: { context: config.limit?.context ?? 128_000, output: config.limit?.output ?? 0 },
     status: "active",
     options: { ...(config.options ?? {}) },
