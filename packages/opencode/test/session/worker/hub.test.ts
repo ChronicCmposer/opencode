@@ -3064,4 +3064,113 @@ describe("startup dead-lease sweep", () => {
       fs.rmSync(directory, { recursive: true, force: true })
     }
   })
+
+  function createSweepTables(connection: ReturnType<typeof openConnection>): void {
+    connection.exec(`
+      CREATE TABLE event_sequence (
+        aggregate_id text PRIMARY KEY,
+        seq integer NOT NULL,
+        owner_id text,
+        worker_owner_id text,
+        worker_heartbeat_at integer,
+        worker_expires_at integer
+      );
+      CREATE TABLE tool_call (
+        call_id text NOT NULL,
+        session_id text NOT NULL,
+        tool text NOT NULL,
+        side_effecting integer NOT NULL DEFAULT 1 CHECK (side_effecting IN (0, 1)),
+        state text NOT NULL CHECK (state IN ('started', 'finished')),
+        outcome text,
+        time_started integer NOT NULL,
+        time_finished integer,
+        worker_owner_id text,
+        PRIMARY KEY (call_id, session_id)
+      );
+      CREATE TABLE message (
+        id text PRIMARY KEY,
+        session_id text,
+        time_created integer,
+        data text
+      );
+    `)
+  }
+
+  function insertStartedCall(
+    connection: ReturnType<typeof openConnection>,
+    callID: string,
+    sessionID: string,
+    workerOwnerID: string,
+  ): void {
+    connection.run(
+      "INSERT INTO tool_call (call_id, session_id, tool, side_effecting, state, outcome, time_started, time_finished, worker_owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [callID, sessionID, "bash", 1, "started", null, Date.now(), null, workerOwnerID],
+    )
+  }
+
+  test("abandons a dead owner's started tool call whose message is gone", async () => {
+    const { filename, directory } = scratch()
+    const connection = openConnection({ filename })
+    try {
+      createSweepTables(connection)
+      insertStartedCall(connection, "msg_gone:call_1", "s-gone", owner(1, DEAD_PID))
+
+      await sweepDeadLeasesAtStartup(filename, undefined, recordingBridgeFrom(() => {}))
+
+      const row = connection.all<{ state: string; outcome: string | null; time_finished: number | null }>(
+        "SELECT state, outcome, time_finished FROM tool_call WHERE call_id = ?",
+        ["msg_gone:call_1"],
+      )[0]
+      expect(row?.state).toBe("finished")
+      expect(row?.outcome).toBe("abandoned")
+      expect(row?.time_finished ?? 0).toBeGreaterThan(0)
+    } finally {
+      connection.close()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test("keeps a dead owner's started call when its message is the last assistant message", async () => {
+    const { filename, directory } = scratch()
+    const connection = openConnection({ filename })
+    try {
+      createSweepTables(connection)
+      connection.run("INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)", [
+        "msg_last",
+        "s-last",
+        Date.now(),
+        JSON.stringify({ id: "msg_last", role: "assistant" }),
+      ])
+      insertStartedCall(connection, "msg_last:call_2", "s-last", owner(1, DEAD_PID))
+
+      await sweepDeadLeasesAtStartup(filename, undefined, recordingBridgeFrom(() => {}))
+
+      const row = connection.all<{ state: string }>("SELECT state FROM tool_call WHERE call_id = ?", [
+        "msg_last:call_2",
+      ])[0]
+      expect(row?.state).toBe("started")
+    } finally {
+      connection.close()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test("does not touch a live owner's started call", async () => {
+    const { filename, directory } = scratch()
+    const connection = openConnection({ filename })
+    try {
+      createSweepTables(connection)
+      insertStartedCall(connection, "msg_live:call_3", "s-live-call", owner(2, process.pid))
+
+      await sweepDeadLeasesAtStartup(filename, undefined, recordingBridgeFrom(() => {}))
+
+      const row = connection.all<{ state: string }>("SELECT state FROM tool_call WHERE call_id = ?", [
+        "msg_live:call_3",
+      ])[0]
+      expect(row?.state).toBe("started")
+    } finally {
+      connection.close()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  })
 })

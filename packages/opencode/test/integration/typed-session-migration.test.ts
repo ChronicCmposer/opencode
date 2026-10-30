@@ -85,7 +85,12 @@ describe("no raw writes in the lane's write surface", () => {
   test("the tool-call ledger has no row DML or raw connection write", () => {
     const file = readSource("session/ledger/tool-call.ts")
     expect(file).not.toMatch(/\bINSERT\s+INTO\b/i)
-    expect(file).not.toMatch(/\bUPDATE\s+tool_call\b/i)
+    // The single row update is the discard-time abandonment sweep, conditional
+    // on `state = 'started'` and the message key prefix.
+    const updates = file.match(/\bUPDATE\s+tool_call\b/gi) ?? []
+    expect(updates).toHaveLength(1)
+    expect(file).toMatch(/outcome = 'abandoned'/)
+    expect(file).not.toMatch(/DELETE\s+FROM\s+tool_call/i)
     expect(file).not.toMatch(/\bDELETE\s+FROM\b/i)
     expect(file).not.toMatch(/connection\.run\s*\(/)
     // The result/finish pair is scoped by the repository capability, not raw SQL.

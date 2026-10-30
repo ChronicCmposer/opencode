@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs"
+import { sql, type SQL } from "drizzle-orm"
 import { Context, Effect, Layer, Option, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
@@ -7,6 +8,64 @@ import type { RepositoryValues, WorkerRepository } from "@/session/worker/reposi
 import { connectedRepository } from "@/session/worker/repository/write"
 import { WorkerDb } from "@/session/worker/db"
 import { LEDGER_SQL_FALLBACK } from "./sql/fallback.gen"
+
+/** The ledger key for one tool call: `<owning assistant message>:<provider call id>`. */
+export const toolCallKey = (messageID: string, callID: string): string => `${messageID}:${callID}`
+
+/** The message prefix of a ledger key, for finding calls owned by one message. */
+export const toolCallMessagePrefix = (messageID: string): string => `${messageID}:`
+
+/** The owning message id of a ledger key, or `undefined` when it is not a ledger key. */
+export function toolCallMessageID(callID: string): string | undefined {
+  const index = callID.indexOf(":")
+  return index <= 0 ? undefined : callID.slice(0, index)
+}
+
+/** The drizzle raw-run surface the hub discard path already holds. */
+export interface LedgerSqlDatabase {
+  run(query: SQL): Effect.Effect<unknown, unknown>
+  all<T = unknown>(query: SQL): Effect.Effect<T[], unknown>
+}
+
+/** The worker owns the tool-call table; a hub that never opened a worker has nothing to abandon. */
+function hasToolCallTable(db: LedgerSqlDatabase): Effect.Effect<boolean> {
+  return db
+    .all(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tool_call' LIMIT 1`)
+    .pipe(Effect.map((rows) => rows.length > 0), Effect.orDie)
+}
+
+/** The driver's row-change count, when it reports one. */
+function changedRows(result: unknown): number {
+  if (typeof result !== "object" || result === null || !("changes" in result)) return 0
+  return typeof result.changes === "number" ? result.changes : 0
+}
+
+/**
+ * Mark every `started` tool-call record owned by the discarded messages as
+ * finished/abandoned in the caller's transaction. Abandoning only stops the
+ * record from blocking automatic resume; it never turns the call into a success.
+ */
+export function abandonForMessages(
+  db: LedgerSqlDatabase,
+  sessionID: string,
+  messageIDs: readonly string[],
+): Effect.Effect<number> {
+  return Effect.gen(function* () {
+    if (!(yield* hasToolCallTable(db))) return 0
+    let changes = 0
+    for (const messageID of messageIDs) {
+      const result = yield* db.run(sql`
+        UPDATE tool_call
+        SET state = 'finished', outcome = 'abandoned', time_finished = ${Date.now()}
+        WHERE session_id = ${sessionID}
+          AND state = 'started'
+          AND substr(call_id, 1, ${toolCallMessagePrefix(messageID).length}) = ${toolCallMessagePrefix(messageID)}
+      `).pipe(Effect.orDie)
+      changes += changedRows(result)
+    }
+    return changes
+  })
+}
 
 export const TOOL_CALL_STATES = ["started", "finished", "indeterminate"] as const
 

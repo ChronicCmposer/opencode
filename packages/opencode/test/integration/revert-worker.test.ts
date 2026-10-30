@@ -38,6 +38,7 @@ import {
   type WorkerModelConfig,
 } from "@/session/worker/layer"
 import type { HubProxyAuthorities } from "@/session/worker/hub"
+import type { DiscardRevertedRequest } from "@/session/worker/hub-proxy-authorities"
 import { buildHubProxyHandlers } from "@/session/worker/hub"
 import { noMcpNoSnapshotHubProxy } from "../lib/hub-proxy-defaults"
 import { openWorkerDatabase, type WorkerDatabase } from "@/session/worker/db"
@@ -161,6 +162,8 @@ interface Harness {
   }
   /** Session ids the hub authority was asked to clear. */
   readonly cleared: readonly string[]
+  /** The discard requests the hub authority received, in arrival order. */
+  readonly requests: readonly DiscardRevertedRequest[]
   /** The worker-local writer seam `createSessionWork` reads through. */
   readonly writer: WriterClientHandle
   readonly close: () => Promise<void>
@@ -174,7 +177,7 @@ interface Harness {
 function hubPort(
   filename: string,
   cleared: string[],
-  options: { readonly failClear?: boolean } = {},
+  options: { readonly failClear?: boolean; readonly requests?: DiscardRevertedRequest[] } = {},
 ): { clients: HubProxyClients; dispose: () => void } {
   const authorities: HubProxyAuthorities = {
     sessionStatus: {
@@ -198,7 +201,9 @@ function hubPort(
     ...buildHubProxyHandlers(authorities, instantRunner),
     ...noMcpNoSnapshotHubProxy,
     "session.discardReverted": (request) => {
-      const { sessionID, messageIDs } = request as { sessionID: string; messageIDs: ReadonlyArray<string> }
+      const discard = request as DiscardRevertedRequest
+      const { sessionID, messageIDs } = discard
+      options.requests?.push(discard)
       if (options.failClear) throw new Error("hub discard failed")
       cleared.push(sessionID)
       // The hub's single transaction: delete the reverted rows and clear `revert` together.
@@ -240,7 +245,8 @@ async function harness(
   databases.push(database)
 
   const cleared: string[] = []
-  const hub = hubPort(filename, cleared, options)
+  const requests: DiscardRevertedRequest[] = []
+  const hub = hubPort(filename, cleared, { ...options, requests })
   disposes.push(hub.dispose)
 
   const snapshot = workerSnapshot({ directory })
@@ -275,6 +281,7 @@ async function harness(
     context,
     instance,
     cleared,
+    requests,
     writer,
     close: async () => {
       for (const dispose of disposes.splice(0).reverse()) await dispose()
@@ -324,6 +331,10 @@ describe("worker-mode revert cleanup", () => {
 
       // 2. The hub authority performed the clear...
       expect(testHarness.cleared).toEqual([SESSION])
+      // ...with the reverted message and an explicit (empty) part list.
+      expect(testHarness.requests).toHaveLength(1)
+      expect(testHarness.requests[0]!.messageIDs).toContain(USER_MESSAGE)
+      expect(testHarness.requests[0]!.parts).toEqual([])
       expect(adminRows(testHarness.filename, "SELECT revert FROM session WHERE id = ?", [SESSION])).toEqual([
         { revert: null },
       ])

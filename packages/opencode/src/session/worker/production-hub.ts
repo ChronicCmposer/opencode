@@ -21,7 +21,7 @@ import { createLiveEventPublisher, instanceLocation, EventV2Bridge, type LiveEve
 import type { EventV2 } from "@opencode-ai/core/event"
 import { DurableLog, StateCache } from "@opencode-ai/core/durable-log"
 import type { MessageID, PartID, SessionID } from "@/session/schema"
-import { DbExecutor } from "./db-executor"
+import { DbExecutor, type DbStatement } from "./db-executor"
 import { spawnDepth } from "@/session/depth"
 import { defined } from "@/util/object"
 import { setThreadName } from "@/util/thread-name"
@@ -49,6 +49,7 @@ import { workerLogMessage, WorkerLogging } from "./worker-logging"
 import { Session } from "@/session/session"
 import { Snapshot } from "@/snapshot"
 import { recordAsync } from "@/session/ledger/crash"
+import { toolCallMessageID } from "@/session/ledger/tool-call"
 import { ensureProductionSchemaAsync } from "@/session/db/schema"
 
 import {
@@ -469,6 +470,8 @@ export async function sweepDeadLeasesAtStartup(
       ? DbExecutor.makePromiseExecutor({ filename, create: false, name: "hub-lease-sweep" })
       : undefined
   const target = executor ?? owned!
+  const hasTable = async (name: string): Promise<boolean> =>
+    (await target.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1", [name])).length > 0
   try {
     const rows = await target.query(
       "SELECT aggregate_id, worker_owner_id FROM event_sequence WHERE worker_owner_id IS NOT NULL AND (worker_expires_at IS NULL OR worker_expires_at <> 0)",
@@ -479,16 +482,77 @@ export async function sweepDeadLeasesAtStartup(
         typeof row.worker_owner_id === "string" &&
         DurableLog.isDeadWorkerOwner(row.worker_owner_id),
     )
-    if (dead.length === 0) return 0
-    const results = await target.transaction(
-      dead.map((row) => ({
-        sql: "UPDATE event_sequence SET worker_expires_at = 0 WHERE aggregate_id = ? AND worker_owner_id = ?",
-        params: [row.aggregate_id, row.worker_owner_id],
-      })),
-    )
-    const released = results.reduce((total, result) => total + result.changes, 0)
-    if (released > 0) {
-      void bridge?.fork(Effect.logInfo(workerLogMessage("startup lease sweep"), { released }))
+    const leaseStatements: DbStatement[] = dead.map((row) => ({
+      sql: "UPDATE event_sequence SET worker_expires_at = 0 WHERE aggregate_id = ? AND worker_owner_id = ?",
+      params: [row.aggregate_id, row.worker_owner_id],
+    }))
+
+    // The startup sweep is best-effort: lease release and ledger abandonment are
+    // independent, so one failure cannot strand the other.
+    const released =
+      leaseStatements.length === 0
+        ? 0
+        : (await target.transaction(leaseStatements)).reduce((total, result) => total + result.changes, 0)
+
+    // A dead worker's `started` tool call keeps automatic resume blocked only
+    // while its message is still the session's last assistant message: the user
+    // must act on that record. Anything older (or whose message is gone) is
+    // abandoned. Abandoning never records a success; the `worker_crash` row and
+    // the indeterminate user-facing message stay, and only the blocking ledger
+    // row is settled.
+    let abandoned = 0
+    try {
+      const now = Date.now()
+      const abandonStatements: DbStatement[] = []
+      if (await hasTable("tool_call")) {
+        const hasMessage = await hasTable("message")
+        const calls = await target.query(
+          "SELECT call_id, session_id, worker_owner_id FROM tool_call WHERE state = 'started' AND worker_owner_id IS NOT NULL",
+        )
+        for (const row of calls) {
+          const owner = row.worker_owner_id
+          if (typeof owner !== "string" || !DurableLog.isDeadWorkerOwner(owner)) continue
+          const callID = String(row.call_id)
+          const sessionID = String(row.session_id)
+          const messageID = toolCallMessageID(callID)
+          if (messageID === undefined) continue
+          if (hasMessage) {
+            const exists = await target.query("SELECT id FROM message WHERE id = ? AND session_id = ? LIMIT 1", [
+              messageID,
+              sessionID,
+            ])
+            const lastAssistant = await target.query(
+              "SELECT id FROM message WHERE session_id = ? AND json_valid(data) AND json_extract(data, '$.role') = 'assistant' ORDER BY time_created DESC, id DESC LIMIT 1",
+              [sessionID],
+            )
+            const blocks = exists.length > 0 && lastAssistant[0]?.id === messageID
+            if (blocks) continue
+          }
+          abandonStatements.push({
+            sql: "UPDATE tool_call SET state = 'finished', outcome = 'abandoned', time_finished = ? WHERE call_id = ? AND session_id = ? AND state = 'started' AND worker_owner_id = ?",
+            params: [now, callID, sessionID, owner],
+          })
+        }
+      }
+      if (abandonStatements.length > 0) {
+        abandoned = (await target.transaction(abandonStatements)).reduce((total, result) => total + result.changes, 0)
+      }
+    } catch (error) {
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("startup tool-call sweep failed"), {
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      )
+      abandoned = 0
+    }
+
+    if (released > 0 || abandoned > 0) {
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("startup lease sweep"), {
+          released,
+          ...(abandoned > 0 ? { abandoned } : {}),
+        }),
+      )
     }
     return released
   } catch (error) {

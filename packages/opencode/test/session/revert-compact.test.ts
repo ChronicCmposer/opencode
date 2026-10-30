@@ -7,6 +7,7 @@ import path from "path"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Effect } from "effect"
 import { Session } from "@/session/session"
+import { EventV2Bridge } from "@/event-v2-bridge"
 
 import { SessionRevert } from "../../src/session/revert"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -19,7 +20,14 @@ import { ModelV2 } from "@opencode-ai/core/model"
 
 const it = testEffect(
   LayerNode.compile(
-    LayerNode.group([Session.node, SessionRevert.node, Snapshot.node, SessionProjector.node, CrossSpawnSpawner.node]),
+    LayerNode.group([
+      Session.node,
+      SessionRevert.node,
+      Snapshot.node,
+      SessionProjector.node,
+      CrossSpawnSpawner.node,
+      EventV2Bridge.node,
+    ]),
   ),
 )
 
@@ -588,6 +596,68 @@ describe("revert + compact workflow", () => {
           expect(yield* read(path.join(dir, "a.txt"))).toBe("a1")
           expect(yield* read(path.join(dir, "b.txt"))).toBe("b2")
           expect(yield* read(path.join(dir, "c.txt"))).toBe("c3")
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live(
+    "cleanup publishes removals before the session.updated that clears revert",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const events = yield* EventV2Bridge.Service
+          const log: Array<{ type: string; data: unknown }> = []
+          const unsubscribe = yield* events.listen((event) =>
+            Effect.sync(() => {
+              log.push({ type: event.type, data: event.data })
+            }),
+          )
+          try {
+            const info = yield* session.create({})
+            const sid = info.id
+            const u1 = yield* user(sid)
+            yield* text(sid, u1.id, "hello")
+            const a1 = yield* assistant(sid, u1.id, dir)
+            yield* text(sid, a1.id, "hi back")
+            const u2 = yield* user(sid)
+            const p2 = yield* text(sid, u2.id, "second")
+            const a2 = yield* assistant(sid, u2.id, dir)
+            yield* text(sid, a2.id, "second answer")
+
+            yield* session.setRevert({
+              sessionID: sid,
+              revert: { messageID: u2.id },
+              summary: { additions: 0, deletions: 0, files: 0 },
+            })
+
+            const start = log.length
+            yield* session.discardReverted({
+              sessionID: sid,
+              messageIDs: [u2.id, a2.id],
+              parts: [{ messageID: u2.id, partID: p2.id }],
+            })
+            const after = log.slice(start)
+
+            expect(after.map((event) => event.type)).toEqual([
+              "message.removed",
+              "message.removed",
+              "message.part.removed",
+              "session.updated",
+            ])
+            const updated = after.at(-1)!.data as { info: { revert?: unknown } }
+            expect(updated.info.revert ?? null).toBeNull()
+            // Every removal precedes the revert clear.
+            const clearIndex = after.findIndex((event) => event.type === "session.updated")
+            const removalIndexes = after
+              .map((event, index) => ({ event, index }))
+              .filter(({ event }) => event.type === "message.removed" || event.type === "message.part.removed")
+              .map(({ index }) => index)
+            expect(removalIndexes.every((index) => index < clearIndex)).toBe(true)
+          } finally {
+            yield* unsubscribe
+          }
         }),
       { git: true },
     ),

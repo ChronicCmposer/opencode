@@ -200,7 +200,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     // The provider may reuse a call id; the durable ledger keys each call by
     // its owning assistant message so the second call never collides with (or
     // settles) the first. Lifecycle and the processor keep the provider id.
-    const ledgerKey = `${input.processor.message.id}:${callID}`
+    const ledgerKey = ToolCallLedger.toolCallKey(input.processor.message.id, callID)
     const settlement = createSettlement(callID, ledgerKey)
     const registered = input.processor.registerToolSettlement !== undefined
     return Effect.gen(function* () {

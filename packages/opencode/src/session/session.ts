@@ -38,6 +38,7 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { SessionID, MessageID, PartID } from "./schema"
 import { SessionPromptService } from "./prompt-service"
+import { ToolCallLedger } from "./ledger/tool-call"
 import { SessionDepth } from "./depth"
 import type { DispatchOrigin } from "./origin"
 import { SessionSpawnProxyService } from "./worker/subagent"
@@ -971,13 +972,18 @@ const layer: Layer.Layer<
     const discardReverted = Effect.fn("Session.discardReverted")(function* (input: DiscardReverted) {
       yield* db.transaction(() =>
         Effect.gen(function* () {
-          yield* clearRevert(input.sessionID)
+          // Abandon the discarded messages' started tool calls first: they must not
+          // block automatic resume after their owning messages disappear.
+          yield* ToolCallLedger.abandonForMessages(db, input.sessionID, input.messageIDs)
+          // Order matters: removals must be published before the revert is cleared, so the UI
+          // never sees a cleared revert while the removed rows are still visible.
           for (const messageID of input.messageIDs) {
             yield* removeMessage({ sessionID: input.sessionID, messageID })
           }
           for (const part of input.parts) {
             yield* removePart({ sessionID: input.sessionID, ...part })
           }
+          yield* clearRevert(input.sessionID)
         }),
       ).pipe(Effect.orDie)
     })
