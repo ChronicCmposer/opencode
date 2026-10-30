@@ -446,12 +446,20 @@ describe("idle eviction retirement", () => {
     const served: number[] = []
     const disposedPorts: number[] = []
     const zeroed: string[] = []
+    let leaseOwnerQueries = 0
+    let leaseObservedSession: string | undefined
     let retiredOwner = ""
     let hub: ReturnType<typeof createSessionHub> | undefined
 
     const db: DbExecutor = {
       threadId: 0,
-      query: async (sql) => (sql.includes("event_sequence") ? [{ worker_owner_id: retiredOwner }] : []),
+      query: async (sql, params) => {
+        if (!sql.includes("event_sequence")) return []
+        // Count only the retired session's lease reads: the successor's own boot
+        // poll is expected and must not mask a retirement re-read.
+        if (Array.isArray(params) && params[0] === leaseObservedSession) leaseOwnerQueries += 1
+        return [{ worker_owner_id: retiredOwner }]
+      },
       run: async (sql, params) => {
         if (sql.includes("worker_expires_at = 0") && Array.isArray(params)) zeroed.push(String(params[0]))
         return { changes: 1, lastInsertRowid: 0 }
@@ -487,19 +495,26 @@ describe("idle eviction retirement", () => {
     const sessionHub = hub
     try {
       const first = sid("ses_idle_evict_first")
-      await sessionHub.dispatcher.dispatch({ sessionID: first, depth: 0 })
+      leaseObservedSession = String(first)
+      await sessionHub.ensureRunning(first)
       const firstWorker = sessionHub.dispatcher.registry.worker(first)?.id
       expect(firstWorker).toBeDefined()
       retiredOwner = `worker-${firstWorker}-1-uuid`
+      const beforeBoot = leaseOwnerQueries
+      await pollUntil(() => leaseOwnerQueries > beforeBoot, {
+        message: "the boot lease-owner poll never observed the claimed owner",
+      })
       sessionHub.attachWorkerPorts(firstWorker!, { egress: {} as MessagePort })
       expect(served).toEqual([firstWorker!])
 
-      await sessionHub.dispatcher.dispatch({ sessionID: sid("ses_idle_evict_second"), depth: 0 })
+      const beforeEviction = leaseOwnerQueries
+      await sessionHub.ensureRunning(sid("ses_idle_evict_second"))
       await pollUntil(
         () => zeroed.includes(String(first)) && disposedPorts.includes(firstWorker!),
         { message: "the evicted generation's hub ports/lease were not released", timeoutMs: 10_000 },
       )
 
+      expect(leaseOwnerQueries).toBe(beforeEviction)
       expect(zeroed).toEqual([String(first)])
       expect(disposedPorts).toEqual([firstWorker!])
       expect(sessionHub.dispatcher.workerForSession(first)).toBeUndefined()

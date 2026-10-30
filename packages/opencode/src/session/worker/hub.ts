@@ -1171,6 +1171,29 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     if (owner !== undefined) leaseOwnerBySession.set(sessionID, owner)
   }
 
+  /**
+   * Learn the current generation's lease owner as soon as its worker claims the
+   * lease, not only after the run. The registry entry exists from admission, but
+   * the worker writes `event_sequence.worker_owner_id` during boot, so poll a
+   * bounded number of times while the run proceeds. The post-run re-confirm stays
+   * authoritative; this only closes the window where a just-cold-started worker is
+   * evicted before its first run returns.
+   */
+  const rememberLeaseOwnerAtBoot = (sessionID: SessionID): void => {
+    const deadline = Date.now() + 5_000
+    const attempt = (): void => {
+      const workerID = dispatcher.registry.entry(sessionID)?.workerID
+      const stored = leaseOwnerBySession.get(sessionID)
+      if (stored !== undefined && (workerID === undefined || stored.startsWith(`worker-${workerID}-`))) return
+      void rememberLeaseOwner(sessionID).then(() => {
+        if (leaseOwnerBySession.has(sessionID) || Date.now() >= deadline) return
+        const timer = setTimeout(attempt, 25)
+        timer.unref?.()
+      })
+    }
+    attempt()
+  }
+
   /** Successor admission waits for the retired generation's release to land. */
   const awaitRetiredLeaseRelease = (sessionID: SessionID): Promise<void> =>
     retiredLeaseReleases.get(sessionID) ?? Promise.resolve()
@@ -1416,6 +1439,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
           try: () => awaitRetiredLeaseRelease(sessionID),
           catch: (error) => error,
         })
+        rememberLeaseOwnerAtBoot(sessionID)
         const result = yield* dispatch.ensureRunningEffect(sessionID, resolveDepth(sessionID), origin)
         lifecycle.resetAttempts(sessionID)
         // Record the owner this generation claimed, so a later retirement can release exactly it without re-reading a possibly-successor-owned row.
@@ -1431,6 +1455,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       // A retired generation's release must land before its successor boots and claims the aggregate.
       await awaitRetiredLeaseRelease(sessionID)
       try {
+        rememberLeaseOwnerAtBoot(sessionID)
         const result = await dispatch.ensureRunning(sessionID, resolveDepth(sessionID), origin)
         lifecycle.resetAttempts(sessionID)
         // Record the owner this generation claimed, so a later retirement can release exactly it without re-reading a possibly-successor-owned row.
@@ -1447,6 +1472,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       await runPromise(admitBarrier(sessionID))
       await awaitRetiredLeaseRelease(sessionID)
       try {
+        rememberLeaseOwnerAtBoot(sessionID)
         const result = await dispatch.startShell(sessionID, shell, resolveDepth(sessionID))
         lifecycle.resetAttempts(sessionID)
         await rememberLeaseOwner(sessionID)
