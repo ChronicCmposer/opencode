@@ -29,7 +29,7 @@ import { errorMessage } from "@/util/error"
 import { isMedia } from "@/util/media"
 import type { SystemError } from "bun"
 import type { Provider } from "@/provider/provider"
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 
 /** Error shape thrown by Bun's fetch() when gzip/br decompression fails mid-stream */
 interface FetchDecompressionError extends Error {
@@ -72,27 +72,36 @@ export const cursor = {
   },
 }
 
-// Storage rows carry JSON typed as the mutable message/part shape. Decoding
-// through the schema validates the payload at the boundary; the schema's
-// inferred type is `readonly`, so narrow once here back to the public mutable
-// types (`Info`/`Part`) that the rest of the module consumes.
-const decodeInfo = Schema.decodeUnknownSync(Info) as (input: unknown) => Info
-const decodePart = Schema.decodeUnknownSync(Part) as (input: unknown) => Part
+// Stored rows are decoded at the boundary, but history can hold rows written
+// before a field became required (or by a plugin through the part API). Failing
+// the read would make the whole session unloadable, so a row that no longer
+// decodes is logged and kept as stored, which is how upstream reads it.
+const decodeInfo = Schema.decodeUnknownOption(Info)
+const decodePart = Schema.decodeUnknownOption(Part)
 
-const info = (row: typeof MessageTable.$inferSelect): Info =>
-  decodeInfo({
-    ...row.data,
-    id: row.id,
+const info = Effect.fnUntraced(function* (row: typeof MessageTable.$inferSelect) {
+  const stored = { ...row.data, id: row.id, sessionID: row.session_id }
+  const decoded = decodeInfo(stored)
+  if (Option.isSome(decoded)) return decoded.value as Info
+  yield* Effect.logWarning("stored message does not match its schema; using it as stored", {
+    messageID: row.id,
     sessionID: row.session_id,
   })
+  return stored as Info
+})
 
-const part = (row: typeof PartTable.$inferSelect): Part =>
-  decodePart({
-    ...row.data,
-    id: row.id,
-    sessionID: row.session_id,
+const part = Effect.fnUntraced(function* (row: typeof PartTable.$inferSelect) {
+  const stored = { ...row.data, id: row.id, sessionID: row.session_id, messageID: row.message_id }
+  const decoded = decodePart(stored)
+  if (Option.isSome(decoded)) return decoded.value as Part
+  yield* Effect.logWarning("stored part does not match its schema; using it as stored", {
+    partID: row.id,
     messageID: row.message_id,
+    sessionID: row.session_id,
+    type: (row.data as { readonly type?: unknown }).type,
   })
+  return stored as Part
+})
 
 const older = (row: Cursor) =>
   or(lt(MessageTable.time_created, row.time), and(eq(MessageTable.time_created, row.time), lt(MessageTable.id, row.id)))
@@ -114,17 +123,16 @@ function hydrate(
         .all()
         .pipe(Effect.orDie)
       for (const row of partRows) {
-        const next = part(row)
+        const next = yield* part(row)
         const list = partByMessage.get(row.message_id)
         if (list) list.push(next)
         else partByMessage.set(row.message_id, [next])
       }
     }
 
-    return rows.map((row) => ({
-      info: info(row),
-      parts: partByMessage.get(row.id) ?? [],
-    }))
+    return yield* Effect.forEach(rows, (row) =>
+      info(row).pipe(Effect.map((message) => ({ info: message, parts: partByMessage.get(row.id) ?? [] }))),
+    )
   })
 }
 
@@ -518,7 +526,7 @@ export function parts(messageID: MessageID) {
       .orderBy(PartTable.id)
       .all()
       .pipe(Effect.orDie)
-    return rows.map(part)
+    return yield* Effect.forEach(rows, part)
   })
 }
 
@@ -532,7 +540,7 @@ export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: Ses
     .pipe(Effect.orDie)
   if (!row) return yield* new NotFoundError({ message: `Message not found: ${input.messageID}` })
   return {
-    info: info(row),
+    info: yield* info(row),
     parts: yield* parts(input.messageID),
   }
 })

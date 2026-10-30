@@ -8,6 +8,8 @@ import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
 
 import { NotFoundError } from "@/storage/storage"
+import { Database } from "@opencode-ai/core/database/database"
+import { PartTable } from "@opencode-ai/core/session/sql"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -1051,6 +1053,34 @@ describe("MessageV2 consistency", () => {
         const all = stream.toReversed()
 
         expect(filtered.map((m) => m.info.id)).toEqual(all.map((m) => m.info.id))
+      }),
+    ),
+  )
+})
+
+describe("stored rows that no longer match the schema", () => {
+  it.instance("a tool part saved without callID still loads, kept as stored", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const [messageID] = yield* fill(sessionID, 1)
+        const { db } = yield* Database.Service
+        const partID = PartID.ascending()
+        yield* db
+          .insert(PartTable)
+          .values({
+            id: partID,
+            message_id: messageID!,
+            session_id: sessionID,
+            time_created: Date.now(),
+            time_updated: Date.now(),
+            data: { type: "tool", tool: "compress", state: { status: "pending", input: {}, raw: "" } } as never,
+          })
+          .run()
+          .pipe(Effect.orDie)
+
+        const result = yield* MessageV2.page({ sessionID, limit: 10 })
+        const parts = result.items.flatMap((item) => item.parts)
+        expect(parts.find((part) => part.id === partID)).toMatchObject({ type: "tool", tool: "compress" })
       }),
     ),
   )
