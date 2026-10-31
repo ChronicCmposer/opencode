@@ -11,7 +11,9 @@ import path from "node:path"
 import { afterEach, describe, expect, test } from "bun:test"
 import { DurableLog } from "@opencode-ai/core/durable-log"
 import { openConnection } from "@opencode-ai/core/database/connection"
-import { encodeFrame, type DurableResyncPayload } from "@/session/egress/frame"
+import { type DurableResyncPayload } from "@/session/egress/frame"
+import { encodeEventsFrameBytes } from "@/session/egress/frame-bytes"
+import { LazyJson, valueOf } from "@/util/lazy-json"
 import type { LiveEvent, LiveEventPublisher } from "@/event-v2-bridge"
 import {
   buildProductionPortBackends,
@@ -94,7 +96,7 @@ function referenceFrame(big: EventV2Event) {
     MAX_WORKER_FRAME_BYTES + 1,
   )
   if (frame === undefined) throw new Error("oversized frame did not produce a position reference")
-  return encodeFrame(frame)
+  return encodeEventsFrameBytes(frame)
 }
 
 describe("hub resolves an oversized durable body before republish", () => {
@@ -113,9 +115,10 @@ describe("hub resolves an oversized durable body before republish", () => {
 
       expect(published[0]?.id).toBe("evt_big")
       expect(published[0]?.type).toBe(fixture.big.type)
-      expect(published[0]?.data).toEqual(JSON.parse(fixture.stored))
+      expect(published[0]?.data).toBeInstanceOf(LazyJson)
+      expect(valueOf(published[0]?.data)).toEqual(JSON.parse(fixture.stored))
       // The live surface sees the body, never the wire reference.
-      expect(published[0]?.data).not.toHaveProperty("__eventBlobPosition")
+      expect(valueOf(published[0]?.data)).not.toHaveProperty("__eventBlobPosition")
     } finally {
       dispose()
       channel.port1.close()

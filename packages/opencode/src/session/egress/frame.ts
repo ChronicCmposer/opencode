@@ -21,6 +21,8 @@ import {
   type AggregatePosition,
 } from "@/session/worker/frame"
 
+import { activeDecoder, type ScannedEventsFrame } from "./scan"
+
 export { FrameTooLargeError, ProtocolError, UnsupportedFrameVersionError, isEventBlobReference }
 export type {
   EventsAckPayload,
@@ -220,6 +222,11 @@ export function decodeFrame(text: string): DecodedEventsFrame {
   const position = durablePositionOf(envelope.payload)
   if (position === undefined) return frame
   return { ...frame, payload: { ...frame.payload, ...position } }
+}
+
+/** Decode one events-port byte frame; `properties` stays raw as `LazyJson`. */
+export function decodeFrameBytes(buffer: ArrayBuffer): ScannedEventsFrame {
+  return activeDecoder().decode(new Uint8Array(buffer))
 }
 
 /** Decode a batch of wire messages, in order. */

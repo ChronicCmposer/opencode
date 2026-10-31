@@ -64,7 +64,8 @@ import {
 } from "@/session/worker/frame"
 import { resolveSessionWorkerIdleTimeoutMs, SESSION_WORKER_IDLE_TIMEOUT_ENV } from "@/session/worker/pool"
 import { createIdleIsolateCap } from "@/session/worker/worker-pools"
-import { encodeFrame } from "@/session/egress/frame"
+import { encodeEventsFrameBytes } from "@/session/egress/frame-bytes"
+import { valueOf } from "@/util/lazy-json"
 import { createMeshWorkerClient, type DurableCommit } from "@/session/egress/mesh"
 import { createLiveEventPublisher, EventV2Bridge, type LiveEvent, type LiveEventPublisher } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -772,7 +773,7 @@ describe("production egress mesh", () => {
       // the attached worker, the third overflows and is answered with a resync.
       for (let ordinal = 1; ordinal <= 3; ordinal++) {
         data.port2.postMessage(
-          encodeFrame(
+          encodeEventsFrameBytes(
             eventFrame({
               event: { id: `evt_${ordinal}`, type: "session.message", properties: { ordinal } },
               aggregateID: "agg",
@@ -792,7 +793,7 @@ describe("production egress mesh", () => {
       // An ack frees a backlog slot, so the next durable commit lands again.
       mesh.acknowledgeDelivery()
       data.port2.postMessage(
-        encodeFrame(
+        encodeEventsFrameBytes(
           eventFrame({
             event: { id: "evt_4", type: "session.message", properties: { ordinal: 4 } },
             aggregateID: "agg",
@@ -822,11 +823,11 @@ describe("production egress mesh", () => {
       // Load: many deltas, then the two flow-control frames the worker sends back.
       for (let i = 0; i < 50; i++) {
         channel.port2.postMessage(
-          encodeFrame(eventFrame({ event: { id: `delta_${i}`, type: "message.part.delta", properties: { i } } })),
+          encodeEventsFrameBytes(eventFrame({ event: { id: `delta_${i}`, type: "message.part.delta", properties: { i } } })),
         )
       }
-      channel.port2.postMessage(encodeFrame(resyncFrame({ pattern: "message.*" })))
-      channel.port2.postMessage(encodeFrame(ackFrame({ count: 50 })))
+      channel.port2.postMessage(encodeEventsFrameBytes(resyncFrame({ pattern: "message.*" })))
+      channel.port2.postMessage(encodeEventsFrameBytes(ackFrame({ count: 50 })))
 
       await pollUntil(() => sink.acks > 0 && sink.resyncs > 0, {
         message: "sink flow-control counters never advanced",
@@ -889,9 +890,9 @@ describe("egress ack correlation", () => {
         MAX_WORKER_FRAME_BYTES + 1,
       )
       if (reference === undefined) throw new Error("oversized durable did not produce a reference")
-      channel.port2.postMessage(encodeFrame(reference))
+      channel.port2.postMessage(encodeEventsFrameBytes(reference))
       channel.port2.postMessage(
-        encodeFrame(
+        encodeEventsFrameBytes(
           eventFrame({
             event: { id: "evt_ok", type: "session.updated", properties: { sessionID } },
             aggregateID: sessionID,
@@ -910,7 +911,7 @@ describe("egress ack correlation", () => {
 
       // The ack covers both hand-offs; the resynced one is settled without
       // crediting a future batch.
-      channel.port2.postMessage(encodeFrame(ackFrame({ count: 2 })))
+      channel.port2.postMessage(encodeEventsFrameBytes(ackFrame({ count: 2 })))
       await wait
       expect(resolved).toBe(true)
     } finally {
@@ -1382,11 +1383,12 @@ describe("Q22 hub event sink", () => {
     const dispose = serveEventsPort(channel.port1, createHubEventSink({ publisher }))
     try {
       channel.port2.postMessage(
-        encodeFrame(eventFrame({ event: { id: "evt_2", type: "message.part.delta", properties: { delta: "hi" } } })),
+        encodeEventsFrameBytes(eventFrame({ event: { id: "evt_2", type: "message.part.delta", properties: { delta: "hi" } } })),
       )
-      channel.port2.postMessage(encodeFrame(endFrame()))
+      channel.port2.postMessage(encodeEventsFrameBytes(endFrame()))
       await pollUntil(() => published.length === 1, { message: "event frame never decoded" })
-      expect(published[0]).toEqual({ id: "evt_2", type: "message.part.delta", data: { delta: "hi" } })
+      expect(published[0]).toMatchObject({ id: "evt_2", type: "message.part.delta" })
+      expect(valueOf(published[0]?.data)).toEqual({ delta: "hi" })
     } finally {
       dispose()
       channel.port1.close()
@@ -1412,7 +1414,7 @@ describe("Q22 hub event sink", () => {
     const dispose = serveEventsPort(channel.port1, sink)
     try {
       channel.port2.postMessage(
-        encodeFrame(
+        encodeEventsFrameBytes(
           eventFrame({
             event: { id: "evt_big", type: "session.next.prompted", properties: reference },
             aggregateID: "ses_big",
@@ -1440,7 +1442,7 @@ describe("Q22 hub event sink", () => {
       const received: { id: string; type: string; properties: unknown }[] = []
       runtime.runSync(
         events.listen((event) =>
-          Effect.sync(() => void received.push({ id: event.id, type: event.type, properties: event.data })),
+          Effect.sync(() => void received.push({ id: event.id, type: event.type, properties: valueOf(event.data) })),
         ),
       )
 
@@ -1449,7 +1451,7 @@ describe("Q22 hub event sink", () => {
         createHubEventSink({ publisher: createLiveEventPublisher(events) }),
       )
       channel.port2.postMessage(
-        encodeFrame(eventFrame({ event: { id: "evt_3", type: "message.part.delta", properties: { d: 1 } } })),
+        encodeEventsFrameBytes(eventFrame({ event: { id: "evt_3", type: "message.part.delta", properties: { d: 1 } } })),
       )
 
       await pollUntil(() => received.length === 1, { message: "event never reached hub EventV2" })
@@ -1495,7 +1497,7 @@ describe("Q22 hub event sink", () => {
         createHubEventSink({ publisher: createLiveEventPublisher(events) }),
       )
       channel.port2.postMessage(
-        encodeFrame(
+        encodeEventsFrameBytes(
           eventFrame({
             event: { id: "evt_d", type: "message.part.updated", properties: { part: 1 } },
             aggregateID: "agg",
@@ -1526,7 +1528,7 @@ describe("Q22 hub event sink", () => {
       const events = runtime.runSync(EventV2.Service)
       const seen: unknown[] = []
       const listener = (event: { payload?: { id?: string; type?: string; properties?: unknown } }) => {
-        if (event.payload?.type === "session.error") seen.push(event.payload)
+        if (event.payload?.type === "session.error") seen.push({ ...event.payload, properties: valueOf(event.payload.properties) })
       }
       GlobalBus.on("event", listener)
       try {
@@ -1535,7 +1537,7 @@ describe("Q22 hub event sink", () => {
           createHubEventSink({ publisher: createLiveEventPublisher(events) }),
         )
         channel.port2.postMessage(
-          encodeFrame(eventFrame({ event: { id: "evt_4", type: "session.error", properties: { m: 1 } } })),
+          encodeEventsFrameBytes(eventFrame({ event: { id: "evt_4", type: "session.error", properties: { m: 1 } } })),
         )
 
         await pollUntil(() => seen.length === 1, { message: "event never reached GlobalBus" })
@@ -1560,10 +1562,11 @@ describe("Q22 hub event sink", () => {
     const dispose = backends.egress!(1, channel.port1)
     try {
       channel.port2.postMessage(
-        encodeFrame(eventFrame({ event: { id: "evt_5", type: "message.part.delta", properties: { delta: "yo" } } })),
+        encodeEventsFrameBytes(eventFrame({ event: { id: "evt_5", type: "message.part.delta", properties: { delta: "yo" } } })),
       )
       await pollUntil(() => published.length === 1, { message: "production sink never republished" })
-      expect(published[0]).toEqual({ id: "evt_5", type: "message.part.delta", data: { delta: "yo" } })
+      expect(published[0]).toMatchObject({ id: "evt_5", type: "message.part.delta" })
+      expect(valueOf(published[0]?.data)).toEqual({ delta: "yo" })
     } finally {
       dispose()
       channel.port1.close()

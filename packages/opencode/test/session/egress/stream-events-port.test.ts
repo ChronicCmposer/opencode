@@ -5,9 +5,11 @@
 // healing on the same port, blob resolution before the ack, fail-loud close with
 // exactly one observed error, and non-durable backpressure drop.
 
+import type { ScannedEventsFrame } from "@/session/egress/scan"
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
-import { type DurableResyncPayload, decodeFrame, encodeFrame } from "@/session/egress/frame"
+import { type DurableResyncPayload, decodeFrameBytes } from "@/session/egress/frame"
+import { encodeEventsFrameBytes } from "@/session/egress/frame-bytes"
 import { createEgressPort, createEgressReceiver } from "@/session/egress/receiver"
 import { type HubEventSink, serveEventsPort } from "@/session/worker/hub"
 import {
@@ -99,7 +101,7 @@ describe("events stream lifecycle", () => {
     try {
       await pollUntil(() => typeof port.onmessage === "function", { message: "listener was never acquired" })
       expect(starts).toBe(1)
-      channel.port2.postMessage(encodeFrame(eventFrame({ event: delta("e1") })))
+      channel.port2.postMessage(encodeEventsFrameBytes(eventFrame({ event: delta("e1") })))
       await pollUntil(() => events.length === 1, { message: "event never reached the sink" })
 
       dispose()
@@ -109,7 +111,7 @@ describe("events stream lifecycle", () => {
       dispose()
       expect(closes).toBe(1)
 
-      channel.port2.postMessage(encodeFrame(eventFrame({ event: delta("e2") })))
+      channel.port2.postMessage(encodeEventsFrameBytes(eventFrame({ event: delta("e2") })))
       await pollUntil(() => false, { timeoutMs: 20 }).catch(() => {})
       expect(events.map((event) => event.id)).toEqual(["e1"])
     } finally {
@@ -121,7 +123,7 @@ describe("events stream lifecycle", () => {
     const channel = new MessageChannel()
     const errors: Error[] = []
     const requests: unknown[] = []
-    channel.port2.onmessage = (event) => void requests.push(decodeFrame(event.data as string))
+    channel.port2.onmessage = (event) => void requests.push(decodeFrameBytes(event.data as ArrayBuffer))
     const { sink, events } = recordingSink()
     const dispose = serveEventsPort(channel.port1, sink, (error) => errors.push(error))
     try {
@@ -130,7 +132,7 @@ describe("events stream lifecycle", () => {
       await pollUntil(() => requests.length === 1, { message: "no resync was requested" })
       expect((requests[0] as { kind: string }).kind).toBe("resync")
       expect(channel.port1.onmessage).not.toBeNull()
-      channel.port2.postMessage(encodeFrame(eventFrame({ event: delta("late") })))
+      channel.port2.postMessage(encodeEventsFrameBytes(eventFrame({ event: delta("late") })))
       await pollUntil(() => events.length === 1, { message: "later frame was not delivered" })
       expect(errors.length).toBe(1)
     } finally {
@@ -163,14 +165,14 @@ describe("events stream ordering", () => {
     const { sink, ops } = recordingSink()
     const dispose = serveEventsPort(channel.port1, sink)
     try {
-      channel.port2.postMessage(encodeFrame(eventFrame({ event: delta("a") })))
-      channel.port2.postMessage(encodeFrame(durable("b", "agg", 1)))
-      channel.port2.postMessage(encodeFrame(eventFrame({ event: delta("c") })))
-      channel.port2.postMessage(encodeFrame(endFrame()))
+      channel.port2.postMessage(encodeEventsFrameBytes(eventFrame({ event: delta("a") })))
+      channel.port2.postMessage(encodeEventsFrameBytes(durable("b", "agg", 1)))
+      channel.port2.postMessage(encodeEventsFrameBytes(eventFrame({ event: delta("c") })))
+      channel.port2.postMessage(encodeEventsFrameBytes(endFrame()))
       await pollUntil(() => ops.length === 4, { message: "frames were not delivered in order" })
       expect(ops).toEqual(["event:a", "event:b", "event:c", "end"])
       // After `end`, later messages are ignored but the port stays usable.
-      channel.port2.postMessage(encodeFrame(eventFrame({ event: delta("d") })))
+      channel.port2.postMessage(encodeEventsFrameBytes(eventFrame({ event: delta("d") })))
       await pollUntil(() => false, { timeoutMs: 20 }).catch(() => {})
       expect(ops.length).toBe(4)
     } finally {
@@ -190,9 +192,9 @@ describe("events stream ordering", () => {
       undefined,
     )
     try {
-      channel.port2.postMessage(encodeFrame(durable("d1", "agg", 1)))
-      channel.port2.postMessage(encodeFrame(durable("d1-stale", "agg", 1)))
-      channel.port2.postMessage(encodeFrame(durable("d2", "agg", 2)))
+      channel.port2.postMessage(encodeEventsFrameBytes(durable("d1", "agg", 1)))
+      channel.port2.postMessage(encodeEventsFrameBytes(durable("d1-stale", "agg", 1)))
+      channel.port2.postMessage(encodeEventsFrameBytes(durable("d2", "agg", 2)))
       await pollUntil(() => events.length === 2, { message: "stale durable was delivered" })
       expect(events.map((event) => event.id)).toEqual(["d1", "d2"])
       expect(sink.resyncs).toBe(0)
@@ -215,13 +217,13 @@ describe("events stream gap healing", () => {
     })
     const resyncs: DurableResyncPayload[] = []
     channel.port2.onmessage = (event) => {
-      const frame = decodeFrame(event.data)
+      const frame = decodeFrameBytes(event.data)
       if (frame.kind === "resync" && frame.payload !== undefined) resyncs.push(frame.payload)
     }
     const dispose = serveEventsPort(channel.port1, sink)
     try {
-      channel.port2.postMessage(encodeFrame(durable("d1", "agg", 1)))
-      channel.port2.postMessage(encodeFrame(durable("d3", "agg", 3)))
+      channel.port2.postMessage(encodeEventsFrameBytes(durable("d1", "agg", 1)))
+      channel.port2.postMessage(encodeEventsFrameBytes(durable("d3", "agg", 3)))
       await pollUntil(() => healed.length === 1 && resyncs.length === 1, {
         message: "gap was not healed on the same port",
       })
@@ -229,7 +231,7 @@ describe("events stream gap healing", () => {
       expect(resyncs[0]).toEqual({ aggregateID: "agg", seq: 3 })
 
       // The port stayed open and the observed cursor advanced; delivery continues.
-      channel.port2.postMessage(encodeFrame(durable("d4", "agg", 4)))
+      channel.port2.postMessage(encodeEventsFrameBytes(durable("d4", "agg", 4)))
       await pollUntil(() => events.length === 3, { message: "stream stopped after a gap" })
       expect(events.map((event) => event.id)).toEqual(["d1", "d3", "d4"])
     } finally {
@@ -253,7 +255,7 @@ describe("events stream blob-before-ack", () => {
     const dispose = serveEventsPort(channel.port1, sink)
     try {
       channel.port2.postMessage(
-        encodeFrame(
+        encodeEventsFrameBytes(
           eventFrame({
             event: {
               id: "big",
@@ -265,7 +267,7 @@ describe("events stream blob-before-ack", () => {
           } as never),
         ),
       )
-      channel.port2.postMessage(encodeFrame(ackFrame({ count: 1 })))
+      channel.port2.postMessage(encodeEventsFrameBytes(ackFrame({ count: 1 })))
       await pollUntil(() => false, { timeoutMs: 20 }).catch(() => {})
       // The unresolved blob blocks both its own event and the following ack.
       expect(ops).toEqual([])
@@ -284,7 +286,7 @@ describe("events stream blob-before-ack", () => {
 describe("events stream backpressure", () => {
   test("drops a non-durable delta under pressure and keeps the durable", async () => {
     const channel = new MessageChannel()
-    const frames: EventsFrame[] = []
+    const frames: ScannedEventsFrame[] = []
     const resyncs: (EventsResyncPayload | undefined)[] = []
     const receiver = createEgressReceiver({
       port: channel.port2,
@@ -293,12 +295,12 @@ describe("events stream backpressure", () => {
       pressure: () => true,
     })
     try {
-      channel.port1.postMessage(encodeFrame(eventFrame({ event: delta("dropped") })))
-      channel.port1.postMessage(encodeFrame(durable("kept", "agg", 1)))
+      channel.port1.postMessage(encodeEventsFrameBytes(eventFrame({ event: delta("dropped") })))
+      channel.port1.postMessage(encodeEventsFrameBytes(durable("kept", "agg", 1)))
       await pollUntil(() => receiver.dropped === 1 && frames.length === 1, {
         message: "pressure did not drop the delta while keeping the durable",
       })
-      expect(frames).toEqual([durable("kept", "agg", 1)])
+      expect(frames.map((frame) => (frame.kind === "event" ? frame.event.id : frame.kind))).toEqual(["kept"])
       expect(receiver.resyncs).toBe(1)
       expect(resyncs).toEqual([undefined])
     } finally {

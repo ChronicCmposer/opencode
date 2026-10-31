@@ -2,7 +2,8 @@
 // a run reply that overtakes its events-port frames.
 
 import { describe, expect, test } from "bun:test"
-import { decodeFrame, encodeFrame } from "@/session/egress/frame"
+import { decodeFrameBytes } from "@/session/egress/frame"
+import { encodeEventsFrameBytes } from "@/session/egress/frame-bytes"
 import type { LiveEvent, LiveEventPublisher } from "@/event-v2-bridge"
 import { createEgressDeliveryBarrier, createHubEventSink, serveEventsPort } from "@/session/worker/hub"
 import { ackFrame, blobPositionReferenceFrame, eventFrame, MAX_WORKER_FRAME_BYTES } from "@/session/worker/frame"
@@ -20,7 +21,7 @@ function recordingPublisher(): { publisher: LiveEventPublisher; published: LiveE
 }
 
 function durable(seq: number) {
-  return encodeFrame(
+  return encodeEventsFrameBytes(
     eventFrame({
       event: { id: `evt_${seq}`, type: "session.message", properties: { sessionID: AGGREGATE, seq } },
       aggregateID: AGGREGATE,
@@ -35,7 +36,7 @@ describe("egress recovery", () => {
     const sink = createHubEventSink({ publisher })
     const channel = new MessageChannel()
     const resyncs: unknown[] = []
-    channel.port2.onmessage = (event) => void resyncs.push(decodeFrame(event.data as string))
+    channel.port2.onmessage = (event) => void resyncs.push(decodeFrameBytes(event.data as ArrayBuffer))
     const errors: Error[] = []
     const dispose = serveEventsPort(channel.port1, sink, (error) => void errors.push(error))
     try {
@@ -65,7 +66,7 @@ describe("egress recovery", () => {
     })
     const channel = new MessageChannel()
     const resyncs: unknown[] = []
-    channel.port2.onmessage = (event) => void resyncs.push(decodeFrame(event.data as string))
+    channel.port2.onmessage = (event) => void resyncs.push(decodeFrameBytes(event.data as ArrayBuffer))
     const dispose = serveEventsPort(channel.port1, sink)
     try {
       const reference = blobPositionReferenceFrame(
@@ -77,7 +78,7 @@ describe("egress recovery", () => {
         MAX_WORKER_FRAME_BYTES + 1,
       )
       if (reference === undefined) throw new Error("no position reference produced")
-      channel.port2.postMessage(encodeFrame(reference))
+      channel.port2.postMessage(encodeEventsFrameBytes(reference))
 
       await pollUntil(() => published.length === 1, { message: "the unresolved durable was never healed" })
       expect(published[0]?.data).toEqual(body)
@@ -120,7 +121,7 @@ describe("egress recovery", () => {
     try {
       channel.port2.postMessage(durable(1))
       channel.port2.postMessage("{not json")
-      channel.port2.postMessage(encodeFrame(ackFrame({ count: 0 })))
+      channel.port2.postMessage(encodeEventsFrameBytes(ackFrame({ count: 0 })))
       await pollUntil(() => published.length === 2, { message: "the rejected last durable was not healed" })
     } finally {
       dispose()

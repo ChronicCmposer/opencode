@@ -24,7 +24,7 @@ import {
   type DeltaSnapshot,
   type DurableDelivery,
 } from "@/session/egress/delta"
-import { encodeFrame } from "@/session/egress/frame"
+import { encodeEventsFrameBytes } from "@/session/egress/frame-bytes"
 import { attachMeshWorker, createEgressMesh } from "@/session/egress/mesh"
 import { createHubEventSink, serveEventsPort } from "@/session/worker/hub"
 import { createWorkerEgressClient } from "@/session/worker/egress-client"
@@ -219,7 +219,7 @@ describe("hub events port → worker resync over the real ports", () => {
       await pollUntil(() => mesh.subscriptions().length === 1, { message: "worker never subscribed" })
 
       const frame = (seq: number) =>
-        encodeFrame(
+        encodeEventsFrameBytes(
           eventFrame({
             event: { id: `evt_${seq}`, type: "session.updated", properties: { sessionID: AGGREGATE } },
             aggregateID: AGGREGATE,

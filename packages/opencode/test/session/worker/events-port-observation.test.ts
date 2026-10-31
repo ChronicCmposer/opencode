@@ -55,7 +55,7 @@ describe("events port failure observation", () => {
     const errors: Error[] = []
     const dispose = serveEventsPort(channel.port1, sinkFor(), (error) => errors.push(error))
     try {
-      channel.port2.postMessage("x".repeat(MAX_WORKER_FRAME_BYTES + 1))
+      channel.port2.postMessage(new ArrayBuffer(MAX_WORKER_FRAME_BYTES + 1))
       await pollUntil(() => errors.length === 1, { message: "oversized frame was silently dropped" })
       expect(errors[0]).toBeInstanceOf(FrameTooLargeError)
     } finally {
