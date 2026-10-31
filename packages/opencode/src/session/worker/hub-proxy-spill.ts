@@ -1,4 +1,9 @@
+import { DurableLog } from "@opencode-ai/core/durable-log"
 import { Option, Schema } from "effect"
+import { randomUUID } from "node:crypto"
+import fs from "node:fs/promises"
+import path from "node:path"
+import { MAX_HUB_PROXY_SPILL_BYTES } from "./frame"
 
 /** A hub-proxy body that crossed through the spill store instead of inline (D15). */
 export interface HubProxySpillReference {
@@ -71,22 +76,118 @@ export interface HubProxySpill {
   sweep(olderThanMs: number): Promise<number>
 }
 
+const SCOPE_PATTERN = /^[A-Za-z0-9._-]{1,200}$/
+
+function isSafeScope(scope: string): boolean {
+  return SCOPE_PATTERN.test(scope) && scope !== "." && scope !== ".."
+}
+
+function requireReference(value: unknown): HubProxySpillReference["__hubProxySpill"] {
+  if (!isHubProxySpillReference(value) || !isSafeScope(value.__hubProxySpill.scope)) {
+    throw new Error("invalid hub-proxy spill reference")
+  }
+  return value.__hubProxySpill
+}
+
+function requireScope(scope: string): string {
+  if (!isSafeScope(scope)) throw new Error(`invalid hub-proxy spill scope: ${scope}`)
+  return scope
+}
+
+const isNotFound = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT"
+
 /** The production spill store rooted at `dir` (normally `dirname(db)/hub-proxy-spill`). */
 export function createHubProxySpill(dir: string): HubProxySpill {
-  const notImplemented = (): never => {
-    throw new Error(`hub-proxy spill at ${dir} is not implemented yet`)
+  const fileFor = (scope: string, hash: string) => path.join(dir, scope, hash)
+
+  const write: HubProxySpill["write"] = async (body, scope, label) => {
+    const bytes = Buffer.byteLength(body)
+    if (bytes > MAX_HUB_PROXY_SPILL_BYTES) {
+      throw new HubProxySpillTooLargeError({ bytes, limit: MAX_HUB_PROXY_SPILL_BYTES, label })
+    }
+    requireScope(scope)
+    const hash = DurableLog.digest(body)
+    const scopeDir = path.join(dir, scope)
+    const file = path.join(scopeDir, hash)
+    const result: HubProxySpillReference = { __hubProxySpill: { hash, bytes, scope } }
+    await fs.mkdir(scopeDir, { recursive: true })
+    const existing = await fs.stat(file).catch(() => undefined)
+    if (existing?.isFile() && existing.size === bytes) return result
+    const temp = path.join(scopeDir, `.${hash}.${randomUUID()}.tmp`)
+    try {
+      await fs.writeFile(temp, body)
+      await fs.rename(temp, file)
+    } catch (error) {
+      await fs.rm(temp, { force: true }).catch(() => undefined)
+      throw error
+    }
+    return result
   }
-  return {
-    write: async () => notImplemented(),
-    read: async () => notImplemented(),
-    remove: async () => notImplemented(),
-    removeScope: async () => notImplemented(),
-    sweep: async () => notImplemented(),
+
+  const read: HubProxySpill["read"] = async (reference) => {
+    const { hash, bytes, scope } = requireReference(reference)
+    const text = await fs.readFile(fileFor(scope, hash), "utf8").catch((error) => {
+      if (isNotFound(error)) throw new HubProxySpillMissingError({ hash, scope })
+      throw error
+    })
+    const actual = Buffer.byteLength(text)
+    if (actual !== bytes) {
+      throw new HubProxySpillCorruptError({ hash, scope, reason: `expected ${bytes} bytes, found ${actual}` })
+    }
+    if (DurableLog.digest(text) !== hash) {
+      throw new HubProxySpillCorruptError({ hash, scope, reason: "content hash does not match" })
+    }
+    return text
   }
+
+  const remove: HubProxySpill["remove"] = async (reference) => {
+    const { hash, scope } = requireReference(reference)
+    await fs.rm(fileFor(scope, hash), { force: true })
+  }
+
+  const countFiles = async (target: string): Promise<number> => {
+    const entries = await fs.readdir(target, { withFileTypes: true }).catch(() => [])
+    let count = 0
+    for (const entry of entries) {
+      if (entry.isDirectory()) count += await countFiles(path.join(target, entry.name))
+      else count += 1
+    }
+    return count
+  }
+
+  const removeScope: HubProxySpill["removeScope"] = async (scope) => {
+    const target = path.join(dir, requireScope(scope))
+    const count = await countFiles(target)
+    await fs.rm(target, { recursive: true, force: true })
+    return count
+  }
+
+  const sweep: HubProxySpill["sweep"] = async (olderThanMs) => {
+    const cutoff = Date.now() - olderThanMs
+    const scopes = await fs.readdir(dir, { withFileTypes: true }).catch(() => [])
+    let removed = 0
+    for (const scope of scopes) {
+      if (!scope.isDirectory()) continue
+      const scopeDir = path.join(dir, scope.name)
+      const files = await fs.readdir(scopeDir).catch(() => [])
+      for (const name of files) {
+        const file = path.join(scopeDir, name)
+        const stat = await fs.stat(file).catch(() => undefined)
+        if (stat === undefined || (olderThanMs > 0 && stat.mtimeMs >= cutoff)) continue
+        await fs.rm(file, { force: true })
+        removed += 1
+      }
+      await fs.rmdir(scopeDir).catch(() => undefined)
+    }
+    return removed
+  }
+
+  return { write, read, remove, removeScope, sweep }
 }
 
 /** `dirname(db)/hub-proxy-spill`, or undefined for an in-memory database. */
 export function hubProxySpillDirectoryFor(filename: string | undefined): string | undefined {
-  void filename
-  return undefined
+  if (filename === undefined || filename.length === 0) return undefined
+  if (filename === ":memory:" || filename.startsWith("file::memory:")) return undefined
+  return path.join(path.dirname(filename), "hub-proxy-spill")
 }
