@@ -27,6 +27,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
+import { Database } from "bun:sqlite"
 import { startMockProvider, type MockProviderScript } from "../test/lib/mock-provider"
 import { readSsePayloads } from "../test/lib/sse"
 import { testProviderConfig } from "../test/lib/test-provider"
@@ -65,7 +66,13 @@ export const TEXT_COMPLETE_MARKER = "[smoke:text.complete]"
  * The smoke plugin. Its `smoke_context` tool runs on the hub and records the
  * context fields plugins rely on in-process (`callID`, `messages`, `extra.model`).
  */
-const smokePlugin = (contextFile: string) => `export default async () => ({
+const smokePlugin = (contextFile: string, historyFile: string) => `export default async () => ({
+  "experimental.chat.messages.transform": async (_input, output) => {
+    const bytes = JSON.stringify(output.messages).length
+    const file = Bun.file(${JSON.stringify(historyFile)})
+    const previous = (await file.exists()) ? Number(await file.text()) : 0
+    if (bytes > previous) await Bun.write(${JSON.stringify(historyFile)}, String(bytes))
+  },
   "experimental.text.complete": async (_input, output) => {
     output.text = output.text + " ${TEXT_COMPLETE_MARKER}"
   },
@@ -96,6 +103,12 @@ const SMOKE_CONTEXT_CALL_ID = "call_smoke_context"
 const TOOL_TURN_PROMPT = "Write the smoke file."
 const TOOL_TURN_FILE = "smoke-tool.txt"
 const TOOL_TURN_CONTENT = "written by the smoke tool turn"
+
+/** Medium-part history the long-session turn must carry through the hub proxy: below any per-string hold, above the worker frame cap. */
+export const LONG_HISTORY_PARTS = 200
+export const LONG_HISTORY_PART_CHARS = 30_000
+export const LONG_HISTORY_MIN_BYTES = 6_000_000
+const LONG_HISTORY_PROMPT = "Continue the long session."
 
 const SERVER_PASSWORD = "smoke-worker-gate"
 const SERVER_USERNAME = "opencode"
@@ -236,7 +249,8 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
   })
   const pluginFile = path.join(home, "smoke-plugin.js")
   const contextFile = path.join(home, "smoke-context.json")
-  writeFileSync(pluginFile, smokePlugin(contextFile))
+  const historyFile = path.join(home, "smoke-history-bytes.txt")
+  writeFileSync(pluginFile, smokePlugin(contextFile, historyFile))
   const providerConfig = testProviderConfig(provider.baseUrl)
   const configJSON = JSON.stringify({
     ...providerConfig,
@@ -342,6 +356,20 @@ export async function runSmokeWorkerBinary(): Promise<SmokeResult> {
     if (context?.callID !== SMOKE_CONTEXT_CALL_ID) missing.push(`plugin tool ctx.callID ${SMOKE_CONTEXT_CALL_ID}`)
     if (context?.messages !== true) missing.push("plugin tool ctx.messages")
     if (context?.model !== true) missing.push("plugin tool ctx.extra.model")
+    // Long-session turn: a ~6 MB history of medium parts must cross the hub proxy to the declared transform.
+    const longSession = await createSession(url, worktree)
+    seedLongHistory(isolatedEnv(home, configJSON)["OPENCODE_DB"]!, longSession, worktree)
+    await promptAsync(url, worktree, longSession, LONG_HISTORY_PROMPT)
+    const historyDeadline = Date.now() + EVENT_TIMEOUT_MS
+    while (Date.now() < historyDeadline && !longTurnCommitted(await sessionMessages(url, worktree, longSession))) {
+      if (eventTypeSeen.has("session.error")) break
+      await sleep(POLL_INTERVAL_MS)
+    }
+    const historyBytes = existsSync(historyFile) ? Number(readFileSync(historyFile, "utf8")) : 0
+    if (!(historyBytes >= LONG_HISTORY_MIN_BYTES)) {
+      missing.push(`messages.transform saw >= ${LONG_HISTORY_MIN_BYTES} history bytes (got ${historyBytes})`)
+    }
+    if (!longTurnCommitted(await sessionMessages(url, worktree, longSession))) missing.push("long-history turn committed")
     // Let the follow-up reply land so a late failure still shows up as session.error.
     await sleep(1_000)
     if (eventTypeSeen.has("session.error") && !missing.includes("no session.error")) missing.push("no session.error")
@@ -405,6 +433,84 @@ function pluginToolContext(
 ): { readonly callID?: unknown; readonly messages?: unknown; readonly model?: unknown } | undefined {
   if (!existsSync(contextFile)) return undefined
   return JSON.parse(readFileSync(contextFile, "utf8"))
+}
+
+/** Insert alternating user/assistant messages whose text parts are each below the per-string hold. */
+function seedLongHistory(databasePath: string, sessionID: string, directory: string): void {
+  const database = new Database(databasePath)
+  try {
+    database.run("PRAGMA busy_timeout = 5000")
+    const model = { providerID: "test", modelID: "test-model" }
+    let parentID = ""
+    const insert = database.transaction(() => {
+      for (let index = 0; index < LONG_HISTORY_PARTS; index++) {
+        const stamp = (index + 1).toString(16).padStart(12, "0")
+        const messageID = `msg_${stamp}${"0".repeat(13)}m`
+        const user = index % 2 === 0
+        if (user) parentID = messageID
+        const data = user
+          ? { role: "user", time: { created: index + 10 }, agent: "build", model }
+          : {
+              role: "assistant",
+              time: { created: index + 10, completed: index + 10 },
+              parentID,
+              agent: "build",
+              mode: "build",
+              ...model,
+              path: { cwd: directory, root: directory },
+              cost: 0,
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              finish: "end_turn",
+            }
+        database.run("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)", [
+          messageID,
+          sessionID,
+          index + 10,
+          index + 10,
+          JSON.stringify(data),
+        ])
+        database.run("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)", [
+          `prt_${stamp}${"0".repeat(13)}p`,
+          messageID,
+          sessionID,
+          index + 10,
+          index + 10,
+          JSON.stringify({ type: "text", text: `${index}:`.padEnd(LONG_HISTORY_PART_CHARS, "x") }),
+        ])
+      }
+    })
+    insert()
+  } finally {
+    database.close()
+  }
+}
+
+interface SmokeMessage {
+  readonly info?: { readonly role?: unknown; readonly error?: unknown; readonly time?: { readonly completed?: unknown } }
+  readonly parts?: ReadonlyArray<{ readonly type?: unknown; readonly text?: unknown }>
+}
+
+async function sessionMessages(url: string, directory: string, sessionID: string): Promise<readonly SmokeMessage[]> {
+  const response = await fetch(`${url}/session/${sessionID}/message`, {
+    headers: { ...authHeaders(), "x-opencode-directory": directory },
+  })
+  return response.ok ? ((await response.json()) as readonly SmokeMessage[]) : []
+}
+
+/** The new prompt got a completed, error-free assistant reply after the seeded history. */
+function longTurnCommitted(messages: readonly SmokeMessage[]): boolean {
+  const prompt = messages.findIndex((message) =>
+    message.parts?.some((part) => part.type === "text" && part.text === LONG_HISTORY_PROMPT),
+  )
+  if (prompt < 0) return false
+  return messages
+    .slice(prompt + 1)
+    .some(
+      (message) =>
+        message.info?.role === "assistant" &&
+        message.info.error === undefined &&
+        typeof message.info.time?.completed === "number",
+    )
 }
 
 function toolTurnWrote(filePath: string): boolean {
