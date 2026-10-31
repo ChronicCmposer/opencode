@@ -70,6 +70,8 @@ import {
   type WorkerPlugin,
   type WorkerPluginHubHook,
 } from "./plugin-host"
+import { createHubProxySpill } from "./hub-proxy-spill"
+import type { HubProxyClientOptions } from "./hub-proxy-wire"
 import {
   SessionPipeline,
   PIPELINE_SESSION_NODES,
@@ -275,6 +277,11 @@ export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
     throw new Error(`session worker workerData.sessionID must be a string, received ${typeof sessionID}`)
   }
 
+  const hubProxySpillDir = candidate.hubProxySpillDir
+  if (hubProxySpillDir !== undefined && typeof hubProxySpillDir !== "string") {
+    throw new Error("session worker workerData.hubProxySpillDir must be a string when present")
+  }
+
   const plugins = candidate.plugins
   if (plugins !== undefined && !Array.isArray(plugins)) {
     throw new Error("session worker workerData.plugins must be an array when present")
@@ -299,6 +306,7 @@ export function parseSessionWorkerInit(data: unknown): SessionWorkerInit {
     ...(sessionID === undefined ? {} : { sessionID }),
     ...(plugins === undefined ? {} : { plugins }),
     ...(pluginTools === undefined ? {} : { pluginTools }),
+    ...(hubProxySpillDir === undefined ? {} : { hubProxySpillDir }),
   }
 }
 
@@ -607,6 +615,18 @@ export interface SessionWorkerBootstrap {
 // ---------------------------------------------------------------------------
 // Worker→hub PID reporting.
 // ---------------------------------------------------------------------------
+
+/** The hub-proxy client's spill wiring: present only when the hub advertised a spill directory. */
+export function hubProxyClientOptions(
+  init: Pick<SessionWorkerInit, "workerID" | "hubProxySpillDir">,
+  threadId: number,
+): HubProxyClientOptions {
+  if (init.hubProxySpillDir === undefined) return {}
+  return {
+    spill: createHubProxySpill(init.hubProxySpillDir),
+    spillScope: `worker-${reportedWorkerID(init, threadId)}`,
+  }
+}
 
 /**
  * The owner id a worker reports: the hub-assigned pool slot id when the hub
@@ -1491,7 +1511,7 @@ export function bootstrapSessionWorker(
       // three proxies (each call is correlated by the client's own request id).
       const hubProxyChannel = new MessageChannel()
       scope.postMessage({ type: "hub-proxy", port: hubProxyChannel.port2 }, [transferable(hubProxyChannel.port2)])
-      const client = createHubProxyClient(hubProxyChannel.port1)
+      const client = createHubProxyClient(hubProxyChannel.port1, hubProxyClientOptions(init, threadId))
       hubProxyClient = client
       options.observeHubProxy?.(client)
       hubProxies = { sessionStatus: client, permission: client, question: client }
