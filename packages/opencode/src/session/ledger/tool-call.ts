@@ -12,9 +12,6 @@ import { LEDGER_SQL_FALLBACK } from "./sql/fallback.gen"
 /** The ledger key for one tool call: `<owning assistant message>:<provider call id>`. */
 export const toolCallKey = (messageID: string, callID: string): string => `${messageID}:${callID}`
 
-/** The message prefix of a ledger key, for finding calls owned by one message. */
-export const toolCallMessagePrefix = (messageID: string): string => `${messageID}:`
-
 /** The owning message id of a ledger key, or `undefined` when it is not a ledger key. */
 export function toolCallMessageID(callID: string): string | undefined {
   const index = callID.indexOf(":")
@@ -41,30 +38,46 @@ function changedRows(result: unknown): number {
 }
 
 /**
- * Mark every `started` tool-call record owned by the discarded messages as
- * finished/abandoned in the caller's transaction. Abandoning only stops the
- * record from blocking automatic resume; it never turns the call into a success.
+ * Mark every `started` tool-call record a rollback discards as finished/abandoned, in the caller's transaction:
+ * calls owned by a removed message, and calls whose tool part is removed from a message the rollback keeps. Run it
+ * before the parts are deleted. Abandoning only stops the record from blocking automatic resume; it never turns the
+ * call into a success.
  */
-export function abandonForMessages(
+export function abandonDiscarded(
   db: LedgerSqlDatabase,
-  sessionID: string,
-  messageIDs: readonly string[],
+  input: { readonly sessionID: string; readonly messageIDs: readonly string[]; readonly partIDs: readonly string[] },
 ): Effect.Effect<number> {
-  return Effect.gen(function* () {
-    if (!(yield* hasToolCallTable(db))) return 0
-    let changes = 0
-    for (const messageID of messageIDs) {
-      const result = yield* db.run(sql`
-        UPDATE tool_call
-        SET state = 'finished', outcome = 'abandoned', time_finished = ${Date.now()}
-        WHERE session_id = ${sessionID}
-          AND state = 'started'
-          AND substr(call_id, 1, ${toolCallMessagePrefix(messageID).length}) = ${toolCallMessagePrefix(messageID)}
-      `).pipe(Effect.orDie)
-      changes += changedRows(result)
-    }
-    return changes
-  })
+  if (input.messageIDs.length === 0 && input.partIDs.length === 0) return Effect.succeed(0)
+  const ownedByMessage =
+    input.messageIDs.length === 0
+      ? sql`0`
+      : sql`substr(call_id, 1, instr(call_id, ':') - 1) IN (${sql.join(
+          input.messageIDs.map((id) => sql`${id}`),
+          sql`, `,
+        )})`
+  const ownedByPart =
+    input.partIDs.length === 0
+      ? sql`0`
+      : sql`call_id IN (
+          SELECT message_id || ':' || json_extract(data, '$.callID') FROM part
+          WHERE id IN (${sql.join(
+            input.partIDs.map((id) => sql`${id}`),
+            sql`, `,
+          )}) AND json_extract(data, '$.type') = 'tool'
+        )`
+  return hasToolCallTable(db).pipe(
+    Effect.flatMap((present) =>
+      present
+        ? db
+            .run(
+              sql`UPDATE tool_call
+                SET state = 'finished', outcome = 'abandoned', time_finished = ${Date.now()}
+                WHERE session_id = ${input.sessionID} AND state = 'started' AND (${ownedByMessage} OR ${ownedByPart})`,
+            )
+            .pipe(Effect.map(changedRows), Effect.orDie)
+        : Effect.succeed(0),
+    ),
+  )
 }
 
 export const TOOL_CALL_STATES = ["started", "finished", "indeterminate"] as const

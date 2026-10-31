@@ -972,9 +972,12 @@ const layer: Layer.Layer<
     const discardReverted = Effect.fn("Session.discardReverted")(function* (input: DiscardReverted) {
       yield* db.transaction(() =>
         Effect.gen(function* () {
-          // Abandon the discarded messages' started tool calls first: they must not
-          // block automatic resume after their owning messages disappear.
-          yield* ToolCallLedger.abandonForMessages(db, input.sessionID, input.messageIDs)
+          // Abandon the discarded started tool calls before their rows go: they must not block automatic resume.
+          yield* ToolCallLedger.abandonDiscarded(db, {
+            sessionID: input.sessionID,
+            messageIDs: input.messageIDs,
+            partIDs: input.parts.map((part) => part.partID),
+          })
           // Order matters: removals must be published before the revert is cleared, so the UI
           // never sees a cleared revert while the removed rows are still visible.
           for (const messageID of input.messageIDs) {

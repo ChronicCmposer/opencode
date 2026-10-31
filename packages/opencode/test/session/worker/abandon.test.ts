@@ -7,7 +7,7 @@ import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import { Session } from "@/session/session"
 import { InstanceRef } from "@/effect/instance-ref"
-import { MessageID, SessionID } from "@/session/schema"
+import { MessageID, PartID, SessionID } from "@/session/schema"
 import { createE2EContext } from "../../lib/parity-harness"
 import { workerSnapshot } from "../../lib/snapshot"
 import { tmpdir } from "../../fixture/fixture"
@@ -69,6 +69,66 @@ describe("Session.discardReverted tool-call abandonment", () => {
         [sessionID],
       )
       expect(started).toEqual([{ call_id: `${kept}:call_2` }])
+    } finally {
+      await ctx.dispose()
+    }
+  }, 60_000)
+
+  test("a partial rollback abandons the started call of a tool part it removes from a kept message", async () => {
+    await using tmp = await tmpdir()
+    const ctx = createE2EContext({
+      snapshot: workerSnapshot({ directory: tmp.path }),
+      modelConfig: {
+        providerID: "mock",
+        modelID: "mock",
+        apiId: "mock",
+        baseUrl: "http://127.0.0.1:1",
+        apiKey: "test",
+        headers: {},
+      },
+    })
+    try {
+      const sessionID = SessionID.make("ses_abandon_partial")
+      const kept = MessageID.ascending()
+      const removedTool = PartID.ascending()
+      const keptTool = PartID.ascending()
+      ctx.connection.run(
+        "INSERT INTO session (id, project_id, slug, directory, title, version, metadata, permission, model, agent, revert, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [sessionID, "e2e", "abandon-partial", tmp.path, "abandon", "1", "{}", "[]", null, "build", null, 1, 1],
+      )
+      ctx.connection.run(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+        [kept, sessionID, 1, 1, JSON.stringify({ role: "assistant" })],
+      )
+      for (const [partID, callID] of [
+        [keptTool, "call_kept"],
+        [removedTool, "call_removed"],
+      ] as const) {
+        ctx.connection.run(
+          "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)",
+          [partID, kept, sessionID, 1, 1, JSON.stringify({ type: "tool", callID, tool: "bash" })],
+        )
+        ctx.connection.run(
+          "INSERT INTO tool_call (call_id, session_id, tool, side_effecting, state, outcome, time_started) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          [`${kept}:${callID}`, sessionID, "bash", 1, "started", null, 1],
+        )
+      }
+
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          yield* sessions.discardReverted({ sessionID, messageIDs: [], parts: [{ messageID: kept, partID: removedTool }] })
+        }).pipe(Effect.provide(ctx.layer), Effect.provideService(InstanceRef, ctx.instance)),
+      )
+
+      const rows = ctx.connection.all<{ call_id: string; state: string; outcome: string | null }>(
+        "SELECT call_id, state, outcome FROM tool_call ORDER BY call_id",
+        [],
+      )
+      expect(rows).toEqual([
+        { call_id: `${kept}:call_kept`, state: "started", outcome: null },
+        { call_id: `${kept}:call_removed`, state: "finished", outcome: "abandoned" },
+      ])
     } finally {
       await ctx.dispose()
     }
