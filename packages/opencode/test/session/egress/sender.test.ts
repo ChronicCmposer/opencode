@@ -7,11 +7,9 @@
 
 import { describe, expect, test } from "bun:test"
 import { recordingBridgeFrom } from "../../lib/recorders"
-import { decodeFrame } from "@/session/egress/frame"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { createEgressSender } from "@/session/egress/sender"
 import {
-  type EventsFrame,
   type EventV2Event,
   ackFrame,
   endFrame,
@@ -19,6 +17,7 @@ import {
   MAX_WORKER_FRAME_BYTES,
 } from "@/session/worker/frame"
 import { pollUntil } from "../../lib/poll"
+import { readByteFrame } from "./byte-frames"
 
 const deltaEvent = (id: string, text?: string): EventV2Event => ({
   id,
@@ -26,20 +25,42 @@ const deltaEvent = (id: string, text?: string): EventV2Event => ({
   properties: text === undefined ? { id } : { id, text },
 })
 
-function asText(data: unknown): string {
-  if (typeof data === "string") return data
-  throw new Error(`expected a JSON string, got ${Object.prototype.toString.call(data)}`)
+function asBuffer(data: unknown): ArrayBuffer {
+  if (data instanceof ArrayBuffer) return data
+  throw new Error(`expected an ArrayBuffer byte frame, got ${Object.prototype.toString.call(data)}`)
 }
 
-function captureRaw(channel: MessageChannel): string[] {
-  const chunks: string[] = []
-  channel.port2.onmessage = (event: MessageEvent) => chunks.push(asText(event.data))
+function captureRaw(channel: MessageChannel): ArrayBuffer[] {
+  const chunks: ArrayBuffer[] = []
+  channel.port2.onmessage = (event: MessageEvent) => chunks.push(asBuffer(event.data))
   channel.port2.start()
   return chunks
 }
 
 describe("egress sender", () => {
-  test("posts a coalesced delta batch as one JSON message per event frame", async () => {
+  test("transfers every posted buffer to the port instead of copying it", () => {
+    const posted: Array<{ readonly buffer: ArrayBuffer; readonly transfer: readonly unknown[]; readonly lengthAtPost: number }> = []
+    const port = {
+      postMessage: (buffer: ArrayBuffer, transfer: readonly unknown[]) => {
+        posted.push({ buffer, transfer, lengthAtPost: buffer.byteLength })
+        // The structured clone is what detaches the sender's copy.
+        structuredClone(buffer, { transfer: [...transfer] as ArrayBuffer[] })
+      },
+    } as unknown as MessagePort
+    const sender = createEgressSender({ port, maxBatch: 1 })
+
+    sender.pushDurable({ id: "d", type: "message.updated", properties: {} }, { aggregateID: "agg", seq: 1 })
+    sender.end()
+
+    expect(posted.length).toBe(4)
+    for (const message of posted) {
+      expect(message.lengthAtPost).toBeGreaterThan(0)
+      expect(message.transfer).toEqual([message.buffer])
+      expect(message.buffer.byteLength).toBe(0)
+    }
+  })
+
+  test("posts a coalesced delta batch as one ArrayBuffer message per event frame", async () => {
     const channel = new MessageChannel()
     const chunks = captureRaw(channel)
     const sender = createEgressSender({ port: channel.port1, maxBatch: 3 })
@@ -49,7 +70,7 @@ describe("egress sender", () => {
     sender.pushDelta(deltaEvent("c", "world"))
 
     await pollUntil(() => chunks.length === 3)
-    expect(chunks.map(decodeFrame)).toEqual([
+    expect(chunks.map(readByteFrame)).toEqual([
       eventFrame({ event: deltaEvent("a", "Hel") }),
       eventFrame({ event: deltaEvent("b", "lo ") }),
       eventFrame({ event: deltaEvent("c", "world") }),
@@ -68,7 +89,7 @@ describe("egress sender", () => {
 
     await pollUntil(() => chunks.length === 4)
     // Each durable hand-off is followed by an ack frame carrying the durable count.
-    expect(chunks.map(decodeFrame)).toEqual([
+    expect(chunks.map(readByteFrame)).toEqual([
       eventFrame({ event: first, aggregateID: "agg", seq: 1 } as Parameters<typeof eventFrame>[0]),
       ackFrame({ count: 1 }),
       eventFrame({ event: second, aggregateID: "agg", seq: 2 } as Parameters<typeof eventFrame>[0]),
@@ -85,10 +106,10 @@ describe("egress sender", () => {
     sender.pushDurable(event, { aggregateID: "s1", seq: 9 })
 
     await pollUntil(() => chunks.length === 2)
-    expect(decodeFrame(chunks[0]!)).toEqual(
+    expect(readByteFrame(chunks[0]!)).toEqual(
       eventFrame({ event, aggregateID: "s1", seq: 9 } as Parameters<typeof eventFrame>[0]),
     )
-    expect(decodeFrame(chunks[1]!)).toEqual(ackFrame({ count: 1 }))
+    expect(readByteFrame(chunks[1]!)).toEqual(ackFrame({ count: 1 }))
   })
 
   test("splits an over-cap batch before posting so every message stays within 4 MiB", async () => {
@@ -103,8 +124,8 @@ describe("egress sender", () => {
     sender.pushDelta(deltaEvent("b", pad))
 
     await pollUntil(() => chunks.length === 2)
-    expect(chunks.every((text) => Buffer.byteLength(text, "utf8") <= 4 * 1024 * 1024)).toBe(true)
-    expect(chunks.map((text) => decodeFrame(text).kind)).toEqual(["event", "event"])
+    expect(chunks.every((buffer) => buffer.byteLength <= 4 * 1024 * 1024)).toBe(true)
+    expect(chunks.map((buffer) => readByteFrame(buffer).kind)).toEqual(["event", "event"])
     channel.port1.close()
   })
 
@@ -117,12 +138,12 @@ describe("egress sender", () => {
     // as a small position reference the hub resolves from the shared blob store.
     expect(() => sender.pushDurable(huge, { aggregateID: "agg", seq: 1 })).not.toThrow()
     await pollUntil(() => chunks.length === 2)
-    expect(chunks.every((text) => Buffer.byteLength(text, "utf8") <= 4 * 1024 * 1024)).toBe(true)
-    const frame = decodeFrame(chunks[0]!)
+    expect(chunks.every((buffer) => buffer.byteLength <= 4 * 1024 * 1024)).toBe(true)
+    const frame = readByteFrame(chunks[0]!)
     expect(frame.kind === "event" ? frame.payload.event.properties : undefined).toMatchObject({
       __eventBlobPosition: { aggregateID: "agg", seq: 1 },
     })
-    expect(decodeFrame(chunks[1]!)).toEqual(ackFrame({ count: 1 }))
+    expect(readByteFrame(chunks[1]!)).toEqual(ackFrame({ count: 1 }))
     channel.port1.close()
   })
 
@@ -137,7 +158,7 @@ describe("egress sender", () => {
     await pollUntil(() => chunks.length === 3)
     // The delta, the zero-count run-end boundary, then the end frame — no ack
     // counting a durable delivery.
-    expect(chunks.map(decodeFrame)).toEqual([
+    expect(chunks.map(readByteFrame)).toEqual([
       eventFrame({ event: deltaEvent("a") }),
       ackFrame({ count: 0 }),
       endFrame(),
@@ -154,7 +175,7 @@ describe("egress sender", () => {
     sender.end()
 
     await pollUntil(() => chunks.length === 3)
-    expect(chunks.map(decodeFrame)).toEqual([
+    expect(chunks.map(readByteFrame)).toEqual([
       eventFrame({ event: deltaEvent("a") }),
       ackFrame({ count: 0 }),
       endFrame(),
@@ -166,14 +187,8 @@ describe("egress sender", () => {
 
   test("drops only an oversized non-durable delta and still posts the rest, ack and end", async () => {
     const channel = new MessageChannel()
-    const frames: EventsFrame[] = []
-    const acks: number[] = []
+    const chunks = captureRaw(channel)
     const warnings: Array<{ readonly message: string; readonly level: string | undefined }> = []
-    const receiver = createEgressReceiver({
-      port: channel.port2,
-      onFrame: (frame) => void frames.push(frame),
-      onAck: (payload) => void acks.push(payload?.count ?? -1),
-    })
     const sender = createEgressSender({
       port: channel.port1,
       maxBatch: 2,
@@ -191,21 +206,18 @@ describe("egress sender", () => {
       sender.pushDelta(deltaEvent("kept", "still delivered"))
       sender.end()
 
-      await pollUntil(() => receiver.ended && acks.length === 1, {
+      await pollUntil(() => chunks.length === 3, {
         message: "the run-end frame was lost with the oversized delta",
       })
 
-      expect(receiver.lastError).toBeUndefined()
-      expect(
-        frames.filter((frame) => frame.kind === "event").map((frame) =>
-          frame.kind === "event" ? frame.payload.event.id : undefined,
-        ),
-      ).toEqual(["kept"])
-      expect(acks).toEqual([0])
+      expect(chunks.map(readByteFrame)).toEqual([
+        eventFrame({ event: deltaEvent("kept", "still delivered") }),
+        ackFrame({ count: 0 }),
+        endFrame(),
+      ])
       expect(warnings).toHaveLength(1)
       expect(warnings[0]?.level).toBe("warn")
     } finally {
-      receiver.close()
       channel.port1.close()
       channel.port2.close()
     }

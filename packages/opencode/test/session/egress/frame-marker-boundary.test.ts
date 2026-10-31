@@ -14,10 +14,10 @@ import { DurableLog } from "@opencode-ai/core/durable-log"
 import {
   MAX_FRAME_BYTES,
   MAX_INLINE_EVENT_BYTES,
-  decodeFrame,
   encodeFrameChunks,
 } from "@/session/egress/frame"
 import { eventFrame, type EventV2Event } from "@/session/worker/frame"
+import { readByteFrame } from "./byte-frames"
 
 function coreMarker(size: number): { readonly __eventBlob: string; readonly size: number } {
   return { __eventBlob: DurableLog.digest(`durable-body-${size}`), size }
@@ -32,8 +32,8 @@ function durableEvent(size: number): EventV2Event {
 }
 
 function decodedProperties(frame: ReturnType<typeof eventFrame>): unknown {
-  const [text] = encodeFrameChunks([frame]).flat()
-  const decoded = decodeFrame(text!)
+  const [buffer] = encodeFrameChunks([frame]).flat()
+  const decoded = readByteFrame(buffer)
   if (decoded.kind !== "event") throw new Error(`expected an event frame, got ${decoded.kind}`)
   return decoded.payload.event.properties
 }

@@ -14,11 +14,12 @@ import { Database, type SQLQueryBindings } from "bun:sqlite"
 import { afterEach, describe, expect, test } from "bun:test"
 import { DurableLog } from "@opencode-ai/core/durable-log"
 import { Event } from "@opencode-ai/schema/event"
-import { ENVELOPE_HEADROOM_BYTES, MAX_INLINE_EVENT_BYTES, decodeFrame, encodeFrameChunks } from "@/session/egress/frame"
+import { ENVELOPE_HEADROOM_BYTES, MAX_INLINE_EVENT_BYTES, encodeFrameChunks } from "@/session/egress/frame"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { createEgressSender } from "@/session/egress/sender"
 import { MAX_WORKER_FRAME_BYTES, eventFrame, type EventsFrame, type EventV2Event } from "@/session/worker/frame"
 import { pollUntil } from "../../lib/poll"
+import { readByteFrame } from "./byte-frames"
 
 const MiB = 1024 * 1024
 
@@ -197,8 +198,8 @@ describe("frame-aligned durable events", () => {
     })
 
     // The hub can only resolve a `__eventBlobPosition`, never the raw marker.
-    const [text] = encodeFrameChunks([frame]).flat()
-    const decoded = decodeFrame(text!)
+    const [buffer] = encodeFrameChunks([frame]).flat()
+    const decoded = readByteFrame(buffer)
     if (decoded.kind !== "event") throw new Error(`expected an event frame, got ${decoded.kind}`)
     expect(decoded.payload.event.properties).toEqual({ __eventBlobPosition: position, frameBytes: 5 * MiB })
   })
@@ -211,8 +212,8 @@ describe("frame-aligned durable events", () => {
       ...position,
     })
 
-    const [text] = encodeFrameChunks([frame]).flat()
-    const decoded = decodeFrame(text!)
+    const [buffer] = encodeFrameChunks([frame]).flat()
+    const decoded = readByteFrame(buffer)
     if (decoded.kind !== "event") throw new Error(`expected an event frame, got ${decoded.kind}`)
     expect(decoded.payload.event.properties).toEqual(reference)
   })
