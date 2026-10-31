@@ -16,9 +16,21 @@ A single-pass, allocation-free, strict RFC 8259 validating scanner for events-po
 
 Frame: `[u32 LE envelopeLength][envelope JSON][properties JSON]`. Limits: 4 MiB total (`too-large`), nesting depth 512 (`too-deep`), 65536 bytes per object key (`key-too-long`). Both segments must be strict JSON: no BOM, no trailing data, strict UTF-8 (no overlongs, UTF-8-encoded surrogates or code points above U+10FFFF; `invalid-utf8`), strict number grammar; lone surrogate `\u` escapes are accepted as in `JSON.parse`.
 
-Envelope (`bad-envelope`, or `unsupported-version` when `v` is not 1): `port` is `"events"`; `id` a non-negative integer; the last duplicate key wins and unknown keys are ignored.
+## Rules
 
-- `event`: `payload.event.id` and `.type` strings; optional integer `generation` and `ordinal`; `aggregateID` (non-empty string) and `seq` (non-negative integer) both or neither. Then a non-empty properties segment follows.
-- `end`: no payload. `resync`: optional `pattern`, `aggregateID`, `seq`, `inclusive`. `ack`: optional non-negative integer `count`. These have no trailing bytes.
+The JS decoder, the C scanner and the fuzz oracle (`test/session/egress/scan-fuzz.test.ts`) implement exactly these; `test/session/egress/scan-corpus.ts` is the shared table both decoders run.
 
-Properties: any valid JSON value. A key spelled `__proto__`, `constructor` or `prototype` (compared after unescaping) at any depth is `dangerous-key`, with the key and its offset. `isBlobReference` follows `isEventBlobReference` in `worker/frame.ts`: `__eventBlobPosition` is an object with a string `aggregateID` and number `seq`, and `frameBytes` is a number; other keys are allowed. Top-level string `sessionID` and `aggregateID` are returned.
+| Topic | Rule |
+| --- | --- |
+| Envelope shape | Must be an object (`bad-envelope`). `v` must be the number 1, a missing or other `v` is `unsupported-version`. `port` is `"events"`, `kind` one of `event`, `end`, `resync`, `ack` (`bad-envelope`). `payload`, when present, is an object. |
+| Integers | `id`, `generation`, `ordinal`, `count`: safe integers (`id`, `count` also >= 0), as `Schema.Int`. `seq`: any integer >= 0. `aggregateID`: non-empty string. `inclusive`: boolean. A malformed field is `bad-envelope` where the kind reads it; other kinds ignore it. |
+| `event` | `payload.event.id` and `.type` strings; `aggregateID` and `seq` both or neither. A non-empty properties segment follows. |
+| `end` | No `payload` at all (not even `{}`) and no trailing bytes. |
+| `resync` / `ack` | Optional payload; an empty payload object decodes as no payload. Same field rules; no trailing bytes (`bad-envelope`, also for any non-event envelope followed by data). |
+| Duplicate keys | The last wins everywhere, as `JSON.parse`; unknown keys are ignored. |
+| Dangerous keys | `__proto__`, `constructor`, `prototype`, compared after unescaping, at any depth, in the envelope and in properties (`dangerous-key`). |
+| Depth | The root container is depth 1 in each segment; more than 512 is `too-deep`. |
+| Key length | Measured in decoded UTF-8 bytes (an escaped lone surrogate counts 3); more than 65536 is `key-too-long`. |
+| Strings | Lone surrogate `\u` escapes are accepted, as `JSON.parse`. A leading BOM is `invalid-json`. |
+| Blob reference | `__eventBlobPosition` object with string `aggregateID` and number `seq`, and number `frameBytes`, taking the last duplicate. |
+| Precedence | Per segment, the first stage that fails wins: invalid UTF-8 anywhere, then JSON syntax (including trailing data), then limits (`too-deep`, `dangerous-key`, `key-too-long`, strongest first). The envelope is checked before its structure, which comes before properties. The C scanner keeps scanning past a limit violation, using a heap bitmap beyond depth 512, to honour this. The one known gap: JS reports `too-deep` for input nested beyond what `JSON.parse` can parse, whatever follows. |

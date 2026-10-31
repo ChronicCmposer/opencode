@@ -8,6 +8,12 @@ typedef struct {
   const uint8_t *p;
   size_t end; /* end of the segment being scanned */
   egress_scan_result *r;
+  /* The strongest limit violation (too-deep > dangerous-key > key-too-long) seen in this segment. Scanning goes on
+     so that a syntax or UTF-8 error anywhere in the segment still wins, as it does for the JS decoder. */
+  egress_code pending_code;
+  size_t pending_offset;
+  const char *pending_message;
+  const char *pending_key;
 } state;
 
 static int fail(state *s, egress_code code, size_t offset, const char *message) {
@@ -15,6 +21,26 @@ static int fail(state *s, egress_code code, size_t offset, const char *message) 
   s->r->code = code;
   s->r->offset = offset;
   s->r->message = message;
+  return 0;
+}
+
+static int limit_rank(egress_code code) {
+  return code == EGRESS_CODE_TOO_DEEP ? 3 : code == EGRESS_CODE_DANGEROUS_KEY ? 2 : code == EGRESS_CODE_KEY_TOO_LONG ? 1 : 0;
+}
+
+static void note_limit(state *s, egress_code code, size_t offset, const char *message, const char *key) {
+  if (limit_rank(code) <= limit_rank(s->pending_code)) return;
+  s->pending_code = code;
+  s->pending_offset = offset;
+  s->pending_message = message;
+  s->pending_key = key;
+}
+
+/* End of a segment that is valid JSON: report the pending limit violation, if any. */
+static int finish_segment(state *s) {
+  if (s->pending_code == EGRESS_CODE_NONE) return 1;
+  fail(s, s->pending_code, s->pending_offset, s->pending_message);
+  s->r->key = s->pending_key;
   return 0;
 }
 
@@ -35,6 +61,47 @@ static int hex_value(uint8_t c) {
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
   return -1;
+}
+
+/* Length of the well-formed UTF-8 sequence at p[k] (lead byte >= 0x80), or 0. */
+static size_t utf8_sequence(const uint8_t *p, size_t k, size_t e) {
+  uint8_t c = p[k];
+  size_t n;
+  uint8_t lo = 0x80, hi = 0xBF;
+  if (c >= 0xC2 && c <= 0xDF) {
+    n = 1;
+  } else if (c >= 0xE0 && c <= 0xEF) {
+    n = 2;
+    if (c == 0xE0) lo = 0xA0;
+    else if (c == 0xED) hi = 0x9F;
+  } else if (c >= 0xF0 && c <= 0xF4) {
+    n = 3;
+    if (c == 0xF0) lo = 0x90;
+    else if (c == 0xF4) hi = 0x8F;
+  } else {
+    return 0;
+  }
+  if (k + n >= e) return 0;
+  if (p[k + 1] < lo || p[k + 1] > hi) return 0;
+  for (size_t j = 2; j <= n; j++) {
+    if (p[k + j] < 0x80 || p[k + j] > 0xBF) return 0;
+  }
+  return n + 1;
+}
+
+/* First ill-formed UTF-8 byte in [start, end), or `end`. */
+static size_t utf8_first_invalid(const uint8_t *p, size_t start, size_t end) {
+  size_t k = start;
+  while (k < end) {
+    if (p[k] < 0x80) {
+      k++;
+      continue;
+    }
+    size_t n = utf8_sequence(p, k, end);
+    if (n == 0) return k;
+    k += n;
+  }
+  return end;
 }
 
 /* *i is at the opening quote. */
@@ -73,27 +140,9 @@ static int scan_string(state *s, size_t *i, egress_span *span) {
       k++;
       continue;
     }
-    size_t n;
-    uint8_t lo = 0x80, hi = 0xBF;
-    if (c >= 0xC2 && c <= 0xDF) {
-      n = 1;
-    } else if (c >= 0xE0 && c <= 0xEF) {
-      n = 2;
-      if (c == 0xE0) lo = 0xA0;
-      else if (c == 0xED) hi = 0x9F;
-    } else if (c >= 0xF0 && c <= 0xF4) {
-      n = 3;
-      if (c == 0xF0) lo = 0x90;
-      else if (c == 0xF4) hi = 0x8F;
-    } else {
-      return fail(s, EGRESS_CODE_INVALID_UTF8, k, "invalid UTF-8 lead byte");
-    }
-    if (k + n >= e) return fail(s, EGRESS_CODE_INVALID_UTF8, k, "truncated UTF-8 sequence");
-    if (p[k + 1] < lo || p[k + 1] > hi) return fail(s, EGRESS_CODE_INVALID_UTF8, k, "invalid UTF-8 sequence");
-    for (size_t j = 2; j <= n; j++) {
-      if (p[k + j] < 0x80 || p[k + j] > 0xBF) return fail(s, EGRESS_CODE_INVALID_UTF8, k, "invalid UTF-8 sequence");
-    }
-    k += n + 1;
+    size_t n = utf8_sequence(p, k, e);
+    if (n == 0) return fail(s, EGRESS_CODE_INVALID_UTF8, k, "invalid UTF-8 sequence");
+    k += n;
   }
   span->present = 1;
   span->escaped = escaped;
@@ -261,21 +310,48 @@ static int key_id(const state *s, const egress_span *span) {
   return K_OTHER;
 }
 
-/* After the opening quote of a member key: scan it, enforce the caps, consume the colon. */
-static int member_key(state *s, size_t *i, int check, egress_span *key) {
+/* UTF-8 length of a validated key body after unescaping; a lone surrogate escape counts as 3 bytes. */
+static size_t decoded_key_bytes(const state *s, const egress_span *span) {
+  if (!span->escaped) return span->length;
+  const uint8_t *src = s->p + span->start;
+  size_t n = span->length, k = 0, bytes = 0;
+  while (k < n) {
+    if (src[k] != '\\') {
+      bytes++;
+      k++;
+    } else if (src[k + 1] != 'u') {
+      bytes++;
+      k += 2;
+    } else {
+      unsigned unit = (unsigned)((hex_value(src[k + 2]) << 12) | (hex_value(src[k + 3]) << 8) | (hex_value(src[k + 4]) << 4) |
+                                 hex_value(src[k + 5]));
+      k += 6;
+      if (unit >= 0xD800 && unit <= 0xDBFF && k + 5 < n && src[k] == '\\' && src[k + 1] == 'u') {
+        unsigned low = (unsigned)((hex_value(src[k + 2]) << 12) | (hex_value(src[k + 3]) << 8) | (hex_value(src[k + 4]) << 4) |
+                                  hex_value(src[k + 5]));
+        if (low >= 0xDC00 && low <= 0xDFFF) {
+          bytes += 4;
+          k += 6;
+          continue;
+        }
+      }
+      bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+    }
+  }
+  return bytes;
+}
+
+/* At a member key: scan it, note limit violations, consume the colon. */
+static int member_key(state *s, size_t *i, egress_span *key) {
   skip_ws(s, i);
   if (*i >= s->end || s->p[*i] != '"') return fail(s, EGRESS_CODE_INVALID_JSON, *i, "expected a property name");
   size_t at = *i;
   if (!scan_string(s, i, key)) return 0;
-  if (key->length > EGRESS_SCAN_MAX_KEY_BYTES) return fail(s, EGRESS_CODE_KEY_TOO_LONG, at, "object key too long");
-  if (check) {
-    const char *bad = dangerous_key(s, key);
-    if (bad != NULL) {
-      fail(s, EGRESS_CODE_DANGEROUS_KEY, at, "dangerous object key");
-      s->r->key = bad;
-      return 0;
-    }
+  if (key->length > EGRESS_SCAN_MAX_KEY_BYTES && decoded_key_bytes(s, key) > EGRESS_SCAN_MAX_KEY_BYTES) {
+    note_limit(s, EGRESS_CODE_KEY_TOO_LONG, at, "object key too long", NULL);
   }
+  const char *bad = dangerous_key(s, key);
+  if (bad != NULL) note_limit(s, EGRESS_CODE_DANGEROUS_KEY, at, "dangerous object key", bad);
   skip_ws(s, i);
   if (*i >= s->end || s->p[*i] != ':') return fail(s, EGRESS_CODE_INVALID_JSON, *i, "expected ':'");
   (*i)++;
@@ -283,7 +359,7 @@ static int member_key(state *s, size_t *i, int check, egress_span *key) {
 }
 
 /* Iterate an object whose '{' is consumed. 1: a member (value follows), 0: closed, -1: error. */
-static int next_member(state *s, size_t *i, int *first, int check, egress_span *key) {
+static int next_member(state *s, size_t *i, int *first, egress_span *key) {
   skip_ws(s, i);
   if (*i >= s->end) return fail(s, EGRESS_CODE_INVALID_JSON, *i, "unexpected end of JSON") - 1;
   uint8_t c = s->p[*i];
@@ -300,13 +376,40 @@ static int next_member(state *s, size_t *i, int *first, int check, egress_span *
     (*i)++;
   }
   *first = 0;
-  return member_key(s, i, check, key) ? 1 : -1;
+  return member_key(s, i, key) ? 1 : -1;
 }
 
-/* Validate one value. `depth` is the number of containers already enclosing it. */
-static int skip_value(state *s, size_t *ip, int depth, int check) {
-  uint8_t stack[EGRESS_SCAN_MAX_DEPTH]; /* 0 object, 1 array */
-  int sp = 0;
+/* Container kinds, one bit per level (1 = array). The first 512 levels live inline; deeper input is validated on
+   a heap bitmap so that its syntax can still be judged before the nesting limit is reported. */
+typedef struct {
+  uint64_t inline_bits[EGRESS_SCAN_MAX_DEPTH / 64];
+  uint64_t *heap;
+  size_t capacity;
+} kind_stack;
+
+static int stack_push(kind_stack *st, size_t sp, int bit) {
+  if (sp >= st->capacity) {
+    size_t grown = st->capacity * 2;
+    uint64_t *bits = realloc(st->heap, grown / 8);
+    if (bits == NULL) return 0;
+    if (st->heap == NULL) memcpy(bits, st->inline_bits, sizeof st->inline_bits);
+    memset(bits + st->capacity / 64, 0, (grown - st->capacity) / 8);
+    st->heap = bits;
+    st->capacity = grown;
+  }
+  uint64_t *words = st->heap != NULL ? st->heap : st->inline_bits;
+  if (bit) words[sp / 64] |= (uint64_t)1 << (sp % 64);
+  else words[sp / 64] &= ~((uint64_t)1 << (sp % 64));
+  return 1;
+}
+
+static int stack_top(const kind_stack *st, size_t sp) {
+  const uint64_t *words = st->heap != NULL ? st->heap : st->inline_bits;
+  return (int)((words[sp / 64] >> (sp % 64)) & 1);
+}
+
+static int skip_value_with(state *s, size_t *ip, int depth, kind_stack *st) {
+  size_t sp = 0;
   size_t i = *ip;
   egress_span span;
   uint8_t c;
@@ -316,8 +419,9 @@ value:
   if (i >= s->end) return fail(s, EGRESS_CODE_INVALID_JSON, i, "unexpected end of JSON");
   c = s->p[i];
   if (c == '{' || c == '[') {
-    if (depth + sp + 1 > EGRESS_SCAN_MAX_DEPTH) return fail(s, EGRESS_CODE_TOO_DEEP, i, "nesting too deep");
-    stack[sp++] = c == '[';
+    if ((size_t)depth + sp + 1 > EGRESS_SCAN_MAX_DEPTH) note_limit(s, EGRESS_CODE_TOO_DEEP, i, "nesting too deep", NULL);
+    if (!stack_push(st, sp, c == '[')) return fail(s, EGRESS_CODE_TOO_DEEP, i, "nesting too deep");
+    sp++;
     i++;
     skip_ws(s, &i);
     if (i < s->end && s->p[i] == (c == '{' ? '}' : ']')) {
@@ -326,7 +430,7 @@ value:
       goto after;
     }
     if (c == '{') {
-      if (!member_key(s, &i, check, &span)) return 0;
+      if (!member_key(s, &i, &span)) return 0;
     }
     goto value;
   }
@@ -352,10 +456,10 @@ after:
   skip_ws(s, &i);
   if (i >= s->end) return fail(s, EGRESS_CODE_INVALID_JSON, i, "unexpected end of JSON");
   c = s->p[i];
-  if (stack[sp - 1] == 0) {
+  if (!stack_top(st, sp - 1)) {
     if (c == ',') {
       i++;
-      if (!member_key(s, &i, check, &span)) return 0;
+      if (!member_key(s, &i, &span)) return 0;
       goto value;
     }
     if (c == '}') {
@@ -375,6 +479,16 @@ after:
     goto after;
   }
   return fail(s, EGRESS_CODE_INVALID_JSON, i, "expected ',' or ']'");
+}
+
+/* Validate one value. `depth` is the number of containers already enclosing it. */
+static int skip_value(state *s, size_t *ip, int depth) {
+  kind_stack st;
+  st.heap = NULL;
+  st.capacity = EGRESS_SCAN_MAX_DEPTH;
+  int ok = skip_value_with(s, ip, depth, &st);
+  free(st.heap);
+  return ok;
 }
 
 enum { T_NONE, T_STRING, T_NUMBER, T_BOOL, T_OBJECT, T_OTHER };
@@ -401,7 +515,7 @@ typedef struct {
   payload_t payload;
 } envelope_t;
 
-static int read_slot(state *s, size_t *i, int depth, int check, slot *out) {
+static int read_slot(state *s, size_t *i, int depth, slot *out) {
   memset(out, 0, sizeof *out);
   skip_ws(s, i);
   if (*i >= s->end) return fail(s, EGRESS_CODE_INVALID_JSON, *i, "unexpected end of JSON");
@@ -416,7 +530,7 @@ static int read_slot(state *s, size_t *i, int depth, int check, slot *out) {
   }
   out->t = c == 't' || c == 'f' ? T_BOOL : T_OTHER;
   out->b = c == 't';
-  return skip_value(s, i, depth, check);
+  return skip_value(s, i, depth);
 }
 
 static double number_value(const state *s, const egress_span *span) {
@@ -439,11 +553,13 @@ static double number_value(const state *s, const egress_span *span) {
   return strtod(buf, NULL);
 }
 
-static int slot_integer(const state *s, const slot *sl, int non_negative, double *out) {
+/* `safe`: within +-(2^53 - 1), as Schema.Int; otherwise any finite integer. */
+static int slot_integer(const state *s, const slot *sl, int non_negative, int safe, double *out) {
   if (sl->t != T_NUMBER) return 0;
   double d = number_value(s, &sl->span);
   if (!isfinite(d) || floor(d) != d) return 0;
   if (non_negative && d < 0) return 0;
+  if (safe && fabs(d) > 9007199254740991.0) return 0;
   *out = d == 0 ? 0 : d;
   return 1;
 }
@@ -454,12 +570,12 @@ static int parse_event(state *s, size_t *i, event_t *event) {
   (*i)++;
   int first = 1, m;
   egress_span key;
-  while ((m = next_member(s, i, &first, 0, &key)) == 1) {
+  while ((m = next_member(s, i, &first, &key)) == 1) {
     int ok;
     switch (key_id(s, &key)) {
-      case K_ID: ok = read_slot(s, i, 3, 0, &event->id); break;
-      case K_TYPE: ok = read_slot(s, i, 3, 0, &event->type); break;
-      default: ok = skip_value(s, i, 3, 0); break;
+      case K_ID: ok = read_slot(s, i, 3, &event->id); break;
+      case K_TYPE: ok = read_slot(s, i, 3, &event->type); break;
+      default: ok = skip_value(s, i, 3); break;
     }
     if (!ok) return 0;
   }
@@ -472,7 +588,7 @@ static int parse_payload(state *s, size_t *i, payload_t *payload) {
   (*i)++;
   int first = 1, m;
   egress_span key;
-  while ((m = next_member(s, i, &first, 0, &key)) == 1) {
+  while ((m = next_member(s, i, &first, &key)) == 1) {
     int ok;
     switch (key_id(s, &key)) {
       case K_EVENT:
@@ -482,17 +598,17 @@ static int parse_payload(state *s, size_t *i, payload_t *payload) {
         } else {
           memset(&payload->event, 0, sizeof payload->event);
           payload->event.t = T_OTHER;
-          ok = skip_value(s, i, 2, 0);
+          ok = skip_value(s, i, 2);
         }
         break;
-      case K_GENERATION: ok = read_slot(s, i, 2, 0, &payload->generation); break;
-      case K_ORDINAL: ok = read_slot(s, i, 2, 0, &payload->ordinal); break;
-      case K_AGGREGATE_ID: ok = read_slot(s, i, 2, 0, &payload->aggregate_id); break;
-      case K_SEQ: ok = read_slot(s, i, 2, 0, &payload->seq); break;
-      case K_PATTERN: ok = read_slot(s, i, 2, 0, &payload->pattern); break;
-      case K_INCLUSIVE: ok = read_slot(s, i, 2, 0, &payload->inclusive); break;
-      case K_COUNT: ok = read_slot(s, i, 2, 0, &payload->count); break;
-      default: ok = skip_value(s, i, 2, 0); break;
+      case K_GENERATION: ok = read_slot(s, i, 2, &payload->generation); break;
+      case K_ORDINAL: ok = read_slot(s, i, 2, &payload->ordinal); break;
+      case K_AGGREGATE_ID: ok = read_slot(s, i, 2, &payload->aggregate_id); break;
+      case K_SEQ: ok = read_slot(s, i, 2, &payload->seq); break;
+      case K_PATTERN: ok = read_slot(s, i, 2, &payload->pattern); break;
+      case K_INCLUSIVE: ok = read_slot(s, i, 2, &payload->inclusive); break;
+      case K_COUNT: ok = read_slot(s, i, 2, &payload->count); break;
+      default: ok = skip_value(s, i, 2); break;
     }
     if (!ok) return 0;
   }
@@ -505,19 +621,22 @@ static int parse_envelope(state *s, size_t start, size_t end, envelope_t *env) {
   skip_ws(s, &i);
   if (i >= end) return fail(s, EGRESS_CODE_INVALID_JSON, i, "empty envelope");
   if (s->p[i] != '{') {
-    if (!skip_value(s, &i, 0, 0)) return 0;
+    if (!skip_value(s, &i, 0)) return 0;
+    skip_ws(s, &i);
+    if (i != end) return fail(s, EGRESS_CODE_INVALID_JSON, i, "unexpected data after the envelope");
+    if (!finish_segment(s)) return 0;
     return fail(s, EGRESS_CODE_BAD_ENVELOPE, start, "frame must be an object");
   }
   i++;
   int first = 1, m;
   egress_span key;
-  while ((m = next_member(s, &i, &first, 0, &key)) == 1) {
+  while ((m = next_member(s, &i, &first, &key)) == 1) {
     int ok;
     switch (key_id(s, &key)) {
-      case K_V: ok = read_slot(s, &i, 1, 0, &env->v); break;
-      case K_PORT: ok = read_slot(s, &i, 1, 0, &env->port); break;
-      case K_KIND: ok = read_slot(s, &i, 1, 0, &env->kind); break;
-      case K_ID: ok = read_slot(s, &i, 1, 0, &env->id); break;
+      case K_V: ok = read_slot(s, &i, 1, &env->v); break;
+      case K_PORT: ok = read_slot(s, &i, 1, &env->port); break;
+      case K_KIND: ok = read_slot(s, &i, 1, &env->kind); break;
+      case K_ID: ok = read_slot(s, &i, 1, &env->id); break;
       case K_PAYLOAD:
         skip_ws(s, &i);
         if (i < end && s->p[i] == '{') {
@@ -525,22 +644,22 @@ static int parse_envelope(state *s, size_t start, size_t end, envelope_t *env) {
         } else {
           memset(&env->payload, 0, sizeof env->payload);
           env->payload.t = T_OTHER;
-          ok = skip_value(s, &i, 1, 0);
+          ok = skip_value(s, &i, 1);
         }
         break;
-      default: ok = skip_value(s, &i, 1, 0); break;
+      default: ok = skip_value(s, &i, 1); break;
     }
     if (!ok) return 0;
   }
   if (m < 0) return 0;
   skip_ws(s, &i);
   if (i != end) return fail(s, EGRESS_CODE_INVALID_JSON, i, "unexpected data after the envelope");
-  return 1;
+  return finish_segment(s);
 }
 
 static void copy_number(const state *s, const slot *sl, egress_number *out) {
   double v;
-  slot_integer(s, sl, 0, &v);
+  slot_integer(s, sl, 0, 0, &v);
   out->present = 1;
   out->value = v;
 }
@@ -555,7 +674,7 @@ static int validate_envelope(state *s, const envelope_t *env, size_t at, egress_
     return fail(s, EGRESS_CODE_BAD_ENVELOPE, at, "port must be \"events\"");
   }
   if (env->id.t != T_NONE) {
-    if (!slot_integer(s, &env->id, 1, &d)) return fail(s, EGRESS_CODE_BAD_ENVELOPE, at, "id must be a non-negative integer");
+    if (!slot_integer(s, &env->id, 1, 1, &d)) return fail(s, EGRESS_CODE_BAD_ENVELOPE, at, "id must be a non-negative integer");
     r->id.present = 1;
     r->id.value = d;
   }
@@ -570,11 +689,11 @@ static int validate_envelope(state *s, const envelope_t *env, size_t at, egress_
     r->event_id = pl->event.id.span;
     r->event_type = pl->event.type.span;
     if (pl->generation.t != T_NONE) {
-      if (!slot_integer(s, &pl->generation, 0, &d)) return fail(s, EGRESS_CODE_BAD_ENVELOPE, at, "generation must be an integer");
+      if (!slot_integer(s, &pl->generation, 0, 1, &d)) return fail(s, EGRESS_CODE_BAD_ENVELOPE, at, "generation must be an integer");
       copy_number(s, &pl->generation, &r->generation);
     }
     if (pl->ordinal.t != T_NONE) {
-      if (!slot_integer(s, &pl->ordinal, 0, &d)) return fail(s, EGRESS_CODE_BAD_ENVELOPE, at, "ordinal must be an integer");
+      if (!slot_integer(s, &pl->ordinal, 0, 1, &d)) return fail(s, EGRESS_CODE_BAD_ENVELOPE, at, "ordinal must be an integer");
       copy_number(s, &pl->ordinal, &r->ordinal);
     }
     if (pl->aggregate_id.t != T_NONE) {
@@ -584,7 +703,7 @@ static int validate_envelope(state *s, const envelope_t *env, size_t at, egress_
       r->aggregate_id = pl->aggregate_id.span;
     }
     if (pl->seq.t != T_NONE) {
-      if (!slot_integer(s, &pl->seq, 1, &d)) return fail(s, EGRESS_CODE_BAD_ENVELOPE, at, "seq must be a non-negative integer");
+      if (!slot_integer(s, &pl->seq, 1, 0, &d)) return fail(s, EGRESS_CODE_BAD_ENVELOPE, at, "seq must be a non-negative integer");
       copy_number(s, &pl->seq, &r->seq);
     }
     if (r->aggregate_id.present != r->seq.present) {
@@ -612,7 +731,7 @@ static int validate_envelope(state *s, const envelope_t *env, size_t at, egress_
       r->aggregate_id = pl->aggregate_id.span;
     }
     if (pl->seq.t != T_NONE) {
-      if (!slot_integer(s, &pl->seq, 1, &d)) return fail(s, EGRESS_CODE_BAD_ENVELOPE, at, "seq must be a non-negative integer");
+      if (!slot_integer(s, &pl->seq, 1, 0, &d)) return fail(s, EGRESS_CODE_BAD_ENVELOPE, at, "seq must be a non-negative integer");
       copy_number(s, &pl->seq, &r->seq);
     }
     if (pl->inclusive.t != T_NONE) {
@@ -627,7 +746,7 @@ static int validate_envelope(state *s, const envelope_t *env, size_t at, egress_
     if (pl->t == T_NONE) return 1;
     if (pl->t != T_OBJECT) return fail(s, EGRESS_CODE_BAD_ENVELOPE, at, "ack payload must be an object");
     if (pl->count.t != T_NONE) {
-      if (!slot_integer(s, &pl->count, 1, &d)) return fail(s, EGRESS_CODE_BAD_ENVELOPE, at, "count must be a non-negative integer");
+      if (!slot_integer(s, &pl->count, 1, 1, &d)) return fail(s, EGRESS_CODE_BAD_ENVELOPE, at, "count must be a non-negative integer");
       copy_number(s, &pl->count, &r->count);
     }
     return 1;
@@ -641,7 +760,7 @@ static int parse_properties(state *s, size_t start, size_t end, egress_scan_resu
   skip_ws(s, &i);
   if (i >= end) return fail(s, EGRESS_CODE_INVALID_JSON, i, "empty properties");
   if (s->p[i] != '{') {
-    if (!skip_value(s, &i, 0, 1)) return 0;
+    if (!skip_value(s, &i, 0)) return 0;
   } else {
     i++;
     int first = 1, m;
@@ -651,12 +770,12 @@ static int parse_properties(state *s, size_t start, size_t end, egress_scan_resu
       uint8_t t;
       slot aggregate_id, seq;
     } position = {0};
-    while ((m = next_member(s, &i, &first, 1, &key)) == 1) {
+    while ((m = next_member(s, &i, &first, &key)) == 1) {
       int ok;
       switch (key_id(s, &key)) {
-        case K_SESSION_ID: ok = read_slot(s, &i, 1, 1, &session); break;
-        case K_AGGREGATE_ID: ok = read_slot(s, &i, 1, 1, &aggregate); break;
-        case K_FRAME_BYTES: ok = read_slot(s, &i, 1, 1, &frame_bytes); break;
+        case K_SESSION_ID: ok = read_slot(s, &i, 1, &session); break;
+        case K_AGGREGATE_ID: ok = read_slot(s, &i, 1, &aggregate); break;
+        case K_FRAME_BYTES: ok = read_slot(s, &i, 1, &frame_bytes); break;
         case K_BLOB_POSITION:
           memset(&position, 0, sizeof position);
           skip_ws(s, &i);
@@ -666,20 +785,20 @@ static int parse_properties(state *s, size_t start, size_t end, egress_scan_resu
             int pfirst = 1, pm;
             egress_span pkey;
             ok = 1;
-            while (ok && (pm = next_member(s, &i, &pfirst, 1, &pkey)) == 1) {
+            while (ok && (pm = next_member(s, &i, &pfirst, &pkey)) == 1) {
               switch (key_id(s, &pkey)) {
-                case K_AGGREGATE_ID: ok = read_slot(s, &i, 2, 1, &position.aggregate_id); break;
-                case K_SEQ: ok = read_slot(s, &i, 2, 1, &position.seq); break;
-                default: ok = skip_value(s, &i, 2, 1); break;
+                case K_AGGREGATE_ID: ok = read_slot(s, &i, 2, &position.aggregate_id); break;
+                case K_SEQ: ok = read_slot(s, &i, 2, &position.seq); break;
+                default: ok = skip_value(s, &i, 2); break;
               }
             }
             if (ok && pm < 0) ok = 0;
           } else {
             position.t = T_OTHER;
-            ok = skip_value(s, &i, 1, 1);
+            ok = skip_value(s, &i, 1);
           }
           break;
-        default: ok = skip_value(s, &i, 1, 1); break;
+        default: ok = skip_value(s, &i, 1); break;
       }
       if (!ok) return 0;
     }
@@ -691,12 +810,21 @@ static int parse_properties(state *s, size_t start, size_t end, egress_scan_resu
   }
   skip_ws(s, &i);
   if (i != end) return fail(s, EGRESS_CODE_INVALID_JSON, i, "unexpected data after the properties");
-  return 1;
+  return finish_segment(s);
+}
+
+/* A syntax error is reported as invalid-utf8 when the segment holds ill-formed UTF-8 anywhere (the JS decoder decodes
+   the whole segment first). Error path only. */
+static void diagnose_utf8(state *s, size_t start, size_t end) {
+  if (s->r->code != EGRESS_CODE_INVALID_JSON) return;
+  size_t at = utf8_first_invalid(s->p, start, end);
+  if (at == end) return;
+  fail(s, EGRESS_CODE_INVALID_UTF8, at, "invalid UTF-8 sequence");
 }
 
 void egress_scan(const uint8_t *data, size_t length, egress_scan_result *r) {
   memset(r, 0, sizeof *r);
-  state s = {data, length, r};
+  state s = {data, length, r, EGRESS_CODE_NONE, 0, NULL, NULL};
   if (length > EGRESS_SCAN_MAX_BYTES) {
     fail(&s, EGRESS_CODE_TOO_LARGE, 0, "frame exceeds the 4 MiB limit");
     return;
@@ -713,12 +841,18 @@ void egress_scan(const uint8_t *data, size_t length, egress_scan_result *r) {
   size_t envelope_end = 4 + envelope_length;
   envelope_t env;
   memset(&env, 0, sizeof env);
-  if (!parse_envelope(&s, 4, envelope_end, &env)) return;
+  if (!parse_envelope(&s, 4, envelope_end, &env)) {
+    diagnose_utf8(&s, 4, envelope_end);
+    return;
+  }
   if (!validate_envelope(&s, &env, 4, r)) return;
   if (r->kind == EGRESS_KIND_EVENT) {
     r->properties_start = envelope_end;
     r->properties_end = length;
-    if (!parse_properties(&s, envelope_end, length, r)) return;
+    if (!parse_properties(&s, envelope_end, length, r)) {
+      diagnose_utf8(&s, envelope_end, length);
+      return;
+    }
   } else if (envelope_end != length) {
     fail(&s, EGRESS_CODE_BAD_ENVELOPE, envelope_end, "unexpected bytes after a frame without properties");
     return;

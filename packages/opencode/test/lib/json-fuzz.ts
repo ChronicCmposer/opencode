@@ -123,7 +123,7 @@ export function randomFrame(rng: Rng): EventsFrame {
       payload: {
         event: { id: `evt_${rng.int(1e9)}`, type: randomString(rng, 20) || "t", properties: randomProperties(rng) },
         ...(rng.chance(0.5) ? { generation: rng.int(100), ordinal: rng.int(1e6) } : {}),
-        ...(rng.chance(0.5) ? { aggregateID: randomString(rng, 12), seq: rng.int(1e6) } : {}),
+        ...(rng.chance(0.5) ? { aggregateID: randomString(rng, 12) || "agg", seq: rng.int(1e6) } : {}),
       },
       ...withId,
     }

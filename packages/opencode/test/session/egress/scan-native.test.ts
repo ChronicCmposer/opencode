@@ -1,10 +1,13 @@
 // The native scanner addon on its own contract: valid frames, every error code, and loading inside a Worker.
 // Skipped (with a printed reason) when the addon is not built; `bun run script/build-egress-scan.ts` builds it.
 
-import { describe, expect, test } from "bun:test"
+import { afterAll, describe, expect, test } from "bun:test"
 import { encodeEventsFrameBytes } from "@/session/egress/frame-bytes"
 import { loadNativeEgressScan, type NativeScanResult } from "@/session/egress/native-scan"
-import { ackFrame, endFrame, eventFrame, resyncFrame } from "@/session/worker/frame"
+import { activeDecoder, EventsFrameRejectedError, resetActiveDecoderForTest } from "@/session/egress/scan"
+import { ackFrame, endFrame, eventFrame, FrameTooLargeError, resyncFrame } from "@/session/worker/frame"
+import { LazyJson } from "@/util/lazy-json"
+import { corpus } from "./scan-corpus"
 
 const native = loadNativeEgressScan()
 if (native === undefined) {
@@ -135,7 +138,7 @@ describe.skipIf(native === undefined)("native egress scan", () => {
     const result = ok(
       scanOf(
         frameOf(
-          '{"v":1,"extra":[1,{"a":null}],"port":"events","kind":"event","id":"x","id":4,"payload":{"event":{"id":"a","type":"b","properties":{"__proto__":1}},"seq":1,"seq":2,"aggregateID":"g"}}',
+          '{"v":1,"extra":[1,{"a":null}],"port":"events","kind":"event","id":"x","id":4,"payload":{"event":{"id":"a","type":"b","properties":{"a":1}},"seq":1,"seq":2,"aggregateID":"g"}}',
           "{}",
         ),
       ),
@@ -462,4 +465,38 @@ describe.skipIf(native === undefined)("native egress scan", () => {
     const bytes = frameOf(eventEnvelope(), '{"sessionID":"s"}')
     for (let n = 0; n < 5000; n++) expect(scanOf(bytes).ok).toBe(true)
   })
+})
+
+describe.skipIf(native === undefined)("native decoder on the shared corpus", () => {
+  afterAll(() => resetActiveDecoderForTest())
+
+  for (const item of corpus) {
+    test(item.name, () => {
+      resetActiveDecoderForTest(native)
+      const decoder = activeDecoder()
+      expect(decoder.name).toBe("native")
+      if ("ok" in item.expect) {
+        const decoded = decoder.decode(item.bytes)
+        const { propertiesText, ...expected } = item.expect.ok as { propertiesText?: string } & Record<string, unknown>
+        if (decoded.kind !== "event") return expect(decoded).toEqual(expected as typeof decoded)
+        const { event, ...rest } = decoded
+        const { event: expectedEvent, ...expectedRest } = expected as { event: object } & Record<string, unknown>
+        expect(rest).toEqual(expectedRest as typeof rest)
+        expect({ id: event.id, type: event.type }).toEqual(expectedEvent as { id: string; type: string })
+        expect(LazyJson.is(event.properties)).toBe(true)
+        expect(event.properties.text).toBe(propertiesText!)
+        return
+      }
+      const error = (() => {
+        try {
+          decoder.decode(item.bytes)
+        } catch (error) {
+          return error
+        }
+      })()
+      if (item.expect.error === "FrameTooLargeError") return expect(error).toBeInstanceOf(FrameTooLargeError)
+      expect(error).toBeInstanceOf(EventsFrameRejectedError)
+      expect((error as EventsFrameRejectedError).code).toBe(item.expect.code!)
+    })
+  }
 })

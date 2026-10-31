@@ -21,7 +21,13 @@ afterEach(() => {
 
 describe("activeDecoder", () => {
   test("no addon selects js", () => {
-    expect(activeDecoder()).toBe(jsDecoder)
+    const spy = spyOn(nativeScan, "loadNativeEgressScan").mockReturnValue(undefined)
+    try {
+      expect(activeDecoder()).toBe(jsDecoder)
+      expect(spy).toHaveBeenCalledTimes(1)
+    } finally {
+      spy.mockRestore()
+    }
   })
 
   test("the selection is cached", () => {

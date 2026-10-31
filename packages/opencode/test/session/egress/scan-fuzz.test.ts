@@ -55,8 +55,22 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const optional = (record: Record<string, unknown>, key: string, test: (v: unknown) => boolean) => {
   if (record[key] !== undefined && !test(record[key])) reject(`bad ${key}`)
 }
-const isInt = (v: unknown) => typeof v === "number" && Number.isInteger(v)
+const isInt = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v)
+const isCount = (v: unknown) => isInt(v) && (v as number) >= 0
+const isSeq = (v: unknown) => typeof v === "number" && Number.isInteger(v) && v >= 0
 const isString = (v: unknown) => typeof v === "string"
+const isAggregateID = (v: unknown) => typeof v === "string" && v.length > 0
+
+// isEventBlobReference from worker/frame.ts, restated over parsed JSON.
+const isBlobReference = (rec: Record<string, unknown> | undefined) => {
+  const position = rec?.["__eventBlobPosition"]
+  return (
+    isRecord(position) &&
+    typeof position["aggregateID"] === "string" &&
+    typeof position["seq"] === "number" &&
+    typeof rec?.["frameBytes"] === "number"
+  )
+}
 
 function oracle(bytes: Uint8Array): Verdict {
   if (bytes.byteLength > MAX_WORKER_FRAME_BYTES) return { ok: false, tooLarge: true, reason: "too-large" }
@@ -69,7 +83,7 @@ function oracle(bytes: Uint8Array): Verdict {
     if (!isRecord(envelope)) reject("bad-envelope")
     const e = envelope as Record<string, unknown>
     if (e["v"] !== 1 || e["port"] !== "events") reject("bad-envelope")
-    optional(e, "id", isInt)
+    optional(e, "id", isCount)
     const payload = e["payload"]
     const fields: Fields = { kind: e["kind"], id: e["id"] }
     switch (e["kind"]) {
@@ -80,8 +94,9 @@ function oracle(bytes: Uint8Array): Verdict {
         if (!isString(event["id"]) || !isString(event["type"])) reject("bad-envelope")
         optional(p, "generation", isInt)
         optional(p, "ordinal", isInt)
-        optional(p, "aggregateID", isString)
-        optional(p, "seq", isInt)
+        optional(p, "aggregateID", isAggregateID)
+        optional(p, "seq", isSeq)
+        if ((p["aggregateID"] === undefined) !== (p["seq"] === undefined)) reject("aggregateID and seq must appear together")
         const properties = parseSegment(bytes.subarray(envelopeEnd))
         const rec = isRecord(properties) ? properties : undefined
         Object.assign(fields, {
@@ -91,7 +106,7 @@ function oracle(bytes: Uint8Array): Verdict {
           ordinal: p["ordinal"],
           aggregateID: p["aggregateID"],
           seq: p["seq"],
-          isBlobReference: rec !== undefined && "__eventBlobPosition" in rec && "frameBytes" in rec,
+          isBlobReference: isBlobReference(rec),
           propertiesSessionID: typeof rec?.["sessionID"] === "string" ? rec["sessionID"] : undefined,
           propertiesAggregateID: typeof rec?.["aggregateID"] === "string" ? rec["aggregateID"] : undefined,
         })
@@ -105,8 +120,8 @@ function oracle(bytes: Uint8Array): Verdict {
           if (!isRecord(payload)) reject("bad-envelope")
           const p = payload as Record<string, unknown>
           optional(p, "pattern", isString)
-          optional(p, "aggregateID", isString)
-          optional(p, "seq", isInt)
+          optional(p, "aggregateID", isAggregateID)
+          optional(p, "seq", isSeq)
           optional(p, "inclusive", (v) => typeof v === "boolean")
           Object.assign(fields, { pattern: p["pattern"], aggregateID: p["aggregateID"], seq: p["seq"], inclusive: p["inclusive"] })
         }
@@ -115,7 +130,7 @@ function oracle(bytes: Uint8Array): Verdict {
         if (payload !== undefined) {
           if (!isRecord(payload)) reject("bad-envelope")
           const p = payload as Record<string, unknown>
-          optional(p, "count", (v) => isInt(v) && (v as number) >= 0)
+          optional(p, "count", isCount)
           Object.assign(fields, { count: p["count"] })
         }
         break

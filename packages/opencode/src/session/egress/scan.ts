@@ -84,11 +84,17 @@ function parseJson(text: string, offset: number): unknown {
   }
 }
 
-/** Iterative walk: depth cap, key length cap, and no `__proto__` / `constructor` / `prototype` key anywhere. */
+/**
+ * Iterative walk: depth cap, key length cap (decoded UTF-8 bytes), and no `__proto__` / `constructor` / `prototype`
+ * key anywhere. When several limits are violated the strongest is reported: too-deep, then dangerous-key, then
+ * key-too-long.
+ */
 function checkValue(root: unknown, offset: number): void {
   if (typeof root !== "object" || root === null) return
   const stack: unknown[] = [root]
   const depths: number[] = [1]
+  let dangerous: string | undefined
+  let longKey = false
   while (stack.length > 0) {
     const value = stack.pop()
     const depth = depths.pop()!
@@ -105,10 +111,8 @@ function checkValue(root: unknown, offset: number): void {
     const record = value as Record<string, unknown>
     for (const key in record) {
       if (!Object.hasOwn(record, key)) continue
-      if (DANGEROUS_KEYS.has(key)) throw dangerousKey(key, offset)
-      if (key.length * 3 > MAX_KEY_BYTES && Buffer.byteLength(key) > MAX_KEY_BYTES) {
-        reject("object key too long", offset, "key-too-long")
-      }
+      if (DANGEROUS_KEYS.has(key)) dangerous ??= key
+      else if (key.length * 3 > MAX_KEY_BYTES && Buffer.byteLength(key) > MAX_KEY_BYTES) longKey = true
       const item = record[key]
       if (typeof item === "object" && item !== null) {
         stack.push(item)
@@ -116,6 +120,8 @@ function checkValue(root: unknown, offset: number): void {
       }
     }
   }
+  if (dangerous !== undefined) throw dangerousKey(dangerous, offset)
+  if (longKey) reject("object key too long", offset, "key-too-long")
 }
 
 function dangerousKey(key: string, offset: number) {
@@ -125,7 +131,10 @@ function dangerousKey(key: string, offset: number) {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
 const isInt = (value: unknown): value is number => typeof value === "number" && Number.isInteger(value)
-const isCount = (value: unknown): value is number => isInt(value) && value >= 0
+const isSafeInt = (value: unknown): value is number => isInt(value) && Number.isSafeInteger(value)
+const isCount = (value: unknown): value is number => isSafeInt(value) && value >= 0
+const isSeq = (value: unknown): value is number => isInt(value) && value >= 0
+const isAggregateID = (value: unknown): value is string => typeof value === "string" && value.length > 0
 
 function optional<T>(record: Record<string, unknown>, key: string, ok: (value: unknown) => value is T): T | undefined {
   const value = record[key]
@@ -178,7 +187,10 @@ export const jsDecoder: EventsFrameDecoder = {
 
     if (kind !== "event") {
       if (envelopeEnd !== bytes.byteLength) reject("properties segment on a non-event frame", envelopeEnd, "bad-envelope")
-      if (kind === "end") return { kind: "end", ...idField }
+      if (kind === "end") {
+        if (payload !== undefined) reject("end frame takes no payload", EVENTS_FRAME_HEADER_BYTES, "bad-envelope")
+        return { kind: "end", ...idField }
+      }
       if (payload === undefined) return { kind, ...idField } as ScannedEventsFrame
       if (kind === "ack") {
         const count = optional(payload, "count", isCount)
@@ -186,8 +198,8 @@ export const jsDecoder: EventsFrameDecoder = {
       }
       const fields = defined({
         pattern: optional(payload, "pattern", isString),
-        aggregateID: optional(payload, "aggregateID", isString),
-        seq: optional(payload, "seq", isInt),
+        aggregateID: optional(payload, "aggregateID", isAggregateID),
+        seq: optional(payload, "seq", isSeq),
         inclusive: optional(payload, "inclusive", isBoolean),
       })
       return { kind: "resync", ...idField, ...(Object.keys(fields).length === 0 ? {} : { payload: fields }) }
@@ -198,10 +210,10 @@ export const jsDecoder: EventsFrameDecoder = {
     if (!isRecord(event) || typeof event["id"] !== "string" || typeof event["type"] !== "string") {
       reject("event is malformed", EVENTS_FRAME_HEADER_BYTES, "bad-envelope")
     }
-    const generation = optional(payload, "generation", isInt)
-    const ordinal = optional(payload, "ordinal", isInt)
-    const aggregateID = optional(payload, "aggregateID", isString)
-    const seq = optional(payload, "seq", isInt)
+    const generation = optional(payload, "generation", isSafeInt)
+    const ordinal = optional(payload, "ordinal", isSafeInt)
+    const aggregateID = optional(payload, "aggregateID", isAggregateID)
+    const seq = optional(payload, "seq", isSeq)
     if ((aggregateID === undefined) !== (seq === undefined)) {
       reject("aggregateID and seq must appear together", EVENTS_FRAME_HEADER_BYTES, "bad-envelope")
     }
