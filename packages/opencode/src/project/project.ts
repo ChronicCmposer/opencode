@@ -22,6 +22,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Project } from "@opencode-ai/schema/project"
+import { valueOf } from "@/util/lazy-json"
 
 export const Info = Project.Info
 export type Info = Types.DeepMutable<Schema.Schema.Type<typeof Info>>
@@ -388,7 +389,7 @@ const layer = Layer.effect(
         const unsubscribe = yield* events.listen((event) => {
           if (event.type !== Command.Event.Executed.type || event.location?.directory !== ctx.directory)
             return Effect.void
-          const data = event.data as EventV2.Data<typeof Command.Event.Executed>
+          const data = valueOf(event.data) as EventV2.Data<typeof Command.Event.Executed>
           return data.name === Command.Default.INIT ? setInitialized(ctx.project.id) : Effect.void
         })
         yield* Effect.addFinalizer(() => unsubscribe)
