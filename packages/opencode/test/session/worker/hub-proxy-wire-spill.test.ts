@@ -171,14 +171,14 @@ describe("hub-proxy spill", () => {
 
   test("without spill an oversized request names the method and byte count", async () => {
     const h = setup({ x: () => 1 } as never)
-    const error: Error = await h.client.call("x" as never, [big()]).catch((e: unknown) => e as Error)
+    const error = (await h.client.call("x" as never, [big()]).catch((e: unknown) => e)) as Error
     expect(error.message).toMatch(/hub-proxy request "x" is \d+ bytes/)
     h.close()
   })
 
   test("without spill an oversized reply yields an error naming the method", async () => {
     const h = setup({ x: () => big() } as never)
-    const error: Error = await h.client.call("x" as never, []).catch((e: unknown) => e as Error)
+    const error = (await h.client.call("x" as never, []).catch((e: unknown) => e)) as Error
     expect(error).toBeInstanceOf(HubProxyRemoteError)
     expect(error.message).toContain('hub-proxy reply "x"')
     h.close()
