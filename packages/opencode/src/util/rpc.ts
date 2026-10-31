@@ -1,4 +1,5 @@
 import { errorMessage } from "@/util/error"
+import { stringifySpliced } from "@/util/lazy-json-splice"
 
 type Definition = {
   [method: string]: (input: any) => any
@@ -24,7 +25,12 @@ function failureMessage(error: unknown): string {
 }
 
 export function emit(event: string, data: unknown) {
-  postMessage(JSON.stringify({ type: "rpc.event", event, data }))
+  postMessage(
+    stringifySpliced({ type: "rpc.event", event, data }, [
+      ["data", "payload", "properties"],
+      ["data", "payload", "syncEvent", "data"],
+    ]),
+  )
 }
 
 export function client<T extends Definition>(target: {

@@ -14,6 +14,9 @@ import {
   tmpdirScoped,
 } from "../fixture/fixture"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
+import { InstanceRef } from "@/effect/instance-ref"
+import { EventV2 } from "@opencode-ai/core/event"
+import { LazyJson } from "../../src/util/lazy-json"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { Git } from "../../src/git"
 import { Vcs } from "@/project/vcs"
@@ -78,6 +81,24 @@ const publishHeadChangeUntil = Effect.fn("VcsTest.publishHeadChangeUntil")(funct
   }
 })
 
+const publishLazyHeadChangeUntil = Effect.fn("VcsTest.publishLazyHeadChangeUntil")(function* (
+  pending: Deferred.Deferred<string | undefined>,
+  head: string,
+) {
+  const events = yield* EventV2Bridge.Service
+  const location = EventV2Bridge.instanceLocation(yield* InstanceRef)
+  for (let i = 0; i < 50; i++) {
+    yield* events.publishLive({
+      id: EventV2.ID.create(),
+      type: Watcher.Event.Updated.type,
+      data: LazyJson.of({ file: head, event: "change" }),
+      location,
+    })
+    if (yield* Deferred.isDone(pending)) return
+    yield* Effect.sleep("10 millis")
+  }
+})
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -127,6 +148,27 @@ describe("Vcs", () => {
 
         const updated = yield* Deferred.await(pending).pipe(Effect.timeout("2 seconds"))
         expect(updated).toBe(branch)
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "publishes BranchUpdated when the watcher event data is a LazyJson",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const branch = `test-${Math.random().toString(36).slice(2)}`
+        yield* git(test.directory, ["branch", branch])
+
+        const vcs = yield* init()
+        yield* vcs.branch()
+        const pending = yield* nextBranchUpdate()
+
+        const head = path.join(test.directory, ".git", "HEAD")
+        yield* write(head, `ref: refs/heads/${branch}\n`)
+        yield* publishLazyHeadChangeUntil(pending, head)
+
+        expect(yield* Deferred.await(pending).pipe(Effect.timeout("2 seconds"))).toBe(branch)
       }),
     { git: true },
   )

@@ -28,6 +28,7 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { valueOf } from "@/util/lazy-json"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -209,7 +210,7 @@ const live: Layer.Layer<
             unsub = await bridge.promise(
               events.listen((event) => {
                 if (event.type !== Permission.Event.Replied.type) return Effect.void
-                const data = event.data as EventV2.Data<typeof Permission.Event.Replied>
+                const data = valueOf(event.data) as EventV2.Data<typeof Permission.Event.Replied>
                 if (data.requestID !== id) return Effect.void
                 void data.reply
                 return Effect.void

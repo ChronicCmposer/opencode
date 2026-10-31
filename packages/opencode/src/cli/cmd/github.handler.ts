@@ -33,6 +33,7 @@ import { Process } from "@/util/process"
 import { parseGitHubRemote } from "@/util/repository"
 import { Effect } from "effect"
 import { extractResponseText, formatPromptTooLargeError } from "./github.shared"
+import { valueOf } from "@/util/lazy-json"
 
 type GitHubAuthor = {
   login: string
@@ -831,7 +832,7 @@ export const githubRun = Effect.fn("Cli.github.run")(function* (args: { event?: 
       await runLocalEffect(
         events.listen((evt) => {
           if (evt.type !== MessageV2.Event.PartUpdated.type) return Effect.void
-          const data = evt.data as EventV2.Data<typeof MessageV2.Event.PartUpdated>
+          const data = valueOf(evt.data) as EventV2.Data<typeof MessageV2.Event.PartUpdated>
           if (data.part.sessionID !== session.id) return Effect.void
           //if (evt.properties.part.messageID === messageID) return
           const part = data.part

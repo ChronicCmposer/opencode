@@ -34,6 +34,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Service, experimentalWebSocketsEnabled, nameHooks } from "./index"
 import type { TriggerName } from "./index"
 import { assertPluginHookStartup } from "./routes"
+import { valueOf } from "@/util/lazy-json"
 
 type State = {
   hooks: Hooks[]
@@ -257,9 +258,12 @@ export const effectLayer = Layer.effect(
         const unsubscribe = yield* events.listen((event) => {
           if (event.location?.directory !== ctx.directory) return Effect.void
           return Effect.sync(() => {
-            const pluginEvent = { id: event.id, type: event.type, properties: event.data } as PluginEvent
+            // Parsed at most once and shared by every plugin; nothing is parsed when no plugin listens.
+            let pluginEvent: PluginEvent | undefined
             for (const hook of hooks) {
-              void hook.event?.({ event: pluginEvent })
+              if (!hook.event) continue
+              pluginEvent ??= { id: event.id, type: event.type, properties: valueOf(event.data) } as PluginEvent
+              void hook.event({ event: pluginEvent })
             }
           })
         })

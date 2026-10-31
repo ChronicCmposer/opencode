@@ -16,6 +16,8 @@ export type Interface = EventV2.Interface
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/EventV2Bridge") {}
 
+const locations = new WeakMap<InstanceContext, Map<string, Location.Ref>>()
+
 /**
  * Build the `Location.Ref` an event must carry to reach an instance `/event` SSE
  * stream. Shared by the publish boundary and the live-only republish seam so a
@@ -26,11 +28,18 @@ export function instanceLocation(
   workspaceID?: WorkspaceV2.ID,
 ): Location.Ref | undefined {
   if (ctx === undefined || ctx.project === undefined) return undefined
-  return new Location.Info({
+  const key = workspaceID ?? ""
+  const byWorkspace = locations.get(ctx) ?? new Map<string, Location.Ref>()
+  locations.set(ctx, byWorkspace)
+  const cached = byWorkspace.get(key)
+  if (cached) return cached
+  const location = new Location.Info({
     directory: AbsolutePath.make(ctx.directory),
     ...(workspaceID ? { workspaceID } : {}),
     project: { id: Project.ID.make(ctx.project.id), directory: AbsolutePath.make(ctx.worktree) },
   })
+  byWorkspace.set(key, location)
+  return location
 }
 
 /** An already-formed event to republish on the hub surface. */

@@ -28,6 +28,7 @@ import { SessionID } from "@/session/schema"
 import { NotFoundError } from "@/storage/storage"
 import { errorData } from "@/util/error"
 import { waitEvent } from "./util"
+import { valueOf } from "@/util/lazy-json"
 import { WorkspaceRef } from "@/effect/instance-ref"
 import { Vcs } from "@/project/vcs"
 import { InstanceStore } from "@/project/instance-store"
@@ -542,7 +543,7 @@ const layer = Layer.effect(
             timeout: TIMEOUT,
             fn(event) {
               if (event.workspace === info.id && event.payload.type === Event.Status.type) {
-                const { status } = event.payload.properties
+                const { status } = valueOf(event.payload.properties) as { status?: string }
                 return status === "error" || status === "connected"
               }
               return false

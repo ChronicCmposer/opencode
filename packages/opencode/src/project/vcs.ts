@@ -7,6 +7,7 @@ import { Git } from "@/git"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { VcsEvent } from "@opencode-ai/schema/vcs-event"
+import { valueOf } from "@/util/lazy-json"
 
 const PATCH_CONTEXT_LINES = 2_147_483_647
 const MAX_PATCH_BYTES = 10_000_000
@@ -319,7 +320,7 @@ const layer: Layer.Layer<Service, never, Git.Service | EventV2Bridge.Service> = 
         const unsubscribe = yield* events.listen((event) => {
           if (event.type !== Watcher.Event.Updated.type || event.location?.directory !== ctx.directory)
             return Effect.void
-          const data = event.data as EventV2.Data<typeof Watcher.Event.Updated>
+          const data = valueOf(event.data) as EventV2.Data<typeof Watcher.Event.Updated>
           if (!data.file.endsWith("HEAD")) return Effect.void
           return Effect.gen(function* () {
             const next = yield* get()
