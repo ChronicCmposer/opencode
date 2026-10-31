@@ -107,7 +107,7 @@ The database and durable log are the only authoritative state. No authoritative 
 
 ### D15 — Worker transport
 
-Send JSON strings over `postMessage`. Decode exactly once with Effect Schema at the port boundary. Reject messages above 4 MiB. There is no build-hash verification: the hub and worker ship in one compiled binary, so they cannot mismatch.
+The events (egress) port, in both directions, sends each frame as one transferred `ArrayBuffer`: `[u32 little-endian envelopeLength][envelope JSON][properties JSON]`, where the envelope is the events frame without `payload.event.properties` and only `event` frames carry a properties segment (D28). Every other port sends JSON strings over `postMessage`, decoded exactly once with Effect Schema at the port boundary. Reject messages above 4 MiB. There is no build-hash verification: the hub and worker ship in one compiled binary, so they cannot mismatch.
 
 A hub-proxy request or reply whose encoded frame exceeds `HUB_PROXY_SPILL_THRESHOLD_BYTES` (4 MiB minus 64 KiB) crosses as a `{ __hubProxySpill: { hash, bytes, scope } }` reference instead of failing the call. The body is written atomically to a content-addressed file `dirname(db)/hub-proxy-spill/<scope>/<sha256>`, verified by size and hash on read, and capped at `MAX_HUB_PROXY_SPILL_BYTES` (64 MiB); above the cap, or with no spill directory (an in-memory database), the call fails with a named error. The scope is `worker-<workerID>`. The worker removes its request file once the call settles and a reply file after reading it; the hub never deletes on the hot path, removes a generation's scope when it retires, and sweeps the whole directory at startup. Hub-side spill IO is asynchronous. Every frame-size rejection names its frame, for example `hub-proxy request "messagesTransform"`. Spilling replaces the earlier per-hook string placeholders, so a declared hook's payload of any shape crosses intact.
 
@@ -167,6 +167,16 @@ Rollback event order is fixed. Revert cleanup runs in one transaction in upstrea
 
 Abandoned tool-call records and lease refusals are settled deliberately. A `tool_call` row owned by a discarded message (`<assistantMessageID>:<callID>`), or by a tool part a partial rollback removes from a kept message, is marked finished with outcome `abandoned` in the same transaction as the revert cleanup, before the rows are deleted; abandoning only stops it blocking automatic resume and never records a success. At startup, a `started` row whose `worker_owner_id` is provably dead is abandoned unless its message still exists and is the session's last assistant message, in which case it keeps blocking until the user acts. The `worker_crash` row and the indeterminate user-facing message are unchanged. The crash-resume decision counts only the crashed generation's `started` rows (and unfenced ones): an earlier generation's leftover was already surfaced as indeterminate and does not block a later run. A worker reports the lease it claimed in its `ready` handshake, so the hub knows the exact owner before the first run returns. A refused live-lease reclaim logs the aggregate, owner, expiry, and reason, at most once per aggregate per process; legacy owner strings without a host scope still wait for lease expiry because a remote PID cannot be proven dead locally.
 
+### D28 — Events-port decode on the hub
+
+The hub main thread validates events frames without Effect Schema and never parses `properties` it does not read. One decoder contract (`session/egress/scan.ts`) has two implementations that accept and reject identical inputs with identical error classes: a hand-written single-pass, non-allocating, strict RFC 8259 validating scanner in C (`native/egress-scan`, a context-aware Node-API addon) and a JS fallback. The envelope gets a structural check; `properties` is untrusted and fully validated, and a `__proto__`, `constructor`, or `prototype` key anywhere (including through escapes) rejects the frame. The decoder flags blob references and reports top-level `properties.sessionID` / `aggregateID`. Rejections are `FrameTooLargeError` or `EventsFrameRejectedError` (a `ProtocolError`) with a code and byte offset; the channel isolation is unchanged. The exact rules are tabled in `native/egress-scan/README.md` and pinned by a shared corpus and a seeded differential fuzz against `JSON.parse`.
+
+Delivered event data from workers is a `LazyJson`: the validated bytes, parsed on first `.value` and cached. SSE (`/event`, `/global/event`, the durable `sync` envelope) and the TUI forwarder splice the raw text; hub readers use `valueOf`. All hub plugins with an `event` hook share one parsed value per event, so a plugin's mutation no longer reaches SSE clients — a deliberate divergence from in-process upstream. `instanceLocation` is cached per (instance context, workspace).
+
+The egress mesh carries only `{ aggregateID, seq }` wakeups, to the worker that committed the event; workers keep their own-aggregate gap tracker and `wakeDurable` and no longer receive or republish event bodies.
+
+The native decoder is built only on a linux arm64 build host for the glibc linux arm64 target; there, a missing C compiler fails the build. Other builds use the JS decoder. The compiled binary embeds the addon and extracts it to `$TMPDIR` at runtime, which must be writable. `OPENCODE_EGRESS_SCAN=js` forces the JS decoder; the active decoder is logged once. Native stays the default only while `script/bench-egress-scan.ts` on linux aarch64 shows at most half the JS decoder's time per delta-sized frame and no slowdown at 4 KB or 480 KB; otherwise the loader defaults to JS.
+
 ## Invariants
 
 | Invariant | Enforced by |
@@ -191,6 +201,9 @@ Abandoned tool-call records and lease refusals are settled deliberately. A `tool
 | Abandoning a tool-call record never records a success and never hides indeterminate work. | D10, D27 |
 | A refused lease reclaim is logged once per aggregate per process. | D12, D27 |
 | No hub-proxy call fails on size below the spill cap; every frame-size error names its frame. | D15 |
+| Both events decoders accept and reject identical inputs with identical error classes. | D28 |
+| The hub never parses `properties` it does not read; SSE splices the validated raw bytes. | D28 |
+| The mesh carries positions only, to the owning worker. | D28 |
 
 ## Superseded and retained plan steps
 
