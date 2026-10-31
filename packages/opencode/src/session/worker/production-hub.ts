@@ -636,7 +636,10 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   // One Effect semaphore bounds every cold isolate spawn for this hub (and every crash respawn, because the pool retains the same handle).
   const spawnGate =
     options.spawnGate ?? makeSpawnGate({ timeoutMs: options.spawnTimeoutMs ?? DEFAULT_SPAWN_GATE_TIMEOUT_MS })
-  const hubProxySpill = options.hubProxySpill
+  // Any file-backed hub spills oversized hub-proxy frames beside its database; an in-memory one has nowhere to spill.
+  const hubProxySpillDir = hubProxySpillDirectoryFor(options.databasePath)
+  const hubProxySpill =
+    options.hubProxySpill ?? (hubProxySpillDir === undefined ? undefined : createHubProxySpill(hubProxySpillDir))
   // Schema-ensure runs off the hub's main thread and before any spawn.
   let bootGate: Promise<void> | undefined
   const awaitBootGate = (): Promise<void> => {
@@ -693,7 +696,11 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   const resolveSource: (sessionID?: SessionID) => SessionWorkerInit | Promise<SessionWorkerInit> =
     typeof options.init === "function" ? options.init : () => options.init as SessionWorkerInit
   const resolveInit = async (sessionID?: SessionID): Promise<SessionWorkerInit> => {
-    const init = await resolveSource(sessionID)
+    const resolved = await resolveSource(sessionID)
+    const init =
+      hubProxySpillDir === undefined || resolved.hubProxySpillDir !== undefined
+        ? resolved
+        : { ...resolved, hubProxySpillDir }
     return sharedPortSource === undefined ? init : withSessionWorkerPorts(init)
   }
   // Persist every typed crash on the hub's off-loop DB thread unless the caller supplied its own sink.
@@ -909,8 +916,6 @@ interface PerSessionResolverDeps {
   readonly sessionOfWorker: (workerID: number) => SessionID | undefined
   /** Layer-scoped runtime for the Promise-shaped worker callbacks; absent uses the default runtime. */
   readonly runPromise?: <A, E>(effect: Effect.Effect<A, E>) => Promise<A>
-  /** Shipped on every worker init so the worker spills oversized frames beside the database. */
-  readonly hubProxySpillDir?: string
 }
 
 /** The per-session resolvers the production hub is composed from: the session → instance/context registry. */
@@ -1303,7 +1308,6 @@ export function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSess
                     deferRequestHooks: deps.requestHooksViaHub,
                   }),
           pluginTools,
-          ...(deps.hubProxySpillDir === undefined ? {} : { hubProxySpillDir: deps.hubProxySpillDir }),
         }
         // A non-serializable provider option or plugin hook is a configuration defect: die loud rather than widen every graph's error channel with the typed.
         return yield* buildSessionWorkerInit(initOptions).pipe(
@@ -1470,8 +1474,6 @@ export function productionSessionHubLayer(
         })
         db = DbExecutor.toPromiseExecutor(service)
       }
-      const spillDir = hubProxySpillDirectoryFor(databasePath)
-      const hubProxySpill = spillDir === undefined ? undefined : createHubProxySpill(spillDir)
       const blobDir = DurableLog.blobDirectoryFor(databasePath)
       const resolveBlob =
         options.backends?.resolveBlob ??
@@ -1502,7 +1504,6 @@ export function productionSessionHubLayer(
         runPromise,
         subagentDepth,
         sessionOfWorker: (workerID) => hubRef?.sessionOfWorker(workerID),
-        ...(spillDir === undefined ? {} : { hubProxySpillDir: spillDir }),
       })
       // The production durable-egress barrier: the events port observes each durable frame and its ack, and `execute` awaits the ack after the run reply.
       const egressDelivery = createEgressDeliveryBarrier({ bridge: effectBridge })
@@ -1531,7 +1532,6 @@ export function productionSessionHubLayer(
         count,
         barrier,
         databasePath,
-        ...(hubProxySpill === undefined ? {} : { hubProxySpill }),
         init: resolvers.resolveInit,
         generationOf: resolvers.generationOfSession,
         ports,

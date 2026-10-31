@@ -20,7 +20,6 @@
 // previous hook's mutations. A throwing hook aborts the chain (fail loud).
 
 import { Schema } from "effect"
-import { withLargeStringsHeld } from "./hub-payload"
 
 export {
   DECLARED_ONLY_HOOKS,
@@ -445,28 +444,17 @@ export function createWorkerPluginHost(
   }
 
   const declared = declaredHooksOf(plugins)
-  // Hooks no hub plugin declares are a no-op on the hub, so they never cross the
-  // port. Declared ones hold oversized strings back so the frame cap cannot fail
-  // a turn the in-process path would run.
+  // Hooks no hub plugin declares are a no-op on the hub, so they never cross the port. Oversized payloads of
+  // declared hooks cross through the hub-proxy spill.
   const rawHubHook = hostOptions?.hubHook
   const hubHook: WorkerPluginHubHook | undefined =
     rawHubHook === undefined
       ? undefined
-      : (name, input, output) =>
-          declared.has(name)
-            ? withLargeStringsHeld([input, output] as const, ([heldInput, heldOutput]) =>
-                rawHubHook(name, heldInput, heldOutput),
-              )
-            : Promise.resolve(output)
+      : (name, input, output) => (declared.has(name) ? rawHubHook(name, input, output) : Promise.resolve(output))
   const gated = <I, O>(name: string, transform: ((input: I, output: O) => Promise<O>) | undefined) =>
     transform === undefined
       ? undefined
-      : (input: I, output: O) =>
-          declared.has(name)
-            ? withLargeStringsHeld([input, output] as const, ([heldInput, heldOutput]) =>
-                transform(heldInput, heldOutput),
-              )
-            : Promise.resolve(output)
+      : (input: I, output: O) => (declared.has(name) ? transform(input, output) : Promise.resolve(output))
   const systemTransform = gated("experimental.chat.system.transform", hostOptions?.systemTransform)
   const messagesTransform = gated("experimental.chat.messages.transform", hostOptions?.messagesTransform)
   const options: WorkerPluginHostOptions = {

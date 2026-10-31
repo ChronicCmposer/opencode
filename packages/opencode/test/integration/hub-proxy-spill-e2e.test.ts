@@ -282,4 +282,33 @@ describe("hub-proxied plugin hooks with multi-MiB payloads of medium strings", (
       }),
     REAL_WORKER_TEST_TIMEOUT_MS,
   )
+
+  it.live(
+    "chat.message receives one 6 MB text part and the turn commits",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const { filename, directory } = freshWorkspace()
+        const sessionID = "ses_spill_single_part"
+        yield* migrateLikeProduction(filename)
+        seedSession(filename, sessionID)
+        yield* llm.text("done")
+
+        const calls: HookCall[] = []
+        const fixture = startHub({ llm, filename, directory, declared: ["chat.message"], calls })
+        try {
+          const text = "y".repeat(MIN_TOTAL_BYTES)
+          yield* Effect.promise(() => dispatchPrompt(fixture.hub, sessionID, [{ type: "text", text }]))
+          const seen = calls.find((call) => call.name === "chat.message")
+          expect(seen).toBeDefined()
+          expect(seen!.bytes).toBeGreaterThanOrEqual(MIN_TOTAL_BYTES)
+          const assistant = readMessages(filename, sessionID).filter((message) => message.role === "assistant").at(-1)
+          expect(assistant).toBeDefined()
+          expect(assistant!.error).toBeUndefined()
+        } finally {
+          yield* Effect.promise(() => fixture.dispose())
+        }
+      }),
+    REAL_WORKER_TEST_TIMEOUT_MS,
+  )
 })
