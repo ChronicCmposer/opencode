@@ -15,6 +15,7 @@ const generated = await import("./generate.ts")
 
 import { Script } from "@opencode-ai/script"
 import pkg from "../package.json"
+import { buildEgressScan, embedsEgressScan } from "./build-egress-scan"
 
 const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
@@ -177,6 +178,14 @@ for (const item of targets) {
   const dbExecutorSourcePath = "./src/session/worker/db-executor.ts"
   const dbExecutorPath = "db-executor.js"
   const treeSitterWorkerPath = "opentui-tree-sitter-worker.js"
+  const embedEgressScan = embedsEgressScan({ platform: process.platform, arch: process.arch }, item)
+  if (embedEgressScan) {
+    console.log("Compiling the native egress scanner")
+    // Throws (failing the build) when the host has no C compiler.
+    await buildEgressScan()
+  } else if (item.os === "linux" && item.arch === "arm64") {
+    console.log("Skipping the native egress scanner: it needs a glibc linux arm64 build host; the JS decoder runs")
+  }
   const bunfsRoot = item.os === "win32" ? "B:/~BUN/root/" : "/$bunfs/root/"
 
   // A bundled worker entrypoint lands in the bunfs module graph at its source path
@@ -230,6 +239,7 @@ for (const item of targets) {
       OPENCODE_SESSION_WORKER_PATH: bunfsRoot + sessionWorkerPath,
       OPENCODE_DB_EXECUTOR_PATH: bunfsRoot + dbExecutorPath,
       OPENCODE_CHANNEL: `'${Script.channel}'`,
+      OPENCODE_EGRESS_SCAN_EMBEDDED: embedEgressScan ? "true" : "false",
       // Compile the fault-injection seam out of production binaries. `define`
       // values are raw code, so `"false"` inlines the boolean literal `false`
       // that `src/testing/faults.ts` checks in `compiledOut()`. Dev/test never
