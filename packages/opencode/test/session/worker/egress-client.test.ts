@@ -13,7 +13,19 @@ import { Logger } from "effect"
 import type { EffectBridge } from "@/effect/bridge"
 import { workerLogMessage } from "@/session/worker/worker-logging"
 import { recordingBridge } from "../../lib/recorders"
+import type { ScannedEventsFrame } from "@/session/egress/scan"
+import { valueOf } from "@/util/lazy-json"
 import { type EventsFrame, type EventV2Event, eventFrame } from "@/session/worker/frame"
+
+/** The plain events frame a decoded frame stands for: scanned fields with `properties` unwrapped. */
+function plain(frame: ScannedEventsFrame): EventsFrame {
+  if (frame.kind !== "event") throw new Error(`expected an event frame, got ${frame.kind}`)
+  const { id, type, properties } = frame.event
+  return eventFrame({
+    event: { id, type, properties: valueOf(properties) },
+    ...(frame.aggregateID === undefined ? {} : { aggregateID: frame.aggregateID, seq: frame.seq }),
+  } as Parameters<typeof eventFrame>[0])
+}
 
 async function pollUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -35,7 +47,7 @@ const durable = (id: string): EventV2Event => ({ id, type: "message.updated", pr
 describe("worker egress client framing round-trip", () => {
   test("emit is transported as an event frame with verbatim {id,type,properties}", async () => {
     const channel = new MessageChannel()
-    const frames: EventsFrame[] = []
+    const frames: ScannedEventsFrame[] = []
     const receiver = createEgressReceiver({ port: channel.port2, onFrame: (frame) => frames.push(frame) })
     const client = createWorkerEgressClient(channel.port1, { maxBatch: 1 })
 
@@ -43,14 +55,14 @@ describe("worker egress client framing round-trip", () => {
     client.emit(event)
 
     await pollUntil(() => frames.length === 1)
-    expect(frames).toEqual([eventFrame({ event })])
+    expect(frames.map(plain)).toEqual([eventFrame({ event })])
     expect(receiver.pendingBytes).toBe(0)
     client.dispose()
   })
 
   test("end flushes buffered deltas then terminates the stream", async () => {
     const channel = new MessageChannel()
-    const frames: EventsFrame[] = []
+    const frames: ScannedEventsFrame[] = []
     let ended = false
     createEgressReceiver({ port: channel.port2, onFrame: (frame) => frames.push(frame), onEnd: () => (ended = true) })
     // Default 16ms window: nothing flushes until `end()`.
@@ -61,13 +73,13 @@ describe("worker egress client framing round-trip", () => {
     client.end()
 
     await pollUntil(() => ended)
-    expect(frames).toEqual([eventFrame({ event: text("e1", "hi") })])
+    expect(frames.map(plain)).toEqual([eventFrame({ event: text("e1", "hi") })])
     expect(client.ended).toBe(true)
   })
 
   test("emitDurable carries writer meta and preserves commit order", async () => {
     const channel = new MessageChannel()
-    const frames: EventsFrame[] = []
+    const frames: ScannedEventsFrame[] = []
     createEgressReceiver({ port: channel.port2, onFrame: (frame) => frames.push(frame) })
     const client = createWorkerEgressClient(channel.port1)
 
@@ -75,7 +87,7 @@ describe("worker egress client framing round-trip", () => {
     client.emitDurable(durable("d2"), { aggregateID: "agg", seq: 2 })
 
     await pollUntil(() => frames.length === 2)
-    expect(frames).toEqual([
+    expect(frames.map(plain)).toEqual([
       eventFrame({ event: durable("d1"), aggregateID: "agg", seq: 1 } as Parameters<typeof eventFrame>[0]),
       eventFrame({ event: durable("d2"), aggregateID: "agg", seq: 2 } as Parameters<typeof eventFrame>[0]),
     ])

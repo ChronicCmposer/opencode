@@ -51,8 +51,11 @@ export class DurableOrderError extends Schema.TaggedErrorClass<DurableOrderError
 }
 
 export interface EgressPortOptions {
-  /** Called with each delivered event frame; `properties` is still raw bytes (`LazyJson`). */
-  readonly onFrame: (frame: ScannedEventsFrame) => unknown
+  /**
+   * Called with each delivered event frame; `properties` is still raw bytes (`LazyJson`). `bytes` is the
+   * original transferred buffer, for consumers that forward the frame verbatim.
+   */
+  readonly onFrame: (frame: ScannedEventsFrame, bytes: ArrayBuffer) => unknown
   /** Called once when the worker's `end` frame arrives. */
   readonly onEnd?: () => void
   /** Called for a received `resync` frame, or `undefined` for an overflow resync. */
@@ -112,7 +115,7 @@ export interface EgressPortConnection {
  * Decode one worker port message into either an events frame or a typed failure, never parsing JSON ad hoc.
  */
 type PortMessage =
-  | { readonly _tag: "frame"; readonly frame: ScannedEventsFrame }
+  | { readonly _tag: "frame"; readonly frame: ScannedEventsFrame; readonly bytes: ArrayBuffer }
   | { readonly _tag: "failure"; readonly error: Error }
 
 /** Every events-port message is one transferred byte frame. */
@@ -158,7 +161,7 @@ export function createEgressPort(port: MessagePort, options: EgressPortOptions):
     return Effect.asVoid(result as Effect.Effect<unknown, Error, never>)
   }
 
-  const handleEvent = (frame: EventFrame): Effect.Effect<void, Error> =>
+  const handleEvent = (frame: EventFrame, bytes: ArrayBuffer): Effect.Effect<void, Error> =>
     Effect.gen(function* () {
       // The canonical durability test (present only when BOTH `aggregateID` and `seq` are set), shared with
       // the sender and fan-out so the three never drift on exactly which frames are durable.
@@ -188,7 +191,7 @@ export function createEgressPort(port: MessagePort, options: EgressPortOptions):
         }
         // Advance only once delivery succeeded: a frame that failed to deliver
         // leaves the cursor behind, so the next frame surfaces as a gap and heals it.
-        yield* settle(options.onFrame(frame))
+        yield* settle(options.onFrame(frame, bytes))
         lastByAggregate.set(meta.aggregateID, meta)
         received++
         return
@@ -200,7 +203,7 @@ export function createEgressPort(port: MessagePort, options: EgressPortOptions):
         return
       }
       received++
-      yield* settle(options.onFrame(frame))
+      yield* settle(options.onFrame(frame, bytes))
     })
 
   const reject = (error: Error): void => {
@@ -223,7 +226,7 @@ export function createEgressPort(port: MessagePort, options: EgressPortOptions):
       const frame = message.frame
       switch (frame.kind) {
         case "event":
-          yield* handleEvent(frame)
+          yield* handleEvent(frame, message.bytes)
           return
         case "end":
           ended = true
@@ -244,7 +247,8 @@ export function createEgressPort(port: MessagePort, options: EgressPortOptions):
       if (released || ended || lastError !== undefined) return
       const message: PortMessage = (() => {
         try {
-          return { _tag: "frame", frame: decodeFrameBytes(asBytes(event.data)) }
+          const bytes = asBytes(event.data)
+          return { _tag: "frame", frame: decodeFrameBytes(bytes), bytes }
         } catch (error) {
           return { _tag: "failure", error: asError(error) }
         }

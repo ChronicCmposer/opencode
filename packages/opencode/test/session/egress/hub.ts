@@ -46,14 +46,14 @@ export interface EgressHub {
   /** Non-end frames delivered from the worker. */
   readonly frames: number
   readonly closed: boolean
-  /** The async JSON stream an SSE route writes for one client. */
-  stream(subscriberId: string): AsyncIterable<string>
+  /** The async byte-frame stream an SSE route writes for one client. */
+  stream(subscriberId: string): AsyncIterable<ArrayBuffer>
   /** Drop non-durable, emit `end`, close ports; idempotent (worker `end` or terminate). */
   close(): void
 }
 
 const END_FRAME = endFrame()
-/** The terminal frame's wire JSON, handed to subscribers that arrive after termination. */
+/** The terminal frame's wire bytes, handed to subscribers that arrive after termination. */
 const END_BYTES = encodeFrame(END_FRAME)
 
 function createNotifier() {
@@ -97,9 +97,9 @@ export function createEgressHub(options: EgressHubOptions): EgressHub {
 
   receiver = createEgressReceiver({
     port: options.egressPort,
-    onFrame: (frame, text) => {
+    onFrame: (frame, bytes) => {
       frames++
-      fanout.publishBytes(text, frame)
+      fanout.publishBytes(bytes, frame)
       notifier.notify()
     },
     onEnd: finish,

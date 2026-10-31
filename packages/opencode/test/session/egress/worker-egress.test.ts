@@ -9,7 +9,8 @@
 import { describe, expect, test } from "bun:test"
 import { createControlLink, type ControlFrame } from "@/session/egress/control"
 import { createEgressHub } from "./hub"
-import { decodeFrame, type EventsFrame } from "@/session/egress/frame"
+import { readByteFrame } from "./byte-frames"
+import type { EventsFrame } from "@/session/egress/frame"
 import { attachMeshWorker, createEgressMesh } from "@/session/egress/mesh"
 import { endFrame } from "@/session/worker/frame"
 import { createWorkerHarness } from "../../lib/worker-harness"
@@ -146,7 +147,7 @@ describe("egress across a worker isolate", () => {
     const { worker, hub } = session
     const frames: EventsFrame[] = []
     const consumer = (async () => {
-      for await (const bytes of hub.stream("sse")) frames.push(decodeFrame(bytes))
+      for await (const bytes of hub.stream("sse")) frames.push(readByteFrame(bytes))
     })()
     await pollWorker(() => hub.fanout.subscribers.length === 1)
     worker.post({ type: "end" })

@@ -7,6 +7,7 @@
 import type { ScannedEventsFrame } from "@/session/egress/scan"
 import { describe, expect, test } from "bun:test"
 import { type DurableMeta } from "@/session/egress/frame"
+import { readByteFrame } from "./byte-frames"
 import { encodeEventsFrameBytes } from "@/session/egress/frame-bytes"
 import { createEgressReceiver, DurableOrderError } from "@/session/egress/receiver"
 import { createEgressSender } from "@/session/egress/sender"
@@ -120,31 +121,31 @@ describe("durable aggregate identity", () => {
 
   test("the client forwards the first durable of a fresh aggregate (seq 0)", async () => {
     const channel = new MessageChannel()
-    const chunks: string[] = []
-    channel.port2.onmessage = (message: MessageEvent) => chunks.push(message.data as string)
+    const chunks: ArrayBuffer[] = []
+    channel.port2.onmessage = (message: MessageEvent) => chunks.push(message.data as ArrayBuffer)
     channel.port2.start()
     const client = createWorkerEgressClient(channel.port1, { windowMs: 0 })
     client.emitDurable(event("d0"), { aggregateID: "agg", seq: 0 })
     await pollUntil(() => chunks.length >= 1)
-    const decoded = JSON.parse(chunks[0]!) as { payload: Record<string, unknown> }
-    expect(decoded.payload["aggregateID"]).toBe("agg")
-    expect(decoded.payload["seq"]).toBe(0)
+    const decoded = (readByteFrame(chunks[0]!) as unknown as { payload: Record<string, unknown> }).payload
+    expect(decoded["aggregateID"]).toBe("agg")
+    expect(decoded["seq"]).toBe(0)
     client.dispose()
   })
 
   test("the egress client forwards explicit aggregate identity over a real port", async () => {
     const channel = new MessageChannel()
-    const chunks: string[] = []
-    channel.port2.onmessage = (message: MessageEvent) => chunks.push(message.data as string)
+    const chunks: ArrayBuffer[] = []
+    channel.port2.onmessage = (message: MessageEvent) => chunks.push(message.data as ArrayBuffer)
     channel.port2.start()
     const client = createWorkerEgressClient(channel.port1)
     client.emitDurable(event("d1"), { aggregateID: "agg", seq: 7 })
     await pollUntil(() => chunks.length >= 1)
-    const decoded = JSON.parse(chunks[0]!) as { payload: Record<string, unknown> }
-    expect(decoded.payload["aggregateID"]).toBe("agg")
-    expect(decoded.payload["seq"]).toBe(7)
-    expect(decoded.payload["generation"]).toBeUndefined()
-    expect(decoded.payload["ordinal"]).toBeUndefined()
+    const decoded = (readByteFrame(chunks[0]!) as unknown as { payload: Record<string, unknown> }).payload
+    expect(decoded["aggregateID"]).toBe("agg")
+    expect(decoded["seq"]).toBe(7)
+    expect(decoded["generation"]).toBeUndefined()
+    expect(decoded["ordinal"]).toBeUndefined()
     client.dispose()
   })
 })

@@ -8,7 +8,8 @@
 
 import { describe, expect, test } from "bun:test"
 import { SUBSCRIBER_BOUND, SubscriberOverflowError, createFanout } from "./fanout"
-import { decodeFrame, encodeFrame } from "@/session/egress/frame"
+import { readByteFrame } from "./byte-frames"
+import { encodeFrame } from "@/session/egress/frame"
 import { endFrame } from "@/session/worker/frame"
 import { deltasFrame, durableFrame } from "../../lib/egress-fixtures"
 
@@ -223,7 +224,7 @@ describe("egress fan-out terminal and bounded-drain APIs", () => {
     for (const id of ["1", "2", "3"]) fanout.publish(deltasFrame(id))
     const first = sub.drainBytes(2)
     expect(first).toHaveLength(2)
-    expect(first.map((bytes) => decodeFrame(bytes))).toEqual([deltasFrame("1"), deltasFrame("2")])
+    expect(first.map((bytes) => readByteFrame(bytes))).toEqual([deltasFrame("1"), deltasFrame("2")])
     expect(sub.drainBytes(5)).toHaveLength(1)
   })
 

@@ -25,6 +25,7 @@ import { FrameTooLargeError, encodeFrame } from "@/session/egress/frame"
 import { createEgressSender } from "@/session/egress/sender"
 import { createEventBlobResolver, createHubEventSink, serveEventsPort } from "@/session/worker/hub"
 import { eventFrame, MAX_WORKER_FRAME_BYTES, type EventV2Event } from "@/session/worker/frame"
+import { valueOf } from "@/util/lazy-json"
 import { pollUntil } from "../../lib/poll"
 
 const AGGREGATE = "ses_inline_boundary"
@@ -165,9 +166,10 @@ describe("inline durable event at the frame boundary", () => {
     const [live] = published
     expect(live?.id).toBe(event.id)
     expect(live?.type).toBe(event.type)
-    expect(live?.data).toEqual(event.properties)
-    expect(live?.data).not.toHaveProperty("__eventBlobPosition")
-    expect(live?.data).not.toHaveProperty("__eventBlob")
+    const data = valueOf(live?.data)
+    expect(data).toEqual(event.properties)
+    expect(data).not.toHaveProperty("__eventBlobPosition")
+    expect(data).not.toHaveProperty("__eventBlob")
     expect(live?.durable).toEqual({ aggregateID: AGGREGATE, seq: SEQ, version: 1 })
   })
 

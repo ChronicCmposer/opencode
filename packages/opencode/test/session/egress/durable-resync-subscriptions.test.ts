@@ -5,7 +5,7 @@
 // worker can re-read its database snapshot.
 
 import { describe, expect, test } from "bun:test"
-import { encodeFrame, resyncWithPositionFrame } from "@/session/egress/frame"
+import { encodeFrame, resyncWithPositionFrame, type EventsFrame } from "@/session/egress/frame"
 import { attachMeshWorker, createEgressMesh } from "@/session/egress/mesh"
 import { createWorkerEgressClient } from "@/session/worker/egress-client"
 import { pollUntil } from "../../lib/poll"
@@ -37,7 +37,7 @@ describe("worker durable resync fan-out", () => {
       })
       await pollUntil(() => mesh.subscriptions().length === 2)
 
-      data.port2.postMessage(encodeFrame(resyncWithPositionFrame({ aggregateID: "ses_title", seq: 3 })))
+      data.port2.postMessage(encodeFrame(resyncWithPositionFrame({ aggregateID: "ses_title", seq: 3 }) as EventsFrame))
 
       await pollUntil(() => seen.length === 2, { message: "gap resync did not reach every subscription" })
       expect(seen).toEqual([
@@ -116,7 +116,7 @@ describe("worker durable resync fan-out", () => {
       })
       await pollUntil(() => mesh.subscriptions().length === 2)
 
-      data.port2.postMessage(encodeFrame(resyncWithPositionFrame({ aggregateID: "ses_title", seq: 3 })))
+      data.port2.postMessage(encodeFrame(resyncWithPositionFrame({ aggregateID: "ses_title", seq: 3 }) as EventsFrame))
 
       await pollUntil(() => seen.length === 1, { message: "a throwing subscriber starved the rest" })
       expect(seen).toEqual([{ pattern: "*", aggregateID: "ses_title", seq: 3 }])

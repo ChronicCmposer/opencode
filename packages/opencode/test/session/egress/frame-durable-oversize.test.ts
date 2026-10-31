@@ -15,6 +15,8 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { DurableLog } from "@opencode-ai/core/durable-log"
 import { Event } from "@opencode-ai/schema/event"
 import { ENVELOPE_HEADROOM_BYTES, MAX_INLINE_EVENT_BYTES, encodeFrameChunks } from "@/session/egress/frame"
+import type { ScannedEventsFrame } from "@/session/egress/scan"
+import { valueOf } from "@/util/lazy-json"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { createEgressSender } from "@/session/egress/sender"
 import { MAX_WORKER_FRAME_BYTES, eventFrame, type EventsFrame, type EventV2Event } from "@/session/worker/frame"
@@ -24,8 +26,8 @@ import { readByteFrame } from "./byte-frames"
 const MiB = 1024 * 1024
 
 interface Received {
-  readonly frame: EventsFrame
-  readonly text: string
+  readonly frame: ScannedEventsFrame
+  readonly bytes: ArrayBuffer
 }
 
 function isBlobPositionReference(
@@ -64,7 +66,7 @@ function harness() {
   const acks: number[] = []
   const receiver = createEgressReceiver({
     port: channel.port2,
-    onFrame: (frame, text) => void received.push({ frame, text }),
+    onFrame: (frame, bytes) => void received.push({ frame, bytes }),
     onAck: (payload) => void acks.push(payload?.count ?? 0),
   })
   const sender = createEgressSender({ port: channel.port1 })
@@ -96,13 +98,14 @@ describe("frame-aligned durable events", () => {
     await pollUntil(() => received.length === 1, { message: "oversized durable event never reached the hub" })
     const [frame] = received
     expect(receiver.lastError).toBeUndefined()
-    expect(Buffer.byteLength(frame!.text, "utf8")).toBeLessThanOrEqual(MAX_WORKER_FRAME_BYTES)
+    expect(frame!.bytes.byteLength).toBeLessThanOrEqual(MAX_WORKER_FRAME_BYTES)
 
-    const payload = frame!.frame.kind === "event" ? frame!.frame.payload : undefined
-    expect(payload?.aggregateID).toBe("ses_1")
-    expect(payload?.seq).toBe(1)
-    expect(isBlobPositionReference(payload?.event.properties)).toBe(true)
-    const reference = payload!.event.properties as {
+    const decoded = frame!.frame.kind === "event" ? frame!.frame : undefined
+    expect(decoded?.aggregateID).toBe("ses_1")
+    expect(decoded?.seq).toBe(1)
+    expect(decoded?.isBlobReference).toBe(true)
+    expect(isBlobPositionReference(valueOf(decoded?.event.properties))).toBe(true)
+    const reference = valueOf(decoded!.event.properties) as {
       readonly __eventBlobPosition: { readonly aggregateID: string; readonly seq: number }
       readonly frameBytes: number
     }
@@ -125,9 +128,10 @@ describe("frame-aligned durable events", () => {
     })
     expect(receiver.lastError).toBeUndefined()
     expect(receiver.received).toBe(2)
-    expect(received.every(({ text }) => Buffer.byteLength(text, "utf8") <= MAX_WORKER_FRAME_BYTES)).toBe(true)
+    expect(received.every(({ bytes }) => bytes.byteLength <= MAX_WORKER_FRAME_BYTES)).toBe(true)
     const last = received[1]!.frame
-    expect(last.kind === "event" ? last.payload.event : undefined).toEqual(small)
+    if (last.kind !== "event") throw new Error(`expected an event frame, got ${last.kind}`)
+    expect({ ...last.event, properties: valueOf(last.event.properties) }).toEqual(small)
     await pollUntil(() => acks.length === 2)
     expect(acks).toEqual([1, 1])
   })
@@ -140,7 +144,7 @@ describe("frame-aligned durable events", () => {
 
     const frame = received[0]!.frame
     if (frame.kind !== "event") throw new Error(`expected an event frame, got ${frame.kind}`)
-    const reference = frame.payload.event.properties
+    const reference = valueOf(frame.event.properties)
     if (!isBlobPositionReference(reference)) throw new Error("wire payload is not a blob position reference")
 
     // The hub shares the worker's SQLite file. Simulate the committed row the

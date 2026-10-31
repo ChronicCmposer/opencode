@@ -7,7 +7,8 @@
 
 import { describe, expect, test } from "bun:test"
 import { EgressStreamOverflowError, createEgressHub } from "./hub"
-import { decodeFrame, encodeFrame, type EventsFrame } from "@/session/egress/frame"
+import { encodeFrame, type EventsFrame } from "@/session/egress/frame"
+import { readByteFrame } from "./byte-frames"
 import { createEgressSender } from "@/session/egress/sender"
 import { endFrame } from "@/session/worker/frame"
 import { delta, deltasFrame, durable, durableFrame } from "../../lib/egress-fixtures"
@@ -23,7 +24,7 @@ function setup(options: { windowMs?: number; maxBatch?: number } = {}) {
 async function startConsumer(hub: ReturnType<typeof createEgressHub>, id: string) {
   const frames: EventsFrame[] = []
   const done = (async () => {
-    for await (const bytes of hub.stream(id)) frames.push(decodeFrame(bytes))
+    for await (const bytes of hub.stream(id)) frames.push(readByteFrame(bytes))
   })()
   await pollUntil(() => hub.fanout.subscribers.length === 1)
   return { frames, done }
@@ -104,7 +105,7 @@ describe("egress hub over MessagePort", () => {
     hub.close()
 
     const frames: EventsFrame[] = []
-    for await (const bytes of hub.stream("late")) frames.push(decodeFrame(bytes))
+    for await (const bytes of hub.stream("late")) frames.push(readByteFrame(bytes))
 
     // The late SSE client must observe the terminal marker, not an empty stream.
     expect(frames).toEqual([endFrame()])
@@ -116,7 +117,7 @@ describe("egress hub over MessagePort", () => {
     await pollUntil(() => hub.closed)
 
     const frames: EventsFrame[] = []
-    for await (const bytes of hub.stream("late")) frames.push(decodeFrame(bytes))
+    for await (const bytes of hub.stream("late")) frames.push(readByteFrame(bytes))
     expect(frames).toEqual([endFrame()])
   })
 

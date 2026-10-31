@@ -13,6 +13,7 @@
 import { Effect, Layer, ManagedRuntime } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
 import { GlobalBus, type GlobalEvent } from "@/bus/global"
+import { valueOf } from "@/util/lazy-json"
 
 /** One captured emission, normalized to the browser/SSE event envelope shape. */
 export interface SinkEvent {
@@ -61,7 +62,7 @@ function parseGlobalPayload(payload: unknown): SinkEvent | undefined {
   if (payload === null || typeof payload !== "object") return undefined
   const record = payload as Record<string, unknown>
   if (typeof record.id !== "string" || typeof record.type !== "string") return undefined
-  return { id: record.id, type: record.type, properties: record.properties }
+  return { id: record.id, type: record.type, properties: valueOf(record.properties) }
 }
 
 /** Register a listener on the event service, synchronously, and return its removal effect. */
@@ -73,7 +74,7 @@ function subscribeEventV2(
     EventV2.Service.use((events) =>
       events.listen((event) =>
         Effect.sync(() =>
-          push({ id: event.id, type: event.type, properties: event.data }),
+          push({ id: event.id, type: event.type, properties: valueOf(event.data) }),
         ),
       ),
     ),
