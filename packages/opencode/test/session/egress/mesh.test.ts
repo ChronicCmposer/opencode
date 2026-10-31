@@ -14,35 +14,22 @@ import {
   attachMeshWorker,
   createEgressMesh,
   createMeshWorkerClient,
-  matchesMeshPattern,
-  type DurableCommit,
+  type DurableWakeup,
   type MeshSink,
 } from "@/session/egress/mesh"
-import { durable } from "../../lib/egress-fixtures"
 import { pollUntil } from "../../lib/poll"
 
-const commit = (id: string, type: string, ordinal: number): DurableCommit => ({
-  meta: { aggregateID: "agg", seq: ordinal },
-  event: durable(id, type),
-})
+const wake = (seq: number): DurableWakeup => ({ aggregateID: "agg", seq })
 
 /** A sink that records the durable ids and resync patterns it is pushed. */
 function recordingSink(sent: string[], resyncs: string[] = []): MeshSink {
   return {
-    sendDurable: (c) => sent.push(`durable:${c.event.id}`),
+    sendDurable: (c) => sent.push(`durable:${c.seq}`),
     sendResync: (pattern) => resyncs.push(pattern),
   }
 }
 
 describe("event mesh registry", () => {
-  test("matches exact, trailing-wildcard and catch-all patterns", () => {
-    expect(matchesMeshPattern("*", "anything")).toBe(true)
-    expect(matchesMeshPattern("session.*", "session.message")).toBe(true)
-    expect(matchesMeshPattern("session.*", "message.session")).toBe(false)
-    expect(matchesMeshPattern("session.message", "session.message")).toBe(true)
-    expect(matchesMeshPattern("session.message", "session.other")).toBe(false)
-  })
-
   test("the default backlog bound is 256", () => {
     expect(MESH_SUBSCRIPTION_BOUND).toBe(256)
   })
@@ -51,25 +38,24 @@ describe("event mesh registry", () => {
     const mesh = createEgressMesh()
     const sent: string[] = []
     mesh.attach("w1", recordingSink(sent))
-    mesh.listen("w1", "session.*")
-    const result = mesh.publish(commit("e1", "session.message", 1))
+    mesh.listen("w1", "p")
+    const result = mesh.publish("w1", wake(1))
     expect(result).toEqual({ delivered: ["w1"], dropped: [] })
-    expect(sent).toEqual(["durable:e1"])
+    expect(sent).toEqual(["durable:1"])
     expect(mesh.outstanding("w1")).toBe(1)
   })
 
-  test("does not deliver to a non-matching subscription", () => {
+  test("does not deliver to a worker with no subscription", () => {
     const mesh = createEgressMesh()
-    mesh.listen("w1", "session.*")
-    expect(mesh.publish(commit("e1", "message.updated", 1))).toEqual({ delivered: [], dropped: [] })
+    expect(mesh.publish("w1", wake(1))).toEqual({ delivered: [], dropped: [] })
     expect(mesh.outstanding("w1")).toBe(0)
   })
 
   test("delivers once per worker even with overlapping patterns", () => {
     const mesh = createEgressMesh()
-    mesh.listen("w1", "session.*")
+    mesh.listen("w1", "p")
     mesh.listen("w1", "*")
-    expect(mesh.publish(commit("e1", "session.message", 1)).delivered).toEqual(["w1"])
+    expect(mesh.publish("w1", wake(1)).delivered).toEqual(["w1"])
     expect(mesh.outstanding("w1")).toBe(1)
   })
 
@@ -80,79 +66,86 @@ describe("event mesh registry", () => {
       sendDurable: () => {},
       sendResync: (pattern, meta) => void resyncs.push({ pattern, ...(meta === undefined ? {} : { meta }) }),
     })
-    mesh.listen("w1", "session.*")
+    mesh.listen("w1", "p")
     mesh.listen("w1", "*")
-    mesh.publish(commit("e1", "session.message", 1))
+    mesh.publish("w1", wake(1))
 
-    const result = mesh.publish(commit("e2", "session.message", 2))
+    const result = mesh.publish("w1", wake(2))
 
     expect(result).toEqual({ delivered: [], dropped: ["w1"] })
     expect(resyncs).toEqual([
-      { pattern: "session.*", meta: { aggregateID: "agg", seq: 2 } },
+      { pattern: "p", meta: { aggregateID: "agg", seq: 2 } },
       { pattern: "*", meta: { aggregateID: "agg", seq: 2 } },
     ])
     expect(mesh.outstanding("w1")).toBe(1)
   })
 
-  test("fans out to every subscribed worker", () => {
+  test("addresses only the named worker", () => {
     const mesh = createEgressMesh()
-    mesh.listen("w1", "session.*")
-    mesh.listen("w2", "session.*")
-    expect([...mesh.publish(commit("e1", "session.message", 1)).delivered].sort()).toEqual(["w1", "w2"])
+    const a: string[] = []
+    const b: string[] = []
+    mesh.attach("w1", recordingSink(a))
+    mesh.attach("w2", recordingSink(b))
+    mesh.listen("w1", "p")
+    mesh.listen("w2", "p")
+    expect(mesh.publish("w1", wake(1)).delivered).toEqual(["w1"])
+    expect(a).toEqual(["durable:1"])
+    expect(b).toEqual([])
+    expect(mesh.outstanding("w2")).toBe(0)
   })
 
   test("unlisten stops delivery and reclaims the worker entry", () => {
     const mesh = createEgressMesh()
-    mesh.listen("w1", "session.*")
-    mesh.unlisten("w1", "session.*")
+    mesh.listen("w1", "p")
+    mesh.unlisten("w1", "p")
     expect(mesh.subscriptions()).toEqual([])
     // A later publish must not resurrect the reclaimed worker.
-    expect(mesh.publish(commit("e1", "session.message", 1))).toEqual({ delivered: [], dropped: [] })
+    expect(mesh.publish("w1", wake(1))).toEqual({ delivered: [], dropped: [] })
     expect(mesh.subscriptions()).toEqual([])
   })
 
   test("detach clears the worker's subscriptions and backlog", () => {
     const mesh = createEgressMesh()
     const detach = mesh.attach("w1", recordingSink([]))
-    mesh.listen("w1", "session.*")
-    mesh.publish(commit("e1", "session.message", 1))
+    mesh.listen("w1", "p")
+    mesh.publish("w1", wake(1))
     expect(mesh.outstanding("w1")).toBe(1)
 
     detach()
     expect(mesh.subscriptions()).toEqual([])
     expect(mesh.outstanding("w1")).toBe(0)
-    expect(mesh.publish(commit("e2", "session.message", 2))).toEqual({ delivered: [], dropped: [] })
+    expect(mesh.publish("w1", wake(2))).toEqual({ delivered: [], dropped: [] })
   })
 
   test("overflow drops the commit and flags resync instead of blocking", () => {
     const mesh = createEgressMesh({ bound: 1 })
     const resyncs: string[] = []
     mesh.attach("w1", recordingSink([], resyncs))
-    mesh.listen("w1", "session.*")
-    mesh.publish(commit("e1", "session.message", 1))
-    const result = mesh.publish(commit("e2", "session.message", 2))
+    mesh.listen("w1", "p")
+    mesh.publish("w1", wake(1))
+    const result = mesh.publish("w1", wake(2))
     expect(result).toEqual({ delivered: [], dropped: ["w1"] })
     expect(mesh.resyncPending).toEqual(["w1"])
-    expect(resyncs).toEqual(["session.*"])
+    expect(resyncs).toEqual(["p"])
     expect(mesh.outstanding("w1")).toBe(1)
   })
 
   test("ack lowers the backlog so delivery resumes", () => {
     const mesh = createEgressMesh({ bound: 1 })
-    mesh.listen("w1", "session.*")
-    mesh.publish(commit("e1", "session.message", 1))
+    mesh.listen("w1", "p")
+    mesh.publish("w1", wake(1))
     mesh.ack("w1")
     expect(mesh.outstanding("w1")).toBe(0)
-    expect(mesh.publish(commit("e2", "session.message", 2)).delivered).toEqual(["w1"])
+    expect(mesh.publish("w1", wake(2)).delivered).toEqual(["w1"])
   })
 
   test("tracks resync per pattern and acknowledges them individually", () => {
     const mesh = createEgressMesh({ bound: 1 })
     mesh.listen("w1", "a.*")
     mesh.listen("w1", "b.*")
-    mesh.publish(commit("a1", "a.event", 1)) // occupies the only slot
-    mesh.publish(commit("b1", "b.event", 2)) // overflow -> resync b.*
-    mesh.publish(commit("a2", "a.event", 3)) // overflow -> resync a.*
+    mesh.publish("w1", wake(1)) // occupies the only slot
+    mesh.publish("w1", wake(2)) // overflow -> resync b.*
+    mesh.publish("w1", wake(3)) // overflow -> resync a.*
     expect(mesh.resyncPending).toEqual(["w1"])
     mesh.acknowledgeResync("w1", "b.*")
     expect(mesh.resyncPending).toEqual(["w1"])
@@ -165,8 +158,8 @@ describe("event mesh registry", () => {
     const sent: string[] = []
     mesh.attach("w1", recordingSink(sent))
     mesh.listen("w1", "*")
-    mesh.publish(commit("e1", "session.message", 1))
-    expect(sent).toEqual(["durable:e1"])
+    mesh.publish("w1", wake(1))
+    expect(sent).toEqual(["durable:1"])
   })
 })
 
@@ -177,25 +170,25 @@ describe("event mesh transport over a control port", () => {
     const attachment = attachMeshWorker(mesh, "w1", channel.port2)
     const client = createMeshWorkerClient(channel.port1)
 
-    const woken: string[] = []
+    const woken: number[] = []
     const resyncs: Array<{ pattern: string; meta?: { aggregateID: string; seq: number } }> = []
-    client.onDurable((c) => woken.push(c.event.id))
+    client.onDurable((c) => woken.push(c.seq))
     client.onResync((pattern, meta) => resyncs.push({ pattern, ...(meta === undefined ? {} : { meta }) }))
 
-    await client.listen("session.*")
-    expect(mesh.subscriptions()).toEqual([{ workerId: "w1", pattern: "session.*" }])
+    await client.listen("p")
+    expect(mesh.subscriptions()).toEqual([{ workerId: "w1", pattern: "p" }])
 
-    mesh.publish(commit("e1", "session.message", 1))
+    mesh.publish("w1", wake(1))
     await pollUntil(() => woken.length === 1)
-    expect(woken).toEqual(["e1"])
+    expect(woken).toEqual([1])
 
     // Backlog bound is 1 and e1 is still un-acknowledged → the second commit overflows.
-    mesh.publish(commit("e2", "session.message", 2))
+    mesh.publish("w1", wake(2))
     await pollUntil(() => resyncs.length === 1)
-    expect(resyncs).toEqual([{ pattern: "session.*", meta: { aggregateID: "agg", seq: 2 } }])
+    expect(resyncs).toEqual([{ pattern: "p", meta: { aggregateID: "agg", seq: 2 } }])
     expect(mesh.resyncPending).toEqual(["w1"])
 
-    client.acknowledgeResync("session.*")
+    client.acknowledgeResync("p")
     await pollUntil(() => mesh.resyncPending.length === 0)
 
     client.dispose()
@@ -208,19 +201,19 @@ describe("event mesh transport over a control port", () => {
     const attachment = attachMeshWorker(mesh, "w1", channel.port2)
     const client = createMeshWorkerClient(channel.port1)
 
-    const woken: string[] = []
-    client.onDurable((c) => woken.push(c.event.id))
+    const woken: number[] = []
+    client.onDurable((c) => woken.push(c.seq))
     await client.listen("*")
 
     // Without a routed ack this wedges at the bound; with it, every commit lands.
     for (let ordinal = 1; ordinal <= 3; ordinal++) {
-      mesh.publish(commit(`e${ordinal}`, "session.message", ordinal))
+      mesh.publish("w1", wake(ordinal))
       await pollUntil(() => woken.length === ordinal)
       client.acknowledgeDelivery()
       await pollUntil(() => mesh.outstanding("w1") === 0)
     }
 
-    expect(woken).toEqual(["e1", "e2", "e3"])
+    expect(woken).toEqual([1, 2, 3])
 
     client.dispose()
     attachment.dispose()
@@ -232,12 +225,12 @@ describe("event mesh transport over a control port", () => {
     const attachment = attachMeshWorker(mesh, "w1", channel.port2)
     const client = createMeshWorkerClient(channel.port1)
 
-    const woken: string[] = []
-    client.onDurable((c) => woken.push(c.event.id))
-    await client.listen("session.*")
-    expect(mesh.subscriptions()).toEqual([{ workerId: "w1", pattern: "session.*" }])
+    const woken: number[] = []
+    client.onDurable((c) => woken.push(c.seq))
+    await client.listen("p")
+    expect(mesh.subscriptions()).toEqual([{ workerId: "w1", pattern: "p" }])
 
-    mesh.publish(commit("e1", "session.message", 1))
+    mesh.publish("w1", wake(1))
     await pollUntil(() => woken.length === 1)
     expect(mesh.outstanding("w1")).toBe(1)
 
@@ -278,7 +271,7 @@ describe("mesh durable.ack count validation", () => {
     const channel = new MessageChannel()
     const attachment = attachMeshWorker(mesh, "w1", channel.port2)
     mesh.listen("w1", "*")
-    mesh.publish(commit("e1", "session.message", 1))
+    mesh.publish("w1", wake(1))
     expect(mesh.outstanding("w1")).toBe(1)
 
     // A negative count would otherwise INCREASE the backlog (1 - (-5) = 6).
@@ -302,23 +295,9 @@ describe("mesh delivery failure handling", () => {
     const mesh = createEgressMesh()
     mesh.attach("w1", closedSink)
     mesh.listen("w1", "*")
-    const result = mesh.publish(commit("e1", "session.message", 1))
+    const result = mesh.publish("w1", wake(1))
     expect(result).toEqual({ delivered: [], dropped: [] })
     expect(mesh.outstanding("w1")).toBe(0)
-  })
-
-  test("a failing sink does not block delivery to healthy sinks", () => {
-    const mesh = createEgressMesh()
-    const sent: string[] = []
-    mesh.attach("w1", closedSink)
-    mesh.attach("w2", recordingSink(sent))
-    mesh.listen("w1", "*")
-    mesh.listen("w2", "*")
-    const result = mesh.publish(commit("e1", "session.message", 1))
-    expect(result.delivered).toEqual(["w2"])
-    expect(mesh.outstanding("w1")).toBe(0)
-    expect(mesh.outstanding("w2")).toBe(1)
-    expect(sent).toEqual(["durable:e1"])
   })
 
   test("a failed resync push still flags the pending resync without throwing", () => {
@@ -330,8 +309,8 @@ describe("mesh delivery failure handling", () => {
       },
     })
     mesh.listen("w1", "*")
-    mesh.publish(commit("e1", "session.message", 1))
-    expect(() => mesh.publish(commit("e2", "session.message", 2))).not.toThrow()
+    mesh.publish("w1", wake(1))
+    expect(() => mesh.publish("w1", wake(2))).not.toThrow()
     expect(mesh.resyncPending).toEqual(["w1"])
   })
 })

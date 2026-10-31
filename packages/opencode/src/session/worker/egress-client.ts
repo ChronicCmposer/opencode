@@ -19,8 +19,7 @@ import type { CoalescerScheduler } from "@/session/egress/coalesce"
 import { decodeFrame, type AggregatePosition, type DurableMeta } from "@/session/egress/frame"
 import {
   createMeshWorkerClient,
-  matchesMeshPattern,
-  type DurableCommit,
+  type DurableWakeup,
   type MeshWorkerClient,
 } from "@/session/egress/mesh"
 import { createEgressSender, type EgressSender } from "@/session/egress/sender"
@@ -53,10 +52,10 @@ export interface WorkerEgressClientOptions {
 
 /** One worker-local durable subscription, driven through the mesh control plane. */
 export interface WorkerDurableSubscription {
-  /** Event-type pattern the hub routes matching durable commits for. */
+  /** Subscription token; the hub wakes a subscribed worker only for its own aggregate. */
   readonly pattern: string
-  /** Called for each matching durable commit; the delivery is acked once it returns. */
-  readonly onDurable: (commit: DurableCommit) => void
+  /** Called for each position wakeup; the delivery is acked once it returns. */
+  readonly onDurable: (wakeup: DurableWakeup) => void
   /**
    * Called when this pattern must resync: either it overflowed at the hub or the
    * hub observed a gap in the worker's durable stream. `position` is the exact
@@ -183,17 +182,16 @@ function buildEgressClient(port: MessagePort, options: WorkerEgressClientOptions
   const wireMesh = (control: MeshWorkerClient): void => {
     if (meshWired) return
     meshWired = true
-    control.onDurable((commit) => {
+    control.onDurable((wakeup) => {
       // Ack in `finally`: a throwing subscriber is a caller bug (fail loud) but
       // must not leak the hub's per-worker backlog slot.
       try {
         for (const subscription of subscriptions.values()) {
-          if (!matchesMeshPattern(subscription.pattern, commit.event.type)) continue
-          subscription.onDurable(commit)
+          subscription.onDurable(wakeup)
         }
       } finally {
         // One hub delivery occupies one slot regardless of how many local
-        // subscribers matched, so ack exactly once per commit.
+        // subscribers matched, so ack exactly once per wakeup.
         control.acknowledgeDelivery()
       }
     })

@@ -352,7 +352,7 @@ export function buildProductionPortBackends(options: ProductionPortBackendsOptio
           port,
           observedSink,
           onEgressError,
-          (commit) => egressMesh.publish(commit),
+          (commit) => egressMesh.publish(String(workerID), commit.meta),
           bridge,
         )
         return () => {

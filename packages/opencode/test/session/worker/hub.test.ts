@@ -65,7 +65,7 @@ import {
 import { resolveSessionWorkerIdleTimeoutMs, SESSION_WORKER_IDLE_TIMEOUT_ENV } from "@/session/worker/pool"
 import { createIdleIsolateCap } from "@/session/worker/worker-pools"
 import { encodeFrame } from "@/session/egress/frame"
-import { createMeshWorkerClient, type DurableCommit } from "@/session/egress/mesh"
+import { createMeshWorkerClient, type DurableWakeup } from "@/session/egress/mesh"
 import { createLiveEventPublisher, EventV2Bridge, type LiveEvent, type LiveEventPublisher } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { DurableLog } from "@opencode-ai/core/durable-log"
@@ -761,7 +761,7 @@ describe("production egress mesh", () => {
     const control = new MessageChannel()
     const dispose = backends.egress!(1, data.port1, control.port1)
     const mesh = createMeshWorkerClient(control.port2)
-    const commits: DurableCommit[] = []
+    const commits: DurableWakeup[] = []
     const resyncs: string[] = []
     mesh.onDurable((commit) => void commits.push(commit))
     mesh.onResync((pattern) => void resyncs.push(pattern))
@@ -783,7 +783,7 @@ describe("production egress mesh", () => {
       }
 
       await pollUntil(() => resyncs.length === 1, { message: "mesh never overflowed to a resync" })
-      expect(commits.map((commit) => commit.meta.seq)).toEqual([1, 2])
+      expect(commits.map((commit) => commit.seq)).toEqual([1, 2])
       expect(resyncs).toEqual(["*"])
       // The hub still republishes every durable event live-only (the mesh is an
       // additive wakeup channel, not a replacement for the event surface).
@@ -801,7 +801,7 @@ describe("production egress mesh", () => {
         ),
       )
       await pollUntil(() => commits.length === 3, { message: "ack never freed a delivery slot" })
-      expect(commits.map((commit) => commit.meta.seq)).toEqual([1, 2, 4])
+      expect(commits.map((commit) => commit.seq)).toEqual([1, 2, 4])
     } finally {
       mesh.dispose()
       dispose()

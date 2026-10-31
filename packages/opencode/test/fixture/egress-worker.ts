@@ -48,7 +48,7 @@ control.onMessage((frame) => {
 })
 
 mesh.onDurable((commit) => {
-  postToParent({ type: "mesh.durable", id: commit.event.id })
+  postToParent({ type: "mesh.durable", aggregateID: commit.aggregateID, seq: commit.seq })
 })
 mesh.onResync((pattern) => {
   postToParent({ type: "mesh.resync", pattern })
