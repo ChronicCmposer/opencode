@@ -466,6 +466,15 @@ describe("5.7 executor robustness", () => {
     await expect(installed.dispose()).resolves.toBeUndefined()
   })
 
+  test("installSessionExecutor reports the claimed session lease in its ready frame", async () => {
+    const posted: unknown[] = []
+    const workerScope: ExecutorWorkerScope = { onmessage: null, postMessage: (message) => posted.push(message) }
+    const lease = { aggregateID: "ses_lease", ownerID: "worker-3-1-host-uuid" }
+    const installed = installSessionExecutor(workerScope, { work: echoWork, threadId: 7, lease })
+    expect(posted[0]).toEqual({ type: "ready", threadId: 7, lease })
+    await installed.dispose()
+  })
+
   test("materialized workers share one monotonic id source", async () => {
     const spawnIds: number[] = []
     const transport = (): ExecutorTransport => {

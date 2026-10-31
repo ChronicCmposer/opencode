@@ -150,6 +150,8 @@ export interface WriterClientHandle {
     readonly seq: number | null
     readonly committed: boolean
   }>
+  /** The session lease this writer claimed at construction, when it was built for a session. */
+  readonly lease?: { readonly aggregateID: string; readonly ownerID: string }
 }
 
 export interface EventEgressClientHandle {

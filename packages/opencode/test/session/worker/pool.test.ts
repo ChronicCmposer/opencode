@@ -455,8 +455,7 @@ describe("idle eviction retirement", () => {
       threadId: 0,
       query: async (sql, params) => {
         if (!sql.includes("event_sequence")) return []
-        // Count only the retired session's lease reads: the successor's own boot
-        // poll is expected and must not mask a retirement re-read.
+        // Count only the retired session's lease reads, so a retirement re-read is visible.
         if (Array.isArray(params) && params[0] === leaseObservedSession) leaseOwnerQueries += 1
         return [{ worker_owner_id: retiredOwner }]
       },
@@ -500,10 +499,8 @@ describe("idle eviction retirement", () => {
       const firstWorker = sessionHub.dispatcher.registry.worker(first)?.id
       expect(firstWorker).toBeDefined()
       retiredOwner = `worker-${firstWorker}-1-uuid`
-      const beforeBoot = leaseOwnerQueries
-      await pollUntil(() => leaseOwnerQueries > beforeBoot, {
-        message: "the boot lease-owner poll never observed the claimed owner",
-      })
+      // The booting worker's ready handshake reports the lease it claimed.
+      sessionHub.rememberWorkerLease?.(firstWorker!, { aggregateID: String(first), ownerID: retiredOwner })
       sessionHub.attachWorkerPorts(firstWorker!, { egress: {} as MessagePort })
       expect(served).toEqual([firstWorker!])
 

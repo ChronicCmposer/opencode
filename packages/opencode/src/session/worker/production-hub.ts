@@ -665,6 +665,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   const sinks: WorkerPoolSinks = {
     onWorkerPorts: (workerID, ports) => hub?.attachWorkerPorts(workerID, ports),
     onHubProxyPort: (workerID, port) => hub?.attachHubProxyPort(workerID, port),
+    onLeaseClaim: (workerID, lease) => hub?.rememberWorkerLease?.(workerID, lease),
   }
   const resolveSource: (sessionID?: SessionID) => SessionWorkerInit | Promise<SessionWorkerInit> =
     typeof options.init === "function" ? options.init : () => options.init as SessionWorkerInit

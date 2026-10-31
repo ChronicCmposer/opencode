@@ -367,6 +367,8 @@ export function createWorkerDatabaseWriter(
     bus?: WorkerBus
     /** The session this generation owns; claimed (or reclaimed) at generation start. */
     sessionID?: string
+    /** Re-entry bridge for diagnostics; absent keeps logging inert. */
+    bridge?: EffectBridge.Shape
     /** D16 content-addressed blob directory; defaults to a sibling of the DB. */
     blobDir?: string
     /**
@@ -442,12 +444,14 @@ export function createWorkerDatabaseWriter(
       onRefused: (refusal) => {
         if (refusedLeaseAggregates.has(refusal.aggregateID)) return
         refusedLeaseAggregates.add(refusal.aggregateID)
-        console.warn(workerLogMessage("lease reclaim refused"), {
-          aggregateID: refusal.aggregateID,
-          ownerID: refusal.ownerID,
-          expiresAt: refusal.expiresAt,
-          reason: "the current lease is still live and its owner is not provably dead",
-        })
+        void options.bridge?.fork(
+          Effect.logWarning(workerLogMessage("lease reclaim refused"), {
+            aggregateID: refusal.aggregateID,
+            ownerID: refusal.ownerID,
+            expiresAt: refusal.expiresAt,
+            reason: "the current lease is still live and its owner is not provably dead",
+          }),
+        )
       },
     })
   }
@@ -483,6 +487,7 @@ export function createWorkerDatabaseWriter(
       const last = published[published.length - 1]
       return { seq: last?.durable?.seq ?? null, committed: true }
     },
+    ...(options.sessionID === undefined ? {} : { lease: { aggregateID: options.sessionID, ownerID } }),
     dispose: () => {
       if (heartbeat !== undefined) clearInterval(heartbeat)
       if (options.sessionID !== undefined) bus.release(options.sessionID)
@@ -574,6 +579,7 @@ export function buildWorkerClients(
             eventBinding: options.database.eventBinding,
           }),
       ...(options.sessionID === undefined ? {} : { sessionID: options.sessionID }),
+      ...withBridge,
     }),
     egress: createWorkerEgressClient(egress, {
       ...(ports.egressControl === undefined ? {} : { controlPort: ports.egressControl }),
@@ -1653,6 +1659,7 @@ export function bootstrapSessionWorker(
     installed = installExecutor(scope, {
       work,
       threadId,
+      ...(clients?.writer.lease === undefined ? {} : { lease: clients.writer.lease }),
       // The control is registered when the first `run` resolves the worker's
       // `SessionRunState`; the proxy reads it live so a cancel after registration
       // reaches the real loop (table B). Before that there is nothing to cancel.

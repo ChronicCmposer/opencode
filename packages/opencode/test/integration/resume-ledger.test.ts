@@ -82,12 +82,13 @@ function seedToolCall(
     readonly sessionID: string
     readonly state: "started" | "finished"
     readonly sideEffecting?: boolean
+    readonly ownerID?: string
   },
 ): void {
   const connection = openConnection({ filename, busyTimeoutMs: 5000 })
   try {
     connection.run(
-      "INSERT INTO tool_call (call_id, session_id, tool, side_effecting, state, outcome, time_started, time_finished) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO tool_call (call_id, session_id, tool, side_effecting, state, outcome, time_started, time_finished, worker_owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       [
         input.callID,
         input.sessionID,
@@ -97,6 +98,7 @@ function seedToolCall(
         input.state === "finished" ? "ok" : null,
         1,
         input.state === "finished" ? 2 : null,
+        input.ownerID ?? null,
       ],
     )
   } finally {
@@ -355,6 +357,43 @@ describe("resume reads the durable tool_call ledger", () => {
           fixture.hub.lifecycle.toolStarted(sessionID, "call_done")
           // A resumable crash resolves the caller with the replacement run, not
           // `WorkerCrashedError`; the assertion is the resume decision itself.
+          const run = dispatchPrompt(fixture, "second turn")
+          run.catch(() => undefined)
+          expect(yield* waitForAttempts(fixture, 1)).toBeGreaterThanOrEqual(1)
+        } finally {
+          yield* Effect.promise(() => fixture.dispose())
+        }
+      }),
+    REAL_WORKER_TEST_TIMEOUT_MS,
+  )
+
+  it.live(
+    "an earlier generation's started row does not block the crashed generation's resume",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const { filename, directory } = freshWorkspace()
+        const sessionID = "ses_resume_old_generation"
+        yield* migrateLikeProduction(filename)
+        seedSession(filename, sessionID)
+        yield* llm.text("second")
+
+        const fixture = startHub({
+          llm,
+          filename,
+          directory,
+          sessionID,
+          env: { OPENCODE_TEST_FAULTS: "crashWorker@prompt:stream" },
+        })
+        try {
+          // Left by a generation that was already surfaced as indeterminate; the user has since sent a new prompt.
+          seedToolCall(filename, {
+            callID: "msg_old:call_old",
+            sessionID,
+            state: "started",
+            ownerID: "worker-999-1-oldhost-00000000-0000-0000-0000-000000000000",
+          })
+          fixture.hub.lifecycle.commit(sessionID, "msg_committed")
           const run = dispatchPrompt(fixture, "second turn")
           run.catch(() => undefined)
           expect(yield* waitForAttempts(fixture, 1)).toBeGreaterThanOrEqual(1)

@@ -164,6 +164,13 @@ export type SessionExecutorInbound =
 export interface SessionExecutorReady {
   readonly type: "ready"
   readonly threadId: number
+  /** The session lease this worker claimed at boot, so the hub knows the exact owner before any run returns. */
+  readonly lease?: WorkerLeaseClaim
+}
+
+export interface WorkerLeaseClaim {
+  readonly aggregateID: string
+  readonly ownerID: string
 }
 export interface SessionExecutorPong {
   readonly type: "pong"
@@ -351,6 +358,7 @@ export interface SessionExecutorInstallOptions {
   readonly onBusy?: (sessionID: SessionID) => Effect.Effect<void>
   readonly threadId?: number
   readonly scope?: Scope.Scope
+  readonly lease?: WorkerLeaseClaim
 }
 
 export interface InstalledSessionExecutor extends SessionExecutor {
@@ -388,7 +396,11 @@ export function installSessionExecutor(
     )
   }
 
-  scope.postMessage({ type: "ready", threadId: options.threadId ?? 0 } satisfies SessionExecutorReady)
+  scope.postMessage({
+    type: "ready",
+    threadId: options.threadId ?? 0,
+    ...(options.lease === undefined ? {} : { lease: options.lease }),
+  } satisfies SessionExecutorReady)
   return {
     handle: executor.handle,
     dispose: async () => {

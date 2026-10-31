@@ -41,7 +41,12 @@ import {
   type RunBarrierPromotionOutcome,
   type RunBarrierRun,
 } from "../run-barrier"
-import { createSessionDispatch, type ExecutorWorkerPool, type SessionExecutionResult } from "./execute"
+import {
+  createSessionDispatch,
+  type ExecutorWorkerPool,
+  type SessionExecutionResult,
+  type WorkerLeaseClaim,
+} from "./execute"
 import { type CancelOutcome } from "./cancel"
 import { type PidRegistry, type PidReport } from "./pid-registry"
 import type { HubProxyHandlers, HubProxyStreamHandler } from "./hub-proxy-wire"
@@ -162,6 +167,8 @@ export interface SessionHub {
   attachWorkerPorts(workerID: number, ports: WorkerTransferredPorts): () => void
   /** Serve the three hub-proxy authorities (`SessionStatus` / `Permission` / `Question`) over a worker's control port. */
   attachHubProxyPort(workerID: number, port: MessagePort): () => void
+  /** Record the session lease a booting worker claimed, before its first run returns. */
+  rememberWorkerLease?(workerID: number, lease: WorkerLeaseClaim): void
   /** Retire one generation of a session's worker that the pool replaces in place (a mid-session model switch). */
   releaseGeneration(sessionID: SessionID, workerID?: number): Promise<void>
   /** Dispatch `sessionID` to a worker and resolve with its result (admission-aware). */
@@ -810,11 +817,20 @@ export function serveEventsPort(
       if (!rejected || sink.heal === undefined) return
       rejected = false
       const heal = sink.heal
-      void Promise.all(
-        seen.map((aggregateID) =>
-          Promise.resolve(heal({ aggregateID, seq: Number.MAX_SAFE_INTEGER, inclusive: true })),
-        ),
-      ).catch(() => {})
+      // Each aggregate heals independently; a failed heal leaves that aggregate's gap visible to the next read, so report it rather than drop it.
+      for (const aggregateID of seen) {
+        void Promise.resolve()
+          .then(() => heal({ aggregateID, seq: Number.MAX_SAFE_INTEGER, inclusive: true }))
+          .catch((error: unknown) => {
+            onError?.(new Error(`run-end heal failed for aggregate ${aggregateID}`, { cause: error }))
+            void bridge?.fork(
+              Effect.logWarning(workerLogMessage("run-end heal failed"), {
+                aggregateID,
+                error: error instanceof Error ? error.message : String(error),
+              }),
+            )
+          })
+      }
     },
     ...(onError === undefined ? {} : { onError }),
   })
@@ -1171,27 +1187,10 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     if (owner !== undefined) leaseOwnerBySession.set(sessionID, owner)
   }
 
-  /**
-   * Learn the current generation's lease owner as soon as its worker claims the
-   * lease, not only after the run. The registry entry exists from admission, but
-   * the worker writes `event_sequence.worker_owner_id` during boot, so poll a
-   * bounded number of times while the run proceeds. The post-run re-confirm stays
-   * authoritative; this only closes the window where a just-cold-started worker is
-   * evicted before its first run returns.
-   */
-  const rememberLeaseOwnerAtBoot = (sessionID: SessionID): void => {
-    const deadline = Date.now() + 5_000
-    const attempt = (): void => {
-      const workerID = dispatcher.registry.entry(sessionID)?.workerID
-      const stored = leaseOwnerBySession.get(sessionID)
-      if (stored !== undefined && (workerID === undefined || stored.startsWith(`worker-${workerID}-`))) return
-      void rememberLeaseOwner(sessionID).then(() => {
-        if (leaseOwnerBySession.has(sessionID) || Date.now() >= deadline) return
-        const timer = setTimeout(attempt, 25)
-        timer.unref?.()
-      })
-    }
-    attempt()
+  /** A booting worker reports the lease it claimed; keep it when it belongs to that worker's generation. */
+  const rememberWorkerLease = (workerID: number, lease: WorkerLeaseClaim): void => {
+    if (!lease.ownerID.startsWith(`worker-${workerID}-`)) return
+    leaseOwnerBySession.set(lease.aggregateID as SessionID, lease.ownerID)
   }
 
   /** Successor admission waits for the retired generation's release to land. */
@@ -1305,14 +1304,22 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
             lastCommittedMessageID: payload.lastCommittedMessageID,
             indeterminate,
           })
-        // The durable `tool_call` rows are the crash truth.
+        // The durable `tool_call` rows are the crash truth. Only the crashed generation's calls (and unfenced ones)
+        // count: an earlier generation's leftover was already surfaced as indeterminate and the user moved on.
         if (db === undefined) return decide(lifecycle.indeterminate(payload.sessionID))
+        const generationPrefix = `worker-${payload.workerID}-`
+        const knownOwner = leaseOwnerBySession.get(payload.sessionID as SessionID)
+        const crashedOwner = knownOwner?.startsWith(generationPrefix) ? knownOwner : undefined
         return boundedResumeDecision(
           () =>
             db
               .query(
-                "SELECT call_id, side_effecting FROM tool_call WHERE session_id = ? AND state = 'started' ORDER BY time_started, call_id",
-                [payload.sessionID],
+                crashedOwner === undefined
+                  ? "SELECT call_id, side_effecting FROM tool_call WHERE session_id = ? AND state = 'started' AND (worker_owner_id IS NULL OR substr(worker_owner_id, 1, ?) = ?) ORDER BY time_started, call_id"
+                  : "SELECT call_id, side_effecting FROM tool_call WHERE session_id = ? AND state = 'started' AND (worker_owner_id IS NULL OR worker_owner_id = ?) ORDER BY time_started, call_id",
+                crashedOwner === undefined
+                  ? [payload.sessionID, generationPrefix.length, generationPrefix]
+                  : [payload.sessionID, crashedOwner],
               )
               .then((rows) =>
                 decide(
@@ -1423,6 +1430,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     sessionOfWorker: (workerID) => dispatcher.registry.sessionsOn(workerID)[0],
     attachWorkerPorts: ports.attachWorkerPorts,
     attachHubProxyPort: ports.attachHubProxyPort,
+    rememberWorkerLease,
     releaseGeneration,
     lifecycle,
     barrier,
@@ -1439,7 +1447,6 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
           try: () => awaitRetiredLeaseRelease(sessionID),
           catch: (error) => error,
         })
-        rememberLeaseOwnerAtBoot(sessionID)
         const result = yield* dispatch.ensureRunningEffect(sessionID, resolveDepth(sessionID), origin)
         lifecycle.resetAttempts(sessionID)
         // Record the owner this generation claimed, so a later retirement can release exactly it without re-reading a possibly-successor-owned row.
@@ -1455,7 +1462,6 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       // A retired generation's release must land before its successor boots and claims the aggregate.
       await awaitRetiredLeaseRelease(sessionID)
       try {
-        rememberLeaseOwnerAtBoot(sessionID)
         const result = await dispatch.ensureRunning(sessionID, resolveDepth(sessionID), origin)
         lifecycle.resetAttempts(sessionID)
         // Record the owner this generation claimed, so a later retirement can release exactly it without re-reading a possibly-successor-owned row.
@@ -1472,7 +1478,6 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       await runPromise(admitBarrier(sessionID))
       await awaitRetiredLeaseRelease(sessionID)
       try {
-        rememberLeaseOwnerAtBoot(sessionID)
         const result = await dispatch.startShell(sessionID, shell, resolveDepth(sessionID))
         lifecycle.resetAttempts(sessionID)
         await rememberLeaseOwner(sessionID)

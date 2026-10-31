@@ -34,6 +34,7 @@ import {
   type SessionExecutorInbound,
   type SessionExecutorOutbound,
   type WorkerSpawnReason,
+  type WorkerLeaseClaim,
 } from "./execute"
 import {
   BOOT_CANCELLED,
@@ -242,6 +243,7 @@ export interface BunExecutorTransportOptions {
   readonly bufferCapacity?: number
   readonly onWorkerPorts?: (ports: WorkerTransferredPorts) => void
   readonly onHubProxyPort?: (port: MessagePort) => void
+  readonly onLeaseClaim?: (lease: WorkerLeaseClaim) => void
   readonly bridge?: EffectBridge.Shape
   readonly onBootTelemetry?: (event: BootTelemetry) => void
   // Boot-stage phase reporting: `boot` before the isolate is constructed, `materialize` when its validated `ready` handshake acknowledges the real graph.
@@ -331,7 +333,7 @@ async function requestWorkerShutdown(worker: Worker, options: WorkerShutdownOpti
 }
 
 type BootFrame =
-  | { readonly kind: "ready" }
+  | { readonly kind: "ready"; readonly lease?: WorkerLeaseClaim }
   | { readonly kind: "worker-ports"; readonly ports: WorkerTransferredPorts }
   | { readonly kind: "hub-proxy"; readonly port: MessagePort }
   // Every invalid frame's teardown is orderly, because even a pre-ready isolate may already have opened SQLite.
@@ -351,6 +353,7 @@ function parseBootFrame(data: unknown): BootFrame | undefined {
     readonly port?: unknown
     readonly egress?: unknown
     readonly egressControl?: unknown
+    readonly lease?: unknown
   }
   if (frame.type === "ready") {
     // Any `ready` frame proves the isolate opened its DB/WAL: even a rejected
@@ -358,7 +361,12 @@ function parseBootFrame(data: unknown): BootFrame | undefined {
     if (typeof frame.threadId !== "number") {
       return { kind: "invalid", reason: "boot-ready frame without a numeric threadId" }
     }
-    return { kind: "ready" }
+    const lease = frame.lease as { readonly aggregateID?: unknown; readonly ownerID?: unknown } | undefined
+    if (lease === undefined) return { kind: "ready" }
+    if (typeof lease !== "object" || typeof lease.aggregateID !== "string" || typeof lease.ownerID !== "string") {
+      return { kind: "invalid", reason: "boot-ready frame with a malformed lease claim" }
+    }
+    return { kind: "ready", lease: { aggregateID: lease.aggregateID, ownerID: lease.ownerID } }
   }
   if (frame.type === "ports") {
     const ports: { -readonly [K in keyof WorkerTransferredPorts]: MessagePort | undefined } = {
@@ -571,6 +579,7 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
         return
       }
       if (bootFrame?.kind === "ready") {
+        if (bootFrame.lease !== undefined) options.onLeaseClaim?.(bootFrame.lease)
         options.onPhase?.("materialize")
         if (bootLifecycle !== undefined && !bootLifecycle.start(created)) return
       }
@@ -845,6 +854,7 @@ export interface BunExecutorWorkerPoolOptions {
   readonly egressBarrier?: (sessionID: SessionID) => Promise<void> | undefined
   readonly onWorkerPorts?: (workerID: number, ports: WorkerTransferredPorts) => void
   readonly onHubProxyPort?: (workerID: number, port: MessagePort) => void
+  readonly onLeaseClaim?: (workerID: number, lease: WorkerLeaseClaim) => void
   readonly sessionID?: SessionID
   readonly reason?: WorkerSpawnReason
   readonly bridge?: EffectBridge.Shape
@@ -858,6 +868,7 @@ export interface BunExecutorWorkerPoolOptions {
 export function spawnBunExecutorWorker(id: number, options: BunExecutorWorkerPoolOptions): ExecutorWorker {
   const onWorkerPorts = options.onWorkerPorts
   const onHubProxyPort = options.onHubProxyPort
+  const onLeaseClaim = options.onLeaseClaim
   // The options doc promises a default-on budget even for a direct spawn. The
   // pool factories resolve once and pass a concrete value, so this is a no-op
   // for them (and never double-warns).
@@ -883,6 +894,7 @@ export function spawnBunExecutorWorker(id: number, options: BunExecutorWorkerPoo
       onWorkerPorts:
         onWorkerPorts === undefined ? undefined : (ports: WorkerTransferredPorts) => onWorkerPorts(id, ports),
       onHubProxyPort: onHubProxyPort === undefined ? undefined : (port: MessagePort) => onHubProxyPort(id, port),
+      onLeaseClaim: onLeaseClaim === undefined ? undefined : (lease: WorkerLeaseClaim) => onLeaseClaim(id, lease),
     }),
   })
   return createExecutorWorker({
@@ -1502,6 +1514,7 @@ export interface ProductionWorkerPoolOptions {
   readonly egressBarrier?: (sessionID: SessionID) => Promise<void> | undefined
   readonly onWorkerPorts?: (workerID: number, ports: WorkerTransferredPorts) => void
   readonly onHubProxyPort?: (workerID: number, port: MessagePort) => void
+  readonly onLeaseClaim?: (workerID: number, lease: WorkerLeaseClaim) => void
   // The production hub drops that session's per-session instance/context so those maps cannot grow without bound.
   readonly onSessionRebound?: (sessionID: SessionID) => void
   // The pool replaces the isolate in place, so the dispatcher's `retireWorker` never sees it; this hook runs the hub's authoritative retirement (lost in-flight calls, ports, pending permission/question requests, and the retired generation's lease release) before the successor boots.
@@ -1552,6 +1565,7 @@ interface ProductionInitState {
 export interface WorkerPoolSinks {
   readonly onWorkerPorts: (workerID: number, ports: WorkerTransferredPorts) => void
   readonly onHubProxyPort: (workerID: number, port: MessagePort) => void
+  readonly onLeaseClaim?: (workerID: number, lease: WorkerLeaseClaim) => void
 }
 
 export type ProductionPoolFactory = (
@@ -1738,6 +1752,7 @@ export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Eff
             : { onPhase: (phase: "boot" | "materialize") => options.onPhase?.(sessionID, phase) }),
           onWorkerPorts: options.onWorkerPorts,
           onHubProxyPort: options.onHubProxyPort,
+          onLeaseClaim: options.onLeaseClaim,
         }),
       })
     }
