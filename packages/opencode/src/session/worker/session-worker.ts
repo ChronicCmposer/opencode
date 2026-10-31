@@ -205,6 +205,8 @@ export interface SessionWorkerInit {
    * paired with no hub client) means the worker lists no plugin tools.
    */
   readonly pluginTools?: readonly PluginToolDescriptor[]
+  /** The hub-proxy spill directory (`dirname(db)/hub-proxy-spill`); absent for an in-memory database. */
+  readonly hubProxySpillDir?: string
 }
 
 interface WorkerScope {

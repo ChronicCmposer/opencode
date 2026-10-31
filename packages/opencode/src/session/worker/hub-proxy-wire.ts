@@ -1,6 +1,7 @@
 // The hub-proxy control wire: the request/reply protocol a session worker uses to reach the hub-resident `SessionStatus` / `Permission` / `Question`.
 
 import { Effect, Option, Schema } from "effect"
+import type { HubProxySpill } from "./hub-proxy-spill"
 import { createRequestChannel, errorTagOf, messageOf, workerFrameChannel } from "./port"
 import { ProtocolError, assertJsonRepresentable } from "./frame"
 import { parseJson } from "@/util/safe-json"
@@ -149,6 +150,10 @@ export interface HubProxyClient {
 export interface HubProxyClientOptions {
   /** Default per-request timeout in ms. */
   readonly timeoutMs?: number
+  /** Oversized requests and replies cross through this spill store; absent, they fail with a named error. */
+  readonly spill?: HubProxySpill
+  /** The spill scope (the worker's lease owner id) this client writes its request bodies under. */
+  readonly spillScope?: string
 }
 
 const DISPOSED_MESSAGE = "hub proxy client disposed"
@@ -255,6 +260,10 @@ function ownLookup<T>(record: Readonly<Record<string, T>> | undefined, key: stri
 export interface ServeHubProxyOptions {
   /** Host-boundary containment: a malformed inbound frame is reported here as a typed error and the poisoned control channel is isolated instead of. */
   readonly onProtocolError?: (error: unknown) => void
+  /** Oversized replies cross through this spill store, and spilled requests are read from it. */
+  readonly spill?: HubProxySpill
+  /** The spill scope (the serving worker's lease owner id) reply bodies are written under. */
+  readonly spillScope?: string
 }
 
 export function serveHubProxy(

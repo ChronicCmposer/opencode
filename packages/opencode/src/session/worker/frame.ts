@@ -55,6 +55,10 @@ export type WorkerFrameVersion = typeof WORKER_FRAME_VERSION
 export const WORKER_PROTOCOL_SCHEMA_VERSION = WORKER_FRAME_VERSION
 
 export const MAX_WORKER_FRAME_BYTES = 4 * 1024 * 1024
+/** A hub-proxy request or reply whose encoded frame exceeds this crosses as a spill reference (D15). */
+export const HUB_PROXY_SPILL_THRESHOLD_BYTES = MAX_WORKER_FRAME_BYTES - 64 * 1024
+/** The largest body a hub-proxy spill accepts; above it the call fails with a named error. */
+export const MAX_HUB_PROXY_SPILL_BYTES = 64 * 1024 * 1024
 
 export const WORKER_FRAME_PORTS = ["events", "writer", "job", "hub-proxy"] as const
 export type WorkerFramePort = (typeof WORKER_FRAME_PORTS)[number]
@@ -201,8 +205,12 @@ export class FrameTooLargeError extends ProtocolError {
   constructor(
     readonly byteLength: number,
     readonly limit: number = MAX_WORKER_FRAME_BYTES,
+    /** What the frame was, e.g. `hub-proxy request "messagesTransform"`; absent keeps the generic message. */
+    readonly label?: string,
   ) {
-    super(`worker frame is ${byteLength} bytes (limit ${limit}); the frame was rejected, not truncated`)
+    super(
+      `${label === undefined ? "worker frame" : label} is ${byteLength} bytes (limit ${limit}); the frame was rejected, not truncated`,
+    )
     Object.defineProperty(this, "_tag", { value: "WorkerFrame.TooLarge", enumerable: true, configurable: true })
     this.name = "FrameTooLargeError"
   }
@@ -255,9 +263,9 @@ export function workerFrameByteLength(text: string): number {
 }
 
 /** Reject an over-bound message before it is posted or parsed. */
-export function assertWorkerFrameSize(text: string, limit: number = MAX_WORKER_FRAME_BYTES): string {
+export function assertWorkerFrameSize(text: string, limit: number = MAX_WORKER_FRAME_BYTES, label?: string): string {
   const byteLength = workerFrameByteLength(text)
-  if (byteLength > limit) throw new FrameTooLargeError(byteLength, limit)
+  if (byteLength > limit) throw new FrameTooLargeError(byteLength, limit, label)
   return text
 }
 

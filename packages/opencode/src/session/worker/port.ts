@@ -57,7 +57,8 @@ export function resolveWorkerEntry(input: {
 }
 
 export interface FrameChannel<Frame> {
-  post(frame: Frame): void
+  /** `label` names the frame in a size rejection, e.g. `hub-proxy request "messagesTransform"`. */
+  post(frame: Frame, label?: string): void
   onMessage(handler: (frame: Frame) => void): () => void
 }
 
@@ -94,7 +95,7 @@ export function workerFrameChannel<Frame extends WorkerFrameCarrier>(
 ): FrameChannel<Frame> {
   const channel = portFromMessagePort<string>(port)
   return {
-    post: (frame) => {
+    post: (frame, label) => {
       options.validateOutbound?.(frame)
       const text = encodeWorkerFrame({
         v: WORKER_FRAME_VERSION,
@@ -103,7 +104,7 @@ export function workerFrameChannel<Frame extends WorkerFrameCarrier>(
         ...(frame.id === undefined ? {} : { id: frame.id }),
         payload: frame,
       })
-      channel.post(assertWorkerFrameSize(text))
+      channel.post(assertWorkerFrameSize(text, undefined, label))
     },
     onMessage: (handler) => {
       let unsubscribe = (): void => {}
