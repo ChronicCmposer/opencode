@@ -482,10 +482,8 @@ const layer = Layer.effect(
           deps.push(dep)
 
           result.command = mergeDeep(result.command ?? {}, yield* Effect.promise(() => ConfigCommand.load(dir)))
-          const [dirAgents, dirModes] = yield* Effect.promise(() =>
-            Promise.all([ConfigAgent.load(dir), ConfigAgent.loadMode(dir)]),
-          )
-          result.agent = mergeDeep(mergeDeep(result.agent ?? {}, dirAgents), dirModes)
+          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
+          result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.loadMode(dir)))
           // Auto-discovered plugins under `.opencode/plugin(s)` are already local files, so ConfigPlugin.load
           // returns normalized Specs and we only need to attach origin metadata here.
           const list = yield* Effect.promise(() => ConfigPlugin.load(dir))
