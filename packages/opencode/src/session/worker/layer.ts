@@ -23,7 +23,6 @@ import { SessionStatus } from "@/session/status"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { DurableLog } from "@opencode-ai/core/durable-log"
-import { Latest } from "@/event-manifest"
 
 import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
@@ -81,10 +80,10 @@ import {
   WRITER_CLIENT_KEY,
   assertSessionLayer,
 } from "./node-table"
-import { createWorkerEventBridge, DURABLE_WAKEUP_METADATA_KEY } from "./event-bridge"
+import { createWorkerEventBridge } from "./event-bridge"
 import type { WorkerDurableSubscription } from "./egress-client"
-import type { DurableCommit, MeshWorkerClient } from "@/session/egress/mesh"
-import { createDeltaSubscription, type SnapshotReader } from "@/session/egress/delta"
+import type { MeshWorkerClient } from "@/session/egress/mesh"
+import { createDeltaSubscription, type DeltaSubscription, type SnapshotReader } from "@/session/egress/delta"
 import type { EventV2Event } from "./frame"
 import { stringHeaders } from "./headers"
 import {
@@ -204,68 +203,21 @@ export class WorkerEventBridge extends Context.Service<WorkerEventBridge, Worker
 ) {}
 
 
-/** The single durable wakeup pattern a worker subscribes to. */
-export const WORKER_DURABLE_WAKE_PATTERN = "*"
-
-/** Parse a durable commit into this build's definition: the aggregate it belongs to and the definition version. */
-function durablePositionOf(
-  commit: DurableCommit,
-): { readonly aggregateID: string; readonly version: number } | undefined {
-  const durable = Latest.get(commit.event.type)?.durable
-  if (durable === undefined) return undefined
-  const properties = commit.event.properties
-  const aggregateID =
-    properties !== null && typeof properties === "object"
-      ? (properties as Readonly<Record<string, unknown>>)[durable.aggregate]
-      : undefined
-  if (typeof aggregateID !== "string") {
-    throw new Error(`durable commit "${commit.event.type}" is missing string aggregate field ${durable.aggregate}`)
-  }
-  return { aggregateID, version: durable.version }
-}
-
 /** Wake one aggregate's `durable()` subscribers so they re-read SQLite. */
-function wakeAggregate(
-  events: Pick<EventV2.Interface, "wakeDurable">,
-  aggregateID: string,
-): void {
+function wakeAggregate(events: Pick<EventV2.Interface, "wakeDurable">, aggregateID: string): void {
   const wakeDurable = events.wakeDurable
   if (wakeDurable === undefined) return
   Effect.runSync(wakeDurable(aggregateID))
 }
 
-/** Bridge one hub-delivered durable commit into the worker's in-isolate EventV2. */
-export function republishDurableCommit(
-  events: Pick<EventV2.Interface, "publishLive" | "wakeDurable">,
-  commit: DurableCommit,
-): void {
-  const position = durablePositionOf(commit)
-  Effect.runSync(
-    events.publishLive({
-      id: EventV2.ID.make(commit.event.id),
-      type: commit.event.type,
-      data: commit.event.properties,
-      ...(position === undefined
-        ? {}
-        : {
-            durable: {
-              aggregateID: commit.meta.aggregateID,
-              seq: commit.meta.seq,
-              version: position.version,
-            },
-          }),
-      metadata: { [DURABLE_WAKEUP_METADATA_KEY]: true },
-    }),
-  )
-  // The durable write already happened in the hub writer; the in-isolate `durable()` subscribers only need waking so their aggregate stream re-reads and.
-  if (position === undefined) return
-  wakeAggregate(events, position.aggregateID)
-}
+/** Placeholder body for the gap tracker, which only reads positions. */
+const WAKEUP_EVENT: EventV2Event = { id: "", type: "durable.wakeup", properties: {} }
 
-/** Wire the worker's durable wakeups: subscribe to the hub mesh through the egress handle's control plane and republish each delivered commit into the. */
+/** The subscription token for this worker's position wakeups; the hub addresses them by session ownership. */
+export const WORKER_DURABLE_WAKE_PATTERN = "durable.wakeup"
+
 /** The EventV2 seams a durable wakeup needs; `durable` enables gap detection. */
-type WakeupEvents = Pick<EventV2.Interface, "publishLive" | "wakeDurable"> &
-  Partial<Pick<EventV2.Interface, "durable">>
+type WakeupEvents = Pick<EventV2.Interface, "wakeDurable"> & Partial<Pick<EventV2.Interface, "durable">>
 
 /** Read a database snapshot for one aggregate through the production durable stream. */
 function durableSnapshotOf(events: WakeupEvents): SnapshotReader | undefined {
@@ -295,53 +247,39 @@ export function wireDurableWakeups(
 ): () => void {
   const subscribe = egress.subscribeDurable
   if (subscribe === undefined || egress.mesh === undefined) return () => {}
-  const seen = new Set<string>()
   const snapshot = durableSnapshotOf(events)
-  const trackers = new Map<string, { receiveDurable: (commit: DurableCommit) => void }>()
+  // The hub wakes a worker only for its own session's aggregate, so one tracker suffices.
+  let tracker: { readonly aggregateID: string; readonly subscription: DeltaSubscription } | undefined
 
-  const trackerFor = (aggregateID: string): { receiveDurable: (commit: DurableCommit) => void } | undefined => {
+  const trackerFor = (aggregateID: string): DeltaSubscription | undefined => {
     if (snapshot === undefined) return undefined
-    const existing = trackers.get(aggregateID)
-    if (existing !== undefined) return existing
+    if (tracker?.aggregateID === aggregateID) return tracker.subscription
     const subscription = createDeltaSubscription({
       aggregateID,
       snapshot,
       onDelta: () => {},
-      // The commit already crossed live in `onDurable`; this subscription exists only to detect a gap and heal it from the snapshot.
+      // The position alone crossed the mesh; this subscription exists only to detect a gap and heal it from the snapshot.
       onDurable: () => {},
       onResync: () => wakeAggregate(events, aggregateID),
     })
-    const tracker = {
-      receiveDurable: (commit: DurableCommit) =>
-        subscription.receiveDurable({
-          aggregateID: commit.meta.aggregateID,
-          seq: commit.meta.seq,
-          event: commit.event,
-        }),
-    }
-    trackers.set(aggregateID, tracker)
-    return tracker
+    tracker = { aggregateID, subscription }
+    return subscription
   }
 
   const unsubscribe = subscribe({
     pattern: WORKER_DURABLE_WAKE_PATTERN,
-    onDurable: (commit) => {
-      const aggregateID = commit.meta.aggregateID
-      seen.add(aggregateID)
-      republishDurableCommit(events, commit)
-      trackerFor(aggregateID)?.receiveDurable(commit)
+    onDurable: ({ aggregateID, seq }) => {
+      wakeAggregate(events, aggregateID)
+      trackerFor(aggregateID)?.receiveDurable({ aggregateID, seq, event: WAKEUP_EVENT })
     },
     // A resync means the hub dropped a delivery (overflow or receiver gap).
     onResync: (_pattern, position) => {
-      if (position !== undefined) {
-        wakeAggregate(events, position.aggregateID)
-        return
-      }
-      for (const aggregateID of seen) wakeAggregate(events, aggregateID)
+      const aggregateID = position?.aggregateID ?? tracker?.aggregateID
+      if (aggregateID !== undefined) wakeAggregate(events, aggregateID)
     },
   })
   return () => {
-    trackers.clear()
+    tracker = undefined
     unsubscribe()
   }
 }

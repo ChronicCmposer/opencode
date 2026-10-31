@@ -74,9 +74,9 @@ describe("worker durable resync fan-out", () => {
       })
       await pollUntil(() => mesh.subscriptions().length === 2)
 
-      mesh.publish({ meta: { aggregateID: "ses_title", seq: 1 }, event: { id: "e1", type: "session.updated", properties: { sessionID: "ses_title" } } })
+      mesh.publish("w1", { aggregateID: "ses_title", seq: 1 })
       await pollUntil(() => mesh.outstanding("w1") === 1)
-      mesh.publish({ meta: { aggregateID: "ses_title", seq: 2 }, event: { id: "e2", type: "session.updated", properties: { sessionID: "ses_title" } } })
+      mesh.publish("w1", { aggregateID: "ses_title", seq: 2 })
 
       await pollUntil(() => seen.length === 2, { message: "overflow resync did not reach every pattern" })
       expect(seen).toEqual([

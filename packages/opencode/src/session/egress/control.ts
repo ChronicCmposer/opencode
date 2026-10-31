@@ -1,6 +1,6 @@
 // Dedicated control channel.
 
-import type { AggregatePosition, EventV2Event } from "./frame"
+import type { AggregatePosition } from "./frame"
 
 /** Permissive control-frame envelope: the transport base every frame satisfies. */
 export interface ControlEnvelope {
@@ -16,7 +16,7 @@ export type ControlFrame =
   | { readonly type: "listen"; readonly id: number; readonly pattern: string }
   | { readonly type: "unlisten"; readonly id: number; readonly pattern: string }
   | { readonly type: "listen.ok"; readonly id: number }
-  | { readonly type: "durable"; readonly meta: AggregatePosition; readonly event: EventV2Event }
+  | { readonly type: "durable"; readonly meta: AggregatePosition }
   | { readonly type: "resync"; readonly pattern: string; readonly meta?: AggregatePosition }
   | { readonly type: "durable.ack"; readonly count: number }
   | { readonly type: "resync.ack"; readonly pattern?: string }
@@ -86,11 +86,6 @@ function controlId(record: Record<string, unknown>): number | undefined {
   return typeof id === "number" && Number.isInteger(id) ? id : undefined
 }
 
-/** The EventV2 event `{ id, type, properties }` a `durable` frame must carry. */
-function isEventV2(value: unknown): value is EventV2Event {
-  return isControlRecord(value) && typeof value.id === "string" && typeof value.type === "string" && "properties" in value
-}
-
 /** The `{ aggregateID, seq }` durable identity a `durable` frame must carry. */
 function isAggregatePositionShape(value: unknown): value is AggregatePosition {
   return (
@@ -136,9 +131,7 @@ function parseControlFrame(data: unknown): ControlFrame | undefined {
         : { type: "unlisten", id, pattern: data.pattern }
     }
     case "durable":
-      return isAggregatePositionShape(data.meta) && isEventV2(data.event)
-        ? { type: "durable", meta: data.meta, event: data.event }
-        : undefined
+      return isAggregatePositionShape(data.meta) ? { type: "durable", meta: data.meta } : undefined
     case "resync": {
       if (typeof data.pattern !== "string") return undefined
       if (data.meta === undefined) return { type: "resync", pattern: data.pattern }

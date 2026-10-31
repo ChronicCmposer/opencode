@@ -204,17 +204,15 @@ describe("hub events port → worker resync over the real ports", () => {
     const attachment = attachMeshWorker(mesh, "w1", control.port2)
     const client = createWorkerEgressClient(data.port1, { controlPort: control.port1 })
     const woken: string[] = []
-    const republished: string[] = []
     // The production `EventV2.durable` re-read is what heals the wake: a wake for
     // the aggregate makes the isolate's durable subscribers re-read SQLite. This
     // stub records that exact seam.
     const events = {
-      publishLive: (event: EventV2.Payload) => Effect.sync(() => void republished.push(event.type)),
       wakeDurable: (aggregateID: string) => Effect.sync(() => void woken.push(aggregateID)),
     }
     const disposeWakeups = wireDurableWakeups(events, client)
     const sink = createHubEventSink({ publisher })
-    const disposeHub = serveEventsPort(data.port2, sink, undefined, (commit) => void mesh.publish(commit))
+    const disposeHub = serveEventsPort(data.port2, sink, undefined, (commit) => void mesh.publish("w1", commit.meta))
     try {
       await pollUntil(() => mesh.subscriptions().length === 1, { message: "worker never subscribed" })
 
@@ -238,7 +236,6 @@ describe("hub events port → worker resync over the real ports", () => {
       data.port1.postMessage(frame(4))
       await pollUntil(() => published.length === 3, { message: "events stream closed after the gap" })
       expect(sink.resyncs).toBe(1)
-      expect(republished).toHaveLength(3)
     } finally {
       disposeHub()
       disposeWakeups()

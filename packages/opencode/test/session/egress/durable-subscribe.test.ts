@@ -3,9 +3,8 @@
 // can never reach a subscriber the hub never registered.
 
 import { describe, expect, test } from "bun:test"
-import { attachMeshWorker, createEgressMesh, type DurableCommit } from "@/session/egress/mesh"
+import { attachMeshWorker, createEgressMesh, type DurableWakeup } from "@/session/egress/mesh"
 import { createWorkerEgressClient } from "@/session/worker/egress-client"
-import { durable } from "../../lib/egress-fixtures"
 import { pollUntil } from "../../lib/poll"
 
 /**
@@ -45,13 +44,13 @@ describe("worker durable subscription failure", () => {
       controlPort: listenFailingPort(controlChannel.port1),
     })
 
-    const commits: DurableCommit[] = []
+    const commits: DurableWakeup[] = []
     client.subscribeDurable({ pattern: "message.updated", onDurable: (commit) => commits.push(commit) })
 
     // The listen failed, but simulate the hub having registered the pattern
     // independently: the durable push must not reach the stale subscription.
     mesh.listen("w1", "message.updated")
-    mesh.publish({ meta: { aggregateID: "agg", seq: 1 }, event: durable("d1") })
+    mesh.publish("w1", { aggregateID: "agg", seq: 1 })
     // The push is still acknowledged by the mesh wiring, so outstanding drains.
     await pollUntil(() => mesh.outstanding("w1") === 0)
 

@@ -7,7 +7,7 @@
 
 import { describe, expect, test } from "bun:test"
 import { createEgressReceiver } from "@/session/egress/receiver"
-import { attachMeshWorker, createEgressMesh, type DurableCommit } from "@/session/egress/mesh"
+import { attachMeshWorker, createEgressMesh, type DurableWakeup } from "@/session/egress/mesh"
 import { createWorkerEgressClient } from "@/session/worker/egress-client"
 import { Logger } from "effect"
 import type { EffectBridge } from "@/effect/bridge"
@@ -92,14 +92,14 @@ describe("worker egress client adapts the mesh control link", () => {
     const client = createWorkerEgressClient(egressChannel.port1, { controlPort: controlChannel.port1 })
 
     expect(client.mesh).toBeDefined()
-    const commits: DurableCommit[] = []
+    const commits: DurableWakeup[] = []
     client.mesh?.onDurable((commit) => commits.push(commit))
     await client.mesh?.listen("message.updated")
 
-    mesh.publish({ meta: { aggregateID: "agg", seq: 1 }, event: durable("d1") })
+    mesh.publish("w1", { aggregateID: "agg", seq: 1 })
 
     await pollUntil(() => commits.length === 1)
-    expect(commits[0]?.event.id).toBe("d1")
+    expect(commits[0]).toEqual({ aggregateID: "agg", seq: 1 })
     client.dispose()
     attachment.dispose()
   })
@@ -111,11 +111,11 @@ describe("worker egress client adapts the mesh control link", () => {
     const attachment = attachMeshWorker(mesh, "w1", controlChannel.port2)
     const client = createWorkerEgressClient(egressChannel.port1, { controlPort: controlChannel.port1 })
 
-    const commits: DurableCommit[] = []
+    const commits: DurableWakeup[] = []
     client.mesh?.onDurable((commit) => commits.push(commit))
     await client.mesh?.listen("*")
 
-    mesh.publish({ meta: { aggregateID: "agg", seq: 1 }, event: durable("d1") })
+    mesh.publish("w1", { aggregateID: "agg", seq: 1 })
     await pollUntil(() => commits.length === 1)
     expect(mesh.outstanding("w1")).toBe(1)
 
@@ -124,9 +124,9 @@ describe("worker egress client adapts the mesh control link", () => {
     client.mesh?.acknowledgeDelivery()
     await pollUntil(() => mesh.outstanding("w1") === 0)
 
-    mesh.publish({ meta: { aggregateID: "agg", seq: 2 }, event: durable("d2") })
+    mesh.publish("w1", { aggregateID: "agg", seq: 2 })
     await pollUntil(() => commits.length === 2)
-    expect(commits.map((commit) => commit.event.id)).toEqual(["d1", "d2"])
+    expect(commits.map((commit) => commit.seq)).toEqual([1, 2])
 
     client.dispose()
     attachment.dispose()
@@ -144,8 +144,8 @@ describe("worker egress client adapts the mesh control link", () => {
     await client.mesh?.listen("*")
 
     // The first delivery occupies the only slot; the second overflows to resync.
-    mesh.publish({ meta: { aggregateID: "agg", seq: 1 }, event: durable("d1") })
-    mesh.publish({ meta: { aggregateID: "agg", seq: 2 }, event: durable("d2") })
+    mesh.publish("w1", { aggregateID: "agg", seq: 1 })
+    mesh.publish("w1", { aggregateID: "agg", seq: 2 })
 
     await pollUntil(() => resyncs.length === 1)
     expect(resyncs).toEqual(["*"])
@@ -174,16 +174,16 @@ describe("worker egress client drives durable mesh subscriptions", () => {
     const attachment = attachMeshWorker(mesh, "w1", controlChannel.port2)
     const client = createWorkerEgressClient(egressChannel.port1, { controlPort: controlChannel.port1 })
 
-    const commits: DurableCommit[] = []
+    const commits: DurableWakeup[] = []
     client.subscribeDurable({ pattern: "message.updated", onDurable: (commit) => commits.push(commit) })
     await pollUntil(() =>
       mesh.subscriptions().some((s) => s.workerId === "w1" && s.pattern === "message.updated"),
     )
 
-    mesh.publish({ meta: { aggregateID: "agg", seq: 1 }, event: durable("d1") })
+    mesh.publish("w1", { aggregateID: "agg", seq: 1 })
 
     await pollUntil(() => commits.length === 1)
-    expect(commits[0]?.event.id).toBe("d1")
+    expect(commits[0]).toEqual({ aggregateID: "agg", seq: 1 })
     // The subscriber's delivery is acknowledged automatically, freeing the slot.
     await pollUntil(() => mesh.outstanding("w1") === 0)
 
@@ -198,7 +198,7 @@ describe("worker egress client drives durable mesh subscriptions", () => {
     const attachment = attachMeshWorker(mesh, "w1", controlChannel.port2)
     const client = createWorkerEgressClient(egressChannel.port1, { controlPort: controlChannel.port1 })
 
-    const commits: DurableCommit[] = []
+    const commits: DurableWakeup[] = []
     const resyncs: string[] = []
     client.subscribeDurable({
       pattern: "*",
@@ -208,8 +208,8 @@ describe("worker egress client drives durable mesh subscriptions", () => {
     await pollUntil(() => mesh.subscriptions().length === 1)
 
     // The first delivery occupies the only slot; the second overflows to resync.
-    mesh.publish({ meta: { aggregateID: "agg", seq: 1 }, event: durable("d1") })
-    mesh.publish({ meta: { aggregateID: "agg", seq: 2 }, event: durable("d2") })
+    mesh.publish("w1", { aggregateID: "agg", seq: 1 })
+    mesh.publish("w1", { aggregateID: "agg", seq: 2 })
 
     await pollUntil(() => resyncs.length === 1)
     expect(resyncs).toEqual(["*"])
