@@ -171,4 +171,69 @@ describe("worker priced cost", () => {
     )
     expect(expected.cost).toBe(0)
   }, 60_000)
+
+  test("an Anthropic stream's cache-write and cache-read tokens are priced", async () => {
+    const event = (type: string, data: unknown) => `event: ${type}\ndata: ${JSON.stringify({ type, ...(data as object) })}\n\n`
+    const frames = [
+      event("message_start", {
+        message: {
+          id: "msg_1",
+          type: "message",
+          role: "assistant",
+          model: "claude-test",
+          content: [],
+          stop_reason: null,
+          usage: { input_tokens: 1000, output_tokens: 1, cache_creation_input_tokens: 2000, cache_read_input_tokens: 500 },
+        },
+      }),
+      event("content_block_start", { index: 0, content_block: { type: "text", text: "" } }),
+      event("content_block_delta", { index: 0, delta: { type: "text_delta", text: "ok" } }),
+      event("content_block_stop", { index: 0 }),
+      event("message_delta", { delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 100 } }),
+      event("message_stop", {}),
+    ]
+    const server = Bun.serve({
+      port: 0,
+      fetch: (request) =>
+        new URL(request.url).pathname.endsWith("/messages")
+          ? new Response(frames.join(""), { headers: { "content-type": "text/event-stream" } })
+          : new Response("not found", { status: 404 }),
+    })
+    const cost: ModelCost = { input: 3, output: 15, cache: { read: 0.3, write: 3.75 } }
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "oc-cost-anthropic-"))
+    const ctx = createE2EContext({
+      snapshot: workerSnapshot({ directory }),
+      modelConfig: {
+        ...modelConfig({ model: "claude-test", baseUrl: `${server.url.origin}/v1`, apiKey: "test" }, cost),
+        npm: "@ai-sdk/anthropic",
+      },
+    })
+    try {
+      const sessionID = await Effect.runPromise(seed(ctx, "claude-test", "hi"))
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const prompt = yield* SessionPromptService.Service
+          yield* prompt.loop({ sessionID })
+        }).pipe(Effect.provide(ctx.layer), Effect.provideService(InstanceRef, ctx.instance)),
+      )
+      const stepFinish = ctx.rows("part").map(rowData).find((part) => part.type === "step-finish")
+      const tokens = stepFinish!.tokens as {
+        input: number
+        output: number
+        reasoning: number
+        cache: { read: number; write: number }
+      }
+      expect(tokens.cache).toEqual({ read: 500, write: 2000 })
+      const priced =
+        (tokens.input * 3 + (tokens.output + tokens.reasoning) * 15 + tokens.cache.read * 0.3 + tokens.cache.write * 3.75) /
+        1_000_000
+      const assistant = ctx.rows("message").map(rowData).find((message) => message.role === "assistant")
+      expect(assistant!.cost as number).toBeCloseTo(priced, 12)
+      expect(stepFinish!.cost as number).toBeCloseTo(priced, 12)
+    } finally {
+      await ctx.dispose()
+      await server.stop(true)
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  }, 60_000)
 })

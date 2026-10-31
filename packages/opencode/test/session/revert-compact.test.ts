@@ -751,3 +751,56 @@ describe("revert + compact workflow", () => {
     ),
   )
 })
+
+describe("revert cleanup event order", () => {
+  it.live(
+    "cleanup publishes upstream's removal-then-clear sequence",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const revert = yield* SessionRevert.Service
+          const events = yield* EventV2Bridge.Service
+          const log: string[] = []
+          const unsubscribe = yield* events.listen((event) =>
+            Effect.sync(() => {
+              if (event.type.startsWith("message.") || event.type === "session.updated") log.push(event.type)
+            }),
+          )
+          try {
+            const info = yield* session.create({})
+            const sid = info.id
+            const u1 = yield* user(sid)
+            yield* text(sid, u1.id, "hello")
+            const a1 = yield* assistant(sid, u1.id, dir)
+            yield* text(sid, a1.id, "hi back")
+            const u2 = yield* user(sid)
+            yield* text(sid, u2.id, "keep")
+            const cut = yield* text(sid, u2.id, "cut here")
+            yield* text(sid, u2.id, "cut too")
+            const a2 = yield* assistant(sid, u2.id, dir)
+            yield* text(sid, a2.id, "second answer")
+            yield* session.setRevert({
+              sessionID: sid,
+              revert: { messageID: u2.id, partID: cut.id },
+              summary: { additions: 0, deletions: 0, files: 0 },
+            })
+            const state = yield* session.get(sid)
+            const start = log.length
+            yield* revert.cleanup(state)
+            // Captured from upstream v1's in-process cleanup for this exact scenario.
+            expect(log.slice(start)).toEqual([
+              "message.removed",
+              "message.part.removed",
+              "message.part.removed",
+              "session.updated",
+            ])
+            expect((yield* session.get(sid)).revert ?? null).toBeNull()
+          } finally {
+            yield* unsubscribe
+          }
+        }),
+      { git: true },
+    ),
+  )
+})
