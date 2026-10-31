@@ -890,7 +890,7 @@ describe("session-hub boundary", () => {
     await expect(boundless.sessionCancel!({ sessionID: BOUND, targetID: BOUND })).rejects.toThrow(/no bound session/)
   })
 
-  test("worker status writes drop a repeated busy but pass retry and idle through", async () => {
+  test("worker status writes drop a repeated busy or idle but pass retry through", async () => {
     const BOUND = SessionID.make("ses_bound_status_dedupe")
     let current: SessionStatus.Info = { type: "idle" }
     const writes: string[] = []
@@ -932,5 +932,11 @@ describe("session-hub boundary", () => {
     expect(writes).toEqual(["busy", "retry"])
     await Effect.runPromise(authorities.sessionStatus.set(BOUND, { type: "idle" }))
     expect(writes).toEqual(["busy", "retry", "idle"])
+    // A hub fallback idle may land first; the worker's late idle is then a repeat.
+    await Effect.runPromise(authorities.sessionStatus.set(BOUND, { type: "idle" }))
+    expect(writes).toEqual(["busy", "retry", "idle"])
+    // A busy after a retry is a real transition, as in-process.
+    await Effect.runPromise(authorities.sessionStatus.set(BOUND, { type: "busy" }))
+    expect(writes).toEqual(["busy", "retry", "idle", "busy"])
   })
 })

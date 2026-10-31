@@ -1134,14 +1134,14 @@ function bindSessionStatus(
             .pipe(
               Effect.map((statuses) => new Map([...statuses].filter(([sessionID]) => sessionID === boundSessionID))),
             ),
-    // The hub publishes admission busy, so the worker's identical repeat is skipped; any non-busy status (retry/idle) still goes through.
+    // The hub publishes admission busy and fallback idles, so the worker's identical busy or idle repeat is skipped; a retry status always goes through.
     set: (sessionID, status) =>
       owns(sessionID)
-        ? status.type === "busy"
-          ? inner.get(sessionID).pipe(
-              Effect.flatMap((current) => (current.type === "busy" ? Effect.void : inner.set(sessionID, status))),
+        ? status.type === "retry"
+          ? inner.set(sessionID, status)
+          : inner.get(sessionID).pipe(
+              Effect.flatMap((current) => (current.type === status.type ? Effect.void : inner.set(sessionID, status))),
             )
-          : inner.set(sessionID, status)
         : Effect.void,
   }
 }

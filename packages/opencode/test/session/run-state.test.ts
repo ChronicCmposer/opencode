@@ -663,6 +663,141 @@ describe("SessionRunState — hub admission busy/idle", () => {
     )
   })
 
+  it.live("a cancel racing the cancelled run publishes one idle", () => {
+    const sessionID = sid("ses_cancel_race")
+    const status = recordingStatus()
+    const gate = Deferred.makeUnsafe<void>()
+    const hub = hubWith(sessionID, {
+      ensureRunningEffect: () =>
+        Deferred.await(gate).pipe(
+          Effect.andThen(Effect.fail(new SessionCancelledError({ message: "cancelled", sessionID }))),
+        ),
+      // An unacknowledged terminate: the worker never published its own idle.
+      cancelWithReport: async () => {
+        Deferred.doneUnsafe(gate, Effect.void)
+        return {
+          outcome: { sessionID, mode: "terminated", winner: "cancel", acknowledged: false, durationMs: 0 },
+          descendants: [],
+        }
+      },
+    })
+
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const work = Effect.succeed(withParts(sessionID))
+        const run = yield* state.ensureRunning(sessionID, work, work).pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          Effect.sync(() => (status.store.get(sessionID)?.type === "busy" ? true : undefined)),
+          "admission busy never published",
+        )
+        yield* state.cancel(sessionID)
+        yield* Fiber.await(run)
+        expect(status.log).toEqual([`${String(sessionID)}:busy`, `${String(sessionID)}:idle`])
+      }).pipe(
+        Effect.provide(runStateLayerWith(status.layer)),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+      ),
+    )
+  })
+
+  it.live("an interrupted run leaves the idle to a worker that acknowledged the cancel", () => {
+    const sessionID = sid("ses_interrupt_ack")
+    const status = recordingStatus()
+    const hub = hubWith(sessionID, {
+      ensureRunningEffect: () => Effect.never,
+      cancelWithReport: async () => ({
+        outcome: { sessionID, mode: "cooperative", winner: "cancel", acknowledged: true, durationMs: 0 },
+        descendants: [],
+      }),
+    })
+
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const work = Effect.succeed(withParts(sessionID))
+        const run = yield* state.ensureRunning(sessionID, work, work).pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          Effect.sync(() => (status.store.get(sessionID)?.type === "busy" ? true : undefined)),
+          "admission busy never published",
+        )
+        yield* Fiber.interrupt(run)
+        expect(status.log).toEqual([`${String(sessionID)}:busy`])
+      }).pipe(
+        Effect.provide(runStateLayerWith(status.layer)),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+      ),
+    )
+  })
+
+  it.live("an interrupted run writes one fallback idle when the worker did not settle", () => {
+    const sessionID = sid("ses_interrupt_terminated")
+    const status = recordingStatus()
+    const hub = hubWith(sessionID, {
+      ensureRunningEffect: () => Effect.never,
+      cancelWithReport: async () => {
+        throw new Error("report lost")
+      },
+    })
+
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        const state = yield* SessionRunState.Service
+        const work = Effect.succeed(withParts(sessionID))
+        const run = yield* state.ensureRunning(sessionID, work, work).pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          Effect.sync(() => (status.store.get(sessionID)?.type === "busy" ? true : undefined)),
+          "admission busy never published",
+        )
+        yield* Fiber.interrupt(run)
+        expect(status.log).toEqual([`${String(sessionID)}:busy`, `${String(sessionID)}:idle`])
+      }).pipe(
+        Effect.provide(runStateLayerWith(status.layer)),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+      ),
+    )
+  })
+
+  it.live("two prompts admitted at once publish one busy", () => {
+    const sessionID = sid("ses_admit_race")
+    const status = recordingStatus()
+    const gate = Deferred.makeUnsafe<void>()
+    const hub = hubWith(sessionID, {
+      ensureRunningEffect: () =>
+        Deferred.await(gate).pipe(Effect.as({ sessionID: String(sessionID), value: withParts(sessionID) })),
+    })
+    // A status read that yields, as the real InstanceState-backed one may: both prompts read "idle" before either writes.
+    const yieldingStatus = Layer.succeed(SessionStatus.Service, {
+      get: (id) =>
+        Effect.sync(() => status.store.get(id) ?? { type: "idle" as const }).pipe(Effect.tap(() => Effect.yieldNow)),
+      set: (id, info) =>
+        Effect.sync(() => {
+          status.store.set(id, info)
+          status.log.push(`${String(id)}:${info.type}`)
+        }),
+      list: () => Effect.sync(() => new Map(status.store)),
+    })
+
+    return withTmpdirInstance()(
+      Effect.gen(function* () {
+        yield* Effect.sleep("20 millis").pipe(Effect.andThen(Deferred.succeed(gate, undefined)), Effect.forkChild)
+        const state = yield* SessionRunState.Service
+        const work = Effect.succeed(withParts(sessionID))
+        yield* Effect.all([state.ensureRunning(sessionID, work, work), state.ensureRunning(sessionID, work, work)], {
+          concurrency: 2,
+        })
+        expect(status.log.filter((entry) => entry.endsWith(":busy"))).toHaveLength(1)
+      }).pipe(
+        Effect.provide(runStateLayerWith(yieldingStatus)),
+        Effect.provideService(SessionHubService, hub),
+        Effect.provide(flagsOn),
+      ),
+    )
+  })
+
   it.live("awaitBusy on a routed session waits for admission", () => {
     const sessionID = sid("ses_await_busy")
     const status = recordingStatus()
