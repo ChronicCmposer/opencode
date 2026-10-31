@@ -44,6 +44,7 @@ import { createPidRegistry, reapSupport, registerReported, type PidRegistry, typ
 import { Plugin } from "@/plugin"
 import type { WorkerPluginHooks } from "./plugin-host"
 import type { HubProxyHandlers, HubProxyStreamHandler } from "./hub-proxy-wire"
+import { createHubProxySpill, hubProxySpillDirectoryFor, type HubProxySpill } from "./hub-proxy-spill"
 import type { SessionWorkerInit } from "./session-worker"
 import { workerLogMessage, WorkerLogging } from "./worker-logging"
 import { Session } from "@/session/session"
@@ -442,6 +443,8 @@ export interface ProductionSessionHubOptions {
   readonly workerPorts?: WorkerPortsInterface
   /** A pre-built, caller-owned pool service; the hub never registers its finalizer. */
   readonly workerPools?: WorkerPoolsInterface
+  /** Spill store for oversized hub-proxy frames (a file-backed database only). */
+  readonly hubProxySpill?: HubProxySpill
 }
 
 /** The Wave-6 services the production hub composes for a worker's ports/pool. */
@@ -567,6 +570,24 @@ export async function sweepDeadLeasesAtStartup(
   }
 }
 
+/** Best-effort startup sweep of spill files left by an earlier hub process. */
+export async function sweepHubProxySpillAtStartup(spill: HubProxySpill, bridge?: EffectBridge.Shape): Promise<number> {
+  try {
+    const removed = await spill.sweep(0)
+    if (removed > 0) {
+      void bridge?.fork(Effect.logInfo(workerLogMessage("startup hub-proxy spill sweep"), { removed }))
+    }
+    return removed
+  } catch (error) {
+    void bridge?.fork(
+      Effect.logWarning(workerLogMessage("startup hub-proxy spill sweep failed"), {
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    )
+    return 0
+  }
+}
+
 /** Resolve the ambient instance a session's worker boots under: this session's captured instance, else its persisted directory. */
 function resolveSessionInstance(
   sessionID: SessionID | undefined,
@@ -615,6 +636,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   // One Effect semaphore bounds every cold isolate spawn for this hub (and every crash respawn, because the pool retains the same handle).
   const spawnGate =
     options.spawnGate ?? makeSpawnGate({ timeoutMs: options.spawnTimeoutMs ?? DEFAULT_SPAWN_GATE_TIMEOUT_MS })
+  const hubProxySpill = options.hubProxySpill
   // Schema-ensure runs off the hub's main thread and before any spawn.
   let bootGate: Promise<void> | undefined
   const awaitBootGate = (): Promise<void> => {
@@ -630,6 +652,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
       () => {
         // The schema gate has migrated/verified the file, so the lease table is safe to sweep.
         void sweepDeadLeasesAtStartup(databasePath, options.db, bridge)
+        if (hubProxySpill !== undefined) void sweepHubProxySpillAtStartup(hubProxySpill, bridge)
         return undefined
       },
       (error: unknown) => {
@@ -747,6 +770,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
             hubProxyHandlersFor: (workerID) => workerPortSeams?.hubProxyHandlersFor(workerID),
             hubProxyStreamingFor: (workerID) => workerPortSeams?.hubProxyStreamingFor(workerID),
             onPidReport: (workerID, report) => workerPortSeams?.onPidReport?.(workerID, report),
+            ...(hubProxySpill === undefined ? {} : { hubProxySpill }),
           }),
         ))
   const pool = workerPools.executorPool
@@ -787,6 +811,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
       writeBarrier: options.writeBarrier,
       resumeDecisionTimeoutMs: options.resumeDecisionTimeoutMs,
       bootGate: awaitBootGate,
+      hubProxySpill,
       onGenerationReleased: options.onGenerationReleased,
       onSessionReleased: options.onSessionReleased,
       promotionOutcome: options.promotionOutcome,
@@ -884,6 +909,8 @@ interface PerSessionResolverDeps {
   readonly sessionOfWorker: (workerID: number) => SessionID | undefined
   /** Layer-scoped runtime for the Promise-shaped worker callbacks; absent uses the default runtime. */
   readonly runPromise?: <A, E>(effect: Effect.Effect<A, E>) => Promise<A>
+  /** Shipped on every worker init so the worker spills oversized frames beside the database. */
+  readonly hubProxySpillDir?: string
 }
 
 /** The per-session resolvers the production hub is composed from: the session → instance/context registry. */
@@ -1276,6 +1303,7 @@ export function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSess
                     deferRequestHooks: deps.requestHooksViaHub,
                   }),
           pluginTools,
+          ...(deps.hubProxySpillDir === undefined ? {} : { hubProxySpillDir: deps.hubProxySpillDir }),
         }
         // A non-serializable provider option or plugin hook is a configuration defect: die loud rather than widen every graph's error channel with the typed.
         return yield* buildSessionWorkerInit(initOptions).pipe(
@@ -1442,6 +1470,8 @@ export function productionSessionHubLayer(
         })
         db = DbExecutor.toPromiseExecutor(service)
       }
+      const spillDir = hubProxySpillDirectoryFor(databasePath)
+      const hubProxySpill = spillDir === undefined ? undefined : createHubProxySpill(spillDir)
       const blobDir = DurableLog.blobDirectoryFor(databasePath)
       const resolveBlob =
         options.backends?.resolveBlob ??
@@ -1472,6 +1502,7 @@ export function productionSessionHubLayer(
         runPromise,
         subagentDepth,
         sessionOfWorker: (workerID) => hubRef?.sessionOfWorker(workerID),
+        ...(spillDir === undefined ? {} : { hubProxySpillDir: spillDir }),
       })
       // The production durable-egress barrier: the events port observes each durable frame and its ack, and `execute` awaits the ack after the run reply.
       const egressDelivery = createEgressDeliveryBarrier({ bridge: effectBridge })
@@ -1500,6 +1531,7 @@ export function productionSessionHubLayer(
         count,
         barrier,
         databasePath,
+        ...(hubProxySpill === undefined ? {} : { hubProxySpill }),
         init: resolvers.resolveInit,
         generationOf: resolvers.generationOfSession,
         ports,

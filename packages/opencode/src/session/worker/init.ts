@@ -623,6 +623,8 @@ export interface BuildSessionWorkerInitOptions {
    * worker lists no plugin tools.
    */
   readonly pluginTools?: readonly PluginToolDescriptor[]
+  /** The hub-proxy spill directory the worker spills oversized frames into; absent for an in-memory database. */
+  readonly hubProxySpillDir?: string
 }
 
 /**
@@ -651,6 +653,7 @@ export const buildSessionWorkerInit = Effect.fn("SessionWorkerInit.build")(funct
     ...(options.capabilities === undefined ? {} : { capabilities: options.capabilities }),
     ...(plugins === undefined ? {} : { plugins }),
     ...(options.pluginTools === undefined ? {} : { pluginTools: options.pluginTools }),
+    ...(options.hubProxySpillDir === undefined ? {} : { hubProxySpillDir: options.hubProxySpillDir }),
   } satisfies SessionWorkerInit
 })
 

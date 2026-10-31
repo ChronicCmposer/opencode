@@ -7,6 +7,7 @@ import { type PidReport } from "./pid-registry"
 import { WorkerID } from "./frame"
 import type { HubProxyHandlers, HubProxyStreamHandler } from "./hub-proxy-wire"
 import { serveHubProxy } from "./hub-proxy-wire"
+import type { HubProxySpill } from "./hub-proxy-spill"
 import { workerLogMessage } from "./worker-logging"
 
 
@@ -103,9 +104,16 @@ export interface Options {
   readonly hubProxyHandlersFor?: (workerID: number) => HubProxyHandlers | undefined
   readonly hubProxyStreamingFor?: (workerID: number) => Readonly<Record<string, HubProxyStreamHandler>> | undefined
   readonly onPidReport?: (workerID: number, report: PidReport) => void
+  /** Oversized hub-proxy frames cross through this store, scoped `worker-<id>`. */
+  readonly hubProxySpill?: HubProxySpill
+  /** Test seam over the hub-proxy server constructor. */
+  readonly serveHubProxy?: typeof serveHubProxy
 }
 
-type WorkerPortServerOptions = Pick<Options, "hubProxyHandlersFor" | "hubProxyStreamingFor" | "onPidReport">
+type WorkerPortServerOptions = Pick<
+  Options,
+  "hubProxyHandlersFor" | "hubProxyStreamingFor" | "onPidReport" | "hubProxySpill" | "serveHubProxy"
+>
 
 function idempotentDisposer(disposers: readonly (() => void)[]): () => void {
   let disposed = false
@@ -130,6 +138,10 @@ function buildWorkerPortServer(
   return idempotentDisposer([dispose])
 }
 
+export function hubProxySpillScope(workerID: number): string {
+  return `worker-${workerID}`
+}
+
 function buildHubProxyServer(
   workerID: number,
   port: MessagePort,
@@ -152,7 +164,17 @@ function buildHubProxyServer(
       options.hubProxyStreamingFor !== undefined
         ? options.hubProxyStreamingFor(workerID)
         : (backends?.hubProxyStreamingFor?.(workerID) ?? backends?.hubProxyStreaming)
-    disposers.push(serveHubProxy(handlers, port, streaming))
+    const serve = options.serveHubProxy ?? serveHubProxy
+    disposers.push(
+      serve(
+        handlers,
+        port,
+        streaming,
+        options.hubProxySpill === undefined
+          ? {}
+          : { spill: options.hubProxySpill, spillScope: hubProxySpillScope(workerID) },
+      ),
+    )
   }
 
   if (disposers.length === 0) return undefined

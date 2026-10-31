@@ -51,6 +51,8 @@ import { type CancelOutcome } from "./cancel"
 import { type PidRegistry, type PidReport } from "./pid-registry"
 import type { HubProxyHandlers, HubProxyStreamHandler } from "./hub-proxy-wire"
 import { serveHubProxy } from "./hub-proxy-wire"
+import type { HubProxySpill } from "./hub-proxy-spill"
+import { hubProxySpillScope } from "./worker-ports"
 import { errorTagOf } from "./port"
 import type { EffectBridge } from "@/effect/bridge"
 import { workerLogMessage } from "./worker-logging"
@@ -259,6 +261,8 @@ export interface SessionHubOptions {
   readonly bridge?: EffectBridge.Shape
   /** Layer-scoped runtime for the Promise-shaped hub callbacks; absent uses the default runtime. */
   readonly runPromise?: <A, E>(effect: Effect.Effect<A, E>) => Promise<A>
+  /** Spill store for oversized hub-proxy frames; the hub serves it per worker and removes a retired generation's scope. */
+  readonly hubProxySpill?: HubProxySpill
 }
 
 /** The canonical `session.cancelled` event type, sourced from the schema definition the hub publishes after a cancel resolves. */
@@ -1006,6 +1010,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
           hubProxyHandlersFor,
           hubProxyStreamingFor,
           onPidReport: options.onPidReport,
+          ...(options.hubProxySpill === undefined ? {} : { hubProxySpill: options.hubProxySpill }),
         })
       : {
           ...serviceAttachments,
@@ -1221,6 +1226,21 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     })
   }
 
+  const removeSpillScope = async (workerID: number): Promise<void> => {
+    const spill = options.hubProxySpill
+    if (spill === undefined) return
+    try {
+      await spill.removeScope(hubProxySpillScope(workerID))
+    } catch (error) {
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("hub-proxy spill scope removal failed"), {
+          workerID,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      )
+    }
+  }
+
   /** Release the hub resources owned by ONE worker generation: its ports, the pending asks bound to that worker. */
   const releaseGenerationResources = async (
     sessionID: SessionID,
@@ -1262,6 +1282,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       workError = error
     }
     await awaitBoundedRetiredLeaseRelease(sessionID, releaseRetiredLease(sessionID, retiredOwnerID))
+    if (workerID !== undefined) await removeSpillScope(workerID)
     if (workFailed) throw workError
     if (hookThrew) throw hookError
   }
