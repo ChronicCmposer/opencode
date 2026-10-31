@@ -4,8 +4,10 @@
 // identity is rejected, and ordering is checked per aggregate, so two interleaved
 // aggregates never look like a gap in each other's stream.
 
+import type { ScannedEventsFrame } from "@/session/egress/scan"
 import { describe, expect, test } from "bun:test"
-import { type DurableMeta, encodeFrame } from "@/session/egress/frame"
+import { type DurableMeta } from "@/session/egress/frame"
+import { encodeEventsFrameBytes } from "@/session/egress/frame-bytes"
 import { createEgressReceiver, DurableOrderError } from "@/session/egress/receiver"
 import { createEgressSender } from "@/session/egress/sender"
 import { createWorkerEgressClient } from "@/session/worker/egress-client"
@@ -21,7 +23,7 @@ function aggregateFrame(eventID: string, meta: DurableMeta): EventsFrame {
 
 interface Harness {
   readonly port1: MessagePort
-  readonly frames: EventsFrame[]
+  readonly frames: ScannedEventsFrame[]
   readonly errors: Error[]
   readonly receiver: ReturnType<typeof createEgressReceiver>
   close(): void
@@ -29,7 +31,7 @@ interface Harness {
 
 function setup(): Harness {
   const channel = new MessageChannel()
-  const frames: EventsFrame[] = []
+  const frames: ScannedEventsFrame[] = []
   const errors: Error[] = []
   const receiver = createEgressReceiver({
     port: channel.port2,
@@ -61,10 +63,10 @@ describe("durable aggregate identity", () => {
     const harness = setup()
     // A half-specified identity must never be accepted as a durable.
     harness.port1.postMessage(
-      encodeFrame(eventFrame({ event: event("d"), aggregateID: "a" } as never)),
+      encodeEventsFrameBytes(eventFrame({ event: event("d"), aggregateID: "a" } as never)),
     )
     harness.port1.postMessage(
-      encodeFrame(eventFrame({ event: event("d"), seq: 1 } as never)),
+      encodeEventsFrameBytes(eventFrame({ event: event("d"), seq: 1 } as never)),
     )
     return pollUntil(() => harness.errors.length >= 1).then(() => {
       expect(harness.frames).toEqual([])
@@ -74,10 +76,10 @@ describe("durable aggregate identity", () => {
 
   test("interleaved aggregates are ordered per aggregate, never as a false gap", async () => {
     const harness = setup()
-    harness.port1.postMessage(encodeFrame(aggregateFrame("a1", { aggregateID: "a", seq: 1 })))
-    harness.port1.postMessage(encodeFrame(aggregateFrame("b1", { aggregateID: "b", seq: 1 })))
-    harness.port1.postMessage(encodeFrame(aggregateFrame("a2", { aggregateID: "a", seq: 2 })))
-    harness.port1.postMessage(encodeFrame(aggregateFrame("b2", { aggregateID: "b", seq: 2 })))
+    harness.port1.postMessage(encodeEventsFrameBytes(aggregateFrame("a1", { aggregateID: "a", seq: 1 })))
+    harness.port1.postMessage(encodeEventsFrameBytes(aggregateFrame("b1", { aggregateID: "b", seq: 1 })))
+    harness.port1.postMessage(encodeEventsFrameBytes(aggregateFrame("a2", { aggregateID: "a", seq: 2 })))
+    harness.port1.postMessage(encodeEventsFrameBytes(aggregateFrame("b2", { aggregateID: "b", seq: 2 })))
     await pollUntil(() => harness.frames.length === 4)
     expect(harness.errors).toEqual([])
     expect(harness.receiver.lastDurable("a")).toEqual({ aggregateID: "a", seq: 2 })
@@ -87,9 +89,9 @@ describe("durable aggregate identity", () => {
 
   test("a real gap within one aggregate is still rejected", async () => {
     const harness = setup()
-    harness.port1.postMessage(encodeFrame(aggregateFrame("a1", { aggregateID: "a", seq: 1 })))
-    harness.port1.postMessage(encodeFrame(aggregateFrame("b1", { aggregateID: "b", seq: 1 })))
-    harness.port1.postMessage(encodeFrame(aggregateFrame("a3", { aggregateID: "a", seq: 3 })))
+    harness.port1.postMessage(encodeEventsFrameBytes(aggregateFrame("a1", { aggregateID: "a", seq: 1 })))
+    harness.port1.postMessage(encodeEventsFrameBytes(aggregateFrame("b1", { aggregateID: "b", seq: 1 })))
+    harness.port1.postMessage(encodeEventsFrameBytes(aggregateFrame("a3", { aggregateID: "a", seq: 3 })))
     await pollUntil(() => harness.errors.length === 1)
     expect(harness.errors[0]).toBeInstanceOf(DurableOrderError)
     expect(harness.errors[0]?.message).toMatch(/gap/)
@@ -98,9 +100,9 @@ describe("durable aggregate identity", () => {
 
   test("a stale seq within one aggregate is out-of-order even when interleaved", async () => {
     const harness = setup()
-    harness.port1.postMessage(encodeFrame(aggregateFrame("a2", { aggregateID: "a", seq: 2 })))
-    harness.port1.postMessage(encodeFrame(aggregateFrame("b5", { aggregateID: "b", seq: 5 })))
-    harness.port1.postMessage(encodeFrame(aggregateFrame("a1", { aggregateID: "a", seq: 1 })))
+    harness.port1.postMessage(encodeEventsFrameBytes(aggregateFrame("a2", { aggregateID: "a", seq: 2 })))
+    harness.port1.postMessage(encodeEventsFrameBytes(aggregateFrame("b5", { aggregateID: "b", seq: 5 })))
+    harness.port1.postMessage(encodeEventsFrameBytes(aggregateFrame("a1", { aggregateID: "a", seq: 1 })))
     await pollUntil(() => harness.errors.length === 1)
     expect(harness.errors[0]).toBeInstanceOf(DurableOrderError)
     expect(harness.errors[0]?.message).toMatch(/out-of-order/)
@@ -109,7 +111,7 @@ describe("durable aggregate identity", () => {
 
   test("the legitimate zero-based first sequence (seq 0) is a durable frame", async () => {
     const harness = setup()
-    harness.port1.postMessage(encodeFrame(aggregateFrame("a0", { aggregateID: "a", seq: 0 })))
+    harness.port1.postMessage(encodeEventsFrameBytes(aggregateFrame("a0", { aggregateID: "a", seq: 0 })))
     await pollUntil(() => harness.frames.length === 1)
     expect(harness.errors).toEqual([])
     expect(harness.receiver.lastDurable("a")).toEqual({ aggregateID: "a", seq: 0 })

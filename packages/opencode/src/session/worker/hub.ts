@@ -10,13 +10,15 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { createEgressPort } from "../egress/receiver"
 import { type DurableCommit } from "../egress/mesh"
 import {
-  durableAggregateMetaOf,
+  ProtocolError,
   isEventBlobReference,
   type EventBlobPosition,
   type EventV2Event,
   type EventsAckPayload,
+  type EventsFrame,
 } from "./frame"
-import { encodeFrame, resyncWithPositionFrame, type DurableResyncPayload } from "../egress/frame"
+import { resyncWithPositionFrame, type DurableResyncPayload } from "../egress/frame"
+import { encodeEventsFrameBytes } from "../egress/frame-bytes"
 import { type LiveEventPublisher } from "../../event-v2-bridge"
 import type { EventV2 } from "@opencode-ai/core/event"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
@@ -25,6 +27,7 @@ import type { SessionID } from "../schema"
 import { type DbExecutor } from "./db-executor"
 import type { DispatchOrigin } from "../origin"
 import { defined } from "../../util/object"
+import { LazyJson, valueOf } from "../../util/lazy-json"
 import {
   SessionDispatch,
   type CancellationConfig,
@@ -406,8 +409,10 @@ export function createDurableHealReader(options: DurableHealReaderOptions): Dura
 
 /** The aggregate an event belongs to, when its payload identifies one. */
 export function aggregateIDOfEvent(event: EventV2Event): string | undefined {
-  if (typeof event.properties !== "object" || event.properties === null) return undefined
-  const properties = event.properties as Record<string, unknown>
+  // Frames from workers always carry a committed aggregateID, so this parse is only reached by hub-originated events.
+  const body = valueOf(event.properties)
+  if (typeof body !== "object" || body === null) return undefined
+  const properties = body as Record<string, unknown>
   for (const field of ["sessionID", "aggregateID", "aggregate_id"]) {
     const value = properties[field]
     if (typeof value === "string" && value.length > 0) return value
@@ -735,7 +740,8 @@ export function serveEventsPort(
   const requestResync = (payload: DurableResyncPayload): void => {
     if (closed) return
     try {
-      port.postMessage(encodeFrame(resyncWithPositionFrame(payload)))
+      const buffer = encodeEventsFrameBytes(resyncWithPositionFrame(payload) as EventsFrame)
+      port.postMessage(buffer, [buffer])
     } catch (error) {
       onError?.(error instanceof Error ? error : new Error(String(error)))
     }
@@ -757,14 +763,19 @@ export function serveEventsPort(
     onFrame: (frame) => {
       if (frame.kind !== "event") return
       // The canonical durability test (present only when BOTH `aggregateID` and `seq` are set).
-      const meta = durableAggregateMetaOf(frame)
-      const event = frame.payload.event
-      if (!isEventBlobReference(event.properties)) {
+      const meta =
+        frame.aggregateID === undefined || frame.seq === undefined
+          ? undefined
+          : { aggregateID: frame.aggregateID, seq: frame.seq }
+      const event = frame.event
+      if (!frame.isBlobReference) {
         deliver(event, meta)
         return
       }
-      // Resolve the oversized body BEFORE the live publisher or the mesh sees it.
-      const position = event.properties.__eventBlobPosition
+      // Resolve the oversized body BEFORE the live publisher or the mesh sees it. The reference is tiny.
+      const reference = event.properties.value
+      if (!isEventBlobReference(reference)) throw new ProtocolError("events frame flagged as a blob reference is not one")
+      const position = reference.__eventBlobPosition
       const resolver = sink.resolveBlob
       if (resolver === undefined) {
         sink.resync({ aggregateID: position.aggregateID, seq: position.seq })
@@ -782,7 +793,7 @@ export function serveEventsPort(
           requestResync({ aggregateID: position.aggregateID, seq: position.seq })
           return
         }
-        deliver({ ...event, properties: data }, meta)
+        deliver({ ...event, properties: LazyJson.of(data) }, meta)
       })
     },
     // A worker that skipped a durable sequence is healed from the committed log (when the sink has a reader) and asked over the same bidirectional events.

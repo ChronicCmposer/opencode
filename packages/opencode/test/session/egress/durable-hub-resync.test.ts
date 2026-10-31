@@ -4,9 +4,11 @@
 // a sequence it must ask the worker to resync from its database instead of
 // closing the events port and ending the session stream.
 
+import type { ScannedEventsFrame } from "@/session/egress/scan"
 import { describe, expect, test } from "bun:test"
 import type { LiveEvent, LiveEventPublisher } from "@/event-v2-bridge"
-import { decodeFrame, encodeFrame } from "@/session/egress/frame"
+import { decodeFrameBytes } from "@/session/egress/frame"
+import { encodeEventsFrameBytes } from "@/session/egress/frame-bytes"
 import { createHubEventSink, serveEventsPort, type HubCacheInvalidation } from "@/session/worker/hub"
 import { eventFrame, type EventsFrame } from "@/session/worker/frame"
 import { pollUntil } from "../../lib/poll"
@@ -38,9 +40,9 @@ function channelHarness() {
   const invalidated: string[] = []
   const cache: HubCacheInvalidation = { invalidate: (aggregateID) => void invalidated.push(aggregateID) }
   const sink = createHubEventSink({ publisher, cache })
-  const workerFrames: EventsFrame[] = []
+  const workerFrames: ScannedEventsFrame[] = []
   channel.port2.onmessage = (message: MessageEvent) => {
-    if (typeof message.data === "string") workerFrames.push(decodeFrame(message.data))
+    if (message.data instanceof ArrayBuffer) workerFrames.push(decodeFrameBytes(message.data))
   }
   channel.port2.start()
   const dispose = serveEventsPort(channel.port1, sink)
@@ -81,7 +83,7 @@ describe("hub durable aggregate identity", () => {
   test("serveEventsPort marks worker aggregate frames durable end to end", async () => {
     const harness = channelHarness()
     try {
-      harness.channel.port2.postMessage(encodeFrame(durableUpdate("evt_1", "ses_title", "initial", 1)))
+      harness.channel.port2.postMessage(encodeEventsFrameBytes(durableUpdate("evt_1", "ses_title", "initial", 1)))
       await pollUntil(() => harness.published.length === 1)
       expect(harness.invalidated).toEqual(["ses_title"])
       expect(harness.sink.resyncs).toBe(0)
@@ -95,10 +97,10 @@ describe("receiver gap resyncs instead of closing the port", () => {
   test("a mid-stream gap surfaces Resync and keeps the stream open", async () => {
     const harness = channelHarness()
     try {
-      harness.channel.port2.postMessage(encodeFrame(durableUpdate("evt_1", "ses_title", "initial", 1)))
+      harness.channel.port2.postMessage(encodeEventsFrameBytes(durableUpdate("evt_1", "ses_title", "initial", 1)))
       // A rename advanced the same aggregate, but the intermediate commit never
       // reached the hub: deliver seq 3, not seq 2.
-      harness.channel.port2.postMessage(encodeFrame(durableUpdate("evt_3", "ses_title", "renamed", 3)))
+      harness.channel.port2.postMessage(encodeEventsFrameBytes(durableUpdate("evt_3", "ses_title", "renamed", 3)))
       await pollUntil(() => harness.sink.resyncs === 1, { message: "gap never surfaced as a resync" })
 
       // The worker is asked to heal from its DB snapshot, with the exact
@@ -108,7 +110,7 @@ describe("receiver gap resyncs instead of closing the port", () => {
       expect(resync).toMatchObject({ kind: "resync", payload: { aggregateID: "ses_title", seq: 3 } })
 
       // Streaming continues: the next durable frame is delivered live-only.
-      harness.channel.port2.postMessage(encodeFrame(durableUpdate("evt_4", "ses_title", "still streaming", 4)))
+      harness.channel.port2.postMessage(encodeEventsFrameBytes(durableUpdate("evt_4", "ses_title", "still streaming", 4)))
       await pollUntil(() => harness.published.length === 3, { message: "stream closed after a gap" })
       expect(harness.sink.resyncs).toBe(1)
     } finally {
@@ -119,7 +121,7 @@ describe("receiver gap resyncs instead of closing the port", () => {
   test("a non-durable delta is never mistaken for a durable frame", async () => {
     const harness = channelHarness()
     try {
-      harness.channel.port2.postMessage(encodeFrame(update("evt_delta", "ses_title", "delta")))
+      harness.channel.port2.postMessage(encodeEventsFrameBytes(update("evt_delta", "ses_title", "delta")))
       await pollUntil(() => harness.published.length === 1)
       expect(harness.invalidated).toEqual([])
     } finally {

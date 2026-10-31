@@ -5,7 +5,7 @@
 
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
-import { encodeFrame } from "@/session/egress/frame"
+import { encodeEventsFrameBytes } from "@/session/egress/frame-bytes"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { type EventV2Event, eventFrame, endFrame } from "@/session/worker/frame"
 import { type HubEventSink, serveEventsPort } from "@/session/worker/hub"
@@ -17,7 +17,7 @@ const delta = (id: string): EventV2Event => ({
   properties: { id },
 })
 
-const eventText = (): string => encodeFrame(eventFrame({ event: delta("boom") }))
+const eventText = (): ArrayBuffer => encodeEventsFrameBytes(eventFrame({ event: delta("boom") }))
 
 function openPort() {
   const channel = new MessageChannel()
@@ -92,7 +92,7 @@ describe("egress fatal callback reporting", () => {
       onError: (error) => errors.push(error),
     })
     try {
-      channel.port2.postMessage(encodeFrame(endFrame()))
+      channel.port2.postMessage(encodeEventsFrameBytes(endFrame()))
       await pollUntil(() => errors.length === 1, {
         message: "a throwing onEnd closed the port without reporting the error",
       })
