@@ -9,7 +9,6 @@ import {
   blobPositionReferenceFrame,
   decodeWorkerFrame,
   durableAggregateMetaOf,
-  encodeWorkerFrameSized,
   isEventBlobReference,
   parseEventsFrame,
   type EventsAckPayload,
@@ -20,6 +19,7 @@ import {
   type WorkerFrameEnvelope,
   type AggregatePosition,
 } from "@/session/worker/frame"
+import { encodeEventsFrameBytes } from "./frame-bytes"
 
 export { FrameTooLargeError, ProtocolError, UnsupportedFrameVersionError, isEventBlobReference }
 export type {
@@ -99,26 +99,19 @@ function durablePositionOf(value: unknown): AggregatePosition | undefined {
   return { aggregateID, seq }
 }
 
-/** Encode one frame and measure it ONCE, enforcing the 4 MiB per-frame bound. */
-function encodeFrameSized(frame: WorkerFrameEnvelope): { readonly text: string; readonly bytes: number } {
-  const sized = encodeWorkerFrameSized(frame)
-  if (sized.bytes > MAX_FRAME_BYTES) throw new FrameTooLargeError(sized.bytes, MAX_FRAME_BYTES)
-  return sized
+/** Encode one events frame as a transferable byte frame, enforcing the 4 MiB bound on the whole buffer. */
+export function encodeFrame(frame: EventsFrame): ArrayBuffer {
+  return encodeEventsFrameBytes(frame, MAX_FRAME_BYTES)
 }
 
-/** Encode one frame as the shared envelope JSON string, enforcing the 4 MiB bound. */
-export function encodeFrame(frame: WorkerFrameEnvelope): string {
-  return encodeFrameSized(frame).text
-}
-
-/** Encode a coalesced batch, one JSON string per frame, preserving order. */
-export function encodeFrames(frames: readonly WorkerFrameEnvelope[]): readonly string[] {
-  const encoded: string[] = []
+/** Encode a coalesced batch, one byte frame per frame, preserving order. */
+export function encodeFrames(frames: readonly EventsFrame[]): readonly ArrayBuffer[] {
+  const encoded: ArrayBuffer[] = []
   let total = 0
   for (const frame of frames) {
-    const sized = encodeFrameSized(frame)
-    total += sized.bytes
-    encoded.push(sized.text)
+    const buffer = encodeFrame(frame)
+    total += buffer.byteLength
+    encoded.push(buffer)
   }
   if (total > MAX_BATCH_BYTES) throw new FrameTooLargeError(total, MAX_BATCH_BYTES)
   return encoded
@@ -138,17 +131,17 @@ export interface EncodeFrameChunksOptions {
 export function encodeFrameChunks(
   frames: readonly EventsFrame[],
   limitOrOptions: number | EncodeFrameChunksOptions = MAX_BATCH_BYTES,
-): readonly (readonly string[])[] {
+): readonly (readonly ArrayBuffer[])[] {
   const options = typeof limitOrOptions === "number" ? { limit: limitOrOptions } : limitOrOptions
   const limit = options.limit ?? MAX_BATCH_BYTES
   const onDrop = options.onDrop
-  const chunks: string[][] = []
-  let current: string[] = []
+  const chunks: ArrayBuffer[][] = []
+  let current: ArrayBuffer[] = []
   let total = 0
   for (const frame of frames) {
-    let sized: { readonly text: string; readonly bytes: number }
+    let buffer: ArrayBuffer
     try {
-      sized = encodeFrameOrReference(frame)
+      buffer = encodeFrameOrReference(frame)
     } catch (error) {
       // Only a non-durable advisory frame is droppable: a durable commit has a
       // position reference or fails loud, so its bytes are never silently lost.
@@ -158,14 +151,15 @@ export function encodeFrameChunks(
       }
       throw error
     }
-    if (sized.bytes > limit) throw new FrameTooLargeError(sized.bytes, limit)
-    if (current.length > 0 && total + sized.bytes > limit) {
+    const bytes = buffer.byteLength
+    if (bytes > limit) throw new FrameTooLargeError(bytes, limit)
+    if (current.length > 0 && total + bytes > limit) {
       chunks.push(current)
       current = []
       total = 0
     }
-    current.push(sized.text)
-    total += sized.bytes
+    current.push(buffer)
+    total += bytes
   }
   if (current.length > 0) chunks.push(current)
   return chunks
@@ -196,11 +190,11 @@ function referenceFrameOf(frame: EventsFrame): EventsFrame | undefined {
 }
 
 /** Encode one frame within the per-frame bound. */
-function encodeFrameOrReference(frame: EventsFrame): { readonly text: string; readonly bytes: number } {
+export function encodeFrameOrReference(frame: EventsFrame): ArrayBuffer {
   const existingReference = referenceFrameOf(frame)
-  if (existingReference !== undefined) return encodeFrameSized(existingReference)
+  if (existingReference !== undefined) return encodeFrame(existingReference)
   try {
-    return encodeFrameSized(frame)
+    return encodeFrame(frame)
   } catch (error) {
     if (!(error instanceof FrameTooLargeError)) throw error
     const reference = blobPositionReferenceFrame(frame, error.byteLength)
@@ -208,7 +202,7 @@ function encodeFrameOrReference(frame: EventsFrame): { readonly text: string; re
     // The substituted frame must be the small, resolvable reference — never the original body re-encoded
     // (which would overflow again) and never a half-formed marker the hub cannot resolve by position.
     if (reference.kind !== "event" || !isEventBlobReference(reference.payload.event.properties)) throw error
-    return encodeFrameSized(reference)
+    return encodeFrame(reference)
   }
 }
 

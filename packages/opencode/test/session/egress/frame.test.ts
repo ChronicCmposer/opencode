@@ -16,7 +16,6 @@ import {
   MAX_BATCH_BYTES,
   MAX_FRAME_BYTES,
   decodeFrame,
-  decodeFrames,
   encodeFrame,
   encodeFrameChunks,
   encodeFrames,
@@ -28,24 +27,16 @@ import {
   UnsupportedFrameVersionError,
   ackFrame,
   endFrame,
-  encodeWorkerFrame,
   eventFrame,
   resyncFrame,
-  workerFrameByteLength,
 } from "@/session/worker/frame"
+import { readByteFrame } from "./byte-frames"
 
 const event = { id: "evt_1", type: "message.part.delta", properties: { sessionID: "s1", delta: "héllo 🌍" } }
 
 function asEventFrame(frame: EventsFrame): Extract<EventsFrame, { readonly kind: "event" }> {
   if (frame.kind !== "event") throw new Error(`expected an event frame, got ${frame.kind}`)
   return frame
-}
-
-/** Valid JSON frame text padded to exactly `bytes` UTF-8 bytes (ASCII padding). */
-function frameTextOfByteLength(bytes: number): string {
-  const prefix = '{"v":1,"port":"events","kind":"event","payload":{"event":{"id":"e","type":"t","properties":{"pad":"'
-  const suffix = '"}}}}'
-  return prefix + "x".repeat(bytes - prefix.length - suffix.length) + suffix
 }
 
 describe("egress frame codec (shared JSON transport)", () => {
@@ -55,23 +46,25 @@ describe("egress frame codec (shared JSON transport)", () => {
     expect(MAX_FRAME_BYTES).toBe(4 * 1024 * 1024)
   })
 
-  test("encodes one frame as a JSON string, not a binary length-prefixed buffer", () => {
+  test("encodes one frame as a byte frame: header, envelope, properties segment", () => {
     const frame = eventFrame({ event })
-    const text = encodeFrame(frame)
-    expect(typeof text).toBe("string")
-    expect(text.startsWith("{")).toBe(true)
-    expect(JSON.parse(text)).toEqual(frame)
+    const buffer = encodeFrame(frame)
+    expect(buffer).toBeInstanceOf(ArrayBuffer)
+    const envelopeLength = new DataView(buffer).getUint32(0, true)
+    const envelope = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 4, envelopeLength)))
+    expect(envelope.payload.event).toEqual({ id: event.id, type: event.type })
+    expect(readByteFrame(buffer)).toEqual(frame)
   })
 
   test("round-trips an event frame with the verbatim {id,type,properties}", () => {
     const frame = eventFrame({ event })
-    const decoded = decodeFrame(encodeFrame(frame))
+    const decoded = readByteFrame(encodeFrame(frame))
     expect(decoded).toEqual(frame)
     expect(asEventFrame(decoded).payload.event).toEqual(event)
   })
 
   test("preserves properties verbatim and never introduces a `data` field", () => {
-    const decoded = asEventFrame(decodeFrame(encodeFrame(eventFrame({ event })))).payload.event
+    const decoded = asEventFrame(readByteFrame(encodeFrame(eventFrame({ event })))).payload.event
     expect(decoded.properties).toEqual({ sessionID: "s1", delta: "héllo 🌍" })
     expect("properties" in decoded).toBe(true)
     expect("data" in decoded).toBe(false)
@@ -79,33 +72,23 @@ describe("egress frame codec (shared JSON transport)", () => {
 
   test("round-trips the end, resync, and ack control frames", () => {
     for (const frame of [endFrame(), resyncFrame({ pattern: "message.*" }), ackFrame({ count: 3 })]) {
-      expect(decodeFrame(encodeFrame(frame))).toEqual(frame)
+      expect(readByteFrame(encodeFrame(frame))).toEqual(frame)
     }
   })
 
-  test("decode then re-encode yields identical text", () => {
-    const frame = eventFrame({ event, aggregateID: "agg", seq: 7 } as Parameters<typeof eventFrame>[0])
-    const text = encodeFrame(frame)
-    expect(encodeFrame(decodeFrame(text))).toBe(text)
-  })
-
-  test("encodes a batch in order as one JSON string per frame", () => {
+  test("encodes a batch in order as one byte frame per frame", () => {
     const frames = [eventFrame({ event }), endFrame()]
     const encoded = encodeFrames(frames)
     expect(encoded).toHaveLength(2)
-    expect(encoded.every((text) => typeof text === "string")).toBe(true)
-    expect(decodeFrames(encoded)).toEqual(frames)
+    expect(encoded.every((buffer) => buffer instanceof ArrayBuffer)).toBe(true)
+    expect(encoded.map(readByteFrame)).toEqual(frames)
   })
 
   test("accepts a frame exactly at the 4 MiB bound", () => {
-    const text = frameTextOfByteLength(MAX_FRAME_BYTES)
-    expect(workerFrameByteLength(text)).toBe(MAX_FRAME_BYTES)
-    expect(decodeFrame(text).kind).toBe("event")
-  })
-
-  test("rejects a per-frame payload over 4 MiB with a typed rejection", () => {
-    const text = frameTextOfByteLength(MAX_FRAME_BYTES + 1)
-    expect(() => decodeFrame(text)).toThrow(FrameTooLargeError)
+    const base = encodeFrame(eventFrame({ event: { id: "e", type: "t", properties: { pad: "" } } }))
+    const pad = "x".repeat(MAX_FRAME_BYTES - base.byteLength)
+    const buffer = encodeFrame(eventFrame({ event: { id: "e", type: "t", properties: { pad } } }))
+    expect(buffer.byteLength).toBe(MAX_FRAME_BYTES)
   })
 
   test("rejects an over-bound frame at encode time, before it is posted", () => {
@@ -129,10 +112,10 @@ describe("egress frame codec (shared JSON transport)", () => {
     expect(chunks.flat()).toHaveLength(3)
     expect(chunks.length).toBeGreaterThan(1)
     for (const chunk of chunks) {
-      const bytes = chunk.reduce((sum, text) => sum + workerFrameByteLength(text), 0)
+      const bytes = chunk.reduce((sum, buffer) => sum + buffer.byteLength, 0)
       expect(bytes).toBeLessThanOrEqual(MAX_BATCH_BYTES)
     }
-    expect(chunks.flat().map((text) => decodeFrame(text).kind)).toEqual(["event", "event", "end"])
+    expect(chunks.flat().map((buffer) => readByteFrame(buffer).kind)).toEqual(["event", "event", "end"])
   })
 
   test("encodeFrameChunks still rejects one frame that alone exceeds the cap", () => {
@@ -140,61 +123,30 @@ describe("egress frame codec (shared JSON transport)", () => {
     expect(() => encodeFrameChunks([huge])).toThrow(FrameTooLargeError)
   })
 
-  test("the hot path uses plain JSON.stringify, never the strict replacer", () => {
-    const original = JSON.stringify
-    let replacers = 0
-    JSON.stringify = ((value: unknown, replacer?: unknown, space?: unknown) => {
-      if (typeof replacer === "function") replacers += 1
-      return original(value as never, replacer as never, space as never)
-    }) as typeof JSON.stringify
-    try {
-      encodeFrame(eventFrame({ event }))
-      expect(replacers).toBe(0)
-    } finally {
-      JSON.stringify = original
-    }
+  test("encodeFrameChunks drops an oversized advisory frame through onDrop and keeps the rest", () => {
+    const huge = eventFrame({ event: { id: "big", type: "t", properties: { pad: "x".repeat(MAX_FRAME_BYTES) } } })
+    const dropped: EventsFrame[] = []
+    const chunks = encodeFrameChunks([huge, endFrame()], { onDrop: (frame) => void dropped.push(frame) })
+    expect(dropped).toEqual([huge])
+    expect(chunks.flat().map((buffer) => readByteFrame(buffer).kind)).toEqual(["end"])
   })
 
-  test("encodeFrame measures the UTF-8 frame size exactly once", () => {
-    const original = Buffer.byteLength
-    let measurements = 0
-    Buffer.byteLength = ((...args: Parameters<typeof Buffer.byteLength>) => {
-      measurements += 1
-      return original(...args)
-    }) as typeof Buffer.byteLength
-    try {
-      encodeFrame(eventFrame({ event }))
-      expect(measurements).toBe(1)
-    } finally {
-      Buffer.byteLength = original
-    }
-  })
-
-  test("encodeFrames measures each frame once, not once to encode and again to total", () => {
-    const original = Buffer.byteLength
-    let measurements = 0
-    Buffer.byteLength = ((...args: Parameters<typeof Buffer.byteLength>) => {
-      measurements += 1
-      return original(...args)
-    }) as typeof Buffer.byteLength
-    try {
-      encodeFrames([eventFrame({ event }), endFrame()])
-      expect(measurements).toBe(2)
-    } finally {
-      Buffer.byteLength = original
-    }
+  test("encodeFrameChunks substitutes a position reference for an oversized durable event", () => {
+    const frame = eventFrame({
+      event: { id: "big", type: "t", properties: { pad: "x".repeat(MAX_FRAME_BYTES) } },
+      aggregateID: "agg",
+      seq: 4,
+    })
+    const [buffer] = encodeFrameChunks([frame]).flat()
+    const decoded = asEventFrame(readByteFrame(buffer))
+    expect(decoded.payload.event.properties).toMatchObject({ __eventBlobPosition: { aggregateID: "agg", seq: 4 } })
+    expect(buffer!.byteLength).toBeLessThan(MAX_FRAME_BYTES)
   })
 
   test("rejects a batch whose total wire size exceeds 4 MiB with a typed rejection", () => {
-    // Two individually valid frames whose combined UTF-8 size is over the bound.
-    const first = frameTextOfByteLength(MAX_FRAME_BYTES - 8)
-    let caught: unknown
-    try {
-      encodeFrames([decodeFrame(first), endFrame()])
-    } catch (error) {
-      caught = error
-    }
-    expect(caught).toBeInstanceOf(FrameTooLargeError)
+    const pad = "x".repeat(MAX_FRAME_BYTES - 1024)
+    const first = eventFrame({ event: { id: "e", type: "t", properties: { pad } } })
+    expect(() => encodeFrames([first, first])).toThrow(FrameTooLargeError)
   })
 
   test("fails loud on an unsupported envelope version", () => {
@@ -219,17 +171,5 @@ describe("egress frame codec (shared JSON transport)", () => {
 
   test("fails loud on a non-string message", () => {
     expect(() => decodeFrame(new Uint8Array([1, 2, 3]) as unknown as string)).toThrow(ProtocolError)
-  })
-
-  test("rejects a producer-side duplicate frame text is not silently merged", () => {
-    // Each message is exactly one frame: decoding a concatenation must fail
-    // instead of splitting it on a numeric header.
-    const joined = encodeFrame(endFrame()) + encodeFrame(endFrame())
-    expect(() => decodeFrame(joined)).toThrow(ProtocolError)
-  })
-
-  test("encodeWorkerFrame is the single serialiser (byte-exact parity)", () => {
-    const frame = eventFrame({ event })
-    expect(encodeFrame(frame)).toBe(encodeWorkerFrame(frame))
   })
 })

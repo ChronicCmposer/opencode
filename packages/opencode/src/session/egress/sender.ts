@@ -13,6 +13,15 @@ import { workerLogMessage } from "@/session/worker/worker-logging"
 import { createCoalescer, type Coalescer, type CoalescerScheduler } from "./coalesce"
 import { durableMetaOf, encodeFrame, encodeFrameChunks, type DurableMeta } from "./frame"
 
+/**
+ * Wire shape for the hub: every message on the events port is exactly one `ArrayBuffer` byte frame (see
+ * `frame-bytes.ts`), transferred rather than copied. A coalesced batch is posted as one message per frame, in
+ * order, followed by one `ack` frame when it carried durables; there is no array-of-buffers message.
+ */
+function transferable(buffer: ArrayBuffer): [ArrayBuffer, [ArrayBuffer]] {
+  return [buffer, [buffer]]
+}
+
 export interface EgressSenderOptions {
   readonly port: MessagePort
   readonly windowMs?: number
@@ -67,11 +76,11 @@ export function createEgressSender(options: EgressSenderOptions): EgressSender {
         },
       })
       for (const chunk of chunks) {
-        for (const text of chunk) options.port.postMessage(text)
+        for (const buffer of chunk) options.port.postMessage(...transferable(buffer))
       }
       const durables = frames.filter((frame) => durableMetaOf(frame) !== undefined).length
       if (durables === 0) return
-      options.port.postMessage(encodeFrame(ackFrame({ count: durables })))
+      options.port.postMessage(...transferable(encodeFrame(ackFrame({ count: durables }))))
     },
   })
 
@@ -87,7 +96,7 @@ export function createEgressSender(options: EgressSenderOptions): EgressSender {
       // Flush pending deltas first, then post the RUN-END flush boundary: a zero-count ack after every
       // durable frame.
       coalescer.flush()
-      options.port.postMessage(encodeFrame(ackFrame({ count: 0 })))
+      options.port.postMessage(...transferable(encodeFrame(ackFrame({ count: 0 }))))
       coalescer.end()
     },
     get buffered() {

@@ -16,13 +16,14 @@
 import type { EventV2Event } from "@/session/worker/frame"
 
 import type { CoalescerScheduler } from "@/session/egress/coalesce"
-import { decodeFrame, type AggregatePosition, type DurableMeta } from "@/session/egress/frame"
+import { type AggregatePosition, type DurableMeta } from "@/session/egress/frame"
 import {
   createMeshWorkerClient,
   matchesMeshPattern,
   type DurableCommit,
   type MeshWorkerClient,
 } from "@/session/egress/mesh"
+import { activeDecoder } from "@/session/egress/scan"
 import { createEgressSender, type EgressSender } from "@/session/egress/sender"
 import { Effect } from "effect"
 import type { EffectBridge } from "@/effect/bridge"
@@ -210,9 +211,9 @@ function buildEgressClient(port: MessagePort, options: WorkerEgressClientOptions
   // when its receiver observed a durable sequence gap. Route it through the same
   // subscription fan-out the mesh uses, so the worker heals from its DB snapshot.
   const onDataMessage = (message: MessageEvent): void => {
-    if (typeof message.data !== "string") return
+    if (!(message.data instanceof ArrayBuffer)) return
     try {
-      const frame = decodeFrame(message.data)
+      const frame = activeDecoder().decode(new Uint8Array(message.data))
       if (frame.kind !== "resync") return
       broadcastResync(
         frame.payload?.pattern,
