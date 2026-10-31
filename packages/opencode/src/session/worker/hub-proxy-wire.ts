@@ -1,9 +1,16 @@
 // The hub-proxy control wire: the request/reply protocol a session worker uses to reach the hub-resident `SessionStatus` / `Permission` / `Question`.
 
 import { Effect, Option, Schema } from "effect"
-import type { HubProxySpill } from "./hub-proxy-spill"
+import { isHubProxySpillReference, type HubProxySpill, type HubProxySpillReference } from "./hub-proxy-spill"
 import { createRequestChannel, errorTagOf, messageOf, workerFrameChannel } from "./port"
-import { ProtocolError, assertJsonRepresentable } from "./frame"
+import {
+  HUB_PROXY_SPILL_THRESHOLD_BYTES,
+  ProtocolError,
+  WORKER_FRAME_VERSION,
+  assertJsonRepresentable,
+  encodeWorkerFrame,
+  workerFrameByteLength,
+} from "./frame"
 import { parseJson } from "@/util/safe-json"
 import type { SessionSpawnRequest, SessionSpawnResult } from "./subagent"
 
@@ -12,10 +19,12 @@ export type HubProxyRequest = {
   readonly id: number
   readonly method: string
   readonly args: readonly unknown[]
+  /** Set when `args` crossed through the spill store; `args` is then `[]`. */
+  readonly spill?: HubProxySpillReference
 }
 
 export type HubProxyReply =
-  | { readonly kind: "reply"; readonly id: number; readonly ok: true; readonly value: unknown }
+  | { readonly kind: "reply"; readonly id: number; readonly ok: true; readonly value: unknown; readonly spill?: HubProxySpillReference }
   | {
       readonly kind: "reply"
       readonly id: number
@@ -44,6 +53,7 @@ const HubProxyFrameSchema = Schema.Union([
     id: Schema.Int,
     method: Schema.Unknown,
     args: Schema.Unknown,
+    spill: Schema.optional(Schema.Unknown),
   }),
   Schema.Struct({
     kind: Schema.Literal("reply"),
@@ -53,6 +63,7 @@ const HubProxyFrameSchema = Schema.Union([
     message: Schema.optional(Schema.String),
     tag: Schema.optional(Schema.String),
     data: Schema.optional(Schema.Unknown),
+    spill: Schema.optional(Schema.Unknown),
   }),
   Schema.Struct({
     kind: Schema.Literal("event"),
@@ -68,6 +79,10 @@ const decodeHubProxyFrameOption = Schema.decodeUnknownOption(HubProxyFrameSchema
 export function decodeHubProxyFrame(input: unknown): HubProxyFrame {
   const decoded = decodeHubProxyFrameOption(input)
   if (Option.isNone(decoded)) throw new ProtocolError("hub-proxy frame does not match the wire schema")
+  const spill = (decoded.value as { readonly spill?: unknown }).spill
+  if (spill !== undefined && !isHubProxySpillReference(spill)) {
+    throw new ProtocolError("hub-proxy frame carries a malformed spill reference")
+  }
   return decoded.value as HubProxyFrame
 }
 
@@ -158,6 +173,23 @@ export interface HubProxyClientOptions {
 
 const DISPOSED_MESSAGE = "hub proxy client disposed"
 
+/** Encoded size of a hub-proxy frame as the port would post it; `0` when it cannot be encoded (the post reports why). */
+function encodedFrameBytes(frame: HubProxyFrame): number {
+  try {
+    return workerFrameByteLength(
+      encodeWorkerFrame({
+        v: WORKER_FRAME_VERSION,
+        port: "hub-proxy",
+        kind: frame.kind,
+        id: frame.id,
+        payload: frame,
+      }),
+    )
+  } catch {
+    return 0
+  }
+}
+
 /** Worker side: a thin request/reply client over a hub-proxy `MessagePort`. */
 export function createHubProxyClient(port: MessagePort, options: HubProxyClientOptions = {}): HubProxyClient {
   // Requests carry untrusted plugin/model values.
@@ -167,7 +199,11 @@ export function createHubProxyClient(port: MessagePort, options: HubProxyClientO
   })
   let nextId = 1
 
-  const requests = createRequestChannel<HubProxyFrame, HubProxyReply, number>(channel, {
+  const labelled: typeof channel = {
+    post: (frame) => channel.post(frame, frame.kind === "request" ? `hub-proxy request "${frame.method}"` : undefined),
+    onMessage: channel.onMessage,
+  }
+  const requests = createRequestChannel<HubProxyFrame, HubProxyReply, number>(labelled, {
     timeoutMs: options.timeoutMs,
     isReply: (frame): frame is HubProxyReply => frame.kind === "reply",
     idOf: (reply) => reply.id,
@@ -189,26 +225,61 @@ export function createHubProxyClient(port: MessagePort, options: HubProxyClientO
     onEvent?: (method: string, payload: unknown) => void,
   ): Effect.Effect<unknown, unknown> =>
     Effect.suspend(() => {
+      const label = `hub-proxy request "${method}"`
+      let requestSpill: HubProxySpillReference | undefined
+      const spillStore = options.spill
+      const spillScope = options.spillScope
+      const prepare =
+        spillStore !== undefined &&
+        spillScope !== undefined &&
+        encodedFrameBytes({ kind: "request", id: 0, method, args }) > HUB_PROXY_SPILL_THRESHOLD_BYTES
+          ? Effect.tryPromise({
+              try: async () => {
+                requestSpill = await spillStore.write(JSON.stringify(args), spillScope, label)
+              },
+              catch: (error) => error,
+            })
+          : Effect.void
+      const removeRequestSpill = Effect.promise(async () => {
+        const reference = requestSpill
+        requestSpill = undefined
+        if (reference !== undefined) await spillStore?.remove(reference).catch(() => {})
+      })
+      const resolveReply = (reply: HubProxyReply): Effect.Effect<unknown, unknown> => {
+        if (!reply.ok) return Effect.fail(new HubProxyRemoteError(reply.message, { tag: reply.tag, data: reply.data }))
+        const reference = reply.spill
+        if (reference === undefined) return Effect.succeed(reply.value)
+        if (spillStore === undefined) {
+          return Effect.fail(new HubProxyRemoteError(`${label} reply spilled but no spill store is configured`))
+        }
+        return Effect.tryPromise({
+          try: async () => {
+            const value: unknown = parseJson(await spillStore.read(reference))
+            await spillStore.remove(reference).catch(() => {})
+            return value
+          },
+          catch: (error) => error,
+        })
+      }
       // The handler is unregistered once this request settles; it is registered before the request is posted, so no event can slip past it.
       let id: number | undefined
-      return requests
-        .request((requestId) => {
-          id = requestId
-          if (onEvent !== undefined) eventHandlers.set(requestId, onEvent)
-          return { kind: "request", id: requestId, method, args }
-        })
-        .pipe(
-          Effect.flatMap((reply) =>
-            reply.ok
-              ? Effect.succeed(reply.value)
-              : Effect.fail(new HubProxyRemoteError(reply.message, { tag: reply.tag, data: reply.data })),
-          ),
-          Effect.ensuring(
-            Effect.sync(() => {
-              if (id !== undefined) eventHandlers.delete(id)
-            }),
-          ),
-        )
+      return prepare.pipe(
+        Effect.andThen(
+          requests.request((requestId) => {
+            id = requestId
+            if (onEvent !== undefined) eventHandlers.set(requestId, onEvent)
+            return requestSpill === undefined
+              ? { kind: "request", id: requestId, method, args }
+              : { kind: "request", id: requestId, method, args: [], spill: requestSpill }
+          }),
+        ),
+        Effect.flatMap(resolveReply),
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (id !== undefined) eventHandlers.delete(id)
+          }).pipe(Effect.andThen(removeRequestSpill)),
+        ),
+      )
     })
 
   const call = (
@@ -287,7 +358,7 @@ export function serveHubProxy(
     const args = frame.args
     const reply = (payload: HubProxyReply): void => {
       try {
-        channel.post(payload)
+        channel.post(payload, payload.ok && typeof method === "string" ? `hub-proxy reply "${method}"` : undefined)
       } catch {
         // Either the peer is gone or `payload.value` is not JSON-serialisable.
         if (!payload.ok) return
@@ -296,7 +367,7 @@ export function serveHubProxy(
             kind: "reply",
             id: payload.id,
             ok: false,
-            message: `hub-proxy reply value for id ${payload.id} is not JSON-serialisable (not structured-cloneable)`,
+            message: `hub-proxy reply "${String(method)}" for id ${payload.id} could not be sent (not JSON-serialisable or over the frame limit)`,
           })
         } catch {
         }
@@ -306,11 +377,11 @@ export function serveHubProxy(
       reply({ kind: "reply", id, ok: false, message: `hub-proxy request ${id} method must be a non-empty string` })
       return
     }
-    if (!Array.isArray(args)) {
+    if (frame.spill === undefined && !Array.isArray(args)) {
       reply({ kind: "reply", id, ok: false, message: `hub-proxy request ${id} args must be an array` })
       return
     }
-    const succeed = (value: unknown): void => {
+    const succeed = async (value: unknown): Promise<void> => {
       const safe = value ?? null
       try {
         assertJsonRepresentable(safe)
@@ -321,6 +392,21 @@ export function serveHubProxy(
           ok: false,
           message: `hub-proxy reply value for id ${id} is not JSON-serialisable (not structured-cloneable)`,
         })
+        return
+      }
+      const spillStore = options.spill
+      const spillScope = options.spillScope
+      if (
+        spillStore !== undefined &&
+        spillScope !== undefined &&
+        encodedFrameBytes({ kind: "reply", id, ok: true, value: safe }) > HUB_PROXY_SPILL_THRESHOLD_BYTES
+      ) {
+        try {
+          const spill = await spillStore.write(JSON.stringify(safe), spillScope, `hub-proxy reply "${method}"`)
+          reply({ kind: "reply", id, ok: true, value: null, spill })
+        } catch (error) {
+          reply({ kind: "reply", id, ok: false, message: `hub-proxy reply "${method}" could not spill: ${messageOf(error)}` })
+        }
         return
       }
       reply({ kind: "reply", id, ok: true, value: safe })
@@ -341,7 +427,7 @@ export function serveHubProxy(
     const emit = (eventMethod: string, payload: unknown): void => {
       try {
         assertJsonRepresentable(payload)
-        channel.post({ kind: "event", id, method: eventMethod, payload })
+        channel.post({ kind: "event", id, method: eventMethod, payload }, `hub-proxy event "${method}"`)
       } catch {
         reply({
           kind: "reply",
@@ -351,11 +437,25 @@ export function serveHubProxy(
         })
       }
     }
+    // A spilled request body is read before any handler runs; an unreadable one fails only this call.
+    const argsOf = async (): Promise<readonly unknown[]> => {
+      const reference = frame.spill
+      if (reference === undefined) return args as readonly unknown[]
+      try {
+        if (options.spill === undefined) throw new Error("no spill store is configured")
+        const body: unknown = parseJson(await options.spill.read(reference))
+        if (!Array.isArray(body)) throw new Error("spilled args are not an array")
+        return body
+      } catch (error) {
+        throw new Error(`hub-proxy request "${method}" spill body is unreadable: ${messageOf(error)}`, { cause: error })
+      }
+    }
     // Own-property guard: a bare lookup would resolve inherited `Object.prototype` members (`toString`, `valueOf`).
     const streamHandler = ownLookup(streaming, method)
     if (streamHandler !== undefined) {
       Promise.resolve()
-        .then(() => streamHandler({ emit }, args))
+        .then(argsOf)
+        .then((resolved) => streamHandler({ emit }, resolved))
         .then(succeed, fail)
       return
     }
@@ -365,7 +465,8 @@ export function serveHubProxy(
       return
     }
     Promise.resolve()
-      .then(() => handler(...args))
+      .then(argsOf)
+      .then((resolved) => handler(...resolved))
       .then(succeed, fail)
   })
 }
