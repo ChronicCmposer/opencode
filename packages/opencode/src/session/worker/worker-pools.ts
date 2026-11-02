@@ -48,6 +48,7 @@ import { mergeEnv, type WorkerModelSelection } from "./init"
 import type { SessionWorkerInit } from "./session-worker"
 import { workerLogMessage } from "./worker-logging"
 import { sessionThreadName } from "@/session/worker/thread-name"
+import { messageOf } from "./port"
 
 import type { WorkerTransferredPorts } from "./worker-ports"
 
@@ -260,8 +261,11 @@ export const DEFAULT_SPAWN_GATE_TIMEOUT_MS = 30_000
 /** Cap on buffered frames, so a transport nobody waits on cannot grow unbounded. */
 export const DEFAULT_TRANSPORT_BUFFER_CAPACITY = 1024
 
-// How long an isolate may take to acknowledge the orderly-shutdown frame before the hub terminates it anyway.
+// How long an isolate may take to acknowledge the orderly-shutdown frame before the hub re-posts it.
 const SHUTDOWN_ACK_TIMEOUT_MS = 1_000
+
+// How long the re-posted shutdown frame gets before the hub terminates the isolate anyway.
+const SHUTDOWN_RETRY_MS = 250
 
 // How long a slot terminate waits for an in-flight boot/init before detaching.
 const MATERIALIZE_JOIN_TIMEOUT_MS = 1_000
@@ -296,31 +300,34 @@ async function requestWorkerShutdown(worker: Worker, options: WorkerShutdownOpti
   }
   if (shutdownRequested.has(worker)) return
   shutdownRequested.add(worker)
-  let acknowledged = false
-  await new Promise<void>((resolve) => {
-    let settled = false
-    let cancelTimer: (() => void) | undefined
-    const finish = (): void => {
-      if (settled) return
-      settled = true
-      cancelTimer?.()
-      worker.removeEventListener?.("message", onMessage)
-      resolve()
-    }
-    const onMessage = (event: MessageEvent): void => {
-      const frame = event.data as { readonly type?: unknown } | undefined
-      if (frame?.type !== "shutdown-ack") return
-      acknowledged = true
-      finish()
-    }
-    cancelTimer = scheduleTimeout(SHUTDOWN_ACK_TIMEOUT_MS, finish)
-    worker.addEventListener?.("message", onMessage)
-    try {
-      worker.postMessage({ type: "shutdown", id: 0 })
-    } catch {
-      finish()
-    }
-  })
+  // One post-and-wait attempt: the ack listener is armed before the frame is
+  // posted, and a `postMessage` throw is a miss rather than a crash.
+  const requestAndAwaitAck = (timeoutMs: number): Promise<boolean> =>
+    new Promise<boolean>((resolve) => {
+      let settled = false
+      let cancelTimer: (() => void) | undefined
+      const finish = (acknowledged: boolean): void => {
+        if (settled) return
+        settled = true
+        cancelTimer?.()
+        worker.removeEventListener?.("message", onMessage)
+        resolve(acknowledged)
+      }
+      const onMessage = (event: MessageEvent): void => {
+        const frame = event.data as { readonly type?: unknown } | undefined
+        if (frame?.type !== "shutdown-ack") return
+        finish(true)
+      }
+      worker.addEventListener?.("message", onMessage)
+      cancelTimer = scheduleTimeout(timeoutMs, () => finish(false))
+      try {
+        worker.postMessage({ type: "shutdown", id: 0 })
+      } catch {
+        finish(false)
+      }
+    })
+  const acknowledged =
+    (await requestAndAwaitAck(SHUTDOWN_ACK_TIMEOUT_MS)) || (await requestAndAwaitAck(SHUTDOWN_RETRY_MS))
   if (acknowledged) return
   rawTerminateCount += 1
   void options.bridge?.fork(
@@ -565,23 +572,34 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       // `ready`, so only the validated ready handshake releases the permit.
       // Releasing there (not on construction or the first frame) is what
       // serializes the expensive cold boot; the boot timer stays armed until then.
-      const bootFrame = parseBootFrame(event.data)
-      if (bootFrame?.kind === "invalid") {
-        failProtocol(bootFrame.reason, bootFrame.error)
+      // A late or malformed frame must never escape the listener: the whole
+      // boot-frame path is contained, and the isolate tears down orderly.
+      try {
+        const bootFrame = parseBootFrame(event.data)
+        if (bootFrame?.kind === "invalid") {
+          failProtocol(bootFrame.reason, bootFrame.error)
+          return
+        }
+        if (bootFrame?.kind === "worker-ports") {
+          options.onWorkerPorts?.(bootFrame.ports)
+          return
+        }
+        if (bootFrame?.kind === "hub-proxy") {
+          options.onHubProxyPort?.(bootFrame.port)
+          return
+        }
+        if (bootFrame?.kind === "ready") {
+          if (bootFrame.lease !== undefined) options.onLeaseClaim?.(bootFrame.lease)
+          options.onPhase?.("materialize")
+          if (bootLifecycle !== undefined && !bootLifecycle.start(created)) return
+        }
+      } catch (error) {
+        const detail = messageOf(error)
+        failProtocol(
+          `boot frame handler threw: ${detail}`,
+          error instanceof Error ? error : new Error(`session worker protocol error: ${detail}`),
+        )
         return
-      }
-      if (bootFrame?.kind === "worker-ports") {
-        options.onWorkerPorts?.(bootFrame.ports)
-        return
-      }
-      if (bootFrame?.kind === "hub-proxy") {
-        options.onHubProxyPort?.(bootFrame.port)
-        return
-      }
-      if (bootFrame?.kind === "ready") {
-        if (bootFrame.lease !== undefined) options.onLeaseClaim?.(bootFrame.lease)
-        options.onPhase?.("materialize")
-        if (bootLifecycle !== undefined && !bootLifecycle.start(created)) return
       }
       const message = event.data as SessionExecutorOutbound
       // Offer the frame to a waiting caller BEFORE buffering, so a matching reply

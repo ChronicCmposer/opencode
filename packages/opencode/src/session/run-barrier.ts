@@ -212,6 +212,8 @@ export interface Interface {
   readonly reset: (sessionID: string) => Effect.Effect<void, RunBarrierBusyError>
   /** Forget a barrier whose owning run can no longer settle (its worker was retired by a crash or terminate). */
   readonly abandon: (sessionID: string) => Effect.Effect<void, RunBarrierBusyError | RunBarrierReportError>
+  /** Force-clear after the owning worker is gone; fails an active wait with `RunBarrierCancelled`. */
+  readonly forget: (sessionID: string) => Effect.Effect<void>
   /** Number of retained Session states (bounded). */
   readonly size: number
 }
@@ -358,6 +360,11 @@ function makeBarrier(): Interface {
       return yield* Effect.fail(record.invalid)
     }
 
+    const owns = (): boolean => runs.get(sessionID) === record
+    const clearActive = (): void => {
+      if (active.get(sessionID) === record) active.delete(sessionID)
+    }
+
     remember(sessionID, "draining")
     active.set(sessionID, record)
 
@@ -366,36 +373,38 @@ function makeBarrier(): Interface {
         duration: RUN_BARRIER_TIMEOUT_MS,
         orElse: () =>
           Effect.suspend(() => {
-            active.delete(sessionID)
-            remember(sessionID, "timed-out")
+            clearActive()
+            if (owns()) remember(sessionID, "timed-out")
             return Effect.fail(new RunBarrierTimeout({ sessionID, timeoutMs: RUN_BARRIER_TIMEOUT_MS }))
           }),
       }),
       Effect.catchTag("RunBarrier.Cancelled", () =>
         Effect.sync(() => {
-          active.delete(sessionID)
-          remember(sessionID, "cancelled")
+          clearActive()
+          if (owns()) remember(sessionID, "cancelled")
           return { sessionID, status: "cancelled" as const }
         }),
       ),
       Effect.catchTag("RunBarrier.Report", (error) =>
         Effect.suspend(() => {
-          active.delete(sessionID)
-          failures.set(sessionID, error)
-          remember(sessionID, "failed")
+          clearActive()
+          if (owns()) {
+            failures.set(sessionID, error)
+            remember(sessionID, "failed")
+          }
           return Effect.fail(error)
         }),
       ),
       Effect.onInterrupt(() =>
         Effect.sync(() => {
-          active.delete(sessionID)
-          if (stateOf(sessionID) === "draining") remember(sessionID, "idle")
+          clearActive()
+          if (owns() && stateOf(sessionID) === "draining") remember(sessionID, "idle")
         }),
       ),
     )
 
-    active.delete(sessionID)
-    if (stateOf(sessionID) !== "cancelled") remember(sessionID, "drained")
+    clearActive()
+    if (owns() && stateOf(sessionID) !== "cancelled") remember(sessionID, "drained")
     return outcome
   })
 
@@ -427,6 +436,19 @@ function makeBarrier(): Interface {
       failures.delete(sessionID)
       runs.delete(sessionID)
     }),
+    forget: (sessionID) =>
+      Effect.sync(() => {
+        const records = new Set([active.get(sessionID), runs.get(sessionID)])
+        states.delete(sessionID)
+        failures.delete(sessionID)
+        runs.delete(sessionID)
+        active.delete(sessionID)
+        for (const record of records) {
+          if (record !== undefined) {
+            Deferred.doneUnsafe(record.done, Effect.fail(new RunBarrierCancelled({ sessionID })))
+          }
+        }
+      }),
     get size() {
       return states.size
     },

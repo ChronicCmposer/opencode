@@ -71,6 +71,7 @@ import {
   type WorkerPortBackends,
   type WorkerPortBackendsSource,
   type WorkerPorts as WorkerPortsInterface,
+  type WorkerPortProtocolErrorSource,
   type WorkerTransferredPorts,
 } from "./worker-ports"
 
@@ -240,6 +241,12 @@ export interface SessionHubOptions {
   readonly onCancelRequested?: (sessionID: SessionID) => void
   /** Receive a worker's `{type:"pid-report"}` frame from its control port. */
   readonly onPidReport?: (workerID: number, report: PidReport) => void
+  /** Host-boundary containment: a malformed or late worker frame is reported here instead of throwing out of the hub port listener. */
+  readonly onProtocolError?: (
+    workerID: number,
+    error: unknown,
+    source: WorkerPortProtocolErrorSource,
+  ) => void
   /** Off-loop fallback for hub-side SQL. */
   readonly db?: DbExecutor
   /** Advisory cache, never authoritative. Defaults to a fresh, empty cache. */
@@ -1021,6 +1028,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
           hubProxyHandlersFor,
           hubProxyStreamingFor,
           onPidReport: options.onPidReport,
+          ...(options.onProtocolError === undefined ? {} : { onProtocolError: options.onProtocolError }),
           ...(options.hubProxySpill === undefined ? {} : { hubProxySpill: options.hubProxySpill }),
         })
       : {
@@ -1434,9 +1442,47 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
         await releaseGenerationResources(sessionID, workerID, { lost: false }, options.onGenerationReleased)
       },
       onSessionReleased: async (sessionID, workerID) => {
-        await releaseGenerationResources(sessionID, workerID, { lost: true }, options.onGenerationReleased)
-        leaseOwnerBySession.delete(sessionID)
-        await options.onSessionReleased?.(sessionID)
+        let failure: unknown
+        let failed = false
+        const rememberFailure = (error: unknown): void => {
+          if (!failed) {
+            failed = true
+            failure = error
+            return
+          }
+          void bridge?.fork(
+            Effect.logWarning(workerLogMessage("session release cleanup failed"), {
+              sessionID,
+              reason: error instanceof Error ? error.message : String(error),
+            }),
+          )
+        }
+
+        // The worker is already terminated; the barrier cannot settle. Cancel it before the bounded lease release.
+        try {
+          await runPromise(barrier.forget(sessionID))
+        } catch (error) {
+          rememberFailure(error)
+        }
+
+        try {
+          await releaseGenerationResources(sessionID, workerID, { lost: true }, options.onGenerationReleased)
+        } catch (error) {
+          rememberFailure(error)
+        } finally {
+          leaseOwnerBySession.delete(sessionID)
+          lifecycle.forget(sessionID)
+          activeRuns.delete(sessionID)
+          commitOutcomes.delete(sessionID)
+          lostGenerations.delete(sessionID)
+          try {
+            await options.onSessionReleased?.(sessionID)
+          } catch (error) {
+            rememberFailure(error)
+          }
+        }
+
+        if (failed) throw failure
       },
       ...defined({
         cancellation,

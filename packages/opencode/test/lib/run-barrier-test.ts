@@ -45,6 +45,7 @@ export const clockedRunBarrierLayer = Layer.effect(
       state: (sessionID) => barrier.state(sessionID),
       reset: (sessionID) => barrier.reset(sessionID),
       abandon: (sessionID) => barrier.abandon(sessionID),
+      forget: (sessionID) => barrier.forget(sessionID),
       get size() {
         return barrier.size
       },

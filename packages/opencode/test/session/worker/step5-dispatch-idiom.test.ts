@@ -119,6 +119,7 @@ describe("Step 5 dispatch idiom", () => {
       state: () => "idle" as const,
       reset: () => Effect.void,
       abandon: () => Effect.void,
+      forget: () => Effect.void,
       get size() {
         return 0
       },

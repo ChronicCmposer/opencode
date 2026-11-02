@@ -423,17 +423,38 @@ export interface PluginToolAbortHandle {
   readonly dispose: () => void
 }
 
+/** Observers for abort failures; a throwing observer must never stop a release. */
+export interface PluginToolAbortOptions {
+  readonly onAbortError?: (error: unknown, sessionID: string, callID: string) => void
+}
+
 /** The hub's in-flight plugin-tool abort registry. */
 export interface PluginToolAbortRegistry {
   readonly registerAbort: (sessionID: string, callID: string) => PluginToolAbortHandle
   readonly abort: (sessionID: string, callID: string) => void
   /** Abort every in-flight call of a session (the hub cancel cascade). */
   readonly abortSession: (sessionID: string) => void
+  /** Abort every in-flight call, then drop the session's map (terminal release). */
+  readonly releaseSession: (sessionID: string) => void
 }
 
 /** A fresh abort registry backed by a session → callID → controller map. */
-export function createPluginToolAbortRegistry(): PluginToolAbortRegistry {
+export function createPluginToolAbortRegistry(options: PluginToolAbortOptions = {}): PluginToolAbortRegistry {
   const bySession = new Map<string, Map<string, AbortController>>()
+
+  // One failing controller (or observer) must never strand the rest of a release.
+  const abortOne = (sessionID: string, callID: string, controller: AbortController): void => {
+    try {
+      controller.abort()
+    } catch (error) {
+      try {
+        options.onAbortError?.(error, sessionID, callID)
+      } catch {
+        // The observer is diagnostic only; the remaining controllers still get released.
+      }
+    }
+  }
+
   return {
     registerAbort: (sessionID, callID) => {
       const controller = new AbortController()
@@ -452,10 +473,19 @@ export function createPluginToolAbortRegistry(): PluginToolAbortRegistry {
       }
     },
     abort: (sessionID, callID) => {
-      bySession.get(sessionID)?.get(callID)?.abort()
+      const controller = bySession.get(sessionID)?.get(callID)
+      if (controller !== undefined) abortOne(sessionID, callID, controller)
     },
     abortSession: (sessionID) => {
-      for (const controller of bySession.get(sessionID)?.values() ?? []) controller.abort()
+      const calls = bySession.get(sessionID)
+      if (calls === undefined) return
+      for (const [callID, controller] of [...calls]) abortOne(sessionID, callID, controller)
+    },
+    releaseSession: (sessionID) => {
+      const calls = bySession.get(sessionID)
+      if (calls === undefined) return
+      for (const [callID, controller] of [...calls]) abortOne(sessionID, callID, controller)
+      bySession.delete(sessionID)
     },
   }
 }

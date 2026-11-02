@@ -707,6 +707,51 @@ function buildDispatcher(
   }
 
   /**
+   * Workers whose mirrored process group was already reaped. Reaping is
+   * best-effort teardown: a cancel settlement, a child crash cascade and the
+   * retirement itself can all name the same worker, but its group is killed
+   * exactly once.
+   */
+  const reapedWorkers = new WeakSet<SessionWorker>()
+
+  const reportReapFailure = (worker: SessionWorker, cause: Cause.Cause<unknown>): Effect.Effect<void> =>
+    bridge === undefined
+      ? Effect.void
+      : Effect.logWarning(workerLogMessage("worker process-group reap failed"), {
+          workerID: worker.id,
+          cause: Cause.pretty(cause),
+        })
+
+  /**
+   * Reap synchronously for the cancel/cascade paths, which settle before the
+   * retirement fiber runs. The mark is taken before the call so a racing
+   * retirement never reaps the same group twice.
+   */
+  const reapWorkerProcessGroupsNow = (worker: SessionWorker): void => {
+    if (cancellation?.reap === undefined || reapedWorkers.has(worker)) return
+    reapedWorkers.add(worker)
+    try {
+      cancellation.reap(worker)
+    } catch (error) {
+      void bridge?.fork(reportReapFailure(worker, Cause.die(error)))
+    }
+  }
+
+  /**
+   * Reap the worker's mirrored process group before its isolate is terminated.
+   * Idempotent and failure-tolerant: a reap that throws must never abort the
+   * retirement or skip the terminate/release.
+   */
+  const reapWorkerProcessGroups = (worker: SessionWorker): Effect.Effect<void> => {
+    if (cancellation?.reap === undefined) return Effect.void
+    return Effect.sync(() => {
+      if (reapedWorkers.has(worker)) return
+      reapedWorkers.add(worker)
+      cancellation.reap?.(worker)
+    }).pipe(Effect.catchCause((cause) => reportReapFailure(worker, cause)))
+  }
+
+  /**
    * The shared retirement release gate. `scope` selects which lifetime the hook
    * releases: a terminal retirement ("session": crash/reap/cancel/idle eviction)
    * also runs the pool's session cleanup and the session-release hook, while an
@@ -796,10 +841,15 @@ function buildDispatcher(
     // The pool terminated the old isolate before it reported the generation
     // change, so there is nothing left to watch: run the release directly (the
     // pool awaits the retired Deferred before spawning the successor).
+    // A live isolate's mirrored group is killed before its terminate; a worker
+    // that already exited (crash, dead-idle replacement) has no group to reap.
     const body =
       scope === "generation"
         ? releaseEffect
-        : Effect.tryPromise({ try: () => worker.terminate().catch(() => undefined), catch: (error) => error }).pipe(
+        : (worker.alive ? reapWorkerProcessGroups(worker) : Effect.void).pipe(
+            Effect.andThen(
+              Effect.tryPromise({ try: () => worker.terminate().catch(() => undefined), catch: (error) => error }),
+            ),
             Effect.timeoutOrElse({
               duration: terminateTimeoutMs,
               orElse: () =>
@@ -910,7 +960,6 @@ function buildDispatcher(
       port,
       terminate: () => worker.terminate().then(() => undefined),
       ...defined({ graceMs: config.graceMs, schedule: config.schedule }),
-      reap: () => config.reap?.(worker),
       ...(bridge === undefined ? {} : { bridge }),
       workerID: worker.id,
     })
@@ -1272,7 +1321,7 @@ function buildDispatcher(
         workers.release(childSessionID)
       }
       if (worker !== undefined) {
-        cancellation?.reap?.(worker)
+        reapWorkerProcessGroupsNow(worker)
         retireWorker(childSessionID)
         cancellation?.onCancelled?.({
           sessionID: childSessionID,
@@ -1530,8 +1579,6 @@ function buildDispatcher(
     readonly worker: SessionWorker | undefined
     /** Terminate and release the worker (the forced/immediate paths). */
     readonly retires: boolean
-    /** Reap mirrored PGIDs when this settlement, not the controller, terminated. */
-    readonly reaps: boolean
   }
 
   /**
@@ -1546,7 +1593,7 @@ function buildDispatcher(
     owned: Pending | undefined,
     settlement: CancelSettlement,
   ): Promise<void> => {
-    const { mode, winner, worker, retires, reaps } = settlement
+    const { mode, winner, worker, retires } = settlement
     // A completion that raced this cancel may have installed a write barrier.
     // The barrier owns the single release/promotion for that run, so the worker
     // must not be released (nor a waiter promoted) until its bounded finish runs.
@@ -1594,7 +1641,7 @@ function buildDispatcher(
     }
 
     if (owns && retires) {
-      if (reaps && worker !== undefined) cancellation?.reap?.(worker)
+      if (worker !== undefined) reapWorkerProcessGroupsNow(worker)
       retireWorker(sessionID)
     }
 
@@ -1678,7 +1725,6 @@ function buildDispatcher(
         winner: "cancel",
         worker,
         retires: true,
-        reaps: false,
       })
       return
     }
@@ -1687,7 +1733,6 @@ function buildDispatcher(
       winner: "cancel",
       worker,
       retires: true,
-      reaps: true,
     })
   }
 
@@ -1754,7 +1799,6 @@ function buildDispatcher(
           winner: "cancel",
           worker,
           retires: true,
-          reaps: false,
         })
         // A boot cancel settles a partial isolate that never started a run, so
         // no worker published the terminal idle. `acknowledged: false` forces the
@@ -1771,7 +1815,6 @@ function buildDispatcher(
         winner: "cancel",
         worker,
         retires: true,
-        reaps: true,
       })
       return { sessionID, mode: "terminated", winner: "cancel", acknowledged: false, durationMs: 0 }
     }
@@ -1798,14 +1841,14 @@ function buildDispatcher(
       // A controller detached mid-cancel is disposed once its last cancel settles.
       if (controllers.get(worker.id) !== controller && controller.pending === 0) controller.dispose()
       owned.phase = { ...owned.phase, cancelPending: false }
-      // The controller terminates/reaps on the forced path; a cooperative or
-      // completed outcome keeps the worker. Only the captured run is released.
+      // A cooperative or completed outcome keeps the worker; only the captured
+      // run is released. Reaping is idempotent, so the retirement's own reap
+      // never repeats one already done here.
       await settleCancelled(sessionID, owned, {
         mode: resolved.mode,
         winner: resolved.winner,
         worker,
         retires: resolved.mode === "terminated" || resolved.mode === "boot",
-        reaps: false,
       })
     }
   }

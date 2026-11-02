@@ -47,6 +47,7 @@ function observableBarrier(service: RunBarrier.Interface): ObservableBarrier {
       state: (sessionID) => service.state(sessionID),
       reset: (sessionID) => service.reset(sessionID),
       abandon: (sessionID) => service.abandon(sessionID),
+      forget: (sessionID) => service.forget(sessionID),
       get size() {
         return service.size
       },
@@ -157,7 +158,8 @@ describe("hub run-barrier wiring (D18)", () => {
         yield* Effect.promise(() => hub.cancel(sessionID))
         yield* Fiber.join(first)
         yield* Effect.promise(flush)
-        expect(hub.barrier.state(sessionID)).toBe("cancelled")
+        // Terminal release clears the barrier via `forget`, so the post-release state is `idle`.
+        expect(hub.barrier.state(sessionID)).toBe("idle")
       } finally {
         yield* Effect.promise(() => hub.terminateAll())
       }
@@ -226,7 +228,8 @@ describe("hub run-barrier four-phase coverage", () => {
         yield* Effect.promise(() => hub.cancel(sessionID))
         yield* Fiber.join(first)
         yield* Effect.promise(flush)
-        expect(hub.barrier.state(sessionID)).toBe("cancelled")
+        // Terminal release clears the barrier via `forget`, so the post-release state is `idle`.
+        expect(hub.barrier.state(sessionID)).toBe("idle")
       } finally {
         yield* Effect.promise(() => hub.terminateAll())
       }

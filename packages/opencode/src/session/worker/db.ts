@@ -543,8 +543,18 @@ function makeWorkerDatabase(options: MakeWorkerDatabaseOptions): WorkerDatabase 
     all,
     ...(bound ? {} : { run }),
     close: Effect.sync(() => {
-      if (options.busConnection !== connection) options.busConnection.close()
-      connection.close()
+      let failure: unknown
+      try {
+        if (options.busConnection !== connection) options.busConnection.close()
+      } catch (error) {
+        failure = error
+      }
+      try {
+        connection.close()
+      } catch (error) {
+        if (failure === undefined) failure = error
+      }
+      if (failure !== undefined) throw failure
     }),
   }
   drizzleRunners.set(database, drizzleRunner)

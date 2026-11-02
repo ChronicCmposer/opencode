@@ -5,10 +5,11 @@
 
 import { describe, expect, test } from "bun:test"
 import { Effect, Exit, Scope } from "effect"
-import { makeProduction, makeSpawnGate } from "@/session/worker/worker-pools"
+import { makeProduction, makeSpawnGate, workerShutdownStats } from "@/session/worker/worker-pools"
 import type { ProductionWorkerPoolOptions } from "@/session/worker/worker-pools"
 import type { ExecutorWorkerPool } from "@/session/worker/execute"
 import { createDispatcher } from "../../lib/dispatcher"
+import { recordingBridgeFrom, type RecordedLog } from "../../lib/recorders"
 import { createRecordingScheduler } from "../../lib/scheduler"
 import { flush, pollUntil, sid } from "../../lib/async"
 
@@ -19,6 +20,9 @@ class FakeWorker {
   static terminateGate: Promise<void> | undefined
   /** When set, a run frame stays unanswered so a test can cancel/crash it. */
   static holdRuns = false
+  /** `second` ignores the first shutdown frame; `never` ignores every one. */
+  static shutdownBehavior: "immediate" | "second" | "never" = "immediate"
+  static shutdownPosts = 0
   onmessage: ((event: MessageEvent) => void) | null = null
   onerror: ((event: ErrorEvent) => void) | null = null
   readonly posted: unknown[] = []
@@ -38,7 +42,13 @@ class FakeWorker {
   postMessage(message: unknown): void {
     this.posted.push(message)
     const frame = message as { readonly type?: string; readonly id?: number; readonly sessionID?: string }
-    if (frame.type === "shutdown") this.emit({ type: "shutdown-ack", id: 0 })
+    if (frame.type === "shutdown") {
+      FakeWorker.shutdownPosts += 1
+      const ignored =
+        FakeWorker.shutdownBehavior === "never" ||
+        (FakeWorker.shutdownBehavior === "second" && FakeWorker.shutdownPosts === 1)
+      if (!ignored) this.emit({ type: "shutdown-ack", id: 0 })
+    }
     if (frame.type === "hasActiveWork") this.emit({ type: "activeWork", id: frame.id, active: false })
     if ((frame.type === "run" || frame.type === "startShell") && !FakeWorker.holdRuns) {
       this.emit({ type: "done", id: frame.id, result: { sessionID: frame.sessionID } })
@@ -68,6 +78,8 @@ class FakeWorker {
     FakeWorker.instances = []
     FakeWorker.terminateGate = undefined
     FakeWorker.holdRuns = false
+    FakeWorker.shutdownBehavior = "immediate"
+    FakeWorker.shutdownPosts = 0
   }
 }
 
@@ -308,6 +320,52 @@ describe("one isolate-terminate authority", () => {
         await pool.terminateAll()
         expect(Date.now() - started).toBeLessThan(5_000)
         expect(FakeWorker.instances).toHaveLength(0)
+      } finally {
+        await dispose()
+      }
+    })
+  })
+
+  test("a missed shutdown ack is retried and never becomes a raw terminate", async () => {
+    await withFakeWorker(async () => {
+      FakeWorker.shutdownBehavior = "second"
+      const { pool, dispose } = await createProductionPool(options())
+      try {
+        const worker = pool.spawn()
+        await worker.execute({ sessionID: sid("ses_authority_retry_ack"), depth: 0 })
+        const isolate = FakeWorker.instances[0]!
+        const before = workerShutdownStats().rawTerminates
+
+        await pool.terminateAll()
+
+        expect(shutdownFrames(isolate)).toBe(2)
+        expect(isolate.terminations).toBe(1)
+        expect(workerShutdownStats().rawTerminates).toBe(before)
+      } finally {
+        await dispose()
+      }
+    })
+  })
+
+  test("a double miss terminates raw exactly once and warns exactly once", async () => {
+    await withFakeWorker(async () => {
+      FakeWorker.shutdownBehavior = "never"
+      const lines: RecordedLog[] = []
+      const { pool, dispose } = await createProductionPool(
+        options({ bridge: recordingBridgeFrom((line) => lines.push(line)) }),
+      )
+      try {
+        const worker = pool.spawn()
+        await worker.execute({ sessionID: sid("ses_authority_double_miss"), depth: 0 })
+        const isolate = FakeWorker.instances[0]!
+        const before = workerShutdownStats().rawTerminates
+
+        await pool.terminateAll()
+
+        expect(workerShutdownStats().rawTerminates).toBe(before + 1)
+        expect(shutdownFrames(isolate)).toBe(2)
+        expect(isolate.terminations).toBe(1)
+        expect(lines.filter((line) => line.message.endsWith("worker shutdown ack timed out"))).toHaveLength(1)
       } finally {
         await dispose()
       }

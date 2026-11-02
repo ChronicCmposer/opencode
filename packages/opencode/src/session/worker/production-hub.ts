@@ -109,6 +109,7 @@ import {
   type WorkerPortBackends,
   type WorkerPortBackendsSource,
   type WorkerPorts as WorkerPortsInterface,
+  type WorkerPortProtocolErrorSource,
   type WorkerTransferredPorts,
 } from "./worker-ports"
 import { SessionHubService } from "./hub"
@@ -383,6 +384,8 @@ export interface ProductionSessionHubOptions {
   readonly onGenerationReleased?: (sessionID: SessionID, workerID?: number) => unknown
   /** Session-scoped release when a session leaves the hub (reap/delete/shutdown). */
   readonly onSessionReleased?: (sessionID: SessionID) => unknown
+  /** Idle-reap window forwarded to the dispatcher. */
+  readonly reapMs?: number
   /** Cheap generation probe (the dispatching session's requested model), so an unchanged generation reuses the cached worker init instead of rebuilding it. */
   readonly generationOf?: (sessionID: SessionID) => string | Promise<string>
   /** Per-session durable-write barrier forwarded to the dispatcher: a completed run's slot is held until it resolves. */
@@ -445,6 +448,19 @@ export interface ProductionSessionHubOptions {
   readonly workerPools?: WorkerPoolsInterface
   /** Spill store for oversized hub-proxy frames (a file-backed database only). */
   readonly hubProxySpill?: HubProxySpill
+}
+
+export interface ProductionSessionHubDiagnostics {
+  readonly registry: number
+  readonly pids: number
+  readonly gateActive: number
+  readonly lifecycle: number
+  readonly barrier: number
+  readonly protocolErrors: number
+}
+
+export type ProductionSessionHub = SessionHub & {
+  readonly diagnostics: () => ProductionSessionHubDiagnostics
 }
 
 /** The Wave-6 services the production hub composes for a worker's ports/pool. */
@@ -611,7 +627,7 @@ function resolveSessionInstance(
 }
 
 /** Compose the production pool + hub, with cooperative cancellation wired. */
-export function createProductionSessionHub(options: ProductionSessionHubOptions): SessionHub {
+export function createProductionSessionHub(options: ProductionSessionHubOptions): ProductionSessionHub {
   // Name the hub's main OS thread for human observability (Linux-only, fail-soft).
   setThreadName("och")
   const bridge = options.bridge
@@ -687,7 +703,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   )
   // The hub is assigned after the pool is built; port transfers arrive only on dispatch (post-assignment), so the deferred reference is safe.
   const lifecycle = createLifecycleTracker()
-  let hub: SessionHub | undefined
+  let hub: ProductionSessionHub | undefined
   const sinks: WorkerPoolSinks = {
     onWorkerPorts: (workerID, ports) => hub?.attachWorkerPorts(workerID, ports),
     onHubProxyPort: (workerID, port) => hub?.attachHubProxyPort(workerID, port),
@@ -766,6 +782,21 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
     (options.poolFactory !== undefined
       ? adaptPool(options.poolFactory(resolveInit, sinks, { maxRunning }))
       : runScoped(makeProduction(poolOptions)))
+  let protocolErrors = 0
+  const onProtocolError = (
+    workerID: number,
+    error: unknown,
+    source: WorkerPortProtocolErrorSource,
+  ): void => {
+    protocolErrors += 1
+    void bridge?.fork(
+      Effect.logWarning(workerLogMessage("worker port protocol error"), {
+        workerID,
+        source,
+        reason: error instanceof Error ? error.message : String(error),
+      }),
+    )
+  }
   const workerPorts: WorkerPortsInterface | undefined =
     options.workerPorts ??
     (scope === undefined
@@ -777,6 +808,7 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
             hubProxyHandlersFor: (workerID) => workerPortSeams?.hubProxyHandlersFor(workerID),
             hubProxyStreamingFor: (workerID) => workerPortSeams?.hubProxyStreamingFor(workerID),
             onPidReport: (workerID, report) => workerPortSeams?.onPidReport?.(workerID, report),
+            onProtocolError,
             ...(hubProxySpill === undefined ? {} : { hubProxySpill }),
           }),
         ))
@@ -798,10 +830,12 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
     }
   }
   options.onServices?.({ ...(workerPorts === undefined ? {} : { workerPorts }), workerPools })
-  hub = createSessionHub({
+  const base = createSessionHub({
     pool,
     ...(bridge === undefined ? {} : { bridge }),
     ...(options.runPromise === undefined ? {} : { runPromise: options.runPromise }),
+    ...(options.reapMs === undefined ? {} : { reapMs: options.reapMs }),
+    onProtocolError,
     lifecycle,
     barrier: options.barrier,
     ...defined({
@@ -838,6 +872,16 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
         reap: options.cancellation?.reap ?? ((worker) => ignoreReapFailure(() => void pids.reap(worker.id))),
         reapAll: options.cancellation?.reapAll ?? (() => ignoreReapFailure(() => void pids.reapAll())),
       }),
+  })
+  hub = Object.assign(base, {
+    diagnostics: (): ProductionSessionHubDiagnostics => ({
+      registry: base.dispatcher.registry.size,
+      pids: pids.size,
+      gateActive: spawnGate.active ?? 0,
+      lifecycle: base.lifecycle.size,
+      barrier: base.barrier.size,
+      protocolErrors,
+    }),
   })
   return hub
 }
@@ -878,6 +922,8 @@ export interface ProductionSessionHubNodeOptions {
   readonly onSessionRebound?: (sessionID: SessionID) => void
   /** Hub-side cleanup when a session's worker is retired (per-session maps). */
   readonly onSessionReleased?: (sessionID: SessionID) => void
+  /** Idle-reap window forwarded to the dispatcher. */
+  readonly reapMs?: number
   /** Cheap generation probe (the dispatching session's requested model), so an unchanged generation reuses the cached worker init instead of rebuilding it. */
   readonly generationOf?: (sessionID: SessionID) => string | Promise<string>
   /** The background-promotion decision the hub observed (see `SessionHubOptions`). */
@@ -1103,31 +1149,74 @@ export function askInGeneration<A, E>(
   return tracker.track(sessionID, epoch, work, rejected)
 }
 
+/** The synchronous session → subagent-depth mirror the dispatch path reads before a worker materializes. */
+export interface SessionDepthIndex {
+  readonly get: (sessionID: SessionID) => number | undefined
+  readonly record: (sessionID: SessionID, depth: number) => void
+  readonly release: (sessionID: SessionID) => void
+  readonly clear: () => void
+  readonly size: number
+}
+
+export function createSessionDepthIndex(): SessionDepthIndex {
+  const depths = new Map<SessionID, number>()
+  const get = (sessionID: SessionID): number | undefined => depths.get(sessionID)
+  const record = (sessionID: SessionID, depth: number): void => {
+    // Roots need no entry (absence resolves to 0); only nested children keep headroom state, so the map stays bounded by the spawned subagent tree.
+    if (depth > 0) depths.set(sessionID, depth)
+    else depths.delete(sessionID)
+  }
+  return {
+    get,
+    record,
+    release: (sessionID) => {
+      depths.delete(sessionID)
+    },
+    clear: () => {
+      depths.clear()
+    },
+    get size() {
+      return depths.size
+    },
+  }
+}
+
 export function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSessionResolvers {
   const { services, bridge, authorities, logBridge, subagentDepth } = deps
   const runPromise = deps.runPromise ?? Effect.runPromise
   const children = createSessionChildrenIndex()
   // The synchronous session → subagent-depth mirror the dispatch path reads BEFORE a worker materializes.
-  const sessionDepths = new Map<SessionID, number>()
+  const sessionDepths = createSessionDepthIndex()
   const depthOf = (sessionID: SessionID): number | undefined => sessionDepths.get(sessionID)
-  const recordDepth = (sessionID: SessionID, depth: number): void => {
-    // Roots need no entry (absence resolves to 0); only nested children keep headroom state, so the map stays bounded by the spawned subagent tree.
-    if (depth > 0) sessionDepths.set(sessionID, depth)
-    else sessionDepths.delete(sessionID)
-  }
+  const recordDepth = (sessionID: SessionID, depth: number): void => sessionDepths.record(sessionID, depth)
   // Per-session state, written on EVERY dispatch (never latched with `??=`).
   const instanceBySession = new Map<SessionID, InstanceContext>()
   const contextBySession = new Map<SessionID, Context.Context<never>>()
   const jobMirrors = createWorkerJobMirror()
+  // The per-hub in-flight plugin-tool abort registry.
+  const pluginToolAborts = createPluginToolAbortRegistry({
+    onAbortError: (error, sessionID, callID) => {
+      void logBridge?.fork(
+        Effect.logWarning(workerLogMessage("plugin tool abort failed"), {
+          sessionID,
+          callID,
+          reason: error instanceof Error ? error.message : String(error),
+        }),
+      )
+    },
+  })
   // Release one session's per-session state; the finalizer clears the rest.
   const releaseSession = (sessionID: SessionID): void => {
     instanceBySession.delete(sessionID)
     contextBySession.delete(sessionID)
     children.release(sessionID)
+    sessionDepths.release(sessionID)
     jobMirrors.releaseSession(sessionID)
     // A session's pending asks belong to its live generation; a rebind or terminal release must not leave them blocked.
     generationAsks.retire(sessionID)
     generationAsks.forget(sessionID)
+    // Abort any in-flight plugin tool and drop the session's abort map (terminal release).
+    pluginToolAborts.releaseSession(sessionID)
   }
   const clearSessions = (): void => {
     instanceBySession.clear()
@@ -1184,8 +1273,7 @@ export function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSess
       provider: () => (context === undefined ? Option.none() : Context.getOption(context, Provider.Service)),
       run: runHubProxyFor(context),
     })
-  // The per-hub in-flight plugin-tool abort registry.
-  const pluginToolAborts = createPluginToolAbortRegistry()
+  // The hub-executed plugin tool authority: every in-flight call registers its abort handle with the hub registry.
   const pluginToolFor = (context: Context.Context<never> | undefined): PluginToolAuthority =>
     pluginToolAuthority({
       plugin: () => (context === undefined ? Option.none() : Context.getOption(context, Plugin.Service)),

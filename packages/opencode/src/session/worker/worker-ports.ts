@@ -8,6 +8,7 @@ import { WorkerID } from "./frame"
 import type { HubProxyHandlers, HubProxyStreamHandler } from "./hub-proxy-wire"
 import { serveHubProxy } from "./hub-proxy-wire"
 import type { HubProxySpill } from "./hub-proxy-spill"
+import { messageOf } from "./port"
 import { workerLogMessage } from "./worker-logging"
 
 
@@ -51,12 +52,23 @@ export interface WorkerPortBackends {
 
 export type WorkerPortBackendsSource = WorkerPortBackends | (() => WorkerPortBackends | undefined)
 
+export type WorkerPortProtocolErrorSource = "hub-proxy" | "pid-report"
+
 // The raw frame is consumed here and its propagation stopped so the JSON-enveloped hub-proxy server on the same port never sees it.
-export function servePidReportPort(onReport: (frame: PidReport) => void, port: MessagePort): () => void {
+export function servePidReportPort(
+  onReport: (frame: PidReport) => void,
+  port: MessagePort,
+  onProtocolError?: (error: unknown) => void,
+): () => void {
   const listener = (event: MessageEvent) => {
     if (!isPidReport(event.data)) return
     event.stopImmediatePropagation()
-    onReport(event.data)
+    try {
+      onReport(event.data)
+    } catch (error) {
+      if (onProtocolError === undefined) throw error
+      onProtocolError(error)
+    }
   }
   port.addEventListener("message", listener)
   port.start()
@@ -104,6 +116,12 @@ export interface Options {
   readonly hubProxyHandlersFor?: (workerID: number) => HubProxyHandlers | undefined
   readonly hubProxyStreamingFor?: (workerID: number) => Readonly<Record<string, HubProxyStreamHandler>> | undefined
   readonly onPidReport?: (workerID: number, report: PidReport) => void
+  /** Host-boundary containment: a malformed or late worker frame is reported here instead of throwing out of the hub port listener. */
+  readonly onProtocolError?: (
+    workerID: number,
+    error: unknown,
+    source: WorkerPortProtocolErrorSource,
+  ) => void
   /** Oversized hub-proxy frames cross through this store, scoped `worker-<id>`. */
   readonly hubProxySpill?: HubProxySpill
   /** Test seam over the hub-proxy server constructor. */
@@ -112,7 +130,13 @@ export interface Options {
 
 type WorkerPortServerOptions = Pick<
   Options,
-  "hubProxyHandlersFor" | "hubProxyStreamingFor" | "onPidReport" | "hubProxySpill" | "serveHubProxy"
+  | "hubProxyHandlersFor"
+  | "hubProxyStreamingFor"
+  | "onPidReport"
+  | "onProtocolError"
+  | "hubProxySpill"
+  | "serveHubProxy"
+  | "bridge"
 >
 
 function idempotentDisposer(disposers: readonly (() => void)[]): () => void {
@@ -150,9 +174,27 @@ function buildHubProxyServer(
 ): (() => void) | undefined {
   const disposers: (() => void)[] = []
 
+  const onProtocolError =
+    options.onProtocolError ??
+    ((id: number, error: unknown, source: WorkerPortProtocolErrorSource) => {
+      void options.bridge?.fork(
+        Effect.logWarning(workerLogMessage("worker port protocol error"), {
+          workerID: id,
+          source,
+          reason: messageOf(error),
+        }),
+      )
+    })
+
   const onPidReport = options.onPidReport
   if (onPidReport !== undefined) {
-    disposers.push(servePidReportPort((report) => onPidReport(workerID, report), port))
+    disposers.push(
+      servePidReportPort(
+        (report) => onPidReport(workerID, report),
+        port,
+        (error) => onProtocolError(workerID, error, "pid-report"),
+      ),
+    )
   }
 
   const handlers =
@@ -165,14 +207,19 @@ function buildHubProxyServer(
         ? options.hubProxyStreamingFor(workerID)
         : (backends?.hubProxyStreamingFor?.(workerID) ?? backends?.hubProxyStreaming)
     const serve = options.serveHubProxy ?? serveHubProxy
+    const onHubProxyProtocolError = (error: unknown) => onProtocolError(workerID, error, "hub-proxy")
     disposers.push(
       serve(
         handlers,
         port,
         streaming,
         options.hubProxySpill === undefined
-          ? {}
-          : { spill: options.hubProxySpill, spillScope: hubProxySpillScope(workerID) },
+          ? { onProtocolError: onHubProxyProtocolError }
+          : {
+              onProtocolError: onHubProxyProtocolError,
+              spill: options.hubProxySpill,
+              spillScope: hubProxySpillScope(workerID),
+            },
       ),
     )
   }
