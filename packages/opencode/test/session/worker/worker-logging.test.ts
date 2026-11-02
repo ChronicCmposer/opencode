@@ -26,6 +26,7 @@ import { SessionPrompt } from "@/session/prompt"
 import { SessionID } from "@/session/schema"
 import { createSessionWork, workerLogBridge } from "@/session/worker/session-worker"
 import { workerLogMessage } from "@/session/worker/worker-logging"
+import { lineFor, recordingLogger } from "../../lib/recorders"
 import { workerSnapshot } from "../../lib/snapshot"
 
 const sid = (value: string) => SessionID.make(value)
@@ -130,8 +131,7 @@ describe("worker logging (c): worker log bridge forwarding", () => {
   })
 })
 
-describe("worker logging (d): createSessionWork failure logging", () => {
-  const failingPromptLayer = (file: string): Layer.Layer<unknown, unknown> =>
+describe("worker logging (d): createSessionWork failure logging", () => {  const failingPromptLayer = (file: string): Layer.Layer<unknown, unknown> =>
     Layer.merge(
       Layer.succeed(SessionPrompt.Service, {
         cancel: () => Effect.succeed(undefined),
@@ -171,5 +171,19 @@ describe("worker logging (d): createSessionWork failure logging", () => {
     } finally {
       await dispose()
     }
+  })
+})
+
+describe("worker logging (e): recording logger level threshold", () => {
+  test("debug lines require an explicit debug opt-in", () => {
+    const info = recordingLogger()
+    info.bridge.fork(Effect.logDebug(workerLogMessage("debug hidden"), { slot: 1 }))
+    expect(info.lines).toHaveLength(0)
+
+    const debug = recordingLogger({ minimumLogLevel: "Debug" })
+    debug.bridge.fork(Effect.logDebug(workerLogMessage("debug visible"), { slot: 2 }))
+    const line = lineFor(debug.lines, "debug visible")
+    expect(line.level).toBe("debug")
+    expect(line.fields).toEqual({ slot: 2 })
   })
 })

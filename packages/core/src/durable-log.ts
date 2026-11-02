@@ -11,6 +11,7 @@ import { decodeDurablePayload, type SerializedEvent } from "./event"
 import { Database } from "./database/database"
 import { inImmediateTransaction, inImmediateTransactionAsync } from "./database/transaction"
 import { makeGlobalNode, type GlobalNode } from "./effect/app-node"
+import { dbTrace } from "./observability/sync-trace"
 
 /** The synchronous connection a DurableLog writes through. */
 export interface Connection {
@@ -1072,6 +1073,12 @@ export function createDurableRepository(connection: Connection): DurableReposito
     if (current === undefined) {
       throw new UnknownAggregateError({ message: `Aggregate ${input.aggregateID} has no lease row` })
     }
+    dbTrace("lease", "info", "reclaim", {
+      owner: input.nextOwnerID,
+      previousOwner: current.workerOwnerID,
+      latestSeq: current.seq,
+      outcome: "attempt",
+    })
     const now = input.now ?? Date.now()
     // A released lease has no owner.
     const released = current.workerOwnerID === undefined
@@ -1088,6 +1095,12 @@ export function createDurableRepository(connection: Connection): DurableReposito
     if (current.workerExpiresAt !== undefined && current.workerExpiresAt > now) {
       const ownerIsDead = !released && (input.isDeadOwner ?? isDeadWorkerOwner)(current.workerOwnerID!)
       if (!ownerIsDead) {
+        dbTrace("lease", "warn", "reclaim refused", {
+          owner: current.workerOwnerID,
+          previousOwner: input.expectedOwnerID,
+          latestSeq: current.seq,
+          outcome: "refused",
+        })
         try {
           input.onRefused?.({
             aggregateID: input.aggregateID,
@@ -1114,6 +1127,12 @@ export function createDurableRepository(connection: Connection): DurableReposito
         message: `Reclaim of ${input.aggregateID} did not match the observed worker lease`,
       })
     }
+    dbTrace("lease", "info", "reclaim", {
+      owner: input.nextOwnerID,
+      previousOwner: current.workerOwnerID,
+      latestSeq: current.seq,
+      outcome: "reclaimed",
+    })
     return changes
   }
 

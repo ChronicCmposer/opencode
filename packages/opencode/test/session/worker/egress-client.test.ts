@@ -9,10 +9,9 @@ import { describe, expect, test } from "bun:test"
 import { createEgressReceiver } from "@/session/egress/receiver"
 import { attachMeshWorker, createEgressMesh, type DurableWakeup } from "@/session/egress/mesh"
 import { createWorkerEgressClient } from "@/session/worker/egress-client"
-import { Logger } from "effect"
+import { Effect, Fiber, Logger, References } from "effect"
 import type { EffectBridge } from "@/effect/bridge"
 import { workerLogMessage } from "@/session/worker/worker-logging"
-import { recordingBridge } from "../../lib/recorders"
 import type { ScannedEventsFrame } from "@/session/egress/scan"
 import { valueOf } from "@/util/lazy-json"
 import { type EventsFrame, type EventV2Event, eventFrame } from "@/session/worker/frame"
@@ -232,6 +231,30 @@ describe("worker egress client drives durable mesh subscriptions", () => {
     attachment.dispose()
   })
 
+  test("emits debug subscribe start and ok lines with the pattern", async () => {
+    const egressChannel = new MessageChannel()
+    const controlChannel = new MessageChannel()
+    const mesh = createEgressMesh()
+    const attachment = attachMeshWorker(mesh, "w1", controlChannel.port2)
+    const records: RecordedLog[] = []
+    const client = createWorkerEgressClient(egressChannel.port1, {
+      controlPort: controlChannel.port1,
+      bridge: recordingLogger(records),
+      workerID: 9,
+    })
+
+    client.subscribeDurable({ pattern: "message.updated", onDurable: () => {} })
+    await pollUntil(() => records.some((entry) => entry.message === workerLogMessage("egress durable subscribe ok")))
+
+    const start = records.find((entry) => entry.message === workerLogMessage("egress durable subscribe start"))
+    const ok = records.find((entry) => entry.message === workerLogMessage("egress durable subscribe ok"))
+    expect(start?.fields).toMatchObject({ peer: "egress", level: "debug", workerID: 9, pattern: "message.updated" })
+    expect(ok?.fields).toMatchObject({ peer: "egress", level: "debug", workerID: 9, pattern: "message.updated" })
+
+    client.dispose()
+    attachment.dispose()
+  })
+
   test("unsubscribing removes the pattern from the hub mesh", async () => {
     const egressChannel = new MessageChannel()
     const controlChannel = new MessageChannel()
@@ -277,7 +300,20 @@ function recordingLogger(records: RecordedLog[]): EffectBridge.Shape {
       fields: typeof fields === "object" && fields !== null ? (fields as Record<string, unknown>) : {},
     })
   })
-  return recordingBridge(sink)
+  return {
+    promise: () => Promise.reject(new Error("recordingLogger: promise is unused")),
+    fork: <A, E, R>(effect: Effect.Effect<A, E, R>): Fiber.Fiber<A, E> => {
+      Effect.runSync(
+        (effect as Effect.Effect<A, E, never>).pipe(
+          Effect.provide(Logger.layer([sink])),
+          Effect.provideService(References.MinimumLogLevel, "Debug"),
+        ),
+      )
+      return undefined as unknown as Fiber.Fiber<A, E>
+    },
+    run: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect as unknown as Effect.Effect<A, E>,
+    bind: <Args extends readonly unknown[], Result>(fn: (...args: Args) => Result) => fn,
+  }
 }
 
 describe("worker egress client lifecycle logging", () => {

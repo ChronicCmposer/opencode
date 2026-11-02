@@ -16,6 +16,7 @@ import {
   type ConnectionOptions,
 } from "@opencode-ai/core/database/connection"
 import { withBusyRetry } from "@opencode-ai/core/database/busy"
+import { syncTrace } from "@opencode-ai/core/observability/sync-trace"
 import { isBusyError, inImmediateTransaction, retryBusySync } from "@opencode-ai/core/database/transaction"
 import { transactionControl } from "@opencode-ai/core/database/sqlite-adapter"
 import {
@@ -34,6 +35,7 @@ import {
 import { ledgerStatements, migrationStatements } from "@/session/writer/migration.statements.gen"
 import { toolCallUpgradeStatements, toolCallUpgradeStatementsAsync } from "@/session/ledger/tool-call"
 import { makePromiseExecutor, type DbExecutor } from "@/session/worker/db-executor"
+import { WORKER_LOG_PREFIX } from "@/session/worker/worker-logging"
 import { SCHEMA_BODY_HASH, SCHEMA_MIGRATION_IDS, SCHEMA_VERSION } from "./allowlist.gen"
 import { hashIdentity, readPersistedBodyHash, writePersistedBodyHash } from "./identity"
 import { assertWorkerTableParity, type SqliteQuery } from "./ownership"
@@ -314,7 +316,7 @@ export interface EnsureSchemaAsyncOptions extends EnsureSchemaOptions {
   /** Renewal cadence; tests shorten it to observe a lost lease promptly. */
   readonly renewIntervalMs?: number
   /** Test seam: fires when the gate is held by a peer and this call waits. */
-  readonly onGateWait?: () => void
+  readonly onGateWait?: (info: { attempt: number; heldUntil?: number; owner?: string }) => void
   /** Refuses worker mode when the hub and worker SQLite drivers differ; tests substitute it. */
   readonly assertDriverParity?: () => void
 }
@@ -358,6 +360,13 @@ async function assertWorkerTableParityAsync(executor: DbExecutor): Promise<void>
 }
 
 export async function ensureProductionSchemaAsync(options: EnsureSchemaAsyncOptions): Promise<SchemaIdentity> {
+  const startedAt = Date.now()
+  syncTrace({
+    prefix: WORKER_LOG_PREFIX,
+    level: "debug",
+    event: "schema ensure begin",
+    fields: { filename: options.filename },
+  })
   const assertDriverParity = options.assertDriverParity ?? assertSqliteDriverParity
   assertDriverParity()
   const inMemory = options.filename === ":memory:"
@@ -365,7 +374,15 @@ export async function ensureProductionSchemaAsync(options: EnsureSchemaAsyncOpti
   const cacheKey = inMemory ? undefined : path.resolve(options.filename)
   if (cacheKey !== undefined) {
     const ensured = ensuredDatabases.get(cacheKey)
-    if (ensured !== undefined) return ensured
+    if (ensured !== undefined) {
+      syncTrace({
+        prefix: WORKER_LOG_PREFIX,
+        level: "debug",
+        event: "schema ensure cache hit",
+        fields: { filename: cacheKey, elapsedMs: Date.now() - startedAt },
+      })
+      return ensured
+    }
   }
 
   // A live-worker refusal must not spawn an executor thread: the common case is a second hub sharing an
@@ -431,6 +448,12 @@ export async function ensureProductionSchemaAsync(options: EnsureSchemaAsyncOpti
   let executor: DbExecutor | undefined
   let ownsExecutor = false
   try {
+    syncTrace({
+      prefix: WORKER_LOG_PREFIX,
+      level: "debug",
+      event: "schema ensure gate wait",
+      fields: { filename: cacheKey, elapsedMs: Date.now() - startedAt },
+    })
     await waitForSchemaGateAsync(gate, token, undefined, options.onGateWait)
     // Everything after acquisition is inside the finally that releases the lease: a throw opening the
     // executor or starting renewal must not leave the row live for the full TTL. Renewal starts last, once
@@ -442,7 +465,17 @@ export async function ensureProductionSchemaAsync(options: EnsureSchemaAsyncOpti
       ownsExecutor = opened.owned
       const renewal = startSchemaGateRenewal(gate, token, options.renewIntervalMs ?? SCHEMA_GATE_RENEW_MS)
       try {
-        return await raceLeaseLoss(renewal, migrateUnderGate(options, executor, expected, cacheKey, gate, token))
+        const identity = await raceLeaseLoss(
+          renewal,
+          migrateUnderGate(options, executor, expected, cacheKey, gate, token),
+        )
+        syncTrace({
+          prefix: WORKER_LOG_PREFIX,
+          level: "debug",
+          event: "schema ensure complete",
+          fields: { filename: cacheKey, elapsedMs: Date.now() - startedAt },
+        })
+        return identity
       } finally {
         renewal.stop()
       }

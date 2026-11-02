@@ -7,7 +7,9 @@ import { Effect, Tracer } from "effect"
 import { createHubProxyClient } from "@/session/worker/hub-proxy-wire"
 import type { PidReport } from "@/session/worker/pid-registry"
 import { Service, layer, make, makeAttachments, node, type WorkerPorts } from "@/session/worker/worker-ports"
+import { workerLogMessage } from "@/session/worker/worker-logging"
 import { it } from "../../lib/effect"
+import { lineFor, recordingLogger } from "../../lib/recorders"
 
 const pidReport = (workerID: number, pgid: number): PidReport => ({
   type: "pid-report",
@@ -106,6 +108,26 @@ describe("worker-ports service", () => {
     }),
   )
 
+  test("logs a dropped-port warning when no backend serves the transfer", () => {
+    const recorder = recordingLogger()
+    const attachments = makeAttachments({ bridge: recorder.bridge })
+    const channel = messageChannel()
+
+    const disposePorts = attachments.attachWorkerPorts(1, { egress: channel.port1 })
+    disposePorts()
+    const droppedPorts = lineFor(recorder.lines, "worker ports dropped")
+    expect(droppedPorts.level).toBe("warn")
+    expect(droppedPorts.fields).toEqual({ workerID: 1, ports: ["egress"] })
+
+    const disposeProxy = attachments.attachHubProxyPort(2, channel.port2)
+    disposeProxy()
+    const droppedProxy = recorder.lines.filter((line) => line.message === workerLogMessage("worker ports dropped"))
+    expect(droppedProxy.at(-1)?.fields).toEqual({ workerID: 2, ports: ["hub-proxy"] })
+
+    channel.port1.close()
+    channel.port2.close()
+  })
+
   it.live("serves pid reports and hub-proxy requests on the same control port", () =>
     Effect.gen(function* () {
       const reports: PidReport[] = []
@@ -192,8 +214,7 @@ describe("worker-ports service", () => {
     }).pipe(Effect.provide(layer({}))),
   )
 
-  test("node is an unbound LayerNode for the service", () => {
-    const entry = node({})
+  test("node is an unbound LayerNode for the service", () => {    const entry = node({})
     expect(entry.kind).toBe("layer")
     expect(entry.name).toBe("@opencode/WorkerPorts")
     expect(entry.service).toBe(Service)

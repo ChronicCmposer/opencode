@@ -39,13 +39,23 @@ import {
   boundedDispatchDepth,
   buildHubProxyHandlers,
   createSessionChildrenIndex,
+  createSessionHub,
   hubProxyAuthoritiesFor,
   sessionSpawnFor,
   spawnChildOnHub,
   type HubProxyRunner,
 } from "@/session/worker/hub"
 import { createLazyExecutorWorkerPool } from "../lib/lazy-worker-pool"
-import type { ExecutorWorker, ExecutorWorkerPool } from "@/session/worker/execute"
+import {
+  createSessionDispatch,
+  type ExecutorWorker,
+  type ExecutorWorkerPool,
+} from "@/session/worker/execute"
+import type { Supervision } from "@/session/worker/supervision"
+import { createLifecycleTracker } from "@/session/ledger/lifecycle"
+import { createFakeExecutorPool } from "../lib/fake-worker-pool"
+import { createTestBarrier } from "../lib/run-barrier-test"
+import { lineFor, recordingLogger } from "../lib/recorders"
 import { serveHubProxy } from "@/session/worker/hub-proxy-wire"
 import type { CancelOutcome } from "@/session/worker/cancel"
 import { recordingHubAuthorities } from "../lib/hub-proxy"
@@ -938,5 +948,58 @@ describe("session-hub boundary", () => {
     // A busy after a retry is a real transition, as in-process.
     await Effect.runPromise(authorities.sessionStatus.set(BOUND, { type: "busy" }))
     expect(writes).toEqual(["busy", "retry", "idle", "busy"])
+  })
+})
+
+describe("session-hub observability", () => {
+  test("a settled retirement reports retirement wait settled", async () => {
+    const recorder = recordingLogger()
+    const hub = createSessionHub({
+      pool: createFakeExecutorPool(1),
+      lifecycle: createLifecycleTracker(),
+      barrier: createTestBarrier(),
+      bridge: recorder.bridge,
+    })
+    const sessionID = SessionID.make("ses_retirement_wait_settled")
+    try {
+      await hub.ensureRunning(sessionID)
+      await hub.dispatcher.retire(sessionID)
+
+      const line = lineFor(recorder.lines, "retirement wait settled")
+      expect(line.level).toBe("info")
+      expect(line.fields).toMatchObject({ sessionID, outcome: "settled" })
+    } finally {
+      await hub.terminateAll()
+    }
+  })
+
+  test("a backoff admission decision reports its delay", async () => {
+    const recorder = recordingLogger({ minimumLogLevel: "Debug" })
+    const sessionID = SessionID.make("ses_supervision_decision")
+    const supervision: Supervision = {
+      size: 0,
+      decideDispatch: () => ({ kind: "backoff", delayMs: 250 }),
+      recordCrash: () => ({ sessionID, attempts: 1, delayMs: 250, dead: false }),
+      recordHealthy: () => {},
+      isDead: () => false,
+      forget: () => {},
+    }
+    const dispatch = createSessionDispatch({
+      dispatcher: {
+        dispatch: async () => {},
+        cancel: async () => {},
+        terminateAll: async () => {},
+        registry: { get: () => undefined },
+      },
+      pool: createFakeExecutorPool(1),
+      supervision,
+      bridge: recorder.bridge,
+    })
+
+    await expect(dispatch.ensureRunning(sessionID, 0, "auto")).rejects.toThrow(/retry in 250ms/)
+
+    const line = lineFor(recorder.lines, "supervision dispatch decision")
+    expect(line.level).toBe("debug")
+    expect(line.fields).toEqual({ sessionID, origin: "auto", kind: "backoff", delayMs: 250 })
   })
 })

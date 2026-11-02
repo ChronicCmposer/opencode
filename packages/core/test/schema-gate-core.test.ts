@@ -18,7 +18,9 @@ import {
   renewSchemaGate,
   startSchemaGateRenewal,
   schemaGateFilename,
+  waitForSchemaGateAsync,
   withSchemaGate,
+  type SchemaGateWait,
 } from "../src/database/schema-gate"
 import { tmpdir } from "./fixture/tmpdir"
 
@@ -67,6 +69,29 @@ describe("core database schema gate", () => {
     expect(journalIDs(filename).length).toBeGreaterThan(0)
     expect(await Bun.file(schemaGateFilename(filename)).exists()).toBe(true)
   }, 30_000)
+
+  test("waitForSchemaGateAsync reports the live holder then acquires", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "wait-info.sqlite")
+    const peer = openSchemaGate(filename)
+    const peerToken = newGateToken(300)
+    expect(acquireSchemaGate(peer, peerToken)).toBe(true)
+
+    const waiter = openSchemaGate(filename)
+    const waiterToken = newGateToken()
+    const waits: SchemaGateWait[] = []
+    try {
+      await waitForSchemaGateAsync(waiter, waiterToken, 5_000, (info) => {
+        waits.push(info)
+        if (waits.length === 1) releaseSchemaGate(peer, peerToken)
+      })
+      expect(waits[0]).toEqual({ attempt: 1, owner: peerToken.owner, heldUntil: peerToken.expiresAt })
+    } finally {
+      releaseSchemaGate(waiter, waiterToken)
+      waiter.close()
+      peer.close()
+    }
+  }, 10_000)
 
   test("withSchemaGate does not run work until it owns the lease", async () => {
     await using tmp = await tmpdir()

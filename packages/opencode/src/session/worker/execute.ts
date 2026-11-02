@@ -842,10 +842,12 @@ export interface SessionDispatchOptions {
   // The hub's authoritative commit outcome for a finished run, read before its active-run record is deleted.
   readonly commitOutcome?: (sessionID: SessionID) => { readonly committed: string | null } | undefined
   readonly supervision?: Supervision
+  readonly bridge?: EffectBridge.Shape
 }
 
 export function createSessionDispatch(options: SessionDispatchOptions): SessionDispatch {
   const supervision = options.supervision ?? createSupervision()
+  const bridge = options.bridge
   // Coalesced dispatches share one rejection instance: every waiter's `admit`
   // observes the exact same crash error. Count each crash event once, not once
   // per joined waiter, so five waiters cannot mark a session dead for one crash.
@@ -872,6 +874,14 @@ export function createSessionDispatch(options: SessionDispatchOptions): SessionD
   /** Fail fast when supervision forbids this dispatch before any worker spawns. */
   const requireAdmission = (sessionID: SessionID, origin: DispatchOrigin): void => {
     const decision: DispatchDecision = supervision.decideDispatch(sessionID, origin)
+    void bridge?.fork(
+      Effect.logDebug(workerLogMessage("supervision dispatch decision"), {
+        sessionID,
+        origin,
+        kind: decision.kind,
+        ...(decision.kind === "backoff" ? { delayMs: decision.delayMs } : {}),
+      }),
+    )
     if (decision.kind === "allow") return
     if (decision.kind === "dead") throw new SessionWorkerDeadError(sessionID)
     throw new Error(`session ${sessionID} worker crashed recently; retry in ${decision.delayMs}ms`)

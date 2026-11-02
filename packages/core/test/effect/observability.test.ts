@@ -6,6 +6,7 @@ import os from "os"
 import path from "path"
 import { fileLogger } from "../../src/observability/logging"
 import { resource } from "../../src/observability/otlp"
+import { dbTrace, traceOnce } from "../../src/observability/sync-trace"
 
 const otelResourceAttributes = process.env.OTEL_RESOURCE_ATTRIBUTES
 const opencodeClient = process.env.OPENCODE_CLIENT
@@ -106,4 +107,35 @@ test("file logger flattens nested objects", async () => {
   expect(line).toContain('tags="[\\\"api\\\",\\\"test\\\"]"')
   expect(line).toContain("session.id=session-1")
   expect(line).not.toContain("request={")
+})
+
+describe("sync trace", () => {
+  test("dbTrace writes a debug lease line only when the log level allows debug", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-sync-trace-"))
+    const file = path.join(dir, "trace.log")
+    const previous = process.env.OPENCODE_LOG_LEVEL
+    try {
+      delete process.env.OPENCODE_LOG_LEVEL
+      dbTrace("lease", "debug", "reclaim", { outcome: "attempt", latestSeq: 7 }, file)
+      expect(await Bun.file(file).exists()).toBe(false)
+
+      process.env.OPENCODE_LOG_LEVEL = "debug"
+      dbTrace("lease", "debug", "reclaim", { outcome: "attempt", latestSeq: 7 }, file)
+      const line = (await Bun.file(file).text()).trim()
+      expect(line.startsWith("[db:lease] reclaim ")).toBe(true)
+      expect(line).toContain('"outcome":"attempt"')
+      expect(line).toContain('"latestSeq":7')
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_LOG_LEVEL
+      else process.env.OPENCODE_LOG_LEVEL = previous
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("traceOnce throttles repeated keys and always allows the first call", () => {
+    const key = `sync-trace-once-${Date.now()}-${Math.random()}`
+    expect(traceOnce(key, 1_000)).toBe(true)
+    expect(traceOnce(key, 1_000)).toBe(false)
+    expect(traceOnce(key, 0)).toBe(true)
+  })
 })

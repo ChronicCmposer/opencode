@@ -46,7 +46,8 @@ import {
 import { SESSION_WORKER_IDLE_TIMEOUT_ENV } from "./pool"
 import { mergeEnv, type WorkerModelSelection } from "./init"
 import type { SessionWorkerInit } from "./session-worker"
-import { workerLogMessage } from "./worker-logging"
+import { syncTrace } from "@opencode-ai/core/observability/sync-trace"
+import { WORKER_LOG_PREFIX, workerLogMessage } from "./worker-logging"
 import { sessionThreadName } from "@/session/worker/thread-name"
 import { messageOf } from "./port"
 
@@ -64,6 +65,7 @@ export interface SpawnGateOptions {
   /** How long an acquisition may wait for a slot before the spawn fails. */
   readonly timeoutMs: number
   readonly capacity?: number
+  readonly bridge?: EffectBridge.Shape
 }
 
 export interface SpawnGateHandle {
@@ -122,6 +124,8 @@ function requirePositiveInteger(name: string, value: number): number {
 export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
   const timeoutMs = requirePositive("timeoutMs", options.timeoutMs)
   const capacity = requirePositiveInteger("capacity", options.capacity ?? DEFAULT_SPAWN_CAPACITY)
+  const bridge = options.bridge
+  let nextPermitId = 1
   const semaphore = Semaphore.makeUnsafe(capacity)
   const scope = Scope.makeUnsafe()
   const runPromise = Effect.runSync(Scope.provide(scope)(FiberSet.makeRuntimePromise()))
@@ -133,11 +137,23 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
   const acquire = (signal?: AbortSignal): Promise<SpawnPermit> => {
     if (signal?.aborted === true) return Promise.reject(new SpawnGateAbortedError())
 
+    const permitId = nextPermitId++
+    const requestedAt = Date.now()
+    void bridge?.fork(
+      Effect.logDebug(workerLogMessage("spawn gate request"), {
+        permitId,
+        active: activeCount,
+        waiting: waitingCount,
+        capacity,
+      }),
+    )
+
     const granted = Deferred.makeUnsafe<void>()
     const released = Deferred.makeUnsafe<void>()
     const aborted = Deferred.makeUnsafe<void>()
     let waitingCounted = false
     let holding = false
+    let releasedOutcome: SpawnOutcome | undefined
 
     const onAbort = (): void => {
       Deferred.doneUnsafe(aborted, Effect.void)
@@ -156,6 +172,14 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
         waitingCounted = false
         activeCount += 1
         holding = true
+        void bridge?.fork(
+          Effect.logInfo(workerLogMessage("spawn gate granted"), {
+            permitId,
+            active: activeCount,
+            waiting: waitingCount,
+            elapsedMs: Date.now() - requestedAt,
+          }),
+        )
         yield* Deferred.succeed(granted, undefined)
         yield* Deferred.await(released)
       }),
@@ -169,9 +193,10 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
     const permit = (): SpawnPermit => {
       let releasedOnce = false
       return {
-        release: () => {
+        release: (outcome) => {
           if (releasedOnce) return
           releasedOnce = true
+          releasedOutcome = outcome
           Deferred.doneUnsafe(released, Effect.void)
         },
       }
@@ -186,6 +211,14 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
       if (holding) {
         holding = false
         activeCount = Math.max(0, activeCount - 1)
+        void bridge?.fork(
+          Effect.logInfo(workerLogMessage("spawn gate released"), {
+            permitId,
+            active: activeCount,
+            waiting: waitingCount,
+            outcome: releasedOutcome,
+          }),
+        )
       }
     })
 
@@ -206,7 +239,16 @@ export function makeSpawnGate(options: SpawnGateOptions): SpawnGateHandle {
         ).pipe(
           Effect.timeoutOrElse({
             duration: timeoutMs,
-            orElse: () => Effect.fail(new SpawnGateTimeoutError(timeoutMs)),
+            orElse: () =>
+              Effect.sync(() => {
+                void bridge?.fork(
+                  Effect.logWarning(workerLogMessage("spawn gate timeout"), {
+                    permitId,
+                    waiting: waitingCount,
+                    timeoutMs,
+                  }),
+                )
+              }).pipe(Effect.andThen(Effect.fail(new SpawnGateTimeoutError(timeoutMs)))),
           }),
           Effect.onError(() => Fiber.interrupt(fiber).pipe(Effect.andThen(cleanup))),
         )
@@ -464,12 +506,11 @@ function scheduleTimeout(ms: number, fire: () => void): () => void {
 export function createBunExecutorTransport(options: BunExecutorTransportOptions): ExecutorTransport {
   const bridge = options.bridge
   // Boot milestones run inside the synchronous construct path, where the bridge
-  // fiber may not get to run; stderr keeps them observable without changing it.
+  // fiber may not get to run; the shared sync sink keeps them observable without
+  // changing that path.
   const traceSync = (event: string, fields: Record<string, unknown>): void => {
     if (bridge === undefined) return
-    try {
-      process.stderr.write(`${workerLogMessage(event)} ${JSON.stringify(fields)}\n`)
-    } catch {}
+    syncTrace({ prefix: WORKER_LOG_PREFIX, level: "info", event, fields })
   }
   const timeoutMs = options.timeoutMs ?? DEFAULT_TRANSPORT_TIMEOUT_MS
   const bufferCapacity = options.bufferCapacity ?? DEFAULT_TRANSPORT_BUFFER_CAPACITY
@@ -1344,7 +1385,27 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
       })
       if (next === undefined) return
       const [workerID, entry] = next
-      if (entry.terminated || mutate((current) => [current.active.has(workerID), current])) continue
+      if (entry.terminated) {
+        void options.bridge?.fork(
+          Effect.logDebug(workerLogMessage("idle eviction skipped"), {
+            workerID,
+            sessionID: entry.sessionID,
+            reason: "terminated",
+          }),
+        )
+        continue
+      }
+      if (mutate((current) => [current.active.has(workerID), current])) {
+        void options.bridge?.fork(
+          Effect.logDebug(workerLogMessage("idle eviction skipped"), {
+            workerID,
+            sessionID: entry.sessionID,
+            reason: "background-work",
+            kept: true,
+          }),
+        )
+        continue
+      }
       // Background work must outlive an idle turn; keep one worker alive even
       // above the cap rather than killing a running job. Its next settlement
       // (or the dispatcher's idle reap) revisits the cap.
@@ -1363,7 +1424,27 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
           })
           return
         }
-        if (entry.terminated || mutate((current) => [current.active.has(workerID), current])) continue
+        if (entry.terminated) {
+          void options.bridge?.fork(
+            Effect.logDebug(workerLogMessage("idle eviction skipped"), {
+              workerID,
+              sessionID: entry.sessionID,
+              reason: "terminated",
+            }),
+          )
+          continue
+        }
+        if (mutate((current) => [current.active.has(workerID), current])) {
+          void options.bridge?.fork(
+            Effect.logDebug(workerLogMessage("idle eviction skipped"), {
+              workerID,
+              sessionID: entry.sessionID,
+              reason: "background-work",
+              kept: true,
+            }),
+          )
+          continue
+        }
       }
       yield* evict(entry)
     }
@@ -1821,31 +1902,48 @@ export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Eff
       sessionID: SessionID,
       requested?: import("./execute").WorkerRunModel,
     ): Promise<WorkerGeneration> => {
-      const cached = state.cached(sessionID)
+      const startedAt = Date.now()
       const requestedKey = requested === undefined ? undefined : modelKey(requested)
+      void bridge?.fork(
+        Effect.logDebug(workerLogMessage("generation resolve begin"), {
+          sessionID,
+          requested: requestedKey,
+        }),
+      )
+      const settle = (entry: WorkerGeneration): WorkerGeneration => {
+        void bridge?.fork(
+          Effect.logDebug(workerLogMessage("generation resolve settled"), {
+            sessionID,
+            generation: entry.generation,
+            elapsedMs: Date.now() - startedAt,
+          }),
+        )
+        return entry
+      }
+      const cached = state.cached(sessionID)
       // The requested model is the authoritative generation key: it is the model
       // this run will actually use, even before the session row catches up.
       if (requestedKey !== undefined) {
-        if (cached?.generation === requestedKey && cached.init !== undefined) return cached
+        if (cached?.generation === requestedKey && cached.init !== undefined) return settle(cached)
         const init = await resolveInit(sessionID, requested)
         const entry: WorkerGeneration = { generation: requestedKey, init }
         state.cache(sessionID, entry)
-        return entry
+        return settle(entry)
       }
       if (options.generationOf !== undefined) {
         const generation = await options.generationOf(sessionID)
-        if (cached?.generation === generation && cached.init !== undefined) return cached
+        if (cached?.generation === generation && cached.init !== undefined) return settle(cached)
         const init = await resolveInit(sessionID)
         const entry: WorkerGeneration = { generation, init }
         state.cache(sessionID, entry)
-        return entry
+        return settle(entry)
       }
       const init = await resolveInit(sessionID)
       const generation = modelKey(init.model)
-      if (cached?.generation === generation) return cached
+      if (cached?.generation === generation) return settle(cached)
       const entry: WorkerGeneration = { generation, init }
       state.cache(sessionID, entry)
-      return entry
+      return settle(entry)
     }
     const spawnFor: SessionBoundSpawner = async (id, sessionID, resolvedInit) => {
       const init = resolvedInit ?? (await resolveInit(sessionID))
@@ -1887,13 +1985,30 @@ export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Eff
             Effect.gen(function* () {
               const lookup = lookups.get(key)
               if (lookup === undefined) throw new Error(`session worker generation ${key} disappeared before boot`)
+              const materializeStartedAt = Date.now()
+              void bridge?.fork(
+                Effect.logInfo(workerLogMessage("worker isolate materialize parked"), {
+                  sessionID: lookup.sessionID,
+                  workerID: lookup.workerID,
+                  generation: key,
+                }),
+              )
               // The schema gate must run before the isolate opens SQLite.
               yield* Effect.tryPromise({
                 try: () => Promise.resolve(options.beforeSpawn?.()),
                 catch: (error) => error,
               }).pipe(Effect.orDie)
               const init = lookup.init ?? (yield* promiseEffect(() => resolveInit(lookup.sessionID)))
-              return yield* promiseEffect(() => spawnFor(lookup.workerID, lookup.sessionID, init))
+              const worker = yield* promiseEffect(() => spawnFor(lookup.workerID, lookup.sessionID, init))
+              void bridge?.fork(
+                Effect.logInfo(workerLogMessage("worker isolate materialize settled"), {
+                  sessionID: lookup.sessionID,
+                  workerID: worker.id,
+                  generation: key,
+                  elapsedMs: Date.now() - materializeStartedAt,
+                }),
+              )
+              return worker
             }),
             (worker) =>
               Effect.tryPromise({

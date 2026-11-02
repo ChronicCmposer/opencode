@@ -1,7 +1,9 @@
 // The hub-proxy control wire: the request/reply protocol a session worker uses to reach the hub-resident `SessionStatus` / `Permission` / `Question`.
 
 import { Effect, Option, Schema } from "effect"
+import type { EffectBridge } from "@/effect/bridge"
 import { isHubProxySpillReference, type HubProxySpill, type HubProxySpillReference } from "./hub-proxy-spill"
+import { workerLogMessage } from "./worker-logging"
 import { createRequestChannel, errorTagOf, messageOf, workerFrameChannel } from "./port"
 import {
   HUB_PROXY_SPILL_THRESHOLD_BYTES,
@@ -169,9 +171,14 @@ export interface HubProxyClientOptions {
   readonly spill?: HubProxySpill
   /** The spill scope (the worker's lease owner id) this client writes its request bodies under. */
   readonly spillScope?: string
+  /** Re-entry bridge for the request lifecycle diagnostics; absent keeps them inert. */
+  readonly bridge?: EffectBridge.Shape
 }
 
 const DISPOSED_MESSAGE = "hub proxy client disposed"
+
+/** How long a request may stay unanswered before the outstanding WARN fires. */
+const HUB_PROXY_OUTSTANDING_MS = 5_000
 
 /** Encoded size of a hub-proxy frame as the port would post it; `0` when it cannot be encoded (the post reports why). */
 function encodedFrameBytes(frame: HubProxyFrame): number {
@@ -226,6 +233,19 @@ export function createHubProxyClient(port: MessagePort, options: HubProxyClientO
   ): Effect.Effect<unknown, unknown> =>
     Effect.suspend(() => {
       const label = `hub-proxy request "${method}"`
+      const requestId = nextId++
+      const startedAt = Date.now()
+      void options.bridge?.fork(Effect.logDebug(workerLogMessage("hub proxy request start"), { method, requestId }))
+      const watchdog = setTimeout(() => {
+        void options.bridge?.fork(
+          Effect.logWarning(workerLogMessage("hub proxy request outstanding"), {
+            method,
+            requestId,
+            elapsedMs: Date.now() - startedAt,
+          }),
+        )
+      }, HUB_PROXY_OUTSTANDING_MS)
+      watchdog.unref?.()
       let requestSpill: HubProxySpillReference | undefined
       const spillStore = options.spill
       const spillScope = options.spillScope
@@ -262,21 +282,32 @@ export function createHubProxyClient(port: MessagePort, options: HubProxyClientO
         })
       }
       // The handler is unregistered once this request settles; it is registered before the request is posted, so no event can slip past it.
-      let id: number | undefined
       return prepare.pipe(
         Effect.andThen(
-          requests.request((requestId) => {
-            id = requestId
-            if (onEvent !== undefined) eventHandlers.set(requestId, onEvent)
-            return requestSpill === undefined
-              ? { kind: "request", id: requestId, method, args }
-              : { kind: "request", id: requestId, method, args: [], spill: requestSpill }
-          }),
+          requests.request(
+            () => {
+              const id = requestId
+              if (onEvent !== undefined) eventHandlers.set(id, onEvent)
+              return requestSpill === undefined
+                ? { kind: "request", id, method, args }
+                : { kind: "request", id, method, args: [], spill: requestSpill }
+            },
+            undefined,
+            requestId,
+          ),
         ),
         Effect.flatMap(resolveReply),
         Effect.ensuring(
           Effect.sync(() => {
-            if (id !== undefined) eventHandlers.delete(id)
+            clearTimeout(watchdog)
+            eventHandlers.delete(requestId)
+            void options.bridge?.fork(
+              Effect.logDebug(workerLogMessage("hub proxy request settled"), {
+                method,
+                requestId,
+                elapsedMs: Date.now() - startedAt,
+              }),
+            )
           }).pipe(Effect.andThen(removeRequestSpill)),
         ),
       )

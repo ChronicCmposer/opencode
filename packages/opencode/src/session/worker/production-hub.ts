@@ -20,6 +20,7 @@ import { attachMeshWorker, createEgressMesh, type EgressMesh } from "@/session/e
 import { createLiveEventPublisher, instanceLocation, EventV2Bridge, type LiveEventPublisher } from "@/event-v2-bridge"
 import type { EventV2 } from "@opencode-ai/core/event"
 import { DurableLog, StateCache } from "@opencode-ai/core/durable-log"
+import { traceOnce } from "@opencode-ai/core/observability/sync-trace"
 import type { MessageID, PartID, SessionID } from "@/session/schema"
 import { DbExecutor, type DbStatement } from "./db-executor"
 import { spawnDepth } from "@/session/depth"
@@ -484,6 +485,12 @@ export async function sweepDeadLeasesAtStartup(
   executor: DbExecutor | undefined,
   bridge?: EffectBridge.Shape,
 ): Promise<number> {
+  const startedAt = Date.now()
+  void bridge?.fork(
+    Effect.logDebug(workerLogMessage("startup lease sweep begin"), {
+      databasePath: filename,
+    }),
+  )
   const owned =
     executor === undefined
       ? DbExecutor.makePromiseExecutor({ filename, create: false, name: "hub-lease-sweep" })
@@ -573,11 +580,28 @@ export async function sweepDeadLeasesAtStartup(
         }),
       )
     }
+    void bridge?.fork(
+      Effect.logDebug(workerLogMessage("startup lease sweep complete"), {
+        databasePath: filename,
+        released,
+        abandoned,
+        elapsedMs: Date.now() - startedAt,
+      }),
+    )
     return released
   } catch (error) {
     void bridge?.fork(
       Effect.logWarning(workerLogMessage("startup lease sweep failed"), {
         error: error instanceof Error ? error.message : String(error),
+      }),
+    )
+    void bridge?.fork(
+      Effect.logDebug(workerLogMessage("startup lease sweep complete"), {
+        databasePath: filename,
+        released: 0,
+        abandoned: 0,
+        failed: true,
+        elapsedMs: Date.now() - startedAt,
       }),
     )
     return 0
@@ -651,7 +675,11 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
       : portSource
   // One Effect semaphore bounds every cold isolate spawn for this hub (and every crash respawn, because the pool retains the same handle).
   const spawnGate =
-    options.spawnGate ?? makeSpawnGate({ timeoutMs: options.spawnTimeoutMs ?? DEFAULT_SPAWN_GATE_TIMEOUT_MS })
+    options.spawnGate ??
+    makeSpawnGate({
+      timeoutMs: options.spawnTimeoutMs ?? DEFAULT_SPAWN_GATE_TIMEOUT_MS,
+      ...(bridge === undefined ? {} : { bridge }),
+    })
   // Any file-backed hub spills oversized hub-proxy frames beside its database; an in-memory one has nowhere to spill.
   const hubProxySpillDir = hubProxySpillDirectoryFor(options.databasePath)
   const hubProxySpill =
@@ -682,10 +710,22 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
         reused: false,
       }),
     )
+    const onGateWait = (info: { attempt: number; heldUntil?: number; owner?: string }): void => {
+      if (!traceOnce(`worker-schema-gate-wait:${databasePath}`, 1_000)) return
+      void bridge?.fork(
+        Effect.logDebug(workerLogMessage("schema gate wait"), {
+          databasePath,
+          attempt: info.attempt,
+          heldUntil: info.heldUntil,
+          owner: info.owner,
+        }),
+      )
+    }
     bootGate = ensureProductionSchemaAsync({
       filename: databasePath,
       liveWorkers,
       ...(options.db === undefined ? {} : { executor: options.db }),
+      onGateWait,
     }).then(
       () => {
         void bridge?.fork(

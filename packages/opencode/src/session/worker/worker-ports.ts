@@ -274,6 +274,12 @@ export function makeAttachments(options: Options = {}): Attachments {
     workerPortDisposers.get(workerID)?.()
     const next = buildWorkerPortServer(workerID, ports, backends())
     if (next === undefined) {
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("worker ports dropped"), {
+          workerID,
+          ports: transferredPortNames(ports),
+        }),
+      )
       workerPortDisposers.delete(workerID)
       return () => {}
     }
@@ -286,6 +292,9 @@ export function makeAttachments(options: Options = {}): Attachments {
     hubProxyDisposers.get(workerID)?.()
     const next = buildHubProxyServer(workerID, port, options, backends())
     if (next === undefined) {
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("worker ports dropped"), { workerID, ports: ["hub-proxy"] }),
+      )
       hubProxyDisposers.delete(workerID)
       return () => {}
     }

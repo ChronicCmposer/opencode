@@ -7,12 +7,45 @@
 // unanswered request.
 
 import { describe, expect, test } from "bun:test"
+import { Effect, Fiber, Logger, References } from "effect"
+import type { EffectBridge } from "@/effect/bridge"
 import {
   HubProxyRemoteError,
   createHubProxyClient,
   serveHubProxy,
   type HubProxyHandlers,
 } from "@/session/worker/hub-proxy-wire"
+import { workerLogMessage } from "@/session/worker/worker-logging"
+
+interface RecordedLog {
+  readonly message: string
+  readonly fields: Record<string, unknown>
+}
+
+/** A bridge that captures debug lines too (the default recorder stops at info). */
+function debugRecordingBridge(records: RecordedLog[]): EffectBridge.Shape {
+  const sink = Logger.make<unknown, void>(({ message }) => {
+    const [head, fields] = Array.isArray(message) ? message : [message, undefined]
+    records.push({
+      message: typeof head === "string" ? head : String(head),
+      fields: typeof fields === "object" && fields !== null ? (fields as Record<string, unknown>) : {},
+    })
+  })
+  return {
+    promise: () => Promise.reject(new Error("debugRecordingBridge: promise is unused")),
+    fork: <A, E, R>(effect: Effect.Effect<A, E, R>): Fiber.Fiber<A, E> => {
+      Effect.runSync(
+        (effect as Effect.Effect<A, E, never>).pipe(
+          Effect.provide(Logger.layer([sink])),
+          Effect.provideService(References.MinimumLogLevel, "Debug"),
+        ),
+      )
+      return undefined as unknown as Fiber.Fiber<A, E>
+    },
+    run: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect as unknown as Effect.Effect<A, E>,
+    bind: <Args extends readonly unknown[], Result>(fn: (...args: Args) => Result) => fn,
+  }
+}
 
 /** Serve `handlers` on a fresh channel and return the client end plus a disposer. */
 function pair(handlers: HubProxyHandlers): { client: ReturnType<typeof createHubProxyClient>; dispose: () => void } {
@@ -85,6 +118,26 @@ describe("createHubProxyClient correlation", () => {
     expect(error).toBeInstanceOf(HubProxyRemoteError)
     expect((error as HubProxyRemoteError).tag).toBe("SessionNotFound")
     expect((error as HubProxyRemoteError).data).toMatchObject({ sessionID: "ses_x" })
+
+    client.dispose()
+    dispose()
+  })
+})
+
+describe("createHubProxyClient request diagnostics", () => {
+  test("emits debug request start and settled lines with the method and id", async () => {
+    const channel = new MessageChannel()
+    const dispose = serveHubProxy({ "sessionStatus.list": () => "ok" }, channel.port2)
+    const records: RecordedLog[] = []
+    const client = createHubProxyClient(channel.port1, { bridge: debugRecordingBridge(records) })
+
+    expect(await client.call("sessionStatus.list", [])).toBe("ok")
+
+    const start = records.find((entry) => entry.message === workerLogMessage("hub proxy request start"))
+    const settled = records.find((entry) => entry.message === workerLogMessage("hub proxy request settled"))
+    expect(start?.fields).toMatchObject({ method: "sessionStatus.list", requestId: 1 })
+    expect(settled?.fields).toMatchObject({ method: "sessionStatus.list", requestId: 1 })
+    expect(typeof settled?.fields.elapsedMs).toBe("number")
 
     client.dispose()
     dispose()

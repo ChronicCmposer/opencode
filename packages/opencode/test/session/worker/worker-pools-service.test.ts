@@ -15,6 +15,7 @@ import {
 } from "@/session/worker/worker-pools"
 import { pollUntil, sid } from "../../lib/async"
 import { it } from "../../lib/effect"
+import { lineFor, recordingBridgeFrom, type RecordedLog } from "../../lib/recorders"
 import { sessionWorkerInit } from "../../lib/session-worker-init"
 
 /** The dependency-light executor fixture (speaks the executor protocol). */
@@ -68,6 +69,43 @@ describe("WorkerPools service surface", () => {
         yield* pools.releaseSession(sessionID, worker.id)
         expect(yield* pools.byID(worker.id)).toBeUndefined()
         expect((yield* pools.stats).workers).toBe(0)
+
+        yield* pools.terminateAll()
+      }),
+    90_000,
+  )
+
+  it.live(
+    "makeProduction logs the generation and materialize transitions",
+    () =>
+      Effect.gen(function* () {
+        const lines: RecordedLog[] = []
+        const pools = yield* makeProduction({
+          init: sessionWorkerInit(),
+          entry: EXECUTOR_FIXTURE,
+          workKind: "instant",
+          timeoutMs: 15_000,
+          generationOf: () => "model-a",
+          bridge: recordingBridgeFrom((line) => lines.push(line), "Debug"),
+        })
+        const sessionID = sid("ses_worker_pools_generation_logging")
+        const worker = yield* pools.spawn()
+
+        yield* Effect.promise(() => worker.execute({ sessionID, depth: 0 }))
+
+        expect(lineFor(lines, "generation resolve begin").fields).toMatchObject({ sessionID })
+        expect(lineFor(lines, "generation resolve settled").fields).toMatchObject({
+          sessionID,
+          generation: "model-a",
+        })
+        expect(lineFor(lines, "worker isolate materialize parked").fields).toMatchObject({
+          sessionID,
+          workerID: worker.id,
+        })
+        expect(lineFor(lines, "worker isolate materialize settled").fields).toMatchObject({
+          sessionID,
+          workerID: worker.id,
+        })
 
         yield* pools.terminateAll()
       }),

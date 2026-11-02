@@ -9,12 +9,12 @@
 // They exist so observability assertions read the same way everywhere and a
 // missing line fails with a descriptive message instead of `undefined`.
 
-import { Effect, Fiber, Logger } from "effect"
+import { Effect, Fiber, Logger, References, type LogLevel } from "effect"
 import type { EffectBridge } from "@/effect/bridge"
 import type { LiveEvent, LiveEventPublisher } from "@/event-v2-bridge"
 import { workerLogMessage } from "@/session/worker/worker-logging"
 
-export type RecordedLogLevel = "info" | "warn" | "error"
+export type RecordedLogLevel = "debug" | "info" | "warn" | "error"
 
 /** A structured log line captured by {@link recordingLogger}. */
 export interface RecordedLog {
@@ -32,8 +32,12 @@ export interface RecordingLogger {
 
 const severityOf = (level: string): RecordedLogLevel => {
   const normalized = level.toLowerCase()
-  if (normalized === "warn" || normalized === "error") return normalized
+  if (normalized === "debug" || normalized === "warn" || normalized === "error") return normalized
   return "info"
+}
+
+export interface RecordingLoggerOptions {
+  readonly minimumLogLevel?: LogLevel.LogLevel
 }
 
 /**
@@ -42,13 +46,19 @@ const severityOf = (level: string): RecordedLogLevel => {
  * the worker prefix is rendered by the forwarding logger, which has its own
  * unit tests.
  */
-export function recordingLogger(): RecordingLogger {
+export function recordingLogger(options: RecordingLoggerOptions = {}): RecordingLogger {
   const lines: RecordedLog[] = []
-  return { bridge: recordingBridgeFrom((line) => lines.push(line)), lines }
+  return {
+    bridge: recordingBridgeFrom((line) => lines.push(line), options.minimumLogLevel),
+    lines,
+  }
 }
 
 /** Build a recording bridge from a plain callback, for one-off assertions. */
-export function recordingBridgeFrom(record: (line: RecordedLog) => void): EffectBridge.Shape {
+export function recordingBridgeFrom(
+  record: (line: RecordedLog) => void,
+  minimumLogLevel: LogLevel.LogLevel = "Info",
+): EffectBridge.Shape {
   const sink = Logger.make<unknown, void>(({ logLevel, message }) => {
     const [head, fields] = Array.isArray(message) ? message : [message, undefined]
     record({
@@ -57,15 +67,23 @@ export function recordingBridgeFrom(record: (line: RecordedLog) => void): Effect
       level: severityOf(logLevel),
     })
   })
-  return recordingBridge(sink)
+  return recordingBridge(sink, minimumLogLevel)
 }
 
 /** Turn a capturing sink into a bridge whose `fork` logs synchronously. */
-export function recordingBridge(sink: Logger.Logger<unknown, void>): EffectBridge.Shape {
+export function recordingBridge(
+  sink: Logger.Logger<unknown, void>,
+  minimumLogLevel: LogLevel.LogLevel = "Info",
+): EffectBridge.Shape {
   return {
     promise: () => Promise.reject(new Error("recording bridge: promise is unused")),
     fork: <A, E, R>(effect: Effect.Effect<A, E, R>): Fiber.Fiber<A, E> => {
-      Effect.runSync((effect as Effect.Effect<A, E, never>).pipe(Effect.provide(Logger.layer([sink]))))
+      Effect.runSync(
+        (effect as Effect.Effect<A, E, never>).pipe(
+          Effect.provide(Logger.layer([sink])),
+          Effect.provideService(References.MinimumLogLevel, minimumLogLevel),
+        ),
+      )
       return undefined as unknown as Fiber.Fiber<A, E>
     },
     run: <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E> =>

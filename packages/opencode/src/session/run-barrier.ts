@@ -124,6 +124,7 @@ export type RunBarrierWaitError =
 interface RunRecord {
   readonly sessionID: string
   readonly epoch: number
+  readonly startedAt: number
   readonly reported: Set<RunBarrierPhase>
   readonly kinds: Map<RunBarrierPhase, RunBarrierObservation["kind"]>
   readonly done: Deferred.Deferred<RunBarrierOutcome, RunBarrierCancelled | RunBarrierReportError>
@@ -324,6 +325,7 @@ function makeBarrier(): Interface {
     const record: RunRecord = {
       sessionID,
       epoch: ++runEpoch,
+      startedAt: Date.now(),
       reported: new Set(),
       kinds: new Map(),
       done: Deferred.makeUnsafe(),
@@ -331,6 +333,7 @@ function makeBarrier(): Interface {
       commitOutcome: undefined,
     }
     runs.set(sessionID, record)
+    yield* Effect.logDebug("run barrier run begin", { sessionID, epoch: record.epoch })
     return makeRun(record)
   })
 
@@ -367,6 +370,7 @@ function makeBarrier(): Interface {
 
     remember(sessionID, "draining")
     active.set(sessionID, record)
+    yield* Effect.logDebug("run barrier wait begin", { sessionID, epoch: record.epoch, state })
 
     const outcome = yield* Deferred.await(record.done).pipe(
       Effect.timeoutOrElse({
@@ -375,7 +379,12 @@ function makeBarrier(): Interface {
           Effect.suspend(() => {
             clearActive()
             if (owns()) remember(sessionID, "timed-out")
-            return Effect.fail(new RunBarrierTimeout({ sessionID, timeoutMs: RUN_BARRIER_TIMEOUT_MS }))
+            return Effect.logWarning("run barrier wait timed out", {
+              sessionID,
+              timeoutMs: RUN_BARRIER_TIMEOUT_MS,
+            }).pipe(
+              Effect.andThen(Effect.fail(new RunBarrierTimeout({ sessionID, timeoutMs: RUN_BARRIER_TIMEOUT_MS }))),
+            )
           }),
       }),
       Effect.catchTag("RunBarrier.Cancelled", () =>
@@ -405,6 +414,11 @@ function makeBarrier(): Interface {
 
     clearActive()
     if (owns() && stateOf(sessionID) !== "cancelled") remember(sessionID, "drained")
+    yield* Effect.logDebug("run barrier wait settled", {
+      sessionID,
+      status: outcome.status,
+      elapsedMs: Date.now() - record.startedAt,
+    })
     return outcome
   })
 

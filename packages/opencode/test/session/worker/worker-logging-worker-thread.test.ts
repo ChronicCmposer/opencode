@@ -9,6 +9,9 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { Effect, Layer } from "effect"
+import { Global } from "@opencode-ai/core/global"
+// Side-effect import: evaluating the production entry writes the prelude lines.
+import "@/session/worker/session-worker"
 import {
   ModelClient,
   PIPELINE_SESSION_NODES,
@@ -76,5 +79,16 @@ describe("worker-thread emit reaches the hub log sink", () => {
     } finally {
       await dispose()
     }
+  })
+
+  test("the boot prelude reports module-eval start and completion with elapsedMs", async () => {
+    const file = path.join(Global.Path.log, "opencode.log")
+    const text = await readUntil(file, "worker module eval complete")
+    const line = text.split("\n").find((entry) => entry.includes("worker module eval complete"))
+    expect(line).toBeDefined()
+    expect(text).toContain("worker module eval start")
+    const fields = JSON.parse(line!.slice(line!.indexOf("{"))) as { elapsedMs?: unknown }
+    expect(typeof fields.elapsedMs).toBe("number")
+    expect(fields.elapsedMs as number).toBeGreaterThanOrEqual(0)
   })
 })

@@ -642,7 +642,19 @@ function buildDispatcher(
    */
   const reapIfIdle = (sessionID: SessionID): Effect.Effect<void> =>
     Effect.gen(function* () {
-      if (terminated || hasRun(sessionID) || hasWaiters(sessionID)) return
+      const run = hasRun(sessionID)
+      const waiters = hasWaiters(sessionID)
+      if (terminated || run || waiters) {
+        void bridge?.fork(
+          Effect.logDebug(workerLogMessage("idle reap abandoned"), {
+            sessionID,
+            hasRun: run,
+            hasWaiters: waiters,
+            reason: "pre-probe",
+          }),
+        )
+        return
+      }
       const worker = workers.worker(sessionID)
       if (worker === undefined) return
       const startedAt = Date.now()
@@ -661,11 +673,41 @@ function buildDispatcher(
       )
       // Re-check after the await: a new run or parked waiter must win, and a
       // retired/replaced worker must not be touched by this stale timer.
-      if (terminated || hasRun(sessionID) || hasWaiters(sessionID)) return
-      if (workers.worker(sessionID) !== worker) return
+      const runAfter = hasRun(sessionID)
+      const waitersAfter = hasWaiters(sessionID)
+      if (terminated || runAfter || waitersAfter) {
+        void bridge?.fork(
+          Effect.logDebug(workerLogMessage("idle reap abandoned"), {
+            sessionID,
+            workerID: worker.id,
+            hasRun: runAfter,
+            hasWaiters: waitersAfter,
+            reason: "post-probe",
+          }),
+        )
+        return
+      }
+      if (workers.worker(sessionID) !== worker) {
+        void bridge?.fork(
+          Effect.logWarning(workerLogMessage("idle reap abandoned"), {
+            sessionID,
+            workerID: worker.id,
+            reason: "worker-replaced",
+          }),
+        )
+        return
+      }
       if (active) {
         // A running background job still owns this isolate; replace this timer
         // with a fresh window under the same key.
+        void bridge?.fork(
+          Effect.logInfo(workerLogMessage("idle reap abandoned"), {
+            sessionID,
+            workerID: worker.id,
+            active: true,
+            reason: "background-work",
+          }),
+        )
         scheduleReap(sessionID)
         return
       }
@@ -789,6 +831,16 @@ function buildDispatcher(
     // the same fiber so a successor waits for the release too.
     const exit = Deferred.makeUnsafe<void>()
     const startedAt = Date.now()
+    if (retiringDone.has(sessionID)) {
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("retiring done overwritten"), {
+          sessionID,
+          workerID: worker.id,
+          scope,
+          reason: "a previous retirement had not settled",
+        }),
+      )
+    }
     retiringDone.set(sessionID, exit)
     void bridge?.fork(
       Effect.logInfo(workerLogMessage("retirement started"), {
@@ -821,6 +873,13 @@ function buildDispatcher(
           }
         }
         const hook = scope === "generation" ? options.onGenerationRetired : options.onSessionReleased
+        void bridge?.fork(
+          Effect.logInfo(workerLogMessage("retirement release hook started"), {
+            sessionID,
+            workerID: worker.id,
+            scope,
+          }),
+        )
         try {
           // The callback may be async (the hub's lease release is an executor
           // round-trip); await it before signalling the successor.
@@ -898,14 +957,46 @@ function buildDispatcher(
                 }),
             }),
             Effect.ignore,
+            Effect.tap(() =>
+              Effect.sync(() => {
+                void bridge?.fork(
+                  Effect.logInfo(workerLogMessage("retirement terminate settled"), {
+                    sessionID,
+                    workerID: worker.id,
+                    scope,
+                  }),
+                )
+              }),
+            ),
             Effect.andThen(releaseEffect),
           )
+    const annotatedBody = body.pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          void bridge?.fork(
+            Effect.logInfo(workerLogMessage("retirement body finished"), {
+              sessionID,
+              workerID: worker.id,
+              scope,
+            }),
+          )
+        }),
+      ),
+    )
     // A terminal retirement exposes its bounded barrier through `retire`/
     // `awaitRelease`; the generation path awaits the same completed Deferred so
     // the pool can gate the successor on the release.
+    void bridge?.fork(
+      Effect.logInfo(workerLogMessage("retirement body started"), {
+        sessionID,
+        workerID: worker.id,
+        scope,
+        alive: worker.alive,
+      }),
+    )
     engine.runRetire(
       sessionID,
-      body.pipe(
+      annotatedBody.pipe(
         // One annotation at the per-session/per-worker fiber boundary, so every
         // Effect log inside the retirement carries the ids the forwarding logger
         // renders into the user-visible prefix.
@@ -1093,6 +1184,14 @@ function buildDispatcher(
         yield* Effect.yieldNow
         const startedAt = Date.now()
         const settled = yield* awaitTerminating(pending.sessionID, exit)
+        void bridge?.fork(
+          Effect.logInfo(workerLogMessage("retirement wait settled"), {
+            sessionID: pending.sessionID,
+            workerID: pending.phase.workerID,
+            settled,
+            elapsedMs: Date.now() - startedAt,
+          }),
+        )
         // A timed-out retirement is still live. Keep it in `retiringDone` so
         // `retiringCount`/`awaitRelease` remain accurate; the successor still
         // starts (bounded), but through the explicit bypass below instead of
@@ -1129,6 +1228,13 @@ function buildDispatcher(
     if (exit === undefined) return Promise.resolve()
     return runPromise(
       Deferred.await(exit).pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            void bridge?.fork(
+              Effect.logInfo(workerLogMessage("retirement wait settled"), { sessionID, outcome: "settled" }),
+            )
+          }),
+        ),
         Effect.timeoutOrElse({
           duration: terminateTimeoutMs,
           orElse: () =>
@@ -1138,6 +1244,7 @@ function buildDispatcher(
                   Effect.logWarning(workerLogMessage("retirement barrier timed out"), {
                     sessionID,
                     timeoutMs: terminateTimeoutMs,
+                    outcome: "timeout",
                   }),
                 ),
             ),

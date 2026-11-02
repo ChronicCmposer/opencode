@@ -19,9 +19,10 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { executorPragmas, resolveWalConfig } from "@opencode-ai/core/database/pragmas"
 import { EXECUTOR_BUSY_RETRY_CONFIG, retryBusySync } from "@opencode-ai/core/database/transaction"
 import { withBusyRetry, type BusyExhaustedError } from "@opencode-ai/core/database/busy"
+import { syncTrace } from "@opencode-ai/core/observability/sync-trace"
 import { Context, Deferred, Duration, Effect, Exit, FiberSet, Layer, Schedule, Schema, Scope, Semaphore } from "effect"
 import { resolveWorkerEntry } from "./port"
-import { workerLogMessage } from "./worker-logging"
+import { workerLogMessage, WORKER_LOG_PREFIX } from "./worker-logging"
 
 export type DbParams = ReadonlyArray<unknown> | Record<string, unknown>
 
@@ -573,12 +574,15 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
               const message = event.data
               if (message.type === "ready") {
                 state.executorThreadId = message.threadId
-                Effect.runSync(
-                  Effect.logInfo(workerLogMessage("db executor ready"), {
+                syncTrace({
+                  prefix: WORKER_LOG_PREFIX,
+                  level: "info",
+                  event: "db executor ready",
+                  fields: {
                     threadId: message.threadId,
                     elapsedMs: Date.now() - bootStartedAt,
-                  }),
-                )
+                  },
+                })
                 Deferred.doneUnsafe(ready, Effect.void)
                 return
               }
@@ -675,15 +679,18 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
             done = true
             clearTimer()
             state.pending.delete(id)
-            Effect.runSync(
-              Effect.logError(workerLogMessage("db executor request timeout"), {
+            syncTrace({
+              prefix: WORKER_LOG_PREFIX,
+              level: "error",
+              event: "db executor request timeout",
+              fields: {
                 requestId: id,
                 kind: request.type,
                 timeoutMs,
                 pendingCount: state.pending.size,
                 transactionOpen: state.transactionOpen,
-              }),
-            )
+              },
+            })
             // A deadline is indeterminate: the transaction may have committed
             // before the response was lost. Retire the whole thread so a retry
             // starts on a fresh connection and no half-open transaction is
@@ -701,25 +708,31 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
         }
         state.pending.set(id, {
           resolve: (value) => {
-            Effect.runSync(
-              Effect.logDebug(workerLogMessage("db executor request settled"), {
+            syncTrace({
+              prefix: WORKER_LOG_PREFIX,
+              level: "debug",
+              event: "db executor request settled",
+              fields: {
                 requestId: id,
                 kind: request.type,
                 outcome: "ok",
                 elapsedMs: Date.now() - startedAt,
-              }),
-            )
+              },
+            })
             finish(Effect.succeed(value))
           },
           reject: (error) => {
-            Effect.runSync(
-              Effect.logDebug(workerLogMessage("db executor request settled"), {
+            syncTrace({
+              prefix: WORKER_LOG_PREFIX,
+              level: "debug",
+              event: "db executor request settled",
+              fields: {
                 requestId: id,
                 kind: request.type,
                 outcome: "error",
                 elapsedMs: Date.now() - startedAt,
-              }),
-            )
+              },
+            })
             finish(Effect.fail(error))
           },
         })
@@ -823,9 +836,21 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
         if (state.closed || state.worker === undefined) return Effect.void
         if (state.transactionOpen) {
           options.onCheckpoint?.("deferred")
+          syncTrace({
+            prefix: WORKER_LOG_PREFIX,
+            level: "debug",
+            event: "db executor checkpoint",
+            fields: { outcome: "deferred", transactionOpen: true },
+          })
           return Effect.void
         }
         options.onCheckpoint?.("issued")
+        syncTrace({
+          prefix: WORKER_LOG_PREFIX,
+          level: "debug",
+          event: "db executor checkpoint",
+          fields: { outcome: "issued", transactionOpen: false },
+        })
         return requestOnce((id) => ({ type: "query", id, sql: "PRAGMA wal_checkpoint(PASSIVE)" })).pipe(
           Effect.asVoid,
           Effect.catchCause(() => Effect.logWarning("db executor passive checkpoint failed")),

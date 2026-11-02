@@ -1216,11 +1216,16 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   /** Read the EXACT `worker_owner_id` a generation holds for this session. */
   const captureRetiredLeaseOwner = async (sessionID: SessionID, workerID?: number): Promise<string | undefined> => {
     if (db === undefined || workerID === undefined) return undefined
+    const startedAt = Date.now()
+    void bridge?.fork(
+      Effect.logDebug(workerLogMessage("capture retired lease owner begin"), { sessionID, workerID }),
+    )
     const generationPrefix = `worker-${workerID}-`
+    let resolved: string | undefined
     try {
       const rows = await db.query("SELECT worker_owner_id FROM event_sequence WHERE aggregate_id = ?", [sessionID])
       const owner = rows[0]?.worker_owner_id
-      return typeof owner === "string" && owner.startsWith(generationPrefix) ? owner : undefined
+      resolved = typeof owner === "string" && owner.startsWith(generationPrefix) ? owner : undefined
     } catch (error) {
       void bridge?.fork(
         Effect.logWarning(workerLogMessage("worker lease owner read failed"), {
@@ -1228,8 +1233,16 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
           error: error instanceof Error ? error.message : String(error),
         }),
       )
-      return undefined
     }
+    void bridge?.fork(
+      Effect.logDebug(workerLogMessage("capture retired lease owner settled"), {
+        sessionID,
+        workerID,
+        owner: resolved,
+        elapsedMs: Date.now() - startedAt,
+      }),
+    )
+    return resolved
   }
 
   /** Zero the retired generation's lease with a conditional update on the exact owner captured at retirement start. */
@@ -1239,8 +1252,19 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     void bridge?.fork(
       Effect.logInfo(workerLogMessage("retired lease release begin"), { sessionID, retiredOwnerID }),
     )
+    void bridge?.fork(
+      Effect.logDebug(workerLogMessage("retired lease UPDATE issued"), { sessionID, retiredOwnerID }),
+    )
     return queueRetiredLeaseRelease(sessionID, async () => {
       const released = await releaseRetiredWorkerLease(db, sessionID, retiredOwnerID)
+      void bridge?.fork(
+        Effect.logDebug(workerLogMessage("retired lease UPDATE completed"), {
+          sessionID,
+          retiredOwnerID,
+          released,
+          elapsedMs: Date.now() - startedAt,
+        }),
+      )
       void bridge?.fork(
         Effect.logInfo(workerLogMessage("retired lease release done"), {
           sessionID,
@@ -1254,15 +1278,33 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
 
   /** Remember the exact owner the CURRENT generation holds after its successful dispatch. */
   const rememberLeaseOwner = async (sessionID: SessionID): Promise<void> => {
+    const startedAt = Date.now()
+    void bridge?.fork(Effect.logDebug(workerLogMessage("remember lease owner begin"), { sessionID }))
     const workerID = dispatcher.registry.entry(sessionID)?.workerID
     if (db === undefined || workerID === undefined) return
     const owner = await captureRetiredLeaseOwner(sessionID, workerID)
-    if (owner !== undefined) leaseOwnerBySession.set(sessionID, owner)
+    if (owner === undefined) return
+    leaseOwnerBySession.set(sessionID, owner)
+    void bridge?.fork(
+      Effect.logDebug(workerLogMessage("remember lease owner settled"), {
+        sessionID,
+        workerID,
+        owner,
+        elapsedMs: Date.now() - startedAt,
+      }),
+    )
   }
 
   /** A booting worker reports the lease it claimed; keep it when it belongs to that worker's generation. */
   const rememberWorkerLease = (workerID: number, lease: WorkerLeaseClaim): void => {
     if (!lease.ownerID.startsWith(`worker-${workerID}-`)) return
+    void bridge?.fork(
+      Effect.logDebug(workerLogMessage("remember worker lease"), {
+        workerID,
+        sessionID: lease.aggregateID,
+        owner: lease.ownerID,
+      }),
+    )
     leaseOwnerBySession.set(lease.aggregateID as SessionID, lease.ownerID)
   }
 
@@ -1578,6 +1620,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     dispatcher,
     pool,
     commitOutcome: (sessionID) => commitOutcomes.get(sessionID),
+    ...(bridge === undefined ? {} : { bridge }),
   })
   const onDispatch = options.onDispatch
   const resolveDepth = (sessionID: SessionID): number =>

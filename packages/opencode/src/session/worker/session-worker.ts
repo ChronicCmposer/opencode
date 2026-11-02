@@ -23,6 +23,7 @@
 // `pgrep -f 'oc serve'` instead. Names are clipped to the kernel's 15-byte
 // `comm` limit (see `@/util/thread-name`).
 
+import { PRELUDE_STARTED_AT } from "./worker-boot-prelude"
 import path from "node:path"
 import { threadId, workerData } from "node:worker_threads"
 import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Scope } from "effect"
@@ -49,7 +50,8 @@ import { openWriterConnection } from "@/session/writer/connection"
 import { createWorkerEgressClient, type WorkerEgressClient } from "./egress-client"
 import { openWorkerDatabase, type WorkerBus, type WorkerConnection, type WorkerDatabase } from "./db"
 import { createProxyReporting, installReporting } from "@/session/ledger/lifecycle"
-import { workerLogMessage } from "./worker-logging"
+import { syncTrace } from "@opencode-ai/core/observability/sync-trace"
+import { WORKER_LOG_PREFIX, workerLogMessage } from "./worker-logging"
 import { workerLoggingLayer } from "./worker-logging"
 import { messageOf } from "./port"
 import { createThreadNamer, type ThreadNamer } from "./thread-naming"
@@ -104,12 +106,16 @@ import type {
 } from "./plugin-tool-wire"
 
 // Synchronous boot trace: the isolate's log bridge is not yet wired when the DB
-// opens and the ports are posted, so write directly to stderr instead.
-const traceSync = (event: string, fields: Record<string, unknown>): void => {
-  try {
-    process.stderr.write(`${workerLogMessage(event)} ${JSON.stringify(fields)}\n`)
-  } catch {}
-}
+// opens and the ports are posted, so write straight to the shared log sink.
+const traceSync = (event: string, fields: Record<string, unknown>): void =>
+  syncTrace({ prefix: WORKER_LOG_PREFIX, level: "info", event, fields })
+
+syncTrace({
+  prefix: WORKER_LOG_PREFIX,
+  level: "info",
+  event: "worker module eval complete",
+  fields: { elapsedMs: Date.now() - PRELUDE_STARTED_AT },
+})
 
 /** The real model capabilities, serialized for the isolate boundary. */
 export interface SerializedModelCapabilities {
@@ -438,6 +444,7 @@ export function createWorkerDatabaseWriter(
   // `BEGIN IMMEDIATE`, so a raced commit fences the reclaim instead of losing it.
   const refusedLeaseAggregates = new Set<string>()
   const claimWorkerLease = (aggregateID: string): void => {
+    const startedAt = Date.now()
     // Refuse a non-worker schema before `ownerOf`: on a pre-`worker_owner_id`
     // journal `ownerOf` reports v1 sync state, which is not a reclaimable worker
     // lease. Surface the same typed refusal the DurableLog uses instead of silently
@@ -449,15 +456,32 @@ export function createWorkerDatabaseWriter(
       })
     }
     const owner = bus.ownerOf(aggregateID)
+    const latestSeq = owner === undefined ? undefined : bus.latest(aggregateID)
+    const outcome = owner === undefined ? "claim" : owner === ownerID ? "owned" : "reclaim"
+    traceSync("worker lease claim start", { sessionID: aggregateID, ownerID, previousOwner: owner, latestSeq, outcome })
+    const claimEnd = (): void =>
+      traceSync("worker lease claim end", {
+        sessionID: aggregateID,
+        ownerID,
+        previousOwner: owner,
+        latestSeq,
+        outcome,
+        elapsedMs: Date.now() - startedAt,
+      })
     if (owner === undefined) {
       bus.claim(aggregateID)
+      claimEnd()
       return
     }
-    if (owner === ownerID) return
+    if (owner === ownerID) {
+      claimEnd()
+      return
+    }
     bus.reclaim({
       aggregateID,
       expectedOwnerID: owner,
-      expectedSeq: bus.latest(aggregateID),
+      // `owner` is defined here, so the captured sequence was read above.
+      expectedSeq: latestSeq!,
       nextOwnerID: ownerID,
       onRefused: (refusal) => {
         if (refusedLeaseAggregates.has(refusal.aggregateID)) return
@@ -472,6 +496,7 @@ export function createWorkerDatabaseWriter(
         )
       },
     })
+    claimEnd()
   }
   if (options.sessionID !== undefined) claimWorkerLease(options.sessionID)
 
@@ -628,11 +653,14 @@ export interface SessionWorkerBootstrap {
 export function hubProxyClientOptions(
   init: Pick<SessionWorkerInit, "workerID" | "hubProxySpillDir">,
   threadId: number,
+  bridge?: EffectBridge.Shape,
 ): HubProxyClientOptions {
-  if (init.hubProxySpillDir === undefined) return {}
+  const bridgeFields = bridge === undefined ? {} : { bridge }
+  if (init.hubProxySpillDir === undefined) return bridgeFields
   return {
     spill: createHubProxySpill(init.hubProxySpillDir),
     spillScope: `worker-${reportedWorkerID(init, threadId)}`,
+    ...bridgeFields,
   }
 }
 
@@ -858,13 +886,22 @@ export function createSessionWork(options: SessionWorkOptions): SessionWork {
   let builtContext: Context.Context<unknown> | undefined
   const resolveContext = (runScope: Scope.Scope): Effect.Effect<Context.Context<unknown>> =>
     Effect.suspend(() => {
-      if (options.context !== undefined) return Effect.succeed(options.context)
-      if (builtContext !== undefined) return Effect.succeed(builtContext)
+      if (options.context !== undefined) {
+        traceSync("first run graph build end", { cached: true, elapsedMs: 0 })
+        return Effect.succeed(options.context)
+      }
+      if (builtContext !== undefined) {
+        traceSync("first run graph build end", { cached: true, elapsedMs: 0 })
+        return Effect.succeed(builtContext)
+      }
+      const buildStartedAt = Date.now()
+      traceSync("first run graph build start", { cached: false })
       const layer = options.layer as Layer.Layer<unknown, unknown>
       const build =
         options.scope === undefined ? Layer.buildWithScope(layer, runScope) : Layer.buildWithScope(layer, options.scope)
       return Effect.map(build.pipe(Effect.orDie), (context) => {
         if (options.scope !== undefined) builtContext = context
+        traceSync("first run graph build end", { cached: false, elapsedMs: Date.now() - buildStartedAt })
         return context
       })
     })
@@ -1326,6 +1363,18 @@ function servesWorkerPorts(capabilities: SessionWorkerCapabilities | undefined):
   }
 }
 
+/** Count the distinct nodes in a graph root, following each dependency once. */
+function countGraphNodes(root: LayerNode.AnyNode): number {
+  const seen = new Set<LayerNode.AnyNode>()
+  const visit = (node: LayerNode.AnyNode): void => {
+    if (seen.has(node)) return
+    seen.add(node)
+    for (const dependency of node.dependencies) visit(dependency)
+  }
+  visit(root)
+  return seen.size
+}
+
 /**
  * Build the reduced layer and install the executor. Split from module scope so
  * tests can import this module (`buildWorkerClients`, the registry) without a
@@ -1542,8 +1591,13 @@ export function bootstrapSessionWorker(
         sessionID: init.sessionID,
         threadId,
       })
-      const client = createHubProxyClient(hubProxyChannel.port1, hubProxyClientOptions(init, threadId))
+      const client = createHubProxyClient(hubProxyChannel.port1, hubProxyClientOptions(init, threadId, bridge))
       hubProxyClient = client
+      traceSync("hub-proxy client ready", {
+        workerID: reportedWorkerID(init, threadId),
+        sessionID: init.sessionID,
+        spill: init.hubProxySpillDir !== undefined,
+      })
       options.observeHubProxy?.(client)
       hubProxies = { sessionStatus: client, permission: client, question: client }
       // The real prompt runs in this isolate; report the durable lifecycle facts
@@ -1624,6 +1678,7 @@ export function bootstrapSessionWorker(
     options.observeBackgroundJobs?.(syncedBackgroundJobs)
     const backgroundJobLayer = Layer.succeed(BackgroundJob.Service, syncedBackgroundJobs)
 
+    const graphStartedAt = Date.now()
     const runtime = buildSessionWorkerLayer({
       // The full runnable graph needs the writer-backed Database and the serialized
       // model catalog the hub ships; the degraded boot runs the reduced pipeline.
@@ -1662,6 +1717,18 @@ export function bootstrapSessionWorker(
       // The worker's Effect logs reach the main `opencode.log` sink. Merged as a
       // non-graph seam, so the node table and its assertion are untouched.
       logging,
+    })
+    // The node count is only known from the built root, so the start line is
+    // emitted once the graph tree exists; its timer still starts before the build.
+    traceSync("graph compile start", {
+      workerID: reportedWorkerID(init, threadId),
+      sessionID: init.sessionID,
+      nodeCount: countGraphNodes(runtime.root),
+    })
+    traceSync("graph compile end", {
+      workerID: reportedWorkerID(init, threadId),
+      sessionID: init.sessionID,
+      elapsedMs: Date.now() - graphStartedAt,
     })
 
     // Build the graph exactly once on a worker-lifetime scope. Every turn provides
@@ -1813,10 +1880,13 @@ export function workerInstanceContext(snapshot: WorkerSnapshot): InstanceContext
 
 if (workerData !== null && workerData !== undefined) {
   const init = parseSessionWorkerInit(workerData)
+  traceSync("worker init parsed", { workerID: init.workerID, sessionID: init.sessionID, role: init.role })
   // Adopt the shipped role BEFORE any heavy bootstrap, so a dynamic app-runtime
   // import during bootstrap sees `session` and never contributes a nested hub.
   setProcessRole(init.role)
   // Thread naming is owned by `bootstrapSessionWorker` (`namer.bind`), which
   // writes the boot name exactly once; this entry only picks the role.
+  traceSync("worker bootstrap start", { workerID: init.workerID, sessionID: init.sessionID })
   bootstrapSessionWorker(init, globalThis as unknown as WorkerScope)
+  traceSync("worker bootstrap returned", { workerID: init.workerID, sessionID: init.sessionID })
 }

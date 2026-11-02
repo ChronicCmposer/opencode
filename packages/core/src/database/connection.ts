@@ -36,13 +36,25 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 }
 
-export function retryOpenWhileBusy<T>(open: () => T, sleep: (ms: number) => void = sleepSync): T {
+export interface BusyRetryEvent {
+  readonly attempt: number
+  readonly delayMs: number
+  readonly error: unknown
+}
+
+export function retryOpenWhileBusy<T>(
+  open: () => T,
+  sleep: (ms: number) => void = sleepSync,
+  onRetry?: (event: BusyRetryEvent) => void,
+): T {
   for (let attempt = 0; ; attempt += 1) {
     try {
       return open()
     } catch (error) {
       if (!isBusySqlError(error) || attempt >= OPEN_BUSY_RETRIES) throw error
-      sleep(Math.min(OPEN_BUSY_BASE_DELAY_MS * 2 ** attempt, OPEN_BUSY_MAX_DELAY_MS))
+      const delayMs = Math.min(OPEN_BUSY_BASE_DELAY_MS * 2 ** attempt, OPEN_BUSY_MAX_DELAY_MS)
+      onRetry?.({ attempt, delayMs, error })
+      sleep(delayMs)
     }
   }
 }
@@ -205,6 +217,8 @@ export interface ConnectionOptions {
   /** Page-cache budget in KiB; defaults to the worker budget, not the hub's 64 MiB. */
   readonly cacheSizeKib?: number
   readonly create?: boolean
+  /** Observes each busy retry before the backoff sleeps. */
+  readonly onRetry?: (event: BusyRetryEvent) => void
 }
 
 /** One SQLite authorizer decision. Throw from the callback to deny the action. */
@@ -282,16 +296,20 @@ export function openConnection(options: ConnectionOptions): Connection {
       cacheSizeKib: options.cacheSizeKib ?? resolveWorkerCacheSizeKib(),
     })
 
-  const native = retryOpenWhileBusy(() => {
-    const handle = new Database(options.filename, { create: options.create ?? true })
-    try {
-      for (const pragma of pragmas) handle.exec(pragma)
-      return handle
-    } catch (error) {
-      handle.close()
-      throw error
-    }
-  })
+  const native = retryOpenWhileBusy(
+    () => {
+      const handle = new Database(options.filename, { create: options.create ?? true })
+      try {
+        for (const pragma of pragmas) handle.exec(pragma)
+        return handle
+      } catch (error) {
+        handle.close()
+        throw error
+      }
+    },
+    sleepSync,
+    options.onRetry,
+  )
 
   const owner = nextOwnerID()
   let closed = false
@@ -359,23 +377,27 @@ export function openNodeConnection(options: NodeConnectionOptions): NodeConnecti
       cacheSizeKib: options.cacheSizeKib ?? resolveWorkerCacheSizeKib(),
     })
 
-  const native = retryOpenWhileBusy(() => {
-    const handle = new DatabaseSync(options.filename, {
-      open: true,
-      enableForeignKeyConstraints: options.foreignKeys ?? true,
-    })
-    try {
-      for (const pragma of pragmas) handle.exec(pragma)
-      // The shared WAL tuning enables foreign keys. Callers may explicitly opt out
-      // for a private test handle, but the worker's scoped handle keeps them ON so
-      // a child row cannot reference another session's parent.
-      if (options.foreignKeys === false) handle.exec("PRAGMA foreign_keys = OFF")
-      return handle
-    } catch (error) {
-      handle.close()
-      throw error
-    }
-  })
+  const native = retryOpenWhileBusy(
+    () => {
+      const handle = new DatabaseSync(options.filename, {
+        open: true,
+        enableForeignKeyConstraints: options.foreignKeys ?? true,
+      })
+      try {
+        for (const pragma of pragmas) handle.exec(pragma)
+        // The shared WAL tuning enables foreign keys. Callers may explicitly opt out
+        // for a private test handle, but the worker's scoped handle keeps them ON so
+        // a child row cannot reference another session's parent.
+        if (options.foreignKeys === false) handle.exec("PRAGMA foreign_keys = OFF")
+        return handle
+      } catch (error) {
+        handle.close()
+        throw error
+      }
+    },
+    sleepSync,
+    options.onRetry,
+  )
 
   const owner = nextOwnerID()
   let closed = false

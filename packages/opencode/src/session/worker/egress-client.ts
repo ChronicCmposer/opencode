@@ -130,6 +130,13 @@ export function createWorkerEgressClient(
 function buildEgressClient(port: MessagePort, options: WorkerEgressClientOptions): WorkerEgressSubscriptionClient {
   const bridge = options.bridge
   const workerID = options.workerID
+  // The shared peer lifecycle shape only declares info/warn; a durable
+  // subscription diagnostic is debug, so the level is overridden here.
+  const subscribeFields = (pattern: string): Record<string, unknown> => ({
+    ...peerLifecycle("egress", workerID)("info"),
+    level: "debug",
+    pattern,
+  })
   const sender: EgressSender = createEgressSender({
     port,
     ...(options.windowMs === undefined ? {} : { windowMs: options.windowMs }),
@@ -249,20 +256,30 @@ function buildEgressClient(port: MessagePort, options: WorkerEgressClientOptions
           `worker egress client has no control port; cannot subscribe to durable pattern "${subscription.pattern}"`,
         )
       }
+      void bridge?.fork(
+        Effect.logDebug(workerLogMessage("egress durable subscribe start"), subscribeFields(subscription.pattern)),
+      )
       wireMesh(control)
       subscriptions.set(subscription.pattern, subscription)
-      void control.listen(subscription.pattern).catch((error) => {
-        // The hub never registered the pattern, so drop the local entry: a stale
-        // subscription would route nothing yet outlive its unsubscribe handle.
-        if (subscriptions.get(subscription.pattern) === subscription) subscriptions.delete(subscription.pattern)
-        void bridge?.fork(
-          Effect.logWarning(workerLogMessage("egress durable subscribe failed"), {
-            ...peerLifecycle("egress", workerID)("warn"),
-            pattern: subscription.pattern,
-            reason: messageOf(error),
-          }),
-        )
-      })
+      void control
+        .listen(subscription.pattern)
+        .then(() => {
+          void bridge?.fork(
+            Effect.logDebug(workerLogMessage("egress durable subscribe ok"), subscribeFields(subscription.pattern)),
+          )
+        })
+        .catch((error) => {
+          // The hub never registered the pattern, so drop the local entry: a stale
+          // subscription would route nothing yet outlive its unsubscribe handle.
+          if (subscriptions.get(subscription.pattern) === subscription) subscriptions.delete(subscription.pattern)
+          void bridge?.fork(
+            Effect.logWarning(workerLogMessage("egress durable subscribe failed"), {
+              ...peerLifecycle("egress", workerID)("warn"),
+              pattern: subscription.pattern,
+              reason: messageOf(error),
+            }),
+          )
+        })
       return () => {
         if (subscriptions.get(subscription.pattern) !== subscription) return
         subscriptions.delete(subscription.pattern)

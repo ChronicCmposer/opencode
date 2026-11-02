@@ -101,7 +101,9 @@ import { markSchemaIdentity } from "@/session/worker/db"
 import { withParts } from "../../lib/session-parts"
 import { startMockProvider } from "../../lib/mock-provider"
 import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
-import { assertStructuredCloneable } from "../../lib/session-worker-init"
+import { assertStructuredCloneable, sessionWorkerInit } from "../../lib/session-worker-init"
+import { bootSessionWorker } from "../../lib/session-worker-harness"
+import { Global } from "@opencode-ai/core/global"
 import {
   DEFAULT_TEST_TIMEOUT_MS,
   REAL_WORKER_SLOW_TEST_TIMEOUT_MS,
@@ -2001,4 +2003,53 @@ describe("real SessionPrompt.loop cancellation", () => {
       fs.rmSync(directory, { recursive: true, force: true })
     }
   }, 30_000)
+})
+
+// ---------------------------------------------------------------------------
+// Boot prelude observability. A real worker reports its parsed init and the
+// generation lease claim through the shared synchronous trace sink.
+// ---------------------------------------------------------------------------
+
+describe("worker boot prelude logging", () => {
+  const readLogUntil = async (predicate: (text: string) => boolean, timeoutMs = 10_000): Promise<string> => {
+    const file = path.join(Global.Path.log, "opencode.log")
+    const deadline = Date.now() + timeoutMs
+    let text = ""
+    while (Date.now() < deadline) {
+      text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : ""
+      if (predicate(text)) return text
+      await Bun.sleep(25)
+    }
+    return text
+  }
+
+  test("a real worker reports parsed init and the lease claim", async () => {
+    const filename = path.join(workerDatabaseDirectory!, "opencode.db")
+    const sessionID = "ses_boot_prelude"
+    const handle = await bootSessionWorker({
+      timeoutMs: 20_000,
+      env: { OPENCODE_DB: filename },
+      init: {
+        ...sessionWorkerInit(),
+        sessionID,
+        workerID: 7,
+        capabilities: { sessionWorkerPorts: true },
+      },
+    })
+    try {
+      const text = await readLogUntil(
+        (entry) =>
+          entry.includes(sessionID) &&
+          entry.includes("worker init parsed") &&
+          entry.includes("worker lease claim start") &&
+          entry.includes("worker lease claim end"),
+      )
+      expect(text).toContain("worker init parsed")
+      expect(text).toContain("worker lease claim start")
+      expect(text).toContain("worker lease claim end")
+      expect(text).toContain(`"sessionID":"${sessionID}"`)
+    } finally {
+      await handle.terminate()
+    }
+  })
 })

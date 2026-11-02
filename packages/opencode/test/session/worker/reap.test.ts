@@ -8,6 +8,7 @@ import { DEFAULT_REAP_MS, REAP_MS_ENV, resolveReapMs } from "@/session/worker/po
 import { createFakeWorkerPool } from "../../lib/fake-worker-pool"
 import { createRecordingScheduler } from "../../lib/scheduler"
 import { flush, sid } from "../../lib/async"
+import { lineFor, recordingLogger } from "../../lib/recorders"
 
 describe("session worker reap", () => {
   test("resolves the reap env inline with a 5 minute default", () => {
@@ -133,6 +134,49 @@ describe("session worker reap", () => {
     await second
     await flush()
     expect(scheduler.pending().filter((timer) => timer.delayMs === 1_000)).toHaveLength(1)
+    await dispatcher.terminateAll()
+  })
+
+
+  test("a 50 ms reap racing a new session is abandoned while background work runs", async () => {
+    const pool = createFakeWorkerPool(1)
+    const scheduler = createRecordingScheduler()
+    const recorder = recordingLogger({ minimumLogLevel: "Debug" })
+    const dispatcher = createDispatcher({
+      pool,
+      schedule: scheduler.schedule,
+      reapMs: 50,
+      bridge: recorder.bridge,
+    })
+
+    const first = dispatcher.dispatch({ sessionID: sid("ses_race") })
+    await flush()
+    const worker = pool.spawned[0]
+    worker.finish(sid("ses_race"))
+    await first
+    await flush()
+
+    // A new session dispatches while the first session's reap is pending; the
+    // first session's background job still owns its isolate, so the window is
+    // abandoned and re-armed instead of retiring it.
+    worker.backgroundWork = true
+    const other = dispatcher.dispatch({ sessionID: sid("ses_other") })
+    await flush()
+    scheduler.fire()
+    await flush()
+
+    const abandoned = lineFor(recorder.lines, "idle reap abandoned")
+    expect(abandoned.level).toBe("info")
+    expect(abandoned.fields).toMatchObject({
+      sessionID: "ses_race",
+      active: true,
+      reason: "background-work",
+    })
+    expect(worker.alive).toBe(true)
+    expect(scheduler.pending().map((timer) => timer.delayMs)).toEqual([50])
+
+    pool.spawned[1].finish(sid("ses_other"))
+    await other
     await dispatcher.terminateAll()
   })
 

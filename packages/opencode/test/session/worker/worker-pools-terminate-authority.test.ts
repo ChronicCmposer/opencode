@@ -9,7 +9,7 @@ import { makeProduction, makeSpawnGate, workerShutdownStats } from "@/session/wo
 import type { ProductionWorkerPoolOptions } from "@/session/worker/worker-pools"
 import type { ExecutorWorkerPool } from "@/session/worker/execute"
 import { createDispatcher } from "../../lib/dispatcher"
-import { recordingBridgeFrom, type RecordedLog } from "../../lib/recorders"
+import { recordingBridgeFrom, lineFor, type RecordedLog } from "../../lib/recorders"
 import { createRecordingScheduler } from "../../lib/scheduler"
 import { flush, pollUntil, sid } from "../../lib/async"
 
@@ -188,6 +188,54 @@ describe("one isolate-terminate authority", () => {
     const next = await gate.acquire()
     expect(gate.active).toBe(1)
     next.release()
+  })
+
+  test("the spawn gate logs its request, grant, and release", async () => {
+    const lines: RecordedLog[] = []
+    const gate = makeSpawnGate({
+      timeoutMs: 1_000,
+      capacity: 1,
+      bridge: recordingBridgeFrom((line) => lines.push(line), "Debug"),
+    })
+    const permit = await gate.acquire()
+
+    expect(lineFor(lines, "spawn gate request")).toMatchObject({
+      level: "debug",
+      fields: { permitId: 1, active: 0, waiting: 0, capacity: 1 },
+    })
+    expect(lineFor(lines, "spawn gate granted")).toMatchObject({
+      level: "info",
+      fields: { permitId: 1, active: 1, waiting: 0 },
+    })
+
+    permit.release("ready")
+    await pollUntil(() => lines.some((line) => line.message.endsWith("spawn gate released")), {
+      message: "the spawn gate never logged its release",
+    })
+    expect(lineFor(lines, "spawn gate released")).toMatchObject({
+      level: "info",
+      fields: { permitId: 1, active: 0, waiting: 0, outcome: "ready" },
+    })
+    await gate.close?.()
+  })
+
+  test("the spawn gate logs a timeout before failing", async () => {
+    const lines: RecordedLog[] = []
+    const gate = makeSpawnGate({
+      timeoutMs: 20,
+      capacity: 1,
+      bridge: recordingBridgeFrom((line) => lines.push(line), "Debug"),
+    })
+    const holder = await gate.acquire()
+
+    await expect(gate.acquire()).rejects.toThrow(/spawn gate/)
+    expect(lineFor(lines, "spawn gate timeout")).toMatchObject({
+      level: "warn",
+      fields: { permitId: 2, timeoutMs: 20 },
+    })
+
+    holder.release()
+    await gate.close?.()
   })
 
   test("a crash retires the isolate through one orderly close", async () => {

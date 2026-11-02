@@ -22,6 +22,7 @@ import { Deferred, Effect, Schema, Schedule, type Scope } from "effect"
 import { openConnection, type Connection } from "./connection"
 import { BusyExhaustedError } from "./busy"
 import { inImmediateTransaction, retryBusySync, type BusyRetryConfig } from "./transaction"
+import { dbTrace } from "../observability/sync-trace"
 
 const SCHEMA_GATE_TABLE_SQL =
   "CREATE TABLE IF NOT EXISTS schema_gate (id INTEGER PRIMARY KEY CHECK (id = 1), owner TEXT NOT NULL, expires_at INTEGER NOT NULL)"
@@ -124,9 +125,15 @@ interface GateRow {
   readonly expires_at: number
 }
 
-function readGateExpiry(connection: Pick<Connection, "all">): number | undefined {
+interface GateState {
+  readonly owner: string | undefined
+  readonly expiresAt: number
+}
+
+function readGate(connection: Pick<Connection, "all">): GateState | undefined {
   const row = connection.all<GateRow>("SELECT owner, expires_at FROM schema_gate WHERE id = 1")[0]
-  return row === undefined ? undefined : Number(row.expires_at)
+  if (row === undefined) return undefined
+  return { owner: row.owner, expiresAt: Number(row.expires_at) }
 }
 
 function holdGate(connection: Pick<Connection, "run">, token: GateToken): void {
@@ -138,19 +145,21 @@ function holdGate(connection: Pick<Connection, "run">, token: GateToken): void {
 
 export type GateAttempt =
   | { readonly acquired: true }
-  | { readonly acquired: false; readonly heldUntil: number | undefined }
+  | { readonly acquired: false; readonly heldUntil: number | undefined; readonly owner: string | undefined }
 
 /**
  * One acquisition attempt. Not acquired means a live lease is held elsewhere
- * (`heldUntil` is its expiry) or the sidecar's write lock stayed busy; both mean
- * "poll again", never "fail the migration".
+ * (`heldUntil` is its expiry, `owner` its holder) or the sidecar's write lock
+ * stayed busy; both mean "poll again", never "fail the migration".
  */
 export function attemptSchemaGate(connection: Connection, token: GateToken): GateAttempt {
   try {
     return inImmediateTransaction(connection, (tx): GateAttempt => {
       tx.exec(SCHEMA_GATE_TABLE_SQL)
-      const heldUntil = readGateExpiry(tx)
-      if (heldUntil !== undefined && heldUntil > Date.now()) return { acquired: false, heldUntil }
+      const gate = readGate(tx)
+      if (gate !== undefined && gate.expiresAt > Date.now()) {
+        return { acquired: false, heldUntil: gate.expiresAt, owner: gate.owner }
+      }
       // Start the lease at acquisition, not at token creation: a caller that
       // waited out a peer's migration must not hold an already-expired row.
       token.expiresAt = Date.now() + token.ttlMs
@@ -158,7 +167,7 @@ export function attemptSchemaGate(connection: Connection, token: GateToken): Gat
       return { acquired: true }
     })
   } catch (error) {
-    if (error instanceof BusyExhaustedError) return { acquired: false, heldUntil: undefined }
+    if (error instanceof BusyExhaustedError) return { acquired: false, heldUntil: undefined, owner: undefined }
     throw error
   }
 }
@@ -195,6 +204,11 @@ export function releaseSchemaGate(connection: Pick<Connection, "run">, token: Ga
         `[schema-gate] failed to release lease ${token.owner}: ${describeError(deleteError)}; ` +
           `fallback expiry failed: ${describeError(expireError)}`,
       )
+      dbTrace("schema-gate", "error", "release failed", {
+        owner: token.owner,
+        reason: describeError(deleteError),
+        fallback: describeError(expireError),
+      })
     }
   }
 }
@@ -268,18 +282,26 @@ export function startSchemaGateRenewal(
   return { lost, stop }
 }
 
+export interface SchemaGateWait {
+  readonly attempt: number
+  readonly heldUntil: number | undefined
+  readonly owner: string | undefined
+}
+
 export async function waitForSchemaGateAsync(
   connection: Connection,
   token: GateToken,
   timeoutMs: number = SCHEMA_GATE_TIMEOUT_MS,
-  onWait?: () => void,
+  onWait?: (info: SchemaGateWait) => void,
 ): Promise<void> {
   let deadline = Date.now() + timeoutMs
+  let attempt = 0
   while (true) {
-    const attempt = attemptSchemaGate(connection, token)
-    if (attempt.acquired) return
-    onWait?.()
-    deadline = extendDeadline(deadline, attempt)
+    const result = attemptSchemaGate(connection, token)
+    if (result.acquired) return
+    attempt += 1
+    onWait?.({ attempt, heldUntil: result.heldUntil, owner: result.owner })
+    deadline = extendDeadline(deadline, result)
     if (Date.now() > deadline) throw new SchemaGateTimeoutError()
     await new Promise((resolve) => setTimeout(resolve, SCHEMA_GATE_POLL_MS))
   }

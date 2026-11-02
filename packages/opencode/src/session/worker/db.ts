@@ -31,6 +31,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { DurableLog, createDurableRepository } from "@opencode-ai/core/durable-log"
 import { makeSqliteClient, type SqliteNativeRunner } from "@opencode-ai/core/database/sqlite-adapter"
+import { syncTrace } from "@opencode-ai/core/observability/sync-trace"
 import {
   openNodeConnection,
   type Authorizer,
@@ -57,6 +58,7 @@ import { leadingKeyword, makeRepository } from "./repository/write"
 import type { WorkerRepository } from "./repository/types"
 import { DURABLE_LOG_TABLES, SESSION_IMMUTABLE_COLUMNS, WORKER_READABLE_HUB_TABLES } from "./repository/policy"
 import { WORKER_DB_KEY } from "./node-table"
+import { WORKER_LOG_PREFIX } from "./worker-logging"
 
 export { SCHEMA_VERSION, WORKER_WRITABLE_TABLES, deriveSessionScopedTables }
 
@@ -381,10 +383,39 @@ export function openWorkerDatabase(
           filename: options.filename,
           ...(options.pragmas === undefined ? {} : { pragmas: options.pragmas }),
           foreignKeys: true,
+          onRetry: (event) =>
+            syncTrace({
+              prefix: WORKER_LOG_PREFIX,
+              level: "debug",
+              event: "worker db open busy retry",
+              fields: {
+                filename: options.filename,
+                sessionID: options.sessionID,
+                attempt: event.attempt,
+                delayMs: event.delayMs,
+              },
+            }),
           initialize: (scoped) => {
             // Gate before the TEMP views exist: `PRAGMA table_info`/`foreign_key_list`
             // must inspect the real schema, not view projections.
-            assertSchema(scoped, options.filename)
+            try {
+              assertSchema(scoped, options.filename)
+            } catch (error) {
+              if (error instanceof SchemaMismatch) {
+                syncTrace({
+                  prefix: WORKER_LOG_PREFIX,
+                  level: "error",
+                  event: "worker schema mismatch",
+                  fields: {
+                    filename: options.filename,
+                    sessionID,
+                    expected: error.expected,
+                    observed: error.observed,
+                  },
+                })
+              }
+              throw error
+            }
             if (options.filename !== IN_MEMORY_FILENAME) assertTableRegistry(scoped)
             if (sessionID !== undefined) installBoundViews(scoped, sessionID)
             // The typed repository already binds/validates its own writes. The
@@ -418,6 +449,18 @@ export function openWorkerDatabase(
                 filename: options.filename,
                 ...(options.pragmas === undefined ? {} : { pragmas: options.pragmas }),
                 foreignKeys: true,
+                onRetry: (event) =>
+                  syncTrace({
+                    prefix: WORKER_LOG_PREFIX,
+                    level: "debug",
+                    event: "worker db open busy retry",
+                    fields: {
+                      filename: options.filename,
+                      sessionID,
+                      attempt: event.attempt,
+                      delayMs: event.delayMs,
+                    },
+                  }),
                 initialize: (scoped) => {
                   scoped.function(SCOPE_FUNCTION, () => sessionID)
                   installScopeTriggers(scoped, DURABLE_LOG_TABLE_SET)
