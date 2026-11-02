@@ -21,6 +21,7 @@ import { EXECUTOR_BUSY_RETRY_CONFIG, retryBusySync } from "@opencode-ai/core/dat
 import { withBusyRetry, type BusyExhaustedError } from "@opencode-ai/core/database/busy"
 import { Context, Deferred, Duration, Effect, Exit, FiberSet, Layer, Schedule, Schema, Scope, Semaphore } from "effect"
 import { resolveWorkerEntry } from "./port"
+import { workerLogMessage } from "./worker-logging"
 
 export type DbParams = ReadonlyArray<unknown> | Record<string, unknown>
 
@@ -503,6 +504,7 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
   const retire = (error: DbExecutorError, orderly: boolean): Effect.Effect<void> =>
     workerGate.withPermits(1)(
       Effect.suspend(() => {
+        const startedAt = Date.now()
         const live = state.worker
         const stale = state.staleWorker
         state.worker = undefined
@@ -510,17 +512,31 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
         failBoot(error)
         failPending(error)
         return Effect.gen(function* () {
+          yield* Effect.logInfo(workerLogMessage("db executor retire begin"), {
+            orderly,
+            reason: error.message,
+          })
           if (live !== undefined) {
             if (orderly) yield* closeWorkerDatabase(live, state.nextId++)
             yield* terminateWorker(live)
           }
           if (stale !== undefined) yield* terminateWorker(stale)
-        })
+        }).pipe(
+          Effect.ensuring(
+            Effect.suspend(() =>
+              Effect.logInfo(workerLogMessage("db executor retire settled"), {
+                orderly,
+                elapsedMs: Date.now() - startedAt,
+              }),
+            ),
+          ),
+        )
       }),
     )
 
   const bootWorker = (ready: Deferred.Deferred<void, DbExecutorError>): Effect.Effect<void> =>
     Effect.gen(function* () {
+      const bootStartedAt = Date.now()
       yield* workerGate
         .withPermits(1)(
           Effect.gen(function* () {
@@ -528,6 +544,7 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
             const stale = state.staleWorker
             state.staleWorker = undefined
             if (stale !== undefined) yield* terminateWorker(stale)
+            yield* Effect.logInfo(workerLogMessage("db executor spawn begin"), { filename: options.filename })
             const spawned = yield* Effect.try({
               try: () => {
                 const workerOptions = {
@@ -544,6 +561,11 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
               catch: (error) => crashedError(`db executor worker failed to start: ${errorMessage(error)}`),
             })
             state.worker = spawned
+            yield* Effect.logInfo(workerLogMessage("db executor spawn"), {
+              filename: options.filename,
+              threadId: (spawned as unknown as { readonly threadId?: number }).threadId,
+              elapsedMs: Date.now() - bootStartedAt,
+            })
             spawned.onmessage = (event: MessageEvent<DbExecutorResponse>) => {
               // A retired worker's late frames must never settle a request for, or
               // resolve, a replacement thread.
@@ -551,6 +573,12 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
               const message = event.data
               if (message.type === "ready") {
                 state.executorThreadId = message.threadId
+                Effect.runSync(
+                  Effect.logInfo(workerLogMessage("db executor ready"), {
+                    threadId: message.threadId,
+                    elapsedMs: Date.now() - bootStartedAt,
+                  }),
+                )
                 Deferred.doneUnsafe(ready, Effect.void)
                 return
               }
@@ -591,10 +619,27 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
   const ensureReady = (): Effect.Effect<void, DbExecutorError> =>
     Effect.suspend(() => {
       if (state.closed) return Effect.fail(closedError())
-      if (state.ready !== undefined) return Deferred.await(state.ready)
+      const bootWait = Effect.suspend(() =>
+        Effect.logDebug(workerLogMessage("db executor boot wait"), {
+          pendingCount: state.pending.size,
+          executorThreadId: state.executorThreadId,
+        }),
+      )
+      const bootReady = Effect.suspend(() =>
+        Effect.logDebug(workerLogMessage("db executor boot ready"), {
+          executorThreadId: state.executorThreadId,
+        }),
+      )
+      if (state.ready !== undefined) {
+        return Deferred.await(state.ready)
+      }
       const ready = Deferred.makeUnsafe<void, DbExecutorError>()
       state.ready = ready
-      return Effect.forkIn(bootWorker(ready), scope).pipe(Effect.flatMap(() => Deferred.await(ready)))
+      return bootWait.pipe(
+        Effect.andThen(Effect.forkIn(bootWorker(ready), scope)),
+        Effect.andThen(Deferred.await(ready)),
+        Effect.andThen(bootReady),
+      )
     })
 
   const requestOnce = (build: (id: number) => DbExecutorRequest): Effect.Effect<unknown, DbExecutorError> =>
@@ -604,7 +649,14 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
       const current = state.worker
       if (current === undefined) return yield* crashedError("db executor worker is not running")
       const id = state.nextId++
+      const request = build(id)
+      yield* Effect.logDebug(workerLogMessage("db executor request"), {
+        requestId: id,
+        kind: request.type,
+        queueDepth: state.pending.size,
+      })
       return yield* Effect.callback<unknown, DbExecutorError>((resume) => {
+        const startedAt = Date.now()
         let done = false
         let timer: ReturnType<typeof setTimeout> | undefined
         const clearTimer = (): void => {
@@ -623,6 +675,15 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
             done = true
             clearTimer()
             state.pending.delete(id)
+            Effect.runSync(
+              Effect.logError(workerLogMessage("db executor request timeout"), {
+                requestId: id,
+                kind: request.type,
+                timeoutMs,
+                pendingCount: state.pending.size,
+                transactionOpen: state.transactionOpen,
+              }),
+            )
             // A deadline is indeterminate: the transaction may have committed
             // before the response was lost. Retire the whole thread so a retry
             // starts on a fresh connection and no half-open transaction is
@@ -639,11 +700,31 @@ function createExecutorCore(options: DbExecutorOptions, scope: Scope.Scope): Exe
           }, timeoutMs)
         }
         state.pending.set(id, {
-          resolve: (value) => finish(Effect.succeed(value)),
-          reject: (error) => finish(Effect.fail(error)),
+          resolve: (value) => {
+            Effect.runSync(
+              Effect.logDebug(workerLogMessage("db executor request settled"), {
+                requestId: id,
+                kind: request.type,
+                outcome: "ok",
+                elapsedMs: Date.now() - startedAt,
+              }),
+            )
+            finish(Effect.succeed(value))
+          },
+          reject: (error) => {
+            Effect.runSync(
+              Effect.logDebug(workerLogMessage("db executor request settled"), {
+                requestId: id,
+                kind: request.type,
+                outcome: "error",
+                elapsedMs: Date.now() - startedAt,
+              }),
+            )
+            finish(Effect.fail(error))
+          },
         })
         try {
-          current.postMessage(build(id))
+          current.postMessage(request)
         } catch (error) {
           finish(Effect.fail(crashedError(`db executor request failed: ${errorMessage(error)}`)))
         }

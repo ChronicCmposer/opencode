@@ -1143,9 +1143,32 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     }
     // Read the authoritative outcome BEFORE deleting the active-run record; the run `done` reply returns exactly this value.
     commitOutcomes.set(sessionID, { committed })
+    const startedAt = Date.now()
+    void bridge?.fork(
+      Effect.logInfo(workerLogMessage("run barrier wait"), {
+        sessionID,
+        barrierState: barrier.state(sessionID),
+        missing: activeRuns.get(sessionID)?.missing(),
+        committed,
+      }),
+    )
     try {
       await runPromise(barrier.wait(sessionID))
+    } catch (error) {
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("run barrier wait failed"), {
+          sessionID,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      )
+      throw error
     } finally {
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("run barrier wait settled"), {
+          sessionID,
+          elapsedMs: Date.now() - startedAt,
+        }),
+      )
       activeRuns.delete(sessionID)
     }
   }
@@ -1160,7 +1183,15 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   const retiredLeaseReleaseTimeoutMs = options.retiredLeaseReleaseTimeoutMs ?? 5_000
 
   const queueRetiredLeaseRelease = (sessionID: SessionID, task: () => Promise<void>): Promise<void> => {
-    const previous = retiredLeaseReleases.get(sessionID) ?? Promise.resolve()
+    const startedAt = Date.now()
+    const existing = retiredLeaseReleases.get(sessionID)
+    void bridge?.fork(
+      Effect.logInfo(workerLogMessage("retired lease release queued"), {
+        sessionID,
+        hasPredecessor: existing !== undefined,
+      }),
+    )
+    const previous = existing ?? Promise.resolve()
     const next = previous.then(task).catch((error: unknown) => {
       void bridge?.fork(
         Effect.logWarning(workerLogMessage("retired lease release failed"), {
@@ -1172,6 +1203,12 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     retiredLeaseReleases.set(sessionID, next)
     void next.finally(() => {
       if (retiredLeaseReleases.get(sessionID) === next) retiredLeaseReleases.delete(sessionID)
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("retired lease release settled"), {
+          sessionID,
+          elapsedMs: Date.now() - startedAt,
+        }),
+      )
     })
     return next
   }
@@ -1198,8 +1235,20 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   /** Zero the retired generation's lease with a conditional update on the exact owner captured at retirement start. */
   const releaseRetiredLease = (sessionID: SessionID, retiredOwnerID: string | undefined): Promise<void> => {
     if (db === undefined || retiredOwnerID === undefined) return Promise.resolve()
+    const startedAt = Date.now()
+    void bridge?.fork(
+      Effect.logInfo(workerLogMessage("retired lease release begin"), { sessionID, retiredOwnerID }),
+    )
     return queueRetiredLeaseRelease(sessionID, async () => {
-      await releaseRetiredWorkerLease(db, sessionID, retiredOwnerID)
+      const released = await releaseRetiredWorkerLease(db, sessionID, retiredOwnerID)
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("retired lease release done"), {
+          sessionID,
+          retiredOwnerID,
+          released,
+          elapsedMs: Date.now() - startedAt,
+        }),
+      )
     })
   }
 
@@ -1218,8 +1267,22 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   }
 
   /** Successor admission waits for the retired generation's release to land. */
-  const awaitRetiredLeaseRelease = (sessionID: SessionID): Promise<void> =>
-    retiredLeaseReleases.get(sessionID) ?? Promise.resolve()
+  const awaitRetiredLeaseRelease = (sessionID: SessionID): Promise<void> => {
+    const pending = retiredLeaseReleases.get(sessionID)
+    if (pending === undefined) return Promise.resolve()
+    const startedAt = Date.now()
+    void bridge?.fork(
+      Effect.logInfo(workerLogMessage("awaiting retired lease release"), { sessionID }),
+    )
+    return pending.finally(() => {
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("retired lease release wait settled"), {
+          sessionID,
+          elapsedMs: Date.now() - startedAt,
+        }),
+      )
+    })
+  }
 
   /** Bound ONLY the retired lease UPDATE. */
   const awaitBoundedRetiredLeaseRelease = (sessionID: SessionID, release: Promise<void>): Promise<void> => {
@@ -1442,6 +1505,10 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
         await releaseGenerationResources(sessionID, workerID, { lost: false }, options.onGenerationReleased)
       },
       onSessionReleased: async (sessionID, workerID) => {
+        const startedAt = Date.now()
+        void bridge?.fork(
+          Effect.logInfo(workerLogMessage("session release hook begin"), { sessionID, workerID }),
+        )
         let failure: unknown
         let failed = false
         const rememberFailure = (error: unknown): void => {
@@ -1482,7 +1549,21 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
           }
         }
 
-        if (failed) throw failure
+        const logSettled = (): void => {
+          void bridge?.fork(
+            Effect.logInfo(workerLogMessage("session release hook settled"), {
+              sessionID,
+              workerID,
+              failed,
+              elapsedMs: Date.now() - startedAt,
+            }),
+          )
+        }
+        if (failed) {
+          logSettled()
+          throw failure
+        }
+        logSettled()
       },
       ...defined({
         cancellation,
@@ -1502,6 +1583,23 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
   const resolveDepth = (sessionID: SessionID): number =>
     options.depthOf === undefined ? 0 : boundedDispatchDepth(options.depthOf(sessionID))
 
+  /** Record the dispatch-time ownership snapshot before any admission awaits. */
+  const logDispatchSnapshot = (sessionID: SessionID, origin?: DispatchOrigin): void => {
+    const entry = dispatcher.registry.entry(sessionID)
+    void bridge?.fork(
+      Effect.logInfo(workerLogMessage("dispatch hub snapshot"), {
+        sessionID,
+        origin,
+        hasRun: dispatcher.registry.has(sessionID),
+        workerID: entry?.workerID,
+        workerState: entry?.state,
+        retiringCount: dispatcher.retiringCount,
+        barrierState: barrier.state(sessionID),
+        retiredLeasePending: retiredLeaseReleases.has(sessionID),
+      }),
+    )
+  }
+
   return {
     dispatcher,
     cache,
@@ -1515,6 +1613,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
     ...(options.workerIncompatibility === undefined ? {} : { workerIncompatibility: options.workerIncompatibility }),
     ensureRunningEffect: (sessionID, origin) =>
       Effect.gen(function* () {
+        logDispatchSnapshot(sessionID, origin)
         // Capture the caller's ambient context synchronously; awaiting first would resume outside this fiber and lose it.
         onDispatch?.(sessionID)
         // The off-loop schema gate must complete before any isolate can spawn.
@@ -1532,6 +1631,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
         return result
       }).pipe(Effect.tapError((error) => Effect.promise(() => surfaceWorkerCrash(error, sessionID)))),
     ensureRunning: async (sessionID, origin) => {
+      logDispatchSnapshot(sessionID, origin)
       // Capture the caller's ambient context synchronously; awaiting first would resume outside this fiber and lose it.
       onDispatch?.(sessionID)
       // The off-loop schema gate must complete before any isolate can spawn.
@@ -1551,6 +1651,7 @@ export function createSessionHub(options: SessionHubOptions): SessionHub {
       }
     },
     startShell: async (sessionID, shell) => {
+      logDispatchSnapshot(sessionID)
       onDispatch?.(sessionID)
       await awaitBootGate()
       await runPromise(admitBarrier(sessionID))

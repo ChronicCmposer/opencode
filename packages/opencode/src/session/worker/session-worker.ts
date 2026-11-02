@@ -103,6 +103,14 @@ import type {
   PluginToolProgress,
 } from "./plugin-tool-wire"
 
+// Synchronous boot trace: the isolate's log bridge is not yet wired when the DB
+// opens and the ports are posted, so write directly to stderr instead.
+const traceSync = (event: string, fields: Record<string, unknown>): void => {
+  try {
+    process.stderr.write(`${workerLogMessage(event)} ${JSON.stringify(fields)}\n`)
+  } catch {}
+}
+
 /** The real model capabilities, serialized for the isolate boundary. */
 export interface SerializedModelCapabilities {
   readonly temperature: boolean
@@ -1473,12 +1481,25 @@ export function bootstrapSessionWorker(
     if (usePrompt) {
       // One connection per worker generation: the schema gate is read-only and a
       // mismatch refuses boot before any run starts (D5/D7).
+      traceSync("worker db open begin", {
+        workerID: reportedWorkerID(init, threadId),
+        sessionID: init.sessionID,
+        threadId,
+        databasePath: Database.path(),
+      })
+      const dbOpenStartedAt = Date.now()
       database = WorkerRuntime.runSync(
         openWorkerDatabase({
           filename: Database.path(),
           ...(init.sessionID === undefined ? {} : { sessionID: init.sessionID }),
         }),
       )
+      traceSync("worker db open done", {
+        workerID: reportedWorkerID(init, threadId),
+        sessionID: init.sessionID,
+        threadId,
+        elapsedMs: Date.now() - dbOpenStartedAt,
+      })
       const egressChannel = new MessageChannel()
       // A dedicated control plane, so durable wakeups and resync never queue
       // behind the delta stream; without it the egress mesh is dead in production.
@@ -1491,6 +1512,11 @@ export function bootstrapSessionWorker(
         },
         [egressChannel.port2, egressControlChannel.port2].map(transferable),
       )
+      traceSync("worker ports posted", {
+        workerID: reportedWorkerID(init, threadId),
+        sessionID: init.sessionID,
+        threadId,
+      })
       clients = buildWorkerClients(
         {
           egress: egressChannel.port1,
@@ -1511,6 +1537,11 @@ export function bootstrapSessionWorker(
       // three proxies (each call is correlated by the client's own request id).
       const hubProxyChannel = new MessageChannel()
       scope.postMessage({ type: "hub-proxy", port: hubProxyChannel.port2 }, [transferable(hubProxyChannel.port2)])
+      traceSync("worker hub-proxy posted", {
+        workerID: reportedWorkerID(init, threadId),
+        sessionID: init.sessionID,
+        threadId,
+      })
       const client = createHubProxyClient(hubProxyChannel.port1, hubProxyClientOptions(init, threadId))
       hubProxyClient = client
       options.observeHubProxy?.(client)
@@ -1678,6 +1709,11 @@ export function bootstrapSessionWorker(
     })
     const slot = init.workerID
     const installExecutor = options.installExecutor ?? installSessionExecutor
+    traceSync("worker ready posting", {
+      workerID: reportedWorkerID(init, threadId),
+      sessionID: init.sessionID,
+      threadId,
+    })
     installed = installExecutor(scope, {
       work,
       threadId,
@@ -1716,6 +1752,11 @@ export function bootstrapSessionWorker(
             onRunStart: (sessionID) => namer.bind(sessionID, true),
             onIdle: () => Effect.sync(() => namer.onIdle()),
           }),
+    })
+    traceSync("worker ready posted", {
+      workerID: reportedWorkerID(init, threadId),
+      sessionID: init.sessionID,
+      threadId,
     })
 
     return {

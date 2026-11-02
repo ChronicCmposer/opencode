@@ -645,10 +645,20 @@ function buildDispatcher(
       if (terminated || hasRun(sessionID) || hasWaiters(sessionID)) return
       const worker = workers.worker(sessionID)
       if (worker === undefined) return
+      const startedAt = Date.now()
+      void bridge?.fork(Effect.logInfo(workerLogMessage("idle reap probe start"), { sessionID, workerID: worker.id }))
       const active = yield* Effect.tryPromise({
         try: () => hasActiveWork(worker, sessionID),
         catch: (error) => error,
       }).pipe(Effect.orElseSucceed(() => false))
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("idle reap probe settled"), {
+          sessionID,
+          workerID: worker.id,
+          active,
+          elapsedMs: Date.now() - startedAt,
+        }),
+      )
       // Re-check after the await: a new run or parked waiter must win, and a
       // retired/replaced worker must not be touched by this stale timer.
       if (terminated || hasRun(sessionID) || hasWaiters(sessionID)) return
@@ -659,6 +669,13 @@ function buildDispatcher(
         scheduleReap(sessionID)
         return
       }
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("idle reap retire dispatched"), {
+          sessionID,
+          workerID: worker.id,
+          idleMs: reapMs,
+        }),
+      )
       retireWorker(sessionID)
       void bridge?.fork(
         Effect.logInfo(workerLogMessage("session worker reaped"), {
@@ -771,7 +788,17 @@ function buildDispatcher(
     // be async (the hub's lease release is an executor round-trip); await it in
     // the same fiber so a successor waits for the release too.
     const exit = Deferred.makeUnsafe<void>()
+    const startedAt = Date.now()
     retiringDone.set(sessionID, exit)
+    void bridge?.fork(
+      Effect.logInfo(workerLogMessage("retirement started"), {
+        sessionID,
+        workerID: worker.id,
+        scope,
+        alive: worker.alive,
+        retiringCount: retiringDone.size,
+      }),
+    )
     let releasing: Promise<void> | undefined
     /** Run the release hook exactly once, even if the terminate watchdog races. */
     const release = (): Promise<void> => {
@@ -834,6 +861,13 @@ function buildDispatcher(
      * fiber's `onExit` after the idempotent release has settled (or failed).
      */
     const completeRetired = (): void => {
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("retirement release complete"), {
+          sessionID,
+          workerID: worker.id,
+          elapsedMs: Date.now() - startedAt,
+        }),
+      )
       if (retiringDone.get(sessionID) === exit) retiringDone.delete(sessionID)
       Deferred.doneUnsafe(exit, Effect.void)
     }
@@ -914,7 +948,17 @@ function buildDispatcher(
       // release directly: skipping it would leave the retired lease live and
       // the old epoch unadvanced. This runs synchronously, before any successor
       // dispatch can create a new entry.
-      if (workerID === undefined) return Promise.resolve()
+      if (workerID === undefined) {
+        void bridge?.fork(
+          Effect.logWarning(workerLogMessage("retire generation skipped"), {
+            sessionID,
+            workerID,
+            currentWorkerID: workers.entry(sessionID)?.workerID,
+            reason: "no-entry",
+          }),
+        )
+        return Promise.resolve()
+      }
       clearIdle(sessionID)
       detachController(workerID)
       return invokeGenerationRelease(sessionID, workerID)
@@ -924,12 +968,29 @@ function buildDispatcher(
       // was retired when its registry entry was replaced. Running the
       // generation hook now would advance the CURRENT generation's ask epoch
       // and cancel the successor's asks, so this stale report is a no-op.
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("retire generation skipped"), {
+          sessionID,
+          workerID,
+          currentWorkerID: worker.id,
+          reason: "worker-mismatch",
+        }),
+      )
       return Promise.resolve()
     }
     // A terminal retirement already owns this session's release gate; join its
     // release rather than starting a second, competing one.
     const retiring = retiringDone.get(sessionID)
-    if (retiring !== undefined) return runPromise(Deferred.await(retiring))
+    if (retiring !== undefined) {
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("retire generation joined terminal retirement"), {
+          sessionID,
+          workerID,
+          retiringCount: retiringDone.size,
+        }),
+      )
+      return runPromise(Deferred.await(retiring))
+    }
     clearIdle(sessionID)
     detachController(worker.id)
     return beginRetirement(sessionID, worker, "generation")
@@ -1030,6 +1091,7 @@ function buildDispatcher(
         // A successor must re-observe ownership after this turn, never re-enter
         // the caller's stack synchronously when the exit signal is already set.
         yield* Effect.yieldNow
+        const startedAt = Date.now()
         const settled = yield* awaitTerminating(pending.sessionID, exit)
         // A timed-out retirement is still live. Keep it in `retiringDone` so
         // `retiringCount`/`awaitRelease` remain accurate; the successor still
@@ -1041,6 +1103,16 @@ function buildDispatcher(
           pending.gate.claim("cancel")
           rejectRun(pending, cancelled(pending.sessionID))
           return
+        }
+        if (!settled) {
+          void bridge?.fork(
+            Effect.logWarning(workerLogMessage("successor admitted despite unanswered retirement"), {
+              sessionID: pending.sessionID,
+              workerID: pending.phase.workerID,
+              elapsedMs: Date.now() - startedAt,
+              timeoutMs: terminateTimeoutMs,
+            }),
+          )
         }
         start(pending, { permitLiveRetirement: !settled })
       }),
@@ -1112,6 +1184,15 @@ function buildDispatcher(
     }
     const exiting = startOptions.permitLiveRetirement === true ? undefined : retiringDone.get(pending.sessionID)
     if (exiting !== undefined) {
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("successor deferred until retired"), {
+          sessionID: pending.sessionID,
+          workerID: pending.phase.workerID,
+          gate: "pre-replace",
+          retiringCount: retiringDone.size,
+          waiterQueueDepth: waiters.get(pending.sessionID)?.length ?? 0,
+        }),
+      )
       deferUntilRetired(pending, exiting)
       return
     }
@@ -1123,6 +1204,15 @@ function buildDispatcher(
     // already timed out is bypassed explicitly (it stays visible for diagnostics).
     const replaced = startOptions.permitLiveRetirement === true ? undefined : retiringDone.get(pending.sessionID)
     if (replaced !== undefined) {
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("successor deferred until retired"), {
+          sessionID: pending.sessionID,
+          workerID: pending.phase.workerID,
+          gate: "post-replace",
+          retiringCount: retiringDone.size,
+          waiterQueueDepth: waiters.get(pending.sessionID)?.length ?? 0,
+        }),
+      )
       deferUntilRetired(pending, replaced)
       return
     }
@@ -1136,6 +1226,7 @@ function buildDispatcher(
         workerID: worker.id,
         depth: pending.depth,
         queueDepth: waiters.get(pending.sessionID)?.length ?? 0,
+        retiringCount: retiringDone.size,
       }),
     )
     const run: SessionRun = {
@@ -1182,6 +1273,14 @@ function buildDispatcher(
     const finish = (): void => {
       if (finalized) return
       finalized = true
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("write barrier settled"), {
+          sessionID: pending.sessionID,
+          workerID: pending.phase.workerID,
+          elapsedMs: Date.now() - barrierStartedAt,
+          finalizedByCancel: pending.gate.winner === "cancel",
+        }),
+      )
       pending.phase = { ...pending.phase, completionBarrierInFlight: false }
       // A cancel that already claimed this run owns release/retire/promotion
       // once the barrier resolves, so it must not be finalized as a completion.
@@ -1192,6 +1291,15 @@ function buildDispatcher(
     const reported = pool.resultFor?.(pending.sessionID)?.committed
     const carried =
       options.commitOutcome?.(pending.sessionID) ?? (reported === undefined ? undefined : { committed: reported })
+    const barrierStartedAt = Date.now()
+    void bridge?.fork(
+      Effect.logInfo(workerLogMessage("completed run entering write barrier"), {
+        sessionID: pending.sessionID,
+        workerID: pending.phase.workerID,
+        carriedCommitted: carried?.committed,
+        timeoutMs: writeBarrierTimeoutMs,
+      }),
+    )
     let barrier: Promise<void> | undefined
     try {
       barrier = writeBarrier?.(pending.sessionID, carried)
@@ -1255,7 +1363,16 @@ function buildDispatcher(
     // A cancel owns this run's terminal decision: keep the run visible in `runs`
     // so a prompt arriving mid-grace parks instead of starting on the worker the
     // cancel is about to retire. `cancelWithGrace` releases the exact run.
-    if (phaseOf(pending).cancelPending) return
+    if (phaseOf(pending).cancelPending) {
+      void bridge?.fork(
+        Effect.logWarning(workerLogMessage("run finalize skipped: cancel pending"), {
+          sessionID: pending.sessionID,
+          workerID: phaseOf(pending).workerID,
+          waiterQueueDepth: waiters.get(pending.sessionID)?.length ?? 0,
+        }),
+      )
+      return
+    }
     // A newer run owns the session (cancel + immediate re-dispatch): settling this
     // stale run must not release the successor's reservation, delete its run
     // entry, retire its worker, or promote its waiters.
@@ -1691,14 +1808,44 @@ function buildDispatcher(
           ? { kind: "join", promise: admitted.promise }
           : { kind: "park", pending: create(sessionID, depth, mode, prompt, shell, model) }
         : { kind: "admit", pending: create(sessionID, depth, mode, prompt, shell, model) }
+    void bridge?.fork(
+      Effect.logInfo(workerLogMessage("dispatch admission snapshot"), {
+        sessionID,
+        kind: decision.kind,
+        hasRun: admitted !== undefined,
+        runAgeMs: admitted?.phase.startedAt === undefined ? undefined : Date.now() - admitted.phase.startedAt,
+        runSettled: admitted?.phase.settled,
+        runWinner: admitted?.gate.winner,
+        waiterQueueDepth: waiters.get(sessionID)?.length ?? 0,
+        retiringCount: retiringDone.size,
+        registryWorkerID: workers.entry(sessionID)?.workerID,
+        registryState: workers.entry(sessionID)?.state,
+      }),
+    )
     if (decision.kind === "park") {
       const parked = waiters.get(sessionID) ?? []
       parked.push(decision.pending)
       waiters.set(sessionID, parked)
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("dispatch parked"), {
+          sessionID,
+          waiterQueueDepth: waiters.get(sessionID)?.length ?? 0,
+          admittedWorkerID: admitted?.phase.workerID,
+        }),
+      )
     }
     if (decision.kind === "admit") runs.set(sessionID, decision.pending)
     if (decision.kind === "reject") return Promise.reject(cancelled(sessionID))
-    if (decision.kind === "join") return decision.promise
+    if (decision.kind === "join") {
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("dispatch joined in-flight run"), {
+          sessionID,
+          admittedWorkerID: admitted?.phase.workerID,
+          runAgeMs: admitted?.phase.startedAt === undefined ? undefined : Date.now() - admitted.phase.startedAt,
+        }),
+      )
+      return decision.promise
+    }
     if (decision.kind === "park") {
       clearIdle(sessionID)
       return decision.pending.promise

@@ -621,6 +621,7 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
   const execute = async (run: ExecutorRun): Promise<void> => {
     const type: SessionRunMode = run.mode ?? "run"
     const id = nextId()
+    const startedAt = Date.now()
     transport.post({
       type,
       id,
@@ -630,16 +631,49 @@ export function createExecutorWorker(options: ExecutorWorkerOptions): ExecutorWo
       ...(run.prompt === undefined || type !== "run" ? {} : { prompt: run.prompt }),
       ...(run.shell === undefined || type !== "startShell" ? {} : { shell: run.shell }),
     })
+    void bridge?.fork(
+      Effect.logInfo(workerLogMessage("worker reply wait parked"), {
+        workerID: options.id,
+        requestId: id,
+        runIdleTimeoutMs,
+      }),
+    )
     const reply = transport.waitFor(
       (message) => isAddressed(message, id) && (message.type === "done" || message.type === "error"),
       NO_REPLY_DEADLINE,
     )
     const message = runIdleTimeoutMs > 0 ? await runPromise(awaitReplyWithLiveness(transport, reply, runIdleTimeoutMs, nextId)) : await reply
+    void bridge?.fork(
+      Effect.logInfo(workerLogMessage("worker reply received"), {
+        workerID: options.id,
+        requestId: id,
+        type: message.type,
+        elapsedMs: Date.now() - startedAt,
+      }),
+    )
     if (message.type === "error") throw new Error(message.message)
     if (message.type !== "done") throw new Error(`unexpected executor reply: ${message.type}`)
     // Do not resolve the run until its durable egress write is acked, so
     // the dispatcher cannot hand this worker the next run ahead of that write.
-    await options.egressBarrier?.(run.sessionID, message.result.durable)
+    if (options.egressBarrier !== undefined) {
+      const egressStartedAt = Date.now()
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("worker egress barrier parked"), {
+          sessionID: run.sessionID,
+          workerID: options.id,
+          durable: message.result.durable,
+        }),
+      )
+      await options.egressBarrier?.(run.sessionID, message.result.durable)
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("worker egress barrier acked"), {
+          sessionID: run.sessionID,
+          workerID: options.id,
+          durable: message.result.durable,
+          elapsedMs: Date.now() - egressStartedAt,
+        }),
+      )
+    }
     recordResult(message.result)
   }
 

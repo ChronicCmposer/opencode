@@ -298,12 +298,20 @@ async function requestWorkerShutdown(worker: Worker, options: WorkerShutdownOpti
     }
     return
   }
-  if (shutdownRequested.has(worker)) return
+  if (shutdownRequested.has(worker)) {
+    void options.bridge?.fork(
+      Effect.logWarning(workerLogMessage("worker shutdown already requested"), {
+        workerID: options.workerID,
+      }),
+    )
+    return
+  }
   shutdownRequested.add(worker)
   // One post-and-wait attempt: the ack listener is armed before the frame is
   // posted, and a `postMessage` throw is a miss rather than a crash.
   const requestAndAwaitAck = (timeoutMs: number): Promise<boolean> =>
     new Promise<boolean>((resolve) => {
+      const startedAt = Date.now()
       let settled = false
       let cancelTimer: (() => void) | undefined
       const finish = (acknowledged: boolean): void => {
@@ -311,6 +319,13 @@ async function requestWorkerShutdown(worker: Worker, options: WorkerShutdownOpti
         settled = true
         cancelTimer?.()
         worker.removeEventListener?.("message", onMessage)
+        void options.bridge?.fork(
+          Effect.logInfo(workerLogMessage("worker shutdown ack attempt settled"), {
+            workerID: options.workerID,
+            acknowledged,
+            elapsedMs: Date.now() - startedAt,
+          }),
+        )
         resolve(acknowledged)
       }
       const onMessage = (event: MessageEvent): void => {
@@ -320,6 +335,12 @@ async function requestWorkerShutdown(worker: Worker, options: WorkerShutdownOpti
       }
       worker.addEventListener?.("message", onMessage)
       cancelTimer = scheduleTimeout(timeoutMs, () => finish(false))
+      void options.bridge?.fork(
+        Effect.logInfo(workerLogMessage("worker shutdown ack attempt"), {
+          workerID: options.workerID,
+          timeoutMs,
+        }),
+      )
       try {
         worker.postMessage({ type: "shutdown", id: 0 })
       } catch {
@@ -442,6 +463,14 @@ function scheduleTimeout(ms: number, fire: () => void): () => void {
 
 export function createBunExecutorTransport(options: BunExecutorTransportOptions): ExecutorTransport {
   const bridge = options.bridge
+  // Boot milestones run inside the synchronous construct path, where the bridge
+  // fiber may not get to run; stderr keeps them observable without changing it.
+  const traceSync = (event: string, fields: Record<string, unknown>): void => {
+    if (bridge === undefined) return
+    try {
+      process.stderr.write(`${workerLogMessage(event)} ${JSON.stringify(fields)}\n`)
+    } catch {}
+  }
   const timeoutMs = options.timeoutMs ?? DEFAULT_TRANSPORT_TIMEOUT_MS
   const bufferCapacity = options.bufferCapacity ?? DEFAULT_TRANSPORT_BUFFER_CAPACITY
   const gate = options.spawnGate
@@ -488,12 +517,19 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
   const constructWorker = (): Worker => {
     endPendingSpawn(reservedSpawn)
     reservedSpawn = undefined
+    const startedAt = Date.now()
+    traceSync("worker construct begin", {
+      workerID: options.workerID,
+      entry: String(options.entry),
+      queuedCount: queued.length,
+    })
     const created = new Worker(options.entry, {
       env: mergeEnv(options.env),
       smol: true,
       ...defined({ workerData: options.workerData, name: options.name }),
     })
     liveExecutorWorkers.set(created, options.databasePath ?? options.env?.OPENCODE_DB)
+    traceSync("worker construct done", { workerID: options.workerID, elapsedMs: Date.now() - startedAt })
     return created
   }
 
@@ -581,14 +617,32 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
           return
         }
         if (bootFrame?.kind === "worker-ports") {
+          void bridge?.fork(
+            Effect.logInfo(workerLogMessage("worker boot frame"), {
+              workerID: options.workerID,
+              kind: "worker-ports",
+            }),
+          )
           options.onWorkerPorts?.(bootFrame.ports)
           return
         }
         if (bootFrame?.kind === "hub-proxy") {
+          void bridge?.fork(
+            Effect.logInfo(workerLogMessage("worker boot frame"), {
+              workerID: options.workerID,
+              kind: "hub-proxy",
+            }),
+          )
           options.onHubProxyPort?.(bootFrame.port)
           return
         }
         if (bootFrame?.kind === "ready") {
+          void bridge?.fork(
+            Effect.logInfo(workerLogMessage("worker ready received"), {
+              workerID: options.workerID,
+              hasLease: bootFrame.lease !== undefined,
+            }),
+          )
           if (bootFrame.lease !== undefined) options.onLeaseClaim?.(bootFrame.lease)
           options.onPhase?.("materialize")
           if (bootLifecycle !== undefined && !bootLifecycle.start(created)) return
@@ -659,8 +713,10 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
         if (signal.aborted) throw new Error("session worker boot aborted")
         // Arm the deadline before construction so a synchronous `new Worker`
         // throw still releases the global permit (the rejection path below).
+        traceSync("worker boot timer armed", { workerID: options.workerID, bootTimeoutMs })
         bootTimer = scheduleTimeout(bootTimeoutMs, () => {
           bootTimer = undefined
+          traceSync("worker boot timeout", { workerID: options.workerID, bootTimeoutMs })
           const error = new Error(`session worker boot timeout after ${bootTimeoutMs}ms`)
           alive = false
           queued.length = 0
@@ -685,6 +741,12 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
       onRun: () => {
         clearBootTimer()
         acquired.release("ready")
+        void bridge?.fork(
+          Effect.logInfo(workerLogMessage("spawn permit release"), {
+            workerID: options.workerID,
+            outcome: "ready",
+          }),
+        )
       },
       onTelemetry: options.onBootTelemetry,
     })
@@ -716,12 +778,30 @@ export function createBunExecutorTransport(options: BunExecutorTransportOptions)
     const acquisition = new AbortController()
     bootAcquisition = acquisition
     booting = (async () => {
+      const gateStartedAt = Date.now()
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("spawn gate acquire requested"), {
+          workerID: options.workerID,
+          queuedCount: queued.length,
+        }),
+      )
       const acquired = await gate.acquire(acquisition.signal)
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("spawn gate acquired"), {
+          workerID: options.workerID,
+          elapsedMs: Date.now() - gateStartedAt,
+        }),
+      )
       // The cancel already resolved to its caller; release the permit the
       // acquisition granted and never construct the isolate. A terminate that
       // landed while waiting takes the same path without a cancel outcome.
       bootAcquisition = undefined
       if (!alive || waitingCancelled) {
+        void bridge?.fork(
+          Effect.logInfo(workerLogMessage("spawn gate acquire discarded"), {
+            workerID: options.workerID,
+          }),
+        )
         endPendingSpawn(reservedSpawn)
         reservedSpawn = undefined
         const cancelled = waitingCancelled
@@ -1207,6 +1287,13 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
       return [undefined, { ...current, tracked, idle, active, evictions: current.evictions + 1 }] as const
     })
     const sessionID = entry.sessionID
+    void options.bridge?.fork(
+      Effect.logInfo(workerLogMessage("idle eviction begin"), {
+        workerID: entry.worker.id,
+        sessionID,
+        capacity,
+      }),
+    )
     if (sessionID !== undefined) {
       // Await the retirement so a successor is never admitted while the old
       // generation's ports/lease are still live. Both the hook and the close are
@@ -1215,6 +1302,12 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
         Effect.tryPromise(() => Promise.resolve(options.onEvict({ worker: entry.worker, sessionID }))),
         "idle worker eviction timed out",
         entry,
+      )
+      void options.bridge?.fork(
+        Effect.logInfo(workerLogMessage("idle eviction hook settled"), {
+          workerID: entry.worker.id,
+          sessionID,
+        }),
       )
     }
     void options.bridge?.fork(
@@ -1228,6 +1321,12 @@ export function createIdleIsolateCap(options: IdleIsolateCapOptions): IdleIsolat
       Effect.tryPromise(() => entry.worker.terminate()),
       "idle worker terminate timed out",
       entry,
+    )
+    void options.bridge?.fork(
+      Effect.logInfo(workerLogMessage("idle eviction terminate settled"), {
+        workerID: entry.worker.id,
+        sessionID,
+      }),
     )
   })
 
@@ -1851,7 +1950,24 @@ export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Eff
         boundKey = undefined
         boundSession = undefined
         current = undefined
-        if (key !== undefined) await invalidate(key)
+        if (key !== undefined) {
+          const invalidateStartedAt = Date.now()
+          void bridge?.fork(
+            Effect.logInfo(workerLogMessage("scoped cache invalidate began"), {
+              workerID: id,
+              cacheKey: key,
+              deadIsolate,
+            }),
+          )
+          await invalidate(key)
+          void bridge?.fork(
+            Effect.logInfo(workerLogMessage("scoped cache invalidate settled"), {
+              workerID: id,
+              cacheKey: key,
+              elapsedMs: Date.now() - invalidateStartedAt,
+            }),
+          )
+        }
       }
 
       const worker: ExecutorWorker = {
@@ -1860,7 +1976,25 @@ export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Eff
           return !terminated && !isolateDead && (current === undefined || current.alive)
         },
         execute: async (run) => {
+          const capStartedAt = Date.now()
+          void bridge?.fork(
+            Effect.logInfo(workerLogMessage("worker cap acquire parked"), {
+              sessionID: run.sessionID,
+              workerID: id,
+              depth: run.depth,
+            }),
+          )
           const release = await cap.acquire(run.depth)
+          void bridge?.fork(
+            Effect.logInfo(workerLogMessage("worker cap acquired"), {
+              sessionID: run.sessionID,
+              workerID: id,
+              depth: run.depth,
+              capRunning: cap.running,
+              capQueued: cap.queued,
+              elapsedMs: Date.now() - capStartedAt,
+            }),
+          )
           try {
             if (terminated) throw new Error(`executor worker ${id} is terminated`)
             const materialized = (async () => {
@@ -1892,7 +2026,25 @@ export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Eff
               lookups.set(key, { sessionID: run.sessionID, workerID: id, init: generation.init })
               if (current === undefined) {
                 try {
+                  const cacheStartedAt = Date.now()
+                  void bridge?.fork(
+                    Effect.logInfo(workerLogMessage("scoped cache get began"), {
+                      sessionID: run.sessionID,
+                      workerID: id,
+                      generation: generation.generation,
+                      cacheKey: key,
+                    }),
+                  )
                   current = await runPromise(ScopedCache.get(cache, key))
+                  void bridge?.fork(
+                    Effect.logInfo(workerLogMessage("scoped cache get settled"), {
+                      sessionID: run.sessionID,
+                      workerID: id,
+                      generation: generation.generation,
+                      cacheKey: key,
+                      elapsedMs: Date.now() - cacheStartedAt,
+                    }),
+                  )
                 } catch (error) {
                   await invalidate(key)
                   throw error
@@ -1939,8 +2091,35 @@ export function makeProduction(options: ProductionWorkerPoolOptions): Effect.Eff
             // A terminate during the first materialization joins that same
             // close: the fresh isolate is discarded, never published. A wedged
             // boot/init resolution is bounded so shutdown cannot park on it.
-            if (pending !== undefined) await runPromise(joinWithin(pending, MATERIALIZE_JOIN_TIMEOUT_MS))
+            if (pending !== undefined) {
+              void bridge?.fork(
+                Effect.logInfo(workerLogMessage("slot terminate joining materialization"), {
+                  workerID: id,
+                  timeoutMs: MATERIALIZE_JOIN_TIMEOUT_MS,
+                }),
+              )
+              const joinStartedAt = Date.now()
+              await runPromise(joinWithin(pending, MATERIALIZE_JOIN_TIMEOUT_MS))
+              void bridge?.fork(
+                Effect.logInfo(workerLogMessage("slot terminate joined materialization"), {
+                  workerID: id,
+                  elapsedMs: Date.now() - joinStartedAt,
+                }),
+              )
+            }
+            void bridge?.fork(
+              Effect.logInfo(workerLogMessage("slot terminate invalidating cache"), {
+                workerID: id,
+              }),
+            )
+            const invalidateStartedAt = Date.now()
             await invalidateBound()
+            void bridge?.fork(
+              Effect.logInfo(workerLogMessage("slot terminate settled"), {
+                workerID: id,
+                elapsedMs: Date.now() - invalidateStartedAt,
+              }),
+            )
           })()
           return termination
         },

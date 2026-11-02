@@ -661,20 +661,53 @@ export function createProductionSessionHub(options: ProductionSessionHubOptions)
   const awaitBootGate = (): Promise<void> => {
     const databasePath = options.databasePath
     if (databasePath === undefined) return Promise.resolve()
+    if (bootGate !== undefined) {
+      void bridge?.fork(
+        Effect.logInfo(workerLogMessage("schema boot gate reused"), {
+          databasePath,
+          elapsedMs: 0,
+        }),
+      )
+      return bootGate
+    }
     // A caller-supplied gate without an exact `active` count (a test fake) keeps the legacy "held" hint; the real semaphore gate never reads it.
     const heldHint = spawnGate.active === undefined && spawnGate.held === true ? 1 : 0
-    bootGate ??= ensureProductionSchemaAsync({
+    const liveWorkers = options.liveWorkers?.() ?? liveSessionWorkerCount(databasePath) + heldHint
+    const startedAt = Date.now()
+    void bridge?.fork(
+      Effect.logInfo(workerLogMessage("schema boot gate start"), {
+        databasePath,
+        liveWorkers,
+        heldHint,
+        reused: false,
+      }),
+    )
+    bootGate = ensureProductionSchemaAsync({
       filename: databasePath,
-      liveWorkers: options.liveWorkers?.() ?? liveSessionWorkerCount(databasePath) + heldHint,
+      liveWorkers,
       ...(options.db === undefined ? {} : { executor: options.db }),
     }).then(
       () => {
+        void bridge?.fork(
+          Effect.logInfo(workerLogMessage("schema boot gate complete"), {
+            databasePath,
+            elapsedMs: Date.now() - startedAt,
+            liveWorkers,
+          }),
+        )
         // The schema gate has migrated/verified the file, so the lease table is safe to sweep.
         void sweepDeadLeasesAtStartup(databasePath, options.db, bridge)
         if (hubProxySpill !== undefined) void sweepHubProxySpillAtStartup(hubProxySpill, bridge)
         return undefined
       },
       (error: unknown) => {
+        void bridge?.fork(
+          Effect.logError(workerLogMessage("schema boot gate failed"), {
+            databasePath,
+            elapsedMs: Date.now() - startedAt,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        )
         bootGate = undefined
         throw error
       },
