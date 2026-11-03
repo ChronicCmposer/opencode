@@ -72,6 +72,7 @@ import { RipgrepBinary } from "@opencode-ai/core/ripgrep/binary"
 import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
 import { make } from "@opencode-ai/core/background-job"
 import { buildLocationServiceMap } from "@opencode-ai/core/location-services"
+import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 
 import {
   EVENT_BRIDGE_KEY,
@@ -1143,6 +1144,18 @@ function workerProjectionPolicy(database?: WorkerDatabase): SessionProjector.Pro
   }
 }
 
+/**
+ * Full-prompt workers still compose a location map because `SystemPrompt` and
+ * `Agent` use it to reach `Reference.Service`. The hub owns file watching, so
+ * workers get an inert watcher: no native `@parcel/watcher` load and no
+ * location subscriptions.
+ *
+ * `Watcher.Interface` is empty today. If it grows, this object stops
+ * type-checking, which is the intended fail-loud behavior.
+ */
+export const workerWatcherService = Watcher.Service.of({})
+const workerWatcherLayer = Layer.succeed(Watcher.Service, workerWatcherService)
+
 /** Boundary replacements every session layer needs. */
 export function boundaryReplacements(
   snapshot: WorkerSnapshot,
@@ -1169,8 +1182,12 @@ export function boundaryReplacements(
     // `AppProcess` and `Ripgrep` run IN the worker: the worker already has a real `CrossSpawnSpawner` (via `ToolRegistry`).
     [RipgrepBinary.node, snapshotRipgrepBinaryLayer(snapshot)],
     [McpBrowser.node, mcpBrowserBoundaryLayer()],
-    // The hub composes the location service map; the worker never resolves a location for a V1 session.
-    [LocationServiceMap.node, buildLocationServiceMap()],
+    // Workers still compose a location map for SystemPrompt/Agent, which use it
+    // to reach Reference.Service; the hub owns file watching. Replace the
+    // watcher node with an inert service so workers never load @parcel/watcher
+    // or subscribe to a location. The static node-table guard cannot inspect
+    // opaque Layer replacements, so this replacement is covered by tests.
+    [LocationServiceMap.node, buildLocationServiceMap([[Watcher.node, workerWatcherLayer]])],
   ]
 }
 

@@ -1,14 +1,15 @@
 import fs from "fs/promises"
 import path from "path"
 import { describe, expect } from "bun:test"
-import { DateTime, Effect, Equal, Hash, Schema } from "effect"
+import { DateTime, Effect, Equal, Hash, Layer, Schema } from "effect"
 import { Tool } from "@opencode-ai/core/tool/tool"
 import { define } from "@opencode-ai/plugin/v2/effect"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { Catalog } from "@opencode-ai/core/catalog"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { LocationServiceMap } from "@opencode-ai/core/location-services"
+import { buildLocationServiceMap, LocationServiceMap } from "@opencode-ai/core/location-services"
+import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { Location } from "@opencode-ai/core/location"
 import { PluginV2 } from "@opencode-ai/core/plugin"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -220,6 +221,30 @@ describe("LocationServiceMap", () => {
           Effect.scoped,
           Effect.provide(LocationServiceMap.Service.get(Location.Ref.make({ directory: AbsolutePath.make(dir.path) }))),
         ),
+      ),
+    ),
+  )
+
+  it.live("honors a per-node watcher replacement", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          const sentinel = Watcher.Service.of({})
+          const map = buildLocationServiceMap([[Watcher.node, Layer.succeed(Watcher.Service, sentinel)]])
+          const ref = Location.Ref.make({ directory: AbsolutePath.make(dir.path) })
+
+          const resolved = yield* Effect.gen(function* () {
+            const locations = yield* LocationServiceMap.Service
+            return yield* Effect.gen(function* () {
+              return yield* Watcher.Service
+            }).pipe(Effect.provide(locations.get(ref)), Effect.scoped)
+          }).pipe(Effect.provide(map))
+
+          expect(resolved).toBe(sentinel)
+        }),
       ),
     ),
   )

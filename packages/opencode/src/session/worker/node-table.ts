@@ -161,7 +161,13 @@ export const SESSION_EXCLUDED: readonly NodeEntry[] = [
   // layer replaces it with a snapshot-backed layer rather than a fail-loud one.
   entry("RipgrepBinary", "@opencode/RipgrepBinary", ["hub"], "excluded", "snapshot-backed binary path"),
   entry("McpBrowser", "@opencode/McpBrowser", ["hub"], "excluded", "hub-only; workers never spawn"),
-  entry("LocationServiceMap", "@opencode/example/LocationServiceMap", ["hub"], "excluded", "hub-composed location map"),
+  entry(
+    "LocationServiceMap",
+    "@opencode/example/LocationServiceMap",
+    ["hub"],
+    "excluded",
+    "hub-composed; workers compose an inert-watcher map",
+  ),
 ]
 
 /**
