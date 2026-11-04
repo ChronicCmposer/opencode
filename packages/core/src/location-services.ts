@@ -1,4 +1,4 @@
-import { Effect, Layer, LayerMap } from "effect"
+import { Duration, Effect, Layer, LayerMap } from "effect"
 import { AgentV2 } from "./agent"
 import { AISDK } from "./aisdk"
 import { Catalog } from "./catalog"
@@ -81,34 +81,99 @@ export const locationServices = LayerNode.group([
 export type LocationServices = LayerNode.Output<typeof locationServices>
 export type LocationError = LayerNode.Error<typeof locationServices>
 
+type FullLocationMap = LayerMap.LayerMap<Location.Ref, LocationServices, LocationError>
+type GlobalTag = NonNullable<typeof LocationServiceMap.node.tag>
+
+const WorkerLocationMapBrand: unique symbol = Symbol("opencode/WorkerLocationServiceMap")
+const emptyContext = Layer.empty as Layer.Layer<unknown, never, never>
+
+export interface LocationServiceMapOptions {
+  readonly idleTimeToLive?: Duration.Input
+}
+
+export interface LocationServiceMapNode extends LayerNode.Node<LocationServiceMap.Service, never, GlobalTag> {
+  readonly locationNodes: readonly LayerNode.AnyNode[]
+  readonly locationReplacements: LayerNode.Replacements
+  readonly locationContext: Layer.Layer<unknown, never, never>
+}
+
+export interface WorkerLocationServiceMapNode extends LocationServiceMapNode {
+  readonly [WorkerLocationMapBrand]: true
+}
+
+export function isWorkerLocationServiceMapNode(input: unknown): input is WorkerLocationServiceMapNode {
+  return (
+    typeof input === "object" &&
+    input !== null &&
+    (input as { readonly [WorkerLocationMapBrand]?: unknown })[WorkerLocationMapBrand] === true
+  )
+}
+
+export function buildLocationServiceMapFrom(
+  services: readonly [LayerNode.AnyNode, ...LayerNode.AnyNode[]],
+  replacements: LayerNode.Replacements = [],
+  context: Layer.Layer<unknown, never, never> = emptyContext,
+  options: LocationServiceMapOptions = {},
+): Layer.Layer<LocationServiceMap.Service> {
+  const group = LayerNode.group(services)
+
+  const map = LayerMap.make(
+    (ref: Location.Ref) => {
+      const allReplacements = replacements.concat([[Location.node, Location.boundNode(ref)]])
+      // Apply replacements during hoist, not afterward: replacements can
+      // introduce new tagged dependencies (Location.boundNode depends on
+      // Project), and the hoist walk is the only pass that can still slice
+      // those back out.
+      const location = LayerNode.hoist(group, Node.tags.values.global, allReplacements)
+
+      return LayerNode.compile(location.node).pipe(
+        Layer.fresh,
+        Layer.tap(() =>
+          Effect.logInfo("booting location services", {
+            directory: ref.directory,
+            workspaceID: ref.workspaceID,
+          }),
+        ),
+        Layer.provide(LayerNode.compile(location.hoisted)),
+        Layer.provide(context),
+      )
+    },
+    options.idleTimeToLive === undefined ? {} : { idleTimeToLive: options.idleTimeToLive },
+  )
+
+  // Keep the public service type as the full map for existing hub consumers.
+  return Layer.effect(LocationServiceMap.Service, map as unknown as Effect.Effect<FullLocationMap>)
+}
+
 export function buildLocationServiceMap(
   replacements: LayerNode.Replacements = [],
 ): Layer.Layer<LocationServiceMap.Service> {
-  return Layer.effect(
-    LocationServiceMap.Service,
-    LayerMap.make(
-      (ref: Location.Ref) => {
-        const allReplacements = replacements.concat([[Location.node, Location.boundNode(ref)]])
-        // Apply replacements during hoist, not afterward: replacements can
-        // introduce new tagged dependencies (Location.boundNode depends on
-        // Project), and the hoist walk is the only pass that can still slice
-        // those back out.
-        const location = LayerNode.hoist(locationServices, Node.tags.values.global, allReplacements)
-
-        return LayerNode.compile(location.node).pipe(
-          Layer.fresh,
-          Layer.tap(() =>
-            Effect.logInfo("booting location services", {
-              directory: ref.directory,
-              workspaceID: ref.workspaceID,
-            }),
-          ),
-          Layer.provide(LayerNode.compile(location.hoisted)),
-        )
-      },
-      { idleTimeToLive: "60 minutes" },
-    ),
+  return buildLocationServiceMapFrom(
+    locationServices.dependencies as readonly [LayerNode.AnyNode, ...LayerNode.AnyNode[]],
+    replacements,
+    emptyContext,
+    { idleTimeToLive: "60 minutes" },
   )
+}
+
+export function buildLocationServiceMapNode(
+  services: readonly [LayerNode.AnyNode, ...LayerNode.AnyNode[]],
+  replacements: LayerNode.Replacements = [],
+  context: Layer.Layer<unknown, never, never> = emptyContext,
+  options: LocationServiceMapOptions = {},
+): WorkerLocationServiceMapNode {
+  return {
+    kind: "layer",
+    name: LocationServiceMap.node.name,
+    service: LocationServiceMap.Service,
+    implementation: buildLocationServiceMapFrom(services, replacements, context, options),
+    dependencies: [],
+    tag: LocationServiceMap.node.tag,
+    locationNodes: services,
+    locationReplacements: replacements,
+    locationContext: context,
+    [WorkerLocationMapBrand]: true,
+  }
 }
 
 // This is temporary for backwards compatibility

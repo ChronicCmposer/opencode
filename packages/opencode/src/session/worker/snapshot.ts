@@ -12,7 +12,9 @@
 
 import { Effect, Layer, Option } from "effect"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
+import { Project as CoreProject } from "@opencode-ai/core/project"
 import { RipgrepBinary } from "@opencode-ai/core/ripgrep/binary"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { Project } from "@opencode-ai/schema/project"
 
 import { Auth } from "@/auth"
@@ -137,6 +139,20 @@ export const buildWorkerSnapshot = Effect.fn("WorkerSnapshot.build")(function* (
   const binary = yield* Effect.serviceOption(RipgrepBinary.Service)
   const ripgrepPath = Option.isSome(binary) ? yield* binary.value.filepath.pipe(Effect.option) : Option.none<string>()
 
+  // Freeze the hub project's git common directory so the worker resolves its
+  // `Project.Service` from the snapshot instead of discovering the repo itself.
+  // Resolution is best-effort, exactly like the ripgrep path: a hub graph
+  // without `Project` (or a failed resolve) ships no store, and the worker
+  // simply resolves without a git vcs store.
+  const coreProject = yield* Effect.serviceOption(CoreProject.Service)
+  const resolvedHubProject =
+    ctx.project?.vcs === "git" && Option.isSome(coreProject)
+      ? yield* coreProject.value.resolve(AbsolutePath.make(ctx.directory)).pipe(Effect.option)
+      : Option.none<CoreProject.Resolved>()
+  const projectStore = Option.flatMap(resolvedHubProject, (resolved) =>
+    resolved.vcs?.type === "git" ? Option.some(String(resolved.vcs.store)) : Option.none<string>(),
+  )
+
   return {
     epoch,
     directory: ctx.directory,
@@ -150,6 +166,7 @@ export const buildWorkerSnapshot = Effect.fn("WorkerSnapshot.build")(function* (
     // honest (and JSON-serializable) in that degraded case.
     ...(ctx.project?.id === undefined ? {} : { projectId: ctx.project.id }),
     ...(ctx.project?.vcs === undefined ? {} : { projectVcs: ctx.project.vcs }),
+    ...(Option.isNone(projectStore) ? {} : { projectStore: projectStore.value }),
     worktree: ctx.worktree,
     ...(Option.isNone(ripgrepPath) ? {} : { ripgrepPath: ripgrepPath.value }),
     config: configInfo,

@@ -11,6 +11,10 @@
 // nodes (e.g. `session-projector`) use an explicit `name`; both are covered.
 
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import {
+  isWorkerLocationServiceMapNode,
+  type WorkerLocationServiceMapNode,
+} from "@opencode-ai/core/location-services"
 import { Schema } from "effect"
 export type Role = "session" | "hub"
 
@@ -396,6 +400,174 @@ export class SessionLayerViolationError extends Schema.TaggedErrorClass<SessionL
 export function assertSessionLayer(root: AnyNode, replacements: LayerNode.Replacements = []): void {
   const report = validateSessionLayer(root, replacements)
   if (!report.ok) throw new SessionLayerViolationError(report)
+}
+
+/**
+ * The location map is a narrower graph than the V1 session layer: it is the
+ * per-location service set a session worker composes, so its table is
+ * deliberately separate from `SESSION_ALLOWLIST`.
+ */
+export const LOCATION_MAP_ALLOWED: ReadonlySet<string> = new Set([
+  "@opencode/v2/Policy",
+  "@opencode/v2/Agent",
+  "@opencode/v2/Command",
+  "@opencode/v2/Reference",
+  "@opencode/v2/Integration",
+  "@opencode/v2/Catalog",
+  "@opencode/v2/AISDK",
+  "@opencode/v2/Plugin",
+  "@opencode/v2/Skill",
+  "@opencode/v2/SkillDiscovery",
+  "@opencode/v2/Credential",
+  "@opencode/GitV2",
+  "@opencode/FileSystem",
+  "@opencode/Event",
+  "@opencode/DurableLog",
+  "@opencode/AppProcess",
+  "@opencode/RepositoryCache",
+  "plugin-internal-reference-only",
+])
+
+/** Nodes a worker replaces inside the map instead of instantiating. */
+export const LOCATION_MAP_REPLACED: ReadonlySet<string> = new Set([
+  "@opencode/Location",
+  "@opencode/v2/Config",
+  "@opencode/v2/storage/Database",
+  "@opencode/Global",
+  "@opencode/ProjectV2",
+])
+
+/** Nodes that must never appear in a worker location map. */
+export const LOCATION_MAP_FORBIDDEN: ReadonlySet<string> = new Set([
+  "@opencode/v2/FileWatcher",
+  "@opencode/v2/FileSystem/Search",
+  "@opencode/v2/FileSystem",
+  "@opencode/ModelsDev",
+  "@opencode/Npm",
+  "@opencode/Plugin",
+  "plugin-internal",
+  "@opencode/ProjectCopy",
+  "@opencode/ProjectDirectories",
+  "@opencode/v2/Permission",
+  "@opencode/v2/ToolRegistry",
+  "@opencode/v2/Snapshot",
+  "@opencode/v2/SessionRunnerModel",
+  "@opencode/v2/SessionRunner",
+])
+
+export interface LocationMapReport {
+  readonly allowed: readonly string[]
+  readonly replaced: readonly string[]
+  readonly forbidden: readonly string[]
+  readonly unknown: readonly string[]
+  readonly ok: boolean
+}
+
+/** Raised when a worker location map violates the location table (fail loud). */
+export class LocationMapViolationError extends Schema.TaggedErrorClass<LocationMapViolationError>()(
+  "WorkerLayer.LocationMapViolation",
+  {
+    report: Schema.Struct({
+      allowed: Schema.Array(Schema.String),
+      replaced: Schema.Array(Schema.String),
+      forbidden: Schema.Array(Schema.String),
+      unknown: Schema.Array(Schema.String),
+      ok: Schema.Boolean,
+    }),
+  },
+) {
+  constructor(override readonly report: LocationMapReport) {
+    super({ report })
+    this.name = "LocationMapViolationError"
+  }
+
+  override get message() {
+    const parts: string[] = []
+    if (this.report.forbidden.length > 0) parts.push(`forbidden nodes: ${this.report.forbidden.join(", ")}`)
+    if (this.report.unknown.length > 0) parts.push(`unclassified nodes: ${this.report.unknown.join(", ")}`)
+    return `worker location map violates the location table (${parts.join("; ")})`
+  }
+}
+
+/**
+ * Validate the location map against its own replacement set first, then the
+ * outer worker set. This prevents an outer boundary (Database/Global) from
+ * masking a real service inside the map.
+ */
+export function validateLocationMap(
+  map: WorkerLocationServiceMapNode,
+  outer: LayerNode.Replacements = [],
+): LocationMapReport {
+  const inner = replacementMap(map.locationReplacements)
+  const outerMap = replacementMap(outer)
+  const seen = new Set<AnyNode>()
+  const allowed = new Set<string>()
+  const replaced = new Set<string>()
+  const forbidden = new Set<string>()
+  const unknown = new Set<string>()
+
+  const visit = (node: AnyNode): void => {
+    if (seen.has(node)) return
+    seen.add(node)
+
+    if (node.kind === "group") {
+      for (const dependency of node.dependencies) visit(dependency)
+      return
+    }
+
+    const replacement = inner.get(node.name) ?? outerMap.get(node.name)
+    if (replacement !== undefined) {
+      replaced.add(node.name)
+      if (LayerNode.isNode(replacement)) {
+        for (const dependency of replacement.dependencies) visit(dependency)
+      }
+      return
+    }
+
+    // The unbound Location node is always replaced per-ref by Location.boundNode.
+    if (node.name === "@opencode/Location") {
+      replaced.add(node.name)
+      return
+    }
+
+    if (LOCATION_MAP_FORBIDDEN.has(node.name)) {
+      forbidden.add(node.name)
+      return
+    }
+
+    if (node.name.startsWith("@opencode/") && !LOCATION_MAP_ALLOWED.has(node.name)) {
+      unknown.add(node.name)
+    } else if (LOCATION_MAP_ALLOWED.has(node.name)) {
+      allowed.add(node.name)
+    }
+
+    for (const dependency of node.dependencies) visit(dependency)
+  }
+
+  for (const node of map.locationNodes) visit(node)
+
+  return {
+    allowed: [...allowed].sort(),
+    replaced: [...replaced].sort(),
+    forbidden: [...forbidden].sort(),
+    unknown: [...unknown].sort(),
+    ok: forbidden.size === 0 && unknown.size === 0,
+  }
+}
+
+/** Validate both the V1 session graph and the reduced location map. */
+export function assertWorkerLayer(root: AnyNode, replacements: LayerNode.Replacements = []): void {
+  assertSessionLayer(root, replacements)
+
+  const entry = replacements.find(([source]) => source.name === "@opencode/example/LocationServiceMap")
+  const map = entry?.[1]
+
+  if (!isWorkerLocationServiceMapNode(map)) {
+    throw new Error("worker layer has no branded location-service map replacement")
+  }
+
+  const report = validateLocationMap(map, replacements)
+  if (!report.ok) throw new LocationMapViolationError(report)
 }
 
 export * as WorkerNodeTable from "./node-table"

@@ -25,7 +25,7 @@
 // a connection.
 
 import path from "node:path"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Effect, Layer, Schema, Semaphore } from "effect"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -484,42 +484,103 @@ export function openWorkerDatabase(
   })
 }
 
+/**
+ * One `Database.Service` per `WorkerDatabase`. The outer worker graph and the
+ * location map both resolve this same client so Drizzle sees one connection.
+ */
+const sharedDatabaseServices = new WeakMap<WorkerDatabase, Database.Interface>()
+const sharedDatabaseLocks = new WeakMap<WorkerDatabase, Semaphore.Semaphore>()
+
+function durableOperations(database: WorkerDatabase): EventV2.WorkerDurableOperations {
+  return {
+    deleteAggregate: (aggregateID, options) => database.bus.deleteAggregate(aggregateID, options),
+  }
+}
+
+function buildDatabaseService(database: WorkerDatabase): Effect.Effect<Database.Interface> {
+  return Effect.gen(function* () {
+    const client = makeSqliteClient(
+      { spanAttributes: { "db.system.name": "sqlite" } },
+      workerRunner(drizzleRunners.get(database) ?? database.drizzleConnection),
+    )
+    const sql = Object.assign(yield* client, { config: { filename: database.filename } })
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults().pipe(Effect.provideService(SqlClient, sql))
+    return { db } satisfies Database.Interface
+  }).pipe(Effect.provide(Reactivity.layer))
+}
+
+export function databaseService(database: WorkerDatabase): Effect.Effect<Database.Interface> {
+  return Effect.gen(function* () {
+    const existing = sharedDatabaseServices.get(database)
+    if (existing !== undefined) return existing
+    const lock = sharedDatabaseLocks.get(database) ?? Semaphore.makeUnsafe(1)
+    sharedDatabaseLocks.set(database, lock)
+    return yield* lock.withPermits(1)(
+      Effect.gen(function* () {
+        const raced = sharedDatabaseServices.get(database)
+        if (raced !== undefined) return raced
+        const built = yield* buildDatabaseService(database)
+        sharedDatabaseServices.set(database, built)
+        return built
+      }),
+    )
+  })
+}
+
 /** Build the worker `Database.Service` over the private validated Drizzle runner. */
 export function databaseLayer(
   database: WorkerDatabase,
 ): Layer.Layer<Database.Service | EventV2.WorkerScopeService | DurableLog.Service> {
-  const client = makeSqliteClient(
-    { spanAttributes: { "db.system.name": "sqlite" } },
-    workerRunner(drizzleRunners.get(database) ?? database.drizzleConnection),
-  )
-  const databaseService = Layer.effect(
+  const service = Layer.effect(
     Database.Service,
     Effect.gen(function* () {
-      const operations = {
-        deleteAggregate: (aggregateID: string, options?: { readonly blobDir?: string }) =>
-          database.bus.deleteAggregate(aggregateID, options),
-      }
+      const operations = durableOperations(database)
       database.eventBinding.durable = operations
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           if (database.eventBinding.durable === operations) database.eventBinding.durable = undefined
         }).pipe(Effect.andThen(database.close)),
       )
-      const sql = Object.assign(yield* client, { config: { filename: database.filename } })
-      const db = yield* EffectDrizzleSqlite.makeWithDefaults().pipe(Effect.provideService(SqlClient, sql))
-      return { db } satisfies Database.Interface
+      return yield* databaseService(database)
     }),
-  ).pipe(Layer.provide(Reactivity.layer))
+  )
   // The scope is provided alongside the Database so every layer built over this
   // database (EventV2 included) sees the worker's typed Context service. The hub
   // graph provides no scope, which is the explicit scopeless state.
   return Layer.mergeAll(
-    databaseService,
+    service,
     Layer.succeed(EventV2.WorkerScopeService, database.eventBinding),
     // EventV2 requires this service; the worker's DurableLog is the same
     // repository-backed writer the worker bus exposes.
     Layer.succeed(DurableLog.Service, database.durableLog),
   )
+}
+
+/**
+ * The location map's non-owning Database layer: it shares the outer graph's
+ * `Database.Service` and client, but never closes the handle. The outer
+ * `databaseLayer` remains the sole owner of `close`.
+ */
+export function workerLocationDatabaseLayer(database: WorkerDatabase): Layer.Layer<Database.Service> {
+  return Layer.effect(
+    Database.Service,
+    Effect.gen(function* () {
+      if (database.eventBinding.durable === undefined) {
+        database.eventBinding.durable = durableOperations(database)
+      }
+      return yield* databaseService(database)
+    }),
+  )
+}
+
+/** The location map is unusable without a worker database. */
+export class MissingWorkerDatabaseError extends Schema.TaggedErrorClass<MissingWorkerDatabaseError>()(
+  "WorkerLocation.MissingDatabase",
+  {},
+) {}
+
+export function missingWorkerDatabaseLayer(): Layer.Layer<Database.Service> {
+  return Layer.effect(Database.Service, Effect.die(new MissingWorkerDatabaseError()))
 }
 
 /** The per-worker DB service. One instance per worker graph. */

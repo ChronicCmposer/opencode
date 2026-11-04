@@ -11,13 +11,11 @@ import { describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { ConfigProvider, Effect, Layer } from "effect"
+import { Effect, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { AbsolutePath } from "@opencode-ai/core/schema"
-import { Location } from "@opencode-ai/core/location"
 import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
+import { isWorkerLocationServiceMapNode } from "@opencode-ai/core/location-services"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
-import { Reference } from "@opencode-ai/core/reference"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { Session } from "@/session/session"
 import { SessionPromptService } from "@/session/prompt-service"
@@ -35,7 +33,6 @@ import {
   llmModelClientLayer,
   reducedLlmLayer,
   serveHubProxy,
-  workerWatcherService,
   type SessionLayerOptions,
   type WorkerModelConfig,
 } from "@/session/worker/layer"
@@ -50,7 +47,6 @@ import { Permission } from "@/permission"
 import { Question } from "@/question"
 import { startMockProvider, type MockProviderHandle } from "../../lib/mock-provider"
 import { workerSnapshot } from "../../lib/snapshot"
-import { tmpdir } from "../../fixture/fixture"
 import { createE2EContext, type E2EContext } from "../../lib/parity-harness"
 import { pluginPassThroughReplacement } from "../../lib/worker-plugin-routes"
 
@@ -137,51 +133,30 @@ describe("full worker graph boot", () => {
     expect(names.has("@opencode/BackgroundJob")).toBe(true)
   })
 
-  test("full-prompt workers use the inert watcher for a git location", async () => {
-    await using tmp = await tmpdir({ git: true })
-
+  test("full-prompt workers compose a reference-only location map with no watcher", () => {
     const built = buildSessionWorkerLayer({
       // The production graph reaches `LocationServiceMap` only as a dependency
       // of SystemPrompt/Agent, so surface the same replacement-provided node in
-      // the root to resolve the map from this test.
+      // the root to inspect the map from this test.
       nodes: LayerNode.group([RUNNABLE_SESSION_NODES, LocationServiceMap.node]),
-      snapshot: workerSnapshot({ directory: tmp.path }),
+      snapshot: workerSnapshot(),
       env: { values: {} },
       clients: stubClients(),
       modelClient: stubModel(),
     })
 
-    const layer = built.layer.pipe(
-      // `LocationServiceMap` builds each location lazily, so the provider must
-      // stay in the effect context (provideMerge, not provide) for the
-      // project-directory watcher branch to observe the flag.
-      Layer.provideMerge(
-        ConfigProvider.layer(
-          ConfigProvider.fromUnknown({
-            OPENCODE_EXPERIMENTAL_FILEWATCHER: "true",
-          }),
-        ),
-      ),
-    )
+    const map = built.replacements.find(([node]) => node.name === LocationServiceMap.node.name)?.[1]
+    expect(isWorkerLocationServiceMapNode(map)).toBe(true)
+    if (!isWorkerLocationServiceMapNode(map)) throw new Error("missing worker location map")
 
-    const result = await Effect.runPromise(
-      Effect.gen(function* () {
-        const locations = yield* LocationServiceMap.Service
-        const ref = Location.Ref.make({ directory: AbsolutePath.make(tmp.path) })
+    const names = new Set<string>()
+    const walk = (node: { readonly kind: string; readonly name: string; readonly dependencies: readonly unknown[] }) => {
+      names.add(node.name)
+      for (const dependency of node.dependencies) walk(dependency as typeof node)
+    }
+    for (const node of map.locationNodes) walk(node as never)
 
-        return yield* Effect.scoped(
-          Effect.gen(function* () {
-            return {
-              watcher: yield* Watcher.Service,
-              reference: yield* Reference.Service,
-            }
-          }).pipe(Effect.provide(locations.get(ref))),
-        )
-      }).pipe(Effect.provide(layer)),
-    )
-
-    expect(result.watcher).toBe(workerWatcherService)
-    expect(result.reference).toBeDefined()
+    expect(names.has(Watcher.node.name)).toBe(false)
   })
 })
 

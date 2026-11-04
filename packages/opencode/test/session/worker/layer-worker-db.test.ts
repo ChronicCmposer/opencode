@@ -21,6 +21,7 @@ import {
   databaseLayer,
   markSchemaIdentity,
   openWorkerDatabase,
+  workerLocationDatabaseLayer,
   type WorkerDatabase,
 } from "@/session/worker/db"
 import {
@@ -148,6 +149,45 @@ describe("per-worker DB node", () => {
     } finally {
       await Effect.runPromise(Scope.close(workerScope, Exit.void))
     }
+  })
+
+  test("the location map shares the outer Database.Service and client", async () => {
+    const filename = temporaryDatabase()
+    migrated(filename)
+    const database = await workerDatabase(filename)
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const outer = yield* Database.Service
+        const inner = yield* Database.Service.pipe(Effect.provide(workerLocationDatabaseLayer(database)))
+        return {
+          sameService: outer === inner,
+          sameClient: outer.db === inner.db,
+          closed: database.connection.closed,
+        }
+      }).pipe(Effect.provide(databaseLayer(database))),
+    )
+
+    expect(result.sameService).toBe(true)
+    expect(result.sameClient).toBe(true)
+    expect(result.closed).toBe(false)
+  })
+
+  test("the non-owning location Database layer does not close the handle", async () => {
+    const filename = temporaryDatabase()
+    migrated(filename)
+    const database = await workerDatabase(filename)
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          return yield* Database.Service
+        }).pipe(Effect.provide(workerLocationDatabaseLayer(database))),
+      ),
+    )
+
+    expect(database.connection.closed).toBe(false)
+    await Effect.runPromise(database.close)
   })
 
   test("hub-only writes fail loud through the worker Database", async () => {

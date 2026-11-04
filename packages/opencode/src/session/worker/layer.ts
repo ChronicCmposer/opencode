@@ -1,6 +1,6 @@
 // Reduced session-worker AppLayer.
 
-import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
+import { Context, Duration, Effect, Layer, Option, Schema, Stream } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
 import type { ConfigV1 } from "@opencode-ai/core/v1/config/config"
@@ -71,15 +71,19 @@ import { Global } from "@opencode-ai/core/global"
 import { RipgrepBinary } from "@opencode-ai/core/ripgrep/binary"
 import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
 import { make } from "@opencode-ai/core/background-job"
-import { buildLocationServiceMap } from "@opencode-ai/core/location-services"
-import { Watcher } from "@opencode-ai/core/filesystem/watcher"
+import { buildLocationServiceMapNode, type WorkerLocationServiceMapNode } from "@opencode-ai/core/location-services"
+import { Config as CoreConfig } from "@opencode-ai/core/config"
+import { snapshotLayer as snapshotCoreConfigLayer } from "@opencode-ai/core/config/snapshot"
+import { Project } from "@opencode-ai/core/project"
+import { workerLocationServices } from "./location-services"
+import { snapshotProjectLayer } from "./snapshot-project"
 
 import {
   EVENT_BRIDGE_KEY,
   EVENT_EGRESS_CLIENT_KEY,
   REQUIRED_SESSION_NODE_KEYS,
   WRITER_CLIENT_KEY,
-  assertSessionLayer,
+  assertWorkerLayer,
 } from "./node-table"
 import { createWorkerEventBridge } from "./event-bridge"
 import type { WorkerDurableSubscription } from "./egress-client"
@@ -126,7 +130,13 @@ import {
   workerPluginHostDeclarers,
   type WorkerPluginHost,
 } from "./plugin-host"
-import { WorkerDb, databaseLayer, type WorkerDatabase } from "./db"
+import {
+  WorkerDb,
+  databaseLayer,
+  missingWorkerDatabaseLayer,
+  workerLocationDatabaseLayer,
+  type WorkerDatabase,
+} from "./db"
 import { ToolCallLedger } from "@/session/ledger/tool-call"
 import { changedHubOwnedSessionColumns, HUB_OWNED_METADATA, SESSION_IMMUTABLE_COLUMNS } from "./repository/policy"
 import { PidReporter, type PidReporterInterface } from "./pid-registry"
@@ -496,6 +506,8 @@ export interface WorkerSnapshot {
   readonly projectId?: string
   /** The project VCS (`"git"`) when the hub's project is version-controlled. */
   readonly projectVcs?: "git"
+  /** The git common dir the hub resolved for `projectVcs === "git"`. */
+  readonly projectStore?: string
   /** The project worktree; defaults to `directory` in the worker. */
   readonly worktree?: string
   /** The hub's `config.directories()`, shipped verbatim so worker-side discovery (skills/agents/commands) scans the same roots. */
@@ -1146,15 +1158,40 @@ function workerProjectionPolicy(database?: WorkerDatabase): SessionProjector.Pro
 
 /**
  * Full-prompt workers still compose a location map because `SystemPrompt` and
- * `Agent` use it to reach `Reference.Service`. The hub owns file watching, so
- * workers get an inert watcher: no native `@parcel/watcher` load and no
- * location subscriptions.
- *
- * `Watcher.Interface` is empty today. If it grows, this object stops
- * type-checking, which is the intended fail-loud behavior.
+ * `Agent` use it to reach `Reference.Service`. The worker map is reference-only:
+ * it has no watcher at all, because the hub owns file watching. The worker
+ * process owns the lifecycle, so locations never idle out.
  */
-export const workerWatcherService = Watcher.Service.of({})
-const workerWatcherLayer = Layer.succeed(Watcher.Service, workerWatcherService)
+export const workerLocationMapIdleTimeToLive = Duration.infinity
+
+export function workerLocationServiceMapNode(
+  snapshot: WorkerSnapshot,
+  database?: WorkerDatabase,
+  overrides: LayerNode.Replacements = [],
+): WorkerLocationServiceMapNode {
+  const replacements: LayerNode.Replacements = [
+    [Project.node, snapshotProjectLayer(snapshot)],
+    [CoreConfig.node, snapshotCoreConfigLayer(snapshot.config)],
+    [
+      Database.node,
+      database === undefined ? missingWorkerDatabaseLayer() : workerLocationDatabaseLayer(database),
+    ],
+    [Global.node, Layer.succeed(Global.Service, Global.make())],
+    ...(database === undefined
+      ? []
+      : ([[DurableLog.node, Layer.succeed(DurableLog.Service, database.durableLog)]] as const)),
+    ...overrides,
+  ]
+
+  const context: Layer.Layer<unknown> =
+    database === undefined
+      ? (Layer.empty as Layer.Layer<unknown>)
+      : (Layer.succeed(EventV2.WorkerScopeService, database.eventBinding) as Layer.Layer<unknown>)
+
+  return buildLocationServiceMapNode(workerLocationServices, replacements, context, {
+    idleTimeToLive: workerLocationMapIdleTimeToLive,
+  })
+}
 
 /** Boundary replacements every session layer needs. */
 export function boundaryReplacements(
@@ -1182,12 +1219,10 @@ export function boundaryReplacements(
     // `AppProcess` and `Ripgrep` run IN the worker: the worker already has a real `CrossSpawnSpawner` (via `ToolRegistry`).
     [RipgrepBinary.node, snapshotRipgrepBinaryLayer(snapshot)],
     [McpBrowser.node, mcpBrowserBoundaryLayer()],
-    // Workers still compose a location map for SystemPrompt/Agent, which use it
-    // to reach Reference.Service; the hub owns file watching. Replace the
-    // watcher node with an inert service so workers never load @parcel/watcher
-    // or subscribe to a location. The static node-table guard cannot inspect
-    // opaque Layer replacements, so this replacement is covered by tests.
-    [LocationServiceMap.node, buildLocationServiceMap([[Watcher.node, workerWatcherLayer]])],
+    // Workers compose a reference-only location map for SystemPrompt/Agent,
+    // which use it to reach Reference.Service. The hub owns file watching and
+    // the map has no watcher at all.
+    [LocationServiceMap.node, workerLocationServiceMapNode(snapshot, database)],
   ]
 }
 
@@ -1885,7 +1920,7 @@ export function buildSessionWorkerLayer(options: SessionLayerOptions): SessionWo
     ...(options.replacements ?? []),
   ]
 
-  assertSessionLayer(base, replacements)
+  assertWorkerLayer(base, replacements)
   const built = AppNodeBuilderV1.build(base, replacements)
   const withPid =
     options.pidReporter === undefined ? built : Layer.merge(built, Layer.succeed(PidReporter, options.pidReporter))
