@@ -14,6 +14,7 @@ import { LSP } from "@/lsp/lsp"
 import { MCP } from "@/mcp"
 import {
   buildHubProxyHandlers,
+  lspAuthorityFor,
   mcpAuthorityFor,
   type HubProxyAuthorities,
 } from "@/session/worker/hub-proxy-authorities"
@@ -158,5 +159,59 @@ describe("hub-served MCP reads", () => {
     expect(Object.keys(result.resources)).toEqual(["docs:readme"])
     expect(result.capabilities).toEqual({ docs: { resources: {} }, plain: {} })
     expect(result.read).toEqual({ contents: [{ uri: "file:///readme", text: "from docs" }] })
+  })
+})
+
+describe("hub-served LSP notifications", () => {
+  const touched: Array<{ file: string; mode?: "document" | "full" }> = []
+  const fakeLsp = {
+    touchFile: (file: string, mode?: "document" | "full") => {
+      touched.push({ file, mode })
+      return Effect.void
+    },
+    diagnostics: () =>
+      Effect.succeed({
+        "/project/a.ts": [
+          {
+            message: "ok",
+            severity: 1,
+            range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+          },
+        ],
+      }),
+  } as unknown as LSP.Interface
+
+  const hubClient = (): HubProxyClient => {
+    const handlers = buildHubProxyHandlers(
+      {
+        lsp: lspAuthorityFor((effect) => Effect.runPromise(effect.pipe(Effect.provideService(LSP.Service, fakeLsp)))),
+      } as HubProxyAuthorities,
+      (effect) => Effect.runPromise(effect),
+    )
+    return {
+      call: async (method, args) => handlers[method]!(...args),
+      dispose: () => {},
+    }
+  }
+
+  test("a worker forwards file-edit notifications and reads diagnostics from the hub", async () => {
+    touched.length = 0
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const lsp = yield* LSP.Service
+        yield* lsp.touchFile("/project/a.ts", "document")
+        return { diagnostics: yield* lsp.diagnostics() }
+      }).pipe(Effect.provide(lspBoundaryLayer(hubClient()))),
+    )
+    expect(touched).toEqual([{ file: "/project/a.ts", mode: "document" }])
+    expect(result.diagnostics).toEqual({
+      "/project/a.ts": [
+        {
+          message: "ok",
+          severity: 1,
+          range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+        },
+      ],
+    })
   })
 })

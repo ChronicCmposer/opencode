@@ -726,6 +726,8 @@ type McpResult<K extends "resources" | "resourceTemplates" | "readResource"> = E
   ReturnType<MCP.Interface[K]>
 >
 type ServerInstructions = Effect.Success<ReturnType<MCP.Interface["instructions"]>>[number]
+type LspDiagnostics = Effect.Success<ReturnType<LSP.Interface["diagnostics"]>>
+type LspStatus = Effect.Success<ReturnType<LSP.Interface["status"]>>
 
 /** The MCP boundary: a worker owns no servers; catalog reads go to the hub's MCP service, and without a hub they are empty. */
 export function mcpBoundaryLayer(hub?: HubProxyClient): Layer.Layer<MCP.Service> {
@@ -781,14 +783,21 @@ function remoteMcpClient(name: string, capabilities: McpCapabilities): McpClient
   }) as McpClient
 }
 
-/** The LSP boundary: a worker owns no language servers, so every read is empty. */
-export function lspBoundaryLayer(): Layer.Layer<LSP.Service> {
+/** The LSP boundary: the hub owns language servers; worker edits forward their notifications to it, and without a hub the boundary is inert. */
+export function lspBoundaryLayer(hub?: HubProxyClient): Layer.Layer<LSP.Service> {
+  const fromHub = <A>(method: HubProxyMethod, args: readonly unknown[]) =>
+    hubProxyCall<A>(hub!, method, args).pipe(Effect.orDie)
   return failLoudBoundary("LSP", LSP.Service, {
     init: () => Effect.void,
-    status: () => Effect.succeed([]),
-    hasClients: () => Effect.succeed(false),
-    touchFile: () => Effect.void,
-    diagnostics: () => Effect.succeed({}),
+    status: hub === undefined ? () => Effect.succeed([]) : () => fromHub<LspStatus>("lsp.status", []),
+    hasClients:
+      hub === undefined ? () => Effect.succeed(false) : (file) => fromHub<boolean>("lsp.hasClients", [file]),
+    touchFile:
+      hub === undefined
+        ? () => Effect.void
+        : (input, diagnostics) => fromHub<void>("lsp.touchFile", [input, diagnostics ?? null]),
+    diagnostics:
+      hub === undefined ? () => Effect.succeed({}) : () => fromHub<LspDiagnostics>("lsp.diagnostics", []),
     hover: () => Effect.succeed(undefined),
     definition: () => Effect.succeed([]),
     references: () => Effect.succeed([]),
@@ -1206,7 +1215,7 @@ export function boundaryReplacements(
     [Database.node, database === undefined ? databaseBoundaryLayer() : workerDatabaseLayer(database)],
     // `SessionProjector` deliberately has NO boundary replacement: it runs IN the worker.
     [MCP.node, mcpBoundaryLayer(boundaries.hubProxies?.sessionStatus)],
-    [LSP.node, lspBoundaryLayer()],
+    [LSP.node, lspBoundaryLayer(boundaries.hubProxies?.sessionStatus)],
     [McpAuth.node, mcpAuthBoundaryLayer()],
     [Npm.node, npmBoundaryLayer()],
     [Account.node, accountBoundaryLayer()],

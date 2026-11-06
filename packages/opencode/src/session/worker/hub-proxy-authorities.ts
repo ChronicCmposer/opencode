@@ -85,6 +85,8 @@ export interface HubProxyAuthorities {
   readonly backgroundJob?: WorkerBackgroundJobAuthority
   /** MCP reads, served from the hub's MCP service in the worker's instance context. */
   readonly mcp?: McpHubAuthority
+  /** LSP notifications, served from the hub's LSP service in the worker's instance context. */
+  readonly lsp?: LspHubAuthority
   /** Hub-owned snapshot authority: git operations stay behind the hub's per-project locks. */
   readonly snapshot?: Omit<Snapshot.Interface, "init" | "cleanup">
 }
@@ -140,6 +142,39 @@ export function mcpAuthorityFor(run: HubProxyRunner): McpHubAuthority {
 function mcpAuthority(authorities: HubProxyAuthorities): McpHubAuthority {
   if (authorities.mcp === undefined) throw new Error('the hub has no "mcp" authority wired; cannot read MCP state')
   return authorities.mcp
+}
+
+/** The hub-side LSP notifications a worker may forward; every value is JSON. */
+export interface LspHubAuthority {
+  readonly touchFile: (input: string, diagnostics?: "document" | "full") => Promise<void>
+  readonly diagnostics: () => Promise<Effect.Success<ReturnType<LSP.Interface["diagnostics"]>>>
+  readonly status: () => Promise<Effect.Success<ReturnType<LSP.Interface["status"]>>>
+  readonly hasClients: (file: string) => Promise<boolean>
+}
+
+/** Serve LSP notifications from the hub's LSP service in the worker's captured context. */
+export function lspAuthorityFor(run: HubProxyRunner): LspHubAuthority {
+  const withLsp = <A>(use: (lsp: LSP.Interface) => Effect.Effect<A>) =>
+    run(
+      Effect.gen(function* () {
+        const lsp = yield* Effect.serviceOption(LSP.Service)
+        if (Option.isNone(lsp))
+          return yield* Effect.die(new Error("the hub has no LSP service in the dispatched context"))
+        return yield* use(lsp.value)
+      }),
+    )
+  return {
+    touchFile: (input, diagnostics) => withLsp((lsp) => lsp.touchFile(input, diagnostics)),
+    diagnostics: () => withLsp((lsp) => lsp.diagnostics()),
+    status: () => withLsp((lsp) => lsp.status()),
+    hasClients: (file) => withLsp((lsp) => lsp.hasClients(file)),
+  }
+}
+
+function lspAuthority(authorities: HubProxyAuthorities): LspHubAuthority {
+  if (authorities.lsp === undefined)
+    throw new Error('the hub has no "lsp" authority wired; cannot forward LSP notifications')
+  return authorities.lsp
 }
 
 
@@ -255,6 +290,15 @@ export function buildHubProxyHandlers(authorities: HubProxyAuthorities, run: Hub
       mcpAuthority(authorities).resourceTemplates(clientName as string | undefined),
     "mcp.readResource": (clientName, uri) =>
       mcpAuthority(authorities).readResource(clientName as string, uri as string),
+    // The wire carries an omitted diagnostics mode as `null`; the service contract is `undefined`.
+    "lsp.touchFile": (input, diagnostics) =>
+      lspAuthority(authorities).touchFile(
+        input as string,
+        (diagnostics ?? undefined) as "document" | "full" | undefined,
+      ),
+    "lsp.diagnostics": () => lspAuthority(authorities).diagnostics(),
+    "lsp.status": () => lspAuthority(authorities).status(),
+    "lsp.hasClients": (file) => lspAuthority(authorities).hasClients(file as string),
     "session.spawn": (request) =>
       authorities.sessionSpawn === undefined
         ? Promise.reject(new Error('the hub has no "sessionSpawn" authority wired; cannot spawn a session'))
@@ -1321,6 +1365,7 @@ export interface HubProxyAuthorityDeps extends SessionScopeAuthorityDeps {
   readonly discardReverted?: NonNullable<HubProxyAuthorities["discardReverted"]>
   readonly backgroundJob?: NonNullable<HubProxyAuthorities["backgroundJob"]>
   readonly mcp?: McpHubAuthority
+  readonly lsp?: LspHubAuthority
   readonly snapshot?: NonNullable<HubProxyAuthorities["snapshot"]>
 }
 
@@ -1348,6 +1393,7 @@ export function hubProxyAuthoritiesFor(deps: HubProxyAuthorityDeps): HubProxyAut
       ? {}
       : { backgroundJob: deps.backgroundJob }),
     ...(deps.mcp === undefined ? {} : { mcp: deps.mcp }),
+    ...(deps.lsp === undefined ? {} : { lsp: deps.lsp }),
     ...(deps.snapshot === undefined ? {} : { snapshot: deps.snapshot }),
     sessionSpawn: sessionSpawnFor(deps.boundSessionID, deps),
     sessionCreate: createSessionFor(deps.boundSessionID, deps.run),

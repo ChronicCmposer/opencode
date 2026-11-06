@@ -78,6 +78,7 @@ import {
   createPluginToolAbortRegistry,
   createWorkerJobMirror,
   hubProxyAuthoritiesFor,
+  lspAuthorityFor,
   mcpAuthorityFor,
   messagesTransformAuthority,
   pluginTriggerAuthority,
@@ -1418,6 +1419,7 @@ export function createPerSessionResolvers(deps: PerSessionResolverDeps): PerSess
       pluginToolAbort: (input) => pluginToolAborts.abort(input.sessionID, input.callID),
       discardReverted: discardRevertedFor(context),
       mcp: mcpAuthorityFor(runHubProxyFor(context)),
+      lsp: lspAuthorityFor(runHubProxyFor(context)),
       snapshot: snapshotFor(context),
       ...(boundSessionID === undefined
         ? {}
