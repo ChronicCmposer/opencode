@@ -31,7 +31,12 @@ import { Truncate } from "@/tool/truncate"
 import { Plugin } from "@/plugin"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { createBunSqliteConnection } from "@/session/writer/connection"
-import { LEDGER_SQL, ToolCallLedger, createToolCallLedger } from "@/session/ledger/tool-call"
+import {
+  LEDGER_SQL,
+  ToolCallLedger,
+  ToolCallNotStartedError,
+  createToolCallLedger,
+} from "@/session/ledger/tool-call"
 import { createLifecycleTracker, type LifecycleTracker } from "@/session/ledger/lifecycle"
 import { RunBarrier, RunBarrierTimeout } from "@/session/run-barrier"
 import { createProductionSessionHub, type SessionHub } from "@/session/worker/hub"
@@ -320,6 +325,29 @@ describe("same-transaction result + finish", () => {
     // The outer rollback takes the result and the ledger finish with it.
     expect(connection.all("SELECT id FROM note")).toEqual([])
     expect(ledger.indeterminate(String(sessionID))[0]).toMatchObject({ callID, state: "indeterminate" })
+  })
+})
+
+describe("standalone ledger writes without an exclusive owner", () => {
+  test("startStandalone and finishStandalone run through the synchronous Effect path", () => {
+    const { ledger } = ledgerForTest()
+
+    const started = Effect.runSync(ledger.startStandalone({ callID, sessionID: String(sessionID), tool: "write" }))
+    expect(started).toMatchObject({ callID, state: "started" })
+
+    const finished = Effect.runSync(ledger.finishStandalone({ callID, sessionID: String(sessionID), outcome: "ok" }))
+    expect(finished).toMatchObject({ state: "finished", outcome: "ok" })
+    expect(ledger.indeterminate(String(sessionID))).toEqual([])
+  })
+
+  test("a standalone failure is a synchronous defect, not a swallowed async rejection", () => {
+    const { ledger } = ledgerForTest()
+
+    // With no exclusive owner the write runs via `Effect.sync`, so a missing
+    // call fails on the calling fiber immediately instead of scheduling work.
+    expect(() =>
+      Effect.runSync(ledger.finishStandalone({ callID: "call_missing", sessionID: String(sessionID), outcome: "ok" })),
+    ).toThrow(ToolCallNotStartedError)
   })
 })
 

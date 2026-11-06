@@ -1,6 +1,9 @@
 // Typed write engine.
 
 import type { WriteOutcome } from "@opencode-ai/core/database/connection"
+import { retryBusySync, type BusyRetryConfig } from "@opencode-ai/core/database/transaction"
+import { syncTrace } from "@opencode-ai/core/observability/sync-trace"
+import { Schema } from "effect"
 import { createWriteCapability, type RepositoryConnection, type WriteCapability } from "./capability"
 import {
   ForeignKeyOwnershipError,
@@ -31,6 +34,38 @@ import type {
 } from "./types"
 
 type Row = Record<string, unknown>
+
+/**
+ * A failed savepoint cleanup leaves the connection's transaction state unknown.
+ * It is terminal (non-busy): replaying the unit could duplicate a partial write.
+ */
+export class RepositoryTransactionStateError extends Schema.TaggedErrorClass<RepositoryTransactionStateError>()(
+  "WorkerRepository.RepositoryTransactionStateError",
+  {
+    cause: Schema.optional(Schema.Defect()),
+    rollbackCause: Schema.optional(Schema.Unknown),
+  },
+) {
+  readonly tag = "DB_REPOSITORY_TRANSACTION_STATE"
+
+  constructor(
+    override readonly cause?: unknown,
+    override readonly rollbackCause?: unknown,
+  ) {
+    super({ cause, rollbackCause })
+    this.name = "RepositoryTransactionStateError"
+  }
+
+  override get message() {
+    return "repository savepoint cleanup failed; connection state is unknown"
+  }
+}
+
+/**
+ * Connections whose savepoint cleanup failed. Every later repository write on
+ * that connection fails closed rather than risk replaying a partial unit.
+ */
+const repositoryPoisoned = new WeakSet<object>()
 
 function quote(identifier: string): string {
   return `"${identifier.replaceAll('"', '""')}"`
@@ -789,30 +824,72 @@ function deleteStatement(entry: TableRegistryEntry, where: Row): { readonly sql:
 
 let savepointCounter = 0
 
+/**
+ * The repository's busy-retry budget. `retryBusySync` retries immediately; the
+ * driver's `busy_timeout` provides the actual wait between attempts.
+ */
+export const REPOSITORY_BUSY_RETRY_CONFIG = {
+  retries: 5,
+  baseDelayMs: 10,
+  maxDelayMs: 1000,
+  onRetry: (event: { attempt: number; delayMs: number; error: unknown }) =>
+    syncTrace({
+      prefix: "[worker:repository] ",
+      level: "debug",
+      event: "write busy retry",
+      fields: { attempt: event.attempt, delayMs: event.delayMs, error: String(event.error) },
+    }),
+} as const satisfies BusyRetryConfig
+
+/**
+ * Retry a whole repository write unit on a busy error. A nested write joins the
+ * caller's transaction; retrying it alone would replay only part of a savepoint
+ * chain, so only the outermost unit is retried. A unit running inside an
+ * external transaction is likewise already owned by that transaction's caller.
+ */
+function withWriteRetry<T>(capability: WriteCapability, work: () => T): T {
+  // A poisoned connection fails closed before any fence or external-transaction
+  // check: the caller's transaction state is unknown, so even a fenced write
+  // must not touch it.
+  if (repositoryPoisoned.has(capability.connection)) throw new RepositoryTransactionStateError()
+  if (transactionFences.has(capability.connection)) return work()
+  if (capability.inExternalTransaction?.() === true) return work()
+  return retryBusySync(work, REPOSITORY_BUSY_RETRY_CONFIG)
+}
+
 /** Run validation+write atomically; nested calls join the caller's transaction. */
 function atomic<T>(capability: WriteCapability, work: () => T): T {
-  const fence = installTransactionFence(capability.connection, capability.statementBudget ?? DEFAULT_STATEMENT_BUDGET)
-  const exec = fence.original.exec
-  try {
-    savepointCounter += 1
-    const savepoint = `worker_repository_${savepointCounter}`
-    exec(`SAVEPOINT ${savepoint}`)
+  const connection = capability.connection
+  // The fence check must run before this unit installs its own fence, or every
+  // savepoint would look nested and the outermost retry would never fire.
+  return withWriteRetry(capability, () => {
+    const fence = installTransactionFence(connection, capability.statementBudget ?? DEFAULT_STATEMENT_BUDGET)
+    const exec = fence.original.exec
     try {
-      const result = work()
-      exec(`RELEASE ${savepoint}`)
-      return result
-    } catch (error) {
+      savepointCounter += 1
+      const savepoint = `worker_repository_${savepointCounter}`
+      exec(`SAVEPOINT ${savepoint}`)
       try {
-        exec(`ROLLBACK TO ${savepoint}`)
+        const result = work()
         exec(`RELEASE ${savepoint}`)
-      } catch {
-        // Preserve the original failure; a savepoint cleanup fault is secondary.
+        return result
+      } catch (error) {
+        try {
+          exec(`ROLLBACK TO ${savepoint}`)
+          exec(`RELEASE ${savepoint}`)
+        } catch (rollbackCause) {
+          // A failed cleanup leaves the savepoint state unknown. Replaying the
+          // unit could duplicate a partial write, so poison the connection and
+          // surface a non-busy error that the retry loop will not retry.
+          repositoryPoisoned.add(capability.connection)
+          throw new RepositoryTransactionStateError(error, rollbackCause)
+        }
+        throw error
       }
-      throw error
+    } finally {
+      releaseTransactionFence(connection, fence)
     }
-  } finally {
-    releaseTransactionFence(capability.connection, fence)
-  }
+  })
 }
 
 /**
@@ -834,44 +911,48 @@ function insertOne(
   input: Row,
   conflict: RepositoryConflict | undefined,
 ): WriteOutcome {
-  const values = insertValues(capability, entry, input, "insert")
-  // The session root is hub authority.
-  if (entry.table === "session" && conflict === undefined) {
-    throw new UnsupportedWriteError({
-      operation: "insert",
-      table: entry.table,
-      reason: "the session root is created by the hub",
-    })
-  }
-  assertForeignKeyOwnership(capability, entry, values)
-  assertUniqueOwnership(capability, entry, values)
-  if (conflict !== undefined) {
-    assertConflictKey(entry, conflict, values)
-    const existing = conflictRow(capability, entry, conflict, values)
-    if (entry.table === "session" && existing === undefined) {
+  // The retry boundary is the whole unit: a busy validation read must be
+  // replayed together with the write it guards, never the write alone.
+  return withWriteRetry(capability, () => {
+    const values = insertValues(capability, entry, input, "insert")
+    // The session root is hub authority.
+    if (entry.table === "session" && conflict === undefined) {
       throw new UnsupportedWriteError({
-        operation: "upsert",
+        operation: "insert",
         table: entry.table,
         reason: "the session root is created by the hub",
       })
     }
-    if (existing !== undefined) {
-      const update = conflictValues(entry, values, conflict)
-      rejectImmutableConflict(capability, entry, update.values)
-      assertAssignmentScope(capability, entry, update.values, "move a row out of scope")
-      assertImmutable(capability, entry, update.values, [existing])
-      assertSessionUpdateColumns(capability, entry, update.values, [existing])
-      assertForeignKeyOwnership(capability, entry, update.values)
-      assertUniqueOwnership(capability, entry, { ...existing, ...update.values })
+    assertForeignKeyOwnership(capability, entry, values)
+    assertUniqueOwnership(capability, entry, values)
+    if (conflict !== undefined) {
+      assertConflictKey(entry, conflict, values)
+      const existing = conflictRow(capability, entry, conflict, values)
+      if (entry.table === "session" && existing === undefined) {
+        throw new UnsupportedWriteError({
+          operation: "upsert",
+          table: entry.table,
+          reason: "the session root is created by the hub",
+        })
+      }
+      if (existing !== undefined) {
+        const update = conflictValues(entry, values, conflict)
+        rejectImmutableConflict(capability, entry, update.values)
+        assertAssignmentScope(capability, entry, update.values, "move a row out of scope")
+        assertImmutable(capability, entry, update.values, [existing])
+        assertSessionUpdateColumns(capability, entry, update.values, [existing])
+        assertForeignKeyOwnership(capability, entry, update.values)
+        assertUniqueOwnership(capability, entry, { ...existing, ...update.values })
+      }
+      if (entry.table === "session") {
+        const statement = sessionUpsertStatement(capability, entry, values, conflict)
+        if (statement === undefined) return { changes: 0, lastInsertRowid: 0 }
+        return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
+      }
     }
-    if (entry.table === "session") {
-      const statement = sessionUpsertStatement(capability, entry, values, conflict)
-      if (statement === undefined) return { changes: 0, lastInsertRowid: 0 }
-      return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
-    }
-  }
-  const statement = insertStatement(capability, entry, values, conflict)
-  return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
+    const statement = insertStatement(capability, entry, values, conflict)
+    return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
+  })
 }
 
 function normalizeInsert<T extends WritableTable>(
@@ -970,7 +1051,7 @@ export function makeRepository(capability: WriteCapability): WorkerRepository {
         const statement = updateStatement(entry, assignments, predicate)
         return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
       }
-      return validatesAgainstStoredRow(entry) ? atomic(capability, write) : write()
+      return validatesAgainstStoredRow(entry) ? atomic(capability, write) : withWriteRetry(capability, write)
     },
     delete(table: any, where: any) {
       const entry = writeEntry(table, "delete")
@@ -983,9 +1064,11 @@ export function makeRepository(capability: WriteCapability): WorkerRepository {
           reason: "the session root may only be removed by the hub",
         })
       }
-      const predicate = scopedWhere(capability, entry, where as Row)
-      const statement = deleteStatement(entry, predicate)
-      return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
+      return withWriteRetry(capability, () => {
+        const predicate = scopedWhere(capability, entry, where as Row)
+        const statement = deleteStatement(entry, predicate)
+        return runOnMain(capability, () => capability.connection.run(statement.sql, statement.params))
+      })
     },
     atomic(operation: any) {
       return atomic(capability, operation)

@@ -7,7 +7,9 @@
 
 import { describe, expect, test } from "bun:test"
 import path from "node:path"
-import { openConnection, type Connection } from "@opencode-ai/core/database/connection"
+import { openConnection, type Connection, type QueryParams } from "@opencode-ai/core/database/connection"
+import type { RepositoryConnection } from "@/session/worker/repository/capability"
+import { connectedRepository } from "@/session/worker/repository/write"
 import {
   BusyExhaustedError,
   TransactionPoisonedError,
@@ -278,6 +280,98 @@ describe("inImmediateTransaction", () => {
     } finally {
       holder.close()
       contender.close()
+    }
+  })
+})
+
+describe("repository whole-unit retry from the worker path", () => {
+  const TODO_DDL = `
+    CREATE TABLE todo (
+      session_id TEXT NOT NULL,
+      content TEXT NOT NULL,
+      status TEXT NOT NULL,
+      priority TEXT NOT NULL,
+      position INTEGER NOT NULL,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL,
+      PRIMARY KEY (session_id, position)
+    );
+  `
+  const todo = {
+    session_id: "ses_repository_busy",
+    content: "retry me",
+    status: "pending",
+    priority: "high",
+    position: 1,
+    time_created: 1,
+    time_updated: 1,
+  }
+
+  test("a busy repository unit surfaces the typed exhaustion, never a raw lock message", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "repository-busy.db")
+    const holder = openConnection({ filename, busyTimeoutMs: 0 })
+    const contender = openConnection({ filename, busyTimeoutMs: 1 })
+    try {
+      holder.exec(TODO_DDL)
+      holder.exec("BEGIN IMMEDIATE")
+      const repository = connectedRepository(contender)
+
+      let failure: unknown
+      try {
+        repository.insert("todo", todo)
+      } catch (error) {
+        failure = error
+      }
+
+      expect(failure).toBeInstanceOf(BusyExhaustedError)
+      expect((failure as BusyExhaustedError).tag).toBe("SQLITE_BUSY_EXHAUSTED")
+      expect((failure as Error).message).not.toContain("database is locked")
+    } finally {
+      holder.exec("ROLLBACK")
+      holder.close()
+      contender.close()
+    }
+  })
+
+  test("nested repository writes join one whole-unit retry instead of double-retrying", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "repository-nested.db")
+    const native = openConnection({ filename, busyTimeoutMs: 0 })
+    try {
+      native.exec(TODO_DDL)
+      const execs: string[] = []
+      let runs = 0
+      let failed = false
+      const scripted: RepositoryConnection = {
+        all: native.all.bind(native),
+        values: native.values.bind(native),
+        run(sql: string, params?: QueryParams) {
+          runs += 1
+          execs.push(sql)
+          if (!failed) {
+            failed = true
+            throw busy()
+          }
+          return native.run(sql, params)
+        },
+        exec(sql: string) {
+          execs.push(sql)
+          native.exec(sql)
+        },
+      }
+      const repository = connectedRepository(scripted)
+
+      const outcome = repository.atomic(() => repository.atomic(() => repository.insert("todo", todo)))
+
+      expect(outcome.changes).toBe(1)
+      // One failed attempt plus one successful attempt; the inner unit never
+      // ran its own retry loop, so each attempt installed exactly two savepoints.
+      expect(runs).toBe(2)
+      expect(execs.filter((sql) => sql.startsWith("SAVEPOINT"))).toHaveLength(4)
+      expect(native.all("SELECT content FROM todo")).toEqual([{ content: "retry me" }])
+    } finally {
+      native.close()
     }
   })
 })

@@ -376,6 +376,85 @@ describe("busy COMMIT recovery", () => {
   })
 })
 
+describe("onRetry instrumentation", () => {
+  test("reports the attempt, delay, and busy error for a transaction-boundary retry", () => {
+    const lock = busy()
+    const events: Array<{ readonly attempt: number; readonly delayMs: number; readonly error: unknown }> = []
+    let begins = 0
+    const connection: TransactionConnection = {
+      exec(sql) {
+        if (sql !== "BEGIN IMMEDIATE") return
+        begins += 1
+        if (begins <= 2) throw lock
+      },
+    }
+
+    const result = inImmediateTransaction(connection, () => "committed", {
+      retries: 3,
+      baseDelayMs: 10,
+      maxDelayMs: 100,
+      onRetry: (event) => events.push(event),
+    })
+
+    expect(result).toBe("committed")
+    expect(begins).toBe(3)
+    expect(events.map((event) => event.attempt)).toEqual([1, 2])
+    // busyDelayMs grows tenfold from the base and is capped by maxDelayMs.
+    expect(events.map((event) => event.delayMs)).toEqual([10, 100])
+    expect(events[0]!.error).toBe(lock)
+    expect(events.every((event) => isBusyError(event.error))).toBe(true)
+  })
+
+  test("a throwing onRetry does not prevent the transaction-boundary retry", () => {
+    let begins = 0
+    const connection: TransactionConnection = {
+      exec(sql) {
+        if (sql !== "BEGIN IMMEDIATE") return
+        begins += 1
+        if (begins === 1) throw busy()
+      },
+    }
+
+    expect(
+      inImmediateTransaction(connection, () => "committed", {
+        retries: 1,
+        baseDelayMs: 1,
+        maxDelayMs: 1,
+        onRetry: () => {
+          throw new Error("instrumentation exploded")
+        },
+      }),
+    ).toBe("committed")
+    expect(begins).toBe(2)
+  })
+
+  test("a throwing onRetry does not mask the exhausted busy failure", () => {
+    const connection: TransactionConnection = {
+      exec(sql) {
+        if (sql === "BEGIN IMMEDIATE") throw busy()
+      },
+    }
+
+    let failure: unknown
+    try {
+      inImmediateTransaction(connection, () => "unreachable", {
+        retries: 1,
+        baseDelayMs: 1,
+        maxDelayMs: 1,
+        onRetry: () => {
+          throw new Error("instrumentation exploded")
+        },
+      })
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toBeInstanceOf(BusyExhaustedError)
+    expect((failure as BusyExhaustedError).attempts).toBe(2)
+    expect((failure as Error).message).not.toContain("instrumentation exploded")
+  })
+})
+
 describe("async helpers keep the Promise contract", () => {
   test("retryBusyAsync rejects a non-busy failure instead of throwing synchronously", async () => {
     let pending: Promise<never> | undefined

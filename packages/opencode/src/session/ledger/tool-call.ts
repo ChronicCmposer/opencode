@@ -746,12 +746,15 @@ export const workerLayer: Layer.Layer<Service> = Layer.effect(
   Effect.gen(function* () {
     const workerDb = yield* Effect.serviceOption(WorkerDb)
     if (Option.isNone(workerDb) || !isWorkerDatabase(workerDb.value)) return unavailableService()
+    const workerDatabase = workerDb.value
     const database = yield* Effect.serviceOption(Database.Service)
     const exclusive: LedgerExclusive | undefined = Option.isSome(database)
       ? <A>(operation: () => A) =>
-          database.value.db
-            .transaction(() => Effect.sync(operation), { behavior: "immediate" })
-            .pipe(Effect.orDie)
+          workerDatabase.withExternalTransaction(
+            database.value.db
+              .transaction(() => Effect.sync(operation), { behavior: "immediate" })
+              .pipe(Effect.orDie),
+          )
       : undefined
     // The lease owner is read per operation: a worker claims its lease after the
     // graph is built, so capturing it here would miss the first write.

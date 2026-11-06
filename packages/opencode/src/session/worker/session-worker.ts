@@ -45,6 +45,7 @@ import { Provider } from "@/provider/provider"
 import { DurableLog } from "@opencode-ai/core/durable-log"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Database } from "@opencode-ai/core/database/database"
+import { retryBusySync, type BusyRetryConfig } from "@opencode-ai/core/database/transaction"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
 import { openWriterConnection } from "@/session/writer/connection"
 import { createWorkerEgressClient, type WorkerEgressClient } from "./egress-client"
@@ -343,6 +344,40 @@ type WriterQueryConnection = Pick<WorkerConnection, "all" | "values" | "run" | "
 /** One third of the 30s worker lease TTL: two missed beats still leave headroom. */
 const WORKER_LEASE_HEARTBEAT_MS = 10_000
 
+/**
+ * Lease maintenance writes retry a short transient SQLite busy lock. The budget
+ * is deliberately small: a heartbeat cadence is 10s and a release runs during
+ * dispose, so neither may stall the worker for long.
+ */
+export const LEASE_BUSY_RETRY_CONFIG: BusyRetryConfig = Object.freeze({
+  retries: 2,
+  baseDelayMs: 10,
+  maxDelayMs: 100,
+})
+
+/** The two lease maintenance writes; the operation selects the log severity. */
+export type LeaseWriteOperation = "heartbeat" | "release"
+
+/**
+ * Run one lease maintenance write with a bounded busy retry, then swallow and
+ * log the failure. A heartbeat that loses its lease is only debug (the next
+ * write fences a superseded generation), while a release that cannot mark the
+ * lease dead is a warning (a successor must reclaim it). Swallowing keeps a
+ * heartbeat interval from throwing and lets dispose finish on exhaustion.
+ */
+export function runLeaseWrite(operation: LeaseWriteOperation, sessionID: string, write: () => void): void {
+  try {
+    retryBusySync(write, LEASE_BUSY_RETRY_CONFIG)
+  } catch (error) {
+    syncTrace({
+      prefix: WORKER_LOG_PREFIX,
+      level: operation === "release" ? "warn" : "debug",
+      event: `worker lease ${operation} failed`,
+      fields: { sessionID, reason: messageOf(error) },
+    })
+  }
+}
+
 function writerQuery(
   connection: WriterQueryConnection,
   method: string,
@@ -505,15 +540,11 @@ export function createWorkerDatabaseWriter(
   // renews the durable-event lease. A stale owner is ignored here: the next write
   // fences it through the normal owner check.
   const heartbeatIntervalMs = options.heartbeatIntervalMs ?? WORKER_LEASE_HEARTBEAT_MS
-  const heartbeatSessionID = options.sessionID
+  const leaseSessionID = options.sessionID
   const heartbeat =
-    heartbeatSessionID !== undefined && heartbeatIntervalMs > 0
+    leaseSessionID !== undefined && heartbeatIntervalMs > 0
       ? setInterval(() => {
-          try {
-            bus.heartbeat(heartbeatSessionID)
-          } catch {
-            // A superseded generation is fenced by its next write, not here.
-          }
+          runLeaseWrite("heartbeat", leaseSessionID, () => bus.heartbeat(leaseSessionID))
         }, heartbeatIntervalMs)
       : undefined
   heartbeat?.unref?.()
@@ -533,7 +564,9 @@ export function createWorkerDatabaseWriter(
     ...(options.sessionID === undefined ? {} : { lease: { aggregateID: options.sessionID, ownerID } }),
     dispose: () => {
       if (heartbeat !== undefined) clearInterval(heartbeat)
-      if (options.sessionID !== undefined) bus.release(options.sessionID)
+      if (leaseSessionID !== undefined) {
+        runLeaseWrite("release", leaseSessionID, () => bus.release(leaseSessionID))
+      }
       if (options.eventBinding !== undefined) WorkerRuntime.runSync(options.eventBinding.clear())
       ownedConnection?.close()
     },

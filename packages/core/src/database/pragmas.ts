@@ -5,6 +5,8 @@
 // pragma list lives here rather than being duplicated per connection. A worker
 // connection keeps a shorter busy timeout (it is synchronous inside an isolate);
 // that is the only connection-specific value and it stays an explicit option.
+// `OPENCODE_DB_WORKER_BUSY_TIMEOUT_MS` tunes that worker wait without changing
+// the main connection's budget.
 
 const MEBIBYTE = 1024 * 1024
 
@@ -23,6 +25,17 @@ export const DEFAULT_CHECKPOINT_INTERVAL_MS = 5 * 60 * 1000
  * executor connections take their own explicit budgets below.
  */
 export const DEFAULT_BUSY_TIMEOUT_MS = 250
+
+/**
+ * Default driver-level `busy_timeout` for a per-session worker connection.
+ *
+ * A worker runs SQLite synchronously inside its isolate, so a long native wait
+ * stalls the whole worker (including cancellation and stream progress). The
+ * default therefore stays short and the repository adds a bounded whole-unit
+ * retry around it. Operators may widen it with
+ * `OPENCODE_DB_WORKER_BUSY_TIMEOUT_MS` when they accept the stall.
+ */
+export const DEFAULT_WORKER_BUSY_TIMEOUT_MS = 250
 
 /**
  * Default page-cache budget for the hub's connection (64 MiB). A per-session
@@ -88,6 +101,16 @@ export function resolveWorkerCacheSizeKib(env: Environment = process.env): numbe
   return parseInteger(env.OPENCODE_DB_WORKER_CACHE_SIZE_KIB, DEFAULT_WORKER_CACHE_SIZE_KIB, 1)
 }
 
+/**
+ * Per-session worker `busy_timeout`. `OPENCODE_DB_WORKER_BUSY_TIMEOUT_MS`
+ * overrides it; malformed/absent values fall back to the short 250ms default.
+ * The repository's bounded retry sits on top of this wait, so widening it is a
+ * deliberate latency trade, not a retry substitute.
+ */
+export function resolveWorkerBusyTimeoutMs(env: Environment = process.env): number {
+  return parseInteger(env.OPENCODE_DB_WORKER_BUSY_TIMEOUT_MS, DEFAULT_WORKER_BUSY_TIMEOUT_MS, 0)
+}
+
 /** Executor page-cache budget; `OPENCODE_DB_EXECUTOR_CACHE_SIZE_KIB` overrides it. */
 export function resolveExecutorCacheSizeKib(env: Environment = process.env): number {
   return parseInteger(env.OPENCODE_DB_EXECUTOR_CACHE_SIZE_KIB, DEFAULT_EXECUTOR_CACHE_SIZE_KIB, 1)
@@ -111,6 +134,12 @@ export interface BusyRetryConfig {
   readonly retries: number
   readonly baseDelayMs: number
   readonly maxDelayMs: number
+  /**
+   * Optional instrumentation called before each retry. It is observational
+   * only: a throw from the hook is swallowed so it can never mask the busy
+   * failure or change the retry count/timing.
+   */
+  readonly onRetry?: (event: { attempt: number; delayMs: number; error: unknown }) => void
 }
 
 /**

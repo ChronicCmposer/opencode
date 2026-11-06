@@ -45,7 +45,7 @@ Build the Effect graph once per worker: 40 runnable nodes and 47 allowlisted nod
 
 ### D5 — No writer isolate
 
-Delete the writer isolate. Each worker opens its own SQLite WAL connection and writes with `BEGIN IMMEDIATE` plus a bounded busy retry. The hub DB executor thread exists only to keep synchronous `bun:sqlite` calls off the event loop; it does not own ordering, caching, migrations, or database state. A hub connection is allowed only as a measured fallback, never as the default write path.
+Delete the writer isolate. Each worker opens its own SQLite WAL connection and writes with `BEGIN IMMEDIATE` plus a bounded busy retry. A busy failure retries the whole outermost savepoint/transaction unit after a clean rollback; it never replays an individual statement inside an open transaction, and a failed rollback stops the retry. `OPENCODE_DB_WORKER_BUSY_TIMEOUT_MS` tunes the worker driver's `busy_timeout` without changing the main connection's budget. The hub DB executor thread exists only to keep synchronous `bun:sqlite` calls off the event loop; it does not own ordering, caching, migrations, or database state. A hub connection is allowed only as a measured fallback, never as the default write path.
 
 Cap running workers at the CPU-core count by default. Queue work at the cap rather than oversubscribing. The queue is scheduling state, not a second admission model.
 
@@ -222,7 +222,7 @@ Landed on the green baseline: layer/graph, dispatch/runtime, and test-infra. Arc
 
 | Risk | Owner | Measurement | Trigger |
 | --- | --- | --- | --- |
-| Per-worker WAL contention and busy retries under 8 sessions. | `writer-db` | Busy-retry count, commit p95, failed-commit rate. | Retry budget exhausted or p95 regression beyond D2. |
+| Per-worker WAL contention and busy retries under 8 sessions. Repository writes retry the whole outermost unit with a bounded budget; `OPENCODE_DB_WORKER_BUSY_TIMEOUT_MS` tunes the worker driver wait. | `writer-db` | Busy-retry count, commit p95, failed-commit rate. | Retry budget exhausted or p95 regression beyond D2. |
 | Synchronous SQLite on the hub event loop. | `writer-db`, `hub-wiring` | Event-loop gap p95 under load. | Any sustained gap from direct hub writes. |
 | CPU benchmark miss. | `dispatch-lifecycle` | Turn CPU share in Session-part JSON/tokenization, throughput, turn p95. | Any D2 condition missed; delete worker stack. |
 | Cross-session leakage. | `test-infra` | Leakage suite across 8 concurrent Sessions. | Any cross-session row, event, or cache hit. |

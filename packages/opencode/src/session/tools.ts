@@ -90,16 +90,19 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     // fail-loud boundary) the tool path keeps its previous no-ledger behavior.
     const workerDb = yield* Effect.serviceOption(WorkerDb)
     if (Option.isNone(workerDb) || typeof workerDb.value.filename !== "string") return undefined
-    const repository = workerDb.value.repository
+    const workerDatabase = workerDb.value
+    const repository = workerDatabase.repository
     if (typeof repository?.insert !== "function" || typeof repository?.select !== "function") return undefined
     const database = yield* Effect.serviceOption(Database.Service)
     const exclusive: LedgerExclusive | undefined = Option.isSome(database)
       ? <A>(operation: () => A) =>
-          database.value.db
-            .transaction(() => Effect.sync(operation), { behavior: "immediate" })
-            .pipe(Effect.orDie)
+          workerDatabase.withExternalTransaction(
+            database.value.db
+              .transaction(() => Effect.sync(operation), { behavior: "immediate" })
+              .pipe(Effect.orDie),
+          )
       : undefined
-    return yield* ToolCallLedger.makeFromWorker(workerDb.value, exclusive === undefined ? {} : { exclusive })
+    return yield* ToolCallLedger.makeFromWorker(workerDatabase, exclusive === undefined ? {} : { exclusive })
   })
 
   /**

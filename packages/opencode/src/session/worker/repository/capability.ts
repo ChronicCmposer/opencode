@@ -15,6 +15,13 @@ export interface WriteCapability {
   /** Max statements per outermost repository transaction; defaults to 500. */
   readonly statementBudget?: number
   readonly withMain: <T>(operation: () => T) => T
+  /**
+   * True while the caller owns an external (non-repository) transaction. The
+   * repository joins that transaction instead of retrying on its own, because
+   * replaying a unit inside a transaction the caller will roll back would
+   * duplicate a partial write.
+   */
+  readonly inExternalTransaction?: () => boolean
 }
 
 export function createWriteCapability(input: WriteCapability): WriteCapability {
@@ -24,6 +31,7 @@ export function createWriteCapability(input: WriteCapability): WriteCapability {
     scopeFunction: input.scopeFunction,
     ...(input.statementBudget === undefined ? {} : { statementBudget: input.statementBudget }),
     withMain: input.withMain,
+    ...(input.inExternalTransaction === undefined ? {} : { inExternalTransaction: input.inExternalTransaction }),
   })
 }
 

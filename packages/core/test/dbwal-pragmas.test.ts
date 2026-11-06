@@ -15,12 +15,15 @@ import {
   DEFAULT_EXECUTOR_BUSY_TIMEOUT_MS,
   DEFAULT_EXECUTOR_CACHE_SIZE_KIB,
   DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
+  DEFAULT_WORKER_BUSY_TIMEOUT_MS,
   executorPragmas,
   resolveExecutorCacheSizeKib,
   resolveExecutorBusyTimeoutMs,
   resolveWalConfig,
+  resolveWorkerBusyTimeoutMs,
   walPragmas,
 } from "@opencode-ai/core/database/pragmas"
+import { WORKER_BUSY_TIMEOUT_MS } from "@opencode-ai/core/database/connection"
 import { tmpdir } from "./fixture/tmpdir"
 
 describe("dbwal: WAL pragma source of truth", () => {
@@ -118,5 +121,24 @@ describe("dbwal: WAL pragma source of truth", () => {
     expect(resolveExecutorBusyTimeoutMs({ OPENCODE_DB_BUSY_TIMEOUT_MS: "1234" })).toBe(1_234)
     expect(resolveExecutorCacheSizeKib({ OPENCODE_DB_EXECUTOR_CACHE_SIZE_KIB: "4096" })).toBe(4_096)
     expect(executorPragmas({ OPENCODE_DB_BUSY_TIMEOUT_MS: "1234" })).toContain("PRAGMA busy_timeout = 1234")
+  })
+
+  test("the worker busy timeout is short by default and independently tunable", () => {
+    expect(DEFAULT_WORKER_BUSY_TIMEOUT_MS).toBe(250)
+    expect(resolveWorkerBusyTimeoutMs({})).toBe(DEFAULT_WORKER_BUSY_TIMEOUT_MS)
+    expect(resolveWorkerBusyTimeoutMs({ OPENCODE_DB_WORKER_BUSY_TIMEOUT_MS: "900" })).toBe(900)
+    // The main and executor budgets are separate knobs, not inherited.
+    expect(resolveWorkerBusyTimeoutMs({ OPENCODE_DB_BUSY_TIMEOUT_MS: "5000" })).toBe(250)
+
+    expect(resolveWorkerBusyTimeoutMs({ OPENCODE_DB_WORKER_BUSY_TIMEOUT_MS: "not-a-number" })).toBe(250)
+    expect(resolveWorkerBusyTimeoutMs({ OPENCODE_DB_WORKER_BUSY_TIMEOUT_MS: "-1" })).toBe(250)
+    expect(resolveWorkerBusyTimeoutMs({ OPENCODE_DB_WORKER_BUSY_TIMEOUT_MS: "3.5" })).toBe(250)
+  })
+
+  test("the connection helper aliases the single source instead of a literal", () => {
+    // `connection.ts` keeps its historical export name, but the value must come
+    // from `pragmas.ts` so the open-time default and the resolver cannot drift.
+    expect(WORKER_BUSY_TIMEOUT_MS).toBe(DEFAULT_WORKER_BUSY_TIMEOUT_MS)
+    expect(WORKER_BUSY_TIMEOUT_MS).toBe(250)
   })
 })

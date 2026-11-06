@@ -14,6 +14,7 @@ import {
 } from "@opencode-ai/core/database/connection"
 import { isBusyError } from "@opencode-ai/core/database/transaction"
 import {
+  DEFAULT_WORKER_BUSY_TIMEOUT_MS,
   resolveWalConfig,
   resolveWorkerCacheSizeKib,
   walPragmas,
@@ -22,9 +23,10 @@ import {
 
 /**
  * A synchronous driver must not stall a Session worker on a lock, so the worker
- * connection keeps a much shorter busy timeout than a read connection.
+ * connection keeps a much shorter busy timeout than a read connection. The value
+ * is re-exported from the core pragma source of truth under its historical name.
  */
-export const WRITER_BUSY_TIMEOUT_MS = 250
+export const WRITER_BUSY_TIMEOUT_MS = DEFAULT_WORKER_BUSY_TIMEOUT_MS
 
 export type { QueryParams, WriteOutcome }
 
@@ -53,7 +55,7 @@ export function createBunSqliteConnection(options: BunSqliteConnectionOptions): 
 export function writerPragmas(config: WalConfig): ReadonlyArray<string> {
   return walPragmas({
     journalSizeLimitBytes: config.journalSizeLimitBytes,
-    busyTimeoutMs: WRITER_BUSY_TIMEOUT_MS,
+    busyTimeoutMs: DEFAULT_WORKER_BUSY_TIMEOUT_MS,
     cacheSizeKib: resolveWorkerCacheSizeKib(),
   })
 }

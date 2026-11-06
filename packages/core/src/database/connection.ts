@@ -14,11 +14,15 @@ import { randomUUID } from "node:crypto"
 import { Schema } from "effect"
 import { Database, type SQLQueryBindings } from "bun:sqlite"
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue, type StatementSync } from "node:sqlite"
-import { resolveWorkerCacheSizeKib, walPragmas } from "./pragmas"
+import { DEFAULT_WORKER_BUSY_TIMEOUT_MS, resolveWorkerCacheSizeKib, walPragmas } from "./pragmas"
 import { isBusySqlError } from "./busy"
 
-/** SQLite stays locked for this long before the sync driver reports busy. */
-export const WORKER_BUSY_TIMEOUT_MS = 250
+/**
+ * Retained name for the worker busy budget. The value lives in `./pragmas` so
+ * the connection default and `resolveWorkerBusyTimeoutMs` cannot drift; this
+ * alias keeps the historical public surface.
+ */
+export const WORKER_BUSY_TIMEOUT_MS = DEFAULT_WORKER_BUSY_TIMEOUT_MS
 
 /**
  * Open-time busy budget. Switching a fresh handle to WAL needs a brief write
@@ -290,7 +294,7 @@ export function openConnection(options: ConnectionOptions): Connection {
     options.pragmas ??
     walPragmas({
       ...(options.journalSizeLimitBytes === undefined ? {} : { journalSizeLimitBytes: options.journalSizeLimitBytes }),
-      busyTimeoutMs: options.busyTimeoutMs ?? WORKER_BUSY_TIMEOUT_MS,
+      busyTimeoutMs: options.busyTimeoutMs ?? DEFAULT_WORKER_BUSY_TIMEOUT_MS,
       // A per-session worker gets its own bounded page cache (default 8 MiB), so
       // eight workers cannot reserve eight copies of the hub's 64 MiB budget.
       cacheSizeKib: options.cacheSizeKib ?? resolveWorkerCacheSizeKib(),
@@ -373,7 +377,7 @@ export function openNodeConnection(options: NodeConnectionOptions): NodeConnecti
     options.pragmas ??
     walPragmas({
       ...(options.journalSizeLimitBytes === undefined ? {} : { journalSizeLimitBytes: options.journalSizeLimitBytes }),
-      busyTimeoutMs: options.busyTimeoutMs ?? WORKER_BUSY_TIMEOUT_MS,
+      busyTimeoutMs: options.busyTimeoutMs ?? DEFAULT_WORKER_BUSY_TIMEOUT_MS,
       cacheSizeKib: options.cacheSizeKib ?? resolveWorkerCacheSizeKib(),
     })
 

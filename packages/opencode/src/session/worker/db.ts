@@ -31,6 +31,12 @@ import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { DurableLog, createDurableRepository } from "@opencode-ai/core/durable-log"
 import { makeSqliteClient, type SqliteNativeRunner } from "@opencode-ai/core/database/sqlite-adapter"
+import {
+  resolveWalConfig,
+  resolveWorkerBusyTimeoutMs,
+  resolveWorkerCacheSizeKib,
+  walPragmas,
+} from "@opencode-ai/core/database/pragmas"
 import { syncTrace } from "@opencode-ai/core/observability/sync-trace"
 import {
   openNodeConnection,
@@ -249,6 +255,12 @@ export interface WorkerDatabase {
   readonly run: (sql: string, params?: QueryParams) => Effect.Effect<WriteOutcome, WorkerDatabaseError>
   /** Close the native handle. Idempotent so termination can call it twice. */
   readonly close: Effect.Effect<void>
+  /**
+   * Run `effect` as the owner of an external transaction. While it is active the
+   * repository joins that transaction and never retries a write unit on its own:
+   * replaying a unit the caller will roll back would duplicate a partial write.
+   */
+  readonly withExternalTransaction: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
 }
 
 /** The read-only surface schema identity and ownership need. */
@@ -353,6 +365,8 @@ export interface OpenWorkerDatabaseOptions {
   readonly filename: string
   /** Overrides at the test boundary; production uses the shared WAL tuning. */
   readonly pragmas?: ReadonlyArray<string>
+  /** Test seam for the worker driver's busy budget; defaults to the resolver. */
+  readonly busyTimeoutMs?: number
   /**
    * The one session this worker owns. When present, reads resolve through the
    * bound TEMP views and every write is repository-scoped. Absent is a
@@ -367,6 +381,15 @@ export function openWorkerDatabase(
   return Effect.gen(function* () {
     const expected = currentSchemaIdentity()
     const sessionID = options.sessionID
+    // Resolve the worker tuning once so the main handle and the durable-log
+    // handle cannot drift apart. Both need the same WAL cap and busy budget.
+    const pragmas =
+      options.pragmas ??
+      walPragmas({
+        journalSizeLimitBytes: resolveWalConfig().journalSizeLimitBytes,
+        busyTimeoutMs: options.busyTimeoutMs ?? resolveWorkerBusyTimeoutMs(),
+        cacheSizeKib: resolveWorkerCacheSizeKib(),
+      })
     let mainAccess = 0
     const withMain = <T>(operation: () => T): T => {
       mainAccess += 1
@@ -381,7 +404,7 @@ export function openWorkerDatabase(
       try: () =>
         openNodeConnection({
           filename: options.filename,
-          ...(options.pragmas === undefined ? {} : { pragmas: options.pragmas }),
+          pragmas,
           foreignKeys: true,
           onRetry: (event) =>
             syncTrace({
@@ -447,7 +470,7 @@ export function openWorkerDatabase(
             try: () =>
               openNodeConnection({
                 filename: options.filename,
-                ...(options.pragmas === undefined ? {} : { pragmas: options.pragmas }),
+                pragmas,
                 foreignKeys: true,
                 onRetry: (event) =>
                   syncTrace({
@@ -601,12 +624,14 @@ interface MakeWorkerDatabaseOptions {
 function makeWorkerDatabase(options: MakeWorkerDatabaseOptions): WorkerDatabase {
   const { connection, filename, sessionID } = options
   const bound = sessionID !== undefined
+  let externalTransactionDepth = 0
   const repository = makeRepository(
     createWriteCapability({
       connection,
       ...(sessionID === undefined ? {} : { sessionID }),
       scopeFunction: SCOPE_FUNCTION,
       withMain: options.withMain,
+      inExternalTransaction: () => externalTransactionDepth > 0,
     }),
   )
   // A bound writer/query handle may open/commit a transaction, but every write
@@ -632,6 +657,18 @@ function makeWorkerDatabase(options: MakeWorkerDatabaseOptions): WorkerDatabase 
       catch: asWorkerDatabaseError,
     })
 
+  const withExternalTransaction = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        externalTransactionDepth += 1
+      }),
+      () => effect,
+      () =>
+        Effect.sync(() => {
+          externalTransactionDepth -= 1
+        }),
+    )
+
   const eventBinding = EventV2.makeWorkerScope(sessionID === undefined ? {} : { sessionID })
   const database = {
     filename,
@@ -646,6 +683,7 @@ function makeWorkerDatabase(options: MakeWorkerDatabaseOptions): WorkerDatabase 
     durableLog: durableBus.service,
     all,
     ...(bound ? {} : { run }),
+    withExternalTransaction,
     close: Effect.sync(() => {
       let failure: unknown
       try {

@@ -119,13 +119,22 @@ function resolveConfig(options: Partial<BusyRetryConfig>): BusyRetryConfig {
     retries: options.retries ?? DEFAULT_BUSY_RETRY_CONFIG.retries,
     baseDelayMs: options.baseDelayMs ?? DEFAULT_BUSY_RETRY_CONFIG.baseDelayMs,
     maxDelayMs: options.maxDelayMs ?? DEFAULT_BUSY_RETRY_CONFIG.maxDelayMs,
+    ...(options.onRetry === undefined ? {} : { onRetry: options.onRetry }),
   }
 }
 
 /** How one failed attempt waits before the next; omitted means retry at once. */
-type BusyWait = (failedAttempt: number) => void | Promise<void>
+type BusyWait = ((failedAttempt: number) => void | Promise<void>) | undefined
 
-const retryImmediately: BusyWait = () => {}
+/** Report a retry without letting instrumentation failure mask the busy error. */
+function traceRetry(config: BusyRetryConfig, attemptsMade: number, error: unknown): void {
+  if (config.onRetry === undefined) return
+  try {
+    config.onRetry({ attempt: attemptsMade, delayMs: busyDelayMs(config, attemptsMade), error })
+  } catch {
+    // Instrumentation is observational; the busy failure must still propagate.
+  }
+}
 
 /**
  * The one retry loop. `work` is retried while it fails with a busy error;
@@ -141,7 +150,8 @@ function retryBusy<T>(work: () => T, config: BusyRetryConfig, wait: BusyWait): T
     } catch (error) {
       if (!isBusyError(error)) throw error
       if (attemptsMade > config.retries) throw new BusyExhaustedError(attemptsMade, error)
-      const waited = wait(attemptsMade)
+      traceRetry(config, attemptsMade, error)
+      const waited = wait?.(attemptsMade)
       return waited instanceof Promise ? waited.then(() => attempt(attemptsMade + 1)) : attempt(attemptsMade + 1)
     }
   }
@@ -150,7 +160,7 @@ function retryBusy<T>(work: () => T, config: BusyRetryConfig, wait: BusyWait): T
 
 /** Synchronous retry: the driver's blocking `busy_timeout` already waited. */
 function retryBusyNow<T>(work: () => T, config: BusyRetryConfig): T {
-  return retryBusy(work, config, retryImmediately) as T
+  return retryBusy(work, config, undefined) as T
 }
 
 /**
