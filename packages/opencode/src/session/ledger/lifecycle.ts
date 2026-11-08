@@ -273,7 +273,7 @@ export function reporting(): LifecycleReporting | undefined {
 /**
  * Bound for the lifecycle reports that may be dropped on teardown (`toolStarted`, `toolFinished`, `phase`).
  */
-export const LIFECYCLE_RPC_TIMEOUT_MS = 5_000
+export const LIFECYCLE_RPC_TIMEOUT_MS = 10_000
 
 export class LifecycleRpcTimeoutError extends Schema.TaggedErrorClass<LifecycleRpcTimeoutError>(
   "LifecycleRpcTimeoutError",

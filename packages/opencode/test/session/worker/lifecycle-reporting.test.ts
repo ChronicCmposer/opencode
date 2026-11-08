@@ -64,8 +64,8 @@ describe("lifecycle proxy reporting", () => {
     expect(settled).toBe(true)
   })
 
-  test("the production bound is five seconds", () => {
-    expect(LIFECYCLE_RPC_TIMEOUT_MS).toBe(5_000)
+  test("the production bound is ten seconds", () => {
+    expect(LIFECYCLE_RPC_TIMEOUT_MS).toBe(10_000)
   })
 
   test("commit resolves after the deadline when the hub never acks", async () => {
