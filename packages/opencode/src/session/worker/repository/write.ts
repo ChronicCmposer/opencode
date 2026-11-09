@@ -829,7 +829,7 @@ let savepointCounter = 0
  * driver's `busy_timeout` provides the actual wait between attempts.
  */
 export const REPOSITORY_BUSY_RETRY_CONFIG = {
-  retries: 10,
+  retries: 20,
   baseDelayMs: 10,
   maxDelayMs: 1000,
   onRetry: (event: { attempt: number; delayMs: number; error: unknown }) =>
